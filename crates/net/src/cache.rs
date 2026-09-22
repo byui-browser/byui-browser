@@ -1,8 +1,15 @@
 //! In-memory response cache and cache-policy helpers.
 
-use std::{collections::HashMap, sync::{Arc, RwLock}, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
 
-use reqwest::{header::{HeaderMap, CACHE_CONTROL}, StatusCode};
+use reqwest::{
+    StatusCode,
+    header::{CACHE_CONTROL, HeaderMap},
+};
 
 use crate::{Request, Response};
 
@@ -56,23 +63,23 @@ pub(crate) struct CachedResponse {
 impl CachedResponse {
     /// Copies a response into the cache with a caller-supplied lifetime.
     pub(crate) fn from_response(response: &Response, ttl: Duration) -> Self {
-        Self { 
-            status: response.status.clone(), 
-            headers: response.headers.clone(), 
-            url: response.url.clone(), 
-            body: response.body.clone(), 
-            expires_at: Instant::now() + ttl 
+        Self {
+            status: response.status.clone(),
+            headers: response.headers.clone(),
+            url: response.url.clone(),
+            body: response.body.clone(),
+            expires_at: Instant::now() + ttl,
         }
     }
 
     /// Reconstructs a public response and marks it as cache-served.
     pub(crate) fn as_response(&self) -> Response {
-        Response { 
-            status: self.status, 
-            headers: self.headers.clone(), 
-            url: self.url.clone(), 
-            body: self.body.clone(), 
-            from_cache: true 
+        Response {
+            status: self.status,
+            headers: self.headers.clone(),
+            url: self.url.clone(),
+            body: self.body.clone(),
+            from_cache: true,
         }
     }
 }
@@ -86,8 +93,22 @@ pub(crate) fn cache_key(request: &Request) -> String {
 /// Responses without `max-age`, or with `no-store`/`no-cache`, are not cached.
 pub(crate) fn cache_ttl(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get(CACHE_CONTROL)?.to_str().ok()?;
-    if value.split(',').any(|directive| matches!(directive.trim().to_ascii_lowercase().as_str(), "no-store" | "no-cache")) { 
-        return None; 
+    if value.split(',').any(|directive| {
+        matches!(
+            directive.trim().to_ascii_lowercase().as_str(),
+            "no-store" | "no-cache"
+        )
+    }) {
+        return None;
     }
-    value.split(',').find_map(|directive| directive.trim().strip_prefix("max-age=")?.parse::<u64>().ok()).map(Duration::from_secs)
+    value
+        .split(',')
+        .find_map(|directive| {
+            directive
+                .trim()
+                .strip_prefix("max-age=")?
+                .parse::<u64>()
+                .ok()
+        })
+        .map(Duration::from_secs)
 }

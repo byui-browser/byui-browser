@@ -1,6 +1,6 @@
 //! Request types and cache-policy controls.
 
-use reqwest::{header::HeaderMap, Method};
+use reqwest::{Method, header::HeaderMap};
 
 /// An HTTP request submitted to the networking controller.
 #[derive(Clone, Debug)]
@@ -20,12 +20,12 @@ pub struct Request {
 impl Request {
     /// Creates a GET request with empty headers, no body, and default caching.
     pub fn get(url: impl Into<String>) -> Self {
-        Self { 
-            method: Method::GET, 
-            url: url.into(), 
-            headers: HeaderMap::new(), 
-            body: None, 
-            cache_mode: CacheMode::Default 
+        Self {
+            method: Method::GET,
+            url: url.into(),
+            headers: HeaderMap::new(),
+            body: None,
+            cache_mode: CacheMode::Default,
         }
     }
 }

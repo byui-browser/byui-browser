@@ -1,7 +1,10 @@
 //! Integration tests for the public networking controller API.
 
 use crate::{CacheMode, Config, Request, RequestController, RequestError};
-use reqwest::{header::{HeaderMap, HeaderValue}, Method, StatusCode};
+use reqwest::{
+    Method, StatusCode,
+    header::{HeaderMap, HeaderValue},
+};
 
 #[test]
 fn get_request_has_expected_defaults() {
@@ -55,7 +58,9 @@ fn invalid_urls_return_typed_errors() {
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
     let controller = RequestController::new().expect("reqwest client should initialize");
 
-    let error = runtime.block_on(controller.execute(Request::get("not a URL"))).unwrap_err();
+    let error = runtime
+        .block_on(controller.execute(Request::get("not a URL")))
+        .unwrap_err();
 
     assert!(matches!(error, RequestError::InvalidUrl(url) if url == "not a URL"));
 }
@@ -81,7 +86,9 @@ fn can_fetch_resource() {
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
     let controller = RequestController::new().expect("reqwest client should initialize");
 
-    let response = runtime.block_on(controller.execute(Request::get("https://picsum.photos/200/300"))).expect("request should succeed");
+    let response = runtime
+        .block_on(controller.execute(Request::get("https://picsum.photos/200/300")))
+        .expect("request should succeed");
 
     assert_eq!(response.status, StatusCode::OK);
     assert!(!response.body.is_empty());

@@ -2,7 +2,7 @@
 
 use reqwest::{Client, Method};
 
-use crate::{cache::ResponseCache, CacheMode, Config, Request, RequestError, Response};
+use crate::{CacheMode, Config, Request, RequestError, Response, cache::ResponseCache};
 
 /// Executes browser HTTP requests using one reusable client and shared cache.
 #[derive(Clone)]
@@ -34,7 +34,10 @@ impl RequestController {
             builder = builder.user_agent(user_agent);
         }
 
-        Ok(Self { client: builder.build()?, cache: ResponseCache::default() })
+        Ok(Self {
+            client: builder.build()?,
+            cache: ResponseCache::default(),
+        })
     }
 
     /// Executes a request, following configured redirects and reusing pooled connections.
@@ -43,7 +46,11 @@ impl RequestController {
         let url = reqwest::Url::parse(&request.url)
             .map_err(|_| RequestError::InvalidUrl(request.url.clone()))?;
         let cacheable = matches!(request.method, Method::GET | Method::HEAD);
-        let can_read_cache = cacheable && matches!(request.cache_mode, CacheMode::Default | CacheMode::OnlyIfCached);
+        let can_read_cache = cacheable
+            && matches!(
+                request.cache_mode,
+                CacheMode::Default | CacheMode::OnlyIfCached
+            );
 
         if can_read_cache {
             if let Some(cached) = self.cache.get(&request) {
@@ -66,12 +73,12 @@ impl RequestController {
         }
         // reqwest follows redirects and manages connection reuse through this client.
         let response = builder.send().await?;
-        let result = Response { 
-            status: response.status(), 
-            headers: response.headers().clone(), 
-            url: response.url().to_string(), 
-            body: response.bytes().await?.to_vec(), 
-            from_cache: false 
+        let result = Response {
+            status: response.status(),
+            headers: response.headers().clone(),
+            url: response.url().to_string(),
+            body: response.bytes().await?.to_vec(),
+            from_cache: false,
         };
 
         if cacheable && request.cache_mode != CacheMode::NoStore {

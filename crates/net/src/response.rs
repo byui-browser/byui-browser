@@ -1,6 +1,6 @@
 //! Response type returned by the networking controller.
 
-use reqwest::{header::HeaderMap, StatusCode};
+use reqwest::{StatusCode, header::HeaderMap};
 
 /// A fully buffered HTTP response returned by the networking controller.
 #[derive(Clone, Debug)]
