@@ -1,56 +1,183 @@
-use common::ids::NodeId;
+use common::ids::NodeId as CommonNodeId;
 use std::collections::BTreeMap;
 
-/// One token produced by the tokenizer.
+/// A stable index into an [`HtmlDocument`] arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeId(pub usize);
+
+impl NodeId {
+    pub const fn index(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
-    /// `<name>`
+    Doctype(String),
+    Comment(String),
     StartTag(String),
-    /// `</name>`
     EndTag(String),
-    /// Character data between tags.
     Text(String),
 }
 
-/// A single DOM node used by the legacy [`crate::parse`] API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
-    /// Arena handle for this node.
-    pub id: NodeId,
-    /// Tag name for elements, `"#text"` for text nodes.
-    pub name: String,
-    /// Parent handle, `None` for the document root.
     pub parent: Option<NodeId>,
+    pub children: Vec<NodeId>,
+    pub kind: NodeKind,
+    pub span: Option<SourceSpan>,
 }
 
-/// The document tree produced by [`crate::parse`].
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Dom {
-    /// Nodes in arena order; `NodeId` indexes into this vector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeKind {
+    Document,
+    Doctype {
+        name: Option<String>,
+        public_id: Option<String>,
+        system_id: Option<String>,
+    },
+    Element(ElementData),
+    Text(String),
+    Comment(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementData {
+    pub name: String,
+    pub namespace: Namespace,
+    pub attributes: Vec<Attribute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attribute {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Namespace {
+    Html,
+    Svg,
+    MathMl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum QuirksMode {
+    #[default]
+    NoQuirks,
+    LimitedQuirks,
+    Quirks,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HtmlDocument {
     pub nodes: Vec<Node>,
+    pub root: NodeId,
+    pub quirks_mode: QuirksMode,
 }
 
-/// An element in an [`HTMLDocument`].
+impl Default for HtmlDocument {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HtmlDocument {
+    pub fn new() -> Self {
+        let mut document = Self {
+            nodes: Vec::new(),
+            root: NodeId(0),
+            quirks_mode: QuirksMode::NoQuirks,
+        };
+        let root = document.push_node(NodeKind::Document, None);
+        document.root = root;
+        document
+    }
+
+    pub fn push_node(&mut self, kind: NodeKind, span: Option<SourceSpan>) -> NodeId {
+        let id = NodeId(self.nodes.len());
+        self.nodes.push(Node {
+            parent: None,
+            children: Vec::new(),
+            kind,
+            span,
+        });
+        id
+    }
+
+    pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
+        self.nodes[child.0].parent = Some(parent);
+        self.nodes[parent.0].children.push(child);
+    }
+
+    pub fn node(&self, id: NodeId) -> Option<&Node> {
+        self.nodes.get(id.0)
+    }
+
+    pub fn text_content(&self, id: NodeId) -> String {
+        fn collect(document: &HtmlDocument, id: NodeId, output: &mut String) {
+            let Some(node) = document.node(id) else {
+                return;
+            };
+            if let NodeKind::Text(text) = &node.kind {
+                output.push_str(text);
+            }
+            for child in &node.children {
+                collect(document, *child, output);
+            }
+        }
+        let mut output = String::new();
+        collect(self, id, &mut output);
+        output
+    }
+
+    pub fn get_element_by_id(&self, value: &str) -> Option<NodeId> {
+        self.nodes.iter().enumerate().find_map(|(index, node)| {
+            let NodeKind::Element(element) = &node.kind else {
+                return None;
+            };
+            element
+                .attributes
+                .iter()
+                .find(|attribute| attribute.name == "id" && attribute.value == value)
+                .map(|_| NodeId(index))
+        })
+    }
+}
+
+pub type HTMLDocument = HtmlDocument;
+
+/// Compatibility projection returned by the original selector API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HTMLElement {
+    pub id: CommonNodeId,
     pub name: String,
     pub attributes: BTreeMap<String, String>,
-    /// `NodeId::new(u32::MAX)` means that this element has no parent.
-    pub parent: NodeId,
-    pub children: Vec<NodeId>,
+    pub parent: Option<CommonNodeId>,
+    pub children: Vec<CommonNodeId>,
+    pub text: String,
 }
 
-/// The location associated with an [`HTMLDocument`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Dom {
+    pub nodes: Vec<LegacyNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyNode {
+    pub id: CommonNodeId,
+    pub name: String,
+    pub parent: Option<CommonNodeId>,
+    pub text: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
     pub url: String,
-}
-
-/// A parsed HTML document.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HTMLDocument {
-    pub doc_type: String,
-    pub nodes: Vec<NodeId>,
-    pub location: Location,
-    pub(crate) elements: Vec<HTMLElement>,
 }
