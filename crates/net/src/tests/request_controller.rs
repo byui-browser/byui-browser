@@ -83,9 +83,6 @@ fn can_fetch_resource() {
 
     let response = runtime.block_on(controller.execute(Request::get("https://picsum.photos/200/300"))).expect("request should succeed");
 
-    // Save response body to file
-    std::fs::write("picture.png", &response.body).expect("Failed to write response body to file");
-
     assert_eq!(response.status, StatusCode::OK);
     assert!(!response.body.is_empty());
 }
