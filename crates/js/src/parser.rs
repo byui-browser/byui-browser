@@ -17,10 +17,12 @@ pub fn parse(tokens: &[Token]) -> Result<Expr, String> {
     // We expect exactly 3 tokens: [Number, Plus, Number]
 
     if tokens.len() == 3 {
-        if let(Token::Number(left), Token::Plus, Token::Number(right)) = (&tokens[0], &tokens[1], &tokens[2]) {
+        if let (Token::Number(left), Token::Plus, Token::Number(right)) =
+            (&tokens[0], &tokens[1], &tokens[2])
+        {
             return Ok(Expr::Add(
                 Box::new(Expr::Number(*left)),
-                Box::new(Expr::Number(*right))
+                Box::new(Expr::Number(*right)),
             ));
         }
     }
@@ -32,7 +34,6 @@ pub fn parse(tokens: &[Token]) -> Result<Expr, String> {
 pub fn eval(expr: &Expr) -> f64 {
     match expr {
         Expr::Number(n) => *n,
-        Expr::Add(left,right) => eval(left) + eval(right),
+        Expr::Add(left, right) => eval(left) + eval(right),
     }
 }
-

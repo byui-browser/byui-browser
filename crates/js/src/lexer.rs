@@ -15,7 +15,6 @@ pub enum Token {
 pub fn tokenize(input: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
 
-
     // Split the input string wherever there is whitespace (spaces)
 
     for word in input.split_whitespace() {
