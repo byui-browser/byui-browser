@@ -7,4 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+/// Label for a newly opened tab before navigating to a page.
+pub const DEFAULT_TAB_TITLE: &str = "New Tab";
+
 // TODO(chrome): Implement browser UI and window management.
