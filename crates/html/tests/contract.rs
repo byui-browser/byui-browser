@@ -199,5 +199,8 @@ fn keeps_incomplete_tag_text_and_unterminated_attribute_values() {
 
     let attributes = parse_raw_html("<input value='unfinished>".to_owned());
     let input = attributes.query("input").pop().expect("input");
-    assert_eq!(input.attributes.get("value"), Some(&"unfinished".to_owned()));
+    assert_eq!(
+        input.attributes.get("value"),
+        Some(&"unfinished".to_owned())
+    );
 }
