@@ -172,23 +172,37 @@ fn handles_unclosed_tags_and_mismatched_closing_tags() {
     let document = parse_raw_html("<div><p>first</div><p>second".to_owned());
     let paragraphs = document.query("p");
     assert_eq!(paragraphs.len(), 2);
-    assert_eq!(document.text_content(paragraphs[0].id), "first");
-    assert_eq!(document.text_content(paragraphs[1].id), "second");
+    assert_eq!(
+        document.text_content(html::NodeId(paragraphs[0].id.index() as usize)),
+        "first"
+    );
+    assert_eq!(
+        document.text_content(html::NodeId(paragraphs[1].id.index() as usize)),
+        "second"
+    );
 }
 
 #[test]
 fn preserves_void_element_siblings_and_does_not_push_void_nodes() {
     let document = parse_raw_html("<p>before<br>after<img src=x>tail</p>".to_owned());
     let paragraph = document.query("p").pop().expect("paragraph");
-    assert_eq!(document.text_content(paragraph.id), "beforeaftertail");
+    assert_eq!(
+        document.text_content(html::NodeId(paragraph.id.index() as usize)),
+        "beforeaftertail"
+    );
     for tag in ["br", "img"] {
         let node_id = paragraph
             .children
             .iter()
             .copied()
-            .find(|id| matches!(&document.nodes[id.0].kind, NodeKind::Element(element) if element.name == tag))
+            .find(|id| {
+                matches!(
+                    &document.nodes[id.index() as usize].kind,
+                    NodeKind::Element(element) if element.name == tag
+                )
+            })
             .expect("void element child");
-        assert!(document.nodes[node_id.0].children.is_empty());
+        assert!(document.nodes[node_id.index() as usize].children.is_empty());
     }
 }
 
