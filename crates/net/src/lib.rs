@@ -10,3 +10,19 @@
 #![forbid(unsafe_code)]
 
 // TODO(net): Implement fetch API, protocols, TLS, and connection pooling.
+
+mod cache;
+mod config;
+mod controller;
+mod error;
+mod request;
+mod response;
+
+#[cfg(test)]
+mod tests;
+
+pub(crate) use config::Config;
+pub(crate) use controller::RequestController;
+pub(crate) use error::RequestError;
+pub(crate) use request::{CacheMode, Request};
+pub(crate) use response::Response;
