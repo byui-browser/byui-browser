@@ -156,3 +156,48 @@ fn parse_5_nested_children_finds_the_text_node() {
     }
     assert_eq!(document.nodes[current.0].parent, Some(document.root));
 }
+
+#[test]
+fn handles_empty_input_and_text_without_markup() {
+    let empty = parse_raw_html(String::new());
+    assert_eq!(empty.nodes.len(), 1);
+    assert!(matches!(empty.nodes[empty.root.0].kind, NodeKind::Document));
+
+    let text = parse_raw_html("plain text < and > signs".to_owned());
+    assert_eq!(text.text_content(text.root), "plain text < and > signs");
+}
+
+#[test]
+fn handles_unclosed_tags_and_mismatched_closing_tags() {
+    let document = parse_raw_html("<div><p>first</div><p>second".to_owned());
+    let paragraphs = document.query("p");
+    assert_eq!(paragraphs.len(), 2);
+    assert_eq!(document.text_content(paragraphs[0].id), "first");
+    assert_eq!(document.text_content(paragraphs[1].id), "second");
+}
+
+#[test]
+fn preserves_void_element_siblings_and_does_not_push_void_nodes() {
+    let document = parse_raw_html("<p>before<br>after<img src=x>tail</p>".to_owned());
+    let paragraph = document.query("p").pop().expect("paragraph");
+    assert_eq!(document.text_content(paragraph.id), "beforeaftertail");
+    for tag in ["br", "img"] {
+        let node_id = paragraph
+            .children
+            .iter()
+            .copied()
+            .find(|id| matches!(&document.nodes[id.0].kind, NodeKind::Element(element) if element.name == tag))
+            .expect("void element child");
+        assert!(document.nodes[node_id.0].children.is_empty());
+    }
+}
+
+#[test]
+fn keeps_incomplete_tag_text_and_unterminated_attribute_values() {
+    let incomplete = parse_raw_html("hello <p".to_owned());
+    assert_eq!(incomplete.text_content(incomplete.root), "hello <p");
+
+    let attributes = parse_raw_html("<input value='unfinished>".to_owned());
+    let input = attributes.query("input").pop().expect("input");
+    assert_eq!(input.attributes.get("value"), Some(&"unfinished".to_owned()));
+}
