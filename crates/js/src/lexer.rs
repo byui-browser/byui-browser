@@ -2,11 +2,7 @@
 // Step 1
 #[derive(Debug, PartialEq)]
 pub enum Token {
-    Let,
-    Identifier(String),
-    Assign,
     Number(f64),
-    Semicolon,
     Plus,
 }
 
