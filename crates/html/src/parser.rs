@@ -24,6 +24,7 @@ pub fn parse_raw_html(raw: String) -> HtmlDocument {
                 open,
                 raw.len(),
             );
+            cursor = raw.len();
             break;
         };
         let close = open + relative_close;
@@ -33,6 +34,23 @@ pub fn parse_raw_html(raw: String) -> HtmlDocument {
             end: close + 1,
         });
         cursor = close + 1;
+
+        // A '<' followed by whitespace is not the start of a tag. Preserve
+        // this malformed markup as text instead of dropping it as an element.
+        if raw[open + 1..close]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+        {
+            append_text(
+                &mut document,
+                current_parent(&stack, root),
+                &raw[open..cursor],
+                open,
+                cursor,
+            );
+            continue;
+        }
 
         if let Some(comment_body) = tag.strip_prefix("!--") {
             let comment = comment_body.strip_suffix("--").unwrap_or(comment_body);
