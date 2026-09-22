@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A valid HTML parser fixture">
+  <title>HTML Data Structures</title>
+  <link rel="stylesheet" href="/assets/site.css">
+  <link rel="icon" href="/assets/favicon.ico">
+</head>
+<body id="page" class="site-body">
+  <header class="site-header">
+    <a class="brand" href="/">Browser Lab</a>
+    <nav aria-label="Primary navigation">
+      <ul>
+        <li><a href="/">Home</a></li>
+        <li><a href="/docs">Docs</a></li>
+        <li><a href="/about">About</a></li>
+      </ul>
+    </nav>
+  </header>
+  <main id="main-content">
+    <article class="post">
+      <header>
+        <p class="eyebrow">Parser notes</p>
+        <h1>Building a Small HTML Tree</h1>
+        <p class="byline">Written by <a href="/authors/ada">Ada Lovelace</a></p>
+      </header>
+      <section id="overview" aria-labelledby="overview-title">
+        <h2 id="overview-title">Overview</h2>
+        <p>HTML documents are trees made from elements, attributes, and text.</p>
+        <p>A useful parser keeps relationships explicit and predictable.</p>
+        <figure>
+          <img src="/images/tree.png" alt="A tree-shaped document diagram" width="640" height="360">
+          <figcaption>A document tree makes parent and child relationships clear.</figcaption>
+        </figure>
+      </section>
+      <section id="concepts" aria-labelledby="concepts-title">
+        <h2 id="concepts-title">Core concepts</h2>
+        <ol>
+          <li><strong>Elements</strong> have names and attributes.</li>
+          <li><strong>Children</strong> preserve document order.</li>
+          <li><strong>Text</strong> belongs to the element that contains it.</li>
+        </ol>
+      </section>
+      <section id="example" aria-labelledby="example-title">
+        <h2 id="example-title">Example</h2>
+        <pre><code>&lt;article&gt;Hello&lt;/article&gt;</code></pre>
+        <p class="note">This example is intentionally small.</p>
+      </section>
+      <section id="table" aria-labelledby="table-title">
+        <h2 id="table-title">Node summary</h2>
+        <table>
+          <caption>Common node properties</caption>
+          <thead>
+            <tr><th scope="col">Property</th><th scope="col">Purpose</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Name</td><td>Identifies an element type.</td></tr>
+            <tr><td>Attributes</td><td>Stores element metadata.</td></tr>
+            <tr><td>Children</td><td>Connects nested elements.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <aside class="callout">
+        <h2>Remember</h2>
+        <p>Malformed input should not make a tree builder panic.</p>
+      </aside>
+      <section id="checklist" aria-labelledby="checklist-title">
+        <h2 id="checklist-title">Checklist</h2>
+        <ul class="checklist">
+          <li data-state="done">Read the input.</li>
+          <li data-state="done">Create stable node identifiers.</li>
+          <li data-state="done">Attach children to parents.</li>
+          <li data-state="done">Keep attributes available.</li>
+          <li data-state="done">Collect text content.</li>
+        </ul>
+      </section>
+      <section id="details">
+        <h2>Details</h2>
+        <details>
+          <summary>Why use an arena?</summary>
+          <p>Arena identifiers make references small and stable.</p>
+          <ul>
+            <li>Stable handles simplify references.</li>
+            <li>Explicit parents simplify traversal.</li>
+          </ul>
+          <p class="tip">Traversal stays deterministic.</p>
+        </details>
+      </section>
+      <hr>
+      <p class="closing">The fixture ends with a complete document tree.</p>
+    </article>
+  </main>
+  <footer class="site-footer">
+    <p>Copyright 2026 Browser Lab.</p>
+    <address><a href="mailto:hello@example.test">hello@example.test</a></address>
+  </footer>
+</body>
+</html>
