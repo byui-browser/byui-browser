@@ -50,6 +50,7 @@ rustup update stable
 make build                 # build the workspace (debug)
 make test                  # unit tests across the workspace
 make test html             # tests for a single crate
+cargo test -p html -- --ignored   # backlog: contract tests not yet implemented
 make lint                  # rustfmt check + clippy (-D warnings)
 make release linux         # release build for macos | linux | windows
 ```
