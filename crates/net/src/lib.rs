@@ -27,7 +27,6 @@ pub(crate) use error::RequestError;
 pub(crate) use request::{CacheMode, Request};
 pub(crate) use response::Response;
 
-
 /*
 
 // Example code added by SoS team
@@ -152,4 +151,3 @@ mod tests {
     }
 }
 */
-

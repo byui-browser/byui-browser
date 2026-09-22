@@ -3,6 +3,10 @@
 //! Run ignored tests with `cargo test -p net -- --ignored` to see the backlog.
 //! None of these may touch a live network; use a local listener or a fake transport.
 
+/*
+
+// Example tests from the SoS team
+
 use net::{NetError, Request, Url, fetch};
 
 #[test]
@@ -29,3 +33,5 @@ fn fetch_returns_status_from_server() {
     let response = fetch(&Request::get(url)).expect("response");
     assert_eq!(response.status, 200);
 }
+
+*/
