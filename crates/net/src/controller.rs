@@ -2,7 +2,13 @@
 
 use reqwest::{Client, Method};
 
-use crate::{CacheMode, Config, Request, RequestError, Response, cache::ResponseCache};
+use crate::{
+    cache::ResponseCache,
+    config::Config,
+    error::RequestError,
+    request::{CacheMode, Request},
+    response::Response,
+};
 
 /// Executes browser HTTP requests using one reusable client and shared cache.
 #[derive(Clone)]

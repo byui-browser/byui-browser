@@ -11,7 +11,7 @@ use reqwest::{
     header::{CACHE_CONTROL, HeaderMap},
 };
 
-use crate::{Request, Response};
+use crate::{request::Request, response::Response};
 
 /// Thread-safe process-local cache shared by cloned request controllers.
 #[derive(Clone, Debug, Default)]
@@ -64,7 +64,7 @@ impl CachedResponse {
     /// Copies a response into the cache with a caller-supplied lifetime.
     pub(crate) fn from_response(response: &Response, ttl: Duration) -> Self {
         Self {
-            status: response.status.clone(),
+            status: response.status,
             headers: response.headers.clone(),
             url: response.url.clone(),
             body: response.body.clone(),
