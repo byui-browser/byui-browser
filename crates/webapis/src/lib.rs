@@ -8,4 +8,22 @@
 
 #![forbid(unsafe_code)]
 
-// TODO(webapis): Implement DOM bindings and Web API surface.
+/// JavaScript-facing `print` function.
+///
+/// This is the first Web API binding exposed by this crate. The JavaScript
+/// engine can register this function under the global `print` name and route
+/// its output through the browser's console/devtools implementation once that
+/// infrastructure is available.
+pub fn print() {
+    println!("JS API Team Rocks!");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::print;
+
+    #[test]
+    fn print_binding_is_callable() {
+        print();
+    }
+}
