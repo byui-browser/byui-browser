@@ -107,4 +107,5 @@ name = "webapis"
 version = "0.1.0"
 dependencies = [
  "common",
+ "js",
 ]
