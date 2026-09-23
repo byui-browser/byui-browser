@@ -1,10 +1,18 @@
-//! HTML parser and DOM construction.
+//! HTML parsing, DOM construction, and basic DOM queries.
 //!
 //! **Owning team**: HTML Team
-//!
-//! Responsibilities: HTML tokenizer, tree builder, DOM construction,
-//! mutation observers, and basic DOM APIs.
 
 #![forbid(unsafe_code)]
 
-// TODO(html): Implement tokenizer, tree builder, and DOM construction.
+mod dom;
+mod parser;
+mod selector;
+mod tokenizer;
+
+pub use dom::{
+    Attribute, Dom, ElementData, HTMLDocument, HTMLElement, HtmlDocument, LegacyNode, Location,
+    Namespace, Node, NodeId, NodeKind, QuirksMode, SourceSpan, Token,
+};
+pub use parser::parse_raw_html;
+pub use selector::Query;
+pub use tokenizer::{parse, tokenize};

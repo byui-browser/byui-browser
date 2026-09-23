@@ -11,16 +11,19 @@ use std::fmt;
 use std::sync::Arc;
 
 /// Values that can cross the host-function boundary.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Undefined,
+    Null,
+    Boolean(bool),
+    Number(f64),
     String(String),
 }
 
 /// Errors raised while resolving or invoking JavaScript host functions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JsError {
-    message: String,
+    pub message: String,
 }
 
 impl JsError {
@@ -85,7 +88,7 @@ impl Realm {
     /// only a global identifier followed by an empty argument list, such as
     /// `print()`, so the host-function path can be exercised end to end.
     pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
-        let expression = source.trim();
+        let expression = source.trim().trim_end_matches(';').trim();
         let call = expression
             .strip_suffix(')')
             .and_then(|prefix| prefix.strip_suffix('('))
@@ -98,6 +101,33 @@ impl Realm {
 
         self.call_global(name, &[])
     }
+}
+
+/// A parsed program. The full statement shape is still under development.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Program {
+    pub statements: Vec<Statement>,
+}
+
+/// One statement in the AST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Statement {}
+
+/// Parses source text into a [`Program`].
+pub fn parse(source: &str) -> JsResult<Program> {
+    if source.trim().is_empty() {
+        return Ok(Program::default());
+    }
+    Err(JsError::new("JavaScript parsing is not implemented"))
+}
+
+/// Parses and evaluates source text, returning the completion value.
+pub fn eval(source: &str) -> JsResult<Value> {
+    let program = parse(source)?;
+    if program.statements.is_empty() {
+        return Ok(Value::Undefined);
+    }
+    Err(JsError::new("JavaScript evaluation is not implemented"))
 }
 
 #[cfg(test)]
@@ -139,5 +169,10 @@ mod tests {
             realm.register_global_function("", Arc::new(|_| Ok(Value::Undefined))),
             Err(JsError::new("global function name cannot be empty"))
         );
+    }
+
+    #[test]
+    fn empty_program_evaluates_to_undefined() {
+        assert_eq!(super::eval(""), Ok(Value::Undefined));
     }
 }
