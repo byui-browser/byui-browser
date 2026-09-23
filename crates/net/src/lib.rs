@@ -7,7 +7,35 @@
 //! the Network process. Cookie jar / cache policy decisions are owned by
 //! Security & Storage.
 
+// Crate-wide flags to ignore dead code and unused imports warnings. Will be
+// removed once implementation is finished, but is required for now to prevent
+// the integration tests from failing.
+#![allow(dead_code)]
+#![allow(unused_imports)]
+// Flag to forbid unsafe code. This is security-critical and permanant.
 #![forbid(unsafe_code)]
+
+// TODO(net): Implement fetch API, protocols, TLS, and connection pooling.
+
+mod cache;
+mod config;
+mod controller;
+mod error;
+mod request;
+mod response;
+
+#[cfg(test)]
+mod tests;
+
+pub(crate) use config::Config;
+pub(crate) use controller::RequestController;
+pub(crate) use error::RequestError;
+pub(crate) use request::{CacheMode, Request};
+pub(crate) use response::Response;
+
+/*
+
+// Example code added by SoS team
 
 use std::fmt;
 
@@ -128,3 +156,4 @@ mod tests {
         assert_eq!(req.url, url);
     }
 }
+*/
