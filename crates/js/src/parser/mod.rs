@@ -39,11 +39,7 @@ impl<'tokens> Parser<'tokens> {
     fn parse_expression(&mut self, minimum_precedence: u8) -> Result<Expr, String> {
         let mut left = self.parse_primary()?;
 
-        loop {
-            let Some(operator) = self.peek().and_then(Self::binary_operator) else {
-                break;
-            };
-
+        while let Some(operator) = self.peek().and_then(Self::binary_operator) {
             if operator.precedence() < minimum_precedence {
                 break;
             }
