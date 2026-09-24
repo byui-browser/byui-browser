@@ -209,8 +209,7 @@ fn scheduler_limits_active_transport_requests() {
         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
     });
 
-    let mut config = Config::default();
-    config.max_in_flight = 1;
+    let config = Config { max_in_flight: 1, ..Config::default() };
     let controller = RequestController::new(config).unwrap();
     runtime().block_on(async {
         let first_controller = controller.clone();
