@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use js::Realm;
-use webapis::{ConsoleSink, register_print};
+use webapis::{ConsoleSink, register_fetch, register_print};
 
 struct StdoutConsole;
 
@@ -23,6 +23,9 @@ fn main() {
     let mut realm = Realm::new();
     register_print(&mut realm, Arc::new(StdoutConsole))
         .expect("registering built-in Web APIs should succeed");
+    let controller =
+        Arc::new(net::RequestController::new().expect("network client should initialize"));
+    register_fetch(&mut realm, controller).expect("registering the fetch Web API should succeed");
 
     realm
         .evaluate_script("print()")

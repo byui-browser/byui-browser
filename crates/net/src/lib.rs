@@ -27,11 +27,11 @@ mod response;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use config::Config;
-pub(crate) use controller::RequestController;
-pub(crate) use error::RequestError;
-pub(crate) use request::{CacheMode, Request};
-pub(crate) use response::Response;
+pub use config::Config;
+pub use controller::RequestController;
+pub use error::RequestError;
+pub use request::{CacheMode, Request};
+pub use response::Response;
 
 /*
 
