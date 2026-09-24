@@ -766,6 +766,9 @@ name = "layout"
 version = "0.1.0"
 dependencies = [
  "common",
+ "html",
+ "paint",
+ "render",
 ]
 
 [[package]]
@@ -1127,6 +1130,8 @@ name = "paint"
 version = "0.1.0"
 dependencies = [
  "common",
+ "html",
+ "layout",
 ]
 
 [[package]]
@@ -1328,6 +1333,7 @@ name = "render"
 version = "0.1.0"
 dependencies = [
  "common",
+ "paint",
 ]
 
 [[package]]
