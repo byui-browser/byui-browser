@@ -1,4 +1,4 @@
-//! Integration tests for the public networking controller API.
+//! Integration tests for the public networking client API.
 
 use crate::{CacheMode, Config, Request, RequestController, RequestError};
 use reqwest::{
@@ -31,6 +31,7 @@ fn custom_request_preserves_headers_and_body() {
         headers,
         body: Some(br#"{"ok":true}"#.to_vec()),
         cache_mode: CacheMode::NoStore,
+        context: Default::default(),
     };
 
     assert_eq!(request.method, Method::POST);
@@ -56,10 +57,10 @@ fn invalid_urls_return_typed_errors() {
     // URL validation happens before reqwest is asked to perform network I/O,
     // so malformed input should produce a stable crate-level error variant.
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let controller = RequestController::new().expect("reqwest client should initialize");
+    let client = RequestController::new(Config::default()).expect("controller should initialize");
 
     let error = runtime
-        .block_on(controller.execute(Request::get("not a URL")))
+        .block_on(client.fetch(Request::get("not a URL")))
         .unwrap_err();
 
     assert!(matches!(error, RequestError::InvalidUrl(url) if url == "not a URL"));
@@ -70,26 +71,44 @@ fn only_if_cached_reports_a_cache_miss_without_network_access() {
     // OnlyIfCached is useful to callers that must avoid network access entirely;
     // an empty cache should fail immediately rather than attempting the URL.
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let controller = RequestController::new().expect("reqwest client should initialize");
+    let client = RequestController::new(Config::default()).expect("controller should initialize");
     let mut request = Request::get("http://127.0.0.1:1");
     request.cache_mode = CacheMode::OnlyIfCached;
 
-    let error = runtime.block_on(controller.execute(request)).unwrap_err();
+    let error = runtime.block_on(client.fetch(request)).unwrap_err();
 
     assert!(matches!(error, RequestError::CacheMiss));
 }
 
 #[test]
-fn can_fetch_resource() {
-    // This test is a sanity check that the controller can reach a real network
-    // resource. It is not intended to be a comprehensive test of the remote site.
+fn can_fetch_resource_from_local_server() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("server should bind");
+    let address = format!(
+        "http://{}",
+        listener.local_addr().expect("address should exist")
+    );
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut stream, _) = listener.accept().expect("server should receive a request");
+        let mut request = [0; 4096];
+        let _ = stream
+            .read(&mut request)
+            .expect("server should read request");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nhello world!",
+            )
+            .expect("server should write response");
+    });
+
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let controller = RequestController::new().expect("reqwest client should initialize");
+    let client = RequestController::new(Config::default()).expect("controller should initialize");
 
     let response = runtime
-        .block_on(controller.execute(Request::get("https://picsum.photos/200/300")))
+        .block_on(client.fetch(Request::get(address)))
         .expect("request should succeed");
+    server.join().expect("server should exit");
 
     assert_eq!(response.status, StatusCode::OK);
-    assert!(!response.body.is_empty());
+    assert_eq!(response.body, b"hello world!");
 }
