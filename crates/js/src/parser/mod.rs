@@ -72,7 +72,7 @@ impl<'tokens> Parser<'tokens> {
             Token::Subtract => Some(BinaryOperator::Subtract),
             Token::Multiply => Some(BinaryOperator::Multiply),
             Token::Divide => Some(BinaryOperator::Divide),
-            Token::Number(_) => None,
+            _ => None,
         }
     }
 }

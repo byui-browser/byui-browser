@@ -9,10 +9,22 @@ pub enum Token {
     Multiply,
     Divide,
     Let,
+    Const,
+    If,
+    Else,
+    Function,
+    Return,
+    True,
+    False,
+    Null,
     Assign,
     Semicolon,
-
     Unknown(char),
+    LeftParen,
+    RightParen,
+    EqualEqual,
+    LessThan,
+    GreaterThan,
 }
 
 // 2. A function that takes a full string and returns a LIST (Vector) of Tokens
@@ -65,25 +77,43 @@ pub fn tokenize(input: &str) -> Vec<Token> {
             }
 
             let identifier = &input[start..end];
-            tokens.push(if identifier == "let" {
-                Token::Let
-            } else {
-                Token::Identifier(identifier.to_owned())
-            });
+            let token = match identifier {
+                "let" => Token::Let,
+                "const" => Token::Const,
+                "if" => Token::If,
+                "else" => Token::Else,
+                "function" => Token::Function,
+                "return" => Token::Return,
+                "true" => Token::True,
+                "false" => Token::False,
+                "null" => Token::Null,
+                _ => Token::Identifier(identifier.to_owned()),
+            };
+            tokens.push(token);
             continue;
         }
 
         chars.next();
-        tokens.push(match ch {
+        let token = match ch {
             '+' => Token::Plus,
             '-' => Token::Subtract,
             '*' => Token::Multiply,
             '/' => Token::Divide,
+            '=' if chars.peek().is_some_and(|(_, next)| *next == '=') => {
+                chars.next();
+                Token::EqualEqual
+            }
             '=' => Token::Assign,
             ';' => Token::Semicolon,
-            other => Token::Unknown(other),
+            '(' => Token::LeftParen,
+            ')' => Token::RightParen,
+            '<' => Token::LessThan,
+            '>' => Token::GreaterThan,
             
-        });
+
+            other => Token::Unknown(other),
+        };
+        tokens.push(token);
     }
 
     tokens
