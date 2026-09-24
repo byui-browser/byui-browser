@@ -6,7 +6,25 @@
 //! Utility/Storage, and DevTools processes per the architecture process model.
 //! Teams own the crates; this crate only composes them.
 
+use std::sync::Arc;
+
+use js::Realm;
+use webapis::{ConsoleSink, register_print};
+
+struct StdoutConsole;
+
+impl ConsoleSink for StdoutConsole {
+    fn log(&self, message: &str) {
+        println!("{message}");
+    }
+}
+
 fn main() {
-    // TODO(browser): Wire up multi-process startup and the first vertical slice.
-    eprintln!("byui-browser: scaffolding only — engine not implemented yet");
+    let mut realm = Realm::new();
+    register_print(&mut realm, Arc::new(StdoutConsole))
+        .expect("registering built-in Web APIs should succeed");
+
+    realm
+        .evaluate_script("print()")
+        .expect("the built-in print function should be callable");
 }

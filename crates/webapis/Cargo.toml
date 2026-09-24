@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 common = { workspace = true }
+js = { workspace = true }
 
 [lints]
 workspace = true
