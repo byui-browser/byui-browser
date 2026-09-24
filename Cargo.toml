@@ -15,6 +15,7 @@ members = [
     "crates/chrome",
     "crates/devtools",
     "crates/browser",
+    "platforms/macos",
 ]
 default-members = ["crates/browser"]
 
