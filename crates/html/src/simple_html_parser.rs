@@ -1,30 +1,4 @@
-type ElementID = u32;
-
-use std::collections::HashMap;
-
-enum Element{
-    Document(Document),
-    HTMLElement(HTMLElement),
-    TextElement(TextElement),
-}
-
-struct HTMLElement{
-    name : String,
-    element_id : ElementID,
-    attributes : HashMap<String, String>,
-    child_ids : Vec<ElementID>,
-}
-
-struct TextElement{
-    text : String,
-    element_id : ElementID,
-}
-
-struct Document{
-    doc_type : String,
-    elements : HashMap<ElementID, Element>,
-    child_ids : Vec<ElementID>,
-}
+pub mod dom_nodes;
 
 fn parse_html(html : String) -> Document {
     let document_id = 0;
