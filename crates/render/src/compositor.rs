@@ -2,6 +2,7 @@
 
 use crate::{DisplayItem, Frame, fonts::glyph};
 
+/// A software compositor for a fixed device-pixel viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Compositor {
     width: u32,
@@ -9,12 +10,15 @@ pub struct Compositor {
 }
 
 impl Compositor {
+    /// Opaque white used to clear a new frame.
     pub const CLEAR_COLOR: [u8; 4] = [255, 255, 255, 255];
 
+    /// Creates a compositor with a device-pixel viewport.
     pub fn new(width: u32, height: u32) -> Self {
         Self { width, height }
     }
 
+    /// Rasterizes paint commands into a new RGBA8 frame.
     pub fn compose(&self, items: &[DisplayItem]) -> Frame {
         let mut frame = Frame {
             width: self.width,
@@ -71,6 +75,7 @@ impl Compositor {
         frame.pixels[offset..offset + 4].copy_from_slice(&rgba);
     }
 
+    /// Rasterizes a paint crate display list into a new frame.
     pub fn compose_paint(&self, list: &paint::DisplayList) -> Frame {
         let items = list
             .items

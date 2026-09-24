@@ -1,6 +1,5 @@
 //! First layout-team vertical slice: HTML -> layout -> paint -> pixels.
 
-use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 
@@ -55,7 +54,28 @@ fn parses_lays_out_paints_and_writes_a_simple_element_image() {
     write_ppm(&output_path, &frame);
     assert!(output_path.is_file());
 
-    let mut message = String::new();
-    let _ = write!(message, "wrote {}", output_path.display());
-    eprintln!("{message}");
+    eprintln!("wrote {}", output_path.display());
+}
+
+#[test]
+fn nested_element_text_is_painted_once() {
+    let document = parse_raw_html("<div><p>Hi</p></div>".to_owned());
+    let layout = layout_tree(
+        &StyledDom::from_html_document(&document),
+        Size {
+            width: 160.0,
+            height: 120.0,
+        },
+    );
+
+    let text_items = paint_document(&layout, &document)
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            paint::DisplayItem::Text { text, .. } => Some(text),
+            paint::DisplayItem::FillRect { .. } => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(text_items, vec!["Hi"]);
 }

@@ -2,6 +2,11 @@
 
 use crate::{LayoutBox, LayoutTree, Rect, Size, StyledDom};
 
+/// Builds a layout tree for a CSS-pixel viewport.
+///
+/// The first slice treats every element as a block and gives it a fixed
+/// 100 CSS-pixel height. Nesting and computed styles are not interpreted yet;
+/// every element is represented as a direct child of the root.
 pub fn layout_tree(styled_dom: &StyledDom, viewport: Size) -> LayoutTree {
     let block_height = 100.0;
     let children = styled_dom

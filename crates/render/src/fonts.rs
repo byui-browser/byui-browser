@@ -1,5 +1,9 @@
 //! Small built-in bitmap font for the software-rendered first slice.
 
+/// Returns the seven-row, five-column bitmap glyph for a supported character.
+///
+/// The first slice supports a small roughly 12-character font; unsupported
+/// characters are skipped by the compositor.
 pub fn glyph(character: char) -> Option<[u8; 7]> {
     let glyph = match character.to_ascii_uppercase() {
         'A' => [
