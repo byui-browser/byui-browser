@@ -8,6 +8,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod local_storage;
+
 use std::sync::Arc;
 
 use common::ids::NodeId;
