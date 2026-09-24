@@ -15,12 +15,27 @@ use std::fmt;
 // types, names, and module layout however your crate's public API needs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Origin {
-    pub scheme: String,
-    pub host: String,
-    pub port: u16,
+    scheme: String,
+    host: String,
+    port: u16,
 }
 
 impl Origin {
+    /// Returns the normalized scheme.
+    pub fn scheme(&self) -> &str {
+        &self.scheme
+    }
+
+    /// Returns the normalized host.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Returns the effective port.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     /// Creates an origin, using the scheme's default port when omitted.
     pub fn new(scheme: impl Into<String>, host: impl Into<String>, port: Option<u16>) -> Self {
         let scheme = scheme.into().to_ascii_lowercase();
@@ -81,7 +96,7 @@ impl StorageKey {
     }
 
     /// Returns the origin associated with this key.
-    pub fn origin(&self) -> &Origin {
+    pub fn get(&self) -> &Origin {
         &self.origin
     }
 }
@@ -219,7 +234,7 @@ mod tests {
         let origin = Origin::placeholder();
         let key = StorageKey::new(origin.clone());
 
-        assert_eq!(key.origin(), &origin);
+        assert_eq!(key.get(), &origin);
     }
 
     #[test]
@@ -227,7 +242,7 @@ mod tests {
         let origin = Origin::new("https", "byui.edu", None);
         let key = StorageKey::new(origin.clone());
 
-        assert_eq!(key.origin(), &origin);
+        assert_eq!(key.get(), &origin);
         assert_eq!(key, StorageKey::new(origin));
     }
 
