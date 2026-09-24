@@ -7,6 +7,9 @@
 
 #![forbid(unsafe_code)]
 
+/// Label for a newly opened tab before navigating to a page.
+pub const DEFAULT_TAB_TITLE: &str = "New Tab";
+
 /// Handle for an open tab.
 // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
 // types, names, and module layout however your crate's public API needs.
