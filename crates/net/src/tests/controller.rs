@@ -1,6 +1,12 @@
 //! Integration tests for the public networking client API.
 
-use crate::{CacheMode, Config, Request, RequestController, RequestError};
+use std::{
+    io::{Read, Write},
+    net::TcpListener,
+    thread,
+};
+
+use crate::{CacheMode, Config, Request, RequestController, RequestError, response};
 use reqwest::{
     Method, StatusCode,
     header::{HeaderMap, HeaderValue},
@@ -82,33 +88,38 @@ fn only_if_cached_reports_a_cache_miss_without_network_access() {
 
 #[test]
 fn can_fetch_resource_from_local_server() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("server should bind");
+    // Keep the test deterministic and independent of DNS, internet access, and
+    // external service availability.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
     let address = format!(
         "http://{}",
-        listener.local_addr().expect("address should exist")
+        listener
+            .local_addr()
+            .expect("test server address should be available")
     );
-    let server = std::thread::spawn(move || {
-        use std::io::{Read, Write};
-        let (mut stream, _) = listener.accept().expect("server should receive a request");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("test server should receive a request");
         let mut request = [0; 4096];
         let _ = stream
             .read(&mut request)
-            .expect("server should read request");
+            .expect("test server should read the request");
         stream
             .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nhello world!",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nlocal body",
             )
-            .expect("server should write response");
+            .expect("test server should write the response");
     });
 
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
     let client = RequestController::new(Config::default()).expect("controller should initialize");
 
     let response = runtime
-        .block_on(client.fetch(Request::get(address)))
+        .block_on(client.fetch(Request::get(&address)))
         .expect("request should succeed");
-    server.join().expect("server should exit");
+    server.join().expect("test server should exit");
 
     assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(response.body, b"hello world!");
+    assert_eq!(response.body, b"local body");
 }
