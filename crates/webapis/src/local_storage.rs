@@ -39,7 +39,7 @@ pub fn register_local_storage(realm: &mut Realm) -> JsResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_item, register_local_storage, set_item, LocalStorage};
+    use super::{LocalStorage, get_item, register_local_storage, set_item};
     use js::{Realm, Value};
 
     #[test]
