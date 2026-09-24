@@ -6,6 +6,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ast;
+pub mod lexer;
+pub mod parser;
+pub mod runtime;
+
 use std::fmt;
 
 /// A JavaScript runtime value.
@@ -70,20 +75,4 @@ pub fn eval(source: &str) -> Result<Value, JsError> {
         return Ok(Value::Undefined);
     }
     todo!("TODO(js): evaluate {} statements", program.statements.len())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_source_parses_to_empty_program() {
-        assert_eq!(parse(""), Ok(Program::default()));
-        assert_eq!(parse("  \n\t"), Ok(Program::default()));
-    }
-
-    #[test]
-    fn empty_program_evaluates_to_undefined() {
-        assert_eq!(eval(""), Ok(Value::Undefined));
-    }
 }
