@@ -2,12 +2,41 @@
 //!
 //! Run ignored tests with `cargo test -p js -- --ignored` to see the backlog.
 
-use js::{Value, eval, parse};
+use js::{Value, eval, lexer, parse, parser, runtime};
 
 #[test]
-#[ignore = "TODO(js): arithmetic not implemented"]
 fn evaluates_arithmetic() {
-    assert_eq!(eval("1 + 2"), Ok(Value::Number(3.0)));
+    let tokens = lexer::tokenize("42 + 10");
+    let ast = parser::parse(&tokens).expect("expression should parse");
+
+    assert_eq!(runtime::evaluate(&ast), 52.0);
+}
+
+#[test]
+fn evaluates_chained_addition() {
+    let tokens = lexer::tokenize("42 + 10 + 8");
+    let ast = parser::parse(&tokens).expect("expression should parse");
+
+    assert_eq!(runtime::evaluate(&ast), 60.0);
+}
+
+#[test]
+fn evaluates_other_arithmetic_operators() {
+    let tokens = lexer::tokenize("42 - 10 * 2 / 4");
+    let ast = parser::parse(&tokens).expect("expression should parse");
+
+    assert_eq!(runtime::evaluate(&ast), 37.0);
+}
+
+#[test]
+fn empty_source_parses_to_empty_program() {
+    assert_eq!(parse(""), Ok(js::Program::default()));
+    assert_eq!(parse("  \n\t"), Ok(js::Program::default()));
+}
+
+#[test]
+fn empty_program_evaluates_to_undefined() {
+    assert_eq!(eval(""), Ok(Value::Undefined));
 }
 
 #[test]

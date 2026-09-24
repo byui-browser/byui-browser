@@ -1,6 +1,4 @@
-// Tell main.rs that the lexer file exists
-mod lexer;
-mod parser;
+use js::{lexer, parser, runtime};
 
 fn main() {
     println!("Running our JS Engine!");
@@ -16,7 +14,7 @@ fn main() {
             println!("Generated AST Tree: {:#?}", ast);
 
             // Step 3: Evaluation (AST -> Final Number Result)
-            let result = parser::eval(&ast);
+            let result = runtime::evaluate(&ast);
             println!("Final Evaluated Result: {}", result);
         }
         Err(e) => println!("Parser Error: {}", e),
