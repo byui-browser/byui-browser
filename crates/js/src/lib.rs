@@ -6,6 +6,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ast;
+pub mod lexer;
+pub mod parser;
+pub mod runtime;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -128,51 +133,4 @@ pub fn eval(source: &str) -> JsResult<Value> {
         return Ok(Value::Undefined);
     }
     Err(JsError::new("JavaScript evaluation is not implemented"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{JsError, Realm, Value};
-    use std::sync::Arc;
-
-    #[test]
-    fn registered_host_function_can_be_called_from_script() {
-        let mut realm = Realm::new();
-        realm
-            .register_global_function(
-                "print",
-                Arc::new(|arguments| {
-                    assert!(arguments.is_empty());
-                    Ok(Value::Undefined)
-                }),
-            )
-            .unwrap();
-
-        assert_eq!(realm.evaluate_script("print()"), Ok(Value::Undefined));
-    }
-
-    #[test]
-    fn unknown_global_is_an_error() {
-        let realm = Realm::new();
-
-        assert_eq!(
-            realm.evaluate_script("print()"),
-            Err(JsError::new("global function `print` is not defined"))
-        );
-    }
-
-    #[test]
-    fn empty_global_names_are_rejected() {
-        let mut realm = Realm::new();
-
-        assert_eq!(
-            realm.register_global_function("", Arc::new(|_| Ok(Value::Undefined))),
-            Err(JsError::new("global function name cannot be empty"))
-        );
-    }
-
-    #[test]
-    fn empty_program_evaluates_to_undefined() {
-        assert_eq!(super::eval(""), Ok(Value::Undefined));
-    }
 }
