@@ -2003,6 +2003,8 @@ version = "0.1.0"
 dependencies = [
  "common",
  "js",
+ "net",
+ "tokio",
 ]
 
 [[package]]
