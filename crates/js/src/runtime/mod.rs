@@ -1,4 +1,5 @@
-use crate::ast::{BinaryOperator, Expr};
+use crate::Value;
+use crate::ast::{BinaryOperator, Expr, LogicalOperator, UnaryOperator};
 
 /// Evaluates an expression from the AST and returns its numeric result.
 /// Evaluates an expression from the AST and returns its value.
@@ -48,13 +49,39 @@ pub fn evaluate(expr: &Expr) -> Value {
         } => {
             let left = evaluate(left);
             match operator {
-                LogicalOperator::And if !is_truthy(&left) => left,
+                LogicalOperator::And if is_truthy(&left) => left,
                 LogicalOperator::Or if is_truthy(&left) => left,
                 _ => evaluate(right),
             }
         }
+
         Expr::Identifier(_) | Expr::Assign { .. } | Expr::Call { .. } => {
             todo!("variables and function calls need a Realm")
         }
+    }
+}
+fn to_number(value: &Value) -> f64 {
+    match value {
+        Value::Number(number) => *number,
+        Value::Boolean(true) => 1.0,
+        Value::Boolean(false) | Value::Null => 0.0,
+        Value::Undefined => f64::NAN,
+        Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                0.0
+            } else {
+                text.parse().unwrap_or(f64::NAN)
+            }
+        }
+    }
+}
+
+fn is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Undefined | Value::Null => false,
+        Value::Boolean(flag) => *flag,
+        Value::Number(number) => *number != 0.0 && !number.is_nan(),
+        Value::String(text) => !text.is_empty(),
     }
 }
