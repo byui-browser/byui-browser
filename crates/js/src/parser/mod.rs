@@ -80,8 +80,17 @@ impl<'tokens> Parser<'tokens> {
 impl BinaryOperator {
     fn precedence(self) -> u8 {
         match self {
+            Self::LogicalOperator => unreachable!(),
             Self::Add | Self::Subtract => 1,
-            Self::Multiply | Self::Divide => 2,
+            Self::Multiply | Self::Divide | Self::Remainder => 2,
+            Self::Less
+            | Self::LessEqual
+            | Self::Greater
+            | Self::GreaterEqual
+            | Self::Equal
+            | Self::NotEqual
+            | Self::StrictEqual
+            | Self::StrictNotEqual => 3,
         }
     }
 }
