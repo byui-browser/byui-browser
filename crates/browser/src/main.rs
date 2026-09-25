@@ -23,8 +23,10 @@ fn main() {
     let mut realm = Realm::new();
     register_print(&mut realm, Arc::new(StdoutConsole))
         .expect("registering built-in Web APIs should succeed");
-    let controller =
-        Arc::new(net::RequestController::new().expect("network client should initialize"));
+    let controller = Arc::new(
+        net::RequestController::new(net::Config::default())
+            .expect("network client should initialize"),
+    );
     register_fetch(&mut realm, controller).expect("registering the fetch Web API should succeed");
 
     realm

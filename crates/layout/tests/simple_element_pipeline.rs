@@ -8,12 +8,16 @@ use layout::{Size, StyledDom, layout_tree};
 use paint::paint_document;
 use render::Compositor;
 
-fn write_ppm(path: &std::path::Path, frame: &render::Frame) {
-    let mut ppm = format!("P6\n{} {}\n255\n", frame.width, frame.height).into_bytes();
-    for rgba in frame.pixels.chunks_exact(4) {
-        ppm.extend_from_slice(&rgba[..3]);
-    }
-    fs::write(path, ppm).expect("write rendered image");
+fn write_png(path: &std::path::Path, frame: &render::Frame) {
+    let file = fs::File::create(path).expect("create rendered image");
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), frame.width, frame.height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .expect("write png header")
+        .write_image_data(&frame.pixels)
+        .expect("write png pixels");
 }
 
 #[test]
@@ -50,8 +54,8 @@ fn parses_lays_out_paints_and_writes_a_simple_element_image() {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"));
     let output_dir = output_dir.join("layout-test-output");
     fs::create_dir_all(&output_dir).expect("create image output directory");
-    let output_path = output_dir.join("simple-element.ppm");
-    write_ppm(&output_path, &frame);
+    let output_path = output_dir.join("simple-element.png");
+    write_png(&output_path, &frame);
     assert!(output_path.is_file());
 
     eprintln!("wrote {}", output_path.display());
