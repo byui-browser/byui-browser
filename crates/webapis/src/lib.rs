@@ -54,7 +54,7 @@ pub fn fetch(controller: &RequestController, arguments: &[Value]) -> JsResult<Va
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|error| JsError::new(format!("unable to start network runtime: {error}")))?;
     let response = runtime
-        .block_on(controller.execute(Request::get(url)))
+        .block_on(controller.fetch(Request::get(url)))
         .map_err(|error| JsError::new(error.to_string()))?;
 
     let body = String::from_utf8(response.body)
@@ -158,7 +158,7 @@ impl TimerQueue {
 mod tests {
     use super::{ConsoleSink, fetch, print, register_fetch, register_print};
     use js::{Realm, Value};
-    use net::RequestController;
+    use net::{Config, RequestController};
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn fetch_requires_one_url_string() {
-        let controller = RequestController::new().unwrap();
+        let controller = RequestController::new(Config::default()).unwrap();
 
         assert_eq!(
             fetch(&controller, &[]).unwrap_err().to_string(),
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn registration_exposes_fetch_to_the_realm() {
-        let controller = std::sync::Arc::new(RequestController::new().unwrap());
+        let controller = std::sync::Arc::new(RequestController::new(Config::default()).unwrap());
         let mut realm = Realm::new();
         register_fetch(&mut realm, controller).unwrap();
 

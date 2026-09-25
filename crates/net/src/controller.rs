@@ -1,101 +1,113 @@
-//! Request execution, redirect, connection-pool, and cache orchestration.
+//! Public request orchestration boundary.
 
-use reqwest::{Client, Method};
+use std::sync::Arc;
 
 use crate::{
     cache::ResponseCache,
     config::Config,
+    cookies::CookieStore,
+    cors::CorsChecker,
     error::RequestError,
+    policy::RequestPolicy,
     request::{CacheMode, Request},
     response::Response,
+    scheduler::{RequestPriority, RequestScheduler},
+    transport::reqwest_transport,
 };
 
-/// Executes browser HTTP requests using one reusable client and shared cache.
+/// Shared, stateful entry point for browser network requests.
+///
+/// A controller owns the process-local cache and scheduler while sharing the
+/// connection pool held by its transport. Cloning a controller is therefore
+/// inexpensive and preserves cache and connection reuse.
 #[derive(Clone)]
 pub struct RequestController {
-    client: Client,
+    inner: Arc<ControllerInner>,
+}
+
+struct ControllerInner {
     cache: ResponseCache,
+    cookies: CookieStore,
+    cors: CorsChecker,
+    policy: RequestPolicy,
+    scheduler: RequestScheduler,
 }
 
 impl std::fmt::Debug for RequestController {
-    /// Formats the controller without exposing its client or cache internals.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RequestController").finish_non_exhaustive()
     }
 }
 
 impl RequestController {
-    /// Creates a controller using [`Config::default`].
-    pub fn new() -> Result<Self, reqwest::Error> {
-        Self::with_config(Config::default())
-    }
-
-    /// Creates a controller with explicit redirect and connection-pool settings.
-    pub fn with_config(config: Config) -> Result<Self, reqwest::Error> {
-        let mut builder = Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(config.max_redirects))
-            .pool_idle_timeout(config.pool_idle_timeout)
-            .pool_max_idle_per_host(config.pool_max_idle_per_host);
-        if let Some(user_agent) = config.user_agent {
-            builder = builder.user_agent(user_agent);
-        }
-
+    /// Creates a controller with the supplied transport, cache, and scheduling
+    /// configuration.
+    ///
+    /// The controller does not perform network I/O during construction. A
+    /// transport-construction error is returned if the underlying HTTP client
+    /// cannot be initialized.
+    pub fn new(config: Config) -> Result<Self, reqwest::Error> {
+        let transport = reqwest_transport(config.clone())?;
         Ok(Self {
-            client: builder.build()?,
-            cache: ResponseCache::default(),
+            inner: Arc::new(ControllerInner {
+                cache: ResponseCache::default(),
+                cookies: CookieStore,
+                cors: CorsChecker,
+                policy: RequestPolicy,
+                scheduler: RequestScheduler::new(transport, config.max_in_flight),
+            }),
         })
     }
 
-    /// Executes a request, following configured redirects and reusing pooled connections.
-    pub async fn execute(&self, request: Request) -> Result<Response, RequestError> {
-        // Parse URL before consulting the cache so invalid input fails consistently.
-        let url = reqwest::Url::parse(&request.url)
-            .map_err(|_| RequestError::InvalidUrl(request.url.clone()))?;
-        let cacheable = matches!(request.method, Method::GET | Method::HEAD);
-        let can_read_cache = cacheable
+    /// Validates and executes one browser request.
+    ///
+    /// Cache hits return before a scheduler permit is acquired. Network-bound
+    /// requests pass through policy validation, cookie attachment, scheduling,
+    /// transport, response validation, cookie processing, and cache insertion.
+    pub async fn fetch(&self, request: Request) -> Result<Response, RequestError> {
+        self.inner.policy.validate_request(&request)?;
+
+        let cacheable = request.is_cacheable_method();
+        if cacheable
             && matches!(
                 request.cache_mode,
                 CacheMode::Default | CacheMode::OnlyIfCached
-            );
-
-        if can_read_cache {
-            if let Some(cached) = self.cache.get(&request) {
-                return Ok(cached);
+            )
+        {
+            if let Some(response) = self.inner.cache.get(&request) {
+                return Ok(response);
             }
             if request.cache_mode == CacheMode::OnlyIfCached {
                 return Err(RequestError::CacheMiss);
             }
         }
 
-        // Keep `request` available for cache insertion after the network call.
-        // The reqwest builder owns the values passed into it, so clone the
-        // request components rather than partially moving `request`.
-        let mut builder = self
-            .client
-            .request(request.method.clone(), url)
-            .headers(request.headers.clone());
-        if let Some(body) = request.body.as_ref() {
-            builder = builder.body(body.clone());
-        }
-        // reqwest follows redirects and manages connection reuse through this client.
-        let response = builder.send().await?;
-        let result = Response {
-            status: response.status(),
-            headers: response.headers().clone(),
-            url: response.url().to_string(),
-            body: response.bytes().await?.to_vec(),
-            from_cache: false,
-        };
+        // Cookie and policy modules operate before transport sees the request;
+        // this keeps browser behavior out of the low-level HTTP implementation.
+        let mut request = request;
+        self.inner.cookies.attach(&mut request)?;
+        // The scheduler owns concurrency admission. Transport remains focused
+        // on HTTP I/O and connection pooling.
+        let response = self
+            .inner
+            .scheduler
+            .submit(request.clone(), RequestPriority::Normal)
+            .await?;
+
+        self.inner.cors.validate(&request, &response)?;
+        self.inner.policy.validate_response(&request, &response)?;
+        self.inner
+            .cookies
+            .process_response(&request, &response.headers)?;
 
         if cacheable && request.cache_mode != CacheMode::NoStore {
-            // Only responses with an explicit positive freshness lifetime are cached.
-            self.cache.insert(&request, &result);
+            self.inner.cache.insert(&request, &response);
         }
-        Ok(result)
+        Ok(response)
     }
 
-    /// Removes all entries from this controller's in-memory cache.
+    /// Removes all currently stored responses from this controller's cache.
     pub fn clear_cache(&self) {
-        self.cache.clear();
+        self.inner.cache.clear();
     }
 }

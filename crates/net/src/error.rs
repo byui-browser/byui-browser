@@ -1,4 +1,4 @@
-//! Errors exposed by the networking controller.
+//! Errors exposed by the networking client.
 
 /// Errors that can occur while preparing, executing, or serving a request.
 #[derive(Debug)]
@@ -9,15 +9,21 @@ pub enum RequestError {
     Transport(reqwest::Error),
     /// `OnlyIfCached` was requested but no fresh cached response exists.
     CacheMiss,
+    /// The URL uses a scheme unsupported by the HTTP transport.
+    UnsupportedScheme(String),
+    /// The scheduler was shut down before the request could run.
+    SchedulerClosed,
 }
 
 impl std::fmt::Display for RequestError {
     /// Formats the error for logs and user-facing diagnostics.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidUrl(url) => write!(f, "invalid request URL: {url}"),
-            Self::Transport(error) => write!(f, "request failed: {error}"),
-            Self::CacheMiss => f.write_str("request is not available in the HTTP cache"),
+            Self::InvalidUrl(url) => write!(f, "Invalid request URL: {url}"),
+            Self::Transport(error) => write!(f, "Request failed: {error}"),
+            Self::CacheMiss => f.write_str("Request is not available in the HTTP cache"),
+            Self::UnsupportedScheme(scheme) => write!(f, "Unsupported URL scheme: {scheme}"),
+            Self::SchedulerClosed => f.write_str("Request scheduler is closed"),
         }
     }
 }

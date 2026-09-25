@@ -1,8 +1,8 @@
-//! Response type returned by the networking controller.
+//! Response type returned by the networking client.
 
 use reqwest::{StatusCode, header::HeaderMap};
 
-/// A fully buffered HTTP response returned by the networking controller.
+/// A fully buffered HTTP response returned by the networking client.
 #[derive(Clone, Debug)]
 pub struct Response {
     /// HTTP status code returned by the server.
