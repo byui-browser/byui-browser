@@ -9,7 +9,7 @@ fn evaluates_arithmetic() {
     let tokens = lexer::tokenize("42 + 10");
     let ast = parser::parse(&tokens).expect("expression should parse");
 
-    assert_eq!(runtime::evaluate(&ast), 52.0);
+    assert_eq!(runtime::evaluate(&ast), Value::Number(52.0));
 }
 
 #[test]
@@ -17,7 +17,7 @@ fn evaluates_chained_addition() {
     let tokens = lexer::tokenize("42 + 10 + 8");
     let ast = parser::parse(&tokens).expect("expression should parse");
 
-    assert_eq!(runtime::evaluate(&ast), 60.0);
+    assert_eq!(runtime::evaluate(&ast), Value::Number(60.0));
 }
 
 #[test]
@@ -25,7 +25,7 @@ fn evaluates_other_arithmetic_operators() {
     let tokens = lexer::tokenize("42 - 10 * 2 / 4");
     let ast = parser::parse(&tokens).expect("expression should parse");
 
-    assert_eq!(runtime::evaluate(&ast), 37.0);
+    assert_eq!(runtime::evaluate(&ast), Value::Number(37.0));
 }
 
 #[test]
