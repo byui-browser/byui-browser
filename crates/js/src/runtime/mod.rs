@@ -1,6 +1,9 @@
 use crate::ast::{BinaryOperator, Expr};
 
-/// Evaluates an expression from the AST and returns its numeric result.
+/// Evaluates a numeric expression from the AST.
+///
+/// Non-numeric AST nodes are reserved for the full evaluator and are rejected
+/// explicitly until that evaluator is implemented.
 pub fn evaluate(expr: &Expr) -> f64 {
     match expr {
         Expr::Number(number) => *number,
@@ -8,11 +11,33 @@ pub fn evaluate(expr: &Expr) -> f64 {
             left,
             operator,
             right,
-        } => match operator {
-            BinaryOperator::Add => evaluate(left) + evaluate(right),
-            BinaryOperator::Subtract => evaluate(left) - evaluate(right),
-            BinaryOperator::Multiply => evaluate(left) * evaluate(right),
-            BinaryOperator::Divide => evaluate(left) / evaluate(right),
-        },
+        } => {
+            let left = evaluate(left);
+            let right = evaluate(right);
+            match operator {
+                BinaryOperator::Add => left + right,
+                BinaryOperator::Subtract => left - right,
+                BinaryOperator::Multiply => left * right,
+                BinaryOperator::Divide => left / right,
+                BinaryOperator::Remainder => left % right,
+                BinaryOperator::Less => (left < right) as u8 as f64,
+                BinaryOperator::LessEqual => (left <= right) as u8 as f64,
+                BinaryOperator::Greater => (left > right) as u8 as f64,
+                BinaryOperator::GreaterEqual => (left >= right) as u8 as f64,
+                BinaryOperator::Equal | BinaryOperator::StrictEqual => (left == right) as u8 as f64,
+                BinaryOperator::NotEqual | BinaryOperator::StrictNotEqual => {
+                    (left != right) as u8 as f64
+                }
+            }
+        }
+        Expr::Unary { .. }
+        | Expr::String(..)
+        | Expr::Boolean(..)
+        | Expr::Null
+        | Expr::Undefined
+        | Expr::Identifier(..)
+        | Expr::Logical { .. }
+        | Expr::Assign { .. }
+        | Expr::Call { .. } => panic!("expression is not supported by the numeric evaluator"),
     }
 }
