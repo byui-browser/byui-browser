@@ -1,0 +1,176 @@
+name: PR team notify
+
+# Routes PR activity to the owning team's Discord channel, based on the paths
+# the PR touches. Path -> team mapping mirrors .github/CODEOWNERS; edit both.
+#
+# Each team's Discord webhook URL is a repository secret named DISCORD_<TEAM>.
+# A team whose secret is unset is skipped silently, so channels can be added
+# one at a time without touching this file.
+#
+# Shared paths (crates/common, docs, .github, Cargo.*) map to no team on
+# purpose. This is additive: the org-level webhook already reports every
+# PR to the scrum-of-scrums channel.
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+  # workflow_run runs from the copy of this file on the default branch, so
+  # changes to the CI-failure path only take effect once merged.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to send a test notification for
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  notify:
+    name: notify owning teams
+    runs-on: ubuntu-latest
+    # Only the four events worth a ping: a PR becoming visible, a review with a
+    # verdict (approved / changes_requested, never a bare comment), and CI
+    # going red. Drafts are announced when marked ready, not when opened.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'pull_request'
+          && (github.event.action == 'ready_for_review'
+              || github.event.pull_request.draft == false))
+      || (github.event_name == 'pull_request_review'
+          && contains(fromJSON('["approved", "changes_requested"]'), github.event.review.state))
+      || (github.event_name == 'workflow_run'
+          && github.event.workflow_run.conclusion == 'failure'
+          && github.event.workflow_run.event == 'pull_request')
+    steps:
+      # Each event hides the PR number somewhere different; resolve it once so
+      # every step below can assume $PR.
+      - name: Resolve PR number
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_EVENT: ${{ github.event.pull_request.number }}
+          PR_DISPATCH: ${{ inputs.pr }}
+          RUN_PRS: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          case "$EVENT" in
+            pull_request|pull_request_review) num="$PR_EVENT" ;;
+            workflow_dispatch)                num="$PR_DISPATCH" ;;
+            workflow_run)
+              # Populated for same-repo PRs; fork runs need a lookup by SHA.
+              num=$(jq -r '.[0].number // empty' <<<"$RUN_PRS")
+              if [ -z "$num" ]; then
+                num=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+                        --search "$HEAD_SHA" --json number --jq '.[0].number // empty')
+              fi
+              ;;
+          esac
+
+          if [ -z "$num" ]; then
+            echo "No PR associated with this event; nothing to notify."
+          fi
+          echo "number=$num" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve owning teams from changed paths
+        id: teams
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+        run: |
+          # The files endpoint returns names only, so a huge PR costs pages of
+          # JSON rather than megabytes of diff. Mapping and de-duplication both
+          # happen here, so the output is at most one line per team.
+          #
+          # Paths owned by every team (crates/common, docs, .github, Cargo.*)
+          # deliberately map to nothing: the org-level webhook already reports
+          # those to scrum-of-scrums, and there is no DISCORD_SCRUM channel.
+          list=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '
+            [ .[].filename
+              | if   startswith("crates/html/")     then "HTML"
+                elif startswith("crates/css/")      then "CSS"
+                elif startswith("crates/layout/")
+                  or startswith("crates/paint/")
+                  or startswith("crates/render/")   then "LAYOUT"
+                elif startswith("crates/js/")       then "JS"
+                elif startswith("crates/webapis/")  then "WEBAPIS"
+                elif startswith("crates/net/")      then "NET"
+                elif startswith("crates/security/")
+                  or startswith("crates/storage/")  then "SECURITY"
+                elif startswith("crates/chrome/")
+                  or startswith("crates/browser/")
+                  or startswith("platforms/")       then "UX"
+                elif startswith("crates/devtools/") then "DEVTOOLS"
+                else empty end
+            ] | unique | .[]' | tr '\n' ' ')
+
+          if [ -z "$list" ]; then
+            echo "No owning team matched; nothing to notify."
+          else
+            echo "Owning teams: $list"
+          fi
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+
+      - name: Post to each team channel
+        if: steps.teams.outputs.list != ''
+        env:
+          # Secret names are computed at runtime, so the whole context is
+          # looked up by key. Values stay masked in the log.
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          TEAMS: ${{ steps.teams.outputs.list }}
+          EVENT: ${{ github.event_name }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+          REVIEWER: ${{ github.event.review.user.login }}
+          REVIEW_URL: ${{ github.event.review.html_url }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          meta=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json title,url,author)
+          title=$(jq -r .title <<<"$meta")
+          pr_url=$(jq -r .url <<<"$meta")
+          author=$(jq -r .author.login <<<"$meta")
+
+          # Discord embed colors are decimal, not hex.
+          case "$EVENT:$REVIEW_STATE" in
+            pull_request:*)
+              headline="New PR by $author"; color=3447003;  link="$pr_url" ;;
+            pull_request_review:approved)
+              headline="Approved by $REVIEWER"; color=3066993; link="$REVIEW_URL" ;;
+            pull_request_review:changes_requested)
+              headline="Changes requested by $REVIEWER"; color=15105570; link="$REVIEW_URL" ;;
+            workflow_run:*)
+              headline="CI failed"; color=15158332; link="$RUN_URL" ;;
+            *)
+              headline="PR update"; color=10027008; link="$pr_url" ;;
+          esac
+          echo "Sending: $headline"
+
+          for t in $TEAMS; do
+            hook=$(jq -r --arg k "DISCORD_$t" '.[$k] // empty' <<<"$ALL_SECRETS")
+            if [ -z "$hook" ]; then
+              echo "DISCORD_$t is not set; skipping."
+              continue
+            fi
+
+            jq -n --arg h "$headline" --arg t "$title" --arg l "$link" \
+                  --arg p "$pr_url" --arg n "$PR" --argjson c "$color" \
+              '{embeds: [{
+                  title: ("PR #" + $n + ": " + $t),
+                  description: $h,
+                  url: $l,
+                  color: $c,
+                  fields: [{name: "Pull request", value: $p}]
+               }]}' \
+              | curl -sS --fail-with-body -X POST \
+                     -H 'Content-Type: application/json' -d @- "$hook" \
+              && echo "Notified $t."
+          done
