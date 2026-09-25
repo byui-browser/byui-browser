@@ -1,18 +1,87 @@
-use crate::ast::{BinaryOperator, Expr};
+use crate::Value;
+use crate::ast::{BinaryOperator, Expr, LogicalOperator, UnaryOperator};
 
 /// Evaluates an expression from the AST and returns its numeric result.
-pub fn evaluate(expr: &Expr) -> f64 {
+/// Evaluates an expression from the AST and returns its value.
+pub fn evaluate(expr: &Expr) -> Value {
     match expr {
-        Expr::Number(number) => *number,
+        Expr::Number(number) => Value::Number(*number),
+        Expr::String(text) => Value::String(text.clone()),
+        Expr::Boolean(flag) => Value::Boolean(*flag),
+        Expr::Null => Value::Null,
+        Expr::Undefined => Value::Undefined,
+        Expr::Unary { operator, operand } => {
+            let value = evaluate(operand);
+            match operator {
+                UnaryOperator::Negate => Value::Number(-to_number(&value)),
+                UnaryOperator::Not => Value::Boolean(!is_truthy(&value)),
+            }
+        }
         Expr::Binary {
             left,
             operator,
             right,
-        } => match operator {
-            BinaryOperator::Add => evaluate(left) + evaluate(right),
-            BinaryOperator::Subtract => evaluate(left) - evaluate(right),
-            BinaryOperator::Multiply => evaluate(left) * evaluate(right),
-            BinaryOperator::Divide => evaluate(left) / evaluate(right),
-        },
+        } => {
+            let left = to_number(&evaluate(left));
+            let right = to_number(&evaluate(right));
+            match operator {
+                BinaryOperator::Add => Value::Number(left + right),
+                BinaryOperator::Subtract => Value::Number(left - right),
+                BinaryOperator::Multiply => Value::Number(left * right),
+                BinaryOperator::Divide => Value::Number(left / right),
+                BinaryOperator::Remainder => Value::Number(left % right),
+                BinaryOperator::Less => Value::Boolean(left < right),
+                BinaryOperator::LessEqual => Value::Boolean(left <= right),
+                BinaryOperator::Greater => Value::Boolean(left > right),
+                BinaryOperator::GreaterEqual => Value::Boolean(left >= right),
+                BinaryOperator::Equal | BinaryOperator::StrictEqual => {
+                    Value::Boolean(left == right)
+                }
+                BinaryOperator::NotEqual | BinaryOperator::StrictNotEqual => {
+                    Value::Boolean(left != right)
+                }
+            }
+        }
+        Expr::Logical {
+            left,
+            operator,
+            right,
+        } => {
+            let left = evaluate(left);
+            match operator {
+                LogicalOperator::And if is_truthy(&left) => left,
+                LogicalOperator::Or if is_truthy(&left) => left,
+                _ => evaluate(right),
+            }
+        }
+
+        Expr::Identifier(_) | Expr::Assign { .. } | Expr::Call { .. } => {
+            todo!("variables and function calls need a Realm")
+        }
+    }
+}
+fn to_number(value: &Value) -> f64 {
+    match value {
+        Value::Number(number) => *number,
+        Value::Boolean(true) => 1.0,
+        Value::Boolean(false) | Value::Null => 0.0,
+        Value::Undefined => f64::NAN,
+        Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                0.0
+            } else {
+                text.parse().unwrap_or(f64::NAN)
+            }
+        }
+    }
+}
+
+fn is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Undefined | Value::Null => false,
+        Value::Boolean(flag) => *flag,
+        Value::Number(number) => *number != 0.0 && !number.is_nan(),
+        Value::String(text) => !text.is_empty(),
     }
 }
