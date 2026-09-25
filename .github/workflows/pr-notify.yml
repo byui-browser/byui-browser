@@ -3,9 +3,10 @@ name: PR team notify
 # Routes PR activity to the owning team's Discord channel, based on the paths
 # the PR touches. Path -> team mapping mirrors .github/CODEOWNERS; edit both.
 #
-# Each team's Discord webhook URL is a repository secret named DISCORD_<TEAM>.
-# A team whose secret is unset is skipped silently, so channels can be added
-# one at a time without touching this file.
+# Each team's Discord webhook URL is a repository secret; the mapping step
+# below resolves changed paths straight to those secret names. A team whose
+# secret is unset is skipped silently, so channels can be added one at a
+# time without touching this file.
 #
 # Shared paths (crates/common, docs, .github, Cargo.*) map to no team on
 # purpose. This is additive: the org-level webhook already reports every
@@ -88,34 +89,34 @@ jobs:
         run: |
           # The files endpoint returns names only, so a huge PR costs pages of
           # JSON rather than megabytes of diff. Mapping and de-duplication both
-          # happen here, so the output is at most one line per team.
+          # happen here, so the output is at most one secret name per team.
           #
           # Paths owned by every team (crates/common, docs, .github, Cargo.*)
           # deliberately map to nothing: the org-level webhook already reports
-          # those to scrum-of-scrums, and there is no DISCORD_SCRUM channel.
+          # those to scrum-of-scrums, and there is no scrum-of-scrums secret.
           list=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '
             [ .[].filename
-              | if   startswith("crates/html/")     then "HTML"
-                elif startswith("crates/css/")      then "CSS"
+              | if   startswith("crates/html/")     then "HTML_DISC_PR"
+                elif startswith("crates/css/")      then "CSS_DISC_PR"
                 elif startswith("crates/layout/")
                   or startswith("crates/paint/")
-                  or startswith("crates/render/")   then "LAYOUT"
-                elif startswith("crates/js/")       then "JS"
-                elif startswith("crates/webapis/")  then "WEBAPIS"
-                elif startswith("crates/net/")      then "NET"
+                  or startswith("crates/render/")   then "LAY_REN_DISC_PR"
+                elif startswith("crates/js/")       then "JS_ENG_DISC_PR"
+                elif startswith("crates/webapis/")  then "JS_API_DISC_PR"
+                elif startswith("crates/net/")      then "NETWORK_DISC_PR"
                 elif startswith("crates/security/")
-                  or startswith("crates/storage/")  then "SECURITY"
+                  or startswith("crates/storage/")  then "SEC_STOR_DISC_PR"
                 elif startswith("crates/chrome/")
                   or startswith("crates/browser/")
-                  or startswith("platforms/")       then "UX"
-                elif startswith("crates/devtools/") then "DEVTOOLS"
+                  or startswith("platforms/")       then "BROWS_UX_DISC_PR"
+                elif startswith("crates/devtools/") then "DEV_TOOLS_DISC_PR"
                 else empty end
             ] | unique | .[]' | tr '\n' ' ')
 
           if [ -z "$list" ]; then
             echo "No owning team matched; nothing to notify."
           else
-            echo "Owning teams: $list"
+            echo "Owning team channels: $list"
           fi
           echo "list=$list" >> "$GITHUB_OUTPUT"
 
@@ -127,7 +128,7 @@ jobs:
           ALL_SECRETS: ${{ toJSON(secrets) }}
           GH_TOKEN: ${{ github.token }}
           PR: ${{ steps.pr.outputs.number }}
-          TEAMS: ${{ steps.teams.outputs.list }}
+          SECRET_NAMES: ${{ steps.teams.outputs.list }}
           EVENT: ${{ github.event_name }}
           REVIEW_STATE: ${{ github.event.review.state }}
           REVIEWER: ${{ github.event.review.user.login }}
@@ -154,10 +155,10 @@ jobs:
           esac
           echo "Sending: $headline"
 
-          for t in $TEAMS; do
-            hook=$(jq -r --arg k "DISCORD_$t" '.[$k] // empty' <<<"$ALL_SECRETS")
+          for name in $SECRET_NAMES; do
+            hook=$(jq -r --arg k "$name" '.[$k] // empty' <<<"$ALL_SECRETS")
             if [ -z "$hook" ]; then
-              echo "DISCORD_$t is not set; skipping."
+              echo "$name is not set; skipping."
               continue
             fi
 
@@ -172,5 +173,5 @@ jobs:
                }]}' \
               | curl -sS --fail-with-body -X POST \
                      -H 'Content-Type: application/json' -d @- "$hook" \
-              && echo "Notified $t."
+              && echo "Notified $name."
           done
