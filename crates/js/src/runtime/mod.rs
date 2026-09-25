@@ -1,43 +1,60 @@
 use crate::ast::{BinaryOperator, Expr};
 
-/// Evaluates a numeric expression from the AST.
-///
-/// Non-numeric AST nodes are reserved for the full evaluator and are rejected
-/// explicitly until that evaluator is implemented.
-pub fn evaluate(expr: &Expr) -> f64 {
+/// Evaluates an expression from the AST and returns its numeric result.
+/// Evaluates an expression from the AST and returns its value.
+pub fn evaluate(expr: &Expr) -> Value {
     match expr {
-        Expr::Number(number) => *number,
+        Expr::Number(number) => Value::Number(*number),
+        Expr::String(text) => Value::String(text.clone()),
+        Expr::Boolean(flag) => Value::Boolean(*flag),
+        Expr::Null => Value::Null,
+        Expr::Undefined => Value::Undefined,
+        Expr::Unary { operator, operand } => {
+            let value = evaluate(operand);
+            match operator {
+                UnaryOperator::Negate => Value::Number(-to_number(&value)),
+                UnaryOperator::Not => Value::Boolean(!is_truthy(&value)),
+            }
+        }
         Expr::Binary {
             left,
             operator,
             right,
         } => {
-            let left = evaluate(left);
-            let right = evaluate(right);
+            let left = to_number(&evaluate(left));
+            let right = to_number(&evaluate(right));
             match operator {
-                BinaryOperator::Add => left + right,
-                BinaryOperator::Subtract => left - right,
-                BinaryOperator::Multiply => left * right,
-                BinaryOperator::Divide => left / right,
-                BinaryOperator::Remainder => left % right,
-                BinaryOperator::Less => (left < right) as u8 as f64,
-                BinaryOperator::LessEqual => (left <= right) as u8 as f64,
-                BinaryOperator::Greater => (left > right) as u8 as f64,
-                BinaryOperator::GreaterEqual => (left >= right) as u8 as f64,
-                BinaryOperator::Equal | BinaryOperator::StrictEqual => (left == right) as u8 as f64,
+                BinaryOperator::Add => Value::Number(left + right),
+                BinaryOperator::Subtract => Value::Number(left - right),
+                BinaryOperator::Multiply => Value::Number(left * right),
+                BinaryOperator::Divide => Value::Number(left / right),
+                BinaryOperator::Remainder => Value::Number(left % right),
+                BinaryOperator::Less => Value::Boolean(left < right),
+                BinaryOperator::LessEqual => Value::Boolean(left <= right),
+                BinaryOperator::Greater => Value::Boolean(left > right),
+                BinaryOperator::GreaterEqual => Value::Boolean(left >= right),
+                BinaryOperator::Equal | BinaryOperator::StrictEqual => {
+                    Value::Boolean(left == right)
+                }
                 BinaryOperator::NotEqual | BinaryOperator::StrictNotEqual => {
-                    (left != right) as u8 as f64
+                    Value::Boolean(left != right)
                 }
             }
         }
-        Expr::Unary { .. }
-        | Expr::String(..)
-        | Expr::Boolean(..)
-        | Expr::Null
-        | Expr::Undefined
-        | Expr::Identifier(..)
-        | Expr::Logical { .. }
-        | Expr::Assign { .. }
-        | Expr::Call { .. } => panic!("expression is not supported by the numeric evaluator"),
+        Expr::Logical {
+            left,
+            operator,
+            right,
+        } => {
+            let left = evaluate(left);
+            match operator {
+                LogicalOperator::And if !is_truthy(&left) => left,
+                LogicalOperator::Or if is_truthy(&left) => left,
+                _ => evaluate(right),
+            }
+        }
+        Expr::Identifier(_) | Expr::Assign { .. } | Expr::Call { .. } => {
+            todo!("variables and function calls need a Realm")
+        }
     }
 }

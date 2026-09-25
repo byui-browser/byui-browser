@@ -1,10 +1,8 @@
-/// A parsed JavaScript program.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Program {
     pub body: Vec<Statement>,
 }
 
-/// Expressions produced by the parser.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// `42`
@@ -79,7 +77,6 @@ pub enum UnaryOperator {
     Not,
 }
 
-/// Operators that combine two expressions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOperator {
     Add,
