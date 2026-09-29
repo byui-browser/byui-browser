@@ -13,7 +13,7 @@ use reqwest::{
 
 use crate::{request::Request, response::Response};
 
-/// Thread-safe process-local cache shared by cloned request controllers.
+/// Thread-safe process-local cache shared by cloned request clients.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ResponseCache {
     entries: Arc<RwLock<HashMap<String, CachedResponse>>>,
@@ -111,4 +111,60 @@ pub(crate) fn cache_ttl(headers: &HeaderMap) -> Option<Duration> {
                 .ok()
         })
         .map(Duration::from_secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_control_parses_max_age_with_other_directives() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CACHE_CONTROL,
+            "public, max-age=60, must-revalidate".parse().unwrap(),
+        );
+
+        assert_eq!(cache_ttl(&headers), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn cache_control_rejects_non_cacheable_directives() {
+        for value in ["no-store", "public, no-cache, max-age=60"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(CACHE_CONTROL, value.parse().unwrap());
+            assert_eq!(cache_ttl(&headers), None, "directive: {value}");
+        }
+    }
+
+    #[test]
+    fn cache_key_distinguishes_http_methods() {
+        let get = Request::get("https://example.test/resource");
+        let mut head = get.clone();
+        head.method = reqwest::Method::HEAD;
+
+        assert_ne!(cache_key(&get), cache_key(&head));
+    }
+
+    #[test]
+    fn expired_entries_are_not_returned() {
+        let cache = ResponseCache::default();
+        let request = Request::get("https://example.test/expired");
+        let response = Response {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            url: request.url.clone(),
+            body: b"stale".to_vec(),
+            from_cache: false,
+        };
+        let cached = CachedResponse::from_response(&response, Duration::ZERO);
+
+        cache
+            .entries
+            .write()
+            .unwrap()
+            .insert(cache_key(&request), cached);
+
+        assert!(cache.get(&request).is_none());
+    }
 }

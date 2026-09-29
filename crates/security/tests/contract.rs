@@ -8,9 +8,9 @@ use security::{Cookie, CookieJar, Origin, same_origin};
 #[ignore = "TODO(security): origin parsing not implemented"]
 fn parses_origin_with_default_port() {
     let origin = Origin::parse("https://byui.instructure.com/courses/1").expect("origin");
-    assert_eq!(origin.scheme, "https");
-    assert_eq!(origin.host, "byui.instructure.com");
-    assert_eq!(origin.port, 443);
+    assert_eq!(origin.scheme(), "https");
+    assert_eq!(origin.host(), "byui.instructure.com");
+    assert_eq!(origin.port(), 443);
 }
 
 #[test]

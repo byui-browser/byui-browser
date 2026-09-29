@@ -10,24 +10,24 @@ use std::{
     thread,
 };
 
-use crate::{Request, RequestController};
+use crate::{Config, Request, RequestController};
 use reqwest::StatusCode;
 
 #[test]
 fn cache_serves_a_fresh_get_without_a_second_network_request() {
     // The local server returns an explicit freshness lifetime. The second GET
-    // should therefore be served from the controller's cache.
+    // should therefore be served from the client's cache.
     let (address, request_count, server) = start_cached_server();
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let controller = RequestController::new().expect("reqwest client should initialize");
+    let client = RequestController::new(Config::default()).expect("controller should initialize");
 
     let (first, second) = runtime.block_on(async {
-        let first = controller
-            .execute(Request::get(&address))
+        let first = client
+            .fetch(Request::get(&address))
             .await
             .expect("first request should succeed");
-        let second = controller
-            .execute(Request::get(&address))
+        let second = client
+            .fetch(Request::get(&address))
             .await
             .expect("cached request should succeed");
         (first, second)
@@ -54,7 +54,7 @@ fn start_cached_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
     let count_for_server = Arc::clone(&request_count);
     let server = thread::spawn(move || {
         // This server intentionally accepts exactly one request. If the second
-        // controller call reaches the network, the test will fail or hang.
+        // client call reaches the network, the test will fail or hang.
         let (mut stream, _) = listener
             .accept()
             .expect("server should receive one request");

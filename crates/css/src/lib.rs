@@ -66,10 +66,42 @@ pub struct ComputedStyles {
 // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
 // signature however your crate's public API needs.
 pub fn parse_stylesheet(input: &str) -> Stylesheet {
-    if input.trim().is_empty() {
-        return Stylesheet::default();
+    let input = remove_comments(input);
+    let mut rules = Vec::new();
+
+    for rule_text in input.split('}') {
+        let Some((selector, declarations)) = rule_text.split_once('{') else {
+            continue;
+        };
+
+        let selector = selector.trim();
+        if selector.is_empty() {
+            continue;
+        }
+
+        let declarations = declarations
+            .split(';')
+            .filter_map(|declaration| {
+                let (property, value) = declaration.split_once(':')?;
+                let property = property.trim();
+                let value = value.trim();
+                if property.is_empty() || value.is_empty() {
+                    return None;
+                }
+                Some(Declaration {
+                    property: property.to_owned(),
+                    value: value.to_owned(),
+                })
+            })
+            .collect();
+
+        rules.push(Rule {
+            selector: Selector(selector.to_owned()),
+            declarations,
+        });
     }
-    todo!("TODO(css): parse rules from: {input:?}")
+
+    Stylesheet { rules }
 }
 
 /// Computes the specificity of a selector.
@@ -78,10 +110,34 @@ pub fn parse_stylesheet(input: &str) -> Stylesheet {
 // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
 // signature however your crate's public API needs.
 pub fn specificity(selector: &Selector) -> Specificity {
-    if selector.0.is_empty() {
-        return Specificity(0, 0, 0);
+    let ids = selector.0.matches('#').count() as u32;
+    let classes = selector.0.matches('.').count() as u32;
+    let tags = selector
+        .0
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+        .filter(|part| !part.is_empty())
+        .filter(|part| !selector.0.contains(&format!("#{part}")))
+        .filter(|part| !selector.0.contains(&format!(".{part}")))
+        .count() as u32;
+
+    Specificity(ids, classes, tags)
+}
+
+fn remove_comments(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut remaining = input;
+
+    while let Some(start) = remaining.find("/*") {
+        result.push_str(&remaining[..start]);
+        let after_start = &remaining[start + 2..];
+        let Some(end) = after_start.find("*/") else {
+            return result;
+        };
+        remaining = &after_start[end + 2..];
     }
-    todo!("TODO(css): compute specificity of: {selector:?}")
+
+    result.push_str(remaining);
+    result
 }
 
 /// Resolves the cascade for every node in `dom` (architecture §3.2).
@@ -120,6 +176,21 @@ mod tests {
         // Pure type behavior, no parsing involved.
         assert!(Specificity(1, 0, 0) > Specificity(0, 9, 9));
         assert!(Specificity(0, 1, 0) > Specificity(0, 0, 9));
+    }
+
+    #[test]
+    fn parses_body_background_as_blue() {
+        let sheet = parse_stylesheet("body { background-color: blue; }");
+
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].selector, Selector("body".into()));
+        assert_eq!(
+            sheet.rules[0].declarations,
+            vec![Declaration {
+                property: "background-color".into(),
+                value: "blue".into(),
+            }]
+        );
     }
 
     #[test]
