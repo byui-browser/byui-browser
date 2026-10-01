@@ -151,6 +151,11 @@ impl HtmlDocument {
     }
 }
 
+// Node API
+impl Node {
+
+}
+
 pub type HTMLDocument = HtmlDocument;
 
 /// Compatibility projection returned by the original selector API.
