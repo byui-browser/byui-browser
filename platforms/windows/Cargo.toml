@@ -1,0 +1,8 @@
+[package]
+name = "gg-browser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wry = "0.37"
+tao = "0.26"
