@@ -7,7 +7,8 @@ Significant architecture decisions from the Weekly Architecture Sync are recorde
 1. Propose the change (Discussion, RFC, or draft ADR).
 2. Discuss in the Weekly Architecture Sync.
 3. Get approval from at least 3 experienced engineers from different teams.
-4. Land the ADR and update `docs/TECH_ARCHITECTURE.md` when needed.
+4. Land the ADR and update `docs/TECH_ARCHITECTURE.md` and the affected
+   `docs/architecture/` documents when needed.
 
 ## Naming
 
@@ -19,10 +20,14 @@ Example: `0001-process-model.md`
 
 Copy [`0000-template.md`](./0000-template.md) when starting a new ADR.
 
-## Suggested first ADRs
+## Index
 
-Per `docs/TECH_ARCHITECTURE.md` §8:
+| ADR | Title | Status |
+| --- | --- | --- |
+| [0001](0001-single-process-first.md) | Single-process browser with IPC-shaped boundaries | Proposed |
+| [0002](0002-dom-representation.md) | DOM representation | Proposed |
 
-1. Process model
-2. IPC format
-3. DOM representation
+Decisions still needed are listed in `docs/architecture/overview.md` §7
+(shared-type ownership, script asynchrony, UI toolkit, GPU backend, cookie
+jar ownership). The IPC-format ADR from `docs/TECH_ARCHITECTURE.md` §8 is
+deferred by ADR 0001.

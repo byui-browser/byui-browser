@@ -23,9 +23,13 @@
 
 ## Architecture fit
 
-<!-- Does this follow the crate boundaries in docs/TECH_ARCHITECTURE.md?
-     Flag anything that moves a responsibility between crates, adds a
-     cross-crate dependency, or needs an ADR (see docs/adr/README.md). -->
+<!-- Does this follow docs/architecture/crates/<crate>.md and the
+     dependency rules in docs/architecture/overview.md §2? Flag anything that
+     moves a responsibility between crates, adds a cross-crate dependency, or
+     needs an ADR (see docs/adr/README.md). If this closes a row in
+     docs/architecture/gap-report-2026-10.md, name it (e.g. "Closes G-25")
+     and mark the row. If the crate doc's "Current state" changes, update it
+     here. -->
 - Follows existing boundaries
 
 ## Ownership & review

@@ -1,5 +1,20 @@
 # Workspace guidance
 
+## Architecture
+
+Before changing code, read `docs/architecture/README.md`. It is a short
+router: find your task in its table and load only the documents it lists
+(the crate document for every crate you touch is always one of them). Do not
+read the whole `docs/architecture/` tree for a single task.
+
+If a crate document's "Current state" section no longer matches the code,
+update it in the same PR. If a change would break an invariant listed in
+that README or a signature in `docs/architecture/contracts/`, stop and raise
+it rather than working around it; the fix is an ADR or a Scrum of Scrums
+decision. Known deviations are tracked in
+`docs/architecture/gap-report-2026-10.md`; do not build further on a gap
+without checking its row.
+
 ## Public Rust APIs
 
 Every crate-level public API must have Rust documentation. Public types,

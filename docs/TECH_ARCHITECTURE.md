@@ -7,7 +7,9 @@
 **Date**: July 2026  
 **Team Size**: ~37 engineers (10 experienced + 27 juniors) across 9 specialized teams
 
-This document defines the technical architecture, crate ownership, inter-team contracts, and development processes. It is the single source of truth for how teams collaborate.
+This document is the project **charter**: principles, team ownership, review rules, workflow, and testing strategy. It is the source of truth for how teams collaborate.
+
+The **technical** detail (layering and dependency rules, the per-crate contracts, what each crate currently is versus what it is meant to be) lives in [`docs/architecture/`](architecture/README.md); start at its README, which routes you to the documents for your task. Where the two disagree, `docs/architecture/` is more recent and the disagreement is an open ADR: see [`architecture/overview.md`](architecture/overview.md) §7 and [`adr/`](adr/README.md). Two proposed ADRs (0001 single-process-first, 0002 DOM representation) would revise §1.2 and §3.1 below once accepted.
 
 ---
 

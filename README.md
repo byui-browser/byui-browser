@@ -2,10 +2,11 @@
 
 The BYU-Idaho browser developed by the CSE 199R and CSE 399R classes.
 
-An independent web browser built from scratch in Rust. See
-[`docs/TECH_ARCHITECTURE.md`](docs/TECH_ARCHITECTURE.md) for architecture,
-crate ownership, and collaboration rules. Team overviews live in
-[`docs/TEAMS.md`](docs/TEAMS.md).
+An independent web browser built from scratch in Rust. Start with
+[`docs/architecture/README.md`](docs/architecture/README.md), which routes
+you to the architecture documents for your task. The project charter (teams,
+process, review rules) is [`docs/TECH_ARCHITECTURE.md`](docs/TECH_ARCHITECTURE.md),
+and team overviews live in [`docs/TEAMS.md`](docs/TEAMS.md).
 
 ## Repository layout
 
@@ -31,7 +32,12 @@ crate ownership, and collaboration rules. Team overviews live in
 ├── platforms/           # Thin native shells (macOS, Windows, Linux)
 ├── tests/               # Integration + conformance tests
 └── docs/
-    ├── TECH_ARCHITECTURE.md
+    ├── architecture/    # Technical architecture: start at README.md
+    │   ├── overview.md  #   target design, layering, dependency rules
+    │   ├── contracts/   #   one doc per cross-team boundary
+    │   ├── crates/      #   one doc per crate: intended vs current
+    │   └── gap-report-2026-10.md
+    ├── TECH_ARCHITECTURE.md   # project charter
     ├── TEAMS.md
     └── adr/             # Architecture Decision Records
 ```
@@ -71,5 +77,8 @@ cargo run -p browser
 
 ## Status
 
-Scaffolding only. Crates compile and declare ownership boundaries; engine
-behavior is intentionally unimplemented so teams can fill in their crates.
+Early engine work on top of the scaffold: an HTML arena parser, a CSS
+parser, a first layout → paint → software-render slice, a JavaScript lexer,
+parser and partial interpreter, and an async HTTP client. See
+[`docs/architecture/gap-report-2026-10.md`](docs/architecture/gap-report-2026-10.md)
+for what is wired together and what is not.

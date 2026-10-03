@@ -52,7 +52,8 @@ This is a class project. Keep two readers in mind:
   upper-class students and the professor). Their job is to make sure every
   team's work fits together, so the PR body must answer their questions
   directly: what other crates can now call or must now change, whether the
-  change matches `docs/TECH_ARCHITECTURE.md`, and how to run it. Write those
+  change matches `docs/architecture/` (the crate doc and contracts), and how
+  to run it. Write those
   sections precisely; write the rest in plain language.
 
 ## Workflow
@@ -100,12 +101,16 @@ This is a class project. Keep two readers in mind:
      (`cargo tree -i -p <crate> --workspace` or grep the `Cargo.toml`s) and
      whether they need changes now or later. For `common`, list every crate
      that uses the touched type.
-   - **Architecture fit.** Does the change respect the crate boundaries and
-     responsibilities in `docs/TECH_ARCHITECTURE.md`? If it moves a
-     responsibility between crates, adds a cross-crate dependency, or decides
-     something the ADR README lists as needing an ADR, say so and either
-     include the doc update or flag it as a follow-up for the reviewers to
-     rule on.
+   - **Architecture fit.** Does the change respect the crate's document in
+     `docs/architecture/crates/<crate>.md`, the dependency rules in
+     `docs/architecture/overview.md` §2, and any `docs/architecture/contracts/`
+     file that names a changed signature? If it moves a responsibility
+     between crates, adds a cross-crate dependency, or decides something
+     `overview.md` §7 lists as needing an ADR, say so and either include the
+     doc update or flag it as a follow-up for the reviewers to rule on. If it
+     closes a row in `docs/architecture/gap-report-2026-10.md`, say which and
+     mark the row. If the crate document's "Current state" section is now
+     wrong, update it in the same PR.
    - **How to verify.** Concrete steps a reviewer can run: the command
      (`cargo run -p browser`, `cargo test -p <crate> <test_name>`), the input
      (a fixture under `tests/` or an inline snippet), and the expected result.
