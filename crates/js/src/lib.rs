@@ -89,7 +89,7 @@ impl Realm {
 
     /// Evaluates the minimal call expression needed by the first Web API slice.
     ///
-    /// The full parser and VM are still future work. This deliberately supports
+    /// The full VM is still future work. This deliberately supports
     /// only a global identifier followed by an empty argument list, such as
     /// `print()`, so the host-function path can be exercised end to end.
     pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
@@ -108,29 +108,36 @@ impl Realm {
     }
 }
 
-/// A parsed program. The full statement shape is still under development.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Program {
-    pub statements: Vec<Statement>,
-}
+/// The owned statement and expression tree produced by parsing.
+pub use ast::{Program, Statement};
 
-/// One statement in the AST.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Statement {}
-
-/// Parses source text into a [`Program`].
-pub fn parse(source: &str) -> JsResult<Program> {
-    if source.trim().is_empty() {
-        return Ok(Program::default());
-    }
-    Err(JsError::new("JavaScript parsing is not implemented"))
+/// Parses source text into an owned [`Program`].
+///
+/// Uses the subset and semicolon policy documented by [`parser::parse_program`].
+/// Syntax errors carry a token index, UTF-8 byte offset, and one-based line and
+/// character column. Locations at end of input point just past the source.
+pub fn parse(source: &str) -> Result<Program, parser::ParseError> {
+    let entries = lexer::tokenize_spanned(source);
+    let starts: Vec<_> = entries.iter().map(|entry| entry.start).collect();
+    let tokens: Vec<_> = entries.into_iter().map(|entry| entry.token).collect();
+    parser::parse_program(&tokens).map_err(|mut error| {
+        let offset = starts
+            .get(error.token_index)
+            .copied()
+            .unwrap_or(source.len());
+        let prefix = &source[..offset];
+        error.offset = Some(offset);
+        error.line = Some(prefix.chars().filter(|ch| *ch == '\n').count() + 1);
+        error.column = Some(prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1);
+        error
+    })
 }
 
 /// Parses and evaluates source text, returning the completion value.
+///
+/// Supports the existing tree-walk runtime: expressions, declarations, and
+/// blocks. Other parsed statement forms and calls return runtime errors.
 pub fn eval(source: &str) -> JsResult<Value> {
-    let program = parse(source)?;
-    if program.statements.is_empty() {
-        return Ok(Value::Undefined);
-    }
-    Err(JsError::new("JavaScript evaluation is not implemented"))
+    let program = parse(source).map_err(|error| JsError::new(error.to_string()))?;
+    runtime::evaluate_program(&program)
 }

@@ -138,16 +138,31 @@ impl HtmlDocument {
     }
 
     pub fn get_element_by_id(&self, value: &str) -> Option<NodeId> {
-        self.nodes.iter().enumerate().find_map(|(index, node)| {
-            let NodeKind::Element(element) = &node.kind else {
-                return None;
-            };
-            element
-                .attributes
-                .iter()
-                .find(|attribute| attribute.name == "id" && attribute.value == value)
-                .map(|_| NodeId(index))
-        })
+        fn find_in_tree(document: &HtmlDocument, parent: NodeId, value: &str) -> Option<NodeId> {
+            let children = document.node(parent)?.children.clone();
+
+            for child in children {
+                let node = document.node(child)?;
+                if let NodeKind::Element(element) = &node.kind
+                    && element
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.name == "id" && attribute.value == value)
+                {
+                    return Some(child);
+                }
+
+                if let Some(found) = find_in_tree(document, child, value) {
+                    return Some(found);
+                }
+            }
+
+            None
+        }
+
+        // The DOM algorithm searches descendants in tree order. The document
+        // node itself is not an element and therefore is never a candidate.
+        find_in_tree(self, self.root, value)
     }
 }
 

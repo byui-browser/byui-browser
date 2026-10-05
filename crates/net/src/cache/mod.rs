@@ -104,11 +104,11 @@ pub(crate) fn cache_ttl(headers: &HeaderMap) -> Option<Duration> {
     value
         .split(',')
         .find_map(|directive| {
-            directive
-                .trim()
-                .strip_prefix("max-age=")?
-                .parse::<u64>()
-                .ok()
+            let (name, value) = directive.trim().split_once('=')?;
+            if !name.trim().eq_ignore_ascii_case("max-age") {
+                return None;
+            }
+            value.trim().trim_matches('"').parse::<u64>().ok()
         })
         .map(Duration::from_secs)
 }
@@ -135,6 +135,36 @@ mod tests {
             headers.insert(CACHE_CONTROL, value.parse().unwrap());
             assert_eq!(cache_ttl(&headers), None, "directive: {value}");
         }
+    }
+
+    #[test]
+    fn cache_control_accepts_case_insensitive_and_quoted_max_age() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CACHE_CONTROL,
+            "PUBLIC, MAX-AGE = \"60\", must-revalidate".parse().unwrap(),
+        );
+
+        assert_eq!(cache_ttl(&headers), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn cache_does_not_store_non_success_responses() {
+        let cache = ResponseCache::default();
+        let request = Request::get("https://example.test/missing");
+        let mut headers = HeaderMap::new();
+        headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+        let response = Response {
+            status: StatusCode::NOT_FOUND,
+            headers,
+            url: request.url.clone(),
+            body: b"missing".to_vec(),
+            from_cache: false,
+        };
+
+        cache.insert(&request, &response);
+
+        assert!(cache.get(&request).is_none());
     }
 
     #[test]

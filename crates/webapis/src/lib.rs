@@ -13,6 +13,7 @@ pub mod local_storage;
 use std::sync::Arc;
 
 use common::ids::NodeId;
+use html::{HtmlDocument, NodeKind};
 use js::{HostFunction, JsError, JsResult, Realm, Value};
 use net::{Request, RequestController};
 
@@ -79,9 +80,6 @@ pub struct Element {
 }
 
 /// Script-visible `document` object.
-///
-/// Wraps the HTML team's DOM; the real binding will hold a handle, not a copy.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Document {
     elements: Vec<Element>,
@@ -93,19 +91,42 @@ impl Document {
         Self::default()
     }
 
+    /// Creates a script-visible document from the HTML document tree.
+    pub fn from_html_document(document: &HtmlDocument) -> Self {
+        fn collect(document: &HtmlDocument, parent: html::NodeId, elements: &mut Vec<Element>) {
+            let Some(node) = document.node(parent) else {
+                return;
+            };
+
+            for child in &node.children {
+                if let Some(node) = document.node(*child) {
+                    if let NodeKind::Element(element) = &node.kind {
+                        let id_attr = element
+                            .attributes
+                            .iter()
+                            .find(|attribute| attribute.name == "id")
+                            .map(|attribute| attribute.value.clone());
+                        elements.push(Element {
+                            node: NodeId::new(child.index() as u32),
+                            id_attr,
+                        });
+                    }
+                    collect(document, *child, elements);
+                }
+            }
+        }
+
+        let mut elements = Vec::new();
+        collect(document, document.root, &mut elements);
+        Self { elements }
+    }
+
     /// `document.getElementById(id)`.
     ///
-    /// Currently only handles the empty document.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
-    // signature however your crate's public API needs.
     pub fn get_element_by_id(&self, id: &str) -> Option<&Element> {
-        if self.elements.is_empty() {
-            return None;
-        }
-        todo!(
-            "TODO(webapis): look up #{id} among {} elements",
-            self.elements.len()
-        )
+        self.elements
+            .iter()
+            .find(|element| element.id_attr.as_deref() == Some(id))
     }
 }
 
@@ -157,6 +178,7 @@ impl TimerQueue {
 #[cfg(test)]
 mod tests {
     use super::{ConsoleSink, fetch, print, register_fetch, register_print};
+    use html::parse_raw_html;
     use js::{Realm, Value};
     use net::{Config, RequestController};
     use std::sync::{Arc, Mutex};
@@ -239,6 +261,21 @@ mod tests {
     #[test]
     fn empty_document_has_no_element_by_id() {
         assert_eq!(super::Document::new().get_element_by_id("main"), None);
+    }
+
+    #[test]
+    fn document_get_element_by_id_uses_tree_order_and_exact_matching() {
+        let html_document = parse_raw_html(
+            "<section id='target'><span id='nested'></span></section><p id='nested'></p>"
+                .to_owned(),
+        );
+        let document = super::Document::from_html_document(&html_document);
+
+        let element = document
+            .get_element_by_id("nested")
+            .expect("nested element");
+        assert_eq!(element.node.index(), 2);
+        assert_eq!(document.get_element_by_id("NESTED"), None);
     }
 
     #[test]

@@ -1,5 +1,3 @@
-// TODO(parser): Add `from_token` parsing once the lexer exposes `&&` and `||`.
-
 use crate::ast::{Expr, LogicalOperator};
 
 impl LogicalOperator {
@@ -16,5 +14,15 @@ impl LogicalOperator {
             operator: self,
             right: Box::new(right),
         }
+    }
+}
+
+use crate::lexer::Token;
+
+pub(super) fn from_token(token: &Token) -> Option<LogicalOperator> {
+    match token {
+        Token::AndAnd => Some(LogicalOperator::And),
+        Token::OrOr => Some(LogicalOperator::Or),
+        _ => None,
     }
 }

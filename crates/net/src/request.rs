@@ -67,6 +67,11 @@ impl Request {
         }
     }
 
+    /// Returns whether this request method may use the response cache.
+    ///
+    /// Only methods whose semantics are read-only are admitted by the current
+    /// cache implementation. Request headers, body, and cache mode are
+    /// evaluated by the controller separately.
     pub(crate) fn is_cacheable_method(&self) -> bool {
         matches!(self.method, Method::GET | Method::HEAD)
     }

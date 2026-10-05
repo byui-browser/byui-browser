@@ -40,13 +40,54 @@ fn empty_program_evaluates_to_undefined() {
 }
 
 #[test]
-#[ignore = "TODO(js): string literals not implemented"]
 fn evaluates_string_literal() {
     assert_eq!(eval("'hi'"), Ok(Value::String("hi".into())));
 }
 
 #[test]
-#[ignore = "TODO(js): parser error reporting not implemented"]
 fn syntax_error_is_an_err_not_a_panic() {
     assert!(parse("let = ;").is_err());
+}
+
+#[test]
+fn evaluates_declaration_read_and_assignment_from_source() {
+    assert_eq!(
+        eval("let count = 1; count = count + 2; count"),
+        Ok(Value::Number(3.0))
+    );
+}
+
+#[test]
+fn nested_blocks_shadow_without_mutating_the_outer_binding() {
+    assert_eq!(
+        eval("let value = 1; { let value = 2; value = 3; } value"),
+        Ok(Value::Number(1.0))
+    );
+}
+
+#[test]
+fn invalid_bindings_return_errors() {
+    assert!(eval("missing").is_err());
+    assert!(eval("const answer = 42; answer = 7").is_err());
+    assert!(eval("let answer = 1; let answer = 2").is_err());
+}
+
+#[test]
+fn unsupported_program_evaluation_returns_errors() {
+    for source in [
+        "f();",
+        "if (true) {}",
+        "while (false) {}",
+        "function f() { return; }",
+    ] {
+        assert!(eval(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn program_parser_preserves_runtime_short_circuit_behavior() {
+    assert_eq!(eval("false && missing"), Ok(Value::Boolean(false)));
+    assert_eq!(eval("true || missing"), Ok(Value::Boolean(true)));
+    assert_eq!(eval("true && 2"), Ok(Value::Number(2.0)));
+    assert_eq!(eval("false || 3"), Ok(Value::Number(3.0)));
 }

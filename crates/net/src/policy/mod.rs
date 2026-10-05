@@ -2,10 +2,18 @@
 
 use crate::{error::RequestError, request::Request, response::Response};
 
+/// Validates URL and browser request/response policy at the controller boundary.
+///
+/// Transport performs HTTP I/O only; this type is where browser-facing policy
+/// checks can evolve without coupling them to reqwest.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RequestPolicy;
 
 impl RequestPolicy {
+    /// Rejects malformed URLs and schemes unsupported by the HTTP transport.
+    ///
+    /// Validation happens before cookies are attached or a scheduler permit is
+    /// acquired, so invalid requests fail without side effects or network work.
     pub(crate) fn validate_request(&self, request: &Request) -> Result<(), RequestError> {
         let url = reqwest::Url::parse(&request.url)
             .map_err(|_| RequestError::InvalidUrl(request.url.clone()))?;
@@ -15,6 +23,10 @@ impl RequestPolicy {
         Ok(())
     }
 
+    /// Validates response policy after transport headers have arrived.
+    ///
+    /// The initial implementation accepts all responses; the method remains a
+    /// separate hook for future status, redirect, or response-security rules.
     pub(crate) fn validate_response(
         &self,
         _request: &Request,

@@ -3,10 +3,12 @@
 use std::{
     io::{Read, Write},
     net::TcpListener,
+    sync::mpsc,
     thread,
 };
 
-use crate::{CacheMode, Config, Request, RequestController, RequestError, response};
+use crate::{CacheMode, Config, Request, RequestController, RequestError};
+use futures_util::StreamExt;
 use reqwest::{
     Method, StatusCode,
     header::{HeaderMap, HeaderValue},
@@ -122,4 +124,128 @@ fn can_fetch_resource_from_local_server() {
 
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.body, b"local body");
+}
+
+#[test]
+fn streaming_fetch_returns_headers_before_body_and_forwards_body_bytes() {
+    // The server pauses after sending headers. A successful fetch_stream call
+    // therefore proves callers can inspect response metadata without waiting
+    // for the complete body.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+    let address = format!(
+        "http://{}",
+        listener
+            .local_addr()
+            .expect("test server address should be available")
+    );
+    let (headers_sent, headers_received) = mpsc::channel();
+    let (send_body, receive_body) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("test server should receive a request");
+        let mut request = [0; 4096];
+        let _ = stream
+            .read(&mut request)
+            .expect("test server should read the request");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nX-Stream: yes\r\nConnection: close\r\n\r\n",
+            )
+            .expect("test server should write response headers");
+        stream.flush().expect("test server should flush headers");
+        headers_sent
+            .send(())
+            .expect("test should still be listening");
+        receive_body.recv().expect("test should release the body");
+        stream
+            .write_all(b"hello world")
+            .expect("test server should write response body");
+    });
+
+    let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let mut response = runtime
+        .block_on(client.fetch_stream(Request::get(&address)))
+        .expect("streaming request should succeed");
+
+    headers_received
+        .recv()
+        .expect("server should have sent response headers");
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.headers["x-stream"], "yes");
+    assert!(!response.from_cache);
+
+    send_body
+        .send(())
+        .expect("test server should receive release");
+    let body = runtime.block_on(async {
+        let mut body = Vec::new();
+        while let Some(chunk) = response.body.next().await {
+            body.extend_from_slice(&chunk.expect("body chunk should be valid"));
+        }
+        body
+    });
+
+    server.join().expect("test server should exit");
+    assert_eq!(body, b"hello world");
+}
+
+#[test]
+fn streaming_fetch_is_cached_only_after_body_completion() {
+    // The first response is streamed and fully consumed. The following
+    // streaming request should then use the completed response from cache.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+    let address = format!(
+        "http://{}",
+        listener
+            .local_addr()
+            .expect("test server address should be available")
+    );
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("test server should receive one request");
+        let mut request = [0; 4096];
+        let _ = stream
+            .read(&mut request)
+            .expect("test server should read the request");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nCache-Control: max-age=60\r\nConnection: close\r\n\r\nstreamed response",
+            )
+            .expect("test server should write response");
+    });
+
+    let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let (first, second) = runtime.block_on(async {
+        let mut first = client
+            .fetch_stream(Request::get(&address))
+            .await
+            .expect("first streaming request should succeed");
+        let mut first_body = Vec::new();
+        while let Some(chunk) = first.body.next().await {
+            first_body.extend_from_slice(&chunk.expect("first body chunk should be valid"));
+        }
+
+        let second = client
+            .fetch_stream(Request::get(&address))
+            .await
+            .expect("cached streaming request should succeed");
+        (first_body, second)
+    });
+
+    server.join().expect("test server should exit");
+    assert_eq!(first, b"streamed response");
+    assert!(second.from_cache);
+    let second_body = runtime.block_on(async {
+        let mut body = Vec::new();
+        let mut second = second;
+        while let Some(chunk) = second.body.next().await {
+            body.extend_from_slice(&chunk.expect("cached body chunk should be valid"));
+        }
+        body
+    });
+    assert_eq!(second_body, b"streamed response");
 }

@@ -1,13 +1,21 @@
-// TODO(parser): Add token-to-unary-operator parsing once the lexer exposes
-// unary operator tokens such as `!`.
-
+use super::super::{ParseResult, Parser};
 use crate::ast::{Expr, UnaryOperator};
+use crate::lexer::Token;
 
-impl UnaryOperator {
-    pub(super) fn build(self, operand: Expr) -> Expr {
-        Expr::Unary {
-            operator: self,
-            operand: Box::new(operand),
-        }
+pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Expr> {
+    let operator = match parser.peek() {
+        Some(Token::Subtract) => Some(UnaryOperator::Negate),
+        Some(Token::Bang) => Some(UnaryOperator::Not),
+        _ => None,
+    };
+    if let Some(operator) = operator {
+        parser.advance();
+        return parser.nested("unary expression", |parser| {
+            Ok(Expr::Unary {
+                operator,
+                operand: Box::new(parse(parser)?),
+            })
+        });
     }
+    super::call::parse(parser)
 }

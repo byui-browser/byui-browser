@@ -1,4 +1,4 @@
-//! Integration tests for response caching.
+//! Crate tests for response caching.
 
 use std::{
     io::{Read, Write},

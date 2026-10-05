@@ -1,25 +1,28 @@
-// TODO(parser): Add `if`, `else`, and `while` token parsing once the lexer
-// exposes the corresponding keywords and delimiters.
+use super::super::{ParseResult, Parser};
+use crate::ast::Statement;
+use crate::lexer::Token;
 
-use crate::ast::{Expr, Statement};
-
-impl Statement {
-    pub(super) fn if_statement(
-        condition: Expr,
-        then_branch: Self,
-        else_branch: Option<Self>,
-    ) -> Self {
-        Self::If {
-            condition,
-            then_branch: Box::new(then_branch),
-            else_branch: else_branch.map(Box::new),
-        }
+pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Statement> {
+    let is_if = parser.consume(&Token::If);
+    if !is_if {
+        parser.expect(&Token::While, "while statement")?;
     }
-
-    pub(super) fn while_statement(condition: Expr, body: Self) -> Self {
-        Self::While {
+    parser.expect(&Token::LeftParen, "condition")?;
+    let condition = parser.parse_expression(0)?;
+    parser.expect(&Token::RightParen, "condition")?;
+    let body = Box::new(parser.parse_statement()?);
+    if is_if {
+        let else_branch = if parser.consume(&Token::Else) {
+            Some(Box::new(parser.parse_statement()?))
+        } else {
+            None
+        };
+        Ok(Statement::If {
             condition,
-            body: Box::new(body),
-        }
+            then_branch: body,
+            else_branch,
+        })
+    } else {
+        Ok(Statement::While { condition, body })
     }
 }

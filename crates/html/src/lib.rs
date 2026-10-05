@@ -14,5 +14,5 @@ pub use dom::{
     Namespace, Node, NodeId, NodeKind, QuirksMode, SourceSpan, Token,
 };
 pub use parser::parse_raw_html;
-pub use selector::Query;
+pub use selector::{Query, SelectorError};
 pub use tokenizer::{parse, tokenize};
