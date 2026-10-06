@@ -17,6 +17,8 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # Mozilla's root certificate data, shipped by webpki-roots (via reqwest).
+    "CDLA-Permissive-2.0",
     "ISC",
     "Unicode-3.0",
     "Zlib",
@@ -24,7 +26,11 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# Workspace crates depend on each other by path with no version, which
+# cargo-deny counts as a wildcard. Exempting only path dependencies
+# (`allow-wildcard-paths`) requires every crate to set `publish = false`, so
+# this stays "allow" until the manifests do.
+wildcards = "allow"
 
 [sources]
 unknown-registry = "deny"
