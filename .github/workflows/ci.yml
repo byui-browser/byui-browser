@@ -34,8 +34,9 @@ jobs:
         run: make lint
 
   # One job per OS keeps the checks list short. Each job tests every workspace
-  # crate separately and reports per-crate results in the run summary, with an
-  # error annotation naming each crate that failed.
+  # crate separately. The run summary lists every test that ran per crate; a
+  # failing crate's output is printed unfolded in the log and its failing tests
+  # are named in an error annotation.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}-latest
@@ -61,28 +62,67 @@ jobs:
           OS_NAME: ${{ matrix.os }}
         run: |
           crates=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[].name' | tr -d '\r' | sort)
+          work=$(mktemp -d)
+          strip_color=$'s/\x1b\\[[0-9;]*m//g'
           {
             echo "### Tests on $OS_NAME"
             echo
-            echo "| Crate | Result |"
-            echo "| --- | --- |"
+            echo "| Crate | Result | Passed | Failed | Ignored |"
+            echo "| --- | --- | --- | --- | --- |"
           } >> "$GITHUB_STEP_SUMMARY"
 
           failed=()
           for crate in $crates; do
+            log="$work/$crate.log"
+            tests="$work/$crate.tests"
+
+            # Passing output stays folded; `tee` keeps it streaming while it runs.
             echo "::group::cargo test --package $crate"
-            if cargo test --package "$crate"; then
+            if cargo test --package "$crate" 2>&1 | tee "$log"; then
               result="pass"
             else
               result="**FAIL**"
               failed+=("$crate")
             fi
             echo "::endgroup::"
-            if [ "$result" != "pass" ]; then
-              echo "::error title=$crate tests failed on $OS_NAME::Reproduce with: cargo test --package $crate"
+
+            sed "$strip_color" "$log" | tr -d '\r' > "$log.plain"
+            grep -E '^test .* \.\.\. ' "$log.plain" > "$tests" || true
+            read -r passed broken ignored < <(awk '
+              / \.\.\. ok$/ { p++ } / \.\.\. FAILED$/ { f++ } / \.\.\. ignored/ { i++ }
+              END { print p + 0, f + 0, i + 0 }' "$tests")
+            echo "| \`$crate\` | $result | $passed | $broken | $ignored |" >> "$GITHUB_STEP_SUMMARY"
+
+            if [ "$result" = "pass" ]; then
+              open=""
+            else
+              open=" open"
+              # Repeat the failure outside the folded group so it is visible on arrival.
+              echo "---- $crate failed on $OS_NAME ----"
+              if grep -q '^failures:$' "$log.plain"; then
+                sed -n '/^failures:$/,/^test result:/p' "$log.plain"
+                names=$(sed -n 's/^test \(.*\) \.\.\. FAILED$/\1/p' "$tests" | head -n 10 | paste -sd ' ' -)
+                detail="$broken failed: $names."
+              else
+                tail -n 60 "$log.plain"
+                detail="Did not build or exited before any test failed."
+              fi
+              echo "::error title=$crate tests failed on $OS_NAME::$detail Reproduce with: cargo test --package $crate"
             fi
-            echo "| \`$crate\` | $result |" >> "$GITHUB_STEP_SUMMARY"
+
+            {
+              echo
+              echo "<details$open><summary><code>$crate</code>: $passed passed, $broken failed, $ignored ignored</summary>"
+              echo
+              echo '```text'
+              if [ -s "$tests" ]; then cat "$tests"; else echo "(no tests ran)"; fi
+              echo '```'
+              echo
+              echo "</details>"
+            } >> "$work/details.md"
           done
+
+          cat "$work/details.md" >> "$GITHUB_STEP_SUMMARY"
 
           if [ "${#failed[@]}" -gt 0 ]; then
             echo "Failed crates: ${failed[*]}"
