@@ -114,7 +114,11 @@ fn execute_statement(environment: &mut Environment, statement: &Statement) -> Js
 fn evaluate_in(expression: &Expr, environment: &mut Environment) -> JsResult<Value> {
     match expression {
         Expr::Identifier(name) => environment.get(name),
-        Expr::Assign { name, value } => {
+        Expr::Assign {
+            name,
+            value,
+            operator,
+        } => {
             let value = evaluate_in(value, environment)?;
             environment.set(name, value)
         }
@@ -161,6 +165,8 @@ fn evaluate_in(expression: &Expr, environment: &mut Environment) -> JsResult<Val
             "function calls are not supported by the tree-walk interpreter",
         )),
     }
+        Expr::Member{..} => todo!()
+
 }
 
 fn binary(operator: BinaryOperator, left: Value, right: Value) -> JsResult<Value> {

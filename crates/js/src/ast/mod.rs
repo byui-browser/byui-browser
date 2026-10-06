@@ -29,10 +29,16 @@ pub enum Expr {
     Assign {
         name: String,
         value: Box<Expr>,
+        operator: AssignOperator,
     },
     Call {
         callee: Box<Expr>,
         arguments: Vec<Expr>,
+    },
+    Member {
+        object: Box<Expr>,
+        property: Box<Expr>,
+        computed: bool,
     },
 }
 
@@ -98,4 +104,11 @@ pub enum BinaryOperator {
 pub enum LogicalOperator {
     And,
     Or,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignOperator {
+    Assign,
+    AddAssign,
+    SubtractAssign,
 }
