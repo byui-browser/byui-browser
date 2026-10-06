@@ -1,20 +1,28 @@
 # macOS shell
 
-A minimal native AppKit window written in Swift. This standalone shell does not
-connect to the Rust engine yet.
+A minimal native macOS window written in Rust using `winit`. This standalone
+shell does not connect to the browser engine yet.
 
 ## Run
 
-Requires macOS and Swift 6 or newer, included with Xcode 16+ or its Command Line
-Tools (`xcode-select --install`).
+Requires macOS, Rust 1.85 or newer, and the Xcode Command Line Tools
+(`xcode-select --install`).
 From the repository root:
 
 ```sh
-mkdir -p target
-xcrun swiftc -swift-version 6 platforms/macos/main.swift -o target/byui-browser-macos
-./target/byui-browser-macos
+cargo run -p browser-macos
 ```
 
 A 640 × 480 window titled **BYUI Browser** opens. Close the window using the red
-close button to quit. The executable is placed in the existing ignored `target/`
-directory.
+close button to quit. A light-gray toolbar, 48 logical pixels high, sits
+above the white content area with a thin divider. Resize the window to check
+that the toolbar stays full-width. Back (left arrow), Forward (right arrow), and
+Reload (circular arrow) appear in that order at the left of the toolbar.
+All three are disabled placeholders: clicking them or pressing keys does not
+navigate or reload a page. Navigation history and reload actions are not
+implemented yet.
+
+The shell uses `softbuffer` to display the toolbar background with `winit`.
+
+On other operating systems, the executable only reports that macOS is required.
+This lets workspace checks run without building a macOS window on those systems.

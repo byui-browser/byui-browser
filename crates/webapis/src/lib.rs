@@ -8,10 +8,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod local_storage;
+
 use std::sync::Arc;
 
 use common::ids::NodeId;
+use html::{HTMLDocument, NodeKind};
 use js::{HostFunction, JsError, JsResult, Realm, Value};
+use net::{Request, RequestController};
 
 /// Destination for messages emitted by browser Web APIs.
 pub trait ConsoleSink: Send + Sync {
@@ -38,6 +42,33 @@ pub fn register_print(realm: &mut Realm, console: Arc<dyn ConsoleSink>) -> JsRes
     realm.register_global_function("print", function)
 }
 
+/// JavaScript-facing `fetch` implementation.
+///
+/// The current JavaScript value model has no object or promise values, so this
+/// first binding exposes the response body as a string. Network execution is
+/// delegated to the networking crate's shared request controller.
+pub fn fetch(controller: &RequestController, arguments: &[Value]) -> JsResult<Value> {
+    let [Value::String(url)] = arguments else {
+        return Err(JsError::new("fetch() expects exactly one URL string"));
+    };
+
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|error| JsError::new(format!("unable to start network runtime: {error}")))?;
+    let response = runtime
+        .block_on(controller.fetch(Request::get(url)))
+        .map_err(|error| JsError::new(error.to_string()))?;
+
+    let body = String::from_utf8(response.body)
+        .map_err(|_| JsError::new("fetch() response body is not valid UTF-8"))?;
+    Ok(Value::String(body))
+}
+
+/// Installs the Web API global `fetch` in a JavaScript realm.
+pub fn register_fetch(realm: &mut Realm, controller: Arc<RequestController>) -> JsResult<()> {
+    let function: HostFunction = Arc::new(move |arguments| fetch(controller.as_ref(), arguments));
+    realm.register_global_function("fetch", function)
+}
+
 /// Script-visible view of a DOM element.
 // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
 // types, names, and module layout however your crate's public API needs.
@@ -49,9 +80,6 @@ pub struct Element {
 }
 
 /// Script-visible `document` object.
-///
-/// Wraps the HTML team's DOM; the real binding will hold a handle, not a copy.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Document {
     elements: Vec<Element>,
@@ -63,19 +91,42 @@ impl Document {
         Self::default()
     }
 
+    /// Creates a script-visible document from the HTML document tree.
+    pub fn from_html_document(document: &HTMLDocument) -> Self {
+        fn collect(document: &HTMLDocument, parent: html::NodeId, elements: &mut Vec<Element>) {
+            let Some(node) = document.node(parent) else {
+                return;
+            };
+
+            for child in &node.children {
+                if let Some(node) = document.node(*child) {
+                    if let NodeKind::Element(element) = &node.kind {
+                        let id_attr = element
+                            .attributes
+                            .iter()
+                            .find(|attribute| attribute.name == "id")
+                            .map(|attribute| attribute.value.clone());
+                        elements.push(Element {
+                            node: NodeId::new(child.index() as u32),
+                            id_attr,
+                        });
+                    }
+                    collect(document, *child, elements);
+                }
+            }
+        }
+
+        let mut elements = Vec::new();
+        collect(document, document.root, &mut elements);
+        Self { elements }
+    }
+
     /// `document.getElementById(id)`.
     ///
-    /// Currently only handles the empty document.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
-    // signature however your crate's public API needs.
     pub fn get_element_by_id(&self, id: &str) -> Option<&Element> {
-        if self.elements.is_empty() {
-            return None;
-        }
-        todo!(
-            "TODO(webapis): look up #{id} among {} elements",
-            self.elements.len()
-        )
+        self.elements
+            .iter()
+            .find(|element| element.id_attr.as_deref() == Some(id))
     }
 }
 
@@ -126,8 +177,10 @@ impl TimerQueue {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsoleSink, print, register_print};
+    use super::{ConsoleSink, fetch, print, register_fetch, register_print};
+    use html::parse_raw_html;
     use js::{Realm, Value};
+    use net::{Config, RequestController};
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -165,6 +218,34 @@ mod tests {
     }
 
     #[test]
+    fn fetch_requires_one_url_string() {
+        let controller = RequestController::new(Config::default()).unwrap();
+
+        assert_eq!(
+            fetch(&controller, &[]).unwrap_err().to_string(),
+            "fetch() expects exactly one URL string"
+        );
+        assert_eq!(
+            fetch(&controller, &[Value::Boolean(true)])
+                .unwrap_err()
+                .to_string(),
+            "fetch() expects exactly one URL string"
+        );
+    }
+
+    #[test]
+    fn registration_exposes_fetch_to_the_realm() {
+        let controller = std::sync::Arc::new(RequestController::new(Config::default()).unwrap());
+        let mut realm = Realm::new();
+        register_fetch(&mut realm, controller).unwrap();
+
+        assert_eq!(
+            realm.call_global("fetch", &[]).unwrap_err().to_string(),
+            "fetch() expects exactly one URL string"
+        );
+    }
+
+    #[test]
     fn registration_exposes_print_to_the_realm() {
         let console = Arc::new(TestConsole::default());
         let mut realm = Realm::new();
@@ -180,6 +261,21 @@ mod tests {
     #[test]
     fn empty_document_has_no_element_by_id() {
         assert_eq!(super::Document::new().get_element_by_id("main"), None);
+    }
+
+    #[test]
+    fn document_get_element_by_id_uses_tree_order_and_exact_matching() {
+        let html_document = parse_raw_html(
+            "<section id='target'><span id='nested'></span></section><p id='nested'></p>"
+                .to_owned(),
+        );
+        let document = super::Document::from_html_document(&html_document);
+
+        let element = document
+            .get_element_by_id("nested")
+            .expect("nested element");
+        assert_eq!(element.node.index(), 2);
+        assert_eq!(document.get_element_by_id("NESTED"), None);
     }
 
     #[test]

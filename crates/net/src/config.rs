@@ -15,6 +15,8 @@ pub struct Config {
     pub pool_max_idle_per_host: usize,
     /// Optional `User-Agent` header applied to outgoing requests.
     pub user_agent: Option<HeaderValue>,
+    /// Maximum number of requests allowed to execute concurrently.
+    pub max_in_flight: usize,
 }
 
 impl Default for Config {
@@ -25,6 +27,7 @@ impl Default for Config {
             pool_idle_timeout: Some(Duration::from_secs(90)),
             pool_max_idle_per_host: 8,
             user_agent: Some(HeaderValue::from_static("byui-browser/0.1")),
+            max_in_flight: 32,
         }
     }
 }
