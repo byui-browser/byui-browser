@@ -33,41 +33,17 @@ jobs:
       - name: Lint
         run: make lint
 
-  # Discover every workspace package so new crates automatically receive checks.
-  crates:
-    name: workspace crates
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.discover.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Discover workspace crates
-        id: discover
-        shell: bash
-        run: |
-          cargo metadata --format-version 1 --no-deps > "$RUNNER_TEMP/workspace.json"
-          python3 - <<'PYTHON' >> "$GITHUB_OUTPUT"
-          import json
-          import os
-          from pathlib import Path
-
-          metadata = json.loads((Path(os.environ["RUNNER_TEMP"]) / "workspace.json").read_text())
-          members = set(metadata["workspace_members"])
-          crates = sorted(package["name"] for package in metadata["packages"] if package["id"] in members)
-          print("matrix=" + json.dumps(crates))
-          PYTHON
-
+  # One job per OS keeps the checks list short. Each job tests every workspace
+  # crate separately and reports per-crate results in the run summary, with an
+  # error annotation naming each crate that failed.
   test:
-    name: test (${{ matrix.crate }}, ${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    needs: crates
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}-latest
     strategy:
-      # Report every crate's result even when another crate fails.
+      # Report every OS's result even when another OS fails.
       fail-fast: false
       matrix:
-        crate: ${{ fromJSON(needs.crates.outputs.matrix) }}
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu, macos, windows]
     steps:
       - uses: actions/checkout@v4
 
@@ -77,9 +53,41 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Test
-        run: cargo test --package "${{ matrix.crate }}"
+      # Crates come from `cargo metadata`, so new workspace members are tested
+      # automatically. A failing crate does not stop the remaining crates.
+      - name: Test each workspace crate
         shell: bash
+        env:
+          OS_NAME: ${{ matrix.os }}
+        run: |
+          crates=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[].name' | tr -d '\r' | sort)
+          {
+            echo "### Tests on $OS_NAME"
+            echo
+            echo "| Crate | Result |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=()
+          for crate in $crates; do
+            echo "::group::cargo test --package $crate"
+            if cargo test --package "$crate"; then
+              result="pass"
+            else
+              result="**FAIL**"
+              failed+=("$crate")
+            fi
+            echo "::endgroup::"
+            if [ "$result" != "pass" ]; then
+              echo "::error title=$crate tests failed on $OS_NAME::Reproduce with: cargo test --package $crate"
+            fi
+            echo "| \`$crate\` | $result |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "Failed crates: ${failed[*]}"
+            exit 1
+          fi
 
   audit:
     name: audit
@@ -98,11 +106,11 @@ jobs:
   gate:
     name: lint, test
     runs-on: ubuntu-latest
-    needs: [crates, lint, test, audit]
+    needs: [lint, test, audit]
     if: always()
     steps:
       - name: Fail if any required job did not succeed
-        if: needs.crates.result != 'success' || needs.lint.result != 'success' || needs.test.result != 'success' || needs.audit.result != 'success'
+        if: needs.lint.result != 'success' || needs.test.result != 'success' || needs.audit.result != 'success'
         run: exit 1
 
       - name: All checks passed
