@@ -1,7 +1,7 @@
 //! The layout-facing projection of the document tree.
 
 use common::ids::NodeId;
-use html::{HtmlDocument, NodeKind};
+use html::{HTMLDocument, NodeKind};
 
 /// The layout-facing projection of an HTML document.
 ///
@@ -16,7 +16,7 @@ pub struct StyledDom {
 impl StyledDom {
     /// Creates the first layout slice's projection: every HTML element is a
     /// visible block. CSS will eventually provide the style information.
-    pub fn from_html_document(document: &HtmlDocument) -> Self {
+    pub fn from_html_document(document: &HTMLDocument) -> Self {
         let nodes = document
             .nodes
             .iter()

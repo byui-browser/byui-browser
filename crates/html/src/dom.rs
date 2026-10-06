@@ -1,7 +1,4 @@
-use common::ids::NodeId as CommonNodeId;
-use std::collections::BTreeMap;
-
-/// A stable index into an [`HtmlDocument`] arena.
+/// A stable index into an [`HTMLDocument`] arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub usize);
 
@@ -9,15 +6,6 @@ impl NodeId {
     pub const fn index(self) -> usize {
         self.0
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Token {
-    Doctype(String),
-    Comment(String),
-    StartTag(String),
-    EndTag(String),
-    Text(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,33 +55,23 @@ pub struct SourceSpan {
     pub end: usize,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum QuirksMode {
-    #[default]
-    NoQuirks,
-    LimitedQuirks,
-    Quirks,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HtmlDocument {
+pub struct HTMLDocument {
     pub nodes: Vec<Node>,
     pub root: NodeId,
-    pub quirks_mode: QuirksMode,
 }
 
-impl Default for HtmlDocument {
+impl Default for HTMLDocument {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl HtmlDocument {
+impl HTMLDocument {
     pub fn new() -> Self {
         let mut document = Self {
             nodes: Vec::new(),
             root: NodeId(0),
-            quirks_mode: QuirksMode::NoQuirks,
         };
         let root = document.push_node(NodeKind::Document, None);
         document.root = root;
@@ -121,7 +99,7 @@ impl HtmlDocument {
     }
 
     pub fn text_content(&self, id: NodeId) -> String {
-        fn collect(document: &HtmlDocument, id: NodeId, output: &mut String) {
+        fn collect(document: &HTMLDocument, id: NodeId, output: &mut String) {
             let Some(node) = document.node(id) else {
                 return;
             };
@@ -149,40 +127,4 @@ impl HtmlDocument {
                 .map(|_| NodeId(index))
         })
     }
-}
-
-// Node API
-impl Node {
-
-}
-
-pub type HTMLDocument = HtmlDocument;
-
-/// Compatibility projection returned by the original selector API.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HTMLElement {
-    pub id: CommonNodeId,
-    pub name: String,
-    pub attributes: BTreeMap<String, String>,
-    pub parent: Option<CommonNodeId>,
-    pub children: Vec<CommonNodeId>,
-    pub text: String,
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Dom {
-    pub nodes: Vec<LegacyNode>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegacyNode {
-    pub id: CommonNodeId,
-    pub name: String,
-    pub parent: Option<CommonNodeId>,
-    pub text: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Location {
-    pub url: String,
 }
