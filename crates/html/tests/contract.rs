@@ -129,6 +129,112 @@ fn parses_attributes_and_boolean_attributes_as_ordered_values() {
 }
 
 #[test]
+fn node_matches_compound_selectors_but_not_relationship_selectors() {
+    let document =
+        parse_raw_html("<button id='save' class='action primary' disabled>Save</button>".to_owned());
+    let button_id = document.query_selector("button").expect("button").id.index() as usize;
+    let button = &document.nodes[button_id];
+
+    assert!(button.matches_selector("button#save.action.primary[disabled]"));
+    assert!(button.matches_selector("[id=save]"));
+    assert!(!button.matches_selector("button#cancel"));
+    assert!(!button.matches_selector("main button"));
+    assert!(!document.nodes[document.root.index()].matches_selector("button"));
+}
+
+#[test]
+fn document_selector_queries_support_compounds_relationships_lists_and_order() {
+    let document = parse_raw_html(
+        "<main id='root'><section class='panel'><p class='note' data-kind='tip'>one</p></section><p class='note'>two</p></main><p class='note'>three</p>".to_owned(),
+    );
+
+    let first = document
+        .query_selector("main#root > section.panel p.note[data-kind='tip']")
+        .expect("first matching paragraph");
+    assert_eq!(first.text, "one");
+
+    let notes = document.query_selector_all("main .note, p.note");
+    assert_eq!(notes.len(), 3);
+    assert_eq!(
+        notes
+            .iter()
+            .map(|node| node.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["one", "two", "three"]
+    );
+    assert_eq!(document.query("p.note").len(), 3);
+    assert!(document.query_selector("p.missing").is_none());
+    assert_eq!(document.query_selector_all("*").len(), 5);
+
+    let quoted_bracket = parse_raw_html("<p data-label='x]y'>value</p>".to_owned());
+    assert_eq!(
+        quoted_bracket
+            .query_selector("p[data-label='x]y']")
+            .expect("quoted bracket value")
+            .text,
+        "value"
+    );
+
+    let section_id = document
+        .query_selector("section.panel")
+        .expect("section")
+        .id
+        .index() as usize;
+    let section = &document.nodes[section_id];
+    let scoped = section.query_selector_all(&document, "main#root > section.panel p.note");
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].text, "one");
+}
+
+#[test]
+fn malformed_and_unsupported_selectors_do_not_match() {
+    let document = parse_raw_html("<div><p class='note'>text</p></div>".to_owned());
+
+    for selector in ["", "p >", "> p", "p,,div", "p:hover", "[class='note'"] {
+        assert!(
+            document.query_selector_all(selector).is_empty(),
+            "unexpected match for selector {selector:?}"
+        );
+    }
+}
+
+#[test]
+fn selector_results_follow_tree_order_not_arena_allocation_order() {
+    let mut document = HtmlDocument::new();
+    let first_allocated = document.push_node(
+        NodeKind::Element(ElementData {
+            name: "div".into(),
+            namespace: Namespace::Html,
+            attributes: vec![Attribute {
+                name: "id".into(),
+                value: "allocated-first".into(),
+            }],
+        }),
+        None,
+    );
+    let second_allocated = document.push_node(
+        NodeKind::Element(ElementData {
+            name: "div".into(),
+            namespace: Namespace::Html,
+            attributes: vec![Attribute {
+                name: "id".into(),
+                value: "tree-first".into(),
+            }],
+        }),
+        None,
+    );
+    document.append_child(document.root, second_allocated);
+    document.append_child(document.root, first_allocated);
+
+    let results = document.query_selector_all("div");
+    assert_eq!(results[0].attributes.get("id"), Some(&"tree-first".to_owned()));
+    assert_eq!(
+        results[1].attributes.get("id"),
+        Some(&"allocated-first".to_owned())
+    );
+}
+
+#[test]
 fn parse_5_nested_children_finds_the_text_node() {
     let document =
         parse_raw_html("<div><div><div><div><div>Hello</div></div></div></div></div>".to_owned());
