@@ -31,7 +31,7 @@ impl Query for HTMLDocument {
     }
 
     fn query_selector_all(&self, selector: &str) -> Vec<HTMLElement> {
-        query_within(self, self.root, true, selector)
+        matches_selector(self, self.root, true, selector)
     }
 }
 
@@ -47,16 +47,16 @@ pub(crate) fn query_from_node(
     else {
         return Vec::new();
     };
-    query_within(document, crate::NodeId(root), false, selector)
+    matches_selector(document, crate::NodeId(root), false, selector)
 }
 
-fn query_within(
+pub(crate) fn matches_selector(
     document: &HTMLDocument,
     root: crate::NodeId,
     include_root: bool,
     selector: &str,
 ) -> Vec<HTMLElement> {
-    let Some(groups) = parse_selector_list(selector) else {
+    let Some(groups) = parse_selector(selector) else {
         return Vec::new();
     };
     let mut matches = Vec::new();
@@ -88,27 +88,31 @@ fn query_within(
 }
 
 #[derive(Debug)]
-struct SelectorGroup {
-    compounds: Vec<CompoundSelector>,
-    combinators: Vec<Combinator>,
+pub(crate) struct SelectorGroup {
+    pub(crate) compounds: Vec<CompoundSelector>,
+    pub(crate) combinators: Vec<Combinator>,
 }
 
-#[derive(Debug)]
-enum Combinator {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Combinator {
     Descendant,
     Child,
 }
 
 #[derive(Debug, Default)]
-struct CompoundSelector {
-    universal: bool,
-    tag: Option<String>,
-    ids: Vec<String>,
-    classes: Vec<String>,
-    attributes: Vec<(String, Option<String>)>,
+pub(crate) struct CompoundSelector {
+    pub(crate) universal: bool,
+    pub(crate) tag: Option<String>,
+    pub(crate) ids: Vec<String>,
+    pub(crate) classes: Vec<String>,
+    pub(crate) attributes: Vec<(String, Option<String>)>,
 }
 
 fn parse_selector_list(selector: &str) -> Option<Vec<SelectorGroup>> {
+    parse_selector(selector)
+}
+
+pub(crate) fn parse_selector(selector: &str) -> Option<Vec<SelectorGroup>> {
     split_outside_attributes(selector, ',')?
         .into_iter()
         .map(parse_group)
@@ -390,7 +394,7 @@ fn matches_at(
     }
 }
 
-fn matches_compound(element: &ElementData, selector: &CompoundSelector) -> bool {
+pub(crate) fn matches_compound(element: &ElementData, selector: &CompoundSelector) -> bool {
     if selector
         .tag
         .as_ref()
@@ -457,6 +461,96 @@ fn project_element(
         parent,
         children,
         text: document.text_content(crate::NodeId(index)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Attribute, Namespace};
+
+    #[test]
+    fn parse_selector_builds_a_group_for_compound_and_relationship_selectors() {
+        let groups = parse_selector("main#root > section.panel p.note[data-kind='tip']").unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].compounds.len(), 3);
+        assert_eq!(groups[0].combinators, vec![Combinator::Child, Combinator::Descendant]);
+        assert_eq!(groups[0].compounds[0].ids, vec!["root"]);
+        assert_eq!(groups[0].compounds[1].classes, vec!["panel"]);
+        assert_eq!(groups[0].compounds[2].classes, vec!["note"]);
+        assert_eq!(groups[0].compounds[2].attributes, vec![("data-kind".to_string(), Some("tip".to_string()))]);
+    }
+
+    #[test]
+    fn parse_selector_rejects_malformed_inputs() {
+        for selector in ["", "p >", "> p", "p,,div", "p:hover", "[class='note'"] {
+            assert!(parse_selector(selector).is_none(), "selector unexpectedly parsed: {selector:?}");
+        }
+    }
+
+    #[test]
+    fn matches_selector_finds_matching_elements_in_document_order() {
+        let document = HTMLDocument::new();
+        let mut document = document;
+        let root = document.root;
+        let main = document.push_node(
+            NodeKind::Element(ElementData {
+                name: "main".into(),
+                namespace: Namespace::Html,
+                attributes: vec![Attribute {
+                    name: "id".into(),
+                    value: "root".into(),
+                }],
+            }),
+            None,
+        );
+        let section = document.push_node(
+            NodeKind::Element(ElementData {
+                name: "section".into(),
+                namespace: Namespace::Html,
+                attributes: vec![Attribute {
+                    name: "class".into(),
+                    value: "panel".into(),
+                }],
+            }),
+            None,
+        );
+        let par = document.push_node(
+            NodeKind::Element(ElementData {
+                name: "p".into(),
+                namespace: Namespace::Html,
+                attributes: vec![Attribute {
+                    name: "class".into(),
+                    value: "note".into(),
+                }],
+            }),
+            None,
+        );
+        let other = document.push_node(
+            NodeKind::Element(ElementData {
+                name: "p".into(),
+                namespace: Namespace::Html,
+                attributes: vec![Attribute {
+                    name: "class".into(),
+                    value: "other".into(),
+                }],
+            }),
+            None,
+        );
+
+        document.append_child(root, main);
+        document.append_child(main, section);
+        document.append_child(section, par);
+        document.append_child(root, other);
+
+        let matches = matches_selector(&document, document.root, true, "main#root > section.panel p.note");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "p");
+        assert_eq!(matches[0].text, "");
+
+        let node = &document.nodes[par.0];
+        assert!(node.matches_selector("p.note"));
+        assert!(!node.matches_selector("p.other"));
     }
 }
 

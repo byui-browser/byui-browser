@@ -187,6 +187,20 @@ fn document_selector_queries_support_compounds_relationships_lists_and_order() {
 }
 
 #[test]
+fn selector_queries_support_nested_class_and_attribute_rule_combinations() {
+    let document = parse_raw_html(
+        r#"<div class="SharedListContainer-module__primerActionBar__Tixik"><div data-component="ActionBar"><div role="toolbar">toolbar</div></div></div>"#
+            .to_owned(),
+    );
+
+    let matches = document.query_selector_all(
+        ".SharedListContainer-module__primerActionBar__Tixik [data-component=ActionBar] > [role=toolbar]",
+    );
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].text, "toolbar");
+}
+
+#[test]
 fn malformed_and_unsupported_selectors_do_not_match() {
     let document = parse_raw_html("<div><p class='note'>text</p></div>".to_owned());
 

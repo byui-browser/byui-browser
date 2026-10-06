@@ -153,7 +153,29 @@ impl HtmlDocument {
 
 // Node API
 impl Node {
+    pub fn query(&self, document: &HtmlDocument, selector: &str) -> Vec<crate::HTMLElement> {
+        crate::selector::query_from_node(document, self, selector)
+    }
 
+    pub fn query_selector(&self, document: &HtmlDocument, selector: &str) -> Option<crate::HTMLElement> {
+        self.query_selector_all(document, selector).into_iter().next()
+    }
+
+    pub fn query_selector_all(&self, document: &HtmlDocument, selector: &str) -> Vec<crate::HTMLElement> {
+        crate::selector::query_from_node(document, self, selector)
+    }
+
+    pub fn matches_selector(&self, selector: &str) -> bool {
+        let NodeKind::Element(element) = &self.kind else {
+            return false;
+        };
+        let Some(parsed) = crate::selector::parse_selector(selector) else {
+            return false;
+        };
+        parsed.iter().any(|group| {
+            group.compounds.iter().all(|compound| crate::selector::matches_compound(element, compound))
+        })
+    }
 }
 
 pub type HTMLDocument = HtmlDocument;
