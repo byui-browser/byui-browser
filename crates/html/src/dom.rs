@@ -173,6 +173,24 @@ impl HTMLDocument {
         output
     }
 
+    /// Returns the source text of inline `script` elements in tree order.
+    ///
+    /// External scripts are not fetched yet, so only the text contained by
+    /// each `script` element is returned. The returned strings are snapshots;
+    /// evaluating them does not mutate this document.
+    pub fn script_sources(&self) -> Vec<String> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                let NodeKind::Element(element) = &node.kind else {
+                    return None;
+                };
+                (element.name == "script").then(|| self.text_content(NodeId(index)))
+            })
+            .collect()
+    }
+
     pub fn get_element_by_id(&self, value: &str) -> Option<NodeId> {
         fn find_in_tree(document: &HTMLDocument, parent: NodeId, value: &str) -> Option<NodeId> {
             let children = document.node(parent)?.children.clone();
