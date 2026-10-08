@@ -1,12 +1,20 @@
-//! Box tree construction and layout (block, inline, flex, grid).
+//! Box tree construction and layout.
 //!
-//! **Owning team**: Layout & Rendering Team
-//!
-//! Planned interface (architecture §3.2):
-//! `layout_tree(styled_dom, viewport) -> LayoutTree`
-//!
-//! Layout never talks directly to the GPU.
+//! This crate converts the HTML/CSS-facing document projection into layout
+//! boxes in CSS pixels. It sits between [`html`] and `paint`; it does not
+//! rasterize pixels or talk to a GPU.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
-// TODO(layout): Implement box tree and layout algorithms.
+mod geometry;
+mod layout;
+mod rectangle;
+mod styled_dom;
+mod tree;
+
+pub use geometry::{Rect, Size};
+pub use layout::layout_tree;
+pub use rectangle::create_rectangle;
+pub use styled_dom::{StyledDom, html_node_id};
+pub use tree::{LayoutBox, LayoutTree};

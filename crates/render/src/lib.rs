@@ -1,10 +1,18 @@
-//! GPU rendering, layer composition, and compositor.
+//! Software rasterization and compositor primitives.
 //!
-//! **Owning team**: Layout & Rendering Team
-//!
-//! Consumes display lists / layer trees from `paint` and produces pixels
-//! (or GPU command streams). Runs in the GPU / Compositor process.
+//! This crate consumes paint commands and produces an RGBA8 frame in device
+//! pixels. It is the final stage of this slice; it does not perform layout or
+//! HTML parsing. The current implementation uses a small built-in bitmap font
+//! and a software buffer rather than a GPU.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
-// TODO(render): Implement compositor and GPU backend (wgpu).
+mod compositor;
+mod display_item;
+mod fonts;
+mod frame;
+
+pub use compositor::Compositor;
+pub use display_item::DisplayItem;
+pub use frame::Frame;
