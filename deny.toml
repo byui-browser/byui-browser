@@ -1,0 +1,38 @@
+# cargo-deny configuration — dependency advisories, licenses, and sources.
+# Enforced by the `audit` job in .github/workflows/ci.yml (architecture §5).
+#
+# Run locally with: cargo deny check
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Permissive licenses compatible with this project's MIT license.
+# Add to this list only with Security & Storage team review.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # Mozilla's root certificate data, shipped by webpki-roots (via reqwest).
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+# Workspace crates depend on each other by path with no version, which
+# cargo-deny counts as a wildcard. Exempting only path dependencies
+# (`allow-wildcard-paths`) requires every crate to set `publish = false`, so
+# this stays "allow" until the manifests do.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
