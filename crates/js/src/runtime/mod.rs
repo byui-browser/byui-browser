@@ -1,7 +1,8 @@
 //! Tree-walk interpreter for parsed programs.
 //!
 //! Supports expressions, `var`/`let`/`const` declarations, blocks, `if`,
-//! `while`, function declarations with closures, calls, and `return`.
+//! `while`, function declarations with closures, calls, `return`, and member
+//! access (`object.name`, `object[key]`, and assignment to either).
 //!
 //! Semantics follow ECMAScript where supported: `var` and function
 //! declarations are hoisted to the enclosing function or script, `let` and
@@ -10,6 +11,10 @@
 //!
 //! Limitations:
 //! - Assigning to an undeclared name is an error, as in strict mode.
+//! - Member access works only on [`Object`] values. Reading a property of any
+//!   other value, including strings and functions, is a runtime error, and so
+//!   is reading a property the object does not have (JavaScript would return
+//!   `undefined`). Methods are called without `this`.
 //! - There is no garbage collector yet. A function stored in the scope it
 //!   closes over forms an `Arc` cycle, so its scope is never freed.
 //! - Evaluation runs on a dedicated engine thread with a large stack. Deep
@@ -20,20 +25,24 @@
 //!   endless loops fail with an error instead of running forever.
 
 mod conversions;
+mod object;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::ast::{
-    BinaryOperator, Expr, LogicalOperator, Program, Statement, UnaryOperator, VarKind,
+    BinaryOperator, Expr, LogicalOperator, MemberProperty, Program, Statement, UnaryOperator,
+    VarKind,
 };
 use crate::stack::{StackGuard, with_engine_stack};
 use crate::{HostFunction, JsError, JsResult, Value};
 pub(crate) use conversions::number_to_string;
 use conversions::{
-    is_truthy, less_than, loose_equals, strict_equals, to_int32, to_number, to_primitive, to_uint32,
+    is_truthy, less_than, loose_equals, strict_equals, to_int32, to_number, to_primitive,
+    to_property_key, to_uint32,
 };
+pub use object::Object;
 
 const STACK_OVERFLOW: &str = "Maximum call stack size exceeded";
 
@@ -340,26 +349,29 @@ pub fn evaluate_program_with_step_limit(program: &Program, step_limit: u64) -> J
 
 /// Evaluates a program with caller-provided resource limits.
 pub fn evaluate_program_with_limits(program: &Program, limits: ExecutionLimits) -> JsResult<Value> {
-    evaluate_program_with_globals(program, &HashMap::new(), limits)
+    evaluate_program_with_globals(program, &HashMap::new(), &HashMap::new(), limits)
 }
 
-/// Evaluates a program with `globals` installed as callable functions in a
-/// scope enclosing the script, so scripts may shadow them with `let`.
+/// Evaluates a program with `functions` and `values` installed in a scope
+/// enclosing the script, so scripts may shadow them with `let`.
 pub(crate) fn evaluate_program_with_globals(
     program: &Program,
-    globals: &HashMap<String, HostFunction>,
+    functions: &HashMap<String, HostFunction>,
+    values: &HashMap<String, Value>,
     limits: ExecutionLimits,
 ) -> JsResult<Value> {
     with_engine_stack(|| {
         let global_scope: ScopeRef = Arc::default();
-        for (name, function) in globals {
+        let functions = functions.iter().map(|(name, function)| {
+            let function = Function::from_host(name, Arc::clone(function));
+            (name, Value::Function(function))
+        });
+        let values = values.iter().map(|(name, value)| (name, value.clone()));
+        for (name, value) in functions.chain(values) {
             global_scope.lock_scope().bindings.insert(
                 name.clone(),
                 Binding {
-                    value: Some(Value::Function(Function::from_host(
-                        name,
-                        Arc::clone(function),
-                    ))),
+                    value: Some(value),
                     mutable: true,
                     lexical: false,
                 },
@@ -603,9 +615,9 @@ impl Interpreter {
                     .map(|argument| self.evaluate(argument, scope))
                     .collect::<JsResult<Vec<_>>>()?;
                 let Value::Function(function) = function else {
-                    let description = match callee.as_ref() {
-                        Expr::Identifier(name) => format!("`{name}`"),
-                        _ => "expression".to_owned(),
+                    let description = match describe(callee) {
+                        Some(path) => format!("`{path}`"),
+                        None => "expression".to_owned(),
                     };
                     return Err(JsError::with_context(
                         crate::JsErrorCategory::Runtime,
@@ -615,6 +627,46 @@ impl Interpreter {
                 };
                 self.call(&function, &arguments)
             }
+            Expr::Member { object, property } => {
+                let target = self.evaluate(object, scope)?;
+                let key = self.property_key(property, scope)?;
+                let Value::Object(target) = target else {
+                    return Err(non_object(&target, "read", &key, "property access"));
+                };
+                target.get(&key).ok_or_else(|| {
+                    let description = match describe(expression) {
+                        Some(path) => format!("`{path}`"),
+                        None => format!("Property `{key}`"),
+                    };
+                    JsError::with_context(
+                        crate::JsErrorCategory::Runtime,
+                        format!("{description} is not defined"),
+                        "property access",
+                    )
+                })
+            }
+            Expr::MemberAssign {
+                object,
+                property,
+                value,
+            } => {
+                let target = self.evaluate(object, scope)?;
+                let key = self.property_key(property, scope)?;
+                let value = self.evaluate(value, scope)?;
+                let Value::Object(target) = target else {
+                    return Err(non_object(&target, "set", &key, "property assignment"));
+                };
+                target.set(key, value.clone());
+                Ok(value)
+            }
+        }
+    }
+
+    /// Evaluates a member expression's property to its string key.
+    fn property_key(&mut self, property: &MemberProperty, scope: &ScopeRef) -> JsResult<String> {
+        match property {
+            MemberProperty::Named(name) => Ok(name.clone()),
+            MemberProperty::Computed(key) => Ok(to_property_key(&self.evaluate(key, scope)?)),
         }
     }
 
@@ -653,6 +705,37 @@ impl Interpreter {
             }),
         }
     }
+}
+
+/// Describes an identifier or a chain of `.name` accesses on one, such as
+/// `console.log`, for error messages. Other expressions return `None`.
+fn describe(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Identifier(name) => Some(name.clone()),
+        Expr::Member {
+            object,
+            property: MemberProperty::Named(name),
+        } => describe(object).map(|path| format!("{path}.{name}")),
+        _ => None,
+    }
+}
+
+/// The error for reading or setting property `key` of a non-object value.
+fn non_object(value: &Value, action: &str, key: &str, context: &str) -> JsError {
+    let kind = match value {
+        Value::Undefined => "undefined",
+        Value::Null => "null",
+        Value::Boolean(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Function(_) => "a function",
+        Value::Object(_) => "an object",
+    };
+    JsError::with_context(
+        crate::JsErrorCategory::Runtime,
+        format!("Cannot {action} property `{key}` of {kind}"),
+        context,
+    )
 }
 
 /// Declares every `var` in a function or script body, including those nested
