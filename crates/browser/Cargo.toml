@@ -11,6 +11,9 @@ rust-version.workspace = true
 name = "browser"
 path = "src/main.rs"
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 common = { workspace = true }
 html = { workspace = true }

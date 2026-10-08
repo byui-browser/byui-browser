@@ -317,3 +317,16 @@ fn keeps_incomplete_tag_text_and_unterminated_attribute_values() {
             })
     ));
 }
+
+#[test]
+fn extracts_inline_script_sources_in_document_order() {
+    let document = parse_raw_html(
+        "<script>print()</script><div><script>fetch('https://example.com')</script></div>"
+            .to_owned(),
+    );
+
+    assert_eq!(
+        document.script_sources(),
+        ["print()", "fetch('https://example.com')"]
+    );
+}
