@@ -1,4 +1,5 @@
 //Tool to hover over elements in on the page and view their HTML tags
+const DISPLAY_LOCATION = document.body //note: will need to append to the dev tools window, not the body as it does now
 
 //Add required css to the page
 const hoverStyles = document.createElement('style');
@@ -13,7 +14,7 @@ document.head.append(hoverStyles);
 
 //add div for element info display
 const elementDetails = document.createElement('div');
-document.body.append(elementDetails); //note: will need to append to the dev tools window, no the body as it does now
+DISPLAY_LOCATION.append(elementDetails); 
 
 //set devtool button to be toggleable
 const toggleButton = document.getElementById("hover-inspect");
