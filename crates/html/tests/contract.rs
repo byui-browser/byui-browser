@@ -120,6 +120,46 @@ fn valid_fixture_has_expected_arena_shape_and_text() {
 }
 
 #[test]
+fn get_element_by_id_returns_the_first_matching_descendant_in_tree_order() {
+    let document = parse_raw_html(
+        "<div id='duplicate'><span id='target'></span></div><p id='target'></p>".to_owned(),
+    );
+
+    let first_target = document
+        .get_element_by_id("target")
+        .expect("target element");
+    assert_eq!(document.nodes[first_target.0].parent, Some(html::NodeId(1)));
+}
+
+#[test]
+fn get_element_by_id_matches_exactly_and_ignores_detached_nodes() {
+    let mut document = parse_raw_html("<div id='target'></div>".to_owned());
+    let detached = document.push_node(
+        NodeKind::Element(ElementData {
+            name: "span".into(),
+            namespace: Namespace::Html,
+            attributes: vec![Attribute {
+                name: "id".into(),
+                value: "detached".into(),
+            }],
+        }),
+        None,
+    );
+
+    assert_eq!(document.get_element_by_id("TARGET"), None);
+    assert_eq!(document.get_element_by_id("detached"), None);
+    assert_eq!(document.get_element_by_id("target"), Some(html::NodeId(1)));
+    assert_eq!(document.node(detached).unwrap().parent, None);
+}
+
+#[test]
+fn get_element_by_id_accepts_an_empty_id() {
+    let document = parse_raw_html("<div id=''></div>".to_owned());
+
+    assert_eq!(document.get_element_by_id(""), Some(html::NodeId(1)));
+}
+
+#[test]
 fn parses_attributes_and_boolean_attributes_as_ordered_values() {
     let document = parse_raw_html("<input disabled class='field' data-count=3>".to_owned());
     let input = document.query("input").pop().expect("input");

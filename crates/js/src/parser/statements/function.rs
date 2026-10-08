@@ -1,18 +1,30 @@
-// TODO(parser): Add function-declaration token parsing once the lexer exposes
-// `function`, identifiers, parameter delimiters, and braces.
-
+use super::super::{ParseResult, Parser};
 use crate::ast::Statement;
+use crate::lexer::Token;
 
-impl Statement {
-    pub(super) fn function_declaration(
-        name: impl Into<String>,
-        params: Vec<String>,
-        body: Vec<Self>,
-    ) -> Self {
-        Self::FunctionDeclaration {
-            name: name.into(),
-            params,
-            body,
+pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Statement> {
+    parser.expect(&Token::Function, "function declaration")?;
+    let name = parser.identifier("function declaration")?;
+    parser.expect(&Token::LeftParen, "function parameters")?;
+    let mut params = Vec::new();
+    if !parser.consume(&Token::RightParen) {
+        loop {
+            if matches!(parser.peek(), Some(Token::Identifier(name)) if params.contains(name)) {
+                return Err(parser.error("Duplicate parameter name", "function parameters"));
+            }
+            params.push(parser.identifier("function parameters")?);
+            if !parser.consume(&Token::Comma) {
+                break;
+            }
         }
+        parser.expect(&Token::RightParen, "function parameters")?;
     }
+    parser.function_depth += 1;
+    let body = super::block::parse(parser);
+    parser.function_depth -= 1;
+    Ok(Statement::FunctionDeclaration {
+        name,
+        params,
+        body: body?,
+    })
 }

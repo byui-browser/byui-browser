@@ -29,6 +29,15 @@ If neither is available, push the branch and give the user the
 `https://github.com/<owner>/<repo>/compare/main...<branch>` link to open the PR
 by hand.
 
+**Work in the terminal, never through a browser or GUI.** Every step in this
+skill is a shell command (`git`, `cargo`, `make`, `gh`) or a GitHub API/MCP
+call. Do not open, drive, or ask for permission to control Safari, Chrome,
+Finder, or any other application, and do not ask the user to grant
+Accessibility, Automation, or screen-control access; this applies to the
+ChatGPT desktop app and Codex as much as to any other agent. If you cannot
+run the command yourself, say so and give the user the exact command to run,
+not a GUI walkthrough.
+
 ## Audience
 
 This is a class project. Keep two readers in mind:
@@ -179,6 +188,8 @@ This is a class project. Keep two readers in mind:
 ## Guardrails
 
 - Never push to `main`, merge, or approve a PR.
+- Never control a browser or desktop application, or request OS permissions
+  to do so. Use shell commands and GitHub API/MCP tools only.
 - Never report a check as passing unless you ran it and it passed.
 - Never push or open a PR without having run `make lint` and `make test`
   locally in this session; local validation is not optional and CI is not a

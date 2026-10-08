@@ -1,6 +1,3 @@
-// TODO(parser): Add assignment-token parsing once the lexer exposes
-// identifiers and `=`.
-
 use crate::ast::Expr;
 
 pub(super) fn build(name: impl Into<String>, value: Expr) -> Expr {

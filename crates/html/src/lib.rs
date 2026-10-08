@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 mod dom;
+mod escape_characters;
 mod parser;
 mod selector;
 mod tokenizer;

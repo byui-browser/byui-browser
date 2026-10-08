@@ -2,6 +2,18 @@
 
 use reqwest::{Method, header::HeaderMap};
 
+/// Request data after URL policy validation has produced the parsed URL.
+///
+/// This remains crate-private so the public request API continues to accept
+/// the existing string URL while the scheduler and transport share one parse.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedRequest {
+    /// Original request, including headers and body prepared by the controller.
+    pub(crate) request: Request,
+    /// Parsed and policy-validated request URL.
+    pub(crate) url: reqwest::Url,
+}
+
 /// Controls the browser context in which a request was initiated.
 #[derive(Clone, Debug, Default)]
 pub struct FetchContext {
@@ -67,6 +79,11 @@ impl Request {
         }
     }
 
+    /// Returns whether this request method may use the response cache.
+    ///
+    /// Only methods whose semantics are read-only are admitted by the current
+    /// cache implementation. Request headers, body, and cache mode are
+    /// evaluated by the controller separately.
     pub(crate) fn is_cacheable_method(&self) -> bool {
         matches!(self.method, Method::GET | Method::HEAD)
     }

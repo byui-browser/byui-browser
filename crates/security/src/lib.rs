@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod permissions;
+
 use std::fmt;
 
 /// A web origin: scheme, host, port. Two documents may touch each other's

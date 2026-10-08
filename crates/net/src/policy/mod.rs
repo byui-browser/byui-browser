@@ -2,19 +2,31 @@
 
 use crate::{error::RequestError, request::Request, response::Response};
 
+/// Validates URL and browser request/response policy at the controller boundary.
+///
+/// Transport performs HTTP I/O only; this type is where browser-facing policy
+/// checks can evolve without coupling them to reqwest.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RequestPolicy;
 
 impl RequestPolicy {
-    pub(crate) fn validate_request(&self, request: &Request) -> Result<(), RequestError> {
+    /// Rejects malformed URLs and schemes unsupported by the HTTP transport.
+    ///
+    /// Validation happens before cookies are attached or a scheduler permit is
+    /// acquired, so invalid requests fail without side effects or network work.
+    pub(crate) fn validate_request(&self, request: &Request) -> Result<reqwest::Url, RequestError> {
         let url = reqwest::Url::parse(&request.url)
             .map_err(|_| RequestError::InvalidUrl(request.url.clone()))?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err(RequestError::UnsupportedScheme(url.scheme().to_owned()));
         }
-        Ok(())
+        Ok(url)
     }
 
+    /// Validates response policy after transport headers have arrived.
+    ///
+    /// The initial implementation accepts all responses; the method remains a
+    /// separate hook for future status, redirect, or response-security rules.
     pub(crate) fn validate_response(
         &self,
         _request: &Request,
@@ -50,6 +62,40 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, RequestError::InvalidUrl(url) if url == "not a URL"));
+    }
+
+    #[test]
+    fn rejects_relative_urls() {
+        let error = RequestPolicy
+            .validate_request(&Request::get("/relative/path"))
+            .unwrap_err();
+
+        assert!(matches!(error, RequestError::InvalidUrl(url) if url == "/relative/path"));
+    }
+
+    #[test]
+    fn rejects_urls_with_invalid_ports() {
+        for value in [
+            "http://example.test:not-a-port/",
+            "http://example.test:65536/",
+        ] {
+            let error = RequestPolicy
+                .validate_request(&Request::get(value))
+                .unwrap_err();
+
+            assert!(matches!(error, RequestError::InvalidUrl(url) if url == value));
+        }
+    }
+
+    #[test]
+    fn accepts_uppercase_http_urls_and_returns_normalized_url() {
+        let url = RequestPolicy
+            .validate_request(&Request::get("HTTP://EXAMPLE.TEST/Path"))
+            .unwrap();
+
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("example.test"));
+        assert_eq!(url.path(), "/Path");
     }
 
     #[test]
