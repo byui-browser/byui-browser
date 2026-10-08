@@ -18,6 +18,7 @@
 // TODO(net): Add persistent cookie storage, strict CORS, and HTTP/3 transport.
 
 mod cache;
+mod cancellation;
 mod config;
 mod controller;
 mod cookies;
@@ -32,8 +33,13 @@ mod transport;
 #[cfg(test)]
 mod tests;
 
+pub use cancellation::{AbortController, AbortSignal};
 pub use config::Config;
 pub use controller::RequestController;
 pub use error::RequestError;
-pub use request::{CacheMode, CredentialsMode, FetchContext, Request, RequestMode};
+pub use request::{
+    CacheMode, CredentialsMode, FetchContext, HeaderList, InitiatorType, Origin, RedirectMode,
+    Referrer, ReferrerPolicy, Request, RequestBody, RequestDestination, RequestMode,
+    RequestPriority, ServiceWorkersMode,
+};
 pub use response::{Response, ResponseBody, StreamingResponse};

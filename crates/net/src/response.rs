@@ -6,9 +6,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use reqwest::{StatusCode, header::HeaderMap};
 
+use crate::cancellation::AbortSignal;
 use crate::error::RequestError;
 
 type BoxedResponseStream = Pin<Box<dyn Stream<Item = Result<Bytes, RequestError>> + Send>>;
@@ -59,9 +60,44 @@ impl ResponseBody {
 
     /// Creates a one-item stream for a body that is already buffered.
     pub(crate) fn once(body: Vec<u8>) -> Self {
-        Self::from_stream(futures_util::stream::once(
-            async move { Ok(Bytes::from(body)) },
-        ))
+        Self::from_stream_with_signal(
+            futures_util::stream::once(async move { Ok(Bytes::from(body)) }),
+            AbortSignal::new(),
+        )
+    }
+
+    /// Creates a buffered response stream that observes a request signal.
+    pub(crate) fn once_with_signal(body: Vec<u8>, signal: AbortSignal) -> Self {
+        Self::from_stream_with_signal(
+            futures_util::stream::once(async move { Ok(Bytes::from(body)) }),
+            signal,
+        )
+    }
+
+    /// Wraps a byte stream so aborting its signal terminates it with an error.
+    pub(crate) fn from_stream_with_signal<S>(stream: S, signal: AbortSignal) -> Self
+    where
+        S: Stream<Item = Result<Bytes, RequestError>> + Send + 'static,
+    {
+        let stream = futures_util::stream::unfold(
+            (Some(Box::pin(stream)), signal),
+            |(stream, signal)| async move {
+                let mut stream = stream?;
+                if signal.is_aborted() {
+                    return Some((Err(RequestError::Aborted), (None, signal)));
+                }
+
+                tokio::select! {
+                    _ = signal.cancelled() => {
+                        Some((Err(RequestError::Aborted), (None, signal)))
+                    }
+                    item = stream.next() => {
+                        item.map(|item| (item, (Some(stream), signal)))
+                    }
+                }
+            },
+        );
+        Self::from_stream(stream)
     }
 
     /// Separates the body stream from the permit that keeps a request admitted.
@@ -132,5 +168,30 @@ impl std::fmt::Debug for StreamingResponse {
             .field("body", &self.body)
             .field("from_cache", &self.from_cache)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::{StreamExt, stream};
+
+    use super::*;
+    use crate::AbortController;
+
+    #[test]
+    fn a_pending_response_stream_ends_with_aborted_error() {
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let controller = AbortController::new();
+        let mut body = ResponseBody::from_stream_with_signal(
+            stream::pending::<Result<Bytes, RequestError>>(),
+            controller.signal(),
+        );
+        controller.abort();
+
+        let item = runtime
+            .block_on(body.next())
+            .expect("abort should produce an item");
+
+        assert!(matches!(item, Err(RequestError::Aborted)));
     }
 }

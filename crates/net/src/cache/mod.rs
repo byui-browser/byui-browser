@@ -22,12 +22,22 @@ pub(crate) struct ResponseCache {
 impl ResponseCache {
     /// Returns a fresh cached response for the request, if one exists.
     pub(crate) fn get(&self, request: &Request, url: &Url) -> Option<Response> {
+        self.get_with_staleness(request, url, false)
+    }
+
+    /// Returns a cached response, optionally allowing an expired entry.
+    pub(crate) fn get_with_staleness(
+        &self,
+        request: &Request,
+        url: &Url,
+        allow_stale: bool,
+    ) -> Option<Response> {
         let key = cache_key(request, url);
         // Clone the response while the read lock is held, then release the lock
         // before returning so callers never hold cache state during network work.
         let entries = self.entries.read().expect("cache lock poisoned");
         let cached = entries.get(&key)?;
-        (cached.expires_at > Instant::now()).then(|| cached.as_response())
+        (allow_stale || cached.expires_at > Instant::now()).then(|| cached.as_response())
     }
 
     /// Stores a successful response when its headers provide a positive TTL.

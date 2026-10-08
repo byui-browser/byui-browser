@@ -13,6 +13,8 @@ pub enum RequestError {
     UnsupportedScheme(String),
     /// The scheduler was shut down before the request could run.
     SchedulerClosed,
+    /// The request was aborted before completion.
+    Aborted,
 }
 
 impl std::fmt::Display for RequestError {
@@ -24,6 +26,7 @@ impl std::fmt::Display for RequestError {
             Self::CacheMiss => f.write_str("Request is not available in the HTTP cache"),
             Self::UnsupportedScheme(scheme) => write!(f, "Unsupported URL scheme: {scheme}"),
             Self::SchedulerClosed => f.write_str("Request scheduler is closed"),
+            Self::Aborted => f.write_str("Request was aborted"),
         }
     }
 }

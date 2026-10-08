@@ -7,7 +7,7 @@ use std::{
     thread,
 };
 
-use crate::{CacheMode, Config, Request, RequestController, RequestError};
+use crate::{AbortController, CacheMode, Config, Request, RequestController, RequestError};
 use futures_util::StreamExt;
 use reqwest::{
     Method, StatusCode,
@@ -36,15 +36,18 @@ fn custom_request_preserves_headers_and_body() {
     let request = Request {
         method: Method::POST,
         url: "https://example.com/api".into(),
-        headers,
-        body: Some(br#"{"ok":true}"#.to_vec()),
+        headers: headers.into(),
+        body: Some(crate::RequestBody::bytes(br#"{"ok":true}"#.to_vec())),
         cache_mode: CacheMode::NoStore,
-        context: Default::default(),
+        ..Request::get("https://example.com/api")
     };
 
     assert_eq!(request.method, Method::POST);
-    assert_eq!(request.headers["content-type"], "application/json");
-    assert_eq!(request.body.as_deref(), Some(br#"{"ok":true}"#.as_slice()));
+    assert_eq!(request.headers.iter().next().unwrap().1, "application/json");
+    assert_eq!(
+        request.body,
+        Some(crate::RequestBody::bytes(br#"{"ok":true}"#.to_vec()))
+    );
     assert_eq!(request.cache_mode, CacheMode::NoStore);
 }
 
@@ -72,6 +75,20 @@ fn invalid_urls_return_typed_errors() {
         .unwrap_err();
 
     assert!(matches!(error, RequestError::InvalidUrl(url) if url == "not a URL"));
+}
+
+#[test]
+fn an_aborted_request_fails_before_network_work() {
+    let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let controller = AbortController::new();
+    let mut request = Request::get("http://127.0.0.1:1");
+    request.signal = controller.signal();
+    controller.abort();
+
+    let error = runtime.block_on(client.fetch(request)).unwrap_err();
+
+    assert!(matches!(error, RequestError::Aborted));
 }
 
 #[test]

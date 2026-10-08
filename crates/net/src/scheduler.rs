@@ -64,12 +64,17 @@ impl RequestScheduler {
         request: PreparedRequest,
         _priority: RequestPriority,
     ) -> Result<StreamingResponse, RequestError> {
-        let permit = self
-            .permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| RequestError::SchedulerClosed)?;
+        if request.request.signal.is_aborted() {
+            return Err(RequestError::Aborted);
+        }
+        let permit = self.permits.clone().acquire_owned();
+        let permit = tokio::select! {
+            _ = request.request.signal.cancelled() => return Err(RequestError::Aborted),
+            permit = permit => permit.map_err(|_| RequestError::SchedulerClosed)?,
+        };
+        if request.request.signal.is_aborted() {
+            return Err(RequestError::Aborted);
+        }
         let mut response = self.transport.send(request).await?;
         response.body.attach_permit(permit);
         Ok(response)

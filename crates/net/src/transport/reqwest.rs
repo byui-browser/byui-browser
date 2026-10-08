@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use reqwest::Client;
+use reqwest::header::{HeaderValue, REFERER};
 
 use crate::{
     config::Config,
@@ -70,11 +71,25 @@ impl Transport for ReqwestTransport {
         let client = self.client.clone();
         Box::pin(async move {
             let PreparedRequest { request, url } = request;
-            let mut builder = client.request(request.method, url).headers(request.headers);
-            if let Some(body) = request.body {
-                builder = builder.body(body);
+            if request.signal.is_aborted() {
+                return Err(RequestError::Aborted);
             }
-            let response = builder.send().await?;
+            let signal = request.signal.clone();
+            let mut headers = request.headers.to_reqwest();
+            headers.remove(REFERER);
+            if let Some(referrer) = request.referrer_value(&url) {
+                if let Ok(value) = HeaderValue::try_from(referrer) {
+                    headers.insert(REFERER, value);
+                }
+            }
+            let mut builder = client.request(request.method, url).headers(headers);
+            if let Some(body) = request.body {
+                builder = builder.body(body.as_bytes().to_vec());
+            }
+            let response = tokio::select! {
+                _ = signal.cancelled() => return Err(RequestError::Aborted),
+                response = builder.send() => response?,
+            };
             let status = response.status();
             let headers = response.headers().clone();
             let response_url = response.url().to_string();
@@ -86,7 +101,7 @@ impl Transport for ReqwestTransport {
                 status,
                 headers,
                 url: response_url,
-                body: ResponseBody::from_stream(body),
+                body: ResponseBody::from_stream_with_signal(body, signal),
                 from_cache: false,
             })
         })

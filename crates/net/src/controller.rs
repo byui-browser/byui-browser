@@ -13,7 +13,7 @@ use crate::{
     policy::RequestPolicy,
     request::{CacheMode, PreparedRequest, Request},
     response::{Response, ResponseBody, StreamingResponse},
-    scheduler::{RequestPriority, RequestScheduler},
+    scheduler::RequestScheduler,
     transport::reqwest_transport,
 };
 
@@ -95,24 +95,38 @@ impl RequestController {
     /// chunks are delivered as the transport receives them. A network response
     /// is inserted into the cache only after the caller consumes the stream to
     /// completion; dropped or failed streams are not cached.
-    pub async fn fetch_stream(&self, request: Request) -> Result<StreamingResponse, RequestError> {
+    pub async fn fetch_stream(
+        &self,
+        mut request: Request,
+    ) -> Result<StreamingResponse, RequestError> {
+        if request.signal.is_aborted() {
+            return Err(RequestError::Aborted);
+        }
         let url = self.inner.policy.validate_request(&request)?;
+        request.url_list = vec![url.clone()];
 
         let cacheable = request.is_cacheable_method();
-        if cacheable
-            && matches!(
-                request.cache_mode,
-                CacheMode::Default | CacheMode::OnlyIfCached
-            )
-        {
-            if let Some(response) = self.inner.cache.get(&request, &url) {
-                return Ok(StreamingResponse {
-                    status: response.status,
-                    headers: response.headers,
-                    url: response.url,
-                    body: ResponseBody::once(response.body),
-                    from_cache: true,
-                });
+        let cache_lookup = match request.cache_mode {
+            CacheMode::Default | CacheMode::OnlyIfCached => Some(false),
+            CacheMode::ForceCache => Some(true),
+            CacheMode::NoStore | CacheMode::Reload | CacheMode::NoCache => None,
+        };
+        if cacheable {
+            if let Some(allow_stale) = cache_lookup {
+                if let Some(response) =
+                    self.inner
+                        .cache
+                        .get_with_staleness(&request, &url, allow_stale)
+                {
+                    // Return information about the response to the devtools and other observers, but do not allow the body to be consumed until the caller polls it.
+                    return Ok(StreamingResponse {
+                        status: response.status,
+                        headers: response.headers,
+                        url: response.url,
+                        body: ResponseBody::once_with_signal(response.body, request.signal.clone()),
+                        from_cache: true,
+                    });
+                }
             }
             if request.cache_mode == CacheMode::OnlyIfCached {
                 return Err(RequestError::CacheMiss);
@@ -133,7 +147,7 @@ impl RequestController {
                     request: request.clone(),
                     url: url.clone(),
                 },
-                RequestPriority::Normal,
+                request.transport_priority(),
             )
             .await?;
 

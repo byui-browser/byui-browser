@@ -12,7 +12,7 @@ common = { workspace = true }
 bytes = "1"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream", "gzip", "brotli", "deflate", "zstd"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 
 [lints]
 workspace = true
