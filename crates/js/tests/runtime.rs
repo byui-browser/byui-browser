@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use js::{HostFunction, JsResult, Realm, Value, eval};
+use js::{HostFunction, JsErrorCategory, JsResult, Realm, Value, eval, eval_with_limits};
 
 fn number(value: f64) -> JsResult<Value> {
     Ok(Value::Number(value))
@@ -262,6 +262,8 @@ fn functions_are_values_compared_by_identity() {
 fn calling_a_non_function_is_an_error() {
     let error = eval("let x = 1; x()").unwrap_err();
     assert!(error.message.contains("not a function"), "{error}");
+    assert_eq!(error.category, JsErrorCategory::Runtime);
+    assert_eq!(error.context.as_deref(), Some("function call"));
 }
 
 #[test]
@@ -290,6 +292,73 @@ fn step_limit_counts_statements_and_expressions() {
         number(3.0)
     );
     assert!(js::runtime::evaluate_program_with_step_limit(&program, 3).is_err());
+}
+
+#[test]
+fn callers_can_configure_loop_limits_and_get_structured_diagnostics() {
+    let error = eval_with_limits(
+        "while (true) {}",
+        js::runtime::ExecutionLimits {
+            step_limit: 100_000,
+            call_depth_limit: 100,
+            loop_iteration_limit: 3,
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.category, JsErrorCategory::Limit);
+    assert_eq!(error.message, "Script exceeded the loop iteration limit");
+    assert_eq!(error.context.as_deref(), Some("while loop iteration"));
+}
+
+#[test]
+fn loop_limit_allows_exactly_the_configured_number_of_iterations() {
+    let limits = js::runtime::ExecutionLimits {
+        loop_iteration_limit: 3,
+        ..js::runtime::ExecutionLimits::default()
+    };
+    assert_eq!(
+        eval_with_limits("let i = 0; while (i < 3) { i = i + 1; } i", limits),
+        number(3.0)
+    );
+}
+
+#[test]
+fn syntax_errors_are_structured() {
+    let error = eval("let = ;").unwrap_err();
+    assert_eq!(error.category, JsErrorCategory::Syntax);
+    assert_eq!(error.context.as_deref(), Some("parsing script"));
+}
+
+#[test]
+fn callers_can_configure_call_depth_limits() {
+    let error = eval_with_limits(
+        "function recurse() { return recurse(); } recurse()",
+        js::runtime::ExecutionLimits {
+            step_limit: 100_000,
+            call_depth_limit: 4,
+            loop_iteration_limit: 100,
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.category, JsErrorCategory::Limit);
+    assert_eq!(error.message, "Maximum call stack size exceeded");
+    assert_eq!(error.context.as_deref(), Some("script function call depth"));
+}
+
+#[test]
+fn realm_uses_configured_limits_for_each_script() {
+    let mut realm = Realm::new();
+    realm.set_execution_limits(js::runtime::ExecutionLimits {
+        step_limit: 100_000,
+        call_depth_limit: 100,
+        loop_iteration_limit: 2,
+    });
+
+    let error = realm.evaluate_script("while (true) {}").unwrap_err();
+    assert_eq!(error.category, JsErrorCategory::Limit);
+    assert_eq!(error.context.as_deref(), Some("while loop iteration"));
 }
 
 #[test]

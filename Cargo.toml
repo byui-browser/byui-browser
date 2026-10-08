@@ -43,3 +43,27 @@ devtools = { path = "crates/devtools" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
+
+# The native shell paints every frame on the UI thread, so keep its drawing
+# code optimized in dev builds; unoptimized software rasterizing makes window
+# drags and hover feedback lag.
+[profile.dev.package.browser-macos]
+opt-level = 3
+
+[profile.dev.package.tiny-skia]
+opt-level = 3
+
+[profile.dev.package.tiny-skia-path]
+opt-level = 3
+
+[profile.dev.package.ab_glyph]
+opt-level = 3
+
+[profile.dev.package.ab_glyph_rasterizer]
+opt-level = 3
+
+[profile.dev.package.owned_ttf_parser]
+opt-level = 3
+
+[profile.dev.package.ttf-parser]
+opt-level = 3

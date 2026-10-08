@@ -20,6 +20,8 @@ impl ConsoleSink for StdoutConsole {
 }
 
 fn main() {
+    // Keep the standalone binary useful while native platform shells are
+    // brought online. `make run` selects the platform shell below.
     let controller = Arc::new(
         net::RequestController::new(net::Config::default())
             .expect("network client should initialize"),

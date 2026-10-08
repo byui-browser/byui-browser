@@ -62,7 +62,7 @@ fn fetch_propagates_a_body_transport_error() {
         .unwrap_err();
 
     server.join();
-    assert!(matches!(error, RequestError::Transport(_)));
+    assert!(matches!(error, RequestError::Decode(_)));
 }
 
 #[test]

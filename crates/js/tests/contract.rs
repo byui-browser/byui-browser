@@ -124,3 +124,48 @@ fn realm_returns_parser_and_host_errors_as_js_errors() {
         Err(JsError::new("host failed"))
     );
 }
+
+#[test]
+fn sprint_two_if_else_runs_only_the_selected_branch() {
+    assert_eq!(
+        eval("let x = 0; if (1 < 2) { x = 4; } else { x = 9; } x"),
+        Ok(Value::Number(4.0))
+    );
+}
+
+#[test]
+fn sprint_two_while_loop_supports_assignment_progress() {
+    assert_eq!(
+        eval("let i = 0; while (i < 5) { i = i + 1; } i"),
+        Ok(Value::Number(5.0))
+    );
+}
+
+#[test]
+fn sprint_two_nested_calls_bind_arguments_and_return_values() {
+    assert_eq!(
+        eval(
+            "function add(a, b) { return a + b; } function twice(x) { return add(x, x); } twice(7)"
+        ),
+        Ok(Value::Number(14.0))
+    );
+}
+
+#[test]
+fn sprint_two_recursive_calls_have_independent_local_scopes() {
+    assert_eq!(
+        eval("function fact(n) { if (n <= 1) { return 1; } return n * fact(n - 1); } fact(6)"),
+        Ok(Value::Number(720.0))
+    );
+}
+
+#[test]
+fn sprint_two_bad_calls_and_excessive_recursion_return_errors() {
+    assert!(eval("notCallable()").is_err());
+    assert_eq!(
+        eval("function loop() { return loop(); } loop()")
+            .unwrap_err()
+            .message,
+        "Maximum call stack size exceeded"
+    );
+}

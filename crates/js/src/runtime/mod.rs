@@ -1,7 +1,8 @@
 //! Tree-walk interpreter for parsed programs.
 //!
 //! Supports expressions, `var`/`let`/`const` declarations, blocks, `if`,
-//! `while`, function declarations with closures, calls, and `return`.
+//! `while`, function declarations with closures, calls, `return`, and member
+//! access (`object.name`, `object[key]`, and assignment to either).
 //!
 //! Semantics follow ECMAScript where supported: `var` and function
 //! declarations are hoisted to the enclosing function or script, `let` and
@@ -10,6 +11,10 @@
 //!
 //! Limitations:
 //! - Assigning to an undeclared name is an error, as in strict mode.
+//! - Member access works only on [`Object`] values. Reading a property of any
+//!   other value, including strings and functions, is a runtime error, and so
+//!   is reading a property the object does not have (JavaScript would return
+//!   `undefined`). Methods are called without `this`.
 //! - There is no garbage collector yet. A function stored in the scope it
 //!   closes over forms an `Arc` cycle, so its scope is never freed.
 //! - Evaluation runs on a dedicated engine thread with a large stack. Deep
@@ -20,20 +25,24 @@
 //!   endless loops fail with an error instead of running forever.
 
 mod conversions;
+mod object;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::ast::{
-    BinaryOperator, Expr, LogicalOperator, Program, Statement, UnaryOperator, VarKind,
+    BinaryOperator, Expr, LogicalOperator, MemberProperty, Program, Statement, UnaryOperator,
+    VarKind,
 };
 use crate::stack::{StackGuard, with_engine_stack};
 use crate::{HostFunction, JsError, JsResult, Value};
 pub(crate) use conversions::number_to_string;
 use conversions::{
-    is_truthy, less_than, loose_equals, strict_equals, to_int32, to_number, to_primitive, to_uint32,
+    is_truthy, less_than, loose_equals, strict_equals, to_int32, to_number, to_primitive,
+    to_property_key, to_uint32,
 };
+pub use object::Object;
 
 const STACK_OVERFLOW: &str = "Maximum call stack size exceeded";
 
@@ -44,6 +53,33 @@ const STEP_LIMIT_EXCEEDED: &str = "Script exceeded the evaluation step limit";
 /// from hanging the engine thread. It is a stand-in for a time-based or
 /// host-controlled interrupt, which does not exist yet.
 pub const DEFAULT_STEP_LIMIT: u64 = 10_000_000;
+
+/// Default maximum number of nested script-function calls.
+pub const DEFAULT_CALL_DEPTH_LIMIT: u64 = 1_024;
+
+/// Default maximum number of `while` iterations in one evaluation.
+pub const DEFAULT_LOOP_ITERATION_LIMIT: u64 = 1_000_000;
+
+/// Resource limits applied independently to each program evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutionLimits {
+    /// Maximum number of statements and expressions evaluated.
+    pub step_limit: u64,
+    /// Maximum number of nested script-function calls.
+    pub call_depth_limit: u64,
+    /// Maximum total number of `while` loop iterations.
+    pub loop_iteration_limit: u64,
+}
+
+impl Default for ExecutionLimits {
+    fn default() -> Self {
+        Self {
+            step_limit: DEFAULT_STEP_LIMIT,
+            call_depth_limit: DEFAULT_CALL_DEPTH_LIMIT,
+            loop_iteration_limit: DEFAULT_LOOP_ITERATION_LIMIT,
+        }
+    }
+}
 
 /// Locks a scope. No code panics while holding the lock, so a poisoned lock
 /// still holds consistent bindings and is recovered rather than propagated.
@@ -295,40 +331,54 @@ impl fmt::Display for Function {
 /// Runs on the engine thread described in the module documentation and
 /// stops after [`DEFAULT_STEP_LIMIT`] steps.
 pub fn evaluate_program(program: &Program) -> JsResult<Value> {
-    evaluate_program_with_step_limit(program, DEFAULT_STEP_LIMIT)
+    evaluate_program_with_limits(program, ExecutionLimits::default())
 }
 
 /// Evaluates a program like [`evaluate_program`], but fails with a
 /// step-limit error once `step_limit` statements and expressions have been
 /// evaluated. A limit of `0` rejects every non-empty program.
 pub fn evaluate_program_with_step_limit(program: &Program, step_limit: u64) -> JsResult<Value> {
-    evaluate_program_with_globals(program, &HashMap::new(), step_limit)
+    evaluate_program_with_limits(
+        program,
+        ExecutionLimits {
+            step_limit,
+            ..ExecutionLimits::default()
+        },
+    )
 }
 
-/// Evaluates a program with `globals` installed as callable functions in a
-/// scope enclosing the script, so scripts may shadow them with `let`.
+/// Evaluates a program with caller-provided resource limits.
+pub fn evaluate_program_with_limits(program: &Program, limits: ExecutionLimits) -> JsResult<Value> {
+    evaluate_program_with_globals(program, &HashMap::new(), &HashMap::new(), limits)
+}
+
+/// Evaluates a program with `functions` and `values` installed in a scope
+/// enclosing the script, so scripts may shadow them with `let`.
 pub(crate) fn evaluate_program_with_globals(
     program: &Program,
-    globals: &HashMap<String, HostFunction>,
-    step_limit: u64,
+    functions: &HashMap<String, HostFunction>,
+    values: &HashMap<String, Value>,
+    limits: ExecutionLimits,
 ) -> JsResult<Value> {
     with_engine_stack(|| {
         let global_scope: ScopeRef = Arc::default();
-        for (name, function) in globals {
+        let functions = functions.iter().map(|(name, function)| {
+            let function = Function::from_host(name, Arc::clone(function));
+            (name, Value::Function(function))
+        });
+        let values = values.iter().map(|(name, value)| (name, value.clone()));
+        for (name, value) in functions.chain(values) {
             global_scope.lock_scope().bindings.insert(
                 name.clone(),
                 Binding {
-                    value: Some(Value::Function(Function::from_host(
-                        name,
-                        Arc::clone(function),
-                    ))),
+                    value: Some(value),
                     mutable: true,
                     lexical: false,
                 },
             );
         }
         let script_scope = child_scope(&global_scope);
-        let completion = Interpreter::new(step_limit).run_body(&script_scope, &program.body)?;
+        let completion = Interpreter::new(limits).run_body(&script_scope, &program.body)?;
         Ok(match completion {
             Completion::Normal(value) => value.unwrap_or(Value::Undefined),
             Completion::Return(value) => value,
@@ -341,7 +391,9 @@ pub(crate) fn evaluate_program_with_globals(
 /// Runs on the engine thread described in the module documentation and
 /// stops after [`DEFAULT_STEP_LIMIT`] steps.
 pub fn evaluate(expression: &Expr) -> JsResult<Value> {
-    with_engine_stack(|| Interpreter::new(DEFAULT_STEP_LIMIT).evaluate(expression, &Arc::default()))
+    with_engine_stack(|| {
+        Interpreter::new(ExecutionLimits::default()).evaluate(expression, &Arc::default())
+    })
 }
 
 /// Statement result; `Normal(None)` is an empty completion, such as from a
@@ -354,15 +406,21 @@ enum Completion {
 struct Interpreter {
     stack: StackGuard,
     steps_remaining: u64,
+    call_depth: u64,
+    loop_iterations_remaining: u64,
+    call_depth_limit: u64,
 }
 
 impl Interpreter {
     /// Creates an interpreter measuring stack use from the caller's frame and
     /// allowing `step_limit` evaluation steps.
-    fn new(step_limit: u64) -> Self {
+    fn new(limits: ExecutionLimits) -> Self {
         Self {
             stack: StackGuard::new(),
-            steps_remaining: step_limit,
+            steps_remaining: limits.step_limit,
+            call_depth: 0,
+            loop_iterations_remaining: limits.loop_iteration_limit,
+            call_depth_limit: limits.call_depth_limit,
         }
     }
 
@@ -370,13 +428,33 @@ impl Interpreter {
     /// expression.
     fn guarded<T>(&mut self, action: impl FnOnce(&mut Self) -> JsResult<T>) -> JsResult<T> {
         if self.steps_remaining == 0 {
-            return Err(JsError::new(STEP_LIMIT_EXCEEDED));
+            return Err(JsError::with_context(
+                crate::JsErrorCategory::Limit,
+                STEP_LIMIT_EXCEEDED,
+                "evaluation step budget",
+            ));
         }
         self.steps_remaining -= 1;
         if self.stack.exhausted() {
-            return Err(JsError::new(STACK_OVERFLOW));
+            return Err(JsError::with_context(
+                crate::JsErrorCategory::Limit,
+                STACK_OVERFLOW,
+                "call stack",
+            ));
         }
         action(self)
+    }
+
+    fn next_loop_iteration(&mut self) -> JsResult<()> {
+        if self.loop_iterations_remaining == 0 {
+            return Err(JsError::with_context(
+                crate::JsErrorCategory::Limit,
+                "Script exceeded the loop iteration limit",
+                "while loop iteration",
+            ));
+        }
+        self.loop_iterations_remaining -= 1;
+        Ok(())
     }
 
     /// Runs a script or function body after hoisting its declarations.
@@ -462,6 +540,7 @@ impl Interpreter {
             Statement::While { condition, body } => {
                 let mut last = Value::Undefined;
                 while is_truthy(&self.evaluate(condition, scope)?) {
+                    self.next_loop_iteration()?;
                     match self.execute_statement(scope, body)? {
                         Completion::Normal(Some(value)) => last = value,
                         Completion::Normal(None) => {}
@@ -536,14 +615,58 @@ impl Interpreter {
                     .map(|argument| self.evaluate(argument, scope))
                     .collect::<JsResult<Vec<_>>>()?;
                 let Value::Function(function) = function else {
-                    let description = match callee.as_ref() {
-                        Expr::Identifier(name) => format!("`{name}`"),
-                        _ => "expression".to_owned(),
+                    let description = match describe(callee) {
+                        Some(path) => format!("`{path}`"),
+                        None => "expression".to_owned(),
                     };
-                    return Err(JsError::new(format!("{description} is not a function")));
+                    return Err(JsError::with_context(
+                        crate::JsErrorCategory::Runtime,
+                        format!("{description} is not a function"),
+                        "function call",
+                    ));
                 };
                 self.call(&function, &arguments)
             }
+            Expr::Member { object, property } => {
+                let target = self.evaluate(object, scope)?;
+                let key = self.property_key(property, scope)?;
+                let Value::Object(target) = target else {
+                    return Err(non_object(&target, "read", &key, "property access"));
+                };
+                target.get(&key).ok_or_else(|| {
+                    let description = match describe(expression) {
+                        Some(path) => format!("`{path}`"),
+                        None => format!("Property `{key}`"),
+                    };
+                    JsError::with_context(
+                        crate::JsErrorCategory::Runtime,
+                        format!("{description} is not defined"),
+                        "property access",
+                    )
+                })
+            }
+            Expr::MemberAssign {
+                object,
+                property,
+                value,
+            } => {
+                let target = self.evaluate(object, scope)?;
+                let key = self.property_key(property, scope)?;
+                let value = self.evaluate(value, scope)?;
+                let Value::Object(target) = target else {
+                    return Err(non_object(&target, "set", &key, "property assignment"));
+                };
+                target.set(key, value.clone());
+                Ok(value)
+            }
+        }
+    }
+
+    /// Evaluates a member expression's property to its string key.
+    fn property_key(&mut self, property: &MemberProperty, scope: &ScopeRef) -> JsResult<String> {
+        match property {
+            MemberProperty::Named(name) => Ok(name.clone()),
+            MemberProperty::Computed(key) => Ok(to_property_key(&self.evaluate(key, scope)?)),
         }
     }
 
@@ -556,6 +679,14 @@ impl Interpreter {
                 closure,
                 ..
             } => self.guarded(|interpreter| {
+                if interpreter.call_depth >= interpreter.call_depth_limit {
+                    return Err(JsError::with_context(
+                        crate::JsErrorCategory::Limit,
+                        STACK_OVERFLOW,
+                        "script function call depth",
+                    ));
+                }
+                interpreter.call_depth += 1;
                 let scope = child_scope(closure);
                 for (index, param) in params.iter().enumerate() {
                     declare_var(&scope, param)?;
@@ -565,13 +696,46 @@ impl Interpreter {
                         arguments.get(index).cloned().unwrap_or(Value::Undefined),
                     );
                 }
-                Ok(match interpreter.run_body(&scope, body)? {
+                let result = match interpreter.run_body(&scope, body)? {
                     Completion::Return(value) => value,
                     Completion::Normal(_) => Value::Undefined,
-                })
+                };
+                interpreter.call_depth -= 1;
+                Ok(result)
             }),
         }
     }
+}
+
+/// Describes an identifier or a chain of `.name` accesses on one, such as
+/// `console.log`, for error messages. Other expressions return `None`.
+fn describe(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Identifier(name) => Some(name.clone()),
+        Expr::Member {
+            object,
+            property: MemberProperty::Named(name),
+        } => describe(object).map(|path| format!("{path}.{name}")),
+        _ => None,
+    }
+}
+
+/// The error for reading or setting property `key` of a non-object value.
+fn non_object(value: &Value, action: &str, key: &str, context: &str) -> JsError {
+    let kind = match value {
+        Value::Undefined => "undefined",
+        Value::Null => "null",
+        Value::Boolean(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Function(_) => "a function",
+        Value::Object(_) => "an object",
+    };
+    JsError::with_context(
+        crate::JsErrorCategory::Runtime,
+        format!("Cannot {action} property `{key}` of {kind}"),
+        context,
+    )
 }
 
 /// Declares every `var` in a function or script body, including those nested

@@ -14,6 +14,38 @@ fn arena_document_starts_with_a_document_root() {
 }
 
 #[test]
+fn create_element_follows_html_document_rules() {
+    let mut document = HTMLDocument::new();
+
+    let element = document.create_element("DiV-Card").expect("valid name");
+    let node = document.node(element).expect("created node");
+
+    assert_eq!(node.parent, None);
+    assert_eq!(node.children, Vec::new());
+    assert!(matches!(
+        &node.kind,
+        NodeKind::Element(ElementData {
+            name,
+            namespace: Namespace::Html,
+            attributes,
+        }) if name == "div-card" && attributes.is_empty()
+    ));
+}
+
+#[test]
+fn create_element_rejects_invalid_names() {
+    let mut document = HTMLDocument::new();
+
+    for name in ["", "1div", "div name", "div/name", "div>"] {
+        assert_eq!(
+            document.create_element(name),
+            Err(html::DomError::InvalidCharacter),
+            "expected {name:?} to be rejected"
+        );
+    }
+}
+
+#[test]
 fn arena_nodes_are_connected_with_stable_ids_and_spans() {
     let mut document = HTMLDocument::new();
     let paragraph = document.push_node(
@@ -180,6 +212,40 @@ fn get_element_by_id_accepts_an_empty_id() {
     let document = parse_raw_html("<div id=''></div>".to_owned());
 
     assert_eq!(document.get_element_by_id(""), Some(html::NodeId(1)));
+}
+
+#[test]
+fn remove_detaches_a_node_but_preserves_its_subtree() {
+    let mut document =
+        parse_raw_html("<section><span id='target'>text</span></section><p></p>".to_owned());
+    let section = html::NodeId(1);
+    let span = document.get_element_by_id("target").expect("target");
+    let text = document
+        .nodes
+        .iter()
+        .position(|node| matches!(&node.kind, NodeKind::Text(value) if value == "text"))
+        .map(html::NodeId)
+        .expect("text node");
+
+    document.remove(section);
+
+    assert_eq!(document.node(section).unwrap().parent, None);
+    assert_eq!(document.node(span).unwrap().parent, Some(section));
+    assert_eq!(document.node(text).unwrap().parent, Some(span));
+    assert_eq!(document.get_element_by_id("target"), None);
+}
+
+#[test]
+fn remove_of_detached_or_root_nodes_is_a_no_op() {
+    let mut document = parse_raw_html("<div></div>".to_owned());
+    let detached = document.push_node(NodeKind::Comment("detached".into()), None);
+    let children_before = document.nodes[document.root.0].children.clone();
+
+    document.remove(detached);
+    document.remove(document.root);
+
+    assert_eq!(document.node(detached).unwrap().parent, None);
+    assert_eq!(document.nodes[document.root.0].children, children_before);
 }
 
 #[test]

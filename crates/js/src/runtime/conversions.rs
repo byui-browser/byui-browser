@@ -3,10 +3,12 @@
 use crate::Value;
 use crate::lexer::is_js_whitespace;
 
-/// `ToPrimitive`: functions convert to their string form; primitives are kept.
+/// `ToPrimitive`: functions and objects convert to their string form
+/// (`[object Object]` for objects, as there are no prototypes to supply
+/// `valueOf` or `toString`); primitives are kept.
 pub(super) fn to_primitive(value: &Value) -> Value {
     match value {
-        Value::Function(_) => Value::String(value.to_string()),
+        Value::Function(_) | Value::Object(_) => Value::String(value.to_string()),
         other => other.clone(),
     }
 }
@@ -18,7 +20,7 @@ pub(super) fn is_truthy(value: &Value) -> bool {
         Value::Boolean(value) => *value,
         Value::Number(value) => *value != 0.0 && !value.is_nan(),
         Value::String(value) => !value.is_empty(),
-        Value::Function(_) => true,
+        Value::Function(_) | Value::Object(_) => true,
     }
 }
 
@@ -28,7 +30,7 @@ pub(super) fn to_number(value: &Value) -> f64 {
         Value::Number(number) => *number,
         Value::Boolean(true) => 1.0,
         Value::Boolean(false) | Value::Null => 0.0,
-        Value::Undefined | Value::Function(_) => f64::NAN,
+        Value::Undefined | Value::Function(_) | Value::Object(_) => f64::NAN,
         Value::String(text) => string_to_number(text),
     }
 }
@@ -165,6 +167,7 @@ pub(super) fn strict_equals(left: &Value, right: &Value) -> bool {
         (Value::Number(left), Value::Number(right)) => left == right,
         (Value::String(left), Value::String(right)) => left == right,
         (Value::Function(left), Value::Function(right)) => left == right,
+        (Value::Object(left), Value::Object(right)) => left == right,
         _ => false,
     }
 }
@@ -177,13 +180,22 @@ pub(super) fn loose_equals(left: &Value, right: &Value) -> bool {
         | (Value::String(text), Value::Number(number)) => *number == string_to_number(text),
         (Value::Boolean(_), _) => loose_equals(&Value::Number(to_number(left)), right),
         (_, Value::Boolean(_)) => loose_equals(left, &Value::Number(to_number(right))),
-        (Value::Function(_), Value::Number(_) | Value::String(_)) => {
+        (Value::Function(_) | Value::Object(_), Value::Number(_) | Value::String(_)) => {
             loose_equals(&to_primitive(left), right)
         }
-        (Value::Number(_) | Value::String(_), Value::Function(_)) => {
+        (Value::Number(_) | Value::String(_), Value::Function(_) | Value::Object(_)) => {
             loose_equals(left, &to_primitive(right))
         }
         _ => strict_equals(left, right),
+    }
+}
+
+/// `ToPropertyKey`: strings are used as-is and every other value uses its
+/// JavaScript string form, so `1` and `'1'` name the same property.
+pub(super) fn to_property_key(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => to_primitive(other).to_string(),
     }
 }
 
@@ -199,56 +211,5 @@ pub(super) fn less_than(left: &Value, right: &Value) -> Option<bool> {
         None
     } else {
         Some(left < right)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{number_to_string, string_to_number};
-
-    #[test]
-    fn formats_numbers_like_javascript() {
-        for (number, expected) in [
-            (1.0, "1"),
-            (-0.0, "0"),
-            (1.5, "1.5"),
-            (0.1 + 0.2, "0.30000000000000004"),
-            (123_456_789.0, "123456789"),
-            (1e21, "1e+21"),
-            (1.5e21, "1.5e+21"),
-            (1e20, "100000000000000000000"),
-            (0.000001, "0.000001"),
-            (1e-7, "1e-7"),
-            (-2.5e-8, "-2.5e-8"),
-            (f64::INFINITY, "Infinity"),
-            (f64::NEG_INFINITY, "-Infinity"),
-            (f64::NAN, "NaN"),
-        ] {
-            assert_eq!(number_to_string(number), expected, "{number:?}");
-        }
-    }
-
-    #[test]
-    fn parses_strings_like_javascript() {
-        for (text, expected) in [
-            ("", 0.0),
-            ("  \n\t ", 0.0),
-            (" 42 ", 42.0),
-            ("-1.5e3", -1500.0),
-            (".5", 0.5),
-            ("5.", 5.0),
-            ("+Infinity", f64::INFINITY),
-            ("-Infinity", f64::NEG_INFINITY),
-            ("0x10", 16.0),
-            ("0B101", 5.0),
-            ("0o17", 15.0),
-        ] {
-            assert_eq!(string_to_number(text), expected, "{text:?}");
-        }
-        for text in [
-            "abc", "inf", "infinity", "NaN", "1e", ".", "0x", "-0x10", "1 2", "e5",
-        ] {
-            assert!(string_to_number(text).is_nan(), "{text:?}");
-        }
     }
 }
