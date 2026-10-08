@@ -1,4 +1,4 @@
-//! HTML parsing, DOM construction, and basic DOM queries.
+//! HTML parsing, DOM construction, and basic DOM queries..
 //!
 //! **Owning team**: HTML Team
 
