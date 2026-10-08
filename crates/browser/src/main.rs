@@ -20,6 +20,8 @@ impl ConsoleSink for StdoutConsole {
 }
 
 fn main() {
+    // Keep the standalone binary useful while native platform shells are
+    // brought online. `make run` selects the platform shell below.
     let mut realm = Realm::new();
     register_print(&mut realm, Arc::new(StdoutConsole))
         .expect("registering built-in Web APIs should succeed");

@@ -41,12 +41,12 @@ fn parses_lays_out_paints_and_writes_a_simple_element_image() {
     let display_list = paint_document(&layout, &document);
     let frame =
         Compositor::new(viewport.width as u32, viewport.height as u32).compose_paint(&display_list);
-    assert_eq!(&frame.pixels[0..4], &[210, 230, 255, 255]);
+    assert_eq!(&frame.pixels[0..4], &[242, 245, 250, 255]);
     assert!(
         frame
             .pixels
             .chunks_exact(4)
-            .any(|pixel| pixel == [25, 45, 70, 255])
+            .any(|pixel| pixel == [30, 43, 62, 255])
     );
 
     let output_dir = option_env!("CARGO_TARGET_DIR")

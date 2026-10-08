@@ -6,15 +6,15 @@ use layout::{LayoutTree, Rect as LayoutRect};
 use crate::{Color, DisplayItem, DisplayList, Rect};
 
 const BACKGROUND: Color = Color {
-    r: 210,
-    g: 230,
-    b: 255,
+    r: 242,
+    g: 245,
+    b: 250,
     a: 255,
 };
 const TEXT: Color = Color {
-    r: 25,
-    g: 45,
-    b: 70,
+    r: 30,
+    g: 43,
+    b: 62,
     a: 255,
 };
 

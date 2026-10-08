@@ -1,4 +1,4 @@
-.PHONY: all build test release lint
+.PHONY: all build run test release lint
 
 # Secondary goals after `test` / `release` (crate name or platform).
 CMD  := $(firstword $(MAKECMDGOALS))
@@ -14,6 +14,20 @@ all: build
 ## Build the workspace (debug).
 build:
 	cargo build --workspace
+
+## Run the native shell for the current operating system.
+run:
+ifeq ($(OS),Windows_NT)
+	$(error Windows shell is not implemented yet)
+else ifneq (,$(filter Darwin darwin,$(shell uname -s)))
+	cargo run -p browser-macos
+else ifneq (,$(filter Linux linux,$(shell uname -s)))
+	$(error Linux shell is not implemented yet)
+else ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(shell uname -s)))
+	$(error Windows shell is not implemented yet)
+else
+	$(error Unsupported operating system '$(shell uname -s)')
+endif
 
 ## Run all workspace tests, or `make test <crate_name>` for one crate.
 test:
