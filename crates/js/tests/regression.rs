@@ -1,10 +1,10 @@
-//! Regression coverage for the Sprint 2 vertical slice.
+//! Regression coverage for the source-to-host-function vertical slice.
 //!
 //! Every test drives the engine through the public source-level APIs
 //! ([`js::eval`], [`js::parse`], and [`js::Realm::evaluate_script`]) so the
 //! lexer, parser, and interpreter are exercised together. The final section
 //! pins down how intentionally unsupported JavaScript fails; see
-//! `docs/js/sprint2-coverage.md` for the full list.
+//! `docs/js/regression-coverage.md` for the full list.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -597,7 +597,7 @@ fn each_realm_script_starts_with_fresh_script_bindings() {
 
 // Intentionally unsupported JavaScript --------------------------------------------
 
-/// Syntax outside the Sprint 2 subset is rejected while parsing rather than
+/// Syntax outside the supported subset is rejected while parsing rather than
 /// misinterpreted. Remove entries as features land.
 #[test]
 fn unsupported_syntax_is_rejected_at_parse_time() {

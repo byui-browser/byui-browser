@@ -1,13 +1,13 @@
-# Sprint 2 JavaScript regression coverage
+# JavaScript regression coverage
 
-The Sprint 2 vertical slice takes JavaScript source text, parses it, runs it
+The JavaScript vertical slice takes JavaScript source text, parses it, runs it
 with the tree-walk interpreter, and calls host functions such as
 `webapis::print`. Its regression suite uses only the public source-evaluation
 APIs: `js::eval`, `js::parse`, and `js::Realm::evaluate_script`.
 
 | File | Covers |
 |---|---|
-| `crates/js/tests/sprint2.rs` | Arithmetic precedence, literals, truthiness, comparisons, short-circuiting, declarations, assignment, control flow, functions, returns, recursion, syntax errors, runtime errors, host-function calls, and unsupported syntax |
+| `crates/js/tests/regression.rs` | Arithmetic precedence, literals, truthiness, comparisons, short-circuiting, declarations, assignment, control flow, functions, returns, recursion, syntax errors, runtime errors, host-function calls, and unsupported syntax |
 | `crates/js/tests/contract.rs` | Source-level contract for string literals and structured syntax errors. These tests were previously `#[ignore]`d. |
 | `crates/webapis/tests/print_binding.rs` | End to end: JavaScript `print()` reaches `webapis::print` through a `Realm` global and writes to an injected `ConsoleSink` |
 
