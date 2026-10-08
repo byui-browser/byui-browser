@@ -11,6 +11,10 @@ hoverStyles.textContent = `
 `;
 document.head.append(hoverStyles);
 
+//add div for element info display
+const elementDetails = document.createElement('div');
+document.body.append(elementDetails); //note: will need to append to the dev tools window, no the body as it does now
+
 //set devtool button to be toggleable
 const toggleButton = document.getElementById("hover-inspect");
 let toggleButtonState = false;
@@ -19,22 +23,22 @@ toggleButton.addEventListener('click', () => {
     console.log(`toggleButtonState = ${toggleButtonState}`);
 });
 
-//on hover: highlight element
+//on hover: highlight element and update elementDetails display
 let currentHovered = null;
 document.body.addEventListener('mouseover', (e) => {
-    // Add highlight to current element
-    if (toggleButtonState){
+    if (toggleButtonState && e.target != elementDetails){
         currentHovered = e.target;
         currentHovered.classList.add('hover-label');
+        elementDetails.textContent = currentHovered.tagName.toLowerCase();
     }
     
 });
 
-//clean up/remove hover effects
+//remove hover effects [ToDo[and clear elementDetails display]] after mouse stops hovering
 document.body.addEventListener('mouseout', (e) => {
-    //remove highlight
     if (currentHovered) {
         currentHovered.classList.remove('hover-label');
         currentHovered = null;
+        elementDetails.textContent = '';
     }
 });
