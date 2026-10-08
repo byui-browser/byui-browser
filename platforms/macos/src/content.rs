@@ -3,9 +3,21 @@
 
 use layout::{Size, StyledDom, layout_tree};
 use render::{Compositor, Frame};
+use tiny_skia::Pixmap;
 
 fn render_demo(width: u32, height: u32) -> Frame {
-    let document = html::parse_raw_html("<div>Hello, browser!</div>".to_owned());
+    let page = browser::welcome_page();
+    let document = html::parse_raw_html(page.html.to_owned());
+    let stylesheet = css::parse_stylesheet(page.css);
+    assert!(
+        !stylesheet.rules.is_empty(),
+        "the welcome page should have a stylesheet"
+    );
+    let script_result = js::eval(page.js).expect("the welcome page script should execute");
+    assert_eq!(
+        script_result,
+        js::Value::String("Welcome to BYUI Browser!".into())
+    );
     let tree = layout_tree(
         &StyledDom::from_html_document(&document),
         Size {
@@ -17,35 +29,34 @@ fn render_demo(width: u32, height: u32) -> Frame {
     Compositor::new(width, height).compose_paint(&display_list)
 }
 
-/// Renders the demo into the window's content area, leaving toolbar pixels intact.
-/// `width` is in device pixels. The current compositor rasterizes at 1x; nearest
-/// neighbor scaling keeps its bitmap font at a consistent logical size on Retina.
-pub(super) fn draw_demo(pixels: &mut [u32], width: usize, scale_factor: f64) {
-    if width == 0 {
-        return;
-    }
-    let top = super::toolbar::height_in_pixels(scale_factor).min(pixels.len() / width);
-    let content = &mut pixels[top * width..];
-    let height = content.len() / width;
-    if height == 0 {
-        return;
-    }
+/// Renders the demo into a device-pixel pixmap sized for the page card.
+/// The current compositor rasterizes at 1x; nearest-neighbor scaling keeps its
+/// bitmap font at a consistent logical size on Retina. Returns `None` for an
+/// empty area.
+pub(super) fn render_page(width: u32, height: u32, scale_factor: f64) -> Option<Pixmap> {
+    let mut pixmap = Pixmap::new(width, height)?;
     let frame = render_demo(
         (width as f64 / scale_factor).ceil() as u32,
         (height as f64 / scale_factor).ceil() as u32,
     );
-    for (y, row) in content.chunks_exact_mut(width).enumerate() {
-        let source_y = (y as f64 / scale_factor) as usize;
-        for (x, pixel) in row.iter_mut().enumerate() {
-            let source_x = (x as f64 / scale_factor) as usize;
-            let offset = (source_y * frame.width as usize + source_x) * 4;
+    for (y, row) in pixmap
+        .data_mut()
+        .chunks_exact_mut(width as usize * 4)
+        .enumerate()
+    {
+        let source_y = ((y as f64 / scale_factor) as u32).min(frame.height - 1);
+        for (x, pixel) in row.chunks_exact_mut(4).enumerate() {
+            let source_x = ((x as f64 / scale_factor) as u32).min(frame.width - 1);
+            let offset = (source_y * frame.width + source_x) as usize * 4;
             let rgba = &frame.pixels[offset..offset + 4];
-            // Softbuffer uses 0x00RRGGBB; composite RGBA onto the white page.
+            // Composite RGBA onto the white page so the card stays opaque.
             let alpha = u32::from(rgba[3]);
-            let channel = |value: u8| (u32::from(value) * alpha + 255 * (255 - alpha)) / 255;
-            *pixel = (channel(rgba[0]) << 16) | (channel(rgba[1]) << 8) | channel(rgba[2]);
+            let channel =
+                |value: u8| ((u32::from(value) * alpha + 255 * (255 - alpha)) / 255) as u8;
+            pixel.copy_from_slice(&[channel(rgba[0]), channel(rgba[1]), channel(rgba[2]), 255]);
         }
     }
+    Some(pixmap)
 }
 
 #[cfg(test)]
@@ -56,41 +67,30 @@ mod tests {
     fn demo_produces_layout_background_and_renderer_text() {
         let frame = render_demo(160, 120);
         assert_eq!((frame.width, frame.height), (160, 120));
-        assert_eq!(&frame.pixels[..4], &[210, 230, 255, 255]);
-        assert!(frame.pixels.chunks_exact(4).any(|p| p == [25, 45, 70, 255]));
+        assert_eq!(&frame.pixels[..4], &[242, 245, 250, 255]);
+        assert!(frame.pixels.chunks_exact(4).any(|p| p == [30, 43, 62, 255]));
         assert_eq!(&frame.pixels[160 * 110 * 4..160 * 110 * 4 + 4], &[255; 4]);
     }
 
     #[test]
-    fn content_is_scaled_below_unchanged_toolbar() {
+    fn page_is_scaled_to_device_pixels() {
         for scale in [1.0, 1.5, 2.0] {
-            let width = (160.0 * scale) as usize;
-            let top = super::super::toolbar::height_in_pixels(scale);
-            let mut pixels = vec![0; width * (top + (120.0 * scale) as usize)];
-            super::super::toolbar::draw(&mut pixels, width, scale);
-            let toolbar = pixels[..top * width].to_vec();
-            draw_demo(&mut pixels, width, scale);
-            assert_eq!(&pixels[..top * width], toolbar);
-            assert_eq!(pixels[top * width], 0x00d2e6ff);
-            assert!(pixels[top * width..].contains(&0x00192d46));
-            assert_eq!(pixels[(top + (110.0 * scale) as usize) * width], 0x00ffffff);
+            let (width, height) = ((160.0 * scale) as u32, (120.0 * scale) as u32);
+            let page = render_page(width, height, scale).unwrap();
+            assert_eq!((page.width(), page.height()), (width, height));
+            let data = page.data();
+            assert_eq!(&data[..4], &[242, 245, 250, 255]);
+            assert!(data.chunks_exact(4).any(|p| p == [30, 43, 62, 255]));
+            let bottom = ((110.0 * scale) as u32 * width) as usize * 4;
+            assert_eq!(&data[bottom..bottom + 4], &[255; 4]);
         }
     }
 
     #[test]
-    fn resize_and_toolbar_only_windows_are_safe() {
-        draw_demo(&mut [], 0, 1.0);
-        for (width, height) in [(1, 1), (3, 48), (1, 49), (17, 70), (320, 240)] {
-            let mut pixels = vec![0x123456; width * height];
-            draw_demo(&mut pixels, width, 1.0);
-            assert!(
-                pixels[..width * height.min(48)]
-                    .iter()
-                    .all(|p| *p == 0x123456)
-            );
-            if height > 48 {
-                assert_eq!(pixels[width * 48], 0x00d2e6ff);
-            }
+    fn tiny_and_empty_pages_are_safe() {
+        assert!(render_page(0, 10, 1.0).is_none());
+        for (width, height) in [(1, 1), (3, 48), (17, 70)] {
+            assert!(render_page(width, height, 2.0).is_some());
         }
     }
 }

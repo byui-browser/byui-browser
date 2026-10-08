@@ -7,7 +7,15 @@ pub enum RequestError {
     InvalidUrl(String),
     /// The underlying HTTP client reported a transport error.
     Transport(reqwest::Error),
-    /// `OnlyIfCached` was requested but no fresh cached response exists.
+    /// The request timed out before it could complete.
+    Timeout(reqwest::Error),
+
+    /// An error occurred while reading the response body.
+    Body(reqwest::Error),
+
+    /// An error occurred while decoding the response.
+    Decode(reqwest::Error),
+
     CacheMiss,
     /// The URL uses a scheme unsupported by the HTTP transport.
     UnsupportedScheme(String),
@@ -21,6 +29,9 @@ impl std::fmt::Display for RequestError {
         match self {
             Self::InvalidUrl(url) => write!(f, "Invalid request URL: {url}"),
             Self::Transport(error) => write!(f, "Request failed: {error}"),
+            Self::Timeout(error) => write!(f, "Request timed out: {error}"),
+            Self::Body(error) => write!(f, "Failed to read response body: {error}"),
+            Self::Decode(error) => write!(f, "Response decode error: {error}"),
             Self::CacheMiss => f.write_str("Request is not available in the HTTP cache"),
             Self::UnsupportedScheme(scheme) => write!(f, "Unsupported URL scheme: {scheme}"),
             Self::SchedulerClosed => f.write_str("Request scheduler is closed"),
@@ -32,8 +43,15 @@ impl std::fmt::Display for RequestError {
 impl std::error::Error for RequestError {}
 
 impl From<reqwest::Error> for RequestError {
-    /// Converts a reqwest error into the networking crate's error type.
     fn from(error: reqwest::Error) -> Self {
-        Self::Transport(error)
+        if error.is_timeout() {
+            Self::Timeout(error)
+        } else if error.is_body() {
+            Self::Body(error)
+        } else if error.is_decode() {
+            Self::Decode(error)
+        } else {
+            Self::Transport(error)
+        }
     }
 }
