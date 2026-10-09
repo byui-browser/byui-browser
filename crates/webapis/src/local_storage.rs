@@ -101,7 +101,7 @@ mod tests {
     use security::{Origin, StorageKey};
     use storage::OriginStorage;
 
-    use super::{get_item, register_local_storage, set_item, LocalStorage};
+    use super::{LocalStorage, get_item, register_local_storage, set_item};
 
     fn storage_key(host: &str) -> StorageKey {
         StorageKey::new(Origin::with_port("https", host, 443))
