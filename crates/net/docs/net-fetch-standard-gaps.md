@@ -1,26 +1,33 @@
 # Net crate: gaps against the Fetch Standard
 
+Step 1 of the Fetch engine plan now separates complete internal responses from
+filtered public views. Public responses use an owned status code and guarded
+header list, hide cookie headers, apply basic/simple-CORS/opaque exposure, and
+enforce null bodies. The detailed audit below records the wider unfinished
+Fetch algorithms; see `fetch-engine-contract.md` for the current supported
+subset and capability errors.
+
 Status: audit of the implementation as of 2026-10-09, including the current working-tree changes in `crates/net`.
 
 This report compares `crates/net` with the [WHATWG Fetch Living Standard](https://fetch.spec.whatwg.org/), last updated 2026-10-06. It evaluates the networking crate as a browser-facing Fetch implementation, not merely as an HTTP client. A field or enum is counted as implemented only when it changes observable behavior at the appropriate policy boundary.
 
-The crate currently provides an HTTP(S) transport with a Fetch-shaped request model: environment-based relative URL resolution, structured HTTP(S) origins, guarded ordered request headers, replayable and one-shot request bodies, automatic body metadata and `Origin`/`Referer` preparation, streamed response bodies, abort signaling, limited redirects through Reqwest, connection pooling, keepalive body-size validation, and a small in-memory cache. It is not yet Fetch-compatible for security-sensitive cross-origin behavior or for the full request/response algorithms.
+The crate currently provides an HTTP(S) transport with a Fetch-shaped request model: environment-based relative URL resolution, structured HTTP(S) origins, guarded ordered request headers, replayable and one-shot request bodies, automatic body metadata and `Origin`/`Referer` preparation, filtered streamed responses, abort signaling, connection pooling, keepalive body-size validation, and a small in-memory cache. Redirects fail closed until the controller owns the redirect loop. Browser-context requests require a `FetchServices` provider. The crate is not yet Fetch-compatible for the full request/response algorithms.
 
 ## Summary
 
-| Area                        | Current state                                                                                                                       | Gap severity |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ------------ |
-| URL and scheme fetch        | HTTP(S) URLs and environment-relative URLs work; non-HTTP schemes do not                                                            | High         |
-| Request headers and methods | Method validation and request/no-CORS guards exist; response filtering is absent                                                    | High         |
-| Request and response bodies | Replayable bytes plus one-shot bytes/streams and basic metadata; Fetch Body semantics are absent                                    | Medium       |
-| Credentials and cookies     | `CredentialsMode` exists, but the cookie store is stateless and never attaches or stores cookies                                    | Critical     |
-| CORS and response tainting  | Checker accepts every response; no preflight or filtered responses                                                                  | Critical     |
-| Redirects                   | Reqwest follows redirects independently of `redirect_mode`                                                                          | High         |
-| HTTP cache                  | TTL-only in-memory cache; no HTTP cache matching/revalidation/partitioning                                                          | High         |
-| Fetch policy integrations   | Keepalive size validation exists; CSP, mixed content, CORP, SRI, service workers, Fetch Metadata, and origin enforcement are absent | Critical     |
-| Cancellation and lifecycle  | Basic abort signal works, but Fetch controller state/reasons/timing are absent                                                      | Medium       |
-| Fetch API surface           | No Fetch `Headers`, `Request`, `Response`, or Body mixin semantics                                                                  | High         |
-| Scheduling and transport    | HTTP/2, compression, pooling, and priority mapping are available; scheduler ordering and HTTP/3 are absent                          | Low/Medium   |
+| Area                        | Current state                                                                                                                            | Gap severity |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| URL and scheme fetch        | HTTP(S) URLs and environment-relative URLs work; non-HTTP schemes do not                                                                 | High         |
+| Request headers and methods | Method validation and request/no-CORS guards exist; response headers are filtered before exposure                                        | High         |
+| Request and response bodies | Replayable bytes plus one-shot bytes/streams and basic metadata; Fetch Body semantics are absent                                         | Medium       |
+| Credentials and cookies     | `FetchServices` can supply and store cookies; matching, persistence, and policy belong to its provider                                   | Critical     |
+| CORS and response tainting  | Simple CORS checks and basic/opaque views exist; preflight and redirect checks are absent                                                | Critical     |
+| Redirects                   | Transport following is disabled; redirect statuses fail before public exposure until step 7                                              | High         |
+| HTTP cache                  | TTL-only in-memory cache with provider-supplied partition keys; full matching/revalidation is absent                                     | High         |
+| Fetch policy integrations   | Browser-context requests require `FetchServices`; CSP, mixed content, CORP, SRI, and worker interception remain provider/later-step work | Critical     |
+| Cancellation and lifecycle  | Basic abort signal works, but Fetch controller state/reasons/timing are absent                                                           | Medium       |
+| Fetch API surface           | Rust response types and guarded headers exist; shared Fetch Body and constructor semantics are absent                                    | High         |
+| Scheduling and transport    | HTTP/2, compression, pooling, and priority mapping are available; scheduler ordering and HTTP/3 are absent                               | Low/Medium   |
 
 ## Detailed gaps
 
@@ -38,7 +45,7 @@ The standard defines fetch schemes as `about`, `blob`, `data`, `file`, and HTTP(
 
 Fetch normalizes the standard methods, rejects forbidden methods such as `CONNECT`, `TRACE`, and `TRACK` at request construction, and applies request-header guards, forbidden request-header filtering, CORS-safelisted checks, and no-CORS restrictions. The implementation now covers these request-side checks and inserts the `Origin` header internally when required. It still does not provide the complete user-agent-owned header set or a separate cookie-header channel, and transport-specific details such as `Referer` are finalized internally.
 
-The ordered multimap shape and mutation guards are directionally correct, but response headers are returned as a raw `reqwest::HeaderMap`, so Fetch's filtered/exposed-header semantics and special `Set-Cookie` handling are not represented.
+The ordered multimap shape and mutation guards now support immutable exposed response headers. The internal response retains `Set-Cookie`, while the public view removes it. Full Fetch `Headers` combination and iteration semantics remain unfinished.
 
 **Required work:** extend the guarded header list with automatic user-agent-controlled headers, response header filtering, and a separate internal cookie-header channel.
 
@@ -52,37 +59,37 @@ The Fetch Standard's `BodyInit`/body algorithms support strings, URL-encoded dat
 
 ### 4. Credentials, cookies, and authentication
 
-**Evidence:** [`CookieStore::attach`](../crates/net/src/cookies/jar.rs) and [`process_response`](../crates/net/src/cookies/jar.rs) are no-ops. [`FetchContext.credentials`](../crates/net/src/request.rs) is stored and exposed, but is not consulted by the controller or transport. `FetchEnvironment` now also carries an optional `NetworkPartitionKey`, but no subsystem uses it yet.
+**Evidence:** [`FetchServices`](../src/services.rs) supplies cookie selection and storage decisions for browser-context requests. The controller calls those methods only when the credentials mode permits credentials. The engine itself has no durable cookie store. `FetchEnvironment` carries an optional `NetworkPartitionKey`, while the provider supplies the process-local cache partition key.
 
-Fetch credentials include cookies, TLS client certificates, and HTTP authentication entries. The crate has no cookie jar, domain/path matching, expiry, Secure/HttpOnly/SameSite enforcement, public-suffix checks, partitioning, response `Set-Cookie` processing, client certificate selection, or HTTP authentication entry handling. `omit`, `same-origin`, and `include` therefore produce the same behavior.
+Fetch credentials include cookies, TLS client certificates, and HTTP authentication entries. The engine delegates cookie matching, persistence, and policy to its provider; it does not implement those rules. TLS client certificate selection and HTTP authentication entries are still absent. `omit`, `same-origin`, and `include` now determine whether provider credential methods are invoked.
 
 This is a critical security gap: once a cookie store is added, it must be keyed by the request's network partition/origin context and must be integrated with CORS credentials checks rather than simply attaching every matching cookie.
 
 ### 5. CORS, no-CORS, and response filtering
 
-**Evidence:** [`CorsChecker::validate`](../crates/net/src/cors/validator.rs) returns `Ok(())` for every request and response. The request layer now rejects non-safelisted no-CORS methods and header values, but the controller still calls the permissive checker only after transport headers arrive and returns unfiltered response headers/body.
+**Evidence:** [`CorsChecker::validate`](../crates/net/src/cors/validator.rs) enforces same-origin and simple CORS checks; [`InternalResponse::expose`](../crates/net/src/response.rs) constructs a filtered view before callers see headers or body. Preflight-required requests fail before transport.
 
-The implementation lacks the core CORS algorithm: although origin serialization, the `Origin` request header, and some no-CORS method/header checks now exist, there are no preflight `OPTIONS` requests, preflight cache, `Access-Control-Allow-*` validation, credentials interaction, redirect checks, or network-error conversion on failure. `RequestMode::SameOrigin` and `RequestMode::NoCors` remain largely inert at the controller boundary. No-CORS requests should use opaque filtered responses and only follow redirects in the allowed cases; the crate exposes status, URL, headers, and body directly.
+The implementation still lacks preflight `OPTIONS`, a preflight cache, complete `Access-Control-Allow-*` parsing, cross-origin credentials, and per-hop redirect checks. `SameOrigin` fails closed on cross-origin results, and `NoCors` produces an opaque view, but the complete Fetch algorithms remain unfinished.
 
-It also lacks CORS-exposed header filtering and the distinction between internal, basic, CORS, opaque, and opaque-redirect filtered responses. The current raw `HeaderMap` can expose headers that Fetch deliberately hides.
+Basic, CORS, and opaque views now filter headers and metadata. Opaque-redirect construction awaits controller-owned redirects. CORS wildcard exposure and other full `Headers` rules remain unfinished.
 
 **Required work:** implement request tainting and the CORS-preflight/CORS-check algorithms before exposing response data, with focused tests for simple, preflighted, credentialed, failed, no-CORS, and redirecting cross-origin requests.
 
 ### 6. Redirect handling
 
-**Evidence:** [`Config.max_redirects`](../crates/net/src/config.rs) configures Reqwest's policy, while [`ReqwestTransport::new`](../crates/net/src/transport/reqwest.rs) enables it unconditionally. `Request` now stores `redirect_mode`, `url_list`, `current_url`, and `redirect_count`, but the controller and transport do not use the mode or record each Reqwest hop.
+**Evidence:** [`ReqwestTransport::new`](../src/transport/reqwest.rs) disables automatic redirects. The controller returns `RedirectFailure` for Fetch redirect statuses before public exposure. `Request` and `InternalResponse` retain URL and redirect state for the one supported exchange; no redirect hop is followed.
 
-The standard's HTTP-redirect fetch algorithm validates the `Location` URL, rejects non-HTTP(S) redirect targets, caps the redirect count at 20, updates the request URL list, applies method/body/header changes for status codes, strips credentials and sensitive headers when required, and re-runs policy checks for each hop. `error` and `manual` modes have distinct observable results. The crate still delegates to Reqwest's follow policy, defaults to a configurable limit of 10, does not expose an intermediate/manual redirect response, and does not apply per-hop Fetch policy. Replayable versus one-shot request bodies are represented, but no controller-level redirect algorithm uses that distinction yet.
+The standard's HTTP-redirect fetch algorithm validates the `Location` URL, rejects non-HTTP(S) redirect targets, caps the redirect count at 20, updates the request URL list, applies method/body/header changes for status codes, strips credentials and sensitive headers when required, and re-runs policy checks for each hop. `error` and `manual` modes have distinct observable results. All of that remains for step 7; the current controller rejects redirects rather than delegating them to Reqwest.
 
-**Required work:** disable transport-owned automatic redirects and implement a controller-level redirect loop that honors `RedirectMode`, tracks every URL, replays or rejects bodies correctly, and invokes CORS/security checks on each hop.
+**Required work:** implement a controller-level redirect loop that honors `RedirectMode`, tracks every URL, replays or rejects bodies correctly, and invokes CORS/security checks on each hop.
 
 ### 7. HTTP cache and cache modes
 
 **Evidence:** [`ResponseCache::insert`](../crates/net/src/cache/mod.rs) stores only successful responses with a parsed `Cache-Control: max-age`; [`cache_key`](../crates/net/src/cache/mod.rs) includes method and normalized URL while ignoring fragments; [`fetch_stream`](../crates/net/src/controller.rs) treats cache modes as local lookup switches.
 
-The Fetch HTTP-network-or-cache algorithm relies on an HTTP cache, cache partitioning, freshness, validators, and revalidation. The current cache is process-local and keyed by method plus normalized URL, with fragment removal and a TTL derived from `max-age`. It does not vary by request headers or `Vary`, credentials, origin/network partition key, authorization, response tainting, or cache policy. It does not process `Date`, `Expires`, `Age`, validators, `Vary`, invalidation, 304 responses, or heuristic freshness.
+The Fetch HTTP-network-or-cache algorithm relies on an HTTP cache, cache partitioning, freshness, validators, and revalidation. The current cache is process-local and keyed by provider-supplied partition, method, and normalized URL, with fragment removal and a TTL derived from `max-age`. It does not vary by request headers or `Vary`, credentials, authorization, response tainting, or full cache policy. It does not process `Date`, `Expires`, `Age`, validators, `Vary`, invalidation, 304 responses, or heuristic freshness.
 
-`NoCache` bypasses the cache rather than revalidating it. `Reload` bypasses the cache but does not add the required revalidation/request directives. `Default` has no stale-while-revalidate behavior. `ForceCache` returns any stored entry but there is no standards-compliant stored-response match. `OnlyIfCached` does not enforce the same-origin restriction and returns a crate-specific `CacheMiss` rather than a Fetch network error. Cache entries are also buffered only after a caller fully consumes the body, which is a product choice but not the standard cache algorithm.
+`NoCache` now fails with an explicit unsupported-feature error until revalidation exists. `Reload` bypasses the cache but does not add the required revalidation/request directives. `Default` has no stale-while-revalidate behavior. `ForceCache` returns any stored entry but there is no standards-compliant stored-response match. `OnlyIfCached` does not enforce the same-origin restriction; misses now return a Fetch network error. Cache entries are also buffered only after a caller fully consumes the body, which is a product choice but not the standard cache algorithm.
 
 **Required work:** decide whether this crate owns a real HTTP cache or delegates to one, then implement cache matching, partitioning, freshness, conditional requests, 304 merging, invalidation, and each cache-mode algorithm.
 
@@ -96,9 +103,9 @@ The referrer-policy enum and explicit/client referrer reduction logic are now pr
 
 ### 9. Security and browser integration hooks
 
-**Evidence:** [`RequestPolicy::validate_response`](../crates/net/src/policy/mod.rs#L26-L35) accepts every response. The request fields for destination, service workers, initiator, integrity, and keepalive are declared in [`Request`](../crates/net/src/request.rs#L297-L313), but no controller path consumes them. The crate itself documents missing persistent cookies, strict CORS, and HTTP/3 in [`lib.rs`](../crates/net/src/lib.rs#L20-L20).
+**Evidence:** Browser-context requests require [`FetchServices`](../src/services.rs) request and response decisions. Integrity, navigation fetch, and keepalive lifetime are rejected before transport. A provider may authorize destination/initiator context and return a service-worker network decision; an interception decision fails closed until worker responses are supported.
 
-The Fetch Standard coordinates with other web-platform policies. Missing or inert integrations include:
+The Fetch Standard coordinates with other web-platform policies. Remaining integrations include:
 
 - Content Security Policy and mixed-content checks;
 - Upgrade Insecure Requests;
@@ -107,13 +114,13 @@ The Fetch Standard coordinates with other web-platform policies. Missing or iner
 - Cross-Origin-Resource-Policy and MIME/nosniff blocking;
 - Subresource Integrity verification of the response body;
 - `keepalive` lifetime/quota enforcement and deferred fetch;
-- network partition keys and HTTP cache partitions;
+- durable network partition state and standards-aware HTTP cache partitions;
 - offline/network-state integration;
 - TLS client certificates and HTTP authentication entries;
 - timing information for Resource Timing/Navigation Timing and server timing;
 - early hints and response lifecycle callbacks.
 
-Keepalive is no longer wholly inert: `Config.max_keepalive_body_size` and request validation reject known bodies over the configured 64 KiB default, while unknown-length keepalive bodies are rejected. The other security-sensitive fields, including `integrity`, `service_workers`, and request context, remain public state without enforcement and should either be wired to policy modules or documented as intentionally unsupported at the public API boundary.
+`Config.max_keepalive_body_size` still checks the known body length, but even an in-quota keepalive request fails with `UnsupportedFeature` until lifetime handling exists. Integrity and navigation fetch also fail explicitly. Browser policy, cookie, worker-network, cache-partition, and diagnostics inputs are supplied by the provider interface; their full browser-owned implementations remain outside this crate.
 
 ### 10. Cancellation and fetch lifecycle
 
@@ -123,9 +130,9 @@ Basic cancellation is implemented, but Fetch controllers distinguish ongoing, te
 
 ### 11. Response representation and Fetch API behavior
 
-**Evidence:** [`Response`](../crates/net/src/response.rs#L129-L140) and [`StreamingResponse`](../crates/net/src/response.rs#L143-L156) expose raw status, URL, headers, and bytes. The crate exports Rust structs and a `Stream`, not the Fetch `Headers`, `Request`, `Response`, and Body interfaces.
+**Evidence:** [`Response`](../src/response.rs) and [`StreamingResponse`](../src/response.rs) now expose filtered status, URL, headers, response type, and body. The private internal representation retains full transport metadata. The crate still exports Rust structs and a stream, not JavaScript Fetch interfaces.
 
-Missing response semantics include response type, URL list/URL exposure rules, redirected flag, status/message distinctions, null/filtered responses, header guards, body consumption helpers (`arrayBuffer`, `blob`, `bytes`, `formData`, `json`, `text`), body locking/disturbance, cloning, and standardized network errors. This may be acceptable if `crates/net` is deliberately a lower-level internal boundary, but it is a gap relative to the Fetch API and should be stated in the crate contract.
+Remaining response work includes full redirect URL-list accuracy, response constructors, body consumption helpers (`arrayBuffer`, `blob`, `bytes`, `formData`, `json`, `text`), body locking/disturbance, stream cloning, and complete network-error construction. The supported Rust subset and limitations are stated in `fetch-engine-contract.md`.
 
 ### 12. Scheduling and transport coverage
 

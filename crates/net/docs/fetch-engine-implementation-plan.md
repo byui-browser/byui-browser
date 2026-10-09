@@ -1,6 +1,7 @@
 # Plan: Make `net` the reusable Fetch engine
 
-Status: proposed implementation plan as of 2026-10-09.
+Status: implementation in progress as of 2026-10-09; step 1 is complete for
+the explicitly bounded single-exchange HTTP(S) subset described below.
 
 ## Goal
 
@@ -168,6 +169,61 @@ type for:
 Each public error must document whether it is recoverable, whether it occurs
 before or after response headers, and whether it consumes the request or
 response body.
+
+### Step 1 completion scope
+
+The first pass added the [engine contract](fetch-engine-contract.md), a private
+[`InternalResponse`](../src/response.rs), filtered public response views, and
+Fetch-oriented [`RequestError`](../src/error.rs) categories. Both `fetch` and
+`fetch_stream` now cross the same response-exposure boundary. Public responses
+use a numeric status and guarded headers rather than raw Reqwest status and
+header maps. Cache-only misses now return a Fetch network error. The follow-up
+work below closes 1.1–1.3 for the supported single-exchange subset.
+
+Step 1 completion record:
+
+- [x] **Enforce the supported contract (1.1).** Client-context requests require
+      browser-owned services. Navigation, keepalive lifetime, preflight,
+      integrity, priority scheduling, cache revalidation, and unsupported
+      redirect modes return typed capability errors. Reqwest does not follow
+      redirects; redirect statuses fail before public exposure. The supported
+      process-local cache modes and their limits are stated in the contract.
+- [x] **Define replaceable provider inputs (1.1).** `FetchServices` supplies
+      request/response policy decisions, credential selection and storage,
+      service-worker network decisions, cache partitions, and a response
+      diagnostics hook. `with_services` installs it; `new` rejects requests
+      carrying client context. Durable stores and policy databases stay outside
+      `net`.
+- [x] **Finish the public type boundary (1.1).** Public request APIs use
+      `http` and `url` types directly. Controller construction and transport
+      failures use engine error variants with diagnostic strings. Public
+      responses use numeric status and guarded headers; Reqwest responses,
+      header maps, status codes, errors, and transport streams stay private.
+- [x] **Populate internal response metadata (1.2).** The supported exchange
+      retains its complete one-URL list and explicit zero redirect count,
+      request/response origins, request mode and response type, null-body state,
+      cache provenance, and actual provider cookie-processing state. Cache hits
+      retain that state. Status text is explicitly the canonical phrase; a
+      custom wire phrase is not retained. Multi-hop state waits for step 7,
+      with redirects rejected until then.
+- [x] **Close public exposure paths (1.2).** Buffered and streaming fetches
+      share `InternalResponse::expose`. Cache hits are rechecked, null and opaque
+      bodies yield no bytes, and redirects fail before public headers. An
+      opaque view drops its internal stream. `OpaqueRedirect` and `Error` are
+      reserved variants outside this supported slice.
+- [x] **Finish the supported error contract (1.3).** `RequestError` documents
+      retryability, timing, and body effects by category. Redirect failure is
+      emitted; response-construction and body-consumption errors are deferred
+      until those operations exist. Initialization and transport failures use
+      engine variants. Abort reasons are not yet supported.
+
+The `webapis` ownership decision belongs in step 1; implementing JavaScript
+`Headers`, `Request`, `Response`, promises, Body methods, and streams is later
+binding work. Its current binding returns a string, so the contract must not
+describe that adaptation as already complete. Likewise, the shared Body model,
+complete CORS/preflight algorithms, controller-owned redirects, and durable
+cache/credential integrations remain in their later numbered steps. Step 1
+must provide honest capability boundaries for those features now.
 
 ## 2. Implement `Headers`
 
@@ -491,10 +547,10 @@ and applies the service's typed result.
 
 ### 8.1 Implement cookie storage integration
 
-Replace the current no-op cookie operations in `cookies/jar.rs` with a typed
-interface to the Security & Storage owners. The interface should accept
-Fetch-relevant inputs and return headers or processing decisions without
-exposing the storage implementation to `net`. The owning service must support:
+Extend the step-1 `FetchServices` credential hooks with the full Security &
+Storage cookie implementation. The typed interface already accepts Fetch
+request context and raw `Set-Cookie` values without exposing storage internals
+to `net`. The owning service must support:
 
 - domain and path matching;
 - expiry and deletion;
