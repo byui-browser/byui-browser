@@ -1,4 +1,7 @@
-use crate::{Attribute, ElementData, HTMLDocument, Namespace, NodeId, NodeKind, SourceSpan};
+use crate::{
+    Attribute, ElementData, HTMLDocument, Namespace, NodeId, NodeKind, SourceSpan,
+    escape_characters::decode_html_entities,
+};
 
 /// Parses raw HTML into an arena-backed document tree.
 pub fn parse_raw_html(raw: String) -> HTMLDocument {
@@ -147,7 +150,9 @@ fn append_text(document: &mut HTMLDocument, parent: NodeId, text: &str, start: u
         return;
     }
     let id = document.push_node(
-        NodeKind::Text(text.to_owned()),
+        // Decode after tokenizing markup so a decoded `<` remains text and
+        // cannot introduce new elements into the tree.
+        NodeKind::Text(decode_html_entities(text, false)),
         Some(SourceSpan { start, end }),
     );
     document.append_child(parent, id);
@@ -182,17 +187,17 @@ fn parse_start_tag(tag: &str) -> (String, Vec<Attribute>) {
             {
                 rest = &rest[quote.len_utf8()..];
                 if let Some(end) = rest.find(quote) {
-                    value = rest[..end].to_owned();
+                    value = decode_html_entities(&rest[..end], true);
                     rest = &rest[end + quote.len_utf8()..];
                 } else {
-                    value = rest.to_owned();
+                    value = decode_html_entities(rest, true);
                     rest = "";
                 }
             } else if let Some(end) = rest.find(char::is_whitespace) {
-                value = rest[..end].to_owned();
+                value = decode_html_entities(&rest[..end], true);
                 rest = &rest[end..];
             } else {
-                value = rest.to_owned();
+                value = decode_html_entities(rest, true);
                 rest = "";
             }
         }

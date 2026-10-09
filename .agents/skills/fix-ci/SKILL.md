@@ -19,6 +19,11 @@ Use whatever GitHub access your agent has. The steps are the same either way:
   hosted agents), for example `pull_request_read`, `actions_list`,
   `get_check_run`, and `get_job_logs`.
 
+Work in the terminal or through the API only. Do not open, drive, or request
+permission to control Safari, Chrome, or any other application to read logs or
+check status; if a log is only reachable through a link you cannot fetch, give
+the user the link and ask them to paste the relevant error.
+
 ## Workflow
 
 1. Resolve the active PR for the current branch (or the branch/PR the user

@@ -79,21 +79,7 @@ pub fn parse_stylesheet(input: &str) -> Stylesheet {
             continue;
         }
 
-        let declarations = declarations
-            .split(';')
-            .filter_map(|declaration| {
-                let (property, value) = declaration.split_once(':')?;
-                let property = property.trim();
-                let value = value.trim();
-                if property.is_empty() || value.is_empty() {
-                    return None;
-                }
-                Some(Declaration {
-                    property: property.to_owned(),
-                    value: value.to_owned(),
-                })
-            })
-            .collect();
+        let declarations = parse_declarations(declarations);
 
         rules.push(Rule {
             selector: Selector(selector.to_owned()),
@@ -138,6 +124,53 @@ fn remove_comments(input: &str) -> String {
 
     result.push_str(remaining);
     result
+}
+
+/// Parses declarations while recovering from errors at a line boundary.
+///
+/// CSS permits the final declaration in a block to omit its semicolon. For
+/// every other line, a missing semicolon is treated as a syntax error and the
+/// whole line is skipped so that following declarations can still be parsed.
+fn parse_declarations(input: &str) -> Vec<Declaration> {
+    let lines: Vec<&str> = input.lines().collect();
+    let last_non_empty_line = lines.iter().rposition(|line| !line.trim().is_empty());
+
+    lines
+        .iter()
+        .enumerate()
+        .flat_map(|(line_number, line)| {
+            let line_has_semicolon = line.contains(';');
+            let is_final_non_empty_line = Some(line_number) == last_non_empty_line;
+
+            line.split(';')
+                .enumerate()
+                .filter_map(move |(fragment_number, declaration)| {
+                    let is_unterminated_fragment =
+                        !line_has_semicolon || fragment_number == line.split(';').count() - 1;
+                    if is_unterminated_fragment
+                        && !is_final_non_empty_line
+                        && !declaration.trim().is_empty()
+                    {
+                        // A declaration without a semicolon before another
+                        // line is malformed. Discard it and recover at the
+                        // next line.
+                        return None;
+                    }
+
+                    let (property, value) = declaration.split_once(':')?;
+                    let property = property.trim();
+                    let value = value.trim();
+                    if property.is_empty() || value.is_empty() {
+                        return None;
+                    }
+
+                    Some(Declaration {
+                        property: property.to_owned(),
+                        value: value.to_owned(),
+                    })
+                })
+        })
+        .collect()
 }
 
 /// Resolves the cascade for every node in `dom` (architecture §3.2).
@@ -191,6 +224,35 @@ mod tests {
                 value: "blue".into(),
             }]
         );
+    }
+
+    #[test]
+    fn skips_a_line_with_a_missing_semicolon_and_continues_parsing() {
+        let sheet = parse_stylesheet(
+            "body {\n  color: red\n  background-color: blue;\n  display: block;\n}",
+        );
+
+        assert_eq!(
+            sheet.rules[0].declarations,
+            vec![
+                Declaration {
+                    property: "background-color".into(),
+                    value: "blue".into(),
+                },
+                Declaration {
+                    property: "display".into(),
+                    value: "block".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_a_final_declaration_without_a_semicolon() {
+        let sheet = parse_stylesheet("body { color: red }");
+
+        assert_eq!(sheet.rules[0].declarations[0].property, "color");
+        assert_eq!(sheet.rules[0].declarations[0].value, "red");
     }
 
     #[test]
