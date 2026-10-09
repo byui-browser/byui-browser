@@ -90,3 +90,21 @@ pub fn read_request(stream: &mut TcpStream) -> String {
     }
     String::from_utf8_lossy(&bytes).into_owned()
 }
+
+#[test]
+#[ignore = "For demonstration only."]
+pub fn fetch_image() {
+    // Fetches an image using the net crate and saves it to a file.
+    let url = "https://www.rust-lang.org/logos/rust-logo-512x512.png";
+    let runtime = runtime();
+    let body = runtime.block_on(async {
+        let controller = net::RequestController::new(net::Config::default())
+            .expect("request controller should initialize");
+        controller
+            .fetch(net::Request::get(url))
+            .await
+            .expect("request should succeed")
+            .body
+    });
+    std::fs::write("rust-logo.png", body).expect("file should be written");
+}
