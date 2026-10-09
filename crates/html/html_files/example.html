@@ -3,9 +3,140 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document</title>
+    <title>CSS Selctor DOM Test Fixture</title>
 </head>
 <body>
-    Hoi!
+    <main id="test-fixture">
+
+        <!-- 1. By Tag: p, div, and a -->
+        <section id="tag-selectors">
+            <p>First paragraph</p>
+            <p>Second paragraph</p>
+            <div>Example div element</div>
+            <div>Another div element</div>
+            <a href="#home">Example link</a>
+            <a href="#about">Another link</a>
+        </section>
+
+        <!-- 2. By Class: .button -->
+        <section id="class-selectors">
+            <button class="button">Primary button</button>
+            <button class="button">Secondary button</button>
+            <div class="button">Button-styled div</div>
+        </section>
+
+        <!-- 3. By ID: #login_button -->
+        <section id="id-selectors">
+            <button id="login_button">Log in</button>
+        </section>
+
+        <!-- 4. Nested elements: ul li -->
+        <section id="nested-selectors">
+            <ul id="main-list">
+                <li>First item</li>
+                <li>Second item</li>
+                <li class="btn">Third item with btn class</li>
+
+                <li>
+                    Parent item
+                    <ul>
+                        <li>Nested child item</li>
+                        <li class="btn">Nested child with btn class</li>
+                    </ul>
+                </li>
+            </ul>
+        </section>
+
+        <!-- 5. Nested elements with a class: ul li.btn -->
+        <section id="nested-class-selectors">
+            <ul>
+                <li class="btn">Matching list item</li>
+                <li>Non-matching list item</li>
+                <li class="btn active">Matching item with multiple classes</li>
+            </ul>
+        </section>
+
+        <!-- 6. Directly nested elements: ul > li -->
+        <section id="direct-child-selectors">
+            <ul id="direct-child-list">
+                <li>Direct child one</li>
+                <li>
+                    Direct child two
+                    <ul>
+                        <li>Descendant, but not a direct child of the outer ul</li>
+                    </ul>
+                </li>
+            </ul>
+        </section>
+
+        <!-- 7. Attribute selector: [role=button]-->
+        <section id="attribute-selectors"> 
+            <button role="button">Native button with role</button> 
+            <div role="button" tabindex="0">Div acting as a button</div> 
+            <span role="button">Span acting as a button</span> 
+            <div role="navigation">Navigation role, not a button</div> 
+        </section> 
+        
+        <!-- 8. Contains operator: [class*=prc-PageLayout-HeaderContent-] --> 
+        <section id="substring-attribute-selectors"> 
+            <header> 
+                <div class="prc-PageLayout-HeaderContent-abc123"> 
+                  Matching header class 
+                </div> 
+                
+                <div class="prc-PageLayout-HeaderContent-def456 extra-class">
+                  Matching header class with another class 
+                </div> 
+                
+                <div class="other-prc-PageLayout-HeaderContent-example"> 
+                  Also matches because the substring occurs in the class attribute 
+                </div> 
+                
+                <div class="prc-PageLayout-FooterContent-abc123">
+                  Does not match the requested substring 
+                </div> 
+            </header> 
+        </section> 
+        
+        <!-- 9. Complex nested selector --> 
+        <!-- 
+          Selector: 
+          .SharedListContainer-module__primerActionBar__Tixik 
+          [data-component=ActionBar]>[role=toolbar] 
+        --> 
+        <section id="complex-selectors"> 
+            <div class="SharedListContainer-module__primerActionBar__Tixik"> 
+                <div data-component="ActionBar"> 
+                    <div role="toolbar"> 
+                        <button>Toolbar action one</button> 
+                        <button>Toolbar action two</button> 
+                    </div> 
+                </div> 
+            </div> 
+            
+            <!-- Does not match: ActionBar is not a direct child of the class element --> 
+            <div class="SharedListContainer-module__primerActionBar__Tixik"> 
+                <section> 
+                    <div data-component="ActionBar"> 
+                        <div role="toolbar"> 
+                            <button>Non-matching toolbar</button> 
+                        </div> 
+                    </div> 
+                </section> 
+            </div> 
+            
+            <!-- Does not match: toolbar has no direct ActionBar parent --> 
+             <div class="SharedListContainer-module__primerActionBar__Tixik"> 
+                <div data-component="ActionBar"> 
+                    <section> 
+                        <div role="toolbar"> 
+                            <button>Nested non-matching toolbar</button> 
+                        </div> 
+                    </section> 
+                </div> 
+            </div> 
+        </section>
+        
+    </main>
 </body>
 </html>
