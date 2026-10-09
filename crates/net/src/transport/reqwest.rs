@@ -84,7 +84,7 @@ impl Transport for ReqwestTransport {
             }
             let mut builder = client.request(request.method, url).headers(headers);
             if let Some(body) = request.body {
-                builder = builder.body(body.as_bytes().to_vec());
+                builder = builder.body(body.into_reqwest_body()?);
             }
             let response = tokio::select! {
                 _ = signal.cancelled() => return Err(RequestError::Aborted),

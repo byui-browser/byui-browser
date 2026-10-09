@@ -17,6 +17,8 @@ pub struct Config {
     pub user_agent: Option<HeaderValue>,
     /// Maximum number of requests allowed to execute concurrently.
     pub max_in_flight: usize,
+    /// Maximum known request-body size, in bytes, for requests marked `keepalive`.
+    pub max_keepalive_body_size: u64,
 }
 
 impl Default for Config {
@@ -28,6 +30,7 @@ impl Default for Config {
             pool_max_idle_per_host: 8,
             user_agent: Some(HeaderValue::from_static("byui-browser/0.1")),
             max_in_flight: 32,
+            max_keepalive_body_size: 65_536,
         }
     }
 }

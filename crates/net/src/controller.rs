@@ -28,6 +28,8 @@ pub struct RequestController {
 }
 
 struct ControllerInner {
+    /// Maximum accepted body size for keepalive requests.
+    max_keepalive_body_size: u64,
     /// Process-local response cache shared by controller clones.
     cache: ResponseCache,
     /// Cookie attachment and response processing boundary.
@@ -54,14 +56,17 @@ impl RequestController {
     /// transport-construction error is returned if the underlying HTTP client
     /// cannot be initialized.
     pub fn new(config: Config) -> Result<Self, reqwest::Error> {
+        let max_in_flight = config.max_in_flight;
+        let max_keepalive_body_size = config.max_keepalive_body_size;
         let transport = reqwest_transport(config.clone())?;
         Ok(Self {
             inner: Arc::new(ControllerInner {
+                max_keepalive_body_size,
                 cache: ResponseCache::default(),
                 cookies: CookieStore,
                 cors: CorsChecker,
                 policy: RequestPolicy,
-                scheduler: RequestScheduler::new(transport, config.max_in_flight),
+                scheduler: RequestScheduler::new(transport, max_in_flight),
             }),
         })
     }
@@ -102,8 +107,11 @@ impl RequestController {
         if request.signal.is_aborted() {
             return Err(RequestError::Aborted);
         }
-        let url = self.inner.policy.validate_request(&request)?;
-        request.url_list = vec![url.clone()];
+        let url = self
+            .inner
+            .policy
+            .validate_request(&request, self.inner.max_keepalive_body_size)?;
+        request.prepare_url(url.clone());
 
         let cacheable = request.is_cacheable_method();
         let cache_lookup = match request.cache_mode {
@@ -136,6 +144,7 @@ impl RequestController {
         // Cookie and policy modules operate before transport sees the request;
         // this keeps browser behavior out of the low-level HTTP implementation.
         let mut request = request;
+        request.apply_fetch_headers()?;
         self.inner.cookies.attach(&mut request)?;
         // The scheduler owns concurrency admission. Transport remains focused
         // on HTTP I/O and connection pooling.

@@ -1,17 +1,23 @@
 //! Fetch-style request state and transport preparation.
 
-use reqwest::{
-    Method, Url,
-    header::{HeaderMap, HeaderName, HeaderValue},
+use std::{
+    fmt, io,
+    pin::Pin,
+    sync::{Arc, Mutex},
 };
 
-use crate::cancellation::AbortSignal;
+use bytes::Bytes;
+use futures_util::{Stream, TryStreamExt};
+use reqwest::{
+    Body, Method, Url,
+    header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
+};
+
+use crate::{cancellation::AbortSignal, error::RequestError};
+
+type RequestStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
 
 /// A request after Fetch policy validation has produced a parsed URL.
-///
-/// This is the transport-facing form of [`Request`]. The controller keeps the
-/// Fetch request model separate from Reqwest's header and body types so policy
-/// code can run before transport-specific conversion.
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedRequest {
     /// Request metadata and caller-supplied state.
@@ -20,36 +26,143 @@ pub(crate) struct PreparedRequest {
     pub(crate) url: Url,
 }
 
-/// A serialized origin associated with the environment that initiated a request.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Origin(String);
+/// Structured origin state for a client environment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Origin {
+    scheme: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
+}
 
 impl Origin {
-    /// Creates an origin from its serialized representation.
-    pub fn new(serialized: impl Into<String>) -> Self {
-        Self(serialized.into())
+    /// Creates the tuple origin for an HTTP(S) URL.
+    pub fn from_url(url: &Url) -> Result<Self, RequestError> {
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(RequestError::UnsupportedScheme(url.scheme().to_owned()));
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| RequestError::InvalidUrl(url.as_str().to_owned()))?;
+        Ok(Self {
+            scheme: Some(url.scheme().to_ascii_lowercase()),
+            host: Some(host.to_ascii_lowercase()),
+            port: url.port_or_known_default(),
+        })
     }
 
-    /// Returns the serialized origin used in policy headers and diagnostics.
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// Creates an opaque origin, which is unequal to every tuple origin.
+    pub fn opaque() -> Self {
+        Self {
+            scheme: None,
+            host: None,
+            port: None,
+        }
+    }
+
+    /// Parses a serialized HTTP(S) origin and rejects paths, credentials, and queries.
+    pub fn parse(serialized: &str) -> Result<Self, RequestError> {
+        let url = Url::parse(serialized)
+            .map_err(|_| RequestError::InvalidOrigin(serialized.to_owned()))?;
+        if url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(RequestError::InvalidOrigin(serialized.to_owned()));
+        }
+        Self::from_url(&url).map_err(|_| RequestError::InvalidOrigin(serialized.to_owned()))
+    }
+
+    /// Returns this origin's canonical serialization, or `"null"` for opaque origins.
+    pub fn as_str(&self) -> String {
+        let (Some(scheme), Some(host), Some(port)) = (&self.scheme, &self.host, self.port) else {
+            return "null".to_owned();
+        };
+        let default_port = match scheme.as_str() {
+            "http" => 80,
+            "https" => 443,
+            _ => port,
+        };
+        if port == default_port {
+            format!("{scheme}://{host}")
+        } else {
+            format!("{scheme}://{host}:{port}")
+        }
+    }
+
+    /// Returns whether this is an opaque origin.
+    pub fn is_opaque(&self) -> bool {
+        self.scheme.is_none()
+    }
+
+    /// Tests tuple-origin equality; opaque origins never match, including themselves.
+    pub fn is_same_origin(&self, other: &Self) -> bool {
+        !self.is_opaque() && !other.is_opaque() && self == other
     }
 }
 
-/// An ordered HTTP header list.
-///
-/// Fetch treats headers as an ordered multimap. Duplicate entries are retained
-/// here and converted to Reqwest's transport representation only immediately
-/// before I/O.
+/// Top-level origin used to partition browser network state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkPartitionKey {
+    /// Origin of the top-level site containing the request's client.
+    pub top_level_origin: Origin,
+}
+
+impl NetworkPartitionKey {
+    /// Creates a partition key from the top-level site's structured origin.
+    pub fn new(top_level_origin: Origin) -> Self {
+        Self { top_level_origin }
+    }
+}
+
+/// Guard that controls which header names and values may be added to a list.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HeaderGuard {
+    /// No Fetch restrictions; intended for internal or non-request header lists.
+    None,
+    /// A request header list with forbidden request headers blocked.
+    #[default]
+    Request,
+    /// A no-CORS request header list restricted to CORS-safelisted headers.
+    RequestNoCors,
+    /// A response header list that blocks forbidden response headers.
+    Response,
+    /// A header list that cannot be changed.
+    Immutable,
+}
+
+/// An ordered HTTP header list with a Fetch mutation guard.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HeaderList {
     entries: Vec<(HeaderName, HeaderValue)>,
+    guard: HeaderGuard,
 }
 
 impl HeaderList {
-    /// Creates an empty header list.
+    /// Creates an empty request-guarded list.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates an empty list with the supplied Fetch guard.
+    pub fn with_guard(guard: HeaderGuard) -> Self {
+        Self {
+            entries: Vec::new(),
+            guard,
+        }
+    }
+
+    /// Returns the current mutation guard.
+    pub fn guard(&self) -> HeaderGuard {
+        self.guard
+    }
+
+    /// Sets a stricter guard. Existing entries are filtered when switching to a request guard.
+    pub(crate) fn set_guard(&mut self, guard: HeaderGuard) {
+        self.guard = guard;
+        self.entries
+            .retain(|(name, value)| allowed_header(guard, name, value));
     }
 
     /// Returns whether the list contains no headers.
@@ -57,15 +170,19 @@ impl HeaderList {
         self.entries.is_empty()
     }
 
-    /// Appends a header without removing an existing entry with the same name.
-    pub fn append(&mut self, name: HeaderName, value: HeaderValue) {
+    /// Appends a header while preserving duplicate entries and insertion order.
+    pub fn append(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), RequestError> {
+        self.check(&name, &value)?;
         self.entries.push((name, value));
+        Ok(())
     }
 
     /// Replaces all entries with `name` with one header value.
-    pub fn insert(&mut self, name: HeaderName, value: HeaderValue) {
-        self.entries.retain(|(existing, _)| existing != name);
+    pub fn insert(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), RequestError> {
+        self.check(&name, &value)?;
+        self.entries.retain(|(existing, _)| existing != &name);
         self.entries.push((name, value));
+        Ok(())
     }
 
     /// Iterates over headers in insertion order.
@@ -81,47 +198,299 @@ impl HeaderList {
         }
         headers
     }
+
+    fn check(&self, name: &HeaderName, value: &HeaderValue) -> Result<(), RequestError> {
+        if allowed_header(self.guard, name, value) {
+            Ok(())
+        } else {
+            Err(RequestError::ForbiddenHeader(name.as_str().to_owned()))
+        }
+    }
+
+    pub(crate) fn insert_internal_header(&mut self, name: HeaderName, value: HeaderValue) {
+        self.entries.retain(|(existing, _)| existing != &name);
+        self.entries.push((name, value));
+    }
 }
 
 impl From<HeaderMap> for HeaderList {
-    /// Copies a Reqwest header map into an ordered Fetch header list.
+    /// Copies permitted request headers from a Reqwest header map.
     fn from(headers: HeaderMap) -> Self {
         let mut list = Self::new();
         for (name, value) in headers {
-            if let Some(name) = name {
-                list.append(name, value);
+            if let Some(name) = name
+                && allowed_header(list.guard, &name, &value)
+            {
+                list.entries.push((name, value));
             }
         }
         list
     }
 }
 
-/// A request body that can later be extended with streaming and form-data sources.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RequestBody {
-    /// A replayable byte sequence suitable for redirects and retries.
-    Bytes(Vec<u8>),
+fn allowed_header(guard: HeaderGuard, name: &HeaderName, value: &HeaderValue) -> bool {
+    match guard {
+        HeaderGuard::None => true,
+        HeaderGuard::Immutable => false,
+        HeaderGuard::Request => !is_forbidden_request_header(name),
+        HeaderGuard::Response => !matches!(name.as_str(), "set-cookie" | "set-cookie2"),
+        HeaderGuard::RequestNoCors => {
+            !is_forbidden_request_header(name) && is_cors_safelisted_header(name, value)
+        }
+    }
 }
 
+fn is_forbidden_request_header(name: &HeaderName) -> bool {
+    let name = name.as_str();
+    matches!(
+        name,
+        "accept-charset"
+            | "accept-encoding"
+            | "access-control-request-headers"
+            | "access-control-request-method"
+            | "access-control-request-private-network"
+            | "connection"
+            | "content-length"
+            | "cookie"
+            | "cookie2"
+            | "date"
+            | "dnt"
+            | "expect"
+            | "host"
+            | "keep-alive"
+            | "origin"
+            | "permissions-policy"
+            | "proxy-connection"
+            | "referer"
+            | "set-cookie"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "via"
+    ) || name.starts_with("proxy-")
+        || name.starts_with("sec-")
+}
+
+fn is_cors_safelisted_header(name: &HeaderName, value: &HeaderValue) -> bool {
+    let raw = value.as_bytes();
+    if raw.len() > 128
+        || raw
+            .iter()
+            .any(|byte| matches!(*byte, 0x00..=0x08 | 0x0a..=0x1f | 0x7f))
+    {
+        return false;
+    }
+    match name.as_str() {
+        "accept" | "accept-language" | "content-language" => true,
+        "content-type" => value.to_str().is_ok_and(|value| {
+            let media_type = value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            matches!(
+                media_type.as_str(),
+                "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
+            )
+        }),
+        "range" => value.to_str().is_ok_and(|value| {
+            value.strip_prefix("bytes=").is_some_and(|range| {
+                let mut parts = range.split('-');
+                let first = parts.next().unwrap_or("");
+                let last = parts.next().unwrap_or("");
+                !first.is_empty()
+                    && first.bytes().all(|byte| byte.is_ascii_digit())
+                    && (last.is_empty() || last.bytes().all(|byte| byte.is_ascii_digit()))
+                    && parts.next().is_none()
+            })
+        }),
+        _ => false,
+    }
+}
+
+/// A request body, either repeatable bytes or a shared one-shot byte/stream source.
+#[derive(Clone)]
+pub struct RequestBody {
+    source: BodySource,
+    content_type: Option<HeaderValue>,
+    length: Option<u64>,
+}
+
+#[derive(Clone)]
+enum BodySource {
+    Bytes(Bytes),
+    OneShotBytes(Arc<Mutex<Option<Bytes>>>),
+    OneShotStream(Arc<Mutex<Option<RequestStream>>>),
+}
+
+impl fmt::Debug for RequestBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestBody")
+            .field("replayable", &self.is_replayable())
+            .field("content_type", &self.content_type)
+            .field("length", &self.length)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for RequestBody {
+    fn eq(&self, other: &Self) -> bool {
+        if self.content_type != other.content_type || self.length != other.length {
+            return false;
+        }
+        match (&self.source, &other.source) {
+            (BodySource::Bytes(a), BodySource::Bytes(b)) => a == b,
+            (BodySource::OneShotBytes(a), BodySource::OneShotBytes(b)) => Arc::ptr_eq(a, b),
+            (BodySource::OneShotStream(a), BodySource::OneShotStream(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for RequestBody {}
+
 impl RequestBody {
-    /// Creates a replayable byte body.
+    /// Creates a replayable byte body with no inferred media type.
     pub fn bytes(body: impl Into<Vec<u8>>) -> Self {
-        Self::Bytes(body.into())
+        let bytes = Bytes::from(body.into());
+        let length = Some(bytes.len() as u64);
+        Self {
+            source: BodySource::Bytes(bytes),
+            content_type: None,
+            length,
+        }
     }
 
-    /// Returns the body bytes for transport conversion.
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        match self {
-            Self::Bytes(body) => body,
+    /// Creates a replayable UTF-8 text body with the Fetch default text media type.
+    pub fn text(body: impl Into<String>) -> Self {
+        Self::with_content_type(
+            body.into().into_bytes(),
+            HeaderValue::from_static("text/plain;charset=UTF-8"),
+        )
+    }
+
+    /// Creates replayable bytes with caller-selected content type.
+    pub fn with_content_type(body: impl Into<Vec<u8>>, content_type: HeaderValue) -> Self {
+        let bytes = Bytes::from(body.into());
+        let length = Some(bytes.len() as u64);
+        Self {
+            source: BodySource::Bytes(bytes),
+            content_type: Some(content_type),
+            length,
         }
+    }
+
+    /// Creates a URL-encoded form body and sets its standard media type.
+    pub fn url_encoded(body: impl Into<Vec<u8>>) -> Self {
+        Self::with_content_type(
+            body,
+            HeaderValue::from_static("application/x-www-form-urlencoded;charset=UTF-8"),
+        )
+    }
+
+    /// Creates a one-shot body from bytes. Clones share consumption state.
+    pub fn one_shot_bytes(body: impl Into<Vec<u8>>) -> Self {
+        let bytes = Bytes::from(body.into());
+        let length = Some(bytes.len() as u64);
+        Self {
+            source: BodySource::OneShotBytes(Arc::new(Mutex::new(Some(bytes)))),
+            content_type: None,
+            length,
+        }
+    }
+
+    /// Creates a one-shot streaming body. Its byte length is unknown.
+    pub fn stream<S>(stream: S) -> Self
+    where
+        S: Stream<Item = Result<Vec<u8>, io::Error>> + Send + 'static,
+    {
+        Self {
+            source: BodySource::OneShotStream(Arc::new(Mutex::new(Some(Box::pin(
+                stream.map_ok(Bytes::from),
+            ))))),
+            content_type: None,
+            length: None,
+        }
+    }
+
+    /// Returns true when this body can be sent repeatedly, such as after a redirect.
+    pub fn is_replayable(&self) -> bool {
+        matches!(self.source, BodySource::Bytes(_))
+    }
+
+    /// Returns the known body length in bytes.
+    pub fn length(&self) -> Option<u64> {
+        self.length
+    }
+
+    /// Returns the media type inferred or assigned to this body.
+    pub fn content_type(&self) -> Option<&HeaderValue> {
+        self.content_type.as_ref()
+    }
+
+    pub(crate) fn apply_metadata(&self, headers: &mut HeaderList) {
+        if let Some(content_type) = &self.content_type
+            && !headers.entries.iter().any(|(name, _)| name == CONTENT_TYPE)
+        {
+            headers.insert_internal_header(CONTENT_TYPE, content_type.clone());
+        }
+    }
+
+    pub(crate) fn into_reqwest_body(self) -> Result<Body, RequestError> {
+        match self.source {
+            BodySource::Bytes(bytes) => Ok(Body::from(bytes)),
+            BodySource::OneShotBytes(shared) => shared
+                .lock()
+                .map_err(|_| RequestError::BodyAlreadyConsumed)?
+                .take()
+                .map(Body::from)
+                .ok_or(RequestError::BodyAlreadyConsumed),
+            BodySource::OneShotStream(shared) => {
+                let stream = shared
+                    .lock()
+                    .map_err(|_| RequestError::BodyAlreadyConsumed)?
+                    .take()
+                    .ok_or(RequestError::BodyAlreadyConsumed)?;
+                Ok(Body::wrap_stream(stream.map_err(|error| error)))
+            }
+        }
+    }
+}
+
+/// Client environment used to resolve URLs and derive request origin/referrer state.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FetchEnvironment {
+    /// Base URL used to resolve relative request URLs.
+    pub base_url: Option<Url>,
+    /// Structured origin of the document or worker that initiated the request.
+    pub origin: Option<Origin>,
+    /// Environment URL used as the default referrer source.
+    pub referrer: Option<Url>,
+    /// Top-level site key used to partition cookies, caches, and connection state.
+    pub network_partition_key: Option<NetworkPartitionKey>,
+}
+
+impl FetchEnvironment {
+    /// Builds an environment whose base URL, origin, and referrer come from one document URL.
+    pub fn from_url(url: Url) -> Result<Self, RequestError> {
+        let origin = Origin::from_url(&url)?;
+        Ok(Self {
+            base_url: Some(url.clone()),
+            origin: Some(origin.clone()),
+            referrer: Some(url),
+            network_partition_key: Some(NetworkPartitionKey::new(origin)),
+        })
     }
 }
 
 /// Controls the browser context in which a request was initiated.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FetchContext {
-    /// Origin of the document or worker that initiated the request.
-    pub origin: Option<Origin>,
+    /// Environment state used by URL, origin, and referrer algorithms.
+    pub environment: FetchEnvironment,
     /// Cross-origin mode used when making the request.
     pub mode: RequestMode,
     /// Whether credentials such as cookies may be included.
@@ -279,40 +648,25 @@ pub enum InitiatorType {
 /// A browser request before conversion to a transport request.
 #[derive(Clone, Debug)]
 pub struct Request {
-    /// The original request URL. The controller parses it before I/O.
-    pub url: String,
-    /// The HTTP method.
-    pub method: Method,
-    /// The ordered Fetch header list.
-    pub headers: HeaderList,
-    /// Optional replayable request body.
-    pub body: Option<RequestBody>,
-    /// Controls the local HTTP cache algorithm.
-    pub cache_mode: CacheMode,
-    /// Controls redirect handling.
-    pub redirect_mode: RedirectMode,
-    /// Controls referrer generation.
-    pub referrer: Referrer,
-    /// Controls referrer reduction.
-    pub referrer_policy: ReferrerPolicy,
-    /// Fetch destination used by CSP, mixed-content, and service-worker policy.
-    pub destination: RequestDestination,
-    /// Whether matching service workers may intercept this request.
-    pub service_workers: ServiceWorkersMode,
-    /// Fetch initiator used by policy and timing integrations.
-    pub initiator: InitiatorType,
-    /// Optional subresource integrity metadata.
-    pub integrity: Option<String>,
-    /// Whether the request may outlive its initiating environment.
-    pub keepalive: bool,
-    /// Scheduler priority requested by the caller.
-    pub priority: RequestPriority,
-    /// Browser context used by security, cookie, and CORS policy modules.
-    pub context: FetchContext,
-    /// Cancellation signal for this request.
-    pub signal: AbortSignal,
-    /// URLs visited by this request, including the initial URL after preparation.
+    pub(crate) url: String,
+    pub(crate) method: Method,
+    pub(crate) headers: HeaderList,
+    pub(crate) body: Option<RequestBody>,
+    pub(crate) cache_mode: CacheMode,
+    pub(crate) redirect_mode: RedirectMode,
+    pub(crate) referrer: Referrer,
+    pub(crate) referrer_policy: ReferrerPolicy,
+    pub(crate) destination: RequestDestination,
+    pub(crate) service_workers: ServiceWorkersMode,
+    pub(crate) initiator: InitiatorType,
+    pub(crate) integrity: Option<String>,
+    pub(crate) keepalive: bool,
+    pub(crate) priority: RequestPriority,
+    pub(crate) context: FetchContext,
+    pub(crate) signal: AbortSignal,
     pub(crate) url_list: Vec<Url>,
+    pub(crate) current_url: Option<Url>,
+    pub(crate) redirect_count: usize,
 }
 
 /// Relative importance assigned to a request by the network scheduler.
@@ -348,7 +702,195 @@ impl Request {
             context: FetchContext::default(),
             signal: AbortSignal::new(),
             url_list: Vec::new(),
+            current_url: None,
+            redirect_count: 0,
         }
+    }
+
+    /// Creates a request after normalizing and validating its method.
+    pub fn new(url: impl Into<String>, method: impl AsRef<str>) -> Result<Self, RequestError> {
+        let mut request = Self::get(url);
+        request.set_method(method)?;
+        Ok(request)
+    }
+
+    /// Returns the original URL string supplied for this request.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Returns the normalized HTTP method.
+    pub fn method(&self) -> &Method {
+        &self.method
+    }
+
+    /// Returns the guarded request header list.
+    pub fn headers(&self) -> &HeaderList {
+        &self.headers
+    }
+
+    /// Returns this request's optional body.
+    pub fn body(&self) -> Option<&RequestBody> {
+        self.body.as_ref()
+    }
+
+    /// Returns the resolved current URL once request preparation has run.
+    pub fn current_url(&self) -> Option<&Url> {
+        self.current_url.as_ref()
+    }
+
+    /// Returns the configured request mode.
+    pub fn mode(&self) -> RequestMode {
+        self.context.mode
+    }
+
+    /// Returns the configured credentials mode.
+    pub fn credentials_mode(&self) -> CredentialsMode {
+        self.context.credentials
+    }
+
+    /// Returns the client environment used to derive URL and origin state.
+    pub fn environment(&self) -> &FetchEnvironment {
+        &self.context.environment
+    }
+
+    /// Returns all URLs visited by this request, in order.
+    pub fn url_list(&self) -> &[Url] {
+        &self.url_list
+    }
+
+    /// Returns the number of redirects followed so far.
+    pub fn redirect_count(&self) -> usize {
+        self.redirect_count
+    }
+
+    /// Replaces the method after Fetch token and forbidden-method validation.
+    pub fn set_method(&mut self, method: impl AsRef<str>) -> Result<(), RequestError> {
+        let method = method.as_ref();
+        let parsed = Method::from_bytes(method.as_bytes())
+            .map_err(|_| RequestError::InvalidMethod(method.to_owned()))?;
+        let normalized = match parsed.as_str().to_ascii_uppercase().as_str() {
+            "DELETE" => Method::DELETE,
+            "GET" => Method::GET,
+            "HEAD" => Method::HEAD,
+            "OPTIONS" => Method::OPTIONS,
+            "POST" => Method::POST,
+            "PUT" => Method::PUT,
+            _ => parsed,
+        };
+        if matches!(normalized.as_str(), "CONNECT" | "TRACE" | "TRACK") {
+            return Err(RequestError::ForbiddenMethod(normalized.to_string()));
+        }
+        if self.context.mode == RequestMode::NoCors
+            && !matches!(normalized, Method::GET | Method::HEAD | Method::POST)
+        {
+            return Err(RequestError::NoCorsMethod(normalized.to_string()));
+        }
+        self.method = normalized;
+        Ok(())
+    }
+
+    /// Appends a caller-controlled request header under the active Fetch guard.
+    pub fn append_header(
+        &mut self,
+        name: HeaderName,
+        value: HeaderValue,
+    ) -> Result<(), RequestError> {
+        self.headers.append(name, value)
+    }
+
+    /// Replaces caller-controlled values for a header under the active Fetch guard.
+    pub fn set_header(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), RequestError> {
+        self.headers.insert(name, value)
+    }
+
+    /// Changes request mode and applies the corresponding request-header guard.
+    pub fn set_mode(&mut self, mode: RequestMode) -> Result<(), RequestError> {
+        if mode == RequestMode::NoCors
+            && !matches!(self.method, Method::GET | Method::HEAD | Method::POST)
+        {
+            return Err(RequestError::NoCorsMethod(self.method.to_string()));
+        }
+        self.context.mode = mode;
+        self.headers.set_guard(if mode == RequestMode::NoCors {
+            HeaderGuard::RequestNoCors
+        } else {
+            HeaderGuard::Request
+        });
+        Ok(())
+    }
+
+    /// Sets the credentials mode used by cookie and authentication policy.
+    pub fn set_credentials_mode(&mut self, mode: CredentialsMode) {
+        self.context.credentials = mode;
+    }
+
+    /// Sets the initiating client environment.
+    pub fn set_environment(&mut self, environment: FetchEnvironment) {
+        self.context.environment = environment;
+    }
+
+    /// Sets or clears the body and derives its content type when absent.
+    pub fn set_body(&mut self, body: Option<RequestBody>) -> Result<(), RequestError> {
+        if body.is_some() && matches!(self.method, Method::GET | Method::HEAD) {
+            return Err(RequestError::BodyNotAllowed(self.method.to_string()));
+        }
+        self.body = body;
+        if let Some(body) = &self.body {
+            body.apply_metadata(&mut self.headers);
+        }
+        Ok(())
+    }
+
+    /// Sets the Fetch cache mode.
+    pub fn set_cache_mode(&mut self, mode: CacheMode) {
+        self.cache_mode = mode;
+    }
+
+    /// Sets the Fetch redirect mode.
+    pub fn set_redirect_mode(&mut self, mode: RedirectMode) {
+        self.redirect_mode = mode;
+    }
+
+    /// Sets the referrer source and reduction policy.
+    pub fn set_referrer(&mut self, referrer: Referrer, policy: ReferrerPolicy) {
+        self.referrer = referrer;
+        self.referrer_policy = policy;
+    }
+
+    /// Sets the request destination used by browser policy integrations.
+    pub fn set_destination(&mut self, destination: RequestDestination) {
+        self.destination = destination;
+    }
+
+    /// Sets whether service workers may intercept this request.
+    pub fn set_service_workers_mode(&mut self, mode: ServiceWorkersMode) {
+        self.service_workers = mode;
+    }
+
+    /// Sets the source that initiated this request.
+    pub fn set_initiator(&mut self, initiator: InitiatorType) {
+        self.initiator = initiator;
+    }
+
+    /// Sets optional subresource integrity metadata.
+    pub fn set_integrity(&mut self, integrity: Option<String>) {
+        self.integrity = integrity;
+    }
+
+    /// Sets the scheduler priority for this request.
+    pub fn set_priority(&mut self, priority: RequestPriority) {
+        self.priority = priority;
+    }
+
+    /// Sets the cancellation signal.
+    pub fn set_signal(&mut self, signal: AbortSignal) {
+        self.signal = signal;
+    }
+
+    /// Sets whether this request may outlive its initiating environment.
+    pub fn set_keepalive(&mut self, keepalive: bool) {
+        self.keepalive = keepalive;
     }
 
     /// Returns whether this request method may use the response cache.
@@ -365,18 +907,46 @@ impl Request {
         }
     }
 
+    pub(crate) fn prepare_url(&mut self, url: Url) {
+        if self.url_list.is_empty() {
+            self.url_list.push(url.clone());
+        }
+        self.current_url = Some(url);
+    }
+
+    pub(crate) fn apply_fetch_headers(&mut self) -> Result<(), RequestError> {
+        if let Some(body) = &self.body {
+            body.apply_metadata(&mut self.headers);
+        }
+        let needs_origin = self.context.mode == RequestMode::Cors
+            || !matches!(self.method, Method::GET | Method::HEAD);
+        if needs_origin && let Some(origin) = &self.context.environment.origin {
+            let value = HeaderValue::try_from(origin.as_str())
+                .map_err(|_| RequestError::InvalidOrigin(origin.as_str()))?;
+            self.headers
+                .insert_internal_header(HeaderName::from_static("origin"), value);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_redirect(&mut self, url: Url) {
+        self.redirect_count += 1;
+        self.current_url = Some(url.clone());
+        self.url_list.push(url);
+    }
+
     /// Computes the `Referer` value for a request target.
     pub(crate) fn referrer_value(&self, target: &Url) -> Option<String> {
-        let Referrer::Url(source) = &self.referrer else {
-            return None;
+        let source = match &self.referrer {
+            Referrer::NoReferrer => return None,
+            Referrer::Client => self.context.environment.referrer.as_ref()?,
+            Referrer::Url(source) => source,
         };
         let same_origin = source.origin() == target.origin();
         let downgrade = source.scheme() == "https" && target.scheme() == "http";
         let source_url = source.as_str().to_owned();
         let source_origin = source.origin().ascii_serialization();
-
         let policy = match self.referrer_policy {
-            // Fetch's user-agent default is the strict-origin-when-cross-origin policy.
             ReferrerPolicy::Empty => ReferrerPolicy::StrictOriginWhenCrossOrigin,
             policy => policy,
         };
@@ -395,9 +965,37 @@ impl Request {
             ReferrerPolicy::StrictOriginWhenCrossOrigin if downgrade => None,
             ReferrerPolicy::StrictOriginWhenCrossOrigin if same_origin => Some(source_url),
             ReferrerPolicy::StrictOriginWhenCrossOrigin => Some(source_origin),
-            // `Empty` is normalized above, but retaining this arm keeps the
-            // match exhaustive if the policy normalization changes later.
             ReferrerPolicy::Empty => Some(source_origin),
         }
+    }
+
+    pub(crate) fn validate_body_state(
+        &self,
+        max_keepalive_body_size: u64,
+    ) -> Result<(), RequestError> {
+        if self.body.is_some() && matches!(self.method, Method::GET | Method::HEAD) {
+            return Err(RequestError::BodyNotAllowed(self.method.to_string()));
+        }
+        if self.context.mode == RequestMode::NoCors
+            && let Some(body) = &self.body
+            && let Some(content_type) = body.content_type()
+            && !is_cors_safelisted_header(&CONTENT_TYPE, content_type)
+        {
+            return Err(RequestError::ForbiddenHeader(
+                CONTENT_TYPE.as_str().to_owned(),
+            ));
+        }
+        if self.keepalive {
+            let body_size = match &self.body {
+                None => Some(0),
+                Some(body) => body.length(),
+            };
+            if body_size.map_or(true, |size| size > max_keepalive_body_size) {
+                return Err(RequestError::KeepaliveBodyTooLarge {
+                    limit: max_keepalive_body_size,
+                });
+            }
+        }
+        Ok(())
     }
 }

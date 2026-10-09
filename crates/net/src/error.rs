@@ -11,6 +11,22 @@ pub enum RequestError {
     CacheMiss,
     /// The URL uses a scheme unsupported by the HTTP transport.
     UnsupportedScheme(String),
+    /// The serialized origin is malformed or is not an HTTP(S) origin.
+    InvalidOrigin(String),
+    /// The request method is not a valid HTTP token.
+    InvalidMethod(String),
+    /// Fetch forbids this request method.
+    ForbiddenMethod(String),
+    /// The method is outside the GET/HEAD/POST set allowed by no-CORS mode.
+    NoCorsMethod(String),
+    /// Fetch forbids this request header under the active header guard.
+    ForbiddenHeader(String),
+    /// A request body cannot be sent with this method.
+    BodyNotAllowed(String),
+    /// A one-shot body has already been consumed by an earlier send attempt.
+    BodyAlreadyConsumed,
+    /// The keepalive body exceeds the configured byte quota.
+    KeepaliveBodyTooLarge { limit: u64 },
     /// The scheduler was shut down before the request could run.
     SchedulerClosed,
     /// The request was aborted before completion.
@@ -25,6 +41,18 @@ impl std::fmt::Display for RequestError {
             Self::Transport(error) => write!(f, "Request failed: {error}"),
             Self::CacheMiss => f.write_str("Request is not available in the HTTP cache"),
             Self::UnsupportedScheme(scheme) => write!(f, "Unsupported URL scheme: {scheme}"),
+            Self::InvalidOrigin(origin) => write!(f, "Invalid request origin: {origin}"),
+            Self::InvalidMethod(method) => write!(f, "Invalid request method: {method}"),
+            Self::ForbiddenMethod(method) => write!(f, "Forbidden request method: {method}"),
+            Self::NoCorsMethod(method) => {
+                write!(f, "Method is not allowed in no-CORS mode: {method}")
+            }
+            Self::ForbiddenHeader(name) => write!(f, "Forbidden request header: {name}"),
+            Self::BodyNotAllowed(method) => write!(f, "A request body is not allowed for {method}"),
+            Self::BodyAlreadyConsumed => f.write_str("Request body has already been consumed"),
+            Self::KeepaliveBodyTooLarge { limit } => {
+                write!(f, "Keepalive request body exceeds {limit} bytes")
+            }
             Self::SchedulerClosed => f.write_str("Request scheduler is closed"),
             Self::Aborted => f.write_str("Request was aborted"),
         }

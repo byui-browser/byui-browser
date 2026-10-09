@@ -5,7 +5,7 @@ mod common;
 use common::{TestServer, runtime};
 use net::{CacheMode, Config, Request, RequestBody, RequestController, RequestError};
 use reqwest::{
-    Method, StatusCode,
+    StatusCode,
     header::{HeaderName, HeaderValue},
 };
 
@@ -18,13 +18,17 @@ fn fetch_sends_headers_and_body_to_a_local_server() {
     });
 
     let mut request = Request::get(server.url());
-    request.method = Method::POST;
-    request.headers.insert(
-        HeaderName::from_static("x-test"),
-        HeaderValue::from_static("integration"),
-    );
-    request.body = Some(RequestBody::bytes(b"request body".to_vec()));
-    request.cache_mode = CacheMode::NoStore;
+    request.set_method("POST").unwrap();
+    request
+        .set_header(
+            HeaderName::from_static("x-test"),
+            HeaderValue::from_static("integration"),
+        )
+        .unwrap();
+    request
+        .set_body(Some(RequestBody::bytes(b"request body".to_vec())))
+        .unwrap();
+    request.set_cache_mode(CacheMode::NoStore);
 
     let controller = RequestController::new(Config::default()).unwrap();
     let response = runtime().block_on(controller.fetch(request)).unwrap();
@@ -96,8 +100,10 @@ fn non_cacheable_post_requests_are_sent_each_time() {
 
     runtime().block_on(async {
         let mut request = Request::get(server.url());
-        request.method = Method::POST;
-        request.body = Some(RequestBody::bytes(b"payload".to_vec()));
+        request.set_method("POST").unwrap();
+        request
+            .set_body(Some(RequestBody::bytes(b"payload".to_vec())))
+            .unwrap();
         controller.fetch(request.clone()).await.unwrap();
         controller.fetch(request).await.unwrap();
     });

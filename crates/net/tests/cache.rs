@@ -75,7 +75,7 @@ fn no_store_streams_are_not_cached() {
 
     runtime().block_on(async {
         let mut request = Request::get(server.url());
-        request.cache_mode = CacheMode::NoStore;
+        request.set_cache_mode(CacheMode::NoStore);
         let first = controller.fetch_stream(request.clone()).await.unwrap();
         let second = controller.fetch_stream(request).await.unwrap();
         assert!(!first.from_cache);
@@ -108,7 +108,7 @@ fn reload_stream_bypasses_cache_and_caches_the_refresh() {
             .await
             .unwrap();
         let mut reload = request;
-        reload.cache_mode = CacheMode::Reload;
+        reload.set_cache_mode(CacheMode::Reload);
         let refreshed_response = controller.fetch_stream(reload).await.unwrap();
         let refreshed = (
             refreshed_response.from_cache,
@@ -147,7 +147,7 @@ fn only_if_cached_returns_a_streaming_cache_hit() {
             .await
             .unwrap();
         let mut only_cached = request;
-        only_cached.cache_mode = CacheMode::OnlyIfCached;
+        only_cached.set_cache_mode(CacheMode::OnlyIfCached);
         let response = controller.fetch_stream(only_cached).await.unwrap();
         let from_cache = response.from_cache;
         let header = response.headers["x-cache-test"]
@@ -176,7 +176,7 @@ fn no_store_requests_are_not_cached() {
 
     runtime().block_on(async {
         let mut request = Request::get(server.url());
-        request.cache_mode = CacheMode::NoStore;
+        request.set_cache_mode(CacheMode::NoStore);
         controller.fetch(request.clone()).await.unwrap();
         controller.fetch(request).await.unwrap();
     });
@@ -225,7 +225,7 @@ fn reload_bypasses_cached_response_and_caches_the_refresh() {
         let request = Request::get(server.url());
         controller.fetch(request.clone()).await.unwrap();
         let mut reload = request;
-        reload.cache_mode = CacheMode::Reload;
+        reload.set_cache_mode(CacheMode::Reload);
         (
             controller.fetch(reload).await.unwrap(),
             controller.fetch(Request::get(server.url())).await.unwrap(),
@@ -251,7 +251,7 @@ fn only_if_cached_returns_a_cached_response_without_network_io() {
         let request = Request::get(server.url());
         controller.fetch(request.clone()).await.unwrap();
         let mut only_cached = request;
-        only_cached.cache_mode = CacheMode::OnlyIfCached;
+        only_cached.set_cache_mode(CacheMode::OnlyIfCached);
         controller.fetch(only_cached).await.unwrap()
     });
 

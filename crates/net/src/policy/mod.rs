@@ -14,11 +14,26 @@ impl RequestPolicy {
     ///
     /// Validation happens before cookies are attached or a scheduler permit is
     /// acquired, so invalid requests fail without side effects or network work.
-    pub(crate) fn validate_request(&self, request: &Request) -> Result<reqwest::Url, RequestError> {
-        let url = reqwest::Url::parse(&request.url)
-            .map_err(|_| RequestError::InvalidUrl(request.url.clone()))?;
+    pub(crate) fn validate_request(
+        &self,
+        request: &Request,
+        max_keepalive_body_size: u64,
+    ) -> Result<reqwest::Url, RequestError> {
+        request.validate_body_state(max_keepalive_body_size)?;
+        let url = match reqwest::Url::parse(&request.url) {
+            Ok(url) => url,
+            Err(_) => match &request.context.environment.base_url {
+                Some(base_url) => base_url
+                    .join(&request.url)
+                    .map_err(|_| RequestError::InvalidUrl(request.url.clone()))?,
+                None => return Err(RequestError::InvalidUrl(request.url.clone())),
+            },
+        };
         if !matches!(url.scheme(), "http" | "https") {
             return Err(RequestError::UnsupportedScheme(url.scheme().to_owned()));
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(RequestError::InvalidUrl(request.url.clone()));
         }
         Ok(url)
     }
@@ -45,12 +60,12 @@ mod tests {
         let policy = RequestPolicy;
         assert!(
             policy
-                .validate_request(&Request::get("http://example.test"))
+                .validate_request(&Request::get("http://example.test"), 65_536)
                 .is_ok()
         );
         assert!(
             policy
-                .validate_request(&Request::get("https://example.test"))
+                .validate_request(&Request::get("https://example.test"), 65_536)
                 .is_ok()
         );
     }
@@ -58,7 +73,7 @@ mod tests {
     #[test]
     fn rejects_invalid_urls_before_transport() {
         let error = RequestPolicy
-            .validate_request(&Request::get("not a URL"))
+            .validate_request(&Request::get("not a URL"), 65_536)
             .unwrap_err();
 
         assert!(matches!(error, RequestError::InvalidUrl(url) if url == "not a URL"));
@@ -67,7 +82,7 @@ mod tests {
     #[test]
     fn rejects_relative_urls() {
         let error = RequestPolicy
-            .validate_request(&Request::get("/relative/path"))
+            .validate_request(&Request::get("/relative/path"), 65_536)
             .unwrap_err();
 
         assert!(matches!(error, RequestError::InvalidUrl(url) if url == "/relative/path"));
@@ -80,7 +95,7 @@ mod tests {
             "http://example.test:65536/",
         ] {
             let error = RequestPolicy
-                .validate_request(&Request::get(value))
+                .validate_request(&Request::get(value), 65_536)
                 .unwrap_err();
 
             assert!(matches!(error, RequestError::InvalidUrl(url) if url == value));
@@ -90,7 +105,7 @@ mod tests {
     #[test]
     fn accepts_uppercase_http_urls_and_returns_normalized_url() {
         let url = RequestPolicy
-            .validate_request(&Request::get("HTTP://EXAMPLE.TEST/Path"))
+            .validate_request(&Request::get("HTTP://EXAMPLE.TEST/Path"), 65_536)
             .unwrap();
 
         assert_eq!(url.scheme(), "http");
@@ -101,7 +116,7 @@ mod tests {
     #[test]
     fn rejects_non_http_schemes() {
         let error = RequestPolicy
-            .validate_request(&Request::get("ftp://example.test/file"))
+            .validate_request(&Request::get("ftp://example.test/file"), 65_536)
             .unwrap_err();
 
         assert!(matches!(error, RequestError::UnsupportedScheme(scheme) if scheme == "ftp"));
