@@ -5,15 +5,18 @@ use std::sync::Arc;
 use futures_util::{StreamExt, stream};
 
 use crate::{
-    cache::ResponseCache,
+    cache::{ResponseCache, StoredResponse},
     config::Config,
-    cookies::CookieStore,
     cors::CorsChecker,
     error::RequestError,
     policy::RequestPolicy,
-    request::{CacheMode, PreparedRequest, Request},
-    response::{Response, ResponseBody, StreamingResponse},
+    request::{
+        CacheMode, CredentialsMode, InitiatorType, PreparedRequest, Request, RequestDestination,
+        ServiceWorkersMode,
+    },
+    response::{InternalResponse, Response, ResponseBody, StreamingResponse},
     scheduler::RequestScheduler,
+    services::{FetchServices, ResponseInfo, ServiceWorkerDecision},
     transport::reqwest_transport,
 };
 
@@ -21,7 +24,9 @@ use crate::{
 ///
 /// A controller owns the process-local cache and scheduler while sharing the
 /// connection pool held by its transport. Cloning a controller is therefore
-/// inexpensive and preserves cache and connection reuse.
+/// inexpensive and preserves cache and connection reuse. Use `with_services`
+/// for requests carrying a browser client origin; `new` is for standalone
+/// requests without browser-owned policy or storage context.
 #[derive(Clone)]
 pub struct RequestController {
     inner: Arc<ControllerInner>,
@@ -32,8 +37,8 @@ struct ControllerInner {
     max_keepalive_body_size: u64,
     /// Process-local response cache shared by controller clones.
     cache: ResponseCache,
-    /// Cookie attachment and response processing boundary.
-    cookies: CookieStore,
+    /// Browser-owned policy, credential, cache-partition, and worker decisions.
+    services: Option<Arc<dyn FetchServices>>,
     /// Cross-origin response validation boundary.
     cors: CorsChecker,
     /// Request and response policy validation boundary.
@@ -53,17 +58,36 @@ impl RequestController {
     /// configuration.
     ///
     /// The controller does not perform network I/O during construction. A
-    /// transport-construction error is returned if the underlying HTTP client
-    /// cannot be initialized.
-    pub fn new(config: Config) -> Result<Self, reqwest::Error> {
+    /// [`RequestError::Initialization`] is returned if the underlying HTTP
+    /// client cannot be initialized.
+    pub fn new(config: Config) -> Result<Self, RequestError> {
+        Self::build(config, None)
+    }
+
+    /// Creates a controller with browser-owned service decisions.
+    ///
+    /// The service is shared by controller clones and must own any durable
+    /// storage or policy data outside this process-local Fetch engine.
+    pub fn with_services(
+        config: Config,
+        services: Arc<dyn FetchServices>,
+    ) -> Result<Self, RequestError> {
+        Self::build(config, Some(services))
+    }
+
+    fn build(
+        config: Config,
+        services: Option<Arc<dyn FetchServices>>,
+    ) -> Result<Self, RequestError> {
         let max_in_flight = config.max_in_flight;
         let max_keepalive_body_size = config.max_keepalive_body_size;
-        let transport = reqwest_transport(config.clone())?;
+        let transport = reqwest_transport(config.clone())
+            .map_err(|error| RequestError::Initialization(error.to_string()))?;
         Ok(Self {
             inner: Arc::new(ControllerInner {
                 max_keepalive_body_size,
                 cache: ResponseCache::default(),
-                cookies: CookieStore,
+                services,
                 cors: CorsChecker,
                 policy: RequestPolicy,
                 scheduler: RequestScheduler::new(transport, max_in_flight),
@@ -86,9 +110,12 @@ impl RequestController {
         }
 
         Ok(Response {
+            response_type: streaming.response_type,
             status: streaming.status,
+            status_text: streaming.status_text,
             headers: streaming.headers,
             url: streaming.url,
+            redirected: streaming.redirected,
             body,
             from_cache: streaming.from_cache,
         })
@@ -98,8 +125,9 @@ impl RequestController {
     ///
     /// The returned headers are available before the body is consumed. Body
     /// chunks are delivered as the transport receives them. A network response
-    /// is inserted into the cache only after the caller consumes the stream to
-    /// completion; dropped or failed streams are not cached.
+    /// with bytes is inserted into the cache only after the caller consumes the
+    /// stream to completion; dropped or failed streams are not cached. Null
+    /// bodies may be cached as soon as headers arrive.
     pub async fn fetch_stream(
         &self,
         mut request: Request,
@@ -113,7 +141,29 @@ impl RequestController {
             .validate_request(&request, self.inner.max_keepalive_body_size)?;
         request.prepare_url(url.clone());
 
+        if let Some(services) = &self.inner.services {
+            services.check_request(&request)?;
+            if request.service_workers == ServiceWorkersMode::All
+                && services.service_worker(&request)? == ServiceWorkerDecision::Intercept
+            {
+                return Err(RequestError::UnsupportedFeature(
+                    "service-worker interception",
+                ));
+            }
+        } else if request.context.environment.origin.is_some()
+            || request.context.credentials == CredentialsMode::Include
+            || request.destination != RequestDestination::Empty
+            || request.initiator != InitiatorType::Other
+        {
+            return Err(RequestError::UnsupportedFeature("browser services"));
+        }
+
         let cacheable = request.is_cacheable_method();
+        if cacheable && request.cache_mode != CacheMode::NoStore {
+            if let Some(services) = &self.inner.services {
+                request.cache_partition = Some(services.cache_partition(&request)?);
+            }
+        }
         let cache_lookup = match request.cache_mode {
             CacheMode::Default | CacheMode::OnlyIfCached => Some(false),
             CacheMode::ForceCache => Some(true),
@@ -126,18 +176,37 @@ impl RequestController {
                         .cache
                         .get_with_staleness(&request, &url, allow_stale)
                 {
+                    let origin = reqwest::Url::parse(&response.url)
+                        .ok()
+                        .and_then(|url| crate::Origin::from_url(&url).ok());
                     // Return information about the response to the devtools and other observers, but do not allow the body to be consumed until the caller polls it.
-                    return Ok(StreamingResponse {
+                    let mut internal = InternalResponse {
                         status: response.status,
+                        status_text: response
+                            .status
+                            .canonical_reason()
+                            .unwrap_or_default()
+                            .to_owned(),
                         headers: response.headers,
-                        url: response.url,
+                        url_list: vec![response.url],
+                        redirect_count: 0,
+                        origin,
+                        request_origin: request.context.environment.origin.clone(),
+                        request_mode: request.context.mode,
+                        response_type: crate::response::ResponseType::Basic,
                         body: ResponseBody::once_with_signal(response.body, request.signal.clone()),
+                        body_is_null: request.method() == reqwest::Method::HEAD
+                            || matches!(response.status.as_u16(), 101 | 204 | 205 | 304),
                         from_cache: true,
-                    });
+                        cookie_headers_processed: response.cookie_headers_processed,
+                    };
+                    internal.response_type = self.inner.cors.response_type(&request, &internal)?;
+                    self.approve_response(&request, &internal)?;
+                    return Ok(internal.expose());
                 }
             }
             if request.cache_mode == CacheMode::OnlyIfCached {
-                return Err(RequestError::CacheMiss);
+                return Err(RequestError::NetworkError);
             }
         }
 
@@ -145,10 +214,20 @@ impl RequestController {
         // this keeps browser behavior out of the low-level HTTP implementation.
         let mut request = request;
         request.apply_fetch_headers()?;
-        self.inner.cookies.attach(&mut request)?;
+        if request.credentials_allowed(&url) {
+            if let Some(services) = &self.inner.services {
+                if let Some(cookie) = services.cookie_header(&request)? {
+                    let value = http::HeaderValue::from_str(&cookie)
+                        .map_err(|_| RequestError::ForbiddenHeader("cookie".into()))?;
+                    request
+                        .headers
+                        .insert_internal_header(http::header::COOKIE, value);
+                }
+            }
+        }
         // The scheduler owns concurrency admission. Transport remains focused
         // on HTTP I/O and connection pooling.
-        let response = self
+        let mut response = self
             .inner
             .scheduler
             .submit(
@@ -160,30 +239,72 @@ impl RequestController {
             )
             .await?;
 
-        let response_metadata = Response {
-            status: response.status,
-            headers: response.headers.clone(),
-            url: response.url.clone(),
-            body: Vec::new(),
-            from_cache: false,
-        };
-        self.inner.cors.validate(&request, &response_metadata)?;
-        self.inner
-            .policy
-            .validate_response(&request, &response_metadata)?;
-        self.inner
-            .cookies
-            .process_response(&request, &response.headers)?;
+        if matches!(response.status.as_u16(), 301 | 302 | 303 | 307 | 308) {
+            return Err(RequestError::RedirectFailure);
+        }
+        response.origin = response
+            .url_list
+            .last()
+            .and_then(|url| reqwest::Url::parse(url).ok())
+            .and_then(|url| crate::Origin::from_url(&url).ok());
+        response.response_type = self.inner.cors.response_type(&request, &response)?;
+        self.inner.policy.validate_response(&request, &response)?;
+        self.approve_response(&request, &response)?;
+        if request.credentials_allowed(&url) {
+            if let Some(services) = &self.inner.services {
+                let values: Vec<http::HeaderValue> = response
+                    .headers
+                    .get_all(http::header::SET_COOKIE)
+                    .iter()
+                    .cloned()
+                    .collect();
+                services.store_set_cookie(&request, &values)?;
+                response.cookie_headers_processed = true;
+            }
+        }
 
         if cacheable && request.cache_mode != CacheMode::NoStore {
-            return Ok(with_cache_capture(
-                response,
-                self.inner.cache.clone(),
-                request,
-                url,
-            ));
+            if response.body_is_null {
+                self.inner.cache.insert(
+                    &request,
+                    &url,
+                    &StoredResponse {
+                        status: response.status,
+                        headers: response.headers.clone(),
+                        url: response.url_list.last().cloned().unwrap_or_default(),
+                        body: Vec::new(),
+                        cookie_headers_processed: response.cookie_headers_processed,
+                    },
+                );
+                return Ok(response.expose());
+            }
+            response = with_cache_capture(response, self.inner.cache.clone(), request.clone(), url);
         }
-        Ok(response)
+        Ok(response.expose())
+    }
+
+    fn approve_response(
+        &self,
+        request: &Request,
+        response: &InternalResponse,
+    ) -> Result<(), RequestError> {
+        if let Some(services) = &self.inner.services {
+            let info = ResponseInfo {
+                status: response.status.as_u16(),
+                status_text: response.status_text.clone(),
+                url: response.url_list.last().cloned().unwrap_or_default(),
+                headers: crate::HeaderList::internal_response(&response.headers),
+                response_origin: response.origin.clone(),
+                request_origin: response.request_origin.clone(),
+                request_mode: response.request_mode,
+                response_type: response.response_type,
+                redirect_count: response.redirect_count,
+                from_cache: response.from_cache,
+            };
+            services.check_response(request, &info)?;
+            services.response_headers(request, &info);
+        }
+        Ok(())
     }
 
     /// Removes all currently stored responses from this controller's cache.
@@ -203,6 +324,7 @@ struct CacheCapture {
     status: reqwest::StatusCode,
     headers: reqwest::header::HeaderMap,
     url: String,
+    cookie_headers_processed: bool,
 }
 
 /// Wraps a response body so completed network responses are copied into cache.
@@ -211,14 +333,14 @@ struct CacheCapture {
 /// collected. Any body error abandons the capture, and only a clean end of
 /// stream inserts the complete response.
 fn with_cache_capture(
-    mut response: StreamingResponse,
+    mut response: InternalResponse,
     cache: ResponseCache,
     request: Request,
     request_url: reqwest::Url,
-) -> StreamingResponse {
+) -> InternalResponse {
     let status = response.status;
     let headers = response.headers.clone();
-    let url = response.url.clone();
+    let url = response.url_list.last().cloned().unwrap_or_default();
     let (body, permit) = response.body.into_parts();
     let capture = CacheCapture {
         cache,
@@ -227,6 +349,7 @@ fn with_cache_capture(
         status,
         headers,
         url,
+        cookie_headers_processed: response.cookie_headers_processed,
     };
     let body = stream::unfold(
         (body, Vec::new(), Some(capture)),
@@ -242,12 +365,12 @@ fn with_cache_capture(
                         capture.cache.insert(
                             &capture.request,
                             &capture.request_url,
-                            &Response {
+                            &StoredResponse {
                                 status: capture.status,
                                 headers: capture.headers,
                                 url: capture.url,
                                 body: collected,
-                                from_cache: false,
+                                cookie_headers_processed: capture.cookie_headers_processed,
                             },
                         );
                     }

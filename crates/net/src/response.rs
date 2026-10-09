@@ -11,6 +11,7 @@ use reqwest::{StatusCode, header::HeaderMap};
 
 use crate::cancellation::AbortSignal;
 use crate::error::RequestError;
+use crate::request::{HeaderList, Origin, RequestMode};
 
 type BoxedResponseStream = Pin<Box<dyn Stream<Item = Result<Bytes, RequestError>> + Send>>;
 
@@ -64,6 +65,11 @@ impl ResponseBody {
             futures_util::stream::once(async move { Ok(Bytes::from(body)) }),
             AbortSignal::new(),
         )
+    }
+
+    /// Creates a null body with no stream chunks.
+    pub(crate) fn empty() -> Self {
+        Self::from_stream(futures_util::stream::empty())
     }
 
     /// Creates a buffered response stream that observes a request signal.
@@ -124,18 +130,99 @@ impl ResponseBody {
     }
 }
 
-/// A fully buffered HTTP response returned by the networking client.
+/// The visibility class selected by Fetch before exposing a response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResponseType {
+    /// A same-origin or navigation response with readable metadata and body.
+    Basic,
+    /// A CORS-approved response with only CORS-exposed headers.
+    Cors,
+    /// A no-CORS response with hidden status, URL, headers, and body.
+    Opaque,
+    /// A manually handled redirect with hidden metadata and body.
+    /// This variant is reserved until controller-owned redirects are implemented.
+    OpaqueRedirect,
+    /// A failed fetch with hidden metadata and body.
+    /// This variant is reserved; current fetch failures return `RequestError`.
+    Error,
+}
+
+/// Complete response state retained inside the Fetch engine.
+///
+/// Policy and cookie processing use this state before a filtered public view
+/// is built. The body owns its transport stream and scheduler permit.
+pub(crate) struct InternalResponse {
+    pub(crate) status: StatusCode,
+    pub(crate) status_text: String,
+    pub(crate) headers: HeaderMap,
+    pub(crate) url_list: Vec<String>,
+    pub(crate) redirect_count: usize,
+    pub(crate) origin: Option<Origin>,
+    pub(crate) request_origin: Option<Origin>,
+    pub(crate) request_mode: RequestMode,
+    pub(crate) response_type: ResponseType,
+    pub(crate) body: ResponseBody,
+    pub(crate) body_is_null: bool,
+    pub(crate) from_cache: bool,
+    pub(crate) cookie_headers_processed: bool,
+}
+
+impl InternalResponse {
+    pub(crate) fn expose(self) -> StreamingResponse {
+        let hidden = matches!(
+            self.response_type,
+            ResponseType::Opaque | ResponseType::OpaqueRedirect | ResponseType::Error
+        );
+        let headers = if hidden {
+            HeaderList::with_guard(crate::HeaderGuard::Immutable)
+        } else {
+            HeaderList::exposed_response(&self.headers, self.response_type == ResponseType::Cors)
+        };
+        StreamingResponse {
+            response_type: self.response_type,
+            status: if hidden { 0 } else { self.status.as_u16() },
+            status_text: if hidden {
+                String::new()
+            } else {
+                self.status_text
+            },
+            headers,
+            url: if hidden {
+                String::new()
+            } else {
+                self.url_list.last().cloned().unwrap_or_default()
+            },
+            redirected: !hidden && self.redirect_count > 0,
+            body: if hidden || self.body_is_null {
+                ResponseBody::empty()
+            } else {
+                self.body
+            },
+            from_cache: !hidden && self.from_cache,
+        }
+    }
+}
+
+/// A fully buffered, already filtered Fetch response.
 #[derive(Clone, Debug)]
 pub struct Response {
-    /// HTTP status code returned by the server.
-    pub status: StatusCode,
-    /// Response headers.
-    pub headers: HeaderMap,
-    /// Final URL after redirects.
+    /// Fetch response visibility class.
+    pub response_type: ResponseType,
+    /// Exposed HTTP status code, or zero for filtered responses.
+    pub status: u16,
+    /// Canonical HTTP reason phrase, empty for filtered responses.
+    /// A custom wire reason phrase is not retained by the current transport.
+    pub status_text: String,
+    /// Immutable exposed response headers, excluding cookie headers.
+    pub headers: HeaderList,
+    /// Exposed final URL, empty for filtered responses.
     pub url: String,
-    /// Raw response body bytes.
+    /// Whether the request followed at least one redirect.
+    pub redirected: bool,
+    /// Exposed body bytes. Filtered and null bodies are empty.
     pub body: Vec<u8>,
-    /// Whether this response was served from the local cache.
+    /// Whether this readable response came from the process-local cache.
+    /// Filtered opaque responses always report `false` to avoid metadata leaks.
     pub from_cache: bool,
 }
 
@@ -145,15 +232,23 @@ pub struct Response {
 /// remains attached to the network transport and is consumed by polling
 /// [`StreamingResponse::body`].
 pub struct StreamingResponse {
-    /// HTTP status code returned by the server.
-    pub status: StatusCode,
-    /// Response headers.
-    pub headers: HeaderMap,
-    /// Final URL after redirects.
+    /// Fetch response visibility class.
+    pub response_type: ResponseType,
+    /// Exposed HTTP status code, or zero for filtered responses.
+    pub status: u16,
+    /// Canonical HTTP reason phrase, empty for filtered responses.
+    /// A custom wire reason phrase is not retained by the current transport.
+    pub status_text: String,
+    /// Immutable exposed response headers, excluding cookie headers.
+    pub headers: HeaderList,
+    /// Exposed final URL, empty for filtered responses.
     pub url: String,
-    /// Body chunks delivered by the network transport.
+    /// Whether the request followed at least one redirect.
+    pub redirected: bool,
+    /// Filtered, abort-aware body chunks. A dropped body releases its permit.
     pub body: ResponseBody,
-    /// Whether this response was served from the local cache.
+    /// Whether this readable response came from the process-local cache.
+    /// Filtered opaque responses always report `false` to avoid metadata leaks.
     pub from_cache: bool,
 }
 
@@ -193,5 +288,68 @@ mod tests {
             .expect("abort should produce an item");
 
         assert!(matches!(item, Err(RequestError::Aborted)));
+    }
+
+    #[test]
+    fn basic_view_hides_cookie_headers_before_exposure() {
+        let mut headers = HeaderMap::new();
+        headers.insert("set-cookie", "session=secret".parse().unwrap());
+        headers.insert("x-visible", "yes".parse().unwrap());
+        let internal = InternalResponse {
+            status: StatusCode::OK,
+            status_text: "OK".into(),
+            headers,
+            url_list: vec!["https://example.test/".into()],
+            redirect_count: 0,
+            origin: None,
+            request_origin: None,
+            request_mode: RequestMode::Cors,
+            response_type: ResponseType::Basic,
+            body: ResponseBody::once(b"body".to_vec()),
+            body_is_null: false,
+            from_cache: false,
+            cookie_headers_processed: true,
+        };
+        assert!(internal.headers.contains_key("set-cookie"));
+        let exposed = internal.expose();
+        assert_eq!(exposed.headers.get("x-visible").unwrap(), "yes");
+        assert!(!exposed.headers.has("set-cookie"));
+        assert_eq!(exposed.headers.guard(), crate::HeaderGuard::Immutable);
+    }
+
+    #[test]
+    fn opaque_and_null_views_cannot_yield_transport_bytes() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for (response_type, body_is_null) in
+            [(ResponseType::Opaque, false), (ResponseType::Basic, true)]
+        {
+            let internal = InternalResponse {
+                status: StatusCode::NO_CONTENT,
+                status_text: "No Content".into(),
+                headers: HeaderMap::new(),
+                url_list: vec!["https://example.test/".into()],
+                redirect_count: 0,
+                origin: None,
+                request_origin: None,
+                request_mode: RequestMode::Cors,
+                response_type,
+                body: ResponseBody::once(b"forbidden".to_vec()),
+                body_is_null,
+                from_cache: response_type == ResponseType::Opaque,
+                cookie_headers_processed: false,
+            };
+            let mut exposed = internal.expose();
+            if response_type == ResponseType::Opaque {
+                assert_eq!(exposed.status, 0);
+                assert!(exposed.url.is_empty());
+                assert!(exposed.headers.is_empty());
+                assert!(!exposed.from_cache);
+            }
+            assert!(
+                runtime
+                    .block_on(async { exposed.body.next().await })
+                    .is_none()
+            );
+        }
     }
 }

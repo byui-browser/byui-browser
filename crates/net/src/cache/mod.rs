@@ -11,7 +11,17 @@ use reqwest::{
     header::{CACHE_CONTROL, HeaderMap},
 };
 
-use crate::{request::Request, response::Response};
+use crate::request::Request;
+
+/// Complete buffered response retained for cache policy and later filtering.
+#[derive(Clone, Debug)]
+pub(crate) struct StoredResponse {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: HeaderMap,
+    pub(crate) url: String,
+    pub(crate) body: Vec<u8>,
+    pub(crate) cookie_headers_processed: bool,
+}
 
 /// Thread-safe process-local cache shared by cloned request clients.
 #[derive(Clone, Debug, Default)]
@@ -21,7 +31,7 @@ pub(crate) struct ResponseCache {
 
 impl ResponseCache {
     /// Returns a fresh cached response for the request, if one exists.
-    pub(crate) fn get(&self, request: &Request, url: &Url) -> Option<Response> {
+    pub(crate) fn get(&self, request: &Request, url: &Url) -> Option<StoredResponse> {
         self.get_with_staleness(request, url, false)
     }
 
@@ -31,7 +41,7 @@ impl ResponseCache {
         request: &Request,
         url: &Url,
         allow_stale: bool,
-    ) -> Option<Response> {
+    ) -> Option<StoredResponse> {
         let key = cache_key(request, url);
         // Clone the response while the read lock is held, then release the lock
         // before returning so callers never hold cache state during network work.
@@ -41,7 +51,7 @@ impl ResponseCache {
     }
 
     /// Stores a successful response when its headers provide a positive TTL.
-    pub(crate) fn insert(&self, request: &Request, url: &Url, response: &Response) {
+    pub(crate) fn insert(&self, request: &Request, url: &Url, response: &StoredResponse) {
         if !response.status.is_success() {
             return;
         }
@@ -67,29 +77,31 @@ pub(crate) struct CachedResponse {
     headers: HeaderMap,
     url: String,
     body: Vec<u8>,
+    cookie_headers_processed: bool,
     pub(crate) expires_at: Instant,
 }
 
 impl CachedResponse {
     /// Copies a response into the cache with a caller-supplied lifetime.
-    pub(crate) fn from_response(response: &Response, ttl: Duration) -> Self {
+    pub(crate) fn from_response(response: &StoredResponse, ttl: Duration) -> Self {
         Self {
             status: response.status,
             headers: response.headers.clone(),
             url: response.url.clone(),
             body: response.body.clone(),
+            cookie_headers_processed: response.cookie_headers_processed,
             expires_at: Instant::now() + ttl,
         }
     }
 
     /// Reconstructs a public response and marks it as cache-served.
-    pub(crate) fn as_response(&self) -> Response {
-        Response {
+    pub(crate) fn as_response(&self) -> StoredResponse {
+        StoredResponse {
             status: self.status,
             headers: self.headers.clone(),
             url: self.url.clone(),
             body: self.body.clone(),
-            from_cache: true,
+            cookie_headers_processed: self.cookie_headers_processed,
         }
     }
 }
@@ -98,7 +110,14 @@ impl CachedResponse {
 pub(crate) fn cache_key(request: &Request, url: &Url) -> String {
     let mut url = url.clone();
     url.set_fragment(None);
-    format!("{} {url}", request.method)
+    match request.cache_partition.as_deref() {
+        Some(partition) => format!(
+            "browser:{}:{partition} {} {url}",
+            partition.len(),
+            request.method
+        ),
+        None => format!("standalone {} {url}", request.method),
+    }
 }
 
 /// Reads a conservative cache lifetime from the response's `Cache-Control` header.
@@ -166,12 +185,12 @@ mod tests {
         let request = Request::get("https://example.test/missing");
         let mut headers = HeaderMap::new();
         headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
-        let response = Response {
+        let response = StoredResponse {
             status: StatusCode::NOT_FOUND,
             headers,
             url: request.url.clone(),
             body: b"missing".to_vec(),
-            from_cache: false,
+            cookie_headers_processed: false,
         };
 
         let url = Url::parse(&request.url).unwrap();
@@ -188,6 +207,20 @@ mod tests {
 
         let url = Url::parse(&get.url).unwrap();
         assert_ne!(cache_key(&get, &url), cache_key(&head, &url));
+    }
+
+    #[test]
+    fn browser_cache_partitions_do_not_share_entries() {
+        let url = Url::parse("https://example.test/resource").unwrap();
+        let mut first = Request::get(url.as_str());
+        first.cache_partition = Some("site-a".into());
+        let mut second = first.clone();
+        second.cache_partition = Some("site-b".into());
+        assert_ne!(cache_key(&first, &url), cache_key(&second, &url));
+        assert_ne!(
+            cache_key(&first, &url),
+            cache_key(&Request::get(url.as_str()), &url)
+        );
     }
 
     #[test]
@@ -220,12 +253,12 @@ mod tests {
     fn expired_entries_are_not_returned() {
         let cache = ResponseCache::default();
         let request = Request::get("https://example.test/expired");
-        let response = Response {
+        let response = StoredResponse {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
             url: request.url.clone(),
             body: b"stale".to_vec(),
-            from_cache: false,
+            cookie_headers_processed: false,
         };
         let cached = CachedResponse::from_response(&response, Duration::ZERO);
 

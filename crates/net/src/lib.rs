@@ -1,21 +1,28 @@
-//! Browser networking boundary for HTTP requests and responses.
+//! Rust Fetch engine boundary for browser and other Rust consumers.
 //!
 //! **Owning team**: Networking Team
 //!
-//! The public entry point is [`RequestController`], which coordinates request
-//! validation, cache access, cookie handling, CORS checks, scheduling, and the
-//! underlying HTTP transport.
-//! Renderer processes never open raw sockets; all network goes through
-//! the Network process. Cookie jar / cache policy decisions are owned by
-//! Security & Storage.
+//! [`RequestController::fetch`] returns a filtered [`Response`].
+//! [`RequestController::fetch_stream`] returns the same filtered metadata with
+//! an abort-aware streaming body whose network errors can arrive after headers.
+//! The transport and its Reqwest header/status/stream types stay behind this
+//! response boundary. The `webapis` crate adapts these Rust values to
+//! JavaScript objects, promises, and streams; this crate owns no JS identity.
+//!
+//! The engine coordinates process-local scheduling and a small in-memory cache.
+//! Durable storage, security policy, service workers, client context, and
+//! diagnostics belong to their browser services and enter through
+//! [`FetchServices`]. Renderer processes do not open sockets directly.
 //!
 //! The current transport executes HTTP(S) requests. Relative URLs require a
 //! [`FetchEnvironment`] with a base URL; `about:`, `blob:`, `data:`, and `file:`
 //! fetching are unsupported and return [`RequestError::UnsupportedScheme`].
-//! Request construction validates methods and caller headers and models
-//! replayable or one-shot request bodies, but the crate does not yet implement
-//! every Fetch algorithm (notably the redirect, CORS, and body-extraction
-//! algorithms described in the project gap audit).
+//! This first engine slice supports basic same-origin responses, simple CORS
+//! checks, opaque no-CORS views, and forbidden response-header filtering.
+//! Requests requiring absent providers or algorithms fail with a typed
+//! [`RequestError::UnsupportedFeature`] before transport. HTTP redirects fail
+//! with [`RequestError::RedirectFailure`] before public response exposure. See the
+//! [engine contract](../docs/fetch-engine-contract.md) for the supported subset.
 
 // Crate-wide flags to ignore dead code warnings. Will be removed once implementation
 // is finished, but is required for now to prevent the integration tests from failing.
@@ -29,13 +36,13 @@ mod cache;
 mod cancellation;
 mod config;
 mod controller;
-mod cookies;
 mod cors;
 mod error;
 mod policy;
 mod request;
 mod response;
 mod scheduler;
+mod services;
 mod transport;
 
 #[cfg(test)]
@@ -45,9 +52,12 @@ pub use cancellation::{AbortController, AbortSignal};
 pub use config::Config;
 pub use controller::RequestController;
 pub use error::RequestError;
+pub use http::{HeaderName, HeaderValue, Method};
 pub use request::{
     CacheMode, CredentialsMode, FetchContext, FetchEnvironment, HeaderGuard, HeaderList,
     InitiatorType, NetworkPartitionKey, Origin, RedirectMode, Referrer, ReferrerPolicy, Request,
     RequestBody, RequestDestination, RequestMode, RequestPriority, ServiceWorkersMode,
 };
-pub use response::{Response, ResponseBody, StreamingResponse};
+pub use response::{Response, ResponseBody, ResponseType, StreamingResponse};
+pub use services::{FetchServices, ResponseInfo, ServiceWorkerDecision};
+pub use url::Url;

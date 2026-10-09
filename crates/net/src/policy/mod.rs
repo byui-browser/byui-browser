@@ -1,6 +1,10 @@
 //! Request and response policy boundary.
 
-use crate::{error::RequestError, request::Request, response::Response};
+use crate::{
+    error::RequestError,
+    request::{CacheMode, CredentialsMode, RedirectMode, Request, RequestPriority},
+    response::InternalResponse,
+};
 
 /// Validates URL and browser request/response policy at the controller boundary.
 ///
@@ -20,6 +24,34 @@ impl RequestPolicy {
         max_keepalive_body_size: u64,
     ) -> Result<reqwest::Url, RequestError> {
         request.validate_body_state(max_keepalive_body_size)?;
+        if request.keepalive {
+            return Err(RequestError::UnsupportedFeature("keepalive lifetime"));
+        }
+        if request.context.mode == crate::RequestMode::Navigate {
+            return Err(RequestError::UnsupportedFeature("navigation fetch"));
+        }
+        if request.context.mode == crate::RequestMode::SameOrigin
+            && request.context.environment.origin.is_none()
+        {
+            return Err(RequestError::UnsupportedFeature("client origin"));
+        }
+        if request.context.credentials == CredentialsMode::Include
+            && request.context.environment.origin.is_none()
+        {
+            return Err(RequestError::UnsupportedFeature("client origin"));
+        }
+        if request.integrity.is_some() {
+            return Err(RequestError::UnsupportedFeature("subresource integrity"));
+        }
+        if request.redirect_mode != RedirectMode::Follow {
+            return Err(RequestError::UnsupportedFeature("redirect mode"));
+        }
+        if request.cache_mode == CacheMode::NoCache {
+            return Err(RequestError::UnsupportedFeature("HTTP cache revalidation"));
+        }
+        if request.priority != RequestPriority::Auto {
+            return Err(RequestError::UnsupportedFeature("priority scheduling"));
+        }
         let url = match reqwest::Url::parse(&request.url) {
             Ok(url) => url,
             Err(_) => match &request.context.environment.base_url {
@@ -35,6 +67,20 @@ impl RequestPolicy {
         if !url.username().is_empty() || url.password().is_some() {
             return Err(RequestError::InvalidUrl(request.url.clone()));
         }
+        if request.context.mode == crate::RequestMode::Cors
+            && request
+                .context
+                .environment
+                .origin
+                .as_ref()
+                .is_some_and(|origin| {
+                    crate::Origin::from_url(&url)
+                        .is_ok_and(|target| !origin.is_same_origin(&target))
+                })
+            && request.requires_cors_preflight()
+        {
+            return Err(RequestError::UnsupportedFeature("CORS preflight"));
+        }
         Ok(url)
     }
 
@@ -45,7 +91,7 @@ impl RequestPolicy {
     pub(crate) fn validate_response(
         &self,
         _request: &Request,
-        _response: &Response,
+        _response: &InternalResponse,
     ) -> Result<(), RequestError> {
         Ok(())
     }
@@ -120,5 +166,45 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, RequestError::UnsupportedScheme(scheme) if scheme == "ftp"));
+    }
+
+    #[test]
+    fn unsupported_integrity_is_rejected_before_transport() {
+        let mut request = Request::get("https://example.test/data");
+        request.set_integrity(Some("sha256-example".into()));
+        let error = RequestPolicy
+            .validate_request(&request, 65_536)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RequestError::UnsupportedFeature("subresource integrity")
+        ));
+    }
+
+    #[test]
+    fn preflight_required_cross_origin_request_is_rejected_before_transport() {
+        let mut request = Request::new("https://remote.test/data", "PUT").unwrap();
+        request.context.environment.origin =
+            Some(crate::Origin::parse("https://client.test").unwrap());
+        let error = RequestPolicy
+            .validate_request(&request, 65_536)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RequestError::UnsupportedFeature("CORS preflight")
+        ));
+    }
+
+    #[test]
+    fn keepalive_request_is_rejected_until_lifetime_is_supported() {
+        let mut request = Request::get("https://example.test/");
+        request.set_keepalive(true);
+        let error = RequestPolicy
+            .validate_request(&request, 65_536)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RequestError::UnsupportedFeature("keepalive lifetime")
+        ));
     }
 }

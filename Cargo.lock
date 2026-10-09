@@ -1049,8 +1049,10 @@ dependencies = [
  "bytes",
  "common",
  "futures-util",
+ "http",
  "reqwest",
  "tokio",
+ "url",
 ]
 
 [[package]]

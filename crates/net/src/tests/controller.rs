@@ -11,7 +11,7 @@ use crate::{AbortController, CacheMode, Config, Request, RequestController, Requ
 use futures_util::StreamExt;
 use reqwest::{
     Method, StatusCode,
-    header::{HeaderMap, HeaderValue},
+    header::{HeaderName, HeaderValue},
 };
 
 #[test]
@@ -31,12 +31,17 @@ fn get_request_has_expected_defaults() {
 fn custom_request_preserves_headers_and_body() {
     // Callers must also be able to construct non-GET requests with arbitrary
     // headers and binary request bodies.
-    let mut headers = HeaderMap::new();
-    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    let mut headers = crate::HeaderList::new();
+    headers
+        .append(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        )
+        .unwrap();
     let request = Request {
         method: Method::POST,
         url: "https://example.com/api".into(),
-        headers: headers.into(),
+        headers,
         body: Some(crate::RequestBody::bytes(br#"{"ok":true}"#.to_vec())),
         cache_mode: CacheMode::NoStore,
         ..Request::get("https://example.com/api")
@@ -52,12 +57,11 @@ fn custom_request_preserves_headers_and_body() {
 }
 
 #[test]
-fn default_config_sets_pool_and_redirect_limits() {
+fn default_config_sets_pool_and_identity() {
     // These defaults define the initial connection-management behavior used by
     // RequestController::new.
     let config = Config::default();
 
-    assert_eq!(config.max_redirects, 10);
     assert_eq!(config.pool_max_idle_per_host, 8);
     assert!(config.pool_idle_timeout.is_some());
     assert_eq!(config.user_agent.unwrap(), "byui-browser/0.1");
@@ -102,7 +106,7 @@ fn only_if_cached_reports_a_cache_miss_without_network_access() {
 
     let error = runtime.block_on(client.fetch(request)).unwrap_err();
 
-    assert!(matches!(error, RequestError::CacheMiss));
+    assert!(matches!(error, RequestError::NetworkError));
 }
 
 #[test]
@@ -190,7 +194,7 @@ fn streaming_fetch_returns_headers_before_body_and_forwards_body_bytes() {
         .recv()
         .expect("server should have sent response headers");
     assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(response.headers["x-stream"], "yes");
+    assert_eq!(response.headers.get("x-stream").unwrap(), "yes");
     assert!(!response.from_cache);
 
     send_body

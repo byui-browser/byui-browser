@@ -8,10 +8,12 @@ use std::{
 
 use bytes::Bytes;
 use futures_util::{Stream, TryStreamExt};
-use reqwest::{
-    Body, Method, Url,
+use http::{
+    Method,
     header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
 };
+use reqwest::Body;
+use url::Url;
 
 use crate::{cancellation::AbortSignal, error::RequestError};
 
@@ -180,7 +182,7 @@ impl HeaderList {
     /// Replaces all entries with `name` with one header value.
     pub fn insert(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), RequestError> {
         self.check(&name, &value)?;
-        self.entries.retain(|(existing, _)| existing != &name);
+        self.entries.retain(|(existing, _)| existing != name);
         self.entries.push((name, value));
         Ok(())
     }
@@ -188,6 +190,44 @@ impl HeaderList {
     /// Iterates over headers in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (&HeaderName, &HeaderValue)> {
         self.entries.iter().map(|(name, value)| (name, value))
+    }
+
+    /// Returns the first value for a header name, if present.
+    pub fn get(&self, name: &str) -> Option<&HeaderValue> {
+        self.entries
+            .iter()
+            .find(|(entry, _)| entry.as_str().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value)
+    }
+
+    /// Returns whether a header with this name is present.
+    pub fn has(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    /// Copies transport headers into an immutable, filtered response list.
+    pub(crate) fn exposed_response(headers: &HeaderMap, cors: bool) -> Self {
+        let mut list = Self::with_guard(HeaderGuard::Response);
+        for (name, value) in headers {
+            if allowed_header(HeaderGuard::Response, name, value)
+                && (!cors || is_cors_exposed(name, headers))
+            {
+                list.entries.push((name.clone(), value.clone()));
+            }
+        }
+        list.guard = HeaderGuard::Immutable;
+        list
+    }
+
+    /// Copies all transport headers for trusted provider decisions.
+    pub(crate) fn internal_response(headers: &HeaderMap) -> Self {
+        let mut list = Self::with_guard(HeaderGuard::Immutable);
+        list.entries.extend(
+            headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+        list
     }
 
     /// Converts the list to the representation expected by the HTTP transport.
@@ -208,24 +248,30 @@ impl HeaderList {
     }
 
     pub(crate) fn insert_internal_header(&mut self, name: HeaderName, value: HeaderValue) {
-        self.entries.retain(|(existing, _)| existing != &name);
+        self.entries.retain(|(existing, _)| existing != name);
         self.entries.push((name, value));
     }
 }
 
-impl From<HeaderMap> for HeaderList {
-    /// Copies permitted request headers from a Reqwest header map.
-    fn from(headers: HeaderMap) -> Self {
-        let mut list = Self::new();
-        for (name, value) in headers {
-            if let Some(name) = name
-                && allowed_header(list.guard, &name, &value)
-            {
-                list.entries.push((name, value));
-            }
-        }
-        list
+fn is_cors_exposed(name: &HeaderName, headers: &HeaderMap) -> bool {
+    if matches!(
+        name.as_str(),
+        "cache-control"
+            | "content-language"
+            | "content-length"
+            | "content-type"
+            | "expires"
+            | "last-modified"
+            | "pragma"
+    ) {
+        return true;
     }
+    headers
+        .get_all("access-control-expose-headers")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|exposed| exposed.trim().eq_ignore_ascii_case(name.as_str()))
 }
 
 fn allowed_header(guard: HeaderGuard, name: &HeaderName, value: &HeaderValue) -> bool {
@@ -527,7 +573,8 @@ pub enum CredentialsMode {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RedirectMode {
     #[default]
-    /// Follow redirects subject to the controller's policy.
+    /// Requests redirect following. Redirect responses currently fail with
+    /// `RedirectFailure` until the controller-owned redirect loop exists.
     Follow,
     /// Fail when the response would redirect.
     Error,
@@ -535,7 +582,10 @@ pub enum RedirectMode {
     Manual,
 }
 
-/// Controls which cache algorithm a request selects.
+/// Controls which process-local cache behavior a request selects.
+///
+/// This is a documented HTTP cache subset. `NoCache` is rejected until
+/// revalidation exists; full Fetch cache matching belongs to a later step.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CacheMode {
     /// Use the normal HTTP cache algorithm.
@@ -620,7 +670,8 @@ pub enum ReferrerPolicy {
 /// Controls whether matching service workers may intercept a request.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ServiceWorkersMode {
-    /// Allow matching service workers to receive the fetch event.
+    /// Ask the browser-owned provider whether a worker matches.
+    /// Interception currently fails closed until worker responses are supported.
     #[default]
     All,
     /// Bypass service workers for this request.
@@ -667,6 +718,7 @@ pub struct Request {
     pub(crate) url_list: Vec<Url>,
     pub(crate) current_url: Option<Url>,
     pub(crate) redirect_count: usize,
+    pub(crate) cache_partition: Option<String>,
 }
 
 /// Relative importance assigned to a request by the network scheduler.
@@ -704,6 +756,7 @@ impl Request {
             url_list: Vec::new(),
             current_url: None,
             redirect_count: 0,
+            cache_partition: None,
         }
     }
 
@@ -755,11 +808,13 @@ impl Request {
     }
 
     /// Returns all URLs visited by this request, in order.
+    /// The supported single-exchange path never follows a redirect.
     pub fn url_list(&self) -> &[Url] {
         &self.url_list
     }
 
     /// Returns the number of redirects followed so far.
+    /// This remains zero until controller-owned redirects are implemented.
     pub fn redirect_count(&self) -> usize {
         self.redirect_count
     }
@@ -848,6 +903,7 @@ impl Request {
     }
 
     /// Sets the Fetch redirect mode.
+    /// `Manual` and `Error` are rejected before network I/O in this slice.
     pub fn set_redirect_mode(&mut self, mode: RedirectMode) {
         self.redirect_mode = mode;
     }
@@ -888,7 +944,10 @@ impl Request {
         self.signal = signal;
     }
 
-    /// Sets whether this request may outlive its initiating environment.
+    /// Requests a Fetch keepalive lifetime.
+    ///
+    /// The engine checks the configured byte limit but currently rejects
+    /// keepalive execution with `UnsupportedFeature` before network I/O.
     pub fn set_keepalive(&mut self, keepalive: bool) {
         self.keepalive = keepalive;
     }
@@ -896,6 +955,31 @@ impl Request {
     /// Returns whether this request method may use the response cache.
     pub(crate) fn is_cacheable_method(&self) -> bool {
         matches!(self.method, Method::GET | Method::HEAD)
+    }
+
+    /// Returns whether the credentials mode permits credentials for this URL.
+    pub(crate) fn credentials_allowed(&self, url: &Url) -> bool {
+        match self.context.credentials {
+            CredentialsMode::Omit => false,
+            CredentialsMode::Include => true,
+            CredentialsMode::SameOrigin => {
+                self.context
+                    .environment
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| {
+                        Origin::from_url(url).is_ok_and(|target| origin.is_same_origin(&target))
+                    })
+            }
+        }
+    }
+
+    pub(crate) fn requires_cors_preflight(&self) -> bool {
+        !matches!(self.method, Method::GET | Method::HEAD | Method::POST)
+            || self
+                .headers
+                .iter()
+                .any(|(name, value)| !is_cors_safelisted_header(name, value))
     }
 
     /// Returns the transport priority corresponding to the Fetch priority.
@@ -990,7 +1074,7 @@ impl Request {
                 None => Some(0),
                 Some(body) => body.length(),
             };
-            if body_size.map_or(true, |size| size > max_keepalive_body_size) {
+            if body_size.is_none_or(|size| size > max_keepalive_body_size) {
                 return Err(RequestError::KeepaliveBodyTooLarge {
                     limit: max_keepalive_body_size,
                 });

@@ -9,8 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use crate::{
-    error::RequestError, request::PreparedRequest, response::StreamingResponse,
-    transport::Transport,
+    error::RequestError, request::PreparedRequest, response::InternalResponse, transport::Transport,
 };
 
 /// Relative importance assigned to a request by the network scheduler.
@@ -63,7 +62,7 @@ impl RequestScheduler {
         &self,
         request: PreparedRequest,
         _priority: RequestPriority,
-    ) -> Result<StreamingResponse, RequestError> {
+    ) -> Result<InternalResponse, RequestError> {
         if request.request.signal.is_aborted() {
             return Err(RequestError::Aborted);
         }
