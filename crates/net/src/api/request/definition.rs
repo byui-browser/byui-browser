@@ -168,12 +168,12 @@ impl Request {
         {
             return Err(RequestError::NoCorsMethod(self.method.to_string()));
         }
-        self.context.mode = mode;
         self.headers.set_guard(if mode == RequestMode::NoCors {
             HeaderGuard::RequestNoCors
         } else {
             HeaderGuard::Request
-        });
+        })?;
+        self.context.mode = mode;
         Ok(())
     }
     /// Sets the credentials mode used by cookie and authentication policy.
@@ -190,9 +190,6 @@ impl Request {
             return Err(RequestError::BodyNotAllowed(self.method.to_string()));
         }
         self.body = body;
-        if let Some(body) = &self.body {
-            body.apply_metadata(&mut self.headers);
-        }
         Ok(())
     }
     /// Sets the Fetch cache mode.
@@ -262,7 +259,7 @@ impl Request {
         !matches!(self.method, Method::GET | Method::HEAD | Method::POST)
             || self
                 .headers
-                .iter()
+                .iter_raw()
                 .any(|(name, value)| !is_cors_safelisted_header(name, value))
     }
     /// Returns the transport priority corresponding to the Fetch priority.
@@ -283,21 +280,16 @@ impl Request {
     pub(crate) fn fetch_headers(&self) -> Result<Headers, RequestError> {
         let mut headers = self.headers.clone();
         if let Some(body) = &self.body {
-            body.apply_metadata(&mut headers);
+            body.apply_metadata(&mut headers)?;
         }
         let needs_origin = self.context.mode == RequestMode::Cors
             || !matches!(self.method, Method::GET | Method::HEAD);
         if needs_origin && let Some(origin) = &self.context.environment.origin {
             let value = HeaderValue::try_from(origin.as_str())
                 .map_err(|_| RequestError::InvalidOrigin(origin.as_str()))?;
-            headers.insert_internal_header(HeaderName::from_static("origin"), value);
+            headers.insert_internal_header(HeaderName::from_static("origin"), value)?;
         }
         Ok(headers)
-    }
-    pub(crate) fn record_redirect(&mut self, url: Url) {
-        self.redirect_count += 1;
-        self.current_url = Some(url.clone());
-        self.url_list.push(url);
     }
     /// Computes the `Referer` value for a request target.
     pub(crate) fn referrer_value(&self, target: &Url) -> Option<String> {

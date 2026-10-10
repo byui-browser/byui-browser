@@ -31,6 +31,7 @@ pub(crate) struct ResponseCache {
 
 impl ResponseCache {
     /// Returns a fresh cached response for the request, if one exists.
+    #[cfg(test)]
     pub(crate) fn get(&self, request: &Request, url: &Url) -> Option<StoredResponse> {
         self.get_with_staleness(request, url, false)
     }

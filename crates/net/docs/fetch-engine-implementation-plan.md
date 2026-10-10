@@ -1,7 +1,7 @@
 # Plan: Make `net` the reusable Fetch engine
 
-Status: implementation in progress as of 2026-10-10; step 1 is complete for
-the explicitly bounded single-exchange HTTP(S) subset described below.
+Status: implementation in progress as of 2026-10-10; steps 1 and 2 are complete
+for the explicitly bounded single-exchange HTTP(S) subset described below.
 
 ## Goal
 
@@ -416,9 +416,10 @@ Implement response filtering for:
 The filter must be applied before constructing the public `Response`, not only
 when a caller queries a header.
 
-### Step 2 progress record (2026-10-10)
+### Step 2 completion record (2026-10-10)
 
-The initial implementation pass is complete for the shared header foundation:
+The shared header model and its exposure primitives are complete for the
+current engine boundary:
 
 - [x] Added the public `Headers` type and migrated request, response, and
       trusted service metadata to use it.
@@ -433,20 +434,59 @@ The initial implementation pass is complete for the shared header foundation:
       metadata, `Referer`, and cookies are not written into caller-owned request
       headers.
 
-Step 2 is not complete yet. The remaining work is:
+Step 2 owns the header representation, mutation rules, and exposure primitives.
+Later steps still own the algorithms that create redirect and network-error
+responses; that does not leave unfinished header-layer work in this step.
 
-- [ ] Finish Fetch iterator semantics for combined ordinary fields while
-      preserving the required ordered representation internally.
-- [ ] Add constructor paths that accept validated string/name-value inputs and
-      convert invalid names and values into the dedicated header errors.
-- [ ] Make guard transitions fully monotonic and reject every attempted
-      mutable transition from immutable collections.
-- [ ] Complete the response-exposure matrix for CORS wildcard exposure,
-      malformed exposure metadata, opaque redirects, and network-error views.
-- [x] Removed the former header-type compatibility alias and updated all crate
-      consumers and documentation to use `Headers` directly.
-- [ ] Add the remaining controller-level channel tests, run the full workspace
-      verification commands, and update the contract once those tests pass.
+### Completed header model and API work
+
+- [x] Finished Fetch iterator semantics for ordinary fields: combine duplicate
+      values according to Fetch field-combination rules while preserving the
+      ordered duplicate representation needed by internal consumers.
+- [x] Kept `Set-Cookie` and other non-combinable fields separate from ordinary
+      combined lookup and iteration. Preserve a dedicated `get_set_cookie`
+      path without joining cookie attributes with commas.
+- [x] Added constructor paths for string name/value pairs and conversion from
+      `HeaderMap` or another `Headers` value. Invalid names and values convert
+      into the dedicated `InvalidHeaderName` and `InvalidHeaderValue` errors.
+- [x] Defined and enforced case normalization, duplicate handling, and ordering
+      consistently across constructors, `append`, `set`, `delete`, `get`, and
+      iteration.
+- [x] Made guard transitions monotonic. Stricter-to-looser transitions are
+      rejected, and every attempted mutation or transition after `Immutable`
+      returns a stable typed error rather than being silently ignored.
+- [x] Preserved the separate caller-controlled, user-agent-controlled,
+      internal-cookie, internal-response, and publicly exposed header channels
+      through request preparation and transport conversion.
+
+### Completed response exposure primitives
+
+- [x] Completed forbidden response-header filtering, including `Set-Cookie`
+      and `Set-Cookie2`, before public response construction.
+- [x] Completed CORS-exposed-header parsing and filtering for safelisted names,
+      explicit exposure lists, wildcard exposure with and without credentials,
+      malformed exposure metadata, duplicate exposure metadata, and case-
+      insensitive names.
+- [x] Kept the header-layer support for opaque, opaque-redirect, and
+      network-error views testable without claiming that Step 2 creates those
+      response types. Actual opaque-redirect creation belongs to Step 7, and
+      network-error construction remains part of the later response/CORS work.
+
+### Completed verification and integration
+
+- [x] Added unit tests for string/name-value conversion, invalid names and
+      values, combined ordinary fields, non-combinable cookie fields, ordering,
+      all guard transitions, and malformed CORS exposure metadata.
+- [x] Added controller-level tests proving that caller headers remain distinct
+      from generated `Origin`, `Referer`, body metadata, cookies, internal
+      response headers, and publicly exposed response headers.
+- [x] Verified that trusted `FetchServices` receives the complete internal
+      header representation while ordinary callers receive only the filtered
+      representation.
+- [x] Ran `cargo fmt --all`, `cargo test --workspace`, and
+      `cargo clippy --all-targets -- -D warnings`. The contract records the
+      verified behavior and the later algorithms that remain explicitly
+      deferred.
 
 ## 3. Implement the shared Body model
 

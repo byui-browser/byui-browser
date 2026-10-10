@@ -77,6 +77,7 @@ impl RequestController {
                         origin,
                         request_origin: request.context.environment.origin.clone(),
                         request_mode: request.context.mode,
+                        credentials_mode: request.context.credentials,
                         response_type: ResponseType::Basic,
                         body: ResponseBody::once_with_signal(response.body, request.signal.clone()),
                         body_is_null: request.method() == reqwest::Method::HEAD
@@ -102,8 +103,8 @@ impl RequestController {
             if let Some(services) = &self.inner.services {
                 if let Some(cookie) = services.cookie_header(&request)? {
                     let value = http::HeaderValue::from_str(&cookie)
-                        .map_err(|_| RequestError::ForbiddenHeader("cookie".into()))?;
-                    transport_headers.insert_internal_header(http::header::COOKIE, value);
+                        .map_err(|_| RequestError::InvalidHeaderValue("cookie".into()))?;
+                    transport_headers.insert_internal_header(http::header::COOKIE, value)?;
                 }
             }
         }

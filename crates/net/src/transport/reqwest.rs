@@ -112,6 +112,7 @@ impl Transport for ReqwestTransport {
                 origin: None,
                 request_origin: request.context.environment.origin.clone(),
                 request_mode: request.context.mode,
+                credentials_mode: request.context.credentials,
                 response_type: ResponseType::Basic,
                 body: ResponseBody::from_stream_with_signal(body, signal),
                 body_is_null,

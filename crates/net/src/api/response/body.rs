@@ -56,6 +56,7 @@ impl ResponseBody {
     }
 
     /// Creates a one-item stream for a body that is already buffered.
+    #[cfg(test)]
     pub(crate) fn once(body: Vec<u8>) -> Self {
         Self::from_stream_with_signal(
             futures_util::stream::once(async move { Ok(Bytes::from(body)) }),

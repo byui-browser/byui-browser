@@ -15,12 +15,10 @@ use crate::{
 
 /// Relative importance assigned to a request by the network scheduler.
 ///
-/// The ordering leaves room for document-aware scheduling. The current
-/// scheduler records the value but does not yet use it to reorder requests.
+/// The current scheduler records the value but does not yet use it to reorder
+/// requests.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) enum RequestPriority {
-    /// Background work that may yield to user-visible requests.
-    Background,
     /// Low-urgency work.
     Low,
     #[default]
@@ -28,8 +26,6 @@ pub(crate) enum RequestPriority {
     Normal,
     /// User-visible work that should be preferred when scheduling is added.
     High,
-    /// The most urgent request class.
-    Highest,
 }
 
 #[derive(Clone)]

@@ -136,12 +136,13 @@ impl RequestBody {
         self.content_type.as_ref()
     }
 
-    pub(crate) fn apply_metadata(&self, headers: &mut Headers) {
+    pub(crate) fn apply_metadata(&self, headers: &mut Headers) -> Result<(), RequestError> {
         if let Some(content_type) = &self.content_type
             && !headers.entries.iter().any(|(name, _)| name == CONTENT_TYPE)
         {
-            headers.insert_internal_header(CONTENT_TYPE, content_type.clone());
+            headers.insert_internal_header(CONTENT_TYPE, content_type.clone())?;
         }
+        Ok(())
     }
 
     pub(crate) fn into_reqwest_body(self) -> Result<Body, RequestError> {

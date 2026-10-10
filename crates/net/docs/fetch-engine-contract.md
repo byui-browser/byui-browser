@@ -25,11 +25,12 @@ Error timing and retry behavior are part of this boundary:
 | Transport failure                                                               | Before or after headers | A one-shot request body may be spent; a delivered response stream is spent. Retry with a new, replayable request. |
 
 The private `InternalResponse` retains the transport status and canonical
-reason phrase, every header (including `Set-Cookie`), complete URL-list and
+reason phrase, every header (including `Set-Cookie` and obsolete `Set-Cookie2`), complete URL-list and
 redirect state for the supported single exchange, origin and tainting state,
 null-body state, cache provenance, cookie-processing state, and the live body.
 Policy and cookie processing run on that representation. Exposure constructs
-an immutable header list and removes forbidden response headers. CORS views
+an immutable header list and removes forbidden response headers, including the
+obsolete `Set-Cookie2` compatibility case. CORS views
 include only safelisted and explicitly exposed headers. Opaque views hide
 status, URL, headers, cache provenance, and body. Both fetch paths use this conversion. An opaque
 view drops the internal body stream and releases its scheduler permit; this
@@ -45,6 +46,27 @@ a `Vec<u8>` in this slice so existing browser consumers can migrate gradually.
 `StreamingResponse` remains a compatibility entry point with identical
 filtering. The shared used/locked/disturbed body model and consumption methods
 belong to later plan steps.
+
+`Headers` is the shared request and response header model. String constructors
+and mutation methods validate HTTP names and values, lowercase names, and trim
+leading and trailing HTTP whitespace from values. The raw representation keeps
+duplicates in insertion order for transport and policy code. Public `get` and
+iteration combine duplicate ordinary fields with a comma and space in the order
+received; `Set-Cookie` values remain separate and are available to trusted
+internal consumers through `get_set_cookie`. Request, no-CORS request, response,
+and immutable guards may only transition toward stricter states. Immutable
+mutation and guard-loosening attempts return stable typed errors.
+
+Caller request headers remain separate from the transport header channel.
+Generated body metadata, `Origin`, `Referer`, and cookies are added only while
+preparing the transport request. Internal response headers retain every field
+for `FetchServices`, while public basic responses remove cookie fields and CORS
+responses expose only safelisted or valid explicitly exposed fields. The CORS
+wildcard exposes non-cookie fields only when credentials mode is not `Include`;
+malformed exposure metadata exposes no additional fields. Opaque,
+opaque-redirect, and error views always construct empty immutable headers,
+although creating opaque redirects and error responses remains later algorithm
+work.
 
 ## Supported behavior and capability boundaries
 

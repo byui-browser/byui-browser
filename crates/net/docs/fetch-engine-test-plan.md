@@ -43,6 +43,26 @@ Primary files:
   order during iteration and transport conversion.
 - `insert_replaces_all_duplicate_values`: `insert` removes every existing
   value for the name and appends exactly one replacement.
+- `set_replaces_duplicates_without_reordering_unrelated_headers`: for an
+  interleaved list such as `A`, `B`, `A`, replacing `A` removes both old
+  values, preserves `B`, and appends the replacement at the end.
+- `delete_removes_all_duplicates_without_reordering_unrelated_headers`:
+  deleting a name removes every occurrence while retaining the relative order
+  of all other fields.
+- `typed_and_string_mutators_share_validation_and_normalization`: cover
+  `append`, `append_str`, `set`, `set_str`, and `insert` with invalid names,
+  leading and trailing optional whitespace, whitespace-only values, and
+  control characters.
+- `header_constructors_preserve_raw_order_and_duplicates`: construct headers
+  from an iterator and `HeaderMap` with interleaved duplicate names, then
+  verify that raw iteration and transport conversion retain their exact order.
+- `public_iteration_combines_only_combinable_fields`: ordinary duplicate
+  fields are combined in first-seen-name order, while `Set-Cookie` and
+  `Set-Cookie2` remain distinct; verify that `get` agrees with the public
+  iterator.
+- `non_utf8_typed_header_values_have_defined_public_behavior`: test the
+  chosen lossy-public-string behavior (or a typed error) for valid raw
+  `HeaderValue` bytes that are not UTF-8.
 - `invalid_header_name_is_rejected`: malformed names return a typed
   `ForbiddenHeader` or validation error.
 - `invalid_header_value_is_rejected`: control characters and invalid bytes do
@@ -53,12 +73,21 @@ Primary files:
   cannot be added to a public response header list.
 - `immutable_headers_reject_mutation`: public exposed headers reject both
   `append` and `insert`.
+- `immutable_headers_reject_every_mutator`: also cover `set`, `set_str`, and
+  `delete`, including the error precedence for invalid input on immutable
+  headers.
+- `header_guard_transition_matrix_is_monotonic`: table-test every source and
+  destination guard pair, including idempotent transitions; rejected
+  transitions must preserve the guard and all stored fields.
+- `request_no_cors_to_cors_fails_without_changing_request_mode`: verify that
+  the request-level mode and header guard remain `NoCors` after the rejected
+  downgrade.
 - `switching_to_no_cors_filters_existing_headers`: changing a request to
   `NoCors` removes headers that are not CORS-safelisted.
 - `no_cors_accepts_only_safelisted_values`: cover `Accept`, language headers,
   supported `Content-Type` values, and valid `Range` syntax.
 - `no_cors_rejects_long_or_control_character_values`: cover the 128-byte
-  limit and forbidden control-character ranges.
+  limit, permitted tab, and forbidden control-character ranges.
 - `no_cors_validates_content_type_media_parameters`: accept supported media
   types with parameters and reject unsupported types.
 - `no_cors_validates_range_grammar`: cover open-ended ranges, numeric ranges,
@@ -67,6 +96,19 @@ Primary files:
   response names regardless of case and retain transport order.
 - `cors_exposure_ignores_malformed_expose_values`: malformed expose-header
   values do not expose arbitrary headers.
+- `cors_exposure_fails_closed_when_any_expose_field_is_malformed`: one
+  malformed value among several `Access-Control-Expose-Headers` fields
+  prevents every explicitly exposed field from becoming public.
+- `cors_exposure_handles_empty_duplicate_and_wildcard_values`: cover empty or
+  whitespace-only values, duplicate names, `*` with and without credentials,
+  and an explicit name alongside `*` for credentialed requests.
+- `cors_exposure_never_exposes_cookie_variants`: wildcard exposure and
+  explicit exposure cannot reveal either `Set-Cookie` or `Set-Cookie2`.
+- `cors_exposure_preserves_all_safelisted_response_headers`: test all seven
+  safelisted response fields with no expose header, malformed expose values,
+  and credentialed wildcard exposure.
+- `cors_exposure_rejects_non_utf8_expose_values`: non-UTF-8 typed expose
+  values fail closed rather than exposing arbitrary response fields.
 - `forbidden_response_headers_are_hidden_before_public_response_creation`:
   prove that cookie headers are absent from the public list, not merely hidden
   by `get`.
@@ -76,12 +118,23 @@ Primary files:
   is inserted only when the caller did not supply `Content-Type`.
 - `internal_origin_referer_and_cookie_headers_are_not_caller_headers`: these
   headers are added only in the internal transport path.
+- `repeated_request_preparation_does_not_duplicate_generated_headers`:
+  preparing or sending the same eligible request repeatedly does not duplicate
+  generated `Origin`, `Referer`, `Cookie`, or inferred `Content-Type`.
+- `generated_headers_are_absent_from_policy_visible_caller_headers`: request
+  policy hooks observe only caller-provided headers, not transport-generated
+  metadata.
+- `cookie_lookup_failure_does_not_mutate_or_send_caller_headers`: a failing
+  cookie service aborts before transport and leaves the caller header list
+  unchanged.
 
 ### Implementation approach
 
 Use table-driven tests for forbidden names, safelisted media types, and range
-forms. Keep one or two controller-level tests to verify that the unit-level
-header behavior is preserved across request preparation and transport.
+forms. Include 128- and 129-byte boundaries, every CORS-safelisted request
+header name, content-type casing and parameter variants, and valid/invalid
+range forms. Keep controller-level tests to verify that the unit-level header
+behavior is preserved across request preparation, policy hooks, and transport.
 
 ## 2. Request methods, bodies, and URL preparation
 
@@ -171,10 +224,17 @@ Primary files:
   hidden.
 - `cors_exposes_explicit_headers_only`: `Access-Control-Expose-Headers`
   controls additional readable headers.
+- `cors_exposure_has_identical_buffered_and_streaming_views`: duplicate-field
+  combination, cookie filtering, and exposed-field ordering agree between
+  buffered and streaming response construction.
 - `response_policy_failure_discards_internal_body`: service rejection cannot
   leave a readable body or cache entry.
 - `error_response_is_not_exposed_as_transport_data`: typed request errors do
   not leak internal status, headers, or body.
+- `opaque_and_error_views_hide_every_transport_field`: opaque,
+  opaque-redirect, and error responses hide status, URL, headers, raw cookie
+  fields, cache provenance, and body bytes, and their headers reject all
+  mutation.
 
 ### Unsupported-preflight tests
 
@@ -188,6 +248,16 @@ following fail before server contact:
 When preflight is implemented, replace these with tests for the `OPTIONS`
 request, allowed methods and headers, credentials, preflight caching, failure,
 and invalidation.
+
+### Invariant and fuzz coverage
+
+Add a small property-based or fuzz suite for valid and invalid header names,
+values, guard transitions, and expose-header lists. It should assert that the
+API never panics; `get` agrees with public iteration; `set` and `delete`
+maintain raw-order invariants; immutable headers never mutate; and malformed
+expose-header input cannot make a non-safelisted field public. Keep the
+deterministic table-driven tests above as the executable specification for
+known boundary values.
 
 ## 4. Null-body responses
 

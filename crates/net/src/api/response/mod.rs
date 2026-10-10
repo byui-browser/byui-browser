@@ -48,6 +48,7 @@ mod tests {
             origin: None,
             request_origin: None,
             request_mode: RequestMode::Cors,
+            credentials_mode: crate::CredentialsMode::SameOrigin,
             response_type: ResponseType::Basic,
             body: ResponseBody::once(b"body".to_vec()),
             body_is_null: false,
@@ -64,9 +65,12 @@ mod tests {
     #[test]
     fn opaque_and_null_views_cannot_yield_transport_bytes() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        for (response_type, body_is_null) in
-            [(ResponseType::Opaque, false), (ResponseType::Basic, true)]
-        {
+        for (response_type, body_is_null) in [
+            (ResponseType::Opaque, false),
+            (ResponseType::OpaqueRedirect, false),
+            (ResponseType::Error, false),
+            (ResponseType::Basic, true),
+        ] {
             let internal = InternalResponse {
                 status: StatusCode::NO_CONTENT,
                 status_text: "No Content".into(),
@@ -76,6 +80,7 @@ mod tests {
                 origin: None,
                 request_origin: None,
                 request_mode: RequestMode::Cors,
+                credentials_mode: crate::CredentialsMode::SameOrigin,
                 response_type,
                 body: ResponseBody::once(b"forbidden".to_vec()),
                 body_is_null,
@@ -83,7 +88,10 @@ mod tests {
                 cookie_headers_processed: false,
             };
             let mut exposed = internal.expose();
-            if response_type == ResponseType::Opaque {
+            if matches!(
+                response_type,
+                ResponseType::Opaque | ResponseType::OpaqueRedirect | ResponseType::Error
+            ) {
                 assert_eq!(exposed.status, 0);
                 assert!(exposed.url.is_empty());
                 assert!(exposed.headers.is_empty());

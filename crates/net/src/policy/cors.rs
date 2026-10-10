@@ -72,6 +72,7 @@ mod tests {
             origin: Some(Origin::parse("https://remote.test").unwrap()),
             request_origin: Some(Origin::parse("https://client.test").unwrap()),
             request_mode: RequestMode::Cors,
+            credentials_mode: CredentialsMode::SameOrigin,
             response_type: ResponseType::Basic,
             body: ResponseBody::once(Vec::new()),
             body_is_null: false,

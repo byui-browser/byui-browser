@@ -1,5 +1,7 @@
 //! Errors exposed by the networking client.
 
+use crate::HeaderGuard;
+
 /// Errors that can occur while preparing, executing, or consuming a fetch.
 ///
 /// URL, method, header, capability, keepalive, and scheduler errors occur
@@ -14,7 +16,7 @@
 /// | Variants | Recovery and body effect |
 /// | --- | --- |
 /// | `Initialization` | Fix client configuration; no request or response body exists. |
-/// | `InvalidUrl`, `InvalidOrigin`, `InvalidMethod`, `ForbiddenMethod`, `NoCorsMethod`, `ForbiddenHeader`, `BodyNotAllowed`, `KeepaliveBodyTooLarge`, `UnsupportedScheme`, `UnsupportedFeature` | Correct the request; no body is consumed by this failed attempt. |
+/// | `InvalidUrl`, `InvalidOrigin`, `InvalidMethod`, `ForbiddenMethod`, `NoCorsMethod`, `ForbiddenHeader`, `InvalidHeaderName`, `InvalidHeaderValue`, `ImmutableHeaders`, `InvalidHeaderGuardTransition`, `BodyNotAllowed`, `KeepaliveBodyTooLarge`, `UnsupportedScheme`, `UnsupportedFeature` | Correct the request; no body is consumed by this failed attempt. |
 /// | `SchedulerClosed` | Use a live controller; the request body was not sent. |
 /// | `NetworkError` | A cache-only miss; retry after cache state changes or choose another cache mode. No body was consumed. |
 /// | `BodyAlreadyConsumed` | The request body was spent by a prior attempt; create a fresh body. |
@@ -56,6 +58,13 @@ pub enum RequestError {
     InvalidHeaderValue(String),
     /// A caller attempted to mutate an immutable response header collection.
     ImmutableHeaders,
+    /// A header collection cannot move from a stricter guard to a looser one.
+    InvalidHeaderGuardTransition {
+        /// Guard active before the rejected transition.
+        from: HeaderGuard,
+        /// Requested guard that would loosen or cross header channels.
+        to: HeaderGuard,
+    },
     /// A request body cannot be sent with this method.
     BodyNotAllowed(String),
     /// A one-shot request body was consumed by an earlier send attempt.
@@ -92,6 +101,9 @@ impl std::fmt::Display for RequestError {
             Self::InvalidHeaderName(name) => write!(f, "Invalid header name: {name}"),
             Self::InvalidHeaderValue(name) => write!(f, "Invalid header value for: {name}"),
             Self::ImmutableHeaders => f.write_str("Headers are immutable"),
+            Self::InvalidHeaderGuardTransition { from, to } => {
+                write!(f, "Header guard cannot transition from {from:?} to {to:?}")
+            }
             Self::BodyNotAllowed(method) => write!(f, "A request body is not allowed for {method}"),
             Self::BodyAlreadyConsumed => f.write_str("Request body has already been consumed"),
             Self::KeepaliveBodyTooLarge { limit } => {
