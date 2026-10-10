@@ -15,14 +15,14 @@ obtain the transport response from either method.
 
 Error timing and retry behavior are part of this boundary:
 
-| Error category | Timing | Body effect and recovery |
-| --- | --- | --- |
-| URL, method, header, scheme, capability, keepalive, and request-body validation | Before headers | No response body exists; a corrected request may be sent. |
-| Same-origin, CORS, and redirect failure | Before public headers | The internal response is discarded; retry only with a new, permitted request. |
-| Client initialization | Before any request | Correct the configuration; no body was used. |
-| Cache-only network miss | Before headers | No body exists; retry after cache state changes or change cache mode. |
-| Abort | Before or after headers | The active stream terminates; a new request needs a new signal. |
-| Transport failure | Before or after headers | A one-shot request body may be spent; a delivered response stream is spent. Retry with a new, replayable request. |
+| Error category                                                                  | Timing                  | Body effect and recovery                                                                                          |
+| ------------------------------------------------------------------------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| URL, method, header, scheme, capability, keepalive, and request-body validation | Before headers          | No response body exists; a corrected request may be sent.                                                         |
+| Same-origin, CORS, and redirect failure                                         | Before public headers   | The internal response is discarded; retry only with a new, permitted request.                                     |
+| Client initialization                                                           | Before any request      | Correct the configuration; no body was used.                                                                      |
+| Cache-only network miss                                                         | Before headers          | No body exists; retry after cache state changes or change cache mode.                                             |
+| Abort                                                                           | Before or after headers | The active stream terminates; a new request needs a new signal.                                                   |
+| Transport failure                                                               | Before or after headers | A one-shot request body may be spent; a delivered response stream is spent. Retry with a new, replayable request. |
 
 The private `InternalResponse` retains the transport status and canonical
 reason phrase, every header (including `Set-Cookie`), complete URL-list and
