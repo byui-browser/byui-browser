@@ -32,32 +32,28 @@
 
 // TODO(net): Add persistent cookie storage, strict CORS, and HTTP/3 transport.
 
+mod api;
 mod cache;
-mod cancellation;
-mod config;
-mod controller;
-mod cors;
-mod error;
+mod engine;
 mod policy;
-mod request;
-mod response;
-mod scheduler;
-mod services;
+mod scheduling;
 mod transport;
 
 #[cfg(test)]
 mod tests;
 
-pub use cancellation::{AbortController, AbortSignal};
-pub use config::Config;
-pub use controller::RequestController;
-pub use error::RequestError;
-pub use http::{HeaderName, HeaderValue, Method};
-pub use request::{
-    CacheMode, CredentialsMode, FetchContext, FetchEnvironment, HeaderGuard, HeaderList,
-    InitiatorType, NetworkPartitionKey, Origin, RedirectMode, Referrer, ReferrerPolicy, Request,
-    RequestBody, RequestDestination, RequestMode, RequestPriority, ServiceWorkersMode,
+pub use api::{
+    cancellation::{AbortController, AbortSignal},
+    config::Config,
+    error::RequestError,
+    request::{
+        CacheMode, CredentialsMode, FetchContext, FetchEnvironment, HeaderGuard, HeaderList,
+        InitiatorType, NetworkPartitionKey, Origin, RedirectMode, Referrer, ReferrerPolicy,
+        Request, RequestBody, RequestDestination, RequestMode, RequestPriority, ServiceWorkersMode,
+    },
+    response::{Response, ResponseBody, ResponseType, StreamingResponse},
+    services::{FetchServices, ResponseInfo, ServiceWorkerDecision},
 };
-pub use response::{Response, ResponseBody, ResponseType, StreamingResponse};
-pub use services::{FetchServices, ResponseInfo, ServiceWorkerDecision};
+pub use engine::RequestController;
+pub use http::{HeaderName, HeaderValue, Method};
 pub use url::Url;

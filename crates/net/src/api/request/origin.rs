@@ -1,6 +1,6 @@
 use url::Url;
 
-use crate::error::RequestError;
+use crate::api::error::RequestError;
 
 /// Structured origin state for a client environment.
 #[derive(Clone, Debug, Eq, PartialEq)]

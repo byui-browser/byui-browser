@@ -1,6 +1,6 @@
 //! Response tainting and the supported simple-CORS validation boundary.
 
-use crate::{
+use crate::api::{
     error::RequestError,
     request::{CredentialsMode, Origin, Request, RequestMode},
     response::{InternalResponse, ResponseType},
@@ -60,7 +60,7 @@ impl CorsChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::response::ResponseBody;
+    use crate::api::response::ResponseBody;
 
     fn response(headers: reqwest::header::HeaderMap) -> InternalResponse {
         InternalResponse {

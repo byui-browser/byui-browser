@@ -4,7 +4,7 @@ use http::{
 };
 use url::Url;
 
-use crate::{cancellation::AbortSignal, error::RequestError};
+use crate::api::{cancellation::AbortSignal, error::RequestError};
 
 use super::{
     CacheMode, CredentialsMode, FetchContext, FetchEnvironment, HeaderGuard, HeaderList,
@@ -265,11 +265,11 @@ impl Request {
                 .any(|(name, value)| !is_cors_safelisted_header(name, value))
     }
     /// Returns the transport priority corresponding to the Fetch priority.
-    pub(crate) fn transport_priority(&self) -> crate::scheduler::RequestPriority {
+    pub(crate) fn transport_priority(&self) -> crate::scheduling::RequestPriority {
         match self.priority {
-            RequestPriority::Low => crate::scheduler::RequestPriority::Low,
-            RequestPriority::Auto => crate::scheduler::RequestPriority::Normal,
-            RequestPriority::High => crate::scheduler::RequestPriority::High,
+            RequestPriority::Low => crate::scheduling::RequestPriority::Low,
+            RequestPriority::Auto => crate::scheduling::RequestPriority::Normal,
+            RequestPriority::High => crate::scheduling::RequestPriority::High,
         }
     }
     pub(crate) fn prepare_url(&mut self, url: Url) {

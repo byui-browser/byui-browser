@@ -9,7 +9,7 @@ use futures_util::{Stream, TryStreamExt};
 use http::header::{CONTENT_TYPE, HeaderValue};
 use reqwest::Body;
 
-use crate::error::RequestError;
+use crate::api::error::RequestError;
 
 use super::HeaderList;
 

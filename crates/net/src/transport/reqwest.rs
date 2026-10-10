@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use reqwest::header::{HeaderValue, REFERER};
 
-use crate::{
+use crate::api::{
     config::Config,
     error::RequestError,
     request::PreparedRequest,

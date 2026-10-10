@@ -1,6 +1,6 @@
 use url::Url;
 
-use crate::error::RequestError;
+use crate::api::error::RequestError;
 
 use super::{NetworkPartitionKey, Origin};
 

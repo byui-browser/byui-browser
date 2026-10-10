@@ -1,6 +1,6 @@
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 
-use crate::error::RequestError;
+use crate::api::error::RequestError;
 
 /// Guard that controls which header names and values may be added to a list.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

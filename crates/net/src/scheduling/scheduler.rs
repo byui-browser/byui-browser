@@ -9,7 +9,8 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use crate::{
-    error::RequestError, request::PreparedRequest, response::InternalResponse, transport::Transport,
+    api::{error::RequestError, request::PreparedRequest, response::InternalResponse},
+    transport::Transport,
 };
 
 /// Relative importance assigned to a request by the network scheduler.
