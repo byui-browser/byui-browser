@@ -376,6 +376,47 @@ Add controlled local-server cases for:
 - transport initialization failure, where configuration allows it to be
   induced deterministically.
 
+### Response decompression
+
+The current Reqwest transport enables gzip, Brotli, deflate, and zstd
+decompression. Add one integration test per encoding:
+
+- `gzip_response_is_decoded_before_public_body_exposure`;
+- `brotli_response_is_decoded_before_public_body_exposure`;
+- `deflate_response_is_decoded_before_public_body_exposure`;
+- `zstd_response_is_decoded_before_public_body_exposure`.
+
+For each encoding, verify both `fetch` and `fetch_stream`, decoded body bytes,
+stream chunk behavior, and the public treatment of `Content-Encoding` and
+`Content-Length`. Reqwest removes those headers after automatic decoding; the
+test should lock down whether that matches the engine contract.
+
+Also add tests for:
+
+- `explicit_accept_encoding_is_preserved`: caller-provided encoding headers
+  are not replaced by transport defaults;
+- `range_requests_do_not_enable_automatic_encoding`: a request with `Range`
+  does not receive an implicit `Accept-Encoding` header or unexpected body
+  transformation;
+- `generated_accept_encoding_is_internal`: automatic transport negotiation is
+  not visible as a caller-controlled request header;
+- `malformed_compressed_body_returns_transport_error`;
+- `truncated_compressed_body_returns_transport_error`;
+- `decompression_failure_does_not_enter_cache`;
+- `abort_during_decompression_releases_permit`;
+- `decoded_response_size_limit_rejects_expansion`;
+- `decompression_ratio_limit_rejects_bomb_like_payload`;
+- `decoded_body_cache_hits_are_independent`: each cache hit receives a fresh
+  decoded body and public response view;
+- `cache_policy_preserves_required_encoding_metadata`: cache matching retains
+  any internal `Vary: Accept-Encoding`, validator, or wire metadata needed by
+  the selected cache design.
+
+The decompression tests should use deterministic compressed fixtures rather
+than relying on a third-party server. Include small payloads, empty payloads,
+multi-chunk payloads, and payloads whose decoded size is much larger than the
+wire size.
+
 Each failure test should assert both the error type and side effects: whether
 the body was partially delivered, whether the scheduler permit was released,
 whether cookies were stored, and whether the response entered the cache.
@@ -414,7 +455,8 @@ behavior boundary:
    tests until preflight exists.
 7. Add redirect boundary tests, then replace them incrementally with redirect
    conformance tests as controller-owned redirects are implemented.
-8. Add transport framing and connection-failure tests.
+8. Add transport framing, connection-failure, and response-decompression
+   tests.
 9. Select a Fetch subset from Web Platform Tests after the engine API and
    shared body model stabilize. Track intentionally unsupported tests
    explicitly.

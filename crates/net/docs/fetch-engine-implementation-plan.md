@@ -1,6 +1,6 @@
 # Plan: Make `net` the reusable Fetch engine
 
-Status: implementation in progress as of 2026-10-09; step 1 is complete for
+Status: implementation in progress as of 2026-10-10; step 1 is complete for
 the explicitly bounded single-exchange HTTP(S) subset described below.
 
 ## Goal
@@ -92,6 +92,10 @@ The current crate already has useful foundations:
 - [`RequestController`](../src/engine/controller.rs) coordinates policy validation,
   cache lookup, cookies, scheduling, transport, response validation, and cache
   capture.
+- [`ReqwestTransport`](../src/transport/reqwest.rs) currently enables native
+  gzip, Brotli, deflate, and zstd response decompression. The transport owns
+  content decoding, while the Fetch engine owns decoded-body limits, header
+  semantics, cache representation, and failure handling.
 
 The main limitations are documented in
 [`net-fetch-standard-gaps.md`](net-fetch-standard-gaps.md), especially the
@@ -108,6 +112,132 @@ The implementation must preserve these project constraints:
 - no unsafe code is introduced;
 - existing callers should be migrated incrementally rather than broken in one
   large change.
+
+## Dependency strategy
+
+Use mature crates for protocol primitives and standards data, while keeping
+browser-specific Fetch behavior in `net`. A dependency is a good fit when it
+provides a narrowly scoped parser, codec, storage model, or middleware seam.
+It is not a substitute for request tainting, response filtering, redirect
+semantics, body ownership, credentials mode, or browser policy ordering.
+
+The current transport already uses `reqwest`, `http`, `url`, `bytes`,
+`futures-util`, and Tokio. Continue to keep Reqwest below the public Fetch
+boundary. Its redirect policy should remain disabled so the controller owns
+Fetch redirect processing.
+
+### Cookie storage: `cookie_store`
+
+Use [`cookie_store`](https://docs.rs/cookie_store/latest/cookie_store/) in the
+browser-owned storage/security provider when implementing the cookie hooks in
+section 8. It supplies RFC 6265 cookie storage, request matching, expiration,
+and public-suffix-aware behavior. The provider integration should:
+
+1. receive the request URL, origin, credentials mode, and network partition
+   key from `FetchServices`;
+2. use `CookieStore::get_request_values` to construct the internal `Cookie`
+   header after browser policy approves credentials;
+3. pass each raw `Set-Cookie` value to `CookieStore::parse` or the equivalent
+   insertion API only after response policy and CORS checks complete; and
+4. persist or evict the store through `storage`, rather than making
+   `cookie_store` state authoritative inside `net`.
+
+`net` must still own the Fetch decision about whether the provider is called.
+Partitioning, SameSite policy, secure-context checks, HttpOnly behavior,
+storage quotas, and browser cookie permissions remain provider responsibilities.
+Add an adapter test suite for domain/path matching, expiration/deletion,
+Secure cookies, public suffixes, partition isolation, and credentials modes.
+
+### HTTP cache: `http-cache-reqwest`
+
+Evaluate [`http-cache-reqwest`](https://docs.rs/http-cache-reqwest/latest/http_cache_reqwest/)
+before expanding `src/cache/memory.rs` into a complete HTTP cache. Its
+middleware provides HTTP cache policy, cache modes, freshness, validators, and
+pluggable cache managers. It can be integrated behind a private transport or
+cache adapter, likely together with
+[`reqwest-middleware`](https://docs.rs/reqwest-middleware/latest/reqwest_middleware/).
+
+The adapter must not bypass the Fetch pipeline. It must translate between the
+engine's internal request/response representation and the middleware types,
+preserve network partition and origin context, keep response bodies cloneable,
+and re-create a fresh filtered response for each caller. Verify Reqwest
+version compatibility before adoption because middleware releases may target
+a different Reqwest major version than this workspace.
+
+Retain the custom cache layer when the required behavior is outside generic
+HTTP caching, including opaque-response isolation, Fetch `OnlyIfCached`
+semantics, provider authorization on cache hits, scheduler-permit ownership,
+and browser-specific partitioning. The adoption decision should be recorded
+with benchmarks and conformance tests for `Vary`, validators, 304 merging,
+unsafe-method invalidation, and all Fetch cache modes.
+
+### Body text decoding: `encoding_rs`
+
+Use [`encoding_rs`](https://docs.rs/encoding_rs/latest/encoding_rs/) when
+implementing `Response::text()` and any content-type/charset-aware body
+decoding in section 3. It implements the Web-compatible Encoding Standard and
+supports streaming decoding. The body state machine remains custom: decoding
+must consume the shared body exactly once, preserve abort and transport
+errors, and distinguish decoding failures from JSON or form-data parsing.
+
+Add tests for UTF-8, declared legacy encodings, invalid byte sequences,
+charset labels, BOM handling, and decoding after a partial stream read.
+
+### Media types: `mime`
+
+Use [`mime`](https://docs.rs/mime/latest/mime/) for parsing and normalizing
+media types in `Content-Type` and body metadata. Do not use it as the complete
+Fetch CORS-safelisting algorithm: the 128-byte/value restrictions and
+Fetch-specific safelist rules still belong in `HeaderList` and the policy
+modules. Add an adapter that converts parser errors into the crate's typed
+request or body errors without exposing the dependency's type publicly.
+
+### Subresource Integrity: `sha2` and `base64`
+
+When section 11 adds SRI, use
+[`sha2`](https://docs.rs/sha2/latest/sha2/) for SHA-256/SHA-384/SHA-512
+digests and [`base64`](https://docs.rs/base64/latest/base64/) for integrity
+metadata decoding. Implement SRI policy in `net` or the security provider,
+but keep the digest primitives in these crates. Hash the response stream as it
+is consumed or tee it into a verification sink; do not buffer a second copy
+unless the selected body/cache design requires it. Verification must complete
+before a response becomes publicly readable or cacheable, and failures must
+prevent cache insertion.
+
+Add tests for supported algorithms, malformed metadata, multiple candidates,
+base64 padding, digest mismatch, successful streaming verification, aborts,
+and cache behavior after verification failure.
+
+### Scheduling and middleware: Tower and Reqwest middleware
+
+[`tower::limit::ConcurrencyLimit`](https://docs.rs/tower/latest/tower/limit/concurrency/index.html)
+can replace the admission semaphore if the transport is exposed as a Tower
+`Service`. [`reqwest-middleware`](https://docs.rs/reqwest-middleware/latest/reqwest_middleware/)
+can provide tracing, diagnostics, or carefully scoped middleware hooks.
+
+Do not adopt either as a direct replacement for the current scheduler without
+first proving body-lifetime semantics. Generic concurrency middleware normally
+holds a permit until the response future completes, whereas this engine keeps
+its permit attached to `ResponseBody` until the body is consumed or dropped.
+If Tower is adopted, introduce a custom response-body guard layer that moves
+the permit into the body and test cancellation, body errors, body drops, and
+cache capture. Do not use generic retry middleware for requests with one-shot
+bodies unless the retry layer understands replayability and Fetch error timing.
+
+### What remains custom
+
+Do not replace these with general-purpose crates:
+
+- `HeaderList` guards and forbidden-header filtering;
+- CORS checks, response tainting, and opaque/basic response views;
+- controller-owned redirects and per-hop policy checks;
+- shared body used/locked/disturbed state and stream teeing;
+- Fetch error categories and recovery/body-consumption semantics;
+- browser service hooks, credentials mode, network partition context, and
+  security-policy ordering.
+
+These are the reusable Fetch engine's core contract, not generic HTTP client
+plumbing.
 
 ## 1. Establish the public contract
 
@@ -682,7 +812,7 @@ Refactor `fetch` and `fetch_stream` into a pipeline with explicit stages:
 6. cookie and user-agent header preparation;
 7. controller-owned redirect loop;
 8. transport request;
-9. internal response construction;
+9. transport decoding and internal response construction;
 10. response policy/CORS/integrity decisions from owning providers;
 11. response filtering;
 12. cookie processing;
@@ -700,6 +830,42 @@ Keep `ReqwestTransport` responsible for HTTP I/O only. It should:
 - not expose raw responses above the controller;
 - preserve streaming and abort behavior;
 - report status, headers, URL, and body chunks to the controller.
+
+#### Response decompression policy
+
+Keep Reqwest's native response decompression for gzip, Brotli, deflate, and
+zstd. It already performs incremental decoding and removes `Content-Encoding`
+and `Content-Length` after decoding. Make that behavior explicit in the
+transport adapter rather than relying only on dependency feature defaults.
+
+The adapter must:
+
+- preserve an explicitly supplied `Accept-Encoding` header;
+- avoid implicit content encoding for requests carrying `Range` unless the
+  selected Fetch/cache policy explicitly permits it;
+- keep automatically generated `Accept-Encoding` internal to transport
+  preparation;
+- convert decompression failures into the crate's transport/body error type;
+- expose decoded bytes to the body state machine while retaining any required
+  wire metadata internally for diagnostics and cache matching;
+- enforce a decoded response-size limit and, where appropriate, a maximum
+  decompression ratio before forwarding or caching unbounded output; and
+- release the scheduler permit and prevent cache insertion after decompression
+  failure, abort, or limit violation.
+
+Add a transport configuration object for decompression limits rather than
+hard-coding limits in the response type. The limit must count decoded bytes
+across streaming chunks, work for both buffered and streaming fetches, and
+produce a documented typed error. If the cache stores decoded bodies, include
+that choice in the cache contract. If it stores encoded representations,
+retain `Content-Encoding`, `Content-Length`, validators, and
+`Vary: Accept-Encoding` in the internal representation and decode only for
+the public body.
+
+Do not move decompression into the Fetch policy layer unless the browser needs
+raw wire bytes for a signature or specialized cache path. The public response
+must describe the decoded representation, while internal response metadata may
+retain wire-level information.
 
 ## 13. Test and conformance plan
 
@@ -740,6 +906,11 @@ Extend the existing request/cache/redirect test servers with cases for:
 - cookie persistence and credentials modes;
 - filtered response headers;
 - integrity success and failure.
+- gzip, Brotli, deflate, and zstd response decoding;
+- malformed/truncated compressed bodies;
+- decoded-size and decompression-ratio limits;
+- range requests and explicit `Accept-Encoding` behavior;
+- cache insertion and validator behavior after decoding.
 
 ### 13.3 Conformance tests
 
@@ -772,16 +943,22 @@ Implement in vertical slices so the browser retains a working network path:
 
 1. Contract and internal/public response split.
 2. `Headers` API and transport conversion.
-3. Shared Body state for buffered and streaming bytes.
+3. Shared Body state for buffered and streaming bytes; use `encoding_rs` for
+   Web-compatible text decoding and `mime` for media-type parsing once body
+   consumption is introduced. Define transport decompression limits and
+   decoded-versus-wire metadata at this boundary.
 4. Fetch-style `Request` and `Response` accessors/cloning.
 5. Null-body responses and body consumption methods.
 6. Response filtering and CORS exposure.
 7. Controller-owned redirects.
-8. Credential/cookie channels and credentials modes.
-9. Cache representation and standards-aware cache behavior.
+8. Credential/cookie channels and credentials modes; implement the browser
+   provider with `cookie_store` behind `FetchServices`.
+9. Cache representation and standards-aware cache behavior; evaluate
+   `http-cache-reqwest` plus `reqwest-middleware` before expanding the custom
+   cache, retaining an adapter for Fetch-specific partitioning and body state.
 10. Cancellation/lifecycle completion.
 11. Integrity, keepalive, service-worker, CSP, CORP, timing, and other policy
-    hooks.
+    hooks; use `sha2` and `base64` for SRI primitives.
 12. Web Platform Tests and removal of compatibility shims.
 
 Do not begin with a wholesale rename of every type. Stabilize the internal
@@ -800,6 +977,9 @@ The change is complete when:
 - redirect modes and URL-list behavior are controller-owned;
 - credentials, cookies, CORS, and cache behavior are integrated rather than
   stored as inert request fields;
+- native response decompression remains enabled, with documented decoded-body
+  limits, range/`Accept-Encoding` behavior, internal wire metadata, and
+  failure-safe cache insertion;
 - `webapis` can wrap the engine without reimplementing security or networking
   semantics;
 - storage, security, service-worker, browser-context, and diagnostics owners
