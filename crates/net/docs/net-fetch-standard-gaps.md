@@ -34,7 +34,7 @@ The crate currently provides an HTTP(S) transport with a Fetch-shaped request mo
 
 ### 1. URL parsing and scheme fetch
 
-**Evidence:** [`RequestPolicy::validate_request`](../src/policy/request.rs) accepts only `http` and `https`, but resolves parseable relative references through [`FetchEnvironment::base_url`](../src/api/request/context.rs). [`RequestController::fetch_stream`](../src/engine/execute.rs) initializes the request URL list and current URL before transport.
+**Evidence:** [`RequestPolicy::validate_request`](../src/policy/request.rs) accepts only `http` and `https`, but resolves parseable relative references through [`FetchEnvironment::base_url`](../src/api/request/context.rs). [`RequestController::fetch`](../src/engine/execute.rs) initializes the request URL list and current URL before transport.
 
 The standard defines fetch schemes as `about`, `blob`, `data`, `file`, and HTTP(S), with scheme-specific fetch behavior. The crate still has no local-URL, `data:` URL, `blob:` URL, or `file:` fetch implementation. Relative URLs now can be resolved against an optional environment/base URL, and requests record an initial/current URL and redirect count, but redirects do not yet update that state through a controller-owned Fetch loop. Origin state supports HTTP(S) tuple and opaque origins, but the complete local-URL, credentials, and opaque-origin bookkeeping is not implemented.
 
@@ -86,7 +86,7 @@ The standard's HTTP-redirect fetch algorithm validates the `Location` URL, rejec
 
 ### 7. HTTP cache and cache modes
 
-**Evidence:** [`ResponseCache::insert`](../src/cache/memory.rs) stores only successful responses with a parsed `Cache-Control: max-age`; [`cache_key`](../src/cache/memory.rs) includes method and normalized URL while ignoring fragments; [`fetch_stream`](../src/engine/execute.rs) treats cache modes as local lookup switches.
+**Evidence:** [`ResponseCache::insert`](../src/cache/memory.rs) stores only successful responses with a parsed `Cache-Control: max-age`; [`cache_key`](../src/cache/memory.rs) includes method and normalized URL while ignoring fragments; [`fetch`](../src/engine/execute.rs) treats cache modes as local lookup switches.
 
 The Fetch HTTP-network-or-cache algorithm relies on an HTTP cache, cache partitioning, freshness, validators, and revalidation. The current cache is process-local and keyed by provider-supplied partition, method, and normalized URL, with fragment removal and a TTL derived from `max-age`. It does not vary by request headers or `Vary`, credentials, authorization, response tainting, or full cache policy. It does not process `Date`, `Expires`, `Age`, validators, `Vary`, invalidation, 304 responses, or heuristic freshness.
 
@@ -131,7 +131,7 @@ Basic cancellation is implemented, but Fetch controllers distinguish ongoing, te
 
 ### 11. Response representation and Fetch API behavior
 
-**Evidence:** [`Response`](../src/api/response/types.rs) and [`StreamingResponse`](../src/api/response/types.rs) now expose filtered status, URL, headers, response type, and body. The private internal representation retains full transport metadata. The crate still exports Rust structs and a stream, not JavaScript Fetch interfaces.
+**Evidence:** [`Response`](../src/api/response/types.rs) exposes filtered status, URL, headers, response type, and body. The private internal representation retains full transport metadata. The crate still exports Rust structs and a stream, not JavaScript Fetch interfaces.
 
 Remaining response work includes full redirect URL-list accuracy, response constructors, Fetch-compatible decoding, `arrayBuffer`, `formData`, and JSON helpers, stream teeing, and complete network-error construction. The supported Rust subset and limitations are stated in `fetch-engine-contract.md`.
 

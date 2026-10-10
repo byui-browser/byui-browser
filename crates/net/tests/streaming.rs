@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use net::{Config, Request, RequestController, RequestError};
 
 #[test]
-fn fetch_stream_yields_body_chunks_before_response_completion() {
+fn fetch_yields_body_chunks_before_response_completion() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = thread::spawn(move || {
@@ -34,7 +34,7 @@ fn fetch_stream_yields_body_chunks_before_response_completion() {
 
     let controller = RequestController::new(Config::default()).unwrap();
     let first_chunk = runtime().block_on(async {
-        let mut response = controller.fetch_stream(Request::get(url)).await.unwrap();
+        let mut response = controller.fetch(Request::get(url)).await.unwrap();
         response.body.next().await.unwrap().unwrap().to_vec()
     });
 
@@ -56,10 +56,7 @@ fn incomplete_stream_forwards_error_and_is_not_cached() {
     let controller = RequestController::new(Config::default()).unwrap();
 
     let (partial, retry) = runtime().block_on(async {
-        let mut response = controller
-            .fetch_stream(Request::get(server.url()))
-            .await
-            .unwrap();
+        let mut response = controller.fetch(Request::get(server.url())).await.unwrap();
         let mut partial = Vec::new();
         let mut error = None;
         while let Some(chunk) = response.body.next().await {
@@ -98,10 +95,7 @@ fn dropping_a_stream_releases_its_scheduler_permit_and_does_not_cache() {
     .unwrap();
 
     runtime().block_on(async {
-        let mut response = controller
-            .fetch_stream(Request::get(server.url()))
-            .await
-            .unwrap();
+        let mut response = controller.fetch(Request::get(server.url())).await.unwrap();
         assert_eq!(
             response.body.next().await.unwrap().unwrap().as_ref(),
             b"body"

@@ -21,25 +21,27 @@ fn cache_serves_a_fresh_get_without_a_second_network_request() {
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
     let client = RequestController::new(Config::default()).expect("controller should initialize");
 
-    let (first, second) = runtime.block_on(async {
+    let (first_status, first_from_cache, first_body, second) = runtime.block_on(async {
         let first = client
             .fetch(Request::get(&address))
             .await
             .expect("first request should succeed");
+        let first_body = first
+            .body
+            .bytes()
+            .await
+            .expect("first response body should be readable");
         let second = client
             .fetch(Request::get(&address))
             .await
             .expect("cached request should succeed");
-        (first, second)
+        (first.status, first.from_cache, first_body, second)
     });
     server.join().expect("test server should exit");
 
-    assert_eq!(first.status, StatusCode::OK);
-    assert!(!first.from_cache);
-    assert_eq!(
-        runtime.block_on(first.body.bytes()).unwrap(),
-        b"cached response"
-    );
+    assert_eq!(first_status, StatusCode::OK);
+    assert!(!first_from_cache);
+    assert_eq!(first_body, b"cached response");
     assert!(second.from_cache);
     assert_eq!(
         runtime.block_on(second.body.bytes()).unwrap(),

@@ -270,8 +270,8 @@ Primary files:
 
 ### Tests to add
 
-For each status below, test both `fetch` and `fetch_stream` with deliberately
-present transport bytes and assert that the public body is empty:
+For each status below, test `fetch` with deliberately present transport bytes
+and assert that the public body is empty:
 
 - `HEAD` response;
 - `101 Switching Protocols`;
@@ -456,8 +456,8 @@ decompression. Add one integration test per encoding:
 - `deflate_response_is_decoded_before_public_body_exposure`;
 - `zstd_response_is_decoded_before_public_body_exposure`.
 
-For each encoding, verify both `fetch` and `fetch_stream`, decoded body bytes,
-stream chunk behavior, and the public treatment of `Content-Encoding` and
+For each encoding, verify `fetch`, decoded body bytes, stream chunk behavior,
+and the public treatment of `Content-Encoding` and
 `Content-Length`. Reqwest removes those headers after automatic decoding; the
 test should lock down whether that matches the engine contract.
 

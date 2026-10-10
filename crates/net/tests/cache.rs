@@ -18,15 +18,9 @@ fn empty_stream_body_can_be_consumed_and_cached() {
     let controller = RequestController::new(Config::default()).unwrap();
 
     let (first, second) = runtime().block_on(async {
-        let first = controller
-            .fetch_stream(Request::get(server.url()))
-            .await
-            .unwrap();
+        let first = controller.fetch(Request::get(server.url())).await.unwrap();
         let first_body = collect_body(first).await.unwrap();
-        let second = controller
-            .fetch_stream(Request::get(server.url()))
-            .await
-            .unwrap();
+        let second = controller.fetch(Request::get(server.url())).await.unwrap();
         let second_from_cache = second.from_cache;
         let second_body = collect_body(second).await.unwrap();
         ((first_body, second_from_cache), second_body)
@@ -49,10 +43,7 @@ fn fully_consumed_stream_is_cached() {
     let controller = RequestController::new(Config::default()).unwrap();
 
     runtime().block_on(async {
-        let response = controller
-            .fetch_stream(Request::get(server.url()))
-            .await
-            .unwrap();
+        let response = controller.fetch(Request::get(server.url())).await.unwrap();
         assert_eq!(collect_body(response).await.unwrap(), b"cached");
         let cached = controller.fetch(Request::get(server.url())).await.unwrap();
         assert!(cached.from_cache);
@@ -64,7 +55,7 @@ fn fully_consumed_stream_is_cached() {
 }
 
 #[test]
-fn no_store_streams_are_not_cached() {
+fn no_store_responses_are_not_cached() {
     let hits = Arc::new(AtomicUsize::new(0));
     let observed_hits = Arc::clone(&hits);
     let server = TestServer::start(2, move |_| {
@@ -76,8 +67,8 @@ fn no_store_streams_are_not_cached() {
     runtime().block_on(async {
         let mut request = Request::get(server.url());
         request.set_cache_mode(CacheMode::NoStore);
-        let first = controller.fetch_stream(request.clone()).await.unwrap();
-        let second = controller.fetch_stream(request).await.unwrap();
+        let first = controller.fetch(request.clone()).await.unwrap();
+        let second = controller.fetch(request).await.unwrap();
         assert!(!first.from_cache);
         assert!(!second.from_cache);
         assert_eq!(collect_body(first).await.unwrap(), b"fresh");
@@ -89,7 +80,7 @@ fn no_store_streams_are_not_cached() {
 }
 
 #[test]
-fn reload_stream_bypasses_cache_and_caches_the_refresh() {
+fn reload_bypasses_cache_and_caches_the_refresh_when_consumed() {
     let hits = Arc::new(AtomicUsize::new(0));
     let observed_hits = Arc::clone(&hits);
     let server = TestServer::start(2, move |_| {
@@ -104,20 +95,17 @@ fn reload_stream_bypasses_cache_and_caches_the_refresh() {
 
     let (first, refreshed, cached) = runtime().block_on(async {
         let request = Request::get(server.url());
-        let first = collect_body(controller.fetch_stream(request.clone()).await.unwrap())
+        let first = collect_body(controller.fetch(request.clone()).await.unwrap())
             .await
             .unwrap();
         let mut reload = request;
         reload.set_cache_mode(CacheMode::Reload);
-        let refreshed_response = controller.fetch_stream(reload).await.unwrap();
+        let refreshed_response = controller.fetch(reload).await.unwrap();
         let refreshed = (
             refreshed_response.from_cache,
             collect_body(refreshed_response).await.unwrap(),
         );
-        let cached_response = controller
-            .fetch_stream(Request::get(server.url()))
-            .await
-            .unwrap();
+        let cached_response = controller.fetch(Request::get(server.url())).await.unwrap();
         let cached = (
             cached_response.from_cache,
             collect_body(cached_response).await.unwrap(),
@@ -135,7 +123,7 @@ fn reload_stream_bypasses_cache_and_caches_the_refresh() {
 }
 
 #[test]
-fn only_if_cached_returns_a_streaming_cache_hit() {
+fn only_if_cached_returns_a_cache_hit() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nX-Cache-Test: yes\r\nConnection: close\r\n\r\ncached".to_vec()
     });
@@ -143,12 +131,12 @@ fn only_if_cached_returns_a_streaming_cache_hit() {
 
     let (from_cache, body, header) = runtime().block_on(async {
         let request = Request::get(server.url());
-        collect_body(controller.fetch_stream(request.clone()).await.unwrap())
+        collect_body(controller.fetch(request.clone()).await.unwrap())
             .await
             .unwrap();
         let mut only_cached = request;
         only_cached.set_cache_mode(CacheMode::OnlyIfCached);
-        let response = controller.fetch_stream(only_cached).await.unwrap();
+        let response = controller.fetch(only_cached).await.unwrap();
         let from_cache = response.from_cache;
         let header = response.headers.get("x-cache-test").unwrap().to_owned();
         let body = collect_body(response).await.unwrap();
@@ -194,7 +182,9 @@ fn clear_cache_forces_a_new_network_request() {
 
     runtime().block_on(async {
         let request = Request::get(server.url());
-        assert!(!controller.fetch(request.clone()).await.unwrap().from_cache);
+        let first = controller.fetch(request.clone()).await.unwrap();
+        assert!(!first.from_cache);
+        collect_body(first).await.unwrap();
         assert!(controller.fetch(request.clone()).await.unwrap().from_cache);
         controller.clear_cache();
         assert!(!controller.fetch(request).await.unwrap().from_cache);
@@ -220,26 +210,25 @@ fn reload_bypasses_cached_response_and_caches_the_refresh() {
 
     let response = runtime().block_on(async {
         let request = Request::get(server.url());
-        controller.fetch(request.clone()).await.unwrap();
+        let first = controller.fetch(request.clone()).await.unwrap();
+        collect_body(first).await.unwrap();
         let mut reload = request;
         reload.set_cache_mode(CacheMode::Reload);
-        (
-            controller.fetch(reload).await.unwrap(),
-            controller.fetch(Request::get(server.url())).await.unwrap(),
-        )
+        let refreshed = controller.fetch(reload).await.unwrap();
+        let refreshed_from_cache = refreshed.from_cache;
+        let refreshed_body = collect_body(refreshed).await.unwrap();
+        let cached = controller.fetch(Request::get(server.url())).await.unwrap();
+        (refreshed_from_cache, refreshed_body, cached)
     });
 
     server.join();
+    assert_eq!(response.1, b"second");
+    assert!(!response.0);
     assert_eq!(
-        runtime().block_on(response.0.body.bytes()).unwrap(),
+        runtime().block_on(response.2.body.bytes()).unwrap(),
         b"second"
     );
-    assert!(!response.0.from_cache);
-    assert_eq!(
-        runtime().block_on(response.1.body.bytes()).unwrap(),
-        b"second"
-    );
-    assert!(response.1.from_cache);
+    assert!(response.2.from_cache);
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
@@ -252,7 +241,8 @@ fn only_if_cached_returns_a_cached_response_without_network_io() {
 
     let cached = runtime().block_on(async {
         let request = Request::get(server.url());
-        controller.fetch(request.clone()).await.unwrap();
+        let first = controller.fetch(request.clone()).await.unwrap();
+        collect_body(first).await.unwrap();
         let mut only_cached = request;
         only_cached.set_cache_mode(CacheMode::OnlyIfCached);
         controller.fetch(only_cached).await.unwrap()
@@ -273,13 +263,14 @@ fn cloned_controllers_share_the_response_cache() {
 
     let (first, second) = runtime().block_on(async {
         let request = Request::get(server.url());
-        (
-            controller.fetch(request.clone()).await.unwrap(),
-            clone.fetch(request).await.unwrap(),
-        )
+        let first = controller.fetch(request.clone()).await.unwrap();
+        let first_from_cache = first.from_cache;
+        collect_body(first).await.unwrap();
+        let second = clone.fetch(request).await.unwrap();
+        (first_from_cache, second)
     });
 
     server.join();
-    assert!(!first.from_cache);
+    assert!(!first);
     assert!(second.from_cache);
 }

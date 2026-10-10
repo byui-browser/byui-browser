@@ -248,9 +248,8 @@ covering these decisions:
 
 - `net` exposes a Rust Fetch engine, not JavaScript bindings.
 - `RequestController::fetch` returns a Fetch-semantic `Response`.
-- `RequestController::fetch_stream` either becomes an internal implementation
-  detail or returns a documented streaming `Response` variant with identical
-  filtering and lifecycle rules.
+- `RequestController::fetch` returns a documented `Response` with a shared
+  body that can be streamed after response filtering.
 - `reqwest::HeaderMap`, `reqwest::StatusCode`, `reqwest::Response`, and
   transport stream types are not part of the Fetch-facing API.
 - `webapis` adapts the engine types into JavaScript `Headers`, `Request`,
@@ -304,8 +303,8 @@ response body.
 
 The first pass added the [engine contract](fetch-engine-contract.md), a private
 [`InternalResponse`](../src/api/response/view.rs), filtered public response views, and
-Fetch-oriented [`RequestError`](../src/api/error.rs) categories. Both `fetch` and
-`fetch_stream` now cross the same response-exposure boundary. Public responses
+Fetch-oriented [`RequestError`](../src/api/error.rs) categories. `fetch` crosses
+the response-exposure boundary. Public responses
 use a numeric status and guarded headers rather than raw Reqwest status and
 header maps. Cache-only misses now return a Fetch network error. The follow-up
 work below closes 1.1–1.3 for the supported single-exchange subset.
@@ -593,9 +592,9 @@ Completed in the current slice:
       `src/api/body.rs`. A body records nullness, known length, optional media
       type, replayability, used/completed/failed/aborted state, its one-shot
       source, and the scheduler permit retained by a live response stream.
-- [x] Removed `RequestBody` and `ResponseBody`. `Request`, `Response`, and
-      `StreamingResponse` now use `Body` directly, so buffered and streaming
-      callers share the same body state and consumption API.
+- [x] Removed `RequestBody`, `ResponseBody`, and `StreamingResponse`.
+      `Request` and `Response` now use `Body` directly, so all callers share
+      the same body state and consumption API.
 - [x] Preserved replayable bytes, text, URL-encoded bodies, custom media
       types, one-shot bytes, and one-shot streams. Added blob-like byte
       construction with metadata and body consumption helpers for bytes,
@@ -613,8 +612,8 @@ Completed in the current slice:
 The following remains before Step 3 is fully complete:
 
 - [x] Exposed body state and one-shot consumption methods through public
-      request and response bodies. `fetch` returns a replayable buffered
-      `Body`; `fetch_stream` returns a live `Body` with the same API.
+      request and response bodies. `fetch` returns response metadata at
+      headers and a `Body` that may remain live with the same API.
 - [ ] Complete the body state transition contract for public and internal
       readers. Direct reads must respect locked and terminal states, internal
       transport/cache extraction must update the same state, and cancellation
@@ -779,14 +778,12 @@ body consumption methods through the shared Body model.
 `clone` produces an independently consumable response according to the body
 cloning rules.
 
-### 5.4 Replace or narrow `StreamingResponse`
+### 5.4 Unify response delivery
 
-Decide whether `StreamingResponse` remains public. The preferred direction is
-to make it an internal transport/controller representation and expose a
-streaming body through `Response` instead. If compatibility requires retaining
-it, document it as an engine-level response view and guarantee that it applies
-the same filtering, null-body, cancellation, and body-state rules as the
-buffered path.
+Completed: `StreamingResponse` and `fetch_stream` were removed. `fetch`
+returns `Response` at header availability, and `Response.body` is the sole
+live or buffered body channel. Filtering, null-body handling, cancellation,
+cache capture, and scheduler-permit ownership now follow that single path.
 
 Update the scheduler-permit handling currently implemented by
 [`Body::into_parts`](../src/api/body.rs) and
@@ -984,7 +981,7 @@ because an integration provider is absent.
 
 ### 12.2 Controller
 
-Refactor `fetch` and `fetch_stream` into a pipeline with explicit stages:
+Refactor `fetch` into a pipeline with explicit stages:
 
 1. request construction and validation;
 2. URL/origin checks and requests to the owning policy providers;
@@ -1116,8 +1113,8 @@ owned by service workers, storage, CSP, navigation, or JavaScript bindings.
   diagnostics providers.
 - Add an ADR because this changes the ownership interpretation of “Fetch”
   between the Networking and JS APIs teams.
-- Document migration paths for callers using raw `HeaderMap` and
-  `StreamingResponse`.
+- Document migration paths for callers using raw `HeaderMap` and the former
+  buffered `fetch` body behavior.
 
 ## 15. Suggested implementation order
 

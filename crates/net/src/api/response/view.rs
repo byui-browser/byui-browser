@@ -1,6 +1,6 @@
 use reqwest::{StatusCode, header::HeaderMap};
 
-use super::{ResponseType, StreamingResponse};
+use super::{Response, ResponseType};
 use crate::api::{
     HeaderGuard, Headers,
     body::Body,
@@ -29,7 +29,7 @@ pub(crate) struct InternalResponse {
 }
 
 impl InternalResponse {
-    pub(crate) fn expose(self) -> StreamingResponse {
+    pub(crate) fn expose(self) -> Response {
         let hidden = matches!(
             self.response_type,
             ResponseType::Opaque | ResponseType::OpaqueRedirect | ResponseType::Error
@@ -43,7 +43,7 @@ impl InternalResponse {
                 self.credentials_mode,
             )
         };
-        StreamingResponse {
+        Response {
             response_type: self.response_type,
             status: if hidden { 0 } else { self.status.as_u16() },
             status_text: if hidden {

@@ -6,12 +6,10 @@ and coordination of cache, credential, security, and transport services. It does
 not create JavaScript objects or promises. `webapis` owns that conversion; its
 current binding returns a string and is not yet a complete Fetch binding.
 
-`RequestController::fetch` returns a buffered, filtered `Response`.
-`fetch_stream` remains public for existing Rust consumers. It returns the same
-status, URL, headers, response type, and redirect metadata, with an abort-aware
-stream instead of buffered bytes. Its body holds the scheduler permit until it
-is consumed or dropped. Stream errors may occur after headers. Callers cannot
-obtain the transport response from either method.
+`RequestController::fetch` returns a filtered `Response` as soon as response
+headers pass Fetch filtering. Its abort-aware `Body` holds the scheduler permit
+until it is consumed or dropped. Body errors may occur after headers. Callers
+cannot obtain the transport response.
 
 Error timing and retry behavior are part of this boundary:
 
@@ -32,7 +30,7 @@ Policy and cookie processing run on that representation. Exposure constructs
 an immutable header list and removes forbidden response headers, including the
 obsolete `Set-Cookie2` compatibility case. CORS views
 include only safelisted and explicitly exposed headers. Opaque views hide
-status, URL, headers, cache provenance, and body. Both fetch paths use this conversion. An opaque
+status, URL, headers, cache provenance, and body. `fetch` uses this conversion. An opaque
 view drops the internal body stream and releases its scheduler permit; this
 slice does not continue downloading an unreadable body in the background.
 
@@ -41,9 +39,8 @@ The public response status is a `u16`, and its headers are `Headers`; no
 stream type crosses the response boundary. Engine request APIs use `http` and
 `url` types rather than Reqwest re-exports. Controller construction and fetch
 failures use `RequestError`; transport errors expose a diagnostic string rather
-than a Reqwest error type. Both response forms expose the shared `Body` type:
-`fetch` returns replayable buffered bytes and `fetch_stream` returns a live,
-abort-aware body with the same consumption API.
+than a Reqwest error type. `Response` exposes the shared, potentially live,
+abort-aware `Body` type.
 
 `Headers` is the shared request and response header model. String constructors
 and mutation methods validate HTTP names and values, lowercase names, and trim

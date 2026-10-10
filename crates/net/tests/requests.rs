@@ -9,16 +9,17 @@ use net::{
 };
 
 #[test]
-fn fetch_propagates_a_body_transport_error() {
+fn body_consumption_propagates_a_post_header_transport_error() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nshort\r\n"
             .to_vec()
     });
     let controller = RequestController::new(Config::default()).unwrap();
 
-    let error = runtime()
-        .block_on(controller.fetch(Request::get(server.url())))
-        .unwrap_err();
+    let error = runtime().block_on(async {
+        let response = controller.fetch(Request::get(server.url())).await.unwrap();
+        response.body.bytes().await.unwrap_err()
+    });
 
     server.join();
     assert!(matches!(error, RequestError::Transport(_)));
@@ -131,9 +132,10 @@ fn cached_browser_response_is_rechecked_before_exposure() {
     request.set_environment(
         FetchEnvironment::from_url(reqwest::Url::parse(&server.url()).unwrap()).unwrap(),
     );
-    runtime()
-        .block_on(controller.fetch(request.clone()))
-        .unwrap();
+    runtime().block_on(async {
+        let response = controller.fetch(request.clone()).await.unwrap();
+        response.body.bytes().await.unwrap();
+    });
     let error = runtime().block_on(controller.fetch(request)).unwrap_err();
     server.join();
     assert!(matches!(

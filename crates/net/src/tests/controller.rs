@@ -151,8 +151,8 @@ fn can_fetch_resource_from_local_server() {
 }
 
 #[test]
-fn streaming_fetch_returns_headers_before_body_and_forwards_body_bytes() {
-    // The server pauses after sending headers. A successful fetch_stream call
+fn fetch_returns_headers_before_body_and_forwards_body_bytes() {
+    // The server pauses after sending headers. A successful fetch call
     // therefore proves callers can inspect response metadata without waiting
     // for the complete body.
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
@@ -190,7 +190,7 @@ fn streaming_fetch_returns_headers_before_body_and_forwards_body_bytes() {
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
     let client = RequestController::new(Config::default()).expect("controller should initialize");
     let mut response = runtime
-        .block_on(client.fetch_stream(Request::get(&address)))
+        .block_on(client.fetch(Request::get(&address)))
         .expect("streaming request should succeed");
 
     headers_received
@@ -216,7 +216,7 @@ fn streaming_fetch_returns_headers_before_body_and_forwards_body_bytes() {
 }
 
 #[test]
-fn streaming_fetch_is_cached_only_after_body_completion() {
+fn fetch_is_cached_only_after_body_completion() {
     // The first response is streamed and fully consumed. The following
     // streaming request should then use the completed response from cache.
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
@@ -245,7 +245,7 @@ fn streaming_fetch_is_cached_only_after_body_completion() {
     let client = RequestController::new(Config::default()).expect("controller should initialize");
     let (first, second) = runtime.block_on(async {
         let mut first = client
-            .fetch_stream(Request::get(&address))
+            .fetch(Request::get(&address))
             .await
             .expect("first streaming request should succeed");
         let mut first_body = Vec::new();
@@ -254,7 +254,7 @@ fn streaming_fetch_is_cached_only_after_body_completion() {
         }
 
         let second = client
-            .fetch_stream(Request::get(&address))
+            .fetch(Request::get(&address))
             .await
             .expect("cached streaming request should succeed");
         (first_body, second)

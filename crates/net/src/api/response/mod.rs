@@ -3,7 +3,7 @@
 mod types;
 mod view;
 
-pub use types::{Response, ResponseType, StreamingResponse};
+pub use types::{Response, ResponseType};
 pub(crate) use view::InternalResponse;
 
 #[cfg(test)]

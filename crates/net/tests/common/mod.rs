@@ -7,19 +7,14 @@ use std::{
     thread,
 };
 
-use futures_util::StreamExt;
-use net::{RequestError, StreamingResponse};
+use net::{RequestError, Response};
 
 pub fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().expect("Tokio runtime should initialize")
 }
 
-pub async fn collect_body(mut response: StreamingResponse) -> Result<Vec<u8>, RequestError> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.body.next().await {
-        body.extend_from_slice(&chunk?);
-    }
-    Ok(body)
+pub async fn collect_body(response: Response) -> Result<Vec<u8>, RequestError> {
+    response.body.bytes().await
 }
 
 pub struct TestServer {

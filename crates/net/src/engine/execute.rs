@@ -1,13 +1,11 @@
 //! Fetch execution and response delivery.
 
-use futures_util::StreamExt;
-
 use crate::{
     api::{
         body::Body,
         error::RequestError,
         request::{CacheMode, PreparedRequest, Request},
-        response::{InternalResponse, Response, ResponseType, StreamingResponse},
+        response::{InternalResponse, Response, ResponseType},
     },
     cache::StoredResponse,
     engine::{RequestController, cache_capture::with_cache_capture},
@@ -16,43 +14,12 @@ use crate::{
 impl RequestController {
     /// Validates and executes one browser request.
     ///
-    /// Cache hits return before a scheduler permit is acquired. Network-bound
-    /// requests pass through policy validation, cookie attachment, scheduling,
-    /// transport, response validation, cookie processing, and cache insertion.
-    pub async fn fetch(&self, request: Request) -> Result<Response, RequestError> {
-        // Reuses the streaming fetch implementation by streaming the response and then buffering it
-        // into a fully collected response.
-        let mut streaming = self.fetch_stream(request).await?;
-        let body_is_null = streaming.body.is_null();
-        let mut body = Vec::new();
-        while let Some(chunk) = streaming.body.next().await {
-            body.extend_from_slice(&chunk?);
-        }
-
-        Ok(Response {
-            response_type: streaming.response_type,
-            status: streaming.status,
-            status_text: streaming.status_text,
-            headers: streaming.headers,
-            url: streaming.url,
-            redirected: streaming.redirected,
-            body: if body_is_null {
-                Body::null()
-            } else {
-                Body::from_bytes(body)
-            },
-            from_cache: streaming.from_cache,
-        })
-    }
-
-    /// Validates and executes one browser request without buffering its body.
-    ///
     /// The returned headers are available before the body is consumed. Body
     /// chunks are delivered as the transport receives them. A network response
     /// with bytes is inserted into the cache only after the caller consumes the
     /// stream to completion; dropped or failed streams are not cached. Null
     /// bodies may be cached as soon as headers arrive.
-    pub async fn fetch_stream(&self, request: Request) -> Result<StreamingResponse, RequestError> {
+    pub async fn fetch(&self, request: Request) -> Result<Response, RequestError> {
         let (request, url, cacheable) = self.prepare_request(request)?;
         let cache_lookup = match request.cache_mode {
             CacheMode::Default | CacheMode::OnlyIfCached => Some(false),

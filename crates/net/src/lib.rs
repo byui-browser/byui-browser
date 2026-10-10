@@ -2,9 +2,9 @@
 //!
 //! **Owning team**: Networking Team
 //!
-//! [`RequestController::fetch`] returns a filtered [`Response`].
-//! [`RequestController::fetch_stream`] returns the same filtered metadata with
-//! an abort-aware streaming body whose network errors can arrive after headers.
+//! [`RequestController::fetch`] returns a filtered [`Response`] as soon as its
+//! response headers pass Fetch filtering. [`Body`] is the sole body channel;
+//! it is abort-aware and network errors can arrive while it is consumed.
 //! The transport and its Reqwest header/status/stream types stay behind this
 //! response boundary. The `webapis` crate adapts these Rust values to
 //! JavaScript objects, promises, and streams; this crate owns no JS identity.
@@ -53,7 +53,7 @@ pub use api::{
         NetworkPartitionKey, Origin, RedirectMode, Referrer, ReferrerPolicy, Request,
         RequestDestination, RequestMode, RequestPriority, ServiceWorkersMode,
     },
-    response::{Response, ResponseType, StreamingResponse},
+    response::{Response, ResponseType},
     services::{FetchServices, ResponseInfo, ServiceWorkerDecision},
 };
 pub use engine::RequestController;
