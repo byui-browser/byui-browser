@@ -105,6 +105,9 @@ pub fn fetch_image() {
             .await
             .expect("request should succeed")
             .body
+            .bytes()
+            .await
+            .expect("response body should be readable")
     });
     std::fs::write("rust-logo.png", body).expect("file should be written");
 }

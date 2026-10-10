@@ -70,6 +70,8 @@ pub enum RequestError {
     /// A one-shot request body was consumed by an earlier send attempt.
     /// This failure occurs before headers; the original body cannot be retried.
     BodyAlreadyConsumed,
+    /// A body consumption helper was called after another reader started.
+    BodyAlreadyUsed,
     /// The keepalive body exceeds the configured byte quota.
     KeepaliveBodyTooLarge { limit: u64 },
     /// The scheduler was shut down before the request could run.
@@ -106,6 +108,7 @@ impl std::fmt::Display for RequestError {
             }
             Self::BodyNotAllowed(method) => write!(f, "A request body is not allowed for {method}"),
             Self::BodyAlreadyConsumed => f.write_str("Request body has already been consumed"),
+            Self::BodyAlreadyUsed => f.write_str("Body has already been used"),
             Self::KeepaliveBodyTooLarge { limit } => {
                 write!(f, "Keepalive request body exceeds {limit} bytes")
             }

@@ -41,11 +41,9 @@ The public response status is a `u16`, and its headers are `Headers`; no
 stream type crosses the response boundary. Engine request APIs use `http` and
 `url` types rather than Reqwest re-exports. Controller construction and fetch
 failures use `RequestError`; transport errors expose a diagnostic string rather
-than a Reqwest error type. The public `Response.body` remains
-a `Vec<u8>` in this slice so existing browser consumers can migrate gradually.
-`StreamingResponse` remains a compatibility entry point with identical
-filtering. The shared used/locked/disturbed body model and consumption methods
-belong to later plan steps.
+than a Reqwest error type. Both response forms expose the shared `Body` type:
+`fetch` returns replayable buffered bytes and `fetch_stream` returns a live,
+abort-aware body with the same consumption API.
 
 `Headers` is the shared request and response header model. String constructors
 and mutation methods validate HTTP names and values, lowercase names, and trim
@@ -111,7 +109,6 @@ stream, response body stream, abort signal, scheduler permit, and private
 
 Existing callers of raw response headers should use `Headers::get` or
 ordered iteration. `Config.max_redirects` was removed because redirects cannot
-be safely followed in this slice. Callers of buffered `Response.body` can
-continue to use the byte vector; later body-state work will provide one-shot
-consumption. `fetch_stream` callers can continue polling `ResponseBody` while
-using the filtered response metadata.
+be safely followed in this slice. Callers consume buffered and streaming
+response bodies through `Body`; live bodies also implement `Stream` for Rust
+consumers.

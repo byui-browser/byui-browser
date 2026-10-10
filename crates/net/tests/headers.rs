@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use common::{TestServer, runtime};
 use net::{
-    CacheMode, Config, CredentialsMode, FetchEnvironment, FetchServices, Referrer, ReferrerPolicy,
-    Request, RequestBody, RequestController, RequestError, RequestMode, ResponseInfo, ResponseType,
-    ServiceWorkerDecision,
+    Body, CacheMode, Config, CredentialsMode, FetchEnvironment, FetchServices, Referrer,
+    ReferrerPolicy, Request, RequestController, RequestError, RequestMode, ResponseInfo,
+    ResponseType, ServiceWorkerDecision,
 };
 use reqwest::{
     StatusCode,
@@ -64,7 +64,7 @@ fn fetch_sends_headers_and_body_to_a_local_server() {
         )
         .unwrap();
     request
-        .set_body(Some(RequestBody::bytes(b"request body".to_vec())))
+        .set_body(Some(Body::from_bytes(b"request body".to_vec())))
         .unwrap();
     request.set_cache_mode(CacheMode::NoStore);
 
@@ -73,7 +73,10 @@ fn fetch_sends_headers_and_body_to_a_local_server() {
 
     server.join();
     assert_eq!(response.status, StatusCode::CREATED);
-    assert_eq!(response.body, b"created");
+    assert_eq!(
+        runtime().block_on(response.body.bytes()).unwrap(),
+        b"created"
+    );
     assert!(!response.from_cache);
 }
 
@@ -140,7 +143,7 @@ fn generated_request_header_channels_do_not_mutate_caller_headers() {
         ReferrerPolicy::UnsafeUrl,
     );
     request
-        .set_body(Some(RequestBody::text("request body")))
+        .set_body(Some(Body::from_text("request body")))
         .unwrap();
     request.set_cache_mode(CacheMode::NoStore);
     assert!(request.headers().is_empty());
@@ -152,7 +155,7 @@ fn generated_request_header_channels_do_not_mutate_caller_headers() {
         .unwrap();
     server.join();
 
-    assert_eq!(response.body, b"ok");
+    assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
     assert!(request.headers().is_empty());
 }
 
@@ -171,7 +174,10 @@ fn configured_user_agent_is_sent_to_the_server() {
     let response = runtime().block_on(controller.fetch(Request::get(server.url())));
 
     server.join();
-    assert_eq!(response.unwrap().body, b"ok");
+    assert_eq!(
+        runtime().block_on(response.unwrap().body.bytes()).unwrap(),
+        b"ok"
+    );
 }
 
 #[test]
@@ -196,7 +202,7 @@ fn cross_origin_fetch_exposes_only_cors_allowed_headers() {
     assert_eq!(response.headers.get("x-visible").unwrap(), "yes");
     assert!(!response.headers.has("x-secret"));
     assert!(!response.headers.has("set-cookie"));
-    assert_eq!(response.body, b"ok");
+    assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
 }
 
 #[test]
@@ -221,7 +227,7 @@ fn cross_origin_no_cors_fetch_is_opaque() {
     assert_eq!(response.status, 0);
     assert!(response.url.is_empty());
     assert!(response.headers.is_empty());
-    assert!(response.body.is_empty());
+    assert!(response.body.is_null());
 }
 
 #[test]
@@ -291,7 +297,7 @@ fn browser_services_own_cookie_and_raw_response_header_decisions() {
         )
         .unwrap();
     server.join();
-    assert_eq!(response.body, b"ok");
+    assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
     assert!(!response.headers.has("set-cookie"));
     assert_eq!(
         &*stored.lock().unwrap(),

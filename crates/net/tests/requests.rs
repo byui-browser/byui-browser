@@ -4,7 +4,7 @@ mod common;
 
 use common::{TestServer, runtime};
 use net::{
-    Config, FetchEnvironment, FetchServices, Request, RequestBody, RequestController, RequestError,
+    Body, Config, FetchEnvironment, FetchServices, Request, RequestController, RequestError,
     ResponseInfo, ServiceWorkerDecision,
 };
 
@@ -53,7 +53,7 @@ fn non_cacheable_post_requests_are_sent_each_time() {
         let mut request = Request::get(server.url());
         request.set_method("POST").unwrap();
         request
-            .set_body(Some(RequestBody::bytes(b"payload".to_vec())))
+            .set_body(Some(Body::from_bytes(b"payload".to_vec())))
             .unwrap();
         controller.fetch(request.clone()).await.unwrap();
         controller.fetch(request).await.unwrap();

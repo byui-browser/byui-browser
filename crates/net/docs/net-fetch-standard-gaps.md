@@ -52,9 +52,9 @@ The ordered multimap shape and mutation guards now support immutable exposed res
 
 ### 3. Request bodies and body lifecycle
 
-**Evidence:** [`RequestBody`](../src/api/request/body.rs) supports replayable bytes, text, URL-encoded bytes, one-shot bytes, and one-shot streams, with known-length and content-type metadata. [`ResponseBody`](../src/api/response/body.rs) remains a Rust stream, not a Fetch Body mixin.
+**Evidence:** [`Body`](../src/api/body.rs) now backs request input plus buffered and streaming response bodies. It supports replayable bytes, text, URL-encoded bytes, blob-like bytes, one-shot bytes, and one-shot streams, with known-length, content-type, locking, and consumption metadata.
 
-The Fetch Standard's `BodyInit`/body algorithms support strings, URL-encoded data, `FormData`, `Blob`, `ArrayBuffer`/typed arrays, and streams. The crate now has streaming request input, text and URL-encoded constructors, automatic content-type metadata for supported constructors, known-length tracking, one-shot consumption errors, rejection of bodies on `GET`/`HEAD`, and null-body handling for `HEAD` plus the supported null-body status codes. It still lacks `FormData`, `Blob`, typed-array conversion, `duplex`, body cloning/`bodyUsed`, standardized body consumption/error state, keepalive aggregate quotas, and the Fetch rule that a successful `CONNECT` response has no body.
+The Fetch Standard's `BodyInit`/body algorithms support strings, URL-encoded data, `FormData`, `Blob`, `ArrayBuffer`/typed arrays, and streams. The crate now has streaming request input, text and URL-encoded constructors, blob-like bytes, automatic content-type metadata for supported constructors, known-length tracking, body-used errors, rejection of bodies on `GET`/`HEAD`, and null-body handling for `HEAD` plus the supported null-body status codes. It still lacks `FormData`, typed-array conversion, `duplex`, Fetch-compatible stream teeing, keepalive aggregate quotas, and the Fetch rule that a successful `CONNECT` response has no body.
 
 **Required work:** extend the body abstraction with the remaining Fetch body types, aggregate keepalive quotas, and Fetch-compatible body consumption and cloning semantics.
 
@@ -125,7 +125,7 @@ The Fetch Standard coordinates with other web-platform policies. Remaining integ
 
 ### 10. Cancellation and fetch lifecycle
 
-**Evidence:** [`AbortSignal`](../src/api/cancellation.rs) is an atomic boolean plus notification, and transport/response streaming maps it to `RequestError::Aborted` in [`ReqwestTransport::send`](../src/transport/reqwest.rs) and [`ResponseBody::from_stream_with_signal`](../src/api/response/body.rs).
+**Evidence:** [`AbortSignal`](../src/api/cancellation.rs) is an atomic boolean plus notification, and transport/response streaming maps it to `RequestError::Aborted` in [`ReqwestTransport::send`](../src/transport/reqwest.rs) and [`Body::from_stream_with_signal`](../src/api/body.rs).
 
 Basic cancellation is implemented, but Fetch controllers distinguish ongoing, terminated, and aborted states, preserve a serialized abort reason, cancel all fetch stages, and coordinate body/error handover. The crate has no abort reason, no distinction between termination and abort, no lifecycle callbacks, and no timing/reporting hooks. Cancellation during a redirect, cache revalidation, cookie processing, or body capture is not modeled as a Fetch algorithm state transition.
 
@@ -133,7 +133,7 @@ Basic cancellation is implemented, but Fetch controllers distinguish ongoing, te
 
 **Evidence:** [`Response`](../src/api/response/types.rs) and [`StreamingResponse`](../src/api/response/types.rs) now expose filtered status, URL, headers, response type, and body. The private internal representation retains full transport metadata. The crate still exports Rust structs and a stream, not JavaScript Fetch interfaces.
 
-Remaining response work includes full redirect URL-list accuracy, response constructors, body consumption helpers (`arrayBuffer`, `blob`, `bytes`, `formData`, `json`, `text`), body locking/disturbance, stream cloning, and complete network-error construction. The supported Rust subset and limitations are stated in `fetch-engine-contract.md`.
+Remaining response work includes full redirect URL-list accuracy, response constructors, Fetch-compatible decoding, `arrayBuffer`, `formData`, and JSON helpers, stream teeing, and complete network-error construction. The supported Rust subset and limitations are stated in `fetch-engine-contract.md`.
 
 ### 12. Scheduling and transport coverage
 

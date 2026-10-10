@@ -1,7 +1,8 @@
 # Plan: Make `net` the reusable Fetch engine
 
 Status: implementation in progress as of 2026-10-10; steps 1 and 2 are complete
-for the explicitly bounded single-exchange HTTP(S) subset described below.
+and step 3 has its shared-body foundation in place for the explicitly bounded
+single-exchange HTTP(S) subset described below.
 
 ## Goal
 
@@ -85,10 +86,9 @@ The current crate already has useful foundations:
   URL-list state, and priority.
 - [`Headers`](../src/api/headers.rs) preserves ordered duplicate headers and has
   request, no-CORS request, response, immutable, and unrestricted guards.
-- [`RequestBody`](../src/api/request/body.rs) supports replayable bytes, text,
-  URL-encoded data, one-shot bytes, and one-shot streams.
-- [`ResponseBody`](../src/api/response/body.rs) provides an abort-aware asynchronous
-  byte stream and holds the scheduler permit while it is live.
+- [`Body`](../src/api/body.rs) is shared by requests and responses. It supports
+  replayable bytes, text, URL-encoded data, blob-like bytes, one-shot bytes,
+  and one-shot streams; live response bodies retain the scheduler permit.
 - [`RequestController`](../src/engine/controller.rs) coordinates policy validation,
   cache lookup, cookies, scheduling, transport, response validation, and cache
   capture.
@@ -218,7 +218,7 @@ can provide tracing, diagnostics, or carefully scoped middleware hooks.
 Do not adopt either as a direct replacement for the current scheduler without
 first proving body-lifetime semantics. Generic concurrency middleware normally
 holds a permit until the response future completes, whereas this engine keeps
-its permit attached to `ResponseBody` until the body is consumed or dropped.
+its permit attached to `Body` until the body is consumed or dropped.
 If Tower is adopted, introduce a custom response-body guard layer that moves
 the permit into the body and test cancellation, body errors, body drops, and
 cache capture. Do not use generic retry middleware for requests with one-shot
@@ -492,8 +492,7 @@ responses; that does not leave unfinished header-layer work in this step.
 
 ### 3.1 Introduce a common body state machine
 
-Replace the split behavior between `RequestBody` and `ResponseBody` with a
-shared engine-level body abstraction that tracks:
+The shared engine-level body abstraction tracks:
 
 - body presence and null-body status;
 - known byte length, when available;
@@ -507,11 +506,15 @@ shared engine-level body abstraction that tracks:
 
 The state transitions must be explicit and tested. In particular, reading the
 body through any consumption method must make later consumption fail with a
-documented body-used error.
+documented body-used error. Direct stream polling, helper-based consumption,
+transport handoff, cache capture, body extraction, cancellation, failure, and
+dropping must all participate in the same transition matrix. Invalid reads
+after locking, completion, failure, abortion, or cancellation must be rejected
+or terminate according to the documented state.
 
 ### 3.2 Support request BodyInit forms
 
-Extend the current [`RequestBody`](../src/api/request/body.rs) constructors to cover the
+Extend [`Body`](../src/api/body.rs) constructors to cover the
 engine-level equivalents of:
 
 - strings and UTF-8 text;
@@ -541,7 +544,10 @@ Provide asynchronous engine methods corresponding to:
 - `form_data` for supported content types.
 
 All methods must share the same consumption state and must preserve abort and
-transport errors.
+transport errors. `json` and `form_data` parsing failures must remain
+distinguishable from transport, abort, and body-state failures. `text` must
+use Fetch-compatible charset, BOM, and malformed-byte handling rather than a
+hard-coded lossy UTF-8 conversion.
 
 ### 3.4 Implement cloning
 
@@ -553,6 +559,9 @@ Add body cloning rules:
 - disturbed, locked, failed, or already-consumed bodies cannot be cloned;
 - cloning must preserve content type and null-body state.
 
+Provide a fallible body-clone operation or equivalent validation path so clone
+attempts can reject invalid states. A one-shot stream clone must not merely
+share an already-consumed source when independent branches are required.
 Ensure cloned streams retain correct scheduler-permit and cancellation
 ownership without allowing the same network operation to be counted twice.
 
@@ -568,10 +577,76 @@ Explicitly create null bodies for:
 - status 304;
 - filtered and network-error responses.
 
+The shared body exposed by both buffered and streaming responses must retain
+the response media type, including when it is reconstructed from transport
+headers, cache entries, or a buffered response. Nullness must be represented
+by the body model rather than only by a separate response-side flag.
+
 Add tests proving that null-body responses cannot accidentally expose bytes
 from the transport stream.
 
-## 4. Expand `Request`
+### Step 3 completion record and remaining work
+
+Completed in the current slice:
+
+- [x] Added the shared public `Body` and `Blob` types in
+      `src/api/body.rs`. A body records nullness, known length, optional media
+      type, replayability, used/completed/failed/aborted state, its one-shot
+      source, and the scheduler permit retained by a live response stream.
+- [x] Removed `RequestBody` and `ResponseBody`. `Request`, `Response`, and
+      `StreamingResponse` now use `Body` directly, so buffered and streaming
+      callers share the same body state and consumption API.
+- [x] Preserved replayable bytes, text, URL-encoded bodies, custom media
+      types, one-shot bytes, and one-shot streams. Added blob-like byte
+      construction with metadata and body consumption helpers for bytes,
+      UTF-8 text, and blobs.
+- [x] Made replayable-body clones independent and one-shot-body clones share
+      consumption state. A second helper-based read now returns the typed
+      `BodyAlreadyUsed` error instead of silently observing a second source.
+- [x] Moved cancellation wrapping, scheduler-permit attachment, cache capture,
+      and response streaming onto the shared body implementation.
+- [x] Replaced exposure-time empty streams with explicit null bodies for
+      filtered views and all currently detected null-body status cases.
+- [x] Added shared-body regression tests for replayable and one-shot clone
+      behavior, body-used errors, blob metadata, and stream failure handling.
+
+The following remains before Step 3 is fully complete:
+
+- [x] Exposed body state and one-shot consumption methods through public
+      request and response bodies. `fetch` returns a replayable buffered
+      `Body`; `fetch_stream` returns a live `Body` with the same API.
+- [ ] Complete the body state transition contract for public and internal
+      readers. Direct reads must respect locked and terminal states, internal
+      transport/cache extraction must update the same state, and cancellation
+      must distinguish abort, failure, cancellation, and dropping.
+- [ ] Add the missing `array_buffer`, `json`, and `form_data` consumption
+      methods, including typed parse errors distinct from transport, abort, and
+      body-state errors.
+- [ ] Add Fetch-compatible content-type/charset/BOM decoding via `encoding_rs`,
+      propagate response `Content-Type` metadata into every response body
+      construction path, and preserve that metadata through cloning and
+      buffering.
+- [ ] Add engine-owned multipart `FormData`, URL-encoded/multipart parsing,
+      typed-array convenience inputs, and a documented duplex capability.
+- [ ] Replace shared one-shot stream cloning with a bounded controlled tee;
+      define branch backpressure, dropping, cancellation, cache capture, and
+      scheduler-permit ownership rules. Reject cloning of disturbed, locked,
+      failed, aborted, canceled, or already-consumed bodies.
+- [ ] Add a complete body-state transition matrix, including direct stream
+      readers, helper consumption, transport handoff, cache extraction,
+      dropping, every null-body source and response status, and terminal
+      failed/aborted/canceled states.
+- [ ] Add a distinct canceled state and define how cancellation differs from
+      abort, transport failure, and ordinary body dropping.
+- [ ] Construct explicit null-body network-error responses when the later
+      response/CORS algorithms create `ResponseType::Error`, rather than
+      exposing an empty but readable body or returning only a generic error.
+- [ ] Add controller-level coverage for body consumption APIs, decoding,
+      parsing, stream teeing, permit release, cache effects, and every
+      buffered/streaming parity case, including response media types and
+      network-error/null-body behavior.
+
+## 4. Expand `Request` and scheme dispatch
 
 ### 4.1 Add a complete engine-level constructor
 
@@ -603,7 +678,8 @@ Apply Fetch validation during construction and option updates, including:
 - no-CORS header and content-type restrictions;
 - body metadata insertion;
 - keepalive byte quotas;
-- URL and scheme validation.
+- URL parsing, base-URL resolution, and scheme validation;
+- dispatch to the supported scheme-specific fetch algorithm.
 
 ### 4.2 Add Fetch-visible accessors and lifecycle methods
 
@@ -622,10 +698,45 @@ from any future JS-facing URL serialization.
 
 ### 4.3 Preserve internal request preparation
 
-Refactor `apply_fetch_headers`, cookie attachment, referrer calculation, and
-origin calculation so they operate on the internal request/header channels.
+Refactor [`Request::fetch_headers`](../src/api/request/definition.rs), cookie
+attachment, referrer calculation, and origin calculation so they operate on
+the internal request/header channels.
 Caller-visible headers must not gain the internally generated `Origin`,
 `Referer`, or cookie values unless the Fetch contract permits them.
+
+### 4.4 Add scheme-specific fetch dispatch
+
+Add a controller-level scheme dispatcher so request construction and execution
+do not assume that every valid URL is an HTTP(S) transport request. The
+dispatcher must:
+
+- retain HTTP(S) as the existing network path;
+- implement `data:` fetches, including percent- and base64-encoded payloads,
+  media-type/default-type handling, decoded bytes, and invalid-payload errors;
+- implement `blob:` resolution through an explicit browser-owned object-URL
+  or blob provider, without making `net` own the blob registry;
+- implement `file:` access only through an explicit filesystem/security
+  provider, with local-file authorization, origin assignment, and failure
+  behavior defined by that provider;
+- implement the browser-specific `byui:` scheme for local browser pages,
+  routing registered page paths through a browser-owned page provider rather
+  than the filesystem or HTTP transport. The provider must define page
+  lookup, response metadata, origin assignment, and access-control behavior;
+- implement the supported `about:` fetch cases, including the required
+  empty/blank response behavior, and reject unsupported `about:` URLs;
+- assign the resulting response URL, origin, status, headers, body, and
+  null-body state through the same internal response and public exposure
+  pipeline used by HTTP(S);
+- reject unsupported schemes with the typed URL/scheme error before invoking
+  the HTTP transport or any unrelated provider.
+
+Define the ownership boundary for filesystem, blob, local-page, and
+`byui:` page data in `FetchServices` or dedicated provider traits. Do not add
+durable file access, blob registries, browser-origin policy databases, or
+browser page registries to `net`. Add focused tests for each supported scheme,
+including `byui:` page routing, malformed and unsupported inputs, origin
+assignment, credential behavior, response filtering, and body/null-body
+semantics.
 
 ## 5. Expand `Response`
 
@@ -677,9 +788,9 @@ it, document it as an engine-level response view and guarantee that it applies
 the same filtering, null-body, cancellation, and body-state rules as the
 buffered path.
 
-Update the scheduler-permit handling currently implemented in
-[`ResponseBody::into_parts`](../src/api/response/body.rs) and
-[`ResponseBody::attach_permit`](../src/api/response/body.rs) so it survives body
+Update the scheduler-permit handling currently implemented by
+[`Body::into_parts`](../src/api/body.rs) and
+[`Body::attach_permit`](../src/api/body.rs) so it survives body
 cloning, teeing, cancellation, and cache capture.
 
 ## 6. Implement Fetch response filtering and CORS integration
@@ -1005,8 +1116,8 @@ owned by service workers, storage, CSP, navigation, or JavaScript bindings.
   diagnostics providers.
 - Add an ADR because this changes the ownership interpretation of “Fetch”
   between the Networking and JS APIs teams.
-- Document compatibility/deprecation paths for callers using raw `HeaderMap`,
-  `Response.body: Vec<u8>`, and `StreamingResponse`.
+- Document migration paths for callers using raw `HeaderMap` and
+  `StreamingResponse`.
 
 ## 15. Suggested implementation order
 
@@ -1018,7 +1129,7 @@ Implement in vertical slices so the browser retains a working network path:
    Web-compatible text decoding and `mime` for media-type parsing once body
    consumption is introduced. Define transport decompression limits and
    decoded-versus-wire metadata at this boundary.
-4. Fetch-style `Request` and `Response` accessors/cloning.
+4. Fetch-style `Request` and `Response` accessors/cloning and scheme dispatch.
 5. Null-body responses and body consumption methods.
 6. Response filtering and CORS exposure.
 7. Controller-owned redirects.

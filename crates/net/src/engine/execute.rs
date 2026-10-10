@@ -4,9 +4,10 @@ use futures_util::StreamExt;
 
 use crate::{
     api::{
+        body::Body,
         error::RequestError,
         request::{CacheMode, PreparedRequest, Request},
-        response::{InternalResponse, Response, ResponseBody, ResponseType, StreamingResponse},
+        response::{InternalResponse, Response, ResponseType, StreamingResponse},
     },
     cache::StoredResponse,
     engine::{RequestController, cache_capture::with_cache_capture},
@@ -22,6 +23,7 @@ impl RequestController {
         // Reuses the streaming fetch implementation by streaming the response and then buffering it
         // into a fully collected response.
         let mut streaming = self.fetch_stream(request).await?;
+        let body_is_null = streaming.body.is_null();
         let mut body = Vec::new();
         while let Some(chunk) = streaming.body.next().await {
             body.extend_from_slice(&chunk?);
@@ -34,7 +36,11 @@ impl RequestController {
             headers: streaming.headers,
             url: streaming.url,
             redirected: streaming.redirected,
-            body,
+            body: if body_is_null {
+                Body::null()
+            } else {
+                Body::from_bytes(body)
+            },
             from_cache: streaming.from_cache,
         })
     }
@@ -79,7 +85,7 @@ impl RequestController {
                         request_mode: request.context.mode,
                         credentials_mode: request.context.credentials,
                         response_type: ResponseType::Basic,
-                        body: ResponseBody::once_with_signal(response.body, request.signal.clone()),
+                        body: Body::once_with_signal(response.body, request.signal.clone()),
                         body_is_null: request.method() == reqwest::Method::HEAD
                             || matches!(response.status.as_u16(), 101 | 204 | 205 | 304),
                         from_cache: true,

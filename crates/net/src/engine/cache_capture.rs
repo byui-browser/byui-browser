@@ -3,10 +3,7 @@
 use futures_util::{StreamExt, stream};
 
 use crate::{
-    api::{
-        request::Request,
-        response::{InternalResponse, ResponseBody},
-    },
+    api::{body::Body, request::Request, response::InternalResponse},
     cache::{ResponseCache, StoredResponse},
 };
 
@@ -76,7 +73,7 @@ pub(crate) fn with_cache_capture(
             }
         },
     );
-    let mut body = ResponseBody::from_stream(body);
+    let mut body = Body::from_stream(body);
     if let Some(permit) = permit {
         body.attach_permit(permit);
     }

@@ -56,7 +56,7 @@ fn fully_consumed_stream_is_cached() {
         assert_eq!(collect_body(response).await.unwrap(), b"cached");
         let cached = controller.fetch(Request::get(server.url())).await.unwrap();
         assert!(cached.from_cache);
-        assert_eq!(cached.body, b"cached");
+        assert_eq!(cached.body.bytes().await.unwrap(), b"cached");
     });
 
     server.join();
@@ -230,9 +230,15 @@ fn reload_bypasses_cached_response_and_caches_the_refresh() {
     });
 
     server.join();
-    assert_eq!(response.0.body, b"second");
+    assert_eq!(
+        runtime().block_on(response.0.body.bytes()).unwrap(),
+        b"second"
+    );
     assert!(!response.0.from_cache);
-    assert_eq!(response.1.body, b"second");
+    assert_eq!(
+        runtime().block_on(response.1.body.bytes()).unwrap(),
+        b"second"
+    );
     assert!(response.1.from_cache);
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
@@ -254,7 +260,7 @@ fn only_if_cached_returns_a_cached_response_without_network_io() {
 
     server.join();
     assert!(cached.from_cache);
-    assert_eq!(cached.body, b"cached");
+    assert_eq!(runtime().block_on(cached.body.bytes()).unwrap(), b"cached");
 }
 
 #[test]

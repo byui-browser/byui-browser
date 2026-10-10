@@ -52,7 +52,7 @@ impl RequestScheduler {
 
     /// Admits a request and keeps its permit with the response body.
     ///
-    /// The permit is deliberately transferred into [`ResponseBody`](crate::ResponseBody)
+    /// The permit is deliberately transferred into [`Body`](crate::Body)
     /// after response headers arrive. It is released only when the body is
     /// fully consumed or dropped.
     pub(crate) async fn submit(

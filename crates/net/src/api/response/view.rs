@@ -1,8 +1,9 @@
 use reqwest::{StatusCode, header::HeaderMap};
 
-use super::{ResponseBody, ResponseType, StreamingResponse};
+use super::{ResponseType, StreamingResponse};
 use crate::api::{
     HeaderGuard, Headers,
+    body::Body,
     request::{CredentialsMode, Origin, RequestMode},
 };
 
@@ -21,7 +22,7 @@ pub(crate) struct InternalResponse {
     pub(crate) request_mode: RequestMode,
     pub(crate) credentials_mode: CredentialsMode,
     pub(crate) response_type: ResponseType,
-    pub(crate) body: ResponseBody,
+    pub(crate) body: Body,
     pub(crate) body_is_null: bool,
     pub(crate) from_cache: bool,
     pub(crate) cookie_headers_processed: bool,
@@ -58,7 +59,7 @@ impl InternalResponse {
             },
             redirected: !hidden && self.redirect_count > 0,
             body: if hidden || self.body_is_null {
-                ResponseBody::empty()
+                Body::null()
             } else {
                 self.body
             },

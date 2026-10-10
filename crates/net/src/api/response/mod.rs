@@ -1,10 +1,8 @@
 //! Response types returned by the networking client.
 
-mod body;
 mod types;
 mod view;
 
-pub use body::ResponseBody;
 pub use types::{Response, ResponseType, StreamingResponse};
 pub(crate) use view::InternalResponse;
 
@@ -15,13 +13,13 @@ mod tests {
     use reqwest::{StatusCode, header::HeaderMap};
 
     use super::*;
-    use crate::{AbortController, RequestError, RequestMode};
+    use crate::{AbortController, Body, RequestError, RequestMode};
 
     #[test]
     fn a_pending_response_stream_ends_with_aborted_error() {
         let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
         let controller = AbortController::new();
-        let mut body = ResponseBody::from_stream_with_signal(
+        let mut body = Body::from_stream_with_signal(
             stream::pending::<Result<Bytes, RequestError>>(),
             controller.signal(),
         );
@@ -50,7 +48,7 @@ mod tests {
             request_mode: RequestMode::Cors,
             credentials_mode: crate::CredentialsMode::SameOrigin,
             response_type: ResponseType::Basic,
-            body: ResponseBody::once(b"body".to_vec()),
+            body: Body::once(b"body".to_vec()),
             body_is_null: false,
             from_cache: false,
             cookie_headers_processed: true,
@@ -82,7 +80,7 @@ mod tests {
                 request_mode: RequestMode::Cors,
                 credentials_mode: crate::CredentialsMode::SameOrigin,
                 response_type,
-                body: ResponseBody::once(b"forbidden".to_vec()),
+                body: Body::once(b"forbidden".to_vec()),
                 body_is_null,
                 from_cache: response_type == ResponseType::Opaque,
                 cookie_headers_processed: false,

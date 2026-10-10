@@ -4,12 +4,13 @@ use http::{
 };
 use url::Url;
 
-use crate::api::{HeaderGuard, Headers, cancellation::AbortSignal, error::RequestError};
+use crate::api::{
+    HeaderGuard, Headers, body::Body, cancellation::AbortSignal, error::RequestError,
+};
 
 use super::{
     CacheMode, CredentialsMode, FetchContext, FetchEnvironment, InitiatorType, Origin,
-    RedirectMode, Referrer, ReferrerPolicy, RequestBody, RequestDestination, RequestMode,
-    ServiceWorkersMode,
+    RedirectMode, Referrer, ReferrerPolicy, RequestDestination, RequestMode, ServiceWorkersMode,
 };
 use crate::api::headers::is_cors_safelisted_header;
 
@@ -19,7 +20,7 @@ pub struct Request {
     pub(crate) url: String,
     pub(crate) method: Method,
     pub(crate) headers: Headers,
-    pub(crate) body: Option<RequestBody>,
+    pub(crate) body: Option<Body>,
     pub(crate) cache_mode: CacheMode,
     pub(crate) redirect_mode: RedirectMode,
     pub(crate) referrer: Referrer,
@@ -95,7 +96,7 @@ impl Request {
         &self.headers
     }
     /// Returns this request's optional body.
-    pub fn body(&self) -> Option<&RequestBody> {
+    pub fn body(&self) -> Option<&Body> {
         self.body.as_ref()
     }
     /// Returns the resolved current URL once request preparation has run.
@@ -185,7 +186,7 @@ impl Request {
         self.context.environment = environment;
     }
     /// Sets or clears the body and derives its content type when absent.
-    pub fn set_body(&mut self, body: Option<RequestBody>) -> Result<(), RequestError> {
+    pub fn set_body(&mut self, body: Option<Body>) -> Result<(), RequestError> {
         if body.is_some() && matches!(self.method, Method::GET | Method::HEAD) {
             return Err(RequestError::BodyNotAllowed(self.method.to_string()));
         }
@@ -334,7 +335,7 @@ impl Request {
         if self.context.mode == RequestMode::NoCors
             && let Some(body) = &self.body
             && let Some(content_type) = body.content_type()
-            && !is_cors_safelisted_header(&CONTENT_TYPE, content_type)
+            && !is_cors_safelisted_header(&CONTENT_TYPE, &content_type)
         {
             return Err(RequestError::ForbiddenHeader(
                 CONTENT_TYPE.as_str().to_owned(),

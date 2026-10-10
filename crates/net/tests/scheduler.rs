@@ -28,7 +28,10 @@ fn zero_in_flight_limit_still_allows_a_request() {
     let response = runtime().block_on(controller.fetch(Request::get(server.url())));
 
     server.join();
-    assert_eq!(response.unwrap().body, b"ok");
+    assert_eq!(
+        runtime().block_on(response.unwrap().body.bytes()).unwrap(),
+        b"ok"
+    );
 }
 
 #[test]

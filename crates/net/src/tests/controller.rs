@@ -7,7 +7,7 @@ use std::{
     thread,
 };
 
-use crate::{AbortController, CacheMode, Config, Request, RequestController, RequestError};
+use crate::{AbortController, Body, CacheMode, Config, Request, RequestController, RequestError};
 use futures_util::StreamExt;
 use reqwest::{
     Method, StatusCode,
@@ -42,7 +42,7 @@ fn custom_request_preserves_headers_and_body() {
         method: Method::POST,
         url: "https://example.com/api".into(),
         headers,
-        body: Some(crate::RequestBody::bytes(br#"{"ok":true}"#.to_vec())),
+        body: Some(Body::from_bytes(br#"{"ok":true}"#.to_vec())),
         cache_mode: CacheMode::NoStore,
         ..Request::get("https://example.com/api")
     };
@@ -51,7 +51,7 @@ fn custom_request_preserves_headers_and_body() {
     assert_eq!(request.headers.iter().next().unwrap().1, "application/json");
     assert_eq!(
         request.body,
-        Some(crate::RequestBody::bytes(br#"{"ok":true}"#.to_vec()))
+        Some(Body::from_bytes(br#"{"ok":true}"#.to_vec()))
     );
     assert_eq!(request.cache_mode, CacheMode::NoStore);
 }
@@ -144,7 +144,10 @@ fn can_fetch_resource_from_local_server() {
     server.join().expect("test server should exit");
 
     assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(response.body, b"local body");
+    assert_eq!(
+        runtime.block_on(response.body.bytes()).unwrap(),
+        b"local body"
+    );
 }
 
 #[test]

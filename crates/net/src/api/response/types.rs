@@ -1,5 +1,4 @@
-use super::ResponseBody;
-use crate::api::Headers;
+use crate::api::{Headers, body::Body};
 
 /// The visibility class selected by Fetch before exposing a response.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,8 +33,8 @@ pub struct Response {
     pub url: String,
     /// Whether the request followed at least one redirect.
     pub redirected: bool,
-    /// Exposed body bytes. Filtered and null bodies are empty.
-    pub body: Vec<u8>,
+    /// Replayable exposed body. Filtered and null bodies are explicit null bodies.
+    pub body: Body,
     /// Whether this readable response came from the process-local cache.
     /// Filtered opaque responses always report `false` to avoid metadata leaks.
     pub from_cache: bool,
@@ -61,7 +60,7 @@ pub struct StreamingResponse {
     /// Whether the request followed at least one redirect.
     pub redirected: bool,
     /// Filtered, abort-aware body chunks. A dropped body releases its permit.
-    pub body: ResponseBody,
+    pub body: Body,
     /// Whether this readable response came from the process-local cache.
     /// Filtered opaque responses always report `false` to avoid metadata leaks.
     pub from_cache: bool,

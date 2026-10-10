@@ -7,10 +7,11 @@ use reqwest::Client;
 use reqwest::header::{HeaderValue, REFERER};
 
 use crate::api::{
+    body::Body,
     config::Config,
     error::RequestError,
     request::PreparedRequest,
-    response::{InternalResponse, ResponseBody, ResponseType},
+    response::{InternalResponse, ResponseType},
 };
 
 /// Performs HTTP I/O behind the networking policy and scheduling layers.
@@ -114,7 +115,7 @@ impl Transport for ReqwestTransport {
                 request_mode: request.context.mode,
                 credentials_mode: request.context.credentials,
                 response_type: ResponseType::Basic,
-                body: ResponseBody::from_stream_with_signal(body, signal),
+                body: Body::from_stream_with_signal(body, signal),
                 body_is_null,
                 from_cache: false,
                 cookie_headers_processed: false,

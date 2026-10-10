@@ -60,7 +60,7 @@ impl CorsChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::response::ResponseBody;
+    use crate::api::body::Body;
 
     fn response(headers: reqwest::header::HeaderMap) -> InternalResponse {
         InternalResponse {
@@ -74,7 +74,7 @@ mod tests {
             request_mode: RequestMode::Cors,
             credentials_mode: CredentialsMode::SameOrigin,
             response_type: ResponseType::Basic,
-            body: ResponseBody::once(Vec::new()),
+            body: Body::once(Vec::new()),
             body_is_null: false,
             from_cache: false,
             cookie_headers_processed: false,

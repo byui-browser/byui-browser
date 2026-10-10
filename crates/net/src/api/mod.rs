@@ -1,5 +1,6 @@
 //! Public Fetch API types and service boundary.
 
+pub(crate) mod body;
 pub(crate) mod cancellation;
 pub(crate) mod config;
 pub(crate) mod error;

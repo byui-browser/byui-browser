@@ -43,16 +43,17 @@ mod transport;
 mod tests;
 
 pub use api::{
+    body::{Blob, Body},
     cancellation::{AbortController, AbortSignal},
     config::Config,
     error::RequestError,
     headers::{HeaderGuard, Headers},
     request::{
         CacheMode, CredentialsMode, FetchContext, FetchEnvironment, InitiatorType,
-        NetworkPartitionKey, Origin, RedirectMode, Referrer, ReferrerPolicy, Request, RequestBody,
+        NetworkPartitionKey, Origin, RedirectMode, Referrer, ReferrerPolicy, Request,
         RequestDestination, RequestMode, RequestPriority, ServiceWorkersMode,
     },
-    response::{Response, ResponseBody, ResponseType, StreamingResponse},
+    response::{Response, ResponseType, StreamingResponse},
     services::{FetchServices, ResponseInfo, ServiceWorkerDecision},
 };
 pub use engine::RequestController;

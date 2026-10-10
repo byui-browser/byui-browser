@@ -36,9 +36,15 @@ fn cache_serves_a_fresh_get_without_a_second_network_request() {
 
     assert_eq!(first.status, StatusCode::OK);
     assert!(!first.from_cache);
-    assert_eq!(first.body, b"cached response");
+    assert_eq!(
+        runtime.block_on(first.body.bytes()).unwrap(),
+        b"cached response"
+    );
     assert!(second.from_cache);
-    assert_eq!(second.body, b"cached response");
+    assert_eq!(
+        runtime.block_on(second.body.bytes()).unwrap(),
+        b"cached response"
+    );
     assert_eq!(request_count.load(Ordering::SeqCst), 1);
 }
 
