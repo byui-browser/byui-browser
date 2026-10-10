@@ -1,7 +1,10 @@
 use reqwest::{StatusCode, header::HeaderMap};
 
 use super::{ResponseBody, ResponseType, StreamingResponse};
-use crate::api::request::{HeaderGuard, HeaderList, Origin, RequestMode};
+use crate::api::{
+    HeaderGuard, Headers,
+    request::{Origin, RequestMode},
+};
 
 /// Complete response state retained inside the Fetch engine.
 ///
@@ -30,9 +33,9 @@ impl InternalResponse {
             ResponseType::Opaque | ResponseType::OpaqueRedirect | ResponseType::Error
         );
         let headers = if hidden {
-            HeaderList::with_guard(HeaderGuard::Immutable)
+            Headers::with_guard(HeaderGuard::Immutable)
         } else {
-            HeaderList::exposed_response(&self.headers, self.response_type == ResponseType::Cors)
+            Headers::exposed_response(&self.headers, self.response_type == ResponseType::Cors)
         };
         StreamingResponse {
             response_type: self.response_type,

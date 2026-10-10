@@ -11,7 +11,7 @@ use reqwest::Body;
 
 use crate::api::error::RequestError;
 
-use super::HeaderList;
+use crate::api::Headers;
 
 type RequestStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
 
@@ -136,7 +136,7 @@ impl RequestBody {
         self.content_type.as_ref()
     }
 
-    pub(crate) fn apply_metadata(&self, headers: &mut HeaderList) {
+    pub(crate) fn apply_metadata(&self, headers: &mut Headers) {
         if let Some(content_type) = &self.content_type
             && !headers.entries.iter().any(|(name, _)| name == CONTENT_TYPE)
         {

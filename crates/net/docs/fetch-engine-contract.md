@@ -35,7 +35,7 @@ status, URL, headers, cache provenance, and body. Both fetch paths use this conv
 view drops the internal body stream and releases its scheduler permit; this
 slice does not continue downloading an unreadable body in the background.
 
-The public response status is a `u16`, and its headers are `HeaderList`; no
+The public response status is a `u16`, and its headers are `Headers`; no
 `reqwest::StatusCode`, `reqwest::HeaderMap`, `reqwest::Response`, or transport
 stream type crosses the response boundary. Engine request APIs use `http` and
 `url` types rather than Reqwest re-exports. Controller construction and fetch
@@ -87,7 +87,7 @@ context are suitable for Network/Renderer IPC. A controller, request body
 stream, response body stream, abort signal, scheduler permit, and private
 `InternalResponse` are process-local and must remain in the Network process.
 
-Existing callers of raw response headers should move to `HeaderList::get` or
+Existing callers of raw response headers should use `Headers::get` or
 ordered iteration. `Config.max_redirects` was removed because redirects cannot
 be safely followed in this slice. Callers of buffered `Response.body` can
 continue to use the byte vector; later body-state work will provide one-shot

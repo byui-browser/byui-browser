@@ -83,7 +83,7 @@ The current crate already has useful foundations:
 - [`Request`](../src/api/request/definition.rs) stores Fetch-oriented request state, including
   mode, credentials, cache mode, redirect mode, referrer, abort signal, body,
   URL-list state, and priority.
-- [`HeaderList`](../src/api/request/headers.rs) preserves ordered duplicate headers and has
+- [`Headers`](../src/api/headers.rs) preserves ordered duplicate headers and has
   request, no-CORS request, response, immutable, and unrestricted guards.
 - [`RequestBody`](../src/api/request/body.rs) supports replayable bytes, text,
   URL-encoded data, one-shot bytes, and one-shot streams.
@@ -188,7 +188,7 @@ charset labels, BOM handling, and decoding after a partial stream read.
 Use [`mime`](https://docs.rs/mime/latest/mime/) for parsing and normalizing
 media types in `Content-Type` and body metadata. Do not use it as the complete
 Fetch CORS-safelisting algorithm: the 128-byte/value restrictions and
-Fetch-specific safelist rules still belong in `HeaderList` and the policy
+Fetch-specific safelist rules still belong in `Headers` and the policy
 modules. Add an adapter that converts parser errors into the crate's typed
 request or body errors without exposing the dependency's type publicly.
 
@@ -228,7 +228,7 @@ bodies unless the retry layer understands replayability and Fetch error timing.
 
 Do not replace these with general-purpose crates:
 
-- `HeaderList` guards and forbidden-header filtering;
+- `Headers` guards and forbidden-header filtering;
 - CORS checks, response tainting, and opaque/basic response views;
 - controller-owned redirects and per-hop policy checks;
 - shared body used/locked/disturbed state and stream teeing;
@@ -357,9 +357,9 @@ must provide honest capability boundaries for those features now.
 
 ## 2. Implement `Headers`
 
-### 2.1 Evolve `HeaderList` into the engine header model
+### 2.1 Complete the engine header model
 
-Use the current [`HeaderList`](../src/api/request/headers.rs) storage as the foundation,
+Use the current [`Headers`](../src/api/headers.rs) storage as the foundation,
 but make its Fetch behavior complete:
 
 - validate header names and values at construction and mutation time;
@@ -373,8 +373,7 @@ but make its Fetch behavior complete:
 
 ### 2.2 Add the public `Headers` API
 
-Add a public `Headers` type or rename `HeaderList` to `Headers` while retaining
-an internal alias during migration. It should provide documented methods for:
+The public `Headers` type should provide documented methods for:
 
 - `new`;
 - construction from an iterator or another header map;
@@ -416,6 +415,38 @@ Implement response filtering for:
 
 The filter must be applied before constructing the public `Response`, not only
 when a caller queries a header.
+
+### Step 2 progress record (2026-10-10)
+
+The initial implementation pass is complete for the shared header foundation:
+
+- [x] Added the public `Headers` type and migrated request, response, and
+      trusted service metadata to use it.
+- [x] Added documented `set`, `delete`, `get_set_cookie`, and iterator-based
+      construction support while retaining `append` and `insert` compatibility.
+- [x] Added combined ordinary-header lookup and separate `Set-Cookie` values.
+- [x] Added immutable-header mutation errors and retained guard-based request,
+      no-CORS, response, and immutable filtering.
+- [x] Added tests for duplicate combination/order, cookie preservation, set and
+      delete behavior, immutable mutation, and no-CORS filtering.
+- [x] Added an internal transport-header channel so generated `Origin`, body
+      metadata, `Referer`, and cookies are not written into caller-owned request
+      headers.
+
+Step 2 is not complete yet. The remaining work is:
+
+- [ ] Finish Fetch iterator semantics for combined ordinary fields while
+      preserving the required ordered representation internally.
+- [ ] Add constructor paths that accept validated string/name-value inputs and
+      convert invalid names and values into the dedicated header errors.
+- [ ] Make guard transitions fully monotonic and reject every attempted
+      mutable transition from immutable collections.
+- [ ] Complete the response-exposure matrix for CORS wildcard exposure,
+      malformed exposure metadata, opaque redirects, and network-error views.
+- [x] Removed the former header-type compatibility alias and updated all crate
+      consumers and documentation to use `Headers` directly.
+- [ ] Add the remaining controller-level channel tests, run the full workspace
+      verification commands, and update the contract once those tests pass.
 
 ## 3. Implement the shared Body model
 

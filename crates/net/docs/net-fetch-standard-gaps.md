@@ -41,7 +41,7 @@ The standard defines fetch schemes as `about`, `blob`, `data`, `file`, and HTTP(
 
 ### 2. Request methods and header guards
 
-**Evidence:** [`Request::new` and `set_method`](../src/api/request/definition.rs) normalize and validate methods; [`HeaderList`](../src/api/request/headers.rs) has request, no-CORS request, response, immutable, and unrestricted guards; transport converts the permitted list in [`ReqwestTransport::send`](../src/transport/reqwest.rs).
+**Evidence:** [`Request::new` and `set_method`](../src/api/request/definition.rs) normalize and validate methods; [`Headers`](../src/api/headers.rs) has request, no-CORS request, response, immutable, and unrestricted guards; transport converts the permitted list in [`ReqwestTransport::send`](../src/transport/reqwest.rs).
 
 Fetch normalizes the standard methods, rejects forbidden methods such as `CONNECT`, `TRACE`, and `TRACK` at request construction, and applies request-header guards, forbidden request-header filtering, CORS-safelisted checks, and no-CORS restrictions. The implementation now covers these request-side checks and inserts the `Origin` header internally when required. It still does not provide the complete user-agent-owned header set or a separate cookie-header channel, and transport-specific details such as `Referer` are finalized internally.
 

@@ -1,11 +1,9 @@
 //! Browser-service response processing.
 
+use crate::api::Headers;
 use crate::{
     api::{
-        error::RequestError,
-        request::{HeaderList, Request},
-        response::InternalResponse,
-        services::ResponseInfo,
+        error::RequestError, request::Request, response::InternalResponse, services::ResponseInfo,
     },
     engine::RequestController,
 };
@@ -21,7 +19,7 @@ impl RequestController {
                 status: response.status.as_u16(),
                 status_text: response.status_text.clone(),
                 url: response.url_list.last().cloned().unwrap_or_default(),
-                headers: HeaderList::internal_response(&response.headers),
+                headers: Headers::internal_response(&response.headers),
                 response_origin: response.origin.clone(),
                 request_origin: response.request_origin.clone(),
                 request_mode: response.request_mode,

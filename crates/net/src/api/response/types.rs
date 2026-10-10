@@ -1,5 +1,5 @@
 use super::ResponseBody;
-use crate::api::request::HeaderList;
+use crate::api::Headers;
 
 /// The visibility class selected by Fetch before exposing a response.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,7 +29,7 @@ pub struct Response {
     /// A custom wire reason phrase is not retained by the current transport.
     pub status_text: String,
     /// Immutable exposed response headers, excluding cookie headers.
-    pub headers: HeaderList,
+    pub headers: Headers,
     /// Exposed final URL, empty for filtered responses.
     pub url: String,
     /// Whether the request followed at least one redirect.
@@ -55,7 +55,7 @@ pub struct StreamingResponse {
     /// A custom wire reason phrase is not retained by the current transport.
     pub status_text: String,
     /// Immutable exposed response headers, excluding cookie headers.
-    pub headers: HeaderList,
+    pub headers: Headers,
     /// Exposed final URL, empty for filtered responses.
     pub url: String,
     /// Whether the request followed at least one redirect.

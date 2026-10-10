@@ -31,7 +31,7 @@ fn get_request_has_expected_defaults() {
 fn custom_request_preserves_headers_and_body() {
     // Callers must also be able to construct non-GET requests with arbitrary
     // headers and binary request bodies.
-    let mut headers = crate::HeaderList::new();
+    let mut headers = crate::Headers::new();
     headers
         .append(
             HeaderName::from_static("content-type"),

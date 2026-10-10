@@ -32,7 +32,7 @@ extended instead of duplicating server logic.
 
 Primary files:
 
-- `crates/net/src/api/request/headers.rs`
+- `crates/net/src/api/headers.rs`
 - `crates/net/tests/requests.rs`
 
 ### Tests to add

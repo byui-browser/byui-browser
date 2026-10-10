@@ -18,21 +18,37 @@ pub enum HeaderGuard {
     Immutable,
 }
 
-/// An ordered HTTP header list with a Fetch mutation guard.
+/// An ordered HTTP header collection with a Fetch mutation guard.
+///
+/// `Headers` is used for both request and response headers. The guard controls
+/// which operations are available: request headers are caller-mutable,
+/// response headers are filtered, and exposed response headers are immutable.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct HeaderList {
+pub struct Headers {
     pub(super) entries: Vec<(HeaderName, HeaderValue)>,
     guard: HeaderGuard,
 }
 
-impl HeaderList {
-    /// Creates an empty request-guarded list.
+impl Headers {
+    /// Creates an empty request header collection.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Creates an empty list with the supplied Fetch guard.
-    pub fn with_guard(guard: HeaderGuard) -> Self {
+    /// Creates a collection from already parsed HTTP header pairs.
+    pub fn try_from_iter<I>(iter: I) -> Result<Self, RequestError>
+    where
+        I: IntoIterator<Item = (HeaderName, HeaderValue)>,
+    {
+        let mut headers = Self::new();
+        for (name, value) in iter {
+            headers.append(name, value)?;
+        }
+        Ok(headers)
+    }
+
+    /// Creates an empty collection with an internal Fetch guard.
+    pub(crate) fn with_guard(guard: HeaderGuard) -> Self {
         Self {
             entries: Vec::new(),
             guard,
@@ -44,8 +60,11 @@ impl HeaderList {
         self.guard
     }
 
-    /// Sets a stricter guard. Existing entries are filtered when switching to a request guard.
+    /// Changes the guard toward a stricter Fetch representation.
     pub(crate) fn set_guard(&mut self, guard: HeaderGuard) {
+        if self.guard == HeaderGuard::Immutable {
+            return;
+        }
         self.guard = guard;
         self.entries
             .retain(|(name, value)| allowed_header(guard, name, value));
@@ -64,10 +83,26 @@ impl HeaderList {
     }
 
     /// Replaces all entries with `name` with one header value.
-    pub fn insert(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), RequestError> {
+    pub fn set(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), RequestError> {
         self.check(&name, &value)?;
         self.entries.retain(|(existing, _)| existing != name);
         self.entries.push((name, value));
+        Ok(())
+    }
+
+    /// Replaces all values for a header name with one value.
+    pub fn insert(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), RequestError> {
+        self.set(name, value)
+    }
+
+    /// Deletes all values associated with `name`.
+    pub fn delete(&mut self, name: &str) -> Result<(), RequestError> {
+        if self.guard == HeaderGuard::Immutable {
+            return Err(RequestError::ImmutableHeaders);
+        }
+        let name = HeaderName::try_from(name)
+            .map_err(|_| RequestError::InvalidHeaderName(name.to_owned()))?;
+        self.entries.retain(|(existing, _)| existing != name);
         Ok(())
     }
 
@@ -76,12 +111,38 @@ impl HeaderList {
         self.entries.iter().map(|(name, value)| (name, value))
     }
 
-    /// Returns the first value for a header name, if present.
-    pub fn get(&self, name: &str) -> Option<&HeaderValue> {
+    /// Returns the combined value for a header name, if present.
+    pub fn get(&self, name: &str) -> Option<String> {
+        let values: Vec<&HeaderValue> = self
+            .entries
+            .iter()
+            .filter(|(entry, _)| entry.as_str().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value)
+            .collect();
+        if values.is_empty() {
+            None
+        } else if name.eq_ignore_ascii_case("set-cookie") {
+            values
+                .first()
+                .map(|value| value.to_str().unwrap_or_default().to_owned())
+        } else {
+            Some(
+                values
+                    .iter()
+                    .map(|value| value.to_str().unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        }
+    }
+
+    /// Returns each `Set-Cookie` value without combining cookie attributes.
+    pub fn get_set_cookie(&self) -> Vec<String> {
         self.entries
             .iter()
-            .find(|(entry, _)| entry.as_str().eq_ignore_ascii_case(name))
-            .map(|(_, value)| value)
+            .filter(|(name, _)| name.as_str().eq_ignore_ascii_case("set-cookie"))
+            .filter_map(|(_, value)| value.to_str().ok().map(str::to_owned))
+            .collect()
     }
 
     /// Returns whether a header with this name is present.
@@ -124,6 +185,9 @@ impl HeaderList {
     }
 
     fn check(&self, name: &HeaderName, value: &HeaderValue) -> Result<(), RequestError> {
+        if self.guard == HeaderGuard::Immutable {
+            return Err(RequestError::ImmutableHeaders);
+        }
         if allowed_header(self.guard, name, value) {
             Ok(())
         } else {
@@ -202,7 +266,7 @@ fn is_forbidden_request_header(name: &HeaderName) -> bool {
         || name.starts_with("sec-")
 }
 
-pub(super) fn is_cors_safelisted_header(name: &HeaderName, value: &HeaderValue) -> bool {
+pub(crate) fn is_cors_safelisted_header(name: &HeaderName, value: &HeaderValue) -> bool {
     let raw = value.as_bytes();
     if raw.len() > 128
         || raw
@@ -237,5 +301,85 @@ pub(super) fn is_cors_safelisted_header(name: &HeaderName, value: &HeaderValue) 
             })
         }),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn value(value: &'static str) -> HeaderValue {
+        HeaderValue::from_static(value)
+    }
+
+    #[test]
+    fn headers_combine_duplicate_values_and_preserve_cookie_values() {
+        let mut headers = Headers::with_guard(HeaderGuard::None);
+        headers
+            .append(HeaderName::from_static("x-test"), value("one"))
+            .unwrap();
+        headers
+            .append(HeaderName::from_bytes(b"X-Test").unwrap(), value("two"))
+            .unwrap();
+        headers
+            .append(HeaderName::from_static("set-cookie"), value("a=1"))
+            .unwrap();
+        headers
+            .append(HeaderName::from_static("set-cookie"), value("b=2"))
+            .unwrap();
+
+        assert_eq!(headers.get("x-test").as_deref(), Some("one, two"));
+        assert_eq!(headers.get_set_cookie(), ["a=1", "b=2"]);
+        assert_eq!(
+            headers
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["x-test", "x-test", "set-cookie", "set-cookie"]
+        );
+    }
+
+    #[test]
+    fn set_and_delete_have_fetch_mutation_semantics() {
+        let mut headers = Headers::new();
+        headers
+            .append(HeaderName::from_static("x-test"), value("one"))
+            .unwrap();
+        headers
+            .append(HeaderName::from_static("x-test"), value("two"))
+            .unwrap();
+        headers
+            .set(HeaderName::from_static("x-test"), value("three"))
+            .unwrap();
+        assert_eq!(headers.get("x-test").as_deref(), Some("three"));
+        headers.delete("X-TEST").unwrap();
+        assert!(!headers.has("x-test"));
+    }
+
+    #[test]
+    fn immutable_headers_reject_all_mutation() {
+        let mut headers = Headers::with_guard(HeaderGuard::Immutable);
+        assert!(matches!(
+            headers.append(HeaderName::from_static("x-test"), value("one")),
+            Err(RequestError::ImmutableHeaders)
+        ));
+        assert!(matches!(
+            headers.delete("x-test"),
+            Err(RequestError::ImmutableHeaders)
+        ));
+    }
+
+    #[test]
+    fn no_cors_guard_removes_existing_unsafelisted_headers() {
+        let mut headers = Headers::new();
+        headers
+            .append(HeaderName::from_static("x-custom"), value("one"))
+            .unwrap();
+        headers
+            .append(HeaderName::from_static("accept"), value("text/plain"))
+            .unwrap();
+        headers.set_guard(HeaderGuard::RequestNoCors);
+        assert!(!headers.has("x-custom"));
+        assert!(headers.has("accept"));
     }
 }

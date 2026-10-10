@@ -4,20 +4,21 @@ use http::{
 };
 use url::Url;
 
-use crate::api::{cancellation::AbortSignal, error::RequestError};
+use crate::api::{HeaderGuard, Headers, cancellation::AbortSignal, error::RequestError};
 
 use super::{
-    CacheMode, CredentialsMode, FetchContext, FetchEnvironment, HeaderGuard, HeaderList,
-    InitiatorType, Origin, RedirectMode, Referrer, ReferrerPolicy, RequestBody, RequestDestination,
-    RequestMode, ServiceWorkersMode, headers::is_cors_safelisted_header,
+    CacheMode, CredentialsMode, FetchContext, FetchEnvironment, InitiatorType, Origin,
+    RedirectMode, Referrer, ReferrerPolicy, RequestBody, RequestDestination, RequestMode,
+    ServiceWorkersMode,
 };
+use crate::api::headers::is_cors_safelisted_header;
 
 /// A browser request before conversion to a transport request.
 #[derive(Clone, Debug)]
 pub struct Request {
     pub(crate) url: String,
     pub(crate) method: Method,
-    pub(crate) headers: HeaderList,
+    pub(crate) headers: Headers,
     pub(crate) body: Option<RequestBody>,
     pub(crate) cache_mode: CacheMode,
     pub(crate) redirect_mode: RedirectMode,
@@ -55,7 +56,7 @@ impl Request {
         Self {
             url: url.into(),
             method: Method::GET,
-            headers: HeaderList::new(),
+            headers: Headers::new(),
             body: None,
             cache_mode: CacheMode::Default,
             redirect_mode: RedirectMode::Follow,
@@ -90,7 +91,7 @@ impl Request {
         &self.method
     }
     /// Returns the guarded request header list.
-    pub fn headers(&self) -> &HeaderList {
+    pub fn headers(&self) -> &Headers {
         &self.headers
     }
     /// Returns this request's optional body.
@@ -278,19 +279,20 @@ impl Request {
         }
         self.current_url = Some(url);
     }
-    pub(crate) fn apply_fetch_headers(&mut self) -> Result<(), RequestError> {
+    /// Builds the internal transport header channel without changing caller headers.
+    pub(crate) fn fetch_headers(&self) -> Result<Headers, RequestError> {
+        let mut headers = self.headers.clone();
         if let Some(body) = &self.body {
-            body.apply_metadata(&mut self.headers);
+            body.apply_metadata(&mut headers);
         }
         let needs_origin = self.context.mode == RequestMode::Cors
             || !matches!(self.method, Method::GET | Method::HEAD);
         if needs_origin && let Some(origin) = &self.context.environment.origin {
             let value = HeaderValue::try_from(origin.as_str())
                 .map_err(|_| RequestError::InvalidOrigin(origin.as_str()))?;
-            self.headers
-                .insert_internal_header(HeaderName::from_static("origin"), value);
+            headers.insert_internal_header(HeaderName::from_static("origin"), value);
         }
-        Ok(())
+        Ok(headers)
     }
     pub(crate) fn record_redirect(&mut self, url: Url) {
         self.redirect_count += 1;

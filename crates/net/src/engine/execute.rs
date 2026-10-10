@@ -96,16 +96,14 @@ impl RequestController {
 
         // Cookie and policy modules operate before transport sees the request;
         // this keeps browser behavior out of the low-level HTTP implementation.
-        let mut request = request;
-        request.apply_fetch_headers()?;
+        let request = request;
+        let mut transport_headers = request.fetch_headers()?;
         if request.credentials_allowed(&url) {
             if let Some(services) = &self.inner.services {
                 if let Some(cookie) = services.cookie_header(&request)? {
                     let value = http::HeaderValue::from_str(&cookie)
                         .map_err(|_| RequestError::ForbiddenHeader("cookie".into()))?;
-                    request
-                        .headers
-                        .insert_internal_header(http::header::COOKIE, value);
+                    transport_headers.insert_internal_header(http::header::COOKIE, value);
                 }
             }
         }
@@ -117,6 +115,7 @@ impl RequestController {
             .submit(
                 PreparedRequest {
                     request: request.clone(),
+                    headers: transport_headers,
                     url: url.clone(),
                 },
                 request.transport_priority(),

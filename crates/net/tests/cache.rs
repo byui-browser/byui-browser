@@ -150,13 +150,7 @@ fn only_if_cached_returns_a_streaming_cache_hit() {
         only_cached.set_cache_mode(CacheMode::OnlyIfCached);
         let response = controller.fetch_stream(only_cached).await.unwrap();
         let from_cache = response.from_cache;
-        let header = response
-            .headers
-            .get("x-cache-test")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
+        let header = response.headers.get("x-cache-test").unwrap().to_owned();
         let body = collect_body(response).await.unwrap();
         (from_cache, body, header)
     });

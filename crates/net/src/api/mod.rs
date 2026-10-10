@@ -3,6 +3,9 @@
 pub(crate) mod cancellation;
 pub(crate) mod config;
 pub(crate) mod error;
+pub(crate) mod headers;
 pub(crate) mod request;
 pub(crate) mod response;
 pub(crate) mod services;
+
+pub use headers::{HeaderGuard, Headers};

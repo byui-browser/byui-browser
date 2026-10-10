@@ -70,12 +70,16 @@ impl Transport for ReqwestTransport {
     > {
         let client = self.client.clone();
         Box::pin(async move {
-            let PreparedRequest { request, url } = request;
+            let PreparedRequest {
+                request,
+                headers: request_headers,
+                url,
+            } = request;
             if request.signal.is_aborted() {
                 return Err(RequestError::Aborted);
             }
             let signal = request.signal.clone();
-            let mut headers = request.headers.to_reqwest();
+            let mut headers = request_headers.to_reqwest();
             headers.remove(REFERER);
             if let Some(referrer) = request.referrer_value(&url) {
                 if let Ok(value) = HeaderValue::try_from(referrer) {

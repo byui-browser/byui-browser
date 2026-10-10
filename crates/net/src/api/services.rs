@@ -1,6 +1,6 @@
 //! Browser-owned inputs to the process-local Fetch engine.
 
-use crate::{HeaderList, Origin, Request, RequestError, RequestMode, ResponseType};
+use crate::{Headers, Origin, Request, RequestError, RequestMode, ResponseType};
 
 /// Decision made by the service-worker owner before network I/O.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,7 +24,7 @@ pub struct ResponseInfo {
     /// Final URL for the one supported HTTP exchange.
     pub url: String,
     /// Complete ordered response headers for trusted policy processing.
-    pub headers: HeaderList,
+    pub headers: Headers,
     /// Origin derived from the final response URL.
     pub response_origin: Option<Origin>,
     /// Origin of the client that initiated the request, when supplied.

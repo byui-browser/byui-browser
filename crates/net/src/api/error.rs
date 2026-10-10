@@ -50,6 +50,12 @@ pub enum RequestError {
     NoCorsMethod(String),
     /// Fetch forbids this request header under the active header guard.
     ForbiddenHeader(String),
+    /// A header name failed HTTP token validation.
+    InvalidHeaderName(String),
+    /// A header value failed HTTP field-value validation.
+    InvalidHeaderValue(String),
+    /// A caller attempted to mutate an immutable response header collection.
+    ImmutableHeaders,
     /// A request body cannot be sent with this method.
     BodyNotAllowed(String),
     /// A one-shot request body was consumed by an earlier send attempt.
@@ -83,6 +89,9 @@ impl std::fmt::Display for RequestError {
                 write!(f, "Method is not allowed in no-CORS mode: {method}")
             }
             Self::ForbiddenHeader(name) => write!(f, "Forbidden request header: {name}"),
+            Self::InvalidHeaderName(name) => write!(f, "Invalid header name: {name}"),
+            Self::InvalidHeaderValue(name) => write!(f, "Invalid header value for: {name}"),
+            Self::ImmutableHeaders => f.write_str("Headers are immutable"),
             Self::BodyNotAllowed(method) => write!(f, "A request body is not allowed for {method}"),
             Self::BodyAlreadyConsumed => f.write_str("Request body has already been consumed"),
             Self::KeepaliveBodyTooLarge { limit } => {
