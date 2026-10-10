@@ -80,16 +80,16 @@ behind narrow interfaces.
 
 The current crate already has useful foundations:
 
-- [`Request`](../src/request.rs) stores Fetch-oriented request state, including
+- [`Request`](../src/api/request/definition.rs) stores Fetch-oriented request state, including
   mode, credentials, cache mode, redirect mode, referrer, abort signal, body,
   URL-list state, and priority.
-- [`HeaderList`](../src/request.rs) preserves ordered duplicate headers and has
+- [`HeaderList`](../src/api/request/headers.rs) preserves ordered duplicate headers and has
   request, no-CORS request, response, immutable, and unrestricted guards.
-- [`RequestBody`](../src/request.rs) supports replayable bytes, text,
+- [`RequestBody`](../src/api/request/body.rs) supports replayable bytes, text,
   URL-encoded data, one-shot bytes, and one-shot streams.
-- [`ResponseBody`](../src/response.rs) provides an abort-aware asynchronous
+- [`ResponseBody`](../src/api/response/body.rs) provides an abort-aware asynchronous
   byte stream and holds the scheduler permit while it is live.
-- [`RequestController`](../src/controller.rs) coordinates policy validation,
+- [`RequestController`](../src/engine/controller.rs) coordinates policy validation,
   cache lookup, cookies, scheduling, transport, response validation, and cache
   capture.
 
@@ -152,7 +152,7 @@ rules.
 
 ### 1.3 Define error categories
 
-Extend [`RequestError`](../src/error.rs) or introduce a dedicated Fetch error
+Extend [`RequestError`](../src/api/error.rs) or introduce a dedicated Fetch error
 type for:
 
 - network errors;
@@ -173,8 +173,8 @@ response body.
 ### Step 1 completion scope
 
 The first pass added the [engine contract](fetch-engine-contract.md), a private
-[`InternalResponse`](../src/response.rs), filtered public response views, and
-Fetch-oriented [`RequestError`](../src/error.rs) categories. Both `fetch` and
+[`InternalResponse`](../src/api/response/view.rs), filtered public response views, and
+Fetch-oriented [`RequestError`](../src/api/error.rs) categories. Both `fetch` and
 `fetch_stream` now cross the same response-exposure boundary. Public responses
 use a numeric status and guarded headers rather than raw Reqwest status and
 header maps. Cache-only misses now return a Fetch network error. The follow-up
@@ -229,7 +229,7 @@ must provide honest capability boundaries for those features now.
 
 ### 2.1 Evolve `HeaderList` into the engine header model
 
-Use the current [`HeaderList`](../src/request.rs) storage as the foundation,
+Use the current [`HeaderList`](../src/api/request/headers.rs) storage as the foundation,
 but make its Fetch behavior complete:
 
 - validate header names and values at construction and mutation time;
@@ -310,7 +310,7 @@ documented body-used error.
 
 ### 3.2 Support request BodyInit forms
 
-Extend the current [`RequestBody`](../src/request.rs) constructors to cover the
+Extend the current [`RequestBody`](../src/api/request/body.rs) constructors to cover the
 engine-level equivalents of:
 
 - strings and UTF-8 text;
@@ -374,7 +374,7 @@ from the transport stream.
 
 ### 4.1 Add a complete engine-level constructor
 
-Extend [`Request::new`](../src/request.rs) and add an options/init structure
+Extend [`Request::new`](../src/api/request/definition.rs) and add an options/init structure
 that can configure:
 
 - URL and base environment;
@@ -430,7 +430,7 @@ Caller-visible headers must not gain the internally generated `Origin`,
 
 ### 5.1 Add response metadata
 
-Replace the current raw fields in [`Response`](../src/response.rs) with a
+Replace the current raw fields in [`Response`](../src/api/response/types.rs) with a
 Fetch-oriented representation containing:
 
 - response type;
@@ -477,8 +477,8 @@ the same filtering, null-body, cancellation, and body-state rules as the
 buffered path.
 
 Update the scheduler-permit handling currently implemented in
-[`ResponseBody::into_parts`](../src/response.rs) and
-[`ResponseBody::attach_permit`](../src/response.rs) so it survives body
+[`ResponseBody::into_parts`](../src/api/response/body.rs) and
+[`ResponseBody::attach_permit`](../src/api/response/body.rs) so it survives body
 cloning, teeing, cancellation, and cache capture.
 
 ## 6. Implement Fetch response filtering and CORS integration
@@ -498,7 +498,7 @@ type that requires filtering.
 ### 6.2 Implement CORS checks
 
 Complete the controller path around the currently permissive
-[`CorsChecker::validate`](../src/cors/validator.rs) by adding:
+[`CorsChecker::response_type`](../src/policy/cors.rs) by adding:
 
 - simple-request checks;
 - preflight `OPTIONS` requests;

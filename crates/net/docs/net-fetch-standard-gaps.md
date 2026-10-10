@@ -33,7 +33,7 @@ The crate currently provides an HTTP(S) transport with a Fetch-shaped request mo
 
 ### 1. URL parsing and scheme fetch
 
-**Evidence:** [`RequestPolicy::validate_request`](../crates/net/src/policy/mod.rs) accepts only `http` and `https`, but resolves parseable relative references through [`FetchEnvironment::base_url`](../crates/net/src/request.rs). [`RequestController::fetch_stream`](../crates/net/src/controller.rs) initializes the request URL list and current URL before transport.
+**Evidence:** [`RequestPolicy::validate_request`](../src/policy/request.rs) accepts only `http` and `https`, but resolves parseable relative references through [`FetchEnvironment::base_url`](../src/api/request/context.rs). [`RequestController::fetch_stream`](../src/engine/execute.rs) initializes the request URL list and current URL before transport.
 
 The standard defines fetch schemes as `about`, `blob`, `data`, `file`, and HTTP(S), with scheme-specific fetch behavior. The crate still has no local-URL, `data:` URL, `blob:` URL, or `file:` fetch implementation. Relative URLs now can be resolved against an optional environment/base URL, and requests record an initial/current URL and redirect count, but redirects do not yet update that state through a controller-owned Fetch loop. Origin state supports HTTP(S) tuple and opaque origins, but the complete local-URL, credentials, and opaque-origin bookkeeping is not implemented.
 
@@ -41,7 +41,7 @@ The standard defines fetch schemes as `about`, `blob`, `data`, `file`, and HTTP(
 
 ### 2. Request methods and header guards
 
-**Evidence:** [`Request::new` and `set_method`](../crates/net/src/request.rs) normalize and validate methods; [`HeaderList`](../crates/net/src/request.rs) has request, no-CORS request, response, immutable, and unrestricted guards; transport converts the permitted list in [`ReqwestTransport::send`](../crates/net/src/transport/reqwest.rs).
+**Evidence:** [`Request::new` and `set_method`](../src/api/request/definition.rs) normalize and validate methods; [`HeaderList`](../src/api/request/headers.rs) has request, no-CORS request, response, immutable, and unrestricted guards; transport converts the permitted list in [`ReqwestTransport::send`](../src/transport/reqwest.rs).
 
 Fetch normalizes the standard methods, rejects forbidden methods such as `CONNECT`, `TRACE`, and `TRACK` at request construction, and applies request-header guards, forbidden request-header filtering, CORS-safelisted checks, and no-CORS restrictions. The implementation now covers these request-side checks and inserts the `Origin` header internally when required. It still does not provide the complete user-agent-owned header set or a separate cookie-header channel, and transport-specific details such as `Referer` are finalized internally.
 
@@ -51,7 +51,7 @@ The ordered multimap shape and mutation guards now support immutable exposed res
 
 ### 3. Request bodies and body lifecycle
 
-**Evidence:** [`RequestBody`](../crates/net/src/request.rs) supports replayable bytes, text, URL-encoded bytes, one-shot bytes, and one-shot streams, with known-length and content-type metadata. [`ResponseBody`](../crates/net/src/response.rs) remains a Rust stream, not a Fetch Body mixin.
+**Evidence:** [`RequestBody`](../src/api/request/body.rs) supports replayable bytes, text, URL-encoded bytes, one-shot bytes, and one-shot streams, with known-length and content-type metadata. [`ResponseBody`](../src/api/response/body.rs) remains a Rust stream, not a Fetch Body mixin.
 
 The Fetch Standard's `BodyInit`/body algorithms support strings, URL-encoded data, `FormData`, `Blob`, `ArrayBuffer`/typed arrays, and streams. The crate now has streaming request input, text and URL-encoded constructors, automatic content-type metadata for supported constructors, known-length tracking, one-shot consumption errors, and rejection of bodies on `GET`/`HEAD`. It still lacks `FormData`, `Blob`, typed-array conversion, `duplex`, body cloning/`bodyUsed`, standardized body consumption/error state, keepalive aggregate quotas, and complete response null-body handling. It also does not yet model the rule that `HEAD`/`CONNECT` responses have no body.
 
@@ -59,7 +59,7 @@ The Fetch Standard's `BodyInit`/body algorithms support strings, URL-encoded dat
 
 ### 4. Credentials, cookies, and authentication
 
-**Evidence:** [`FetchServices`](../src/services.rs) supplies cookie selection and storage decisions for browser-context requests. The controller calls those methods only when the credentials mode permits credentials. The engine itself has no durable cookie store. `FetchEnvironment` carries an optional `NetworkPartitionKey`, while the provider supplies the process-local cache partition key.
+**Evidence:** [`FetchServices`](../src/api/services.rs) supplies cookie selection and storage decisions for browser-context requests. The controller calls those methods only when the credentials mode permits credentials. The engine itself has no durable cookie store. `FetchEnvironment` carries an optional `NetworkPartitionKey`, while the provider supplies the process-local cache partition key.
 
 Fetch credentials include cookies, TLS client certificates, and HTTP authentication entries. The engine delegates cookie matching, persistence, and policy to its provider; it does not implement those rules. TLS client certificate selection and HTTP authentication entries are still absent. `omit`, `same-origin`, and `include` now determine whether provider credential methods are invoked.
 
@@ -67,7 +67,7 @@ This is a critical security gap: once a cookie store is added, it must be keyed 
 
 ### 5. CORS, no-CORS, and response filtering
 
-**Evidence:** [`CorsChecker::validate`](../crates/net/src/cors/validator.rs) enforces same-origin and simple CORS checks; [`InternalResponse::expose`](../crates/net/src/response.rs) constructs a filtered view before callers see headers or body. Preflight-required requests fail before transport.
+**Evidence:** [`CorsChecker::response_type`](../src/policy/cors.rs) enforces same-origin and simple CORS checks; [`InternalResponse::expose`](../src/api/response/view.rs) constructs a filtered view before callers see headers or body. Preflight-required requests fail before transport.
 
 The implementation still lacks preflight `OPTIONS`, a preflight cache, complete `Access-Control-Allow-*` parsing, cross-origin credentials, and per-hop redirect checks. `SameOrigin` fails closed on cross-origin results, and `NoCors` produces an opaque view, but the complete Fetch algorithms remain unfinished.
 
@@ -85,7 +85,7 @@ The standard's HTTP-redirect fetch algorithm validates the `Location` URL, rejec
 
 ### 7. HTTP cache and cache modes
 
-**Evidence:** [`ResponseCache::insert`](../crates/net/src/cache/mod.rs) stores only successful responses with a parsed `Cache-Control: max-age`; [`cache_key`](../crates/net/src/cache/mod.rs) includes method and normalized URL while ignoring fragments; [`fetch_stream`](../crates/net/src/controller.rs) treats cache modes as local lookup switches.
+**Evidence:** [`ResponseCache::insert`](../src/cache/memory.rs) stores only successful responses with a parsed `Cache-Control: max-age`; [`cache_key`](../src/cache/memory.rs) includes method and normalized URL while ignoring fragments; [`fetch_stream`](../src/engine/execute.rs) treats cache modes as local lookup switches.
 
 The Fetch HTTP-network-or-cache algorithm relies on an HTTP cache, cache partitioning, freshness, validators, and revalidation. The current cache is process-local and keyed by provider-supplied partition, method, and normalized URL, with fragment removal and a TTL derived from `max-age`. It does not vary by request headers or `Vary`, credentials, authorization, response tainting, or full cache policy. It does not process `Date`, `Expires`, `Age`, validators, `Vary`, invalidation, 304 responses, or heuristic freshness.
 
@@ -95,7 +95,7 @@ The Fetch HTTP-network-or-cache algorithm relies on an HTTP cache, cache partiti
 
 ### 8. Referrer, origin, and request context
 
-**Evidence:** [`Referrer::Client`](../crates/net/src/request.rs) now resolves through `FetchEnvironment.referrer`, and [`referrer_value`](../crates/net/src/request.rs) applies the configured reduction policy. [`Origin`](../crates/net/src/request.rs) is structured and can parse/serialize HTTP(S) tuple origins or represent opaque origins; `apply_fetch_headers` derives an internal `Origin` header when required.
+**Evidence:** [`Referrer::Client`](../src/api/request/definition.rs) now resolves through `FetchEnvironment.referrer`, and [`referrer_value`](../src/api/request/definition.rs) applies the configured reduction policy. [`Origin`](../src/api/request/origin.rs) is structured and can parse/serialize HTTP(S) tuple origins or represent opaque origins; `apply_fetch_headers` derives an internal `Origin` header when required.
 
 The referrer-policy enum and explicit/client referrer reduction logic are now present, and same-origin comparison is available for structured origins. The crate still does not derive same-site relationships, apply origin changes across redirects, or connect origin state to strict same-origin, credentials, CORS, and cookie behavior. Opaque origins are represented but are not integrated into those algorithms.
 
@@ -103,7 +103,7 @@ The referrer-policy enum and explicit/client referrer reduction logic are now pr
 
 ### 9. Security and browser integration hooks
 
-**Evidence:** Browser-context requests require [`FetchServices`](../src/services.rs) request and response decisions. Integrity, navigation fetch, and keepalive lifetime are rejected before transport. A provider may authorize destination/initiator context and return a service-worker network decision; an interception decision fails closed until worker responses are supported.
+**Evidence:** Browser-context requests require [`FetchServices`](../src/api/services.rs) request and response decisions. Integrity, navigation fetch, and keepalive lifetime are rejected before transport. A provider may authorize destination/initiator context and return a service-worker network decision; an interception decision fails closed until worker responses are supported.
 
 The Fetch Standard coordinates with other web-platform policies. Remaining integrations include:
 
@@ -124,19 +124,19 @@ The Fetch Standard coordinates with other web-platform policies. Remaining integ
 
 ### 10. Cancellation and fetch lifecycle
 
-**Evidence:** [`AbortSignal`](../crates/net/src/cancellation.rs#L10-L66) is an atomic boolean plus notification, and transport/response streaming maps it to `RequestError::Aborted` in [`ReqwestTransport::send`](../crates/net/src/transport/reqwest.rs#L89-L92) and [`ResponseBody::from_stream_with_signal`](../crates/net/src/response.rs#L79-L100).
+**Evidence:** [`AbortSignal`](../src/api/cancellation.rs) is an atomic boolean plus notification, and transport/response streaming maps it to `RequestError::Aborted` in [`ReqwestTransport::send`](../src/transport/reqwest.rs) and [`ResponseBody::from_stream_with_signal`](../src/api/response/body.rs).
 
 Basic cancellation is implemented, but Fetch controllers distinguish ongoing, terminated, and aborted states, preserve a serialized abort reason, cancel all fetch stages, and coordinate body/error handover. The crate has no abort reason, no distinction between termination and abort, no lifecycle callbacks, and no timing/reporting hooks. Cancellation during a redirect, cache revalidation, cookie processing, or body capture is not modeled as a Fetch algorithm state transition.
 
 ### 11. Response representation and Fetch API behavior
 
-**Evidence:** [`Response`](../src/response.rs) and [`StreamingResponse`](../src/response.rs) now expose filtered status, URL, headers, response type, and body. The private internal representation retains full transport metadata. The crate still exports Rust structs and a stream, not JavaScript Fetch interfaces.
+**Evidence:** [`Response`](../src/api/response/types.rs) and [`StreamingResponse`](../src/api/response/types.rs) now expose filtered status, URL, headers, response type, and body. The private internal representation retains full transport metadata. The crate still exports Rust structs and a stream, not JavaScript Fetch interfaces.
 
 Remaining response work includes full redirect URL-list accuracy, response constructors, body consumption helpers (`arrayBuffer`, `blob`, `bytes`, `formData`, `json`, `text`), body locking/disturbance, stream cloning, and complete network-error construction. The supported Rust subset and limitations are stated in `fetch-engine-contract.md`.
 
 ### 12. Scheduling and transport coverage
 
-**Evidence:** [`Request::transport_priority`](../crates/net/src/request.rs) maps Fetch low/auto/high priority to scheduler priority classes, but [`RequestScheduler::submit`](../crates/net/src/scheduler.rs) still receives `_priority` and never reorders admission. Reqwest is configured for Rustls, HTTP/2, compression, pooling, and a custom user agent in [`ReqwestTransport::new`](../crates/net/src/transport/reqwest.rs).
+**Evidence:** [`Request::transport_priority`](../src/api/request/definition.rs) maps Fetch low/auto/high priority to scheduler priority classes, but [`RequestScheduler::submit`](../src/scheduling/scheduler.rs) still receives `_priority` and never reorders admission. Reqwest is configured for Rustls, HTTP/2, compression, pooling, and a custom user agent in [`ReqwestTransport::new`](../src/transport/reqwest.rs).
 
 The semaphore provides concurrency admission, and Fetch priority now reaches the scheduler boundary, but it still has no effect on ordering. There are no per-origin/host limits, network partition-aware connection pools, connection timing records, proxy policy, offline mode, or HTTP/3 transport. These are not all required for a minimal HTTP(S) Fetch subset, but they are gaps from the browser-wide behavior described by the standard and the crate's stated browser boundary.
 
