@@ -74,6 +74,7 @@ pub(crate) fn with_cache_capture(
         },
     );
     let mut body = Body::from_stream(body);
+    body.set_content_type(response.headers.get(http::header::CONTENT_TYPE).cloned());
     if let Some(permit) = permit {
         body.attach_permit(permit);
     }

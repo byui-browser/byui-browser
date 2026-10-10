@@ -43,7 +43,7 @@ mod transport;
 mod tests;
 
 pub use api::{
-    body::{Blob, Body},
+    body::{Blob, Body, FormData, FormDataEntry},
     cancellation::{AbortController, AbortSignal},
     config::Config,
     error::RequestError,

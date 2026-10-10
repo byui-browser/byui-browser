@@ -37,6 +37,9 @@ impl RequestController {
                         .ok()
                         .and_then(|url| crate::Origin::from_url(&url).ok());
                     // Return information about the response to the devtools and other observers, but do not allow the body to be consumed until the caller polls it.
+                    let content_type = response.headers.get(http::header::CONTENT_TYPE).cloned();
+                    let mut body = Body::once_with_signal(response.body, request.signal.clone());
+                    body.set_content_type(content_type);
                     let mut internal = InternalResponse {
                         status: response.status,
                         status_text: response
@@ -52,7 +55,7 @@ impl RequestController {
                         request_mode: request.context.mode,
                         credentials_mode: request.context.credentials,
                         response_type: ResponseType::Basic,
-                        body: Body::once_with_signal(response.body, request.signal.clone()),
+                        body,
                         body_is_null: request.method() == reqwest::Method::HEAD
                             || matches!(response.status.as_u16(), 101 | 204 | 205 | 304),
                         from_cache: true,

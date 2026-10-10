@@ -86,7 +86,7 @@ The current crate already has useful foundations:
   URL-list state, and priority.
 - [`Headers`](../src/api/headers.rs) preserves ordered duplicate headers and has
   request, no-CORS request, response, immutable, and unrestricted guards.
-- [`Body`](../src/api/body.rs) is shared by requests and responses. It supports
+- [`Body`](../src/api/body/mod.rs) is shared by requests and responses. It supports
   replayable bytes, text, URL-encoded data, blob-like bytes, one-shot bytes,
   and one-shot streams; live response bodies retain the scheduler permit.
 - [`RequestController`](../src/engine/controller.rs) coordinates policy validation,
@@ -513,7 +513,7 @@ or terminate according to the documented state.
 
 ### 3.2 Support request BodyInit forms
 
-Extend [`Body`](../src/api/body.rs) constructors to cover the
+Extend [`Body`](../src/api/body/mod.rs) constructors to cover the
 engine-level equivalents of:
 
 - strings and UTF-8 text;
@@ -589,7 +589,7 @@ from the transport stream.
 Completed in the current slice:
 
 - [x] Added the shared public `Body` and `Blob` types in
-      `src/api/body.rs`. A body records nullness, known length, optional media
+      `src/api/body/mod.rs`. A body records nullness, known length, optional media
       type, replayability, used/completed/failed/aborted state, its one-shot
       source, and the scheduler permit retained by a live response stream.
 - [x] Removed `RequestBody`, `ResponseBody`, and `StreamingResponse`.
@@ -618,14 +618,17 @@ The following remains before Step 3 is fully complete:
       readers. Direct reads must respect locked and terminal states, internal
       transport/cache extraction must update the same state, and cancellation
       must distinguish abort, failure, cancellation, and dropping.
-- [ ] Add the missing `array_buffer`, `json`, and `form_data` consumption
-      methods, including typed parse errors distinct from transport, abort, and
-      body-state errors.
-- [ ] Add Fetch-compatible content-type/charset/BOM decoding via `encoding_rs`,
-      propagate response `Content-Type` metadata into every response body
-      construction path, and preserve that metadata through cloning and
-      buffering.
-- [ ] Add engine-owned multipart `FormData`, URL-encoded/multipart parsing,
+- [x] Added `array_buffer`, generic `json`, and `form_data` consumption
+      methods. JSON and form parsing now return typed parse errors distinct
+      from transport, abort, and body-state failures.
+- [x] Added charset- and BOM-aware text decoding through `encoding_rs` and
+      propagated `Content-Type` metadata from live transports, cache hits, and
+      cache-capture wrappers into response bodies.
+- [x] Added engine-owned `FormData` and `FormDataEntry` types. Text-only forms
+      serialize as URL-encoded bodies; file-bearing forms serialize as
+      multipart bodies; and both URL-encoded and supported multipart bodies
+      can be parsed through `Body::form_data`.
+- [ ] Complete binary-safe multipart parsing, RFC 5987 filename handling,
       typed-array convenience inputs, and a documented duplex capability.
 - [ ] Replace shared one-shot stream cloning with a bounded controlled tee;
       define branch backpressure, dropping, cancellation, cache capture, and
@@ -786,8 +789,8 @@ live or buffered body channel. Filtering, null-body handling, cancellation,
 cache capture, and scheduler-permit ownership now follow that single path.
 
 Update the scheduler-permit handling currently implemented by
-[`Body::into_parts`](../src/api/body.rs) and
-[`Body::attach_permit`](../src/api/body.rs) so it survives body
+[`Body::into_parts`](../src/api/body/mod.rs) and
+[`Body::attach_permit`](../src/api/body/mod.rs) so it survives body
 cloning, teeing, cancellation, and cache capture.
 
 ## 6. Implement Fetch response filtering and CORS integration

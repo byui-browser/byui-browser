@@ -10,9 +10,12 @@ rust-version.workspace = true
 [dependencies]
 common = { workspace = true }
 bytes = "1"
+encoding_rs = "0.8"
 futures-util = "0.3"
 http = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream", "gzip", "brotli", "deflate", "zstd"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 url = "2"
 

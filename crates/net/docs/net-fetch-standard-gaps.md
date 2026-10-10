@@ -52,7 +52,7 @@ The ordered multimap shape and mutation guards now support immutable exposed res
 
 ### 3. Request bodies and body lifecycle
 
-**Evidence:** [`Body`](../src/api/body.rs) now backs request input plus buffered and streaming response bodies. It supports replayable bytes, text, URL-encoded bytes, blob-like bytes, one-shot bytes, and one-shot streams, with known-length, content-type, locking, and consumption metadata.
+**Evidence:** [`Body`](../src/api/body/mod.rs) now backs request input plus buffered and streaming response bodies. It supports replayable bytes, text, URL-encoded bytes, blob-like bytes, one-shot bytes, and one-shot streams, with known-length, content-type, locking, and consumption metadata.
 
 The Fetch Standard's `BodyInit`/body algorithms support strings, URL-encoded data, `FormData`, `Blob`, `ArrayBuffer`/typed arrays, and streams. The crate now has streaming request input, text and URL-encoded constructors, blob-like bytes, automatic content-type metadata for supported constructors, known-length tracking, body-used errors, rejection of bodies on `GET`/`HEAD`, and null-body handling for `HEAD` plus the supported null-body status codes. It still lacks `FormData`, typed-array conversion, `duplex`, Fetch-compatible stream teeing, keepalive aggregate quotas, and the Fetch rule that a successful `CONNECT` response has no body.
 
@@ -125,7 +125,7 @@ The Fetch Standard coordinates with other web-platform policies. Remaining integ
 
 ### 10. Cancellation and fetch lifecycle
 
-**Evidence:** [`AbortSignal`](../src/api/cancellation.rs) is an atomic boolean plus notification, and transport/response streaming maps it to `RequestError::Aborted` in [`ReqwestTransport::send`](../src/transport/reqwest.rs) and [`Body::from_stream_with_signal`](../src/api/body.rs).
+**Evidence:** [`AbortSignal`](../src/api/cancellation.rs) is an atomic boolean plus notification, and transport/response streaming maps it to `RequestError::Aborted` in [`ReqwestTransport::send`](../src/transport/reqwest.rs) and [`Body::from_stream_with_signal`](../src/api/body/mod.rs).
 
 Basic cancellation is implemented, but Fetch controllers distinguish ongoing, terminated, and aborted states, preserve a serialized abort reason, cancel all fetch stages, and coordinate body/error handover. The crate has no abort reason, no distinction between termination and abort, no lifecycle callbacks, and no timing/reporting hooks. Cancellation during a redirect, cache revalidation, cookie processing, or body capture is not modeled as a Fetch algorithm state transition.
 

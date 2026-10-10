@@ -100,9 +100,12 @@ impl Transport for ReqwestTransport {
             let body_is_null = is_head || matches!(status.as_u16(), 101 | 204 | 205 | 304);
             let headers = response.headers().clone();
             let response_url = response.url().to_string();
+            let content_type = headers.get(http::header::CONTENT_TYPE).cloned();
             let body = response
                 .bytes_stream()
                 .map(|chunk| chunk.map_err(|error| RequestError::Transport(error.to_string())));
+            let mut body = Body::from_stream_with_signal(body, signal);
+            body.set_content_type(content_type);
 
             Ok(InternalResponse {
                 status,
@@ -115,7 +118,7 @@ impl Transport for ReqwestTransport {
                 request_mode: request.context.mode,
                 credentials_mode: request.context.credentials,
                 response_type: ResponseType::Basic,
-                body: Body::from_stream_with_signal(body, signal),
+                body,
                 body_is_null,
                 from_cache: false,
                 cookie_headers_processed: false,

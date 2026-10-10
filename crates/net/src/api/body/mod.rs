@@ -14,35 +14,18 @@ use reqwest::Body as ReqwestBody;
 
 use crate::api::{Headers, cancellation::AbortSignal, error::RequestError};
 
+mod blob;
+mod consume;
+mod form_data;
+mod metadata;
+#[cfg(test)]
+mod tests;
+
+pub use blob::Blob;
+pub use form_data::{FormData, FormDataEntry};
+
 /// A sendable stream used by a live Fetch body.
 pub(crate) type BoxedBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, RequestError>> + Send>>;
-
-/// Bytes together with an optional media type.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Blob {
-    bytes: Vec<u8>,
-    media_type: Option<HeaderValue>,
-}
-
-impl Blob {
-    /// Creates a byte payload with an optional media type.
-    pub fn new(bytes: impl Into<Vec<u8>>, media_type: Option<HeaderValue>) -> Self {
-        Self {
-            bytes: bytes.into(),
-            media_type,
-        }
-    }
-
-    /// Returns the payload bytes.
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    /// Returns the payload media type, when supplied.
-    pub fn media_type(&self) -> Option<&HeaderValue> {
-        self.media_type.as_ref()
-    }
-}
 
 enum BodySource {
     Null,
@@ -183,7 +166,18 @@ impl Body {
 
     /// Creates a replayable body from blob-like bytes and media type.
     pub fn from_blob(blob: Blob) -> Self {
-        Self::from_bytes_with_content_type(blob.bytes, blob.media_type)
+        let (bytes, media_type) = blob.into_parts();
+        Self::from_bytes_with_content_type(bytes, media_type)
+    }
+
+    /// Creates a replayable URL-encoded or multipart body from form data.
+    ///
+    /// Text-only forms use `application/x-www-form-urlencoded`; a form with a
+    /// file entry uses a deterministic multipart boundary and preserves the
+    /// file media type where supplied.
+    pub fn from_form_data(form: FormData) -> Self {
+        let (bytes, content_type) = form_data::serialize(form);
+        Self::from_bytes_with_content_type(bytes, Some(content_type))
     }
 
     /// Creates a one-shot byte body. Clones share its consumption state.
@@ -332,6 +326,14 @@ impl Body {
         Ok(())
     }
 
+    /// Assigns response media type derived from transport or cache headers.
+    pub(crate) fn set_content_type(&mut self, content_type: Option<HeaderValue>) {
+        self.state
+            .lock()
+            .expect("body state lock should not be poisoned")
+            .content_type = content_type;
+    }
+
     /// Returns whether any reader has started consuming this body.
     pub fn is_used(&self) -> bool {
         self.state
@@ -346,36 +348,6 @@ impl Body {
             .lock()
             .expect("body state lock should not be poisoned")
             .locked
-    }
-
-    /// Consumes this body into owned bytes.
-    pub async fn bytes(mut self) -> Result<Vec<u8>, RequestError> {
-        {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| RequestError::BodyAlreadyUsed)?;
-            if state.used || state.locked {
-                return Err(RequestError::BodyAlreadyUsed);
-            }
-            state.locked = true;
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = self.next().await {
-            bytes.extend_from_slice(&chunk?);
-        }
-        Ok(bytes)
-    }
-
-    /// Consumes this body as UTF-8 text, replacing malformed byte sequences.
-    pub async fn text(self) -> Result<String, RequestError> {
-        Ok(String::from_utf8_lossy(&self.bytes().await?).into_owned())
-    }
-
-    /// Consumes this body as a blob-like byte payload.
-    pub async fn blob(self) -> Result<Blob, RequestError> {
-        let media_type = self.content_type();
-        Ok(Blob::new(self.bytes().await?, media_type))
     }
 
     /// Transfers the source to Reqwest for a request send.
@@ -508,76 +480,5 @@ impl Stream for Body {
                 Poll::Ready(Some(Err(error)))
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io;
-
-    use futures_util::stream;
-
-    use super::*;
-
-    #[test]
-    fn replayable_clones_have_independent_consumption_state() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let body = Body::from_bytes(b"replayable".to_vec());
-        let clone = body.clone();
-
-        assert_eq!(runtime.block_on(body.bytes()).unwrap(), b"replayable");
-        assert_eq!(runtime.block_on(clone.bytes()).unwrap(), b"replayable");
-    }
-
-    #[test]
-    fn one_shot_clones_share_consumption_state() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let body = Body::one_shot_bytes(b"once".to_vec());
-        let clone = body.clone();
-
-        assert!(!body.is_locked());
-        assert_eq!(runtime.block_on(clone.bytes()).unwrap(), b"once");
-        assert!(body.is_locked());
-        assert!(body.is_used());
-        assert!(matches!(
-            runtime.block_on(body.bytes()),
-            Err(RequestError::BodyAlreadyUsed)
-        ));
-    }
-
-    #[test]
-    fn body_helpers_preserve_text_and_blob_metadata() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let text = Body::from_text("hello");
-        assert_eq!(runtime.block_on(text.text()).unwrap(), "hello");
-
-        let blob = Blob::new(
-            b"blob".to_vec(),
-            Some(HeaderValue::from_static("application/octet-stream")),
-        );
-        let blob = runtime.block_on(Body::from_blob(blob).blob()).unwrap();
-        assert_eq!(blob.bytes(), b"blob");
-        assert_eq!(
-            blob.media_type(),
-            Some(&HeaderValue::from_static("application/octet-stream"))
-        );
-    }
-
-    #[test]
-    fn response_stream_failure_marks_the_shared_body_used() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let body = Body::stream(stream::once(async {
-            Err(io::Error::other("stream failure"))
-        }));
-        let clone = body.clone();
-
-        assert!(matches!(
-            runtime.block_on(clone.bytes()),
-            Err(RequestError::Transport(_))
-        ));
-        assert!(matches!(
-            runtime.block_on(body.bytes()),
-            Err(RequestError::BodyAlreadyUsed)
-        ));
     }
 }

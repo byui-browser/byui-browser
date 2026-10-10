@@ -20,6 +20,7 @@ use crate::HeaderGuard;
 /// | `SchedulerClosed` | Use a live controller; the request body was not sent. |
 /// | `NetworkError` | A cache-only miss; retry after cache state changes or choose another cache mode. No body was consumed. |
 /// | `BodyAlreadyConsumed` | The request body was spent by a prior attempt; create a fresh body. |
+/// | `BodyDecode`, `BodyJson`, `BodyFormData` | The body was read but could not be decoded or parsed; retry with a fresh response body. |
 /// | `CorsDenied`, `SameOriginViolation`, `RedirectFailure` | Internal headers arrived; the internal response body is discarded. The request body may have been sent. |
 /// | `Transport`, `Aborted` | May occur before public headers or during streaming. The request body may have been sent; a delivered response stream is spent. |
 #[derive(Debug)]
@@ -72,6 +73,12 @@ pub enum RequestError {
     BodyAlreadyConsumed,
     /// A body consumption helper was called after another reader started.
     BodyAlreadyUsed,
+    /// Body bytes could not be decoded using the selected character encoding.
+    BodyDecode(String),
+    /// Body bytes are not valid JSON for the requested Rust type.
+    BodyJson(String),
+    /// Body bytes are not valid supported form data.
+    BodyFormData(String),
     /// The keepalive body exceeds the configured byte quota.
     KeepaliveBodyTooLarge { limit: u64 },
     /// The scheduler was shut down before the request could run.
@@ -109,6 +116,9 @@ impl std::fmt::Display for RequestError {
             Self::BodyNotAllowed(method) => write!(f, "A request body is not allowed for {method}"),
             Self::BodyAlreadyConsumed => f.write_str("Request body has already been consumed"),
             Self::BodyAlreadyUsed => f.write_str("Body has already been used"),
+            Self::BodyDecode(error) => write!(f, "Body decoding failed: {error}"),
+            Self::BodyJson(error) => write!(f, "Body JSON parsing failed: {error}"),
+            Self::BodyFormData(error) => write!(f, "Body form-data parsing failed: {error}"),
             Self::KeepaliveBodyTooLarge { limit } => {
                 write!(f, "Keepalive request body exceeds {limit} bytes")
             }
