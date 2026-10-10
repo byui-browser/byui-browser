@@ -618,28 +618,50 @@ The following remains before Step 3 is fully complete:
       readers. Direct reads must respect locked and terminal states, internal
       transport/cache extraction must update the same state, and cancellation
       must distinguish abort, failure, cancellation, and dropping.
+- [ ] Make nullness authoritative in `Body` rather than duplicating it in the
+      separate `InternalResponse::body_is_null` flag. Ensure all response
+      construction, filtering, caching, and buffering paths use the same null
+      body representation.
+- [ ] Preserve known response body length when available, including
+      `Content-Length` from live transport responses and cached responses, and
+      retain that metadata through body wrapping and cache capture.
+- [ ] Decide whether completion, failure, abortion, and cancellation state is
+      intentionally internal or needs documented public accessors. The public
+      body-state contract must match the state tracked by the implementation.
 - [x] Added `array_buffer`, generic `json`, and `form_data` consumption
       methods. JSON and form parsing now return typed parse errors distinct
       from transport, abort, and body-state failures.
 - [x] Added charset- and BOM-aware text decoding through `encoding_rs` and
       propagated `Content-Type` metadata from live transports, cache hits, and
       cache-capture wrappers into response bodies.
+- [ ] Define JSON-specific decoding semantics independently of generic text
+      decoding, including BOMs, malformed UTF-8, and conflicting or non-UTF-8
+      `Content-Type` charset declarations, and add focused tests.
 - [x] Added engine-owned `FormData` and `FormDataEntry` types. Text-only forms
       serialize as URL-encoded bodies; file-bearing forms serialize as
       multipart bodies; and both URL-encoded and supported multipart bodies
       can be parsed through `Body::form_data`.
 - [ ] Complete binary-safe multipart parsing, RFC 5987 filename handling,
       typed-array convenience inputs, and a documented duplex capability.
+- [ ] Harden multipart serialization with collision-safe boundaries, escaped
+      field names and filenames, CR/LF and quote validation, and adversarial
+      serializer/parser round-trip tests.
 - [ ] Replace shared one-shot stream cloning with a bounded controlled tee;
       define branch backpressure, dropping, cancellation, cache capture, and
       scheduler-permit ownership rules. Reject cloning of disturbed, locked,
       failed, aborted, canceled, or already-consumed bodies.
+- [ ] Define the relationship between the infallible Rust `Clone` implementation
+      and Fetch's fallible body-clone rules. Remove, restrict, or clearly mark
+      compatibility cloning where invalid body states must be rejected.
 - [ ] Add a complete body-state transition matrix, including direct stream
       readers, helper consumption, transport handoff, cache extraction,
       dropping, every null-body source and response status, and terminal
       failed/aborted/canceled states.
 - [ ] Add a distinct canceled state and define how cancellation differs from
       abort, transport failure, and ordinary body dropping.
+- [ ] Define and test the `CONNECT` response null-body path, or explicitly
+      document why the browser-facing rejection of `CONNECT` makes that Fetch
+      case unreachable in this engine boundary.
 - [ ] Construct explicit null-body network-error responses when the later
       response/CORS algorithms create `ResponseType::Error`, rather than
       exposing an empty but readable body or returning only a generic error.
