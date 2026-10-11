@@ -75,7 +75,7 @@ fn incomplete_stream_forwards_error_and_is_not_cached() {
     server.join();
 
     assert_eq!(partial, b"short");
-    assert!(matches!(retry.0, Some(RequestError::Decode(_))));
+    assert!(matches!(retry.0, Some(RequestError::Transport(_))));
     assert!(!retry.1.from_cache);
     assert_eq!(runtime().block_on(retry.1.body.bytes()).unwrap(), b"valid");
     assert_eq!(hits.load(Ordering::SeqCst), 2);
