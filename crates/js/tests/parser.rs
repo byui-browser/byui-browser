@@ -300,6 +300,18 @@ fn malformed_sources_return_errors_without_panicking() {
         "while (x) function f() {}",
         "function f(a, a) {}",
         "1 /* unclosed",
+        "a.",
+        "a.1",
+        "a.'b'",
+        "a..b",
+        "a[",
+        "a[]",
+        "a[1",
+        "a[1,2]",
+        ".a",
+        "[1]",
+        "a.b() = 1",
+        "a.b + 1 = 2",
     ] {
         let error = parse(source).expect_err(source);
         assert!(!error.message.is_empty());
@@ -344,6 +356,8 @@ fn long_flat_expression_chains_are_bounded() {
         vec!["1"; 10_000].join("+"),
         vec!["a"; 10_000].join("||"),
         format!("f{}", "()".repeat(10_000)),
+        format!("o{}", ".x".repeat(10_000)),
+        format!("o{}", "[0]".repeat(10_000)),
     ] {
         assert!(parse(&source).unwrap_err().message.contains("nesting"));
     }

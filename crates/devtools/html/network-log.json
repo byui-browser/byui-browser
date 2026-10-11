@@ -1,0 +1,28 @@
+{
+  "requests": [
+    {
+      "name": "https://example.test/",
+      "status": 200,
+      "type": "document",
+      "time": 42
+    },
+    {
+      "name": "https://example.test/styles.css",
+      "status": 200,
+      "type": "stylesheet",
+      "time": 18
+    },
+    {
+      "name": "https://example.test/app.js",
+      "status": 200,
+      "type": "script",
+      "time": 31
+    },
+    {
+      "name": "https://example.test/logo.png",
+      "status": 404,
+      "type": "image",
+      "time": 12
+    }
+  ]
+}

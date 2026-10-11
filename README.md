@@ -48,6 +48,7 @@ rustup update stable
 
 ```bash
 make build                 # build the workspace (debug)
+make run                   # run the native shell for the current OS
 make test                  # unit tests across the workspace
 make test html             # tests for a single crate
 cargo test -p html -- --ignored   # backlog: contract tests not yet implemented
@@ -60,6 +61,11 @@ The binary entry point:
 ```bash
 cargo run -p browser
 ```
+
+`make run` selects the platform shell automatically. The macOS shell currently
+renders the startup HTML page, parses its CSS, and executes its JavaScript
+startup script. Linux and Windows shells are not implemented yet, so the
+command reports that limitation instead of running the wrong binary.
 
 ## Development workflow
 

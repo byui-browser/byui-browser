@@ -77,7 +77,10 @@ pub fn register_fetch(realm: &mut Realm, controller: Arc<RequestController>) -> 
 // types, names, and module layout however your crate's public API needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Element {
+    /// Index of this element in its document's DOM arena.
     pub node: NodeId,
+    /// The element's HTML local name, normalized to ASCII lowercase.
+    pub local_name: String,
     /// Value of the `id` attribute, if any.
     pub id_attr: Option<String>,
 }
@@ -92,40 +95,47 @@ pub struct Document {
 impl Document {
     /// An empty document.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            elements: Vec::new(),
+            source_document: Some(HTMLDocument::new()),
+        }
     }
 
     /// Creates a script-visible document from the HTML document tree.
     pub fn from_html_document(document: &HTMLDocument) -> Self {
-        fn collect(document: &HTMLDocument, parent: html::NodeId, elements: &mut Vec<Element>) {
-            let Some(node) = document.node(parent) else {
-                return;
-            };
-
-            for child in &node.children {
-                if let Some(node) = document.node(*child) {
-                    if let NodeKind::Element(element) = &node.kind {
-                        let id_attr = element
-                            .attributes
-                            .iter()
-                            .find(|attribute| attribute.name == "id")
-                            .map(|attribute| attribute.value.clone());
-                        elements.push(Element {
-                            node: NodeId::new(child.index() as u32),
-                            id_attr,
-                        });
-                    }
-                    collect(document, *child, elements);
-                }
-            }
-        }
-
-        let mut elements = Vec::new();
-        collect(document, document.root, &mut elements);
         Self {
-            elements,
+            elements: collect_elements(document),
             source_document: Some(document.clone()),
         }
+    }
+
+    /// Implements `document.createElement(localName)` for an HTML document.
+    ///
+    /// The returned element is detached until a later tree mutation appends
+    /// it. Names are validated according to the DOM Standard and normalized
+    /// to ASCII lowercase. Invalid names return `InvalidCharacterError`.
+    /// This Rust API owns the created node in the document's private arena.
+    /// JavaScript method bindings and custom-element options are not supported.
+    pub fn create_element(&mut self, local_name: &str) -> JsResult<Element> {
+        let document = self.source_document.get_or_insert_with(HTMLDocument::new);
+
+        let node = document
+            .create_element(local_name)
+            .map_err(|error| JsError::new(error.to_string()))?;
+
+        let element = match document.node(node) {
+            Some(html::Node {
+                kind: NodeKind::Element(element),
+                ..
+            }) => element,
+            _ => return Err(JsError::new("created node is not an element")),
+        };
+
+        Ok(Element {
+            node: NodeId::new(node.index() as u32),
+            local_name: element.name.clone(),
+            id_attr: None,
+        })
     }
 
     /// `document.getElementById(id)`.
@@ -134,6 +144,20 @@ impl Document {
         self.elements
             .iter()
             .find(|element| element.id_attr.as_deref() == Some(id))
+    }
+
+    /// Removes an element node from this document's tree.
+    ///
+    /// The node and its descendants remain allocated and retain their stable
+    /// IDs, but they are no longer reachable from the document root. Removing
+    /// a detached node, the document root, or an invalid node ID is a no-op.
+    pub fn remove(&mut self, node: NodeId) {
+        let Some(document) = self.source_document.as_mut() else {
+            return;
+        };
+
+        document.remove(html::NodeId(node.index() as usize));
+        self.elements = collect_elements(document);
     }
 
     /// Returns a static snapshot of matching element descendants in tree order.
@@ -146,10 +170,10 @@ impl Document {
     /// combinations of those forms, and comma-separated selector lists.
     pub fn query_selector_all(&self, selector: &str) -> Result<Vec<NodeId>, SelectorError> {
         let selectors = parse_selector_list(selector)?;
-        let Some(document) = &self.source_document else {
-            return Ok(Vec::new());
-        };
         let mut matches = Vec::new();
+        let Some(document) = &self.source_document else {
+            return Ok(matches);
+        };
 
         fn collect(
             document: &HTMLDocument,
@@ -176,7 +200,135 @@ impl Document {
         collect(document, document.root, &selectors, &mut matches);
         Ok(matches)
     }
+
+    /// Appends an existing node from this document to the document's children.
+    ///
+    /// Returns `child` after a successful append, matching the DOM
+    /// `Node.appendChild()` return value. If `child` already has a parent, it
+    /// is moved from that parent before being appended. The document hierarchy
+    /// rules are checked before changing the tree; invalid insertions return a
+    /// [`DomException`]. The current DOM model supports existing node IDs only;
+    /// it does not yet provide `DocumentFragment` or JavaScript `Node` values.
+    pub fn append_child(&mut self, child: NodeId) -> Result<NodeId, DomException> {
+        if self.source_document.is_none() {
+            self.source_document = Some(HTMLDocument::new());
+        }
+        let source = self.source_document.as_ref().unwrap();
+        let root = source.root;
+        let child_id = html::NodeId(child.index() as usize);
+        let child_node = source.node(child_id).ok_or(DomException::NotFoundError)?;
+
+        if child_id == root || matches!(child_node.kind, NodeKind::Document) {
+            return Err(DomException::HierarchyRequestError);
+        }
+
+        match &child_node.kind {
+            NodeKind::Comment(_) | NodeKind::Element(_) | NodeKind::Doctype { .. } => {}
+            NodeKind::Text(_) => return Err(DomException::HierarchyRequestError),
+            NodeKind::Document => return Err(DomException::HierarchyRequestError),
+        }
+
+        let root_node = source
+            .node(root)
+            .ok_or(DomException::HierarchyRequestError)?;
+        if !matches!(root_node.kind, NodeKind::Document) {
+            return Err(DomException::HierarchyRequestError);
+        }
+
+        for sibling in root_node
+            .children
+            .iter()
+            .copied()
+            .filter(|sibling| *sibling != child_id)
+        {
+            let Some(sibling) = source.node(sibling) else {
+                return Err(DomException::HierarchyRequestError);
+            };
+            match (&child_node.kind, &sibling.kind) {
+                (NodeKind::Element(_), NodeKind::Element(_))
+                | (NodeKind::Doctype { .. }, NodeKind::Doctype { .. })
+                | (NodeKind::Doctype { .. }, NodeKind::Element(_)) => {
+                    return Err(DomException::HierarchyRequestError);
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(parent) = child_node.parent {
+            let Some(parent_node) = source.node(parent) else {
+                return Err(DomException::NotFoundError);
+            };
+            if !parent_node.children.contains(&child_id) {
+                return Err(DomException::NotFoundError);
+            }
+        }
+
+        let document = self.source_document.as_mut().unwrap();
+        if let Some(parent) = document.nodes[child_id.0].parent {
+            let siblings = &mut document.nodes[parent.0].children;
+            let Some(position) = siblings.iter().position(|sibling| *sibling == child_id) else {
+                return Err(DomException::NotFoundError);
+            };
+            siblings.remove(position);
+        }
+        document.nodes[child_id.0].parent = Some(root);
+        document.nodes[root.0].children.push(child_id);
+        self.elements = collect_elements(document);
+
+        Ok(child)
+    }
 }
+
+fn collect_elements(document: &HTMLDocument) -> Vec<Element> {
+    fn collect(document: &HTMLDocument, parent: html::NodeId, elements: &mut Vec<Element>) {
+        let Some(node) = document.node(parent) else {
+            return;
+        };
+
+        for child in &node.children {
+            if let Some(node) = document.node(*child) {
+                if let NodeKind::Element(element) = &node.kind {
+                    let id_attr = element
+                        .attributes
+                        .iter()
+                        .find(|attribute| attribute.name == "id")
+                        .map(|attribute| attribute.value.clone());
+                    elements.push(Element {
+                        node: NodeId::new(child.index() as u32),
+                        local_name: element.name.clone(),
+                        id_attr,
+                    });
+                }
+                collect(document, *child, elements);
+            }
+        }
+    }
+
+    let mut elements = Vec::new();
+    collect(document, document.root, &mut elements);
+    elements
+}
+
+/// A DOM exception returned by an invalid `Document::append_child` operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomException {
+    /// The insertion would violate the document's node hierarchy constraints.
+    HierarchyRequestError,
+    /// The node ID does not refer to a node in this document's arena.
+    NotFoundError,
+}
+
+impl std::fmt::Display for DomException {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::HierarchyRequestError => "HierarchyRequestError",
+            Self::NotFoundError => "NotFoundError",
+        };
+        formatter.write_str(name)
+    }
+}
+
+impl std::error::Error for DomException {}
 
 /// Error returned when a `query_selector_all` selector is invalid or unsupported.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,9 +507,9 @@ impl TimerQueue {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsoleSink, fetch, print, register_fetch, register_print};
+    use super::{ConsoleSink, DomException, fetch, print, register_fetch, register_print};
     use common::ids::NodeId;
-    use html::parse_raw_html;
+    use html::{Attribute, ElementData, HTMLDocument, Namespace, NodeKind, parse_raw_html};
     use js::{Realm, Value};
     use net::{Config, RequestController};
     use std::sync::{Arc, Mutex};
@@ -458,6 +610,81 @@ mod tests {
     }
 
     #[test]
+    fn create_element_lowercases_and_returns_a_detached_html_element() {
+        let mut document = super::Document::new();
+
+        let element = document.create_element("CuStOm-Widget").unwrap();
+
+        assert_eq!(element.local_name, "custom-widget");
+        assert_eq!(element.node.index(), 1);
+        assert_eq!(element.id_attr, None);
+    }
+
+    #[test]
+    fn create_element_rejects_invalid_local_names() {
+        let mut document = super::Document::new();
+
+        for name in ["", "1div", "div name", "div/name", "div>"] {
+            assert_eq!(
+                document.create_element(name).unwrap_err().to_string(),
+                "InvalidCharacterError",
+                "expected {name:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn created_elements_preserve_parsed_nodes_and_stay_out_of_queries() {
+        let mut document = super::Document::from_html_document(&parse_raw_html(
+            "<div id='existing'></div>".into(),
+        ));
+        let first = document.create_element("DIV").unwrap();
+        let second = document.create_element("span").unwrap();
+        assert_eq!(first.node, NodeId::new(2));
+        assert_eq!(second.node, NodeId::new(3));
+        assert_eq!(
+            document.query_selector_all("*").unwrap(),
+            vec![NodeId::new(1)]
+        );
+        assert_eq!(
+            document.get_element_by_id("existing").unwrap().node,
+            NodeId::new(1)
+        );
+        let source = document.source_document.as_ref().unwrap();
+        assert_eq!(source.node(html::NodeId(2)).unwrap().parent, None);
+        assert_eq!(source.node(html::NodeId(3)).unwrap().parent, None);
+    }
+
+    #[test]
+    fn document_remove_detaches_the_node_from_queries() {
+        let html_document = parse_raw_html(
+            "<section><span id='target'></span></section><p id='other'></p>".to_owned(),
+        );
+        let mut document = super::Document::from_html_document(&html_document);
+        let section = NodeId::new(1);
+
+        document.remove(section);
+
+        assert_eq!(document.get_element_by_id("target"), None);
+        assert_eq!(
+            document.get_element_by_id("other").unwrap().node,
+            NodeId::new(3)
+        );
+        assert_eq!(document.query_selector_all("span").unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn document_remove_of_detached_or_root_nodes_is_a_no_op() {
+        let html_document = parse_raw_html("<div id='target'></div>".to_owned());
+        let mut document = super::Document::from_html_document(&html_document);
+
+        document.remove(NodeId::new(99));
+        document.remove(NodeId::new(0));
+
+        assert!(document.get_element_by_id("target").is_some());
+    }
+
+    #[test]
     fn document_query_selector_all_returns_matching_descendants_in_tree_order() {
         let html_document = parse_raw_html(
             "<main><article class='post target'><span class='target'></span></article><p class='target'></p></main>"
@@ -487,6 +714,96 @@ mod tests {
         assert!(document.query_selector_all("").is_err());
         assert!(document.query_selector_all("div,").is_err());
         assert_eq!(document.query_selector_all(".missing").unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn document_append_child_adds_a_detached_element_and_returns_its_id() {
+        let mut html_document = HTMLDocument::new();
+        let html_child = html_document.push_node(
+            NodeKind::Element(ElementData {
+                name: "main".into(),
+                namespace: Namespace::Html,
+                attributes: vec![Attribute {
+                    name: "id".into(),
+                    value: "appended".into(),
+                }],
+            }),
+            None,
+        );
+        let mut document = super::Document::from_html_document(&html_document);
+        let child = NodeId::new(html_child.index() as u32);
+
+        assert_eq!(document.append_child(child), Ok(child));
+        let source = document.source_document.as_ref().unwrap();
+        assert_eq!(source.node(source.root).unwrap().children, vec![html_child]);
+        assert_eq!(document.get_element_by_id("appended").unwrap().node, child);
+    }
+
+    #[test]
+    fn document_append_child_moves_a_child_from_its_old_parent() {
+        let mut html_document = HTMLDocument::new();
+        let element = html_document.push_node(
+            NodeKind::Element(ElementData {
+                name: "main".into(),
+                namespace: Namespace::Html,
+                attributes: Vec::new(),
+            }),
+            None,
+        );
+        let comment = html_document.push_node(NodeKind::Comment("move me".into()), None);
+        html_document.append_child(html_document.root, element);
+        html_document.append_child(element, comment);
+        let mut document = super::Document::from_html_document(&html_document);
+        let comment_id = NodeId::new(comment.index() as u32);
+
+        assert_eq!(document.append_child(comment_id), Ok(comment_id));
+        let source = document.source_document.as_ref().unwrap();
+        assert_eq!(source.node(element).unwrap().children, Vec::new());
+        assert_eq!(
+            source.node(source.root).unwrap().children,
+            vec![element, comment]
+        );
+        assert_eq!(source.node(comment).unwrap().parent, Some(source.root));
+    }
+
+    #[test]
+    fn document_append_child_rejects_invalid_hierarchy_without_mutating_the_tree() {
+        let mut html_document = HTMLDocument::new();
+        let existing_element = html_document.push_node(
+            NodeKind::Element(ElementData {
+                name: "main".into(),
+                namespace: Namespace::Html,
+                attributes: Vec::new(),
+            }),
+            None,
+        );
+        let second_element = html_document.push_node(
+            NodeKind::Element(ElementData {
+                name: "aside".into(),
+                namespace: Namespace::Html,
+                attributes: Vec::new(),
+            }),
+            None,
+        );
+        html_document.append_child(html_document.root, existing_element);
+        let mut document = super::Document::from_html_document(&html_document);
+        let before = document.source_document.clone();
+
+        assert_eq!(
+            document.append_child(NodeId::new(second_element.index() as u32)),
+            Err(DomException::HierarchyRequestError)
+        );
+        assert_eq!(document.source_document, before);
+    }
+
+    #[test]
+    fn document_append_child_reports_unknown_node_ids() {
+        let mut document = super::Document::new();
+
+        assert_eq!(
+            document.append_child(NodeId::new(99)),
+            Err(DomException::NotFoundError)
+        );
     }
 
     #[test]

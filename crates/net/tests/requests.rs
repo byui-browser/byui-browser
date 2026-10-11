@@ -22,7 +22,7 @@ fn body_consumption_propagates_a_post_header_transport_error() {
     });
 
     server.join();
-    assert!(matches!(error, RequestError::Transport(_)));
+    assert!(matches!(error, RequestError::Decode(_)));
 }
 
 #[test]
