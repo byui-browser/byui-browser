@@ -58,7 +58,10 @@ pub fn fetch(controller: &RequestController, arguments: &[Value]) -> JsResult<Va
         .block_on(controller.fetch(Request::get(url)))
         .map_err(|error| JsError::new(error.to_string()))?;
 
-    let body = String::from_utf8(response.body)
+    let body = runtime
+        .block_on(response.body.bytes())
+        .map_err(|error| JsError::new(error.to_string()))?;
+    let body = String::from_utf8(body)
         .map_err(|_| JsError::new("fetch() response body is not valid UTF-8"))?;
     Ok(Value::String(body))
 }

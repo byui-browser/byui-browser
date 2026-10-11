@@ -9,18 +9,16 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use crate::{
-    error::RequestError, request::PreparedRequest, response::StreamingResponse,
+    api::{error::RequestError, request::PreparedRequest, response::InternalResponse},
     transport::Transport,
 };
 
 /// Relative importance assigned to a request by the network scheduler.
 ///
-/// The ordering leaves room for document-aware scheduling. The current
-/// scheduler records the value but does not yet use it to reorder requests.
+/// The current scheduler records the value but does not yet use it to reorder
+/// requests.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) enum RequestPriority {
-    /// Background work that may yield to user-visible requests.
-    Background,
     /// Low-urgency work.
     Low,
     #[default]
@@ -28,8 +26,6 @@ pub(crate) enum RequestPriority {
     Normal,
     /// User-visible work that should be preferred when scheduling is added.
     High,
-    /// The most urgent request class.
-    Highest,
 }
 
 #[derive(Clone)]
@@ -56,20 +52,25 @@ impl RequestScheduler {
 
     /// Admits a request and keeps its permit with the response body.
     ///
-    /// The permit is deliberately transferred into [`ResponseBody`](crate::ResponseBody)
+    /// The permit is deliberately transferred into [`Body`](crate::Body)
     /// after response headers arrive. It is released only when the body is
     /// fully consumed or dropped.
     pub(crate) async fn submit(
         &self,
         request: PreparedRequest,
         _priority: RequestPriority,
-    ) -> Result<StreamingResponse, RequestError> {
-        let permit = self
-            .permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| RequestError::SchedulerClosed)?;
+    ) -> Result<InternalResponse, RequestError> {
+        if request.request.signal.is_aborted() {
+            return Err(RequestError::Aborted);
+        }
+        let permit = self.permits.clone().acquire_owned();
+        let permit = tokio::select! {
+            _ = request.request.signal.cancelled() => return Err(RequestError::Aborted),
+            permit = permit => permit.map_err(|_| RequestError::SchedulerClosed)?,
+        };
+        if request.request.signal.is_aborted() {
+            return Err(RequestError::Aborted);
+        }
         let mut response = self.transport.send(request).await?;
         response.body.attach_permit(permit);
         Ok(response)
