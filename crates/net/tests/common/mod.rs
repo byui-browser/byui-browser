@@ -7,19 +7,14 @@ use std::{
     thread,
 };
 
-use futures_util::StreamExt;
-use net::{RequestError, StreamingResponse};
+use net::{RequestError, Response};
 
 pub fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().expect("Tokio runtime should initialize")
 }
 
-pub async fn collect_body(mut response: StreamingResponse) -> Result<Vec<u8>, RequestError> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.body.next().await {
-        body.extend_from_slice(&chunk?);
-    }
-    Ok(body)
+pub async fn collect_body(response: Response) -> Result<Vec<u8>, RequestError> {
+    response.body.bytes().await
 }
 
 pub struct TestServer {
@@ -89,4 +84,25 @@ pub fn read_request(stream: &mut TcpStream) -> String {
         }
     }
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[test]
+#[ignore = "For demonstration only."]
+pub fn fetch_image() {
+    // Fetches an image using the net crate and saves it to a file.
+    let url = "https://www.rust-lang.org/logos/rust-logo-512x512.png";
+    let runtime = runtime();
+    let body = runtime.block_on(async {
+        let controller = net::RequestController::new(net::Config::default())
+            .expect("request controller should initialize");
+        controller
+            .fetch(net::Request::get(url))
+            .await
+            .expect("request should succeed")
+            .body
+            .bytes()
+            .await
+            .expect("response body should be readable")
+    });
+    std::fs::write("rust-logo.png", body).expect("file should be written");
 }
