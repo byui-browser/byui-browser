@@ -2,3 +2,4 @@ Everyone please practice using branches and git commits by adding your name to t
 Makenna wold
 Caleb Bassett
 Levi Miller
+Troy Justesen
