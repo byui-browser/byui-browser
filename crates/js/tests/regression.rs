@@ -602,8 +602,7 @@ fn each_realm_script_starts_with_fresh_script_bindings() {
 #[test]
 fn unsupported_syntax_is_rejected_at_parse_time() {
     for source in [
-        // Member access, objects, and arrays.
-        "let o = 1; o.x",
+        // Object and array literals.
         "let o = {};",
         "let a = [1, 2];",
         // Update and compound assignment.
