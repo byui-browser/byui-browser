@@ -142,8 +142,12 @@ fn remove_selector_comments(input: &str) -> String {
             i += 1;
         } else if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
             i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') { i += 1; }
-            if i + 1 >= chars.len() { break; }
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            if i + 1 >= chars.len() {
+                break;
+            }
             i += 2;
             // A comment behaves like whitespace between selector tokens.
             out.push(' ');
@@ -155,12 +159,17 @@ fn remove_selector_comments(input: &str) -> String {
     out
 }
 
-fn parse_selector_list_mode(input: &str, allow_relative: bool) -> Result<SelectorList, SelectorParseError> {
+fn parse_selector_list_mode(
+    input: &str,
+    allow_relative: bool,
+) -> Result<SelectorList, SelectorParseError> {
     let cleaned;
     let input = if input.contains("/*") {
         cleaned = remove_selector_comments(input);
         cleaned.as_str()
-    } else { input };
+    } else {
+        input
+    };
     let mut parser = Parser::new(input);
     parser.skip_whitespace();
     if parser.is_eof() {
@@ -198,7 +207,11 @@ fn nth_of_selector_argument(argument: &str) -> Option<&str> {
             && bytes[index + 3].is_ascii_whitespace()
         {
             let selectors = argument[index + 3..].trim();
-            return if selectors.is_empty() { None } else { Some(selectors) };
+            return if selectors.is_empty() {
+                None
+            } else {
+                Some(selectors)
+            };
         }
         index += 1;
     }
@@ -212,40 +225,78 @@ struct Parser {
 
 impl Parser {
     fn new(input: &str) -> Self {
-        Self { chars: input.chars().collect(), pos: 0 }
+        Self {
+            chars: input.chars().collect(),
+            pos: 0,
+        }
     }
 
-    fn peek(&self) -> Option<char> { self.chars.get(self.pos).copied() }
-    fn peek_next(&self) -> Option<char> { self.chars.get(self.pos + 1).copied() }
-    fn is_eof(&self) -> bool { self.pos >= self.chars.len() }
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+    fn peek_next(&self) -> Option<char> {
+        self.chars.get(self.pos + 1).copied()
+    }
+    fn is_eof(&self) -> bool {
+        self.pos >= self.chars.len()
+    }
     fn consume(&mut self, c: char) -> bool {
-        if self.peek() == Some(c) { self.pos += 1; true } else { false }
+        if self.peek() == Some(c) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
     }
     fn error<T>(&self, message: &str) -> Result<T, SelectorParseError> {
-        Err(SelectorParseError { position: self.pos, message: message.to_owned() })
+        Err(SelectorParseError {
+            position: self.pos,
+            message: message.to_owned(),
+        })
     }
     fn skip_whitespace(&mut self) -> bool {
         let start = self.pos;
-        while self.peek().is_some_and(char::is_whitespace) { self.pos += 1; }
+        while self.peek().is_some_and(char::is_whitespace) {
+            self.pos += 1;
+        }
         self.pos != start
     }
 
-    fn parse_complex_selector(&mut self, allow_relative: bool) -> Result<ComplexSelector, SelectorParseError> {
+    fn parse_complex_selector(
+        &mut self,
+        allow_relative: bool,
+    ) -> Result<ComplexSelector, SelectorParseError> {
         let leading_combinator = if allow_relative {
             match (self.peek(), self.peek_next()) {
-                (Some('>'), _) => { self.pos += 1; Some(Combinator::Child) }
-                (Some('+'), _) => { self.pos += 1; Some(Combinator::NextSibling) }
-                (Some('~'), _) => { self.pos += 1; Some(Combinator::SubsequentSibling) }
-                (Some('|'), Some('|')) => { self.pos += 2; Some(Combinator::Column) }
+                (Some('>'), _) => {
+                    self.pos += 1;
+                    Some(Combinator::Child)
+                }
+                (Some('+'), _) => {
+                    self.pos += 1;
+                    Some(Combinator::NextSibling)
+                }
+                (Some('~'), _) => {
+                    self.pos += 1;
+                    Some(Combinator::SubsequentSibling)
+                }
+                (Some('|'), Some('|')) => {
+                    self.pos += 2;
+                    Some(Combinator::Column)
+                }
                 _ => None,
             }
-        } else { None };
+        } else {
+            None
+        };
         self.skip_whitespace();
         let mut compounds = vec![self.parse_compound_selector()?];
         let mut combinators = Vec::new();
         loop {
             let had_space = self.skip_whitespace();
-            if self.is_eof() || self.peek() == Some(',') { break; }
+            if self.is_eof() || self.peek() == Some(',') {
+                break;
+            }
 
             let explicit = match (self.peek(), self.peek_next()) {
                 (Some('>'), _) => Some((Combinator::Child, 1)),
@@ -270,7 +321,11 @@ impl Parser {
             combinators.push(combinator);
             compounds.push(self.parse_compound_selector()?);
         }
-        Ok(ComplexSelector { leading_combinator, compounds, combinators })
+        Ok(ComplexSelector {
+            leading_combinator,
+            compounds,
+            combinators,
+        })
     }
 
     fn parse_compound_selector(&mut self) -> Result<CompoundSelector, SelectorParseError> {
@@ -283,21 +338,33 @@ impl Parser {
             match self.peek() {
                 Some('#') => {
                     self.pos += 1;
-                    compound.simples.push(SimpleSelector::Id(self.parse_identifier("ID")?));
+                    compound
+                        .simples
+                        .push(SimpleSelector::Id(self.parse_identifier("ID")?));
                 }
                 Some('.') => {
                     self.pos += 1;
-                    compound.simples.push(SimpleSelector::Class(self.parse_identifier("class")?));
+                    compound
+                        .simples
+                        .push(SimpleSelector::Class(self.parse_identifier("class")?));
                 }
-                Some('[') => compound.simples.push(SimpleSelector::Attribute(self.parse_attribute_selector()?)),
-                Some(':') => compound.simples.push(SimpleSelector::Pseudo(self.parse_pseudo_selector()?)),
-                Some('&') => { self.pos += 1; compound.simples.push(SimpleSelector::Nesting); },
+                Some('[') => compound
+                    .simples
+                    .push(SimpleSelector::Attribute(self.parse_attribute_selector()?)),
+                Some(':') => compound
+                    .simples
+                    .push(SimpleSelector::Pseudo(self.parse_pseudo_selector()?)),
+                Some('&') => {
+                    self.pos += 1;
+                    compound.simples.push(SimpleSelector::Nesting);
+                }
                 _ => break,
             }
         }
 
         if compound.type_selector.is_none() && compound.simples.is_empty() {
-            return self.error("expected a type selector, class, ID, attribute, or pseudo-selector");
+            return self
+                .error("expected a type selector, class, ID, attribute, or pseudo-selector");
         }
         Ok(compound)
     }
@@ -314,11 +381,17 @@ impl Parser {
 
     fn parse_type_selector(&mut self) -> Result<TypeSelector, SelectorParseError> {
         let (namespace, name) = if self.consume('|') {
-            (Some(String::new()), self.parse_name_or_star("type selector")?)
+            (
+                Some(String::new()),
+                self.parse_name_or_star("type selector")?,
+            )
         } else {
             let first = self.parse_name_or_star("type selector")?;
             if self.consume('|') {
-                (Some(first), self.parse_name_or_star("type selector after namespace")?)
+                (
+                    Some(first),
+                    self.parse_name_or_star("type selector after namespace")?,
+                )
             } else {
                 (None, first)
             }
@@ -327,7 +400,9 @@ impl Parser {
     }
 
     fn parse_name_or_star(&mut self, context: &str) -> Result<String, SelectorParseError> {
-        if self.consume('*') { return Ok("*".to_owned()); }
+        if self.consume('*') {
+            return Ok("*".to_owned());
+        }
         self.parse_identifier(context)
     }
 
@@ -338,7 +413,9 @@ impl Parser {
                 self.pos += 1;
             } else if c == '\\' {
                 self.pos += 1;
-                let Some(escaped) = self.peek() else { return self.error("incomplete CSS escape"); };
+                let Some(escaped) = self.peek() else {
+                    return self.error("incomplete CSS escape");
+                };
                 if escaped == '\n' || escaped == '\r' || escaped == '\u{000C}' {
                     return self.error("CSS escapes cannot escape a newline");
                 }
@@ -348,7 +425,9 @@ impl Parser {
                         self.pos += 1;
                         digits += 1;
                     }
-                    if self.peek().is_some_and(char::is_whitespace) { self.pos += 1; }
+                    if self.peek().is_some_and(char::is_whitespace) {
+                        self.pos += 1;
+                    }
                 } else {
                     self.pos += 1;
                 }
@@ -356,7 +435,9 @@ impl Parser {
                 break;
             }
         }
-        if self.pos == start { return self.error(&format!("expected {context} name")); }
+        if self.pos == start {
+            return self.error(&format!("expected {context} name"));
+        }
         Ok(self.chars[start..self.pos].iter().collect())
     }
 
@@ -366,27 +447,52 @@ impl Parser {
         let (namespace, name) = self.parse_attribute_name()?;
         self.skip_whitespace();
         if self.consume(']') {
-            return Ok(AttributeSelector { namespace, name, operator: None, value: None, modifier: None });
+            return Ok(AttributeSelector {
+                namespace,
+                name,
+                operator: None,
+                value: None,
+                modifier: None,
+            });
         }
 
-        let operator = if self.consume('=') { AttributeOperator::Equals }
-        else if self.consume('~') && self.consume('=') { AttributeOperator::Includes }
-        else if self.consume('|') && self.consume('=') { AttributeOperator::DashMatch }
-        else if self.consume('^') && self.consume('=') { AttributeOperator::Prefix }
-        else if self.consume('$') && self.consume('=') { AttributeOperator::Suffix }
-        else if self.consume('*') && self.consume('=') { AttributeOperator::Substring }
-        else { return self.error("expected attribute operator or ']' "); };
+        let operator = if self.consume('=') {
+            AttributeOperator::Equals
+        } else if self.consume('~') && self.consume('=') {
+            AttributeOperator::Includes
+        } else if self.consume('|') && self.consume('=') {
+            AttributeOperator::DashMatch
+        } else if self.consume('^') && self.consume('=') {
+            AttributeOperator::Prefix
+        } else if self.consume('$') && self.consume('=') {
+            AttributeOperator::Suffix
+        } else if self.consume('*') && self.consume('=') {
+            AttributeOperator::Substring
+        } else {
+            return self.error("expected attribute operator or ']' ");
+        };
 
         self.skip_whitespace();
         let value = self.parse_attribute_value()?;
         self.skip_whitespace();
         let modifier = match self.peek() {
-            Some(c @ ('i' | 'I' | 's' | 'S')) => { self.pos += 1; Some(c.to_ascii_lowercase()) }
+            Some(c @ ('i' | 'I' | 's' | 'S')) => {
+                self.pos += 1;
+                Some(c.to_ascii_lowercase())
+            }
             _ => None,
         };
         self.skip_whitespace();
-        if !self.consume(']') { return self.error("expected ']' to close attribute selector"); }
-        Ok(AttributeSelector { namespace, name, operator: Some(operator), value: Some(value), modifier })
+        if !self.consume(']') {
+            return self.error("expected ']' to close attribute selector");
+        }
+        Ok(AttributeSelector {
+            namespace,
+            name,
+            operator: Some(operator),
+            value: Some(value),
+            modifier,
+        })
     }
 
     fn parse_attribute_name(&mut self) -> Result<(Option<String>, String), SelectorParseError> {
@@ -397,11 +503,17 @@ impl Parser {
             if !self.consume('|') {
                 return self.error("expected '|' after wildcard attribute namespace");
             }
-            return Ok((Some("*".to_owned()), self.parse_identifier("attribute after namespace")?));
+            return Ok((
+                Some("*".to_owned()),
+                self.parse_identifier("attribute after namespace")?,
+            ));
         }
         let first = self.parse_identifier("attribute")?;
         if self.consume('|') {
-            Ok((Some(first), self.parse_identifier("attribute after namespace")?))
+            Ok((
+                Some(first),
+                self.parse_identifier("attribute after namespace")?,
+            ))
         } else {
             Ok((None, first))
         }
@@ -412,9 +524,13 @@ impl Parser {
             self.pos += 1;
             let start = self.pos;
             while !self.is_eof() && self.peek() != Some(quote) {
-                if self.consume('\\') && !self.is_eof() { self.pos += 1; } else if !self.is_eof() { self.pos += 1; }
+                if !self.is_eof() {
+                    self.pos += 1;
+                }
             }
-            if self.is_eof() { return self.error("unterminated quoted attribute value"); }
+            if self.is_eof() {
+                return self.error("unterminated quoted attribute value");
+            }
             let value: String = self.chars[start..self.pos].iter().collect();
             self.pos += 1;
             Ok(value)
@@ -427,17 +543,33 @@ impl Parser {
         self.pos += 1; // ':'
         let element = self.consume(':');
         let name = self.parse_identifier("pseudo-selector")?;
-        let argument = if self.consume('(') { Some(self.parse_function_argument()?) } else { None };
+        let argument = if self.consume('(') {
+            Some(self.parse_function_argument()?)
+        } else {
+            None
+        };
         let lower_name = name.to_ascii_lowercase();
         let nested_text = match (lower_name.as_str(), argument.as_deref()) {
-            ("is" | "where" | "not" | "has" | "host" | "host-context" | "slotted", Some(text)) => Some(text),
+            ("is" | "where" | "not" | "has" | "host" | "host-context" | "slotted", Some(text)) => {
+                Some(text)
+            }
             ("nth-child" | "nth-last-child", Some(text)) => nth_of_selector_argument(text),
             _ => None,
         };
         let nested_selectors = if let Some(text) = nested_text {
-            Some(Box::new(parse_selector_list_mode(text, lower_name == "has")?))
-        } else { None };
-        Ok(PseudoSelector { element, name, argument, nested_selectors })
+            Some(Box::new(parse_selector_list_mode(
+                text,
+                lower_name == "has",
+            )?))
+        } else {
+            None
+        };
+        Ok(PseudoSelector {
+            element,
+            name,
+            argument,
+            nested_selectors,
+        })
     }
 
     fn parse_function_argument(&mut self) -> Result<String, SelectorParseError> {
@@ -446,8 +578,16 @@ impl Parser {
         let mut quote: Option<char> = None;
         while let Some(c) = self.peek() {
             if let Some(q) = quote {
-                if c == '\\' { self.pos += 1; if !self.is_eof() { self.pos += 1; } continue; }
-                if c == q { quote = None; }
+                if c == '\\' {
+                    self.pos += 1;
+                    if !self.is_eof() {
+                        self.pos += 1;
+                    }
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                }
                 self.pos += 1;
                 continue;
             }
@@ -462,7 +602,13 @@ impl Parser {
                         return Ok(argument.trim().to_owned());
                     }
                 }
-                '\\' => { self.pos += 1; if !self.is_eof() { self.pos += 1; } continue; }
+                '\\' => {
+                    self.pos += 1;
+                    if !self.is_eof() {
+                        self.pos += 1;
+                    }
+                    continue;
+                }
                 _ => {}
             }
             self.pos += 1;
@@ -471,8 +617,12 @@ impl Parser {
     }
 }
 
-fn is_name_start(c: char) -> bool { c == '_' || c == '-' || c.is_alphabetic() || c as u32 >= 0x80 }
-fn is_name_char(c: char) -> bool { is_name_start(c) || c.is_ascii_digit() }
+fn is_name_start(c: char) -> bool {
+    c == '_' || c == '-' || c.is_alphabetic() || c as u32 >= 0x80
+}
+fn is_name_char(c: char) -> bool {
+    is_name_start(c) || c.is_ascii_digit()
+}
 
 #[cfg(test)]
 mod tests {
@@ -489,8 +639,16 @@ mod tests {
         let parsed = parse_selector_list("div.card#main").unwrap();
         let compound = &parsed.selectors[0].compounds[0];
         assert_eq!(compound.type_selector.as_ref().unwrap().name, "div");
-        assert!(compound.simples.contains(&SimpleSelector::Class("card".into())));
-        assert!(compound.simples.contains(&SimpleSelector::Id("main".into())));
+        assert!(
+            compound
+                .simples
+                .contains(&SimpleSelector::Class("card".into()))
+        );
+        assert!(
+            compound
+                .simples
+                .contains(&SimpleSelector::Id("main".into()))
+        );
     }
 
     #[test]
@@ -501,14 +659,20 @@ mod tests {
             ("h1 + p", Combinator::NextSibling),
             ("h1 ~ p", Combinator::SubsequentSibling),
         ] {
-            assert_eq!(parse_selector_list(input).unwrap().selectors[0].combinators, vec![expected]);
+            assert_eq!(
+                parse_selector_list(input).unwrap().selectors[0].combinators,
+                vec![expected]
+            );
         }
     }
 
     #[test]
     fn parses_attribute_selector() {
         let parsed = parse_selector_list("input[type=\"text\" i]").unwrap();
-        let SimpleSelector::Attribute(attribute) = &parsed.selectors[0].compounds[0].simples[0] else { panic!("expected attribute") };
+        let SimpleSelector::Attribute(attribute) = &parsed.selectors[0].compounds[0].simples[0]
+        else {
+            panic!("expected attribute")
+        };
         assert_eq!(attribute.name, "type");
         assert_eq!(attribute.value.as_deref(), Some("text"));
         assert_eq!(attribute.modifier, Some('i'));
@@ -517,7 +681,10 @@ mod tests {
     #[test]
     fn parses_wildcard_attribute_namespace() {
         let parsed = parse_selector_list("[*|href]").unwrap();
-        let SimpleSelector::Attribute(attribute) = &parsed.selectors[0].compounds[0].simples[0] else { panic!("expected attribute") };
+        let SimpleSelector::Attribute(attribute) = &parsed.selectors[0].compounds[0].simples[0]
+        else {
+            panic!("expected attribute")
+        };
         assert_eq!(attribute.namespace.as_deref(), Some("*"));
         assert_eq!(attribute.name, "href");
     }
@@ -526,7 +693,9 @@ mod tests {
     fn parses_pseudo_selector_with_nested_parentheses() {
         let parsed = parse_selector_list("li:nth-child(2n + 1), a:not(.active)").unwrap();
         assert_eq!(parsed.selectors.len(), 2);
-        let SimpleSelector::Pseudo(pseudo) = &parsed.selectors[0].compounds[0].simples[0] else { panic!("expected pseudo") };
+        let SimpleSelector::Pseudo(pseudo) = &parsed.selectors[0].compounds[0].simples[0] else {
+            panic!("expected pseudo")
+        };
         assert_eq!(pseudo.name, "nth-child");
         assert_eq!(pseudo.argument.as_deref(), Some("2n + 1"));
     }
@@ -535,17 +704,26 @@ mod tests {
     fn parses_nested_selector_functions_and_relative_has_selectors() {
         let parsed = parse_selector_list("article:has(> img.hero), :is(h1, h2, .title)").unwrap();
         assert_eq!(parsed.selectors.len(), 2);
-        let SimpleSelector::Pseudo(has) = &parsed.selectors[0].compounds[0].simples[0] else { panic!("expected :has") };
+        let SimpleSelector::Pseudo(has) = &parsed.selectors[0].compounds[0].simples[0] else {
+            panic!("expected :has")
+        };
         let nested = has.nested_selectors.as_ref().unwrap();
-        assert_eq!(nested.selectors[0].leading_combinator, Some(Combinator::Child));
-        let SimpleSelector::Pseudo(is) = &parsed.selectors[1].compounds[0].simples[0] else { panic!("expected :is") };
+        assert_eq!(
+            nested.selectors[0].leading_combinator,
+            Some(Combinator::Child)
+        );
+        let SimpleSelector::Pseudo(is) = &parsed.selectors[1].compounds[0].simples[0] else {
+            panic!("expected :is")
+        };
         assert_eq!(is.nested_selectors.as_ref().unwrap().selectors.len(), 3);
     }
 
     #[test]
     fn parses_nth_child_of_selector_list() {
         let parsed = parse_selector_list("li:nth-child(2n + 1 of .item, #featured)").unwrap();
-        let SimpleSelector::Pseudo(pseudo) = &parsed.selectors[0].compounds[0].simples[0] else { panic!("expected pseudo") };
+        let SimpleSelector::Pseudo(pseudo) = &parsed.selectors[0].compounds[0].simples[0] else {
+            panic!("expected pseudo")
+        };
         assert_eq!(pseudo.nested_selectors.as_ref().unwrap().selectors.len(), 2);
     }
 
@@ -553,7 +731,11 @@ mod tests {
     fn parses_column_combinator_and_nesting_selector() {
         let parsed = parse_selector_list("col.selected || td, & > .child").unwrap();
         assert_eq!(parsed.selectors[0].combinators, vec![Combinator::Column]);
-        assert!(parsed.selectors[1].compounds[0].simples.contains(&SimpleSelector::Nesting));
+        assert!(
+            parsed.selectors[1].compounds[0]
+                .simples
+                .contains(&SimpleSelector::Nesting)
+        );
     }
 
     #[test]

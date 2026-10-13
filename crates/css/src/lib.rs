@@ -9,7 +9,11 @@
 
 /// Parsing of CSS selector syntax into a structured abstract syntax tree.
 pub mod selector;
-pub use selector::{parse_selector_list, AttributeOperator, AttributeSelector, Combinator, CompoundSelector, ComplexSelector, PseudoSelector, SelectorList, SelectorParseError, SimpleSelector, TypeSelector};
+pub use selector::{
+    AttributeOperator, AttributeSelector, Combinator, ComplexSelector, CompoundSelector,
+    PseudoSelector, SelectorList, SelectorParseError, SimpleSelector, TypeSelector,
+    parse_selector_list,
+};
 
 use common::ids::NodeId;
 
