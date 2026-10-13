@@ -1,6 +1,4 @@
-
-use super::attribute::Attribute;
-use super::namespace::Namespace;
+use super::{attribute::Attribute, namespace::Namespace};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElementData {

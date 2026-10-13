@@ -1,6 +1,4 @@
-use super::node_id::NodeId;
-use super::node_kind::NodeKind;
-use super::source_span::SourceSpan;
+use super::{node_id::NodeId, node_kind::NodeKind, source_span::SourceSpan};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {

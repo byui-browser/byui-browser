@@ -1,10 +1,7 @@
-use super::node::Node;
-use super::node_id::NodeId;
-use super::node_kind::NodeKind;
-use super::source_span::SourceSpan;
-use super::element_data::ElementData;
-use super::namespace::Namespace;
-use super::dom_error::DomError;
+use super::{
+    dom_error::DomError, element_data::ElementData, namespace::Namespace, node::Node,
+    node_id::NodeId, node_kind::NodeKind, source_span::SourceSpan,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HTMLDocument {
@@ -150,9 +147,6 @@ impl HTMLDocument {
         find_in_tree(self, self.root, value)
     }
 }
-
-
-
 
 fn is_ascii_whitespace(character: char) -> bool {
     matches!(character, '\t' | '\n' | '\x0c' | '\r' | ' ')
