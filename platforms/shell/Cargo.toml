@@ -25,8 +25,11 @@ softbuffer = { version = "0.4", default-features = false }
 
 # Both display servers are supported; winit picks Wayland when
 # `WAYLAND_DISPLAY` is set and falls back to X11 (or XWayland) otherwise.
+# `wayland-csd-adwaita` draws a titlebar on compositors such as GNOME's that
+# offer no server-side decorations, so the window still has native-looking
+# buttons and resize borders there.
 [target.'cfg(target_os = "linux")'.dependencies]
-winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
 softbuffer = { version = "0.4", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
 
 [lints]

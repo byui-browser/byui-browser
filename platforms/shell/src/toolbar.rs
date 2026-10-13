@@ -1,10 +1,13 @@
-//! Browser chrome for the native shell: one unified toolbar row (window
-//! controls, navigation, address field, actions) above a rounded page card.
+//! Browser chrome for the native shell: one unified toolbar row (navigation,
+//! address field, actions) above a rounded page card.
 //!
-//! The native titlebar is hidden, so the window controls are drawn and handled
-//! here. Navigation is not implemented yet: Back and Forward are drawn disabled,
-//! and Reload, the address field, New Tab, and the menu only show hover and
-//! press feedback. The address text is a fixed label for the welcome page.
+//! Window controls come from the operating system: each shell keeps its native
+//! decorations, and where those overlap the toolbar (macOS's traffic lights on
+//! a transparent titlebar) the controls shift right by
+//! [`ChromeState::window_controls_inset`]. Navigation is not implemented yet:
+//! Back and Forward are drawn disabled, and Reload, the address field, New
+//! Tab, and the menu only show hover and press feedback. The address text is a
+//! fixed label for the welcome page.
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform};
@@ -21,10 +24,14 @@ const PAGE_RADIUS: f32 = 10.0;
 const CENTER_Y: f32 = 26.0;
 const BUTTON_SIZE: f32 = 28.0;
 const BUTTON_TOP: f32 = CENTER_Y - BUTTON_SIZE / 2.0;
-const LIGHT_RADIUS: f32 = 6.0;
 const ADDRESS_HEIGHT: f32 = 34.0;
 const ADDRESS_MAX_WIDTH: f32 = 640.0;
-const ADDRESS_LEADING: f32 = 188.0;
+/// Logical distance from the toolbar's left edge (after the window-controls
+/// inset) to the Back button.
+const NAV_LEADING: f32 = 12.0;
+/// Logical distance from the toolbar's left edge (after the window-controls
+/// inset) to the earliest position of the address field.
+const ADDRESS_LEADING: f32 = 116.0;
 /// Narrower windows drop the New Tab and menu buttons to keep the address
 /// field usable.
 const TRAILING_MIN_WIDTH: f32 = 360.0;
@@ -35,12 +42,6 @@ const ADDRESS_PAGE: &str = "welcome";
 /// A clickable region of the chrome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Control {
-    /// Closes the window and quits.
-    Close,
-    /// Minimizes the window to the Dock.
-    Minimize,
-    /// Toggles the window between its zoomed and normal sizes.
-    Zoom,
     /// Back navigation; disabled because there is no history yet.
     Back,
     /// Forward navigation; disabled because there is no history yet.
@@ -55,10 +56,7 @@ pub(crate) enum Control {
     Menu,
 }
 
-const CONTROLS: [Control; 9] = [
-    Control::Close,
-    Control::Minimize,
-    Control::Zoom,
+const CONTROLS: [Control; 6] = [
     Control::Back,
     Control::Forward,
     Control::Reload,
@@ -72,23 +70,22 @@ impl Control {
     pub(crate) fn is_enabled(self) -> bool {
         !matches!(self, Control::Back | Control::Forward)
     }
-
-    fn is_window_control(self) -> bool {
-        matches!(self, Control::Close | Control::Minimize | Control::Zoom)
-    }
 }
 
 /// Interaction and appearance state that changes how the chrome is painted.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct ChromeState {
     /// Control under the pointer, if any.
     pub hovered: Option<Control>,
     /// Control with the left mouse button held down on it, if any.
     pub pressed: Option<Control>,
-    /// Whether the window is key; unfocused windows show gray window controls.
-    pub focused: bool,
     /// Whether to use the dark palette.
     pub dark: bool,
+    /// Logical width at the toolbar's left reserved for the operating
+    /// system's own window buttons when they overlap the toolbar, as macOS's
+    /// traffic lights do on a transparent titlebar. Zero when the system draws
+    /// its buttons in a separate titlebar above the toolbar.
+    pub window_controls_inset: f32,
 }
 
 /// A rectangle in device pixels.
@@ -120,11 +117,12 @@ pub(crate) fn page_rect(width: u32, height: u32, scale_factor: f64) -> Option<Pi
 }
 
 /// Returns the enabled or disabled control at a point given in logical
-/// pixels, for a window `width` logical pixels wide.
-pub(crate) fn hit_test(x: f64, y: f64, width: f64) -> Option<Control> {
+/// pixels, for a window `width` logical pixels wide whose toolbar starts
+/// `inset` logical pixels in (see [`ChromeState::window_controls_inset`]).
+pub(crate) fn hit_test(x: f64, y: f64, width: f64, inset: f32) -> Option<Control> {
     let (x, y) = (x as f32, y as f32);
     CONTROLS.into_iter().find(|control| {
-        control_rect(*control, width as f32).is_some_and(|rect| {
+        control_rect(*control, width as f32, inset).is_some_and(|rect| {
             x >= rect.left() && x < rect.right() && y >= rect.top() && y < rect.bottom()
         })
     })
@@ -315,12 +313,12 @@ fn draw_toolbar(
     font: Option<&FontVec>,
 ) {
     let transform = Transform::from_scale(scale, scale);
-    draw_window_controls(pixmap, state, transform);
+    let inset = state.window_controls_inset;
     for control in CONTROLS {
-        if control.is_window_control() || control == Control::Address {
+        if control == Control::Address {
             continue;
         }
-        let Some(rect) = control_rect(control, width) else {
+        let Some(rect) = control_rect(control, width, inset) else {
             continue;
         };
         let active = control.is_enabled();
@@ -342,75 +340,8 @@ fn draw_toolbar(
         let (cx, cy) = (rect.x() + rect.width() / 2.0, CENTER_Y);
         draw_icon(pixmap, control, cx, cy, color, transform);
     }
-    if let Some(rect) = control_rect(Control::Address, width) {
+    if let Some(rect) = control_rect(Control::Address, width, inset) {
         draw_address_field(pixmap, rect, scale, state, palette, font);
-    }
-}
-
-fn draw_window_controls(pixmap: &mut Pixmap, state: &ChromeState, transform: Transform) {
-    let group_hovered = state.hovered.is_some_and(Control::is_window_control);
-    for (control, fill_rgb, edge_rgb) in [
-        (Control::Close, [0xff, 0x5f, 0x57], [0xe2, 0x46, 0x3f]),
-        (Control::Minimize, [0xfe, 0xbc, 0x2e], [0xe1, 0xa1, 0x16]),
-        (Control::Zoom, [0x28, 0xc8, 0x40], [0x1a, 0xab, 0x29]),
-    ] {
-        let Some(rect) = control_rect(control, 0.0) else {
-            continue;
-        };
-        let (cx, cy) = (rect.x() + rect.width() / 2.0, CENTER_Y);
-        let Some(circle) = PathBuilder::from_circle(cx, cy, LIGHT_RADIUS) else {
-            continue;
-        };
-        let (fill_color, edge_color) = if state.focused || group_hovered {
-            let darken = if state.pressed == Some(control) {
-                0.8
-            } else {
-                1.0
-            };
-            (rgb_scaled(fill_rgb, darken), rgb_scaled(edge_rgb, darken))
-        } else if state.dark {
-            (rgba(0x4b, 0x4c, 0x51, 255), rgba(0x42, 0x43, 0x47, 255))
-        } else {
-            (rgba(0xdd, 0xdd, 0xe0, 255), rgba(0xc9, 0xc9, 0xcd, 255))
-        };
-        fill(pixmap, &circle, fill_color, transform);
-        stroke(pixmap, &circle, edge_color, 0.5, transform);
-        if !group_hovered {
-            continue;
-        }
-        let glyph = rgba(0x4d, 0x1a, 0x00, 170);
-        let mut builder = PathBuilder::new();
-        match control {
-            Control::Close => {
-                builder.move_to(cx - 2.4, cy - 2.4);
-                builder.line_to(cx + 2.4, cy + 2.4);
-                builder.move_to(cx + 2.4, cy - 2.4);
-                builder.line_to(cx - 2.4, cy + 2.4);
-                if let Some(path) = builder.finish() {
-                    stroke(pixmap, &path, glyph, 1.1, transform);
-                }
-            }
-            Control::Minimize => {
-                builder.move_to(cx - 3.0, cy);
-                builder.line_to(cx + 3.0, cy);
-                if let Some(path) = builder.finish() {
-                    stroke(pixmap, &path, glyph, 1.1, transform);
-                }
-            }
-            _ => {
-                builder.move_to(cx - 3.0, cy - 3.0);
-                builder.line_to(cx + 1.4, cy - 3.0);
-                builder.line_to(cx - 3.0, cy + 1.4);
-                builder.close();
-                builder.move_to(cx + 3.0, cy + 3.0);
-                builder.line_to(cx - 1.4, cy + 3.0);
-                builder.line_to(cx + 3.0, cy - 1.4);
-                builder.close();
-                if let Some(path) = builder.finish() {
-                    fill(pixmap, &path, glyph, transform);
-                }
-            }
-        }
     }
 }
 
@@ -622,28 +553,28 @@ fn draw_text(
     caret
 }
 
-fn control_rect(control: Control, width: f32) -> Option<Rect> {
+/// Returns where `control` sits in a toolbar `width` logical pixels wide
+/// whose leading controls start `inset` pixels in, or `None` when the window
+/// is too narrow to show it.
+fn control_rect(control: Control, width: f32, inset: f32) -> Option<Rect> {
     let button = |x: f32| Rect::from_xywh(x, BUTTON_TOP, BUTTON_SIZE, BUTTON_SIZE);
-    let light = |cx: f32| Rect::from_xywh(cx - 8.0, CENTER_Y - 8.0, 16.0, 16.0);
     let trailing = width >= TRAILING_MIN_WIDTH;
     match control {
-        Control::Close => light(20.0),
-        Control::Minimize => light(40.0),
-        Control::Zoom => light(60.0),
-        Control::Back => button(84.0),
-        Control::Forward => button(116.0),
-        Control::Reload => button(148.0),
+        Control::Back => button(inset + NAV_LEADING),
+        Control::Forward => button(inset + NAV_LEADING + 32.0),
+        Control::Reload => button(inset + NAV_LEADING + 64.0),
         Control::NewTab => button(width - 80.0).filter(|_| trailing),
         Control::Menu => button(width - 44.0).filter(|_| trailing),
         Control::Address => {
+            let leading = inset + ADDRESS_LEADING;
             let right = if trailing { width - 92.0 } else { width - 12.0 };
-            let available = right - ADDRESS_LEADING;
+            let available = right - leading;
             if available < 80.0 {
                 return None;
             }
             let field_width = available.min(ADDRESS_MAX_WIDTH);
             // Center in the window like Safari, but never under other controls.
-            let x = ((width - field_width) / 2.0).clamp(ADDRESS_LEADING, right - field_width);
+            let x = ((width - field_width) / 2.0).clamp(leading, right - field_width);
             Rect::from_xywh(
                 x,
                 CENTER_Y - ADDRESS_HEIGHT / 2.0,
@@ -696,11 +627,6 @@ fn stroke(pixmap: &mut Pixmap, path: &Path, color: Color, width: f32, transform:
 
 fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
     Color::from_rgba8(r, g, b, a)
-}
-
-fn rgb_scaled([r, g, b]: [u8; 3], factor: f32) -> Color {
-    let channel = |value: u8| (f32::from(value) * factor) as u8;
-    rgba(channel(r), channel(g), channel(b), 255)
 }
 
 struct Palette {
@@ -794,10 +720,7 @@ mod tests {
             let card = page_rect(width, height, scale).unwrap();
             let mut page = Pixmap::new(card.width, card.height).unwrap();
             page.fill(Color::from_rgba8(255, 0, 0, 255));
-            let state = ChromeState {
-                focused: true,
-                ..ChromeState::default()
-            };
+            let state = ChromeState::default();
             let out = compose(width, height, scale, &state, Some(&page), None).unwrap();
             let middle = pixel(&out, card.x + card.width / 2, card.y + card.height / 2);
             assert_eq!(middle, [255, 0, 0, 255]);
@@ -809,24 +732,40 @@ mod tests {
 
     #[test]
     fn hit_testing_finds_toolbar_controls() {
-        assert_eq!(hit_test(20.0, 26.0, 1000.0), Some(Control::Close));
-        assert_eq!(hit_test(60.0, 26.0, 1000.0), Some(Control::Zoom));
-        assert_eq!(hit_test(98.0, 26.0, 1000.0), Some(Control::Back));
-        assert_eq!(hit_test(162.0, 26.0, 1000.0), Some(Control::Reload));
-        assert_eq!(hit_test(500.0, 26.0, 1000.0), Some(Control::Address));
-        assert_eq!(hit_test(1000.0 - 30.0, 26.0, 1000.0), Some(Control::Menu));
-        assert_eq!(hit_test(181.0, 26.0, 1000.0), None);
-        assert_eq!(hit_test(500.0, 200.0, 1000.0), None);
+        assert_eq!(hit_test(26.0, 26.0, 1000.0, 0.0), Some(Control::Back));
+        assert_eq!(hit_test(90.0, 26.0, 1000.0, 0.0), Some(Control::Reload));
+        assert_eq!(hit_test(500.0, 26.0, 1000.0, 0.0), Some(Control::Address));
+        assert_eq!(
+            hit_test(1000.0 - 30.0, 26.0, 1000.0, 0.0),
+            Some(Control::Menu)
+        );
+        assert_eq!(hit_test(109.0, 26.0, 1000.0, 0.0), None);
+        assert_eq!(hit_test(500.0, 200.0, 1000.0, 0.0), None);
         assert!(!Control::Back.is_enabled());
         assert!(Control::Reload.is_enabled());
     }
 
     #[test]
+    fn window_controls_inset_shifts_leading_controls() {
+        // Space reserved for macOS's traffic lights holds no toolbar control.
+        assert_eq!(hit_test(20.0, 26.0, 1000.0, 72.0), None);
+        assert_eq!(hit_test(60.0, 26.0, 1000.0, 72.0), None);
+        assert_eq!(hit_test(98.0, 26.0, 1000.0, 72.0), Some(Control::Back));
+        assert_eq!(hit_test(162.0, 26.0, 1000.0, 72.0), Some(Control::Reload));
+        assert_eq!(hit_test(181.0, 26.0, 1000.0, 72.0), None);
+        // The address field never slides under the leading controls.
+        let narrow = control_rect(Control::Address, 400.0, 72.0).unwrap();
+        assert_eq!(narrow.x(), 72.0 + ADDRESS_LEADING);
+        let centered = control_rect(Control::Address, 2000.0, 72.0).unwrap();
+        assert_eq!(centered.x(), (2000.0 - ADDRESS_MAX_WIDTH) / 2.0);
+    }
+
+    #[test]
     fn narrow_windows_drop_trailing_controls_then_the_address_field() {
-        assert!(control_rect(Control::Menu, 340.0).is_none());
-        assert!(control_rect(Control::Address, 340.0).is_some());
-        assert!(control_rect(Control::Address, 250.0).is_none());
-        let wide = control_rect(Control::Address, 2000.0).unwrap();
+        assert!(control_rect(Control::Menu, 340.0, 0.0).is_none());
+        assert!(control_rect(Control::Address, 340.0, 0.0).is_some());
+        assert!(control_rect(Control::Address, 200.0, 0.0).is_none());
+        let wide = control_rect(Control::Address, 2000.0, 0.0).unwrap();
         assert_eq!(wide.width(), ADDRESS_MAX_WIDTH);
         assert_eq!(wide.x(), (2000.0 - ADDRESS_MAX_WIDTH) / 2.0);
     }
@@ -836,12 +775,12 @@ mod tests {
         assert!(compose(0, 0, 1.0, &ChromeState::default(), None, None).is_none());
         for (width, height) in [(1, 1), (20, 60), (300, 120), (1200, 800)] {
             for dark in [false, true] {
-                for hovered in [None, Some(Control::Close), Some(Control::Address)] {
+                for hovered in [None, Some(Control::Reload), Some(Control::Address)] {
                     let state = ChromeState {
                         hovered,
                         pressed: hovered,
-                        focused: !dark,
                         dark,
+                        window_controls_inset: if dark { 72.0 } else { 0.0 },
                     };
                     let out = compose(width, height, 1.5, &state, None, None).unwrap();
                     assert_eq!(out.width(), width);
@@ -856,7 +795,6 @@ mod tests {
             let (width, height) = ((640.0 * scale) as u32, (400.0 * scale) as u32);
             let state = ChromeState {
                 hovered: Some(Control::Reload),
-                focused: true,
                 dark,
                 ..ChromeState::default()
             };

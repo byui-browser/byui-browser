@@ -26,14 +26,14 @@ Wayland). To force one backend, run with only that display set, for example
 
 ## What you see
 
-A 1120 × 720 window titled **BYUI Browser** opens with a unified toolbar
-(52 logical pixels high) and the page shown as a rounded card inset from the
-window frame. The desktop's decorations are hidden so the toolbar spans the
-whole window, and the shell draws and handles the window controls itself:
-close quits, minimize iconifies the window, and zoom (or double-clicking empty
-toolbar space) toggles maximized. Drag empty toolbar space to move the window,
-and drag any window edge or corner to resize it. The window controls turn gray
-when the window loses focus.
+A 1120 × 720 window titled **BYUI Browser** opens with the desktop's own
+titlebar and frame above a unified toolbar (52 logical pixels high) and the
+page shown as a rounded card inset from the window frame. The window
+manager's buttons close, minimize, and maximize the window, and its borders
+resize it, exactly as for any other application. On Wayland compositors
+without server-side decorations (such as GNOME's) winit draws an
+Adwaita-style titlebar instead. Dragging empty toolbar space also moves the
+window, and double-clicking it toggles maximized, like Safari's toolbar.
 
 From left to right the toolbar shows Back, Forward, Reload, a centered address
 field labelled `byui://welcome`, New Tab, and a menu button. Navigation is not
@@ -49,8 +49,6 @@ usual paths. If none is found the toolbar is drawn without text.
 
 - The chrome always uses the light palette: `winit` does not report the
   desktop's dark-mode preference on X11 or Wayland.
-- The window has no drop shadow or border beyond what it paints itself, since
-  the compositor's decorations are hidden.
 
 On other operating systems, the executable only reports that Linux is required.
 This lets workspace checks run without building a Linux window on those systems.

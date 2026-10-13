@@ -14,33 +14,31 @@ use winit::dpi::LogicalSize;
 use winit::error::EventLoopError;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{CursorIcon, ResizeDirection, Theme, Window, WindowAttributes, WindowId};
+use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
 use crate::toolbar::{self, ChromeState, Control};
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
-/// Width in logical pixels of the invisible resize handles along the window
-/// edges, used only when [`Platform::resize_borders`] is set.
-const RESIZE_BORDER: f64 = 6.0;
 
 /// How a native shell wants its window set up.
 ///
-/// The shared shell draws its own window controls in the toolbar, so every
-/// platform hides the native titlebar one way or another; the differences
-/// between desktops are captured here.
+/// Every shell keeps the operating system's own window decorations (title
+/// bar buttons, borders, resize handles); the differences between desktops
+/// are captured here.
 #[derive(Clone, Copy, Debug)]
 pub struct Platform {
     /// Adjusts the default window attributes before the window is created,
-    /// for example to hide the native titlebar or decorations. The title and
-    /// sizes are already set when this runs.
+    /// for example to make the titlebar transparent so the toolbar extends
+    /// under it. The title and sizes are already set when this runs.
     pub configure_window: fn(WindowAttributes) -> WindowAttributes,
     /// Returns font files to try, in order, for toolbar text. The first one
     /// that loads is used; if none loads the toolbar omits its text.
     pub ui_font_files: fn() -> Vec<PathBuf>,
-    /// Whether the shell must provide resize handles itself. Set this when
-    /// hiding the decorations also removes the native resize border, as on
-    /// Linux; macOS keeps native edge resizing for frameless windows.
-    pub resize_borders: bool,
+    /// Logical width at the toolbar's left that the system's window buttons
+    /// cover when they overlap the toolbar, as macOS's traffic lights do on a
+    /// transparent titlebar. Zero when the system draws its buttons in a
+    /// separate titlebar above the window contents.
+    pub window_controls_inset: f32,
 }
 
 struct App {
@@ -51,9 +49,6 @@ struct App {
     chrome: ChromeState,
     /// Pointer position in logical pixels while it is over the window.
     cursor: Option<(f64, f64)>,
-    /// Window edge under the pointer when the shell draws its own resize
-    /// borders; takes precedence over toolbar controls.
-    resize: Option<ResizeDirection>,
     /// The rendered page and the device size it was rendered for.
     page: Option<((u32, u32), Pixmap)>,
     /// Last presented window contents in softbuffer's 0x00RRGGBB format,
@@ -71,9 +66,11 @@ impl App {
             window: None,
             surface: None,
             font: None,
-            chrome: ChromeState::default(),
+            chrome: ChromeState {
+                window_controls_inset: platform.window_controls_inset,
+                ..ChromeState::default()
+            },
             cursor: None,
-            resize: None,
             page: None,
             frame: Vec::new(),
             frame_key: None,
@@ -87,41 +84,23 @@ impl App {
         }
     }
 
-    fn update_cursor(&self) {
-        let Some(window) = &self.window else {
-            return;
-        };
-        window.set_cursor(match (self.resize, self.chrome.hovered) {
-            (Some(direction), _) => resize_cursor(direction),
-            (None, Some(Control::Address)) => CursorIcon::Text,
-            (None, _) => CursorIcon::Default,
-        });
-    }
-
     fn set_hovered(&mut self, hovered: Option<Control>) {
         let hovered = hovered.filter(|control| control.is_enabled());
         if self.chrome.hovered != hovered {
             self.chrome.hovered = hovered;
-            self.update_cursor();
+            if let Some(window) = &self.window {
+                window.set_cursor(if hovered == Some(Control::Address) {
+                    CursorIcon::Text
+                } else {
+                    CursorIcon::Default
+                });
+            }
             self.redraw();
         }
     }
 
-    fn set_resize(&mut self, resize: Option<ResizeDirection>) {
-        if self.resize != resize {
-            self.resize = resize;
-            self.update_cursor();
-        }
-    }
-
-    fn activate(&mut self, control: Control, event_loop: &ActiveEventLoop) {
-        let Some(window) = &self.window else {
-            return;
-        };
+    fn activate(&mut self, control: Control) {
         match control {
-            Control::Close => event_loop.exit(),
-            Control::Minimize => window.set_minimized(true),
-            Control::Zoom => window.set_maximized(!window.is_maximized()),
             Control::Reload => {
                 self.page = None;
                 self.redraw();
@@ -209,28 +188,17 @@ impl App {
             return;
         };
         let scale = window.scale_factor();
-        let size = window.inner_size().to_logical::<f64>(scale);
+        let width = window.inner_size().to_logical::<f64>(scale).width;
         self.cursor = Some((x, y));
-        let resize = if self.platform.resize_borders && !window.is_maximized() {
-            resize_direction(x, y, size.width, size.height)
-        } else {
-            None
-        };
-        self.set_resize(resize);
-        if resize.is_some() {
-            self.set_hovered(None);
-        } else {
-            self.set_hovered(toolbar::hit_test(x, y, size.width));
-        }
+        let inset = self.platform.window_controls_inset;
+        self.set_hovered(toolbar::hit_test(x, y, width, inset));
     }
 
     fn pressed(&mut self) {
         let Some(window) = &self.window else {
             return;
         };
-        if let Some(direction) = self.resize {
-            let _ = window.drag_resize_window(direction);
-        } else if let Some(control) = self.chrome.hovered {
+        if let Some(control) = self.chrome.hovered {
             self.chrome.pressed = Some(control);
             self.redraw();
         } else if self
@@ -246,7 +214,8 @@ impl App {
                 window.set_maximized(!window.is_maximized());
             } else {
                 self.last_toolbar_click = Some(now);
-                // Empty toolbar space moves the window, like a titlebar.
+                // Empty toolbar space moves the window, like a titlebar;
+                // the system's own titlebar and frame keep working too.
                 let _ = window.drag_window();
             }
         }
@@ -256,8 +225,6 @@ impl App {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
-            // The toolbar spans the full window width and draws the window
-            // controls itself, so the platform hides its native titlebar.
             let attributes = (self.platform.configure_window)(
                 Window::default_attributes()
                     .with_title("BYUI Browser")
@@ -276,7 +243,6 @@ impl ApplicationHandler for App {
                     .expect("failed to create window surface"),
             );
             self.font = toolbar::load_ui_font((self.platform.ui_font_files)());
-            self.chrome.focused = window.has_focus();
             window.request_redraw();
             self.window = Some(window);
         }
@@ -293,10 +259,6 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(_)
             | WindowEvent::ScaleFactorChanged { .. }
             | WindowEvent::ThemeChanged(_) => self.redraw(),
-            WindowEvent::Focused(focused) => {
-                self.chrome.focused = focused;
-                self.redraw();
-            }
             WindowEvent::CursorMoved { position, .. } => {
                 let Some(window) = &self.window else {
                     return;
@@ -306,7 +268,6 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = None;
-                self.set_resize(None);
                 self.set_hovered(None);
             }
             WindowEvent::MouseInput {
@@ -319,7 +280,7 @@ impl ApplicationHandler for App {
                     if let Some(control) = self.chrome.pressed.take() {
                         self.redraw();
                         if self.chrome.hovered == Some(control) {
-                            self.activate(control, event_loop);
+                            self.activate(control);
                         }
                     }
                 }
@@ -330,88 +291,10 @@ impl ApplicationHandler for App {
     }
 }
 
-/// Returns the resize handle under a pointer at (`x`, `y`) logical pixels in
-/// a window of `width` × `height` logical pixels, or `None` away from the
-/// edges.
-fn resize_direction(x: f64, y: f64, width: f64, height: f64) -> Option<ResizeDirection> {
-    let left = x < RESIZE_BORDER;
-    let right = x >= width - RESIZE_BORDER;
-    let top = y < RESIZE_BORDER;
-    let bottom = y >= height - RESIZE_BORDER;
-    Some(match (left, right, top, bottom) {
-        (true, _, true, _) => ResizeDirection::NorthWest,
-        (_, true, true, _) => ResizeDirection::NorthEast,
-        (true, _, _, true) => ResizeDirection::SouthWest,
-        (_, true, _, true) => ResizeDirection::SouthEast,
-        (true, _, _, _) => ResizeDirection::West,
-        (_, true, _, _) => ResizeDirection::East,
-        (_, _, true, _) => ResizeDirection::North,
-        (_, _, _, true) => ResizeDirection::South,
-        _ => return None,
-    })
-}
-
-fn resize_cursor(direction: ResizeDirection) -> CursorIcon {
-    match direction {
-        ResizeDirection::East => CursorIcon::EResize,
-        ResizeDirection::West => CursorIcon::WResize,
-        ResizeDirection::North => CursorIcon::NResize,
-        ResizeDirection::South => CursorIcon::SResize,
-        ResizeDirection::NorthEast => CursorIcon::NeResize,
-        ResizeDirection::NorthWest => CursorIcon::NwResize,
-        ResizeDirection::SouthEast => CursorIcon::SeResize,
-        ResizeDirection::SouthWest => CursorIcon::SwResize,
-    }
-}
-
 /// Opens the browser window described by `platform` and runs it until the
 /// user closes it.
 pub fn run(platform: Platform) -> Result<(), EventLoopError> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop.run_app(&mut App::new(platform))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resize_handles_cover_edges_and_corners() {
-        assert_eq!(resize_direction(100.0, 100.0, 800.0, 600.0), None);
-        assert_eq!(
-            resize_direction(2.0, 300.0, 800.0, 600.0),
-            Some(ResizeDirection::West)
-        );
-        assert_eq!(
-            resize_direction(799.0, 300.0, 800.0, 600.0),
-            Some(ResizeDirection::East)
-        );
-        assert_eq!(
-            resize_direction(400.0, 0.0, 800.0, 600.0),
-            Some(ResizeDirection::North)
-        );
-        assert_eq!(
-            resize_direction(400.0, 598.0, 800.0, 600.0),
-            Some(ResizeDirection::South)
-        );
-        assert_eq!(
-            resize_direction(1.0, 1.0, 800.0, 600.0),
-            Some(ResizeDirection::NorthWest)
-        );
-        assert_eq!(
-            resize_direction(797.0, 597.0, 800.0, 600.0),
-            Some(ResizeDirection::SouthEast)
-        );
-        assert_eq!(
-            resize_direction(0.0, 599.0, 800.0, 600.0),
-            Some(ResizeDirection::SouthWest)
-        );
-        assert_eq!(
-            resize_direction(799.0, 0.0, 800.0, 600.0),
-            Some(ResizeDirection::NorthEast)
-        );
-        // Just inside the handle width is page content.
-        assert_eq!(resize_direction(6.0, 300.0, 800.0, 600.0), None);
-    }
 }

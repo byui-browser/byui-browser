@@ -1,21 +1,22 @@
 //! Minimal Linux shell for X11 and Wayland. Run with `cargo run -p browser-linux`.
 //!
 //! The window, toolbar, and page rendering come from the shared
-//! `browser-shell` crate; this crate only describes the Linux window and
-//! finds a system font for the toolbar text.
+//! `browser-shell` crate; this crate only describes the Linux window, which
+//! keeps the desktop's own decorations, and finds a system font for the
+//! toolbar text.
 
 #![forbid(unsafe_code)]
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), winit::error::EventLoopError> {
     browser_shell::run(browser_shell::Platform {
-        // Hide the desktop's decorations so the toolbar can span the full
-        // window width; the shell draws the window controls itself. Without
-        // decorations there is no native resize border either, so the shell
-        // adds its own resize handles.
-        configure_window: |attributes| attributes.with_decorations(false),
+        // Keep the desktop's own decorations: the window manager (or, on
+        // Wayland compositors without server-side decorations, winit's
+        // Adwaita-style client-side frame) provides the titlebar, its
+        // buttons, and the resize borders above and around the toolbar.
+        configure_window: |attributes| attributes,
         ui_font_files: linux::ui_font_files,
-        resize_borders: true,
+        window_controls_inset: 0.0,
     })
 }
 

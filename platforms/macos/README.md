@@ -22,11 +22,12 @@ A 1120 × 720 window titled **BYUI Browser** opens with a unified, Safari-style
 toolbar (52 logical pixels high) and the page shown as a rounded card inset
 from the window frame. The chrome follows the system light or dark appearance.
 
-The native titlebar is hidden, so the shell draws and handles the window
-controls itself: close quits, minimize sends the window to the Dock, and zoom
-(or double-clicking empty toolbar space) toggles the zoomed size. Drag empty
-toolbar space to move the window. The window controls turn gray when the window
-loses focus.
+The titlebar is transparent and the content extends under it, so the toolbar
+spans the full window width while macOS keeps its own traffic-light buttons at
+the top left; the toolbar leaves room for them. Close, minimize, and zoom
+behave as in any Mac app, and the window resizes from its edges as usual.
+Dragging empty toolbar space moves the window, and double-clicking it toggles
+the zoomed size.
 
 From left to right the toolbar shows Back, Forward, Reload, a centered address
 field labelled `byui://welcome`, New Tab, and a menu button. Navigation is not

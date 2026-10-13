@@ -10,7 +10,8 @@ Thin native shells that host the browser UI. The engine produces pixels and even
 | `windows/` | Win32 / WinUI            | Browser UX  | Not implemented |
 
 `make run` picks the shell for the current operating system. Each platform
-crate only describes its window (how to hide the native titlebar, which system
-font to use) and calls `browser_shell::run`; the chrome and the welcome-page
-demo live once in `shell/`. Create a shell subdirectory when starting platform
+crate only describes its window (its native decorations, which system font to
+use) and calls `browser_shell::run`; the toolbar and the welcome-page demo
+live once in `shell/`, and every shell keeps its operating system's own window
+buttons and frame. Create a shell subdirectory when starting platform
 work. Do not put engine logic here.
