@@ -29,12 +29,12 @@ else
 	$(error Unsupported operating system '$(shell uname -s)')
 endif
 
-## Run all workspace tests, or `make test <crate_name>` for one crate.
+## Run all workspace tests, or `make test <crate_name>...` for specific crates.
 test:
 ifeq ($(strip $(ARGS)),)
 	cargo test --workspace
 else
-	cargo test -p $(ARGS)
+	cargo test $(foreach crate,$(ARGS),-p $(crate))
 endif
 
 ## Release-build the browser for a platform: `make release <macos|linux|windows>`.
