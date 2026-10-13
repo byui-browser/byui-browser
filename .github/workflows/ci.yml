@@ -40,6 +40,8 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}-latest
+    # A hung test otherwise holds the runner until GitHub's 6-hour limit.
+    timeout-minutes: 30
     strategy:
       # Report every OS's result even when another OS fails.
       fail-fast: false
