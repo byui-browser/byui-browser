@@ -6,14 +6,11 @@
 //! and Reload, the address field, New Tab, and the menu only show hover and
 //! press feedback. The address text is a fixed label for the welcome page.
 
-use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
+use ab_glyph::{Font, FontVec, PxScale, ScaleFont, VariableFont, point};
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform};
 
-#[cfg(target_os = "macos")]
-use ab_glyph::VariableFont;
-
 /// Toolbar height in logical pixels; the page card starts directly below it.
-pub(super) const TOOLBAR_HEIGHT: f64 = 52.0;
+pub(crate) const TOOLBAR_HEIGHT: f64 = 52.0;
 /// Logical height of the strip holding every toolbar control. It stops above
 /// the page card's shadow so the strip can be repainted on its own.
 const CONTROLS_HEIGHT: f64 = 46.0;
@@ -37,7 +34,7 @@ const ADDRESS_PAGE: &str = "welcome";
 
 /// A clickable region of the chrome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Control {
+pub(crate) enum Control {
     /// Closes the window and quits.
     Close,
     /// Minimizes the window to the Dock.
@@ -72,7 +69,7 @@ const CONTROLS: [Control; 9] = [
 
 impl Control {
     /// Whether the control responds to hover and clicks.
-    pub(super) fn is_enabled(self) -> bool {
+    pub(crate) fn is_enabled(self) -> bool {
         !matches!(self, Control::Back | Control::Forward)
     }
 
@@ -83,7 +80,7 @@ impl Control {
 
 /// Interaction and appearance state that changes how the chrome is painted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct ChromeState {
+pub(crate) struct ChromeState {
     /// Control under the pointer, if any.
     pub hovered: Option<Control>,
     /// Control with the left mouse button held down on it, if any.
@@ -96,7 +93,7 @@ pub(super) struct ChromeState {
 
 /// A rectangle in device pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct PixelRect {
+pub(crate) struct PixelRect {
     /// Left edge in device pixels.
     pub x: u32,
     /// Top edge in device pixels.
@@ -109,7 +106,7 @@ pub(super) struct PixelRect {
 
 /// Returns the page card's area for a window of `width` × `height` device
 /// pixels, or `None` when the window is too small to show any page.
-pub(super) fn page_rect(width: u32, height: u32, scale_factor: f64) -> Option<PixelRect> {
+pub(crate) fn page_rect(width: u32, height: u32, scale_factor: f64) -> Option<PixelRect> {
     let inset = (PAGE_INSET * scale_factor).round() as u32;
     let top = (TOOLBAR_HEIGHT * scale_factor).round() as u32;
     let page_width = width.checked_sub(inset * 2).filter(|w| *w > 0)?;
@@ -124,7 +121,7 @@ pub(super) fn page_rect(width: u32, height: u32, scale_factor: f64) -> Option<Pi
 
 /// Returns the enabled or disabled control at a point given in logical
 /// pixels, for a window `width` logical pixels wide.
-pub(super) fn hit_test(x: f64, y: f64, width: f64) -> Option<Control> {
+pub(crate) fn hit_test(x: f64, y: f64, width: f64) -> Option<Control> {
     let (x, y) = (x as f32, y as f32);
     CONTROLS.into_iter().find(|control| {
         control_rect(*control, width as f32).is_some_and(|rect| {
@@ -133,19 +130,18 @@ pub(super) fn hit_test(x: f64, y: f64, width: f64) -> Option<Control> {
     })
 }
 
-/// Loads the system UI font for toolbar text, or `None` if no known macOS
-/// font file is readable; the chrome then omits its text.
-#[cfg(target_os = "macos")]
-pub(super) fn load_ui_font() -> Option<FontVec> {
-    [
-        "/System/Library/Fonts/SFNS.ttf",
-        "/System/Library/Fonts/HelveticaNeue.ttc",
-        "/System/Library/Fonts/Helvetica.ttc",
-    ]
-    .into_iter()
-    .find_map(|path| {
+/// Loads the first readable font file in `candidates` for toolbar text, or
+/// `None` if none loads; the chrome then omits its text.
+///
+/// Each platform shell lists its system UI font files in order of preference.
+/// Variable fonts with an optical-size axis are set to the toolbar text size.
+pub fn load_ui_font<P: AsRef<std::path::Path>>(
+    candidates: impl IntoIterator<Item = P>,
+) -> Option<FontVec> {
+    candidates.into_iter().find_map(|path| {
         let mut font = FontVec::try_from_vec(std::fs::read(path).ok()?).ok()?;
-        // SF is a variable font; pick the optical size designed for UI text.
+        // SF and other variable UI fonts pick the optical size designed for
+        // small text; fonts without an `opsz` axis ignore this.
         font.set_variation(b"opsz", TEXT_SIZE);
         Some(font)
     })
@@ -156,7 +152,7 @@ pub(super) fn load_ui_font() -> Option<FontVec> {
 /// `width` and `height` are in device pixels and `page` should match
 /// [`page_rect`]'s size; a missing or mismatched page shows a blank card.
 /// Returns `None` only for a zero-sized window.
-pub(super) fn compose(
+pub(crate) fn compose(
     width: u32,
     height: u32,
     scale_factor: f64,
@@ -188,7 +184,7 @@ pub(super) fn compose(
 /// The result matches the same rows of [`compose`] for the same arguments, so
 /// hover, press, and focus changes can skip repainting the page. `height` is
 /// the full window height in device pixels.
-pub(super) fn compose_controls(
+pub(crate) fn compose_controls(
     width: u32,
     height: u32,
     scale_factor: f64,
@@ -212,7 +208,7 @@ pub(super) fn compose_controls(
 }
 
 /// Height in device pixels of the strip that [`compose_controls`] repaints.
-pub(super) fn controls_height_in_pixels(scale_factor: f64) -> u32 {
+pub(crate) fn controls_height_in_pixels(scale_factor: f64) -> u32 {
     (CONTROLS_HEIGHT * scale_factor).floor() as u32
 }
 

@@ -1,0 +1,17 @@
+[package]
+name = "browser-linux"
+description = "Minimal native Linux window (X11 and Wayland) for BYUI Browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+browser-shell = { path = "../shell" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+
+[lints]
+workspace = true

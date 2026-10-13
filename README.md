@@ -62,10 +62,11 @@ The binary entry point:
 cargo run -p browser
 ```
 
-`make run` selects the platform shell automatically. The macOS shell currently
-renders the startup HTML page, parses its CSS, and executes its JavaScript
-startup script. Linux and Windows shells are not implemented yet, so the
-command reports that limitation instead of running the wrong binary.
+`make run` selects the platform shell automatically. The macOS and Linux
+shells currently render the startup HTML page, parse its CSS, and execute its
+JavaScript startup script; see [`platforms/`](platforms/README.md) for what
+each shell needs. The Windows shell is not implemented yet, so the command
+reports that limitation instead of running the wrong binary.
 
 ## Development workflow
 

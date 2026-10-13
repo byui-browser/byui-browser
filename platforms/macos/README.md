@@ -1,7 +1,9 @@
 # macOS shell
 
-A minimal native macOS window written in Rust using `winit`. This standalone
-shell displays a fixed HTML demo using the project's layout, paint, and render APIs.
+A minimal native macOS window written in Rust using `winit`. This shell
+displays a fixed HTML demo using the project's layout, paint, and render APIs.
+The window, toolbar, and rendering code is shared with the Linux shell in
+[`platforms/shell`](../shell); this crate only describes the macOS window.
 
 ## Run
 
@@ -54,3 +56,4 @@ navigation, full CSS support, or renderer-process integration.
 
 On other operating systems, the executable only reports that macOS is required.
 This lets workspace checks run without building a macOS window on those systems.
+Linux users run the [Linux shell](../linux) instead.
