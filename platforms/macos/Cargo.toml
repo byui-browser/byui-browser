@@ -7,6 +7,18 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+browser = { path = "../../crates/browser" }
+css = { workspace = true }
+html = { workspace = true }
+js = { workspace = true }
+layout = { workspace = true }
+paint = { workspace = true }
+render = { workspace = true }
+# Anti-aliased chrome drawing and system-font text for the toolbar.
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+ab_glyph = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 softbuffer = { version = "0.4", default-features = false }

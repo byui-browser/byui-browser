@@ -2,6 +2,7 @@
 
 use crate::ast::{Expr, Program};
 use crate::lexer::Token;
+use crate::stack::with_engine_stack;
 use std::fmt;
 
 mod expressions;
@@ -54,16 +55,22 @@ type ParseResult<T> = Result<T, ParseError>;
 /// input. Newlines are whitespace, not automatic semicolon insertion; in
 /// particular `return` followed by a newline may still have a value. Empty
 /// statements, comma declarations, and trailing commas are unsupported.
-/// Returns outside functions and constants without initializers are rejected.
-/// Nesting beyond 128 recursive grammar levels returns an error to bound stack
-/// usage. The lexer does not currently supply a remainder operator token.
+/// Returns outside functions, constants without initializers, duplicate
+/// parameter names, and `let`/`const`/`function` declarations used directly as
+/// an `if`, `else`, or `while` body are rejected.
+///
+/// To bound stack usage, nesting beyond 128 recursive grammar levels and any
+/// expression tree deeper than 512 nodes (including long left-associative
+/// chains such as `1 + 1 + ...`) return an error.
 pub fn parse_program(tokens: &[Token]) -> ParseResult<Program> {
-    let mut parser = Parser::new(tokens);
-    let mut body = Vec::new();
-    while parser.peek().is_some() {
-        body.push(parser.parse_statement()?);
-    }
-    Ok(Program { body })
+    with_engine_stack(|| {
+        let mut parser = Parser::new(tokens);
+        let mut body = Vec::new();
+        while parser.peek().is_some() {
+            body.push(parser.parse_statement()?);
+        }
+        Ok(Program { body })
+    })
 }
 
 /// Parses one complete expression into an owned AST.
@@ -72,13 +79,24 @@ pub fn parse_program(tokens: &[Token]) -> ParseResult<Program> {
 /// Trailing tokens, including semicolons, are rejected. Errors include a token
 /// index; source positions are supplied by the program-level [`crate::parse`].
 pub fn parse(tokens: &[Token]) -> ParseResult<Expr> {
-    let mut parser = Parser::new(tokens);
-    let expression = parser.parse_expression(0)?;
-    if parser.peek().is_some() {
-        return Err(parser.error("Unexpected token after expression", "expression"));
-    }
-    Ok(expression)
+    with_engine_stack(|| {
+        let mut parser = Parser::new(tokens);
+        let expression = parser.parse_expression(0)?;
+        if parser.peek().is_some() {
+            return Err(parser.error("Unexpected token after expression", "expression"));
+        }
+        Ok(expression)
+    })
 }
+
+/// Maximum number of recursive grammar levels.
+const MAX_NESTING: usize = 128;
+
+/// Maximum depth of one expression tree. Recursion depth alone does not bound
+/// this, because binary chains and call suffixes are built in loops.
+const MAX_EXPRESSION_DEPTH: usize = 512;
+
+const NESTING_ERROR: &str = "Maximum parser nesting exceeded";
 
 struct Parser<'tokens> {
     tokens: &'tokens [Token],
@@ -152,8 +170,8 @@ impl<'tokens> Parser<'tokens> {
         context: &'static str,
         parse: impl FnOnce(&mut Self) -> ParseResult<T>,
     ) -> ParseResult<T> {
-        if self.depth >= 128 {
-            return Err(self.error("Maximum parser nesting exceeded", context));
+        if self.depth >= MAX_NESTING {
+            return Err(self.error(NESTING_ERROR, context));
         }
         self.depth += 1;
         let result = parse(self);
@@ -162,9 +180,27 @@ impl<'tokens> Parser<'tokens> {
     }
 
     fn parse_expression(&mut self, minimum_precedence: u8) -> ParseResult<Expr> {
+        self.parse_expression_with_depth(minimum_precedence)
+            .map(|(expression, _)| expression)
+    }
+
+    /// Parses an expression and reports the depth of its tree.
+    fn parse_expression_with_depth(
+        &mut self,
+        minimum_precedence: u8,
+    ) -> ParseResult<(Expr, usize)> {
         self.nested("expression", |parser| {
             expressions::parse(parser, minimum_precedence)
         })
+    }
+
+    /// Validates the depth of a node about to be built from its children.
+    fn node_depth(&self, depth: usize, context: &'static str) -> ParseResult<usize> {
+        if depth > MAX_EXPRESSION_DEPTH {
+            Err(self.error(NESTING_ERROR, context))
+        } else {
+            Ok(depth)
+        }
     }
 
     fn parse_statement(&mut self) -> ParseResult<crate::ast::Statement> {
