@@ -8,8 +8,8 @@
 
 use std::sync::Arc;
 
-use js::Realm;
-use webapis::{ConsoleSink, register_fetch, register_print};
+use browser::evaluate_page_scripts;
+use webapis::ConsoleSink;
 
 struct StdoutConsole;
 
@@ -20,16 +20,16 @@ impl ConsoleSink for StdoutConsole {
 }
 
 fn main() {
-    let mut realm = Realm::new();
-    register_print(&mut realm, Arc::new(StdoutConsole))
-        .expect("registering built-in Web APIs should succeed");
+    // Keep the standalone binary useful while native platform shells are
+    // brought online. `make run` selects the platform shell below.
     let controller = Arc::new(
         net::RequestController::new(net::Config::default())
             .expect("network client should initialize"),
     );
-    register_fetch(&mut realm, controller).expect("registering the fetch Web API should succeed");
-
-    realm
-        .evaluate_script("print()")
-        .expect("the built-in print function should be callable");
+    evaluate_page_scripts(
+        "<script>print()</script>",
+        Arc::new(StdoutConsole),
+        controller,
+    )
+    .expect("page scripts should evaluate");
 }
