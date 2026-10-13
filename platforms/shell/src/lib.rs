@@ -11,7 +11,12 @@
 
 #![forbid(unsafe_code)]
 
+// The drawing code is only used by `app`, so on unsupported operating systems
+// it is compiled for tests alone; building it there would otherwise fail
+// `-D warnings` with dead-code errors.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 mod content;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 mod toolbar;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -19,4 +24,3 @@ mod app;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use app::{Platform, run};
-pub use toolbar::load_ui_font;

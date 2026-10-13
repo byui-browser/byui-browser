@@ -6,7 +6,7 @@
 //! and Reload, the address field, New Tab, and the menu only show hover and
 //! press feedback. The address text is a fixed label for the welcome page.
 
-use ab_glyph::{Font, FontVec, PxScale, ScaleFont, VariableFont, point};
+use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform};
 
 /// Toolbar height in logical pixels; the page card starts directly below it.
@@ -135,9 +135,12 @@ pub(crate) fn hit_test(x: f64, y: f64, width: f64) -> Option<Control> {
 ///
 /// Each platform shell lists its system UI font files in order of preference.
 /// Variable fonts with an optical-size axis are set to the toolbar text size.
-pub fn load_ui_font<P: AsRef<std::path::Path>>(
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn load_ui_font<P: AsRef<std::path::Path>>(
     candidates: impl IntoIterator<Item = P>,
 ) -> Option<FontVec> {
+    use ab_glyph::VariableFont;
+
     candidates.into_iter().find_map(|path| {
         let mut font = FontVec::try_from_vec(std::fs::read(path).ok()?).ok()?;
         // SF and other variable UI fonts pick the optical size designed for
