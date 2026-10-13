@@ -1,3 +1,7 @@
 Everyone please practice using branches and git commits by adding your name to this file!
 Makenna wold
 Kyle Nordick
+Caleb Bassett
+Levi Miller
+Troy Justesen
+Silas Carlson
