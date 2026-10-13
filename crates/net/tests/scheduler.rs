@@ -58,10 +58,18 @@ fn scheduler_limits_active_transport_requests() {
         let second_controller = controller.clone();
         let first_url = server.url();
         let second_url = server.url();
-        let first =
-            tokio::spawn(async move { first_controller.fetch(Request::get(first_url)).await });
-        let second =
-            tokio::spawn(async move { second_controller.fetch(Request::get(second_url)).await });
+        // Each task reads its own body. The scheduler permit stays with a
+        // response body until it is consumed, so an unread response parked in
+        // one join handle would starve the other request, whichever task the
+        // runtime happens to admit first.
+        let first = tokio::spawn(async move {
+            let response = first_controller.fetch(Request::get(first_url)).await?;
+            response.body.bytes().await
+        });
+        let second = tokio::spawn(async move {
+            let response = second_controller.fetch(Request::get(second_url)).await?;
+            response.body.bytes().await
+        });
         first.await.unwrap().unwrap();
         second.await.unwrap().unwrap();
     });
