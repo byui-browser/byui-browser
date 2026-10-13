@@ -16,7 +16,7 @@ use crate::HeaderGuard;
 /// | Variants | Recovery and body effect |
 /// | --- | --- |
 /// | `Initialization` | Fix client configuration; no request or response body exists. |
-/// | `InvalidUrl`, `InvalidOrigin`, `InvalidMethod`, `ForbiddenMethod`, `NoCorsMethod`, `ForbiddenHeader`, `InvalidHeaderName`, `InvalidHeaderValue`, `ImmutableHeaders`, `InvalidHeaderGuardTransition`, `BodyNotAllowed`, `KeepaliveBodyTooLarge`, `UnsupportedScheme`, `UnsupportedFeature` | Correct the request; no body is consumed by this failed attempt. |
+/// | `InvalidUrl`, `InvalidOrigin`, `InvalidMethod`, `ForbiddenMethod`, `NoCorsMethod`, `ForbiddenHeader`, `InvalidHeaderName`, `InvalidHeaderValue`, `ImmutableHeaders`, `InvalidHeaderGuardTransition`, `BodyNotAllowed`, `KeepaliveBodyTooLarge`, `UnsupportedScheme`, `UnsupportedFeature`, `InvalidResponse` | Correct the request, provider, or response metadata; no body is exposed by this failed attempt. |
 /// | `SchedulerClosed` | Use a live controller; the request body was not sent. |
 /// | `NetworkError` | A cache-only miss; retry after cache state changes or choose another cache mode. No body was consumed. |
 /// | `BodyAlreadyConsumed` | The request body was spent by a prior attempt; create a fresh body. |
@@ -43,6 +43,8 @@ pub enum RequestError {
     UnsupportedFeature(&'static str),
     /// The URL uses a scheme unsupported by the HTTP transport.
     UnsupportedScheme(String),
+    /// A provider or transport adapter returned invalid response metadata.
+    InvalidResponse(String),
     /// The serialized origin is malformed or is not an HTTP(S) origin.
     InvalidOrigin(String),
     /// The request method is not a valid HTTP token.
@@ -100,6 +102,7 @@ impl std::fmt::Display for RequestError {
             Self::RedirectFailure => f.write_str("Redirect could not be processed"),
             Self::UnsupportedFeature(feature) => write!(f, "Unsupported Fetch feature: {feature}"),
             Self::UnsupportedScheme(scheme) => write!(f, "Unsupported URL scheme: {scheme}"),
+            Self::InvalidResponse(response) => write!(f, "Invalid response: {response}"),
             Self::InvalidOrigin(origin) => write!(f, "Invalid request origin: {origin}"),
             Self::InvalidMethod(method) => write!(f, "Invalid request method: {method}"),
             Self::ForbiddenMethod(method) => write!(f, "Forbidden request method: {method}"),

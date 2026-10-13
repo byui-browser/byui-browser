@@ -4,7 +4,8 @@ use super::{Response, ResponseType};
 use crate::api::{
     HeaderGuard, Headers,
     body::Body,
-    request::{CredentialsMode, Origin, RequestMode},
+    providers::SchemeResource,
+    request::{CredentialsMode, Origin, Request, RequestMode},
 };
 
 /// Complete response state retained inside the Fetch engine.
@@ -29,6 +30,49 @@ pub(crate) struct InternalResponse {
 }
 
 impl InternalResponse {
+    /// Converts provider-owned resource metadata into the internal response
+    /// representation used by the Fetch policy and exposure pipeline.
+    pub(crate) fn from_scheme_resource(
+        resource: SchemeResource,
+        request: &Request,
+    ) -> Result<Self, crate::RequestError> {
+        let status = StatusCode::from_u16(resource.status).map_err(|error| {
+            crate::RequestError::InvalidResponse(format!(
+                "scheme provider returned invalid status {}: {error}",
+                resource.status
+            ))
+        })?;
+        let mut headers = HeaderMap::new();
+        for (name, value) in resource.headers {
+            headers.append(name, value);
+        }
+        let content_type = resource
+            .media_type
+            .or_else(|| headers.get(http::header::CONTENT_TYPE).cloned());
+        let (mut body, body_is_null) = resource.body.into_body();
+        body.set_content_type(content_type);
+        let status_text = resource
+            .status_text
+            .unwrap_or_else(|| status.canonical_reason().unwrap_or_default().to_owned());
+
+        Ok(Self {
+            status,
+            status_text,
+            headers,
+            url_list: vec![resource.url.to_string()],
+            redirect_count: 0,
+            origin: Some(resource.origin),
+            request_origin: request.context.environment.origin.clone(),
+            request_mode: request.context.mode,
+            credentials_mode: request.context.credentials,
+            response_type: ResponseType::Basic,
+            body,
+            body_is_null,
+            from_cache: false,
+            cookie_headers_processed: false,
+        })
+    }
+
     pub(crate) fn expose(self) -> Response {
         let hidden = matches!(
             self.response_type,

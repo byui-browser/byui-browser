@@ -36,6 +36,19 @@ fn unsupported_schemes_are_rejected_without_network_io() {
 }
 
 #[test]
+fn supported_non_http_scheme_reaches_dispatcher_seam() {
+    let controller = RequestController::new(Config::default()).unwrap();
+    let error = runtime()
+        .block_on(controller.fetch(Request::get("data:text/plain,hello")))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RequestError::UnsupportedFeature("scheme-specific fetch dispatcher")
+    ));
+}
+
+#[test]
 fn non_cacheable_post_requests_are_sent_each_time() {
     use std::sync::{
         Arc,

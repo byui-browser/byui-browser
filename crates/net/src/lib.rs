@@ -48,6 +48,7 @@ pub use api::{
     config::Config,
     error::RequestError,
     headers::{HeaderGuard, Headers},
+    providers::{ProviderBodyStream, SchemeBody, SchemeResource},
     request::{
         CacheMode, CredentialsMode, FetchContext, FetchEnvironment, InitiatorType,
         NetworkPartitionKey, Origin, RedirectMode, Referrer, ReferrerPolicy, Request,
