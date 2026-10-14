@@ -3,7 +3,6 @@
 use crate::{
     api::{error::RequestError, request::Request, response::Response},
     engine::RequestController,
-    policy::FetchScheme,
 };
 
 impl RequestController {
@@ -17,20 +16,7 @@ impl RequestController {
     pub async fn fetch(&self, request: Request) -> Result<Response, RequestError> {
         let (request, validated_url, cacheable) = self.prepare_request(request)?;
         let url = validated_url.url;
-
-        // Dispatcher seam for feature 4.4. HTTP(S) retains the existing
-        // network implementation; local scheme handlers follow separately.
-        match validated_url.scheme {
-            FetchScheme::Http | FetchScheme::Https => {
-                self.fetch_http(request, url, cacheable).await
-            }
-            FetchScheme::Data
-            | FetchScheme::Blob
-            | FetchScheme::File
-            | FetchScheme::Byui
-            | FetchScheme::About => Err(RequestError::UnsupportedFeature(
-                "scheme-specific fetch dispatcher",
-            )),
-        }
+        self.fetch_scheme(request, url, validated_url.scheme, cacheable)
+            .await
     }
 }

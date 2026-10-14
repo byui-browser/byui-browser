@@ -1,4 +1,4 @@
-//! Browser-owned resource results used by scheme-specific Fetch providers.
+//! Provider-neutral resource and body values.
 
 use std::pin::Pin;
 
@@ -10,10 +10,6 @@ use url::Url;
 use crate::api::{body::Body, error::RequestError, request::Origin};
 
 /// A sendable stream supplied by a browser-owned scheme provider.
-///
-/// Providers may use [`SchemeBody::Bytes`] for small or already-materialized
-/// resources. This stream form keeps the provider boundary ready for files,
-/// blobs, and pages that should not be buffered in a later implementation.
 pub type ProviderBodyStream =
     Pin<Box<dyn Stream<Item = Result<Vec<u8>, RequestError>> + Send + 'static>>;
 
@@ -28,10 +24,6 @@ pub enum SchemeBody {
 }
 
 /// Provider-neutral resource metadata used to construct an internal response.
-///
-/// This is not the public Fetch [`Response`](crate::Response). Providers return
-/// resource facts through this type; `net` validates and converts them into an
-/// internal response before applying Fetch policy and public filtering.
 pub struct SchemeResource {
     /// Final URL represented by the resource.
     pub url: Url,
@@ -43,8 +35,7 @@ pub struct SchemeResource {
     pub headers: Vec<(HeaderName, HeaderValue)>,
     /// Media type associated with the body, when known.
     pub media_type: Option<HeaderValue>,
-    /// Origin assigned by the provider, including an opaque origin where
-    /// required by the scheme.
+    /// Origin assigned by the provider, including an opaque origin where required.
     pub origin: Origin,
     /// Body bytes, stream, or explicit null-body state.
     pub body: SchemeBody,

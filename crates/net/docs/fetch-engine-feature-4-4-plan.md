@@ -1,7 +1,8 @@
 # Feature 4.4 plan: scheme-specific Fetch dispatch
 
-Status: first pipeline pass complete; scheme handlers remain, reviewed against
-the current `crates/net` implementation on 2026-10-13.
+Status: provider boundary and engine-owned `data:` handler in progress; blob,
+file, byui, and about handlers remain, reviewed against the current
+`crates/net` implementation on 2026-10-14.
 
 This plan records only the work that remains for feature 4.4 of the
 [`fetch-engine-implementation-plan.md`](fetch-engine-implementation-plan.md).
@@ -46,9 +47,10 @@ The initial pipeline refactor is complete:
 - Added unit coverage for scheme classification and an integration test proving
   a supported non-HTTP URL reaches the dispatcher seam.
 
-The non-HTTP branches intentionally return
-`UnsupportedFeature("scheme-specific fetch dispatcher")` until their handlers
-and providers are implemented.
+The `data:` branch now decodes percent-encoded and base64 payloads into the
+shared response/body pipeline. Provider-backed branches fail with a typed
+`MissingProvider` error when their matching capability is absent; installed
+providers still await their scheme handlers.
 
 ## Next steps
 
@@ -59,8 +61,8 @@ work below before implementing any provider-backed scheme handler.
 
 #### 1.1 Define provider-neutral resource results — complete
 
-The first-pass [`SchemeResource`](../src/api/providers.rs) and
-[`SchemeBody`](../src/api/providers.rs) types now provide the provider
+The first-pass [`SchemeResource`](../src/api/providers/body.rs) and
+[`SchemeBody`](../src/api/providers/body.rs) types now provide the provider
 boundary. `SchemeBody` supports explicit null bodies, materialized bytes, and
 sendable `Vec<u8>` chunk streams for future non-buffered providers. `net`
 converts these values into `Body` and then `InternalResponse`; public fetches
@@ -82,7 +84,7 @@ object, or browser-specific policy database. Providers return this data to
 `net`; `net` remains responsible for constructing the internal and public
 Fetch responses.
 
-The first implementation uses [`SchemeResource`](../src/api/providers.rs) with
+The first implementation uses [`SchemeResource`](../src/api/providers/body.rs) with
 `SchemeBody::Null`, `SchemeBody::Bytes`, and `SchemeBody::Stream` variants.
 The stream variant uses a sendable `Vec<u8>` chunk stream so browser providers
 can add streaming later without changing the public `Response` return value.
@@ -103,8 +105,8 @@ Alternatives considered:
 
 #### 1.2 Define narrow provider traits
 
-Add provider traits in [`services.rs`](../src/api/services.rs), or in a new
-`api/providers.rs` module:
+Add provider traits in the `api/providers/` module alongside
+[`services.rs`](../src/api/services.rs):
 
 - `BlobProvider` resolves or rejects a `blob:` URL;
 - `FileProvider` authorizes and opens a `file:` URL; and

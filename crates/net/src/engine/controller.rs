@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use crate::{
-    api::{config::Config, error::RequestError, services::FetchServices},
+    api::{
+        config::Config, error::RequestError, providers::SchemeProviders, services::FetchServices,
+    },
     cache::ResponseCache,
     policy::{CorsChecker, RequestPolicy},
     scheduling::RequestScheduler,
@@ -29,6 +31,8 @@ pub(crate) struct ControllerInner {
     pub(crate) cache: ResponseCache,
     /// Browser-owned policy, credential, cache-partition, and worker decisions.
     pub(crate) services: Option<Arc<dyn FetchServices>>,
+    /// Browser-owned scheme providers selected by the dispatcher.
+    pub(crate) providers: SchemeProviders,
     /// Cross-origin response validation boundary.
     pub(crate) cors: CorsChecker,
     /// Request and response policy validation boundary.
@@ -51,7 +55,7 @@ impl RequestController {
     /// [`RequestError::Initialization`] is returned if the underlying HTTP
     /// client cannot be initialized.
     pub fn new(config: Config) -> Result<Self, RequestError> {
-        Self::build(config, None)
+        Self::build(config, None, SchemeProviders::default())
     }
 
     /// Creates a controller with browser-owned service decisions.
@@ -62,12 +66,22 @@ impl RequestController {
         config: Config,
         services: Arc<dyn FetchServices>,
     ) -> Result<Self, RequestError> {
-        Self::build(config, Some(services))
+        Self::build(config, Some(services), SchemeProviders::default())
+    }
+
+    /// Creates a controller with browser services and scheme-specific providers.
+    pub fn with_services_and_providers(
+        config: Config,
+        services: Arc<dyn FetchServices>,
+        providers: SchemeProviders,
+    ) -> Result<Self, RequestError> {
+        Self::build(config, Some(services), providers)
     }
 
     fn build(
         config: Config,
         services: Option<Arc<dyn FetchServices>>,
+        providers: SchemeProviders,
     ) -> Result<Self, RequestError> {
         let max_in_flight = config.max_in_flight;
         let max_keepalive_body_size = config.max_keepalive_body_size;
@@ -78,6 +92,7 @@ impl RequestController {
                 max_keepalive_body_size,
                 cache: ResponseCache::default(),
                 services,
+                providers,
                 cors: CorsChecker,
                 policy: RequestPolicy,
                 scheduler: RequestScheduler::new(transport, max_in_flight),

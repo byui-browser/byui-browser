@@ -21,10 +21,16 @@ impl CorsChecker {
         response: &InternalResponse,
     ) -> Result<ResponseType, RequestError> {
         let final_url = response.url_list.last().ok_or(RequestError::NetworkError)?;
-        let url = reqwest::Url::parse(final_url).map_err(|_| RequestError::NetworkError)?;
         let origin = request.context.environment.origin.as_ref();
         let same_origin = origin.is_some_and(|origin| {
-            Origin::from_url(&url).is_ok_and(|target| origin.is_same_origin(&target))
+            response
+                .origin
+                .as_ref()
+                .is_some_and(|target| origin.is_same_origin(target))
+                || reqwest::Url::parse(final_url)
+                    .ok()
+                    .and_then(|url| Origin::from_url(&url).ok())
+                    .is_some_and(|target| origin.is_same_origin(&target))
         });
         if same_origin || (origin.is_none() && request.context.mode != RequestMode::NoCors) {
             return Ok(ResponseType::Basic);

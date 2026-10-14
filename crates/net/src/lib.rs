@@ -15,8 +15,10 @@
 //! [`FetchServices`]. Renderer processes do not open sockets directly.
 //!
 //! The current transport executes HTTP(S) requests. Relative URLs require a
-//! [`FetchEnvironment`] with a base URL; `about:`, `blob:`, `data:`, and `file:`
-//! fetching are unsupported and return [`RequestError::UnsupportedScheme`].
+//! [`FetchEnvironment`] with a base URL. Engine-owned `data:` URLs are decoded
+//! locally; `blob:`, `file:`, and `byui:` require matching providers installed
+//! with [`RequestController::with_services_and_providers`], while unsupported
+//! schemes return [`RequestError::UnsupportedScheme`].
 //! This first engine slice supports basic same-origin responses, simple CORS
 //! checks, opaque no-CORS views, and forbidden response-header filtering.
 //! Requests requiring absent providers or algorithms fail with a typed
@@ -48,7 +50,10 @@ pub use api::{
     config::Config,
     error::RequestError,
     headers::{HeaderGuard, Headers},
-    providers::{ProviderBodyStream, SchemeBody, SchemeResource},
+    providers::{
+        BlobProvider, FileProvider, PageProvider, ProviderBodyStream, ProviderFuture, SchemeBody,
+        SchemeProviders, SchemeResource,
+    },
     request::{
         CacheMode, CredentialsMode, FetchContext, FetchEnvironment, InitiatorType,
         NetworkPartitionKey, Origin, RedirectMode, Referrer, ReferrerPolicy, Request,

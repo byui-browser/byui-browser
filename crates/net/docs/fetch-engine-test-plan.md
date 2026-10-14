@@ -259,7 +259,180 @@ expose-header input cannot make a non-safelisted field public. Keep the
 deterministic table-driven tests above as the executable specification for
 known boundary values.
 
-## 4. Null-body responses
+## 4. Scheme dispatch and local-resource fetches
+
+Primary files:
+
+- `crates/net/src/policy/request.rs`
+- `crates/net/src/engine/execute.rs`
+- `crates/net/src/engine/schemes/`
+- `crates/net/src/engine/http.rs`
+- `crates/net/src/api/providers/`
+- `crates/net/tests/schemes.rs`
+
+The supported scheme set is `http`, `https`, `data`, `blob`, `file`, `byui`,
+and the explicitly allowlisted `about` cases. Scheme tests should be
+table-driven where the observable contract is shared, with focused provider
+fakes for browser-owned resources. Every local-scheme test must assert that
+the request does not reach the HTTP transport, HTTP cache, or an unrelated
+provider.
+
+### Common dispatch and response invariants
+
+Add a matrix covering every supported scheme and assert that:
+
+- URL parsing selects exactly the expected internal `FetchScheme`;
+- mixed-case scheme input is normalized consistently with URL parsing;
+- relative URLs resolve only when an environment base URL is available;
+- unsupported schemes such as `ftp:` fail with `UnsupportedScheme` before
+  scheduler admission, provider lookup, cookie lookup, or network I/O;
+- `http:` and `https:` retain the existing transport, cache, scheduler,
+  credential, redirect, and CORS behavior;
+- `data:`, `blob:`, `file:`, `byui:`, and `about:` bypass HTTP transport and
+  HTTP cache unless a future contract explicitly says otherwise;
+- only the provider matching the selected scheme is called, and missing
+  providers return `MissingProvider` without calling any other provider;
+- provider errors are returned unchanged or mapped to the documented typed
+  error, with no partially exposed response;
+- all successful scheme handlers use the shared response finalization and
+  exposure path rather than creating a scheme-specific public response type;
+- response URL, status, status text, headers, origin, response type, and body
+  metadata are populated consistently; and
+- buffered, streamed, empty, and explicit null-body resources follow the same
+  response and policy rules.
+
+Use recording fakes for the HTTP transport, blob provider, file provider, and
+page provider. Each fake should record calls, request URL, request headers,
+request credentials mode, and whether its body was consumed. The fixture
+should make it possible to prove both "called exactly once" and "not called".
+
+### `data:` URLs
+
+Cover the engine-owned parser and response construction with:
+
+- plain text payloads and percent-encoded bytes;
+- `;base64` payloads, including padding and an empty base64 payload;
+- media types with parameters and the default
+  `text/plain;charset=US-ASCII` type;
+- empty payloads, non-UTF-8 payload bytes, and payloads containing commas;
+- malformed percent escapes, a missing comma separator, invalid base64,
+  duplicate `base64` markers, malformed media types, and invalid parameters;
+- status `200`, the resolved `data:` response URL, generated `Content-Type`,
+  and exact body bytes;
+- opaque-origin behavior and the absence of cookies, credentials, and cache
+  entries; and
+- `HEAD`, if accepted by request validation, producing a null public body
+  according to the shared null-body contract.
+
+For each successful form, compare buffered and streaming consumption and verify
+that no provider or local/HTTP transport fake was invoked.
+
+### `blob:` URLs
+
+With a recording `BlobProvider`, add tests for:
+
+- successful resolution of a registered blob and exact provider URL/request
+  arguments;
+- missing, revoked, malformed, and otherwise unresolvable blob URLs;
+- provider-supplied media type, headers, status, response URL, and creator
+  origin being preserved after response exposure;
+- creator-origin assignment versus an opaque origin, including cross-origin
+  blob URLs whose creator origin is not the URL's serialized origin;
+- byte, streamed, empty, and explicit null-body resources;
+- provider failure before any body exposure and body-stream failure after
+  headers, including permit release and cache exclusion;
+- `credentials: omit`, `same-origin`, and `include` never causing HTTP cookie
+  lookup or `Set-Cookie` storage for the blob path;
+- response filtering, forbidden response headers, and policy rejection being
+  applied exactly as for other internal responses; and
+- no HTTP transport, file provider, or page provider call for a blob request.
+
+Also verify that a blob response is not cached by the HTTP cache and that
+repeated requests resolve through the provider each time unless a later blob
+cache contract is added.
+
+### `file:` URLs
+
+With a recording, authorization-aware `FileProvider`, cover:
+
+- absent provider, denied access, missing file, malformed path, and provider
+  failure;
+- successful text and binary reads, media-type assignment, response headers,
+  status, response URL, and provider-selected origin;
+- path normalization, query and fragment handling, and platform-specific path
+  forms according to the provider contract;
+- directory targets and unsupported file types failing before body exposure;
+- byte, streamed, empty, and null-body responses;
+- credentials and cookies never being selected or stored;
+- no direct filesystem access by `net`, no HTTP transport/cache access, and no
+  blob/page provider calls; and
+- denied or failed reads releasing scheduler/body resources and never entering
+  the cache.
+
+The test suite should use an in-memory fake provider. Do not make tests depend
+on host filesystem state or permissions.
+
+### `byui:` browser pages
+
+With a recording `PageProvider`, add tests for:
+
+- registered page lookup and exact path normalization;
+- missing pages, malformed URLs, unsupported page kinds, and provider errors;
+- path, query, and fragment behavior, including deterministic handling of
+  encoded path segments;
+- HTML and non-HTML pages preserving provider status, media type, headers,
+  response URL, and assigned origin;
+- page responses with bytes, streams, empty bodies, and explicit null bodies;
+- page-specific access-control/response filtering behavior;
+- request credentials and cookie exclusion; and
+- no HTTP transport/cache, filesystem, or blob provider access.
+
+Include a routing table test proving that a `byui:` request cannot fall through
+to Reqwest or the file provider when lookup fails. Verify that provider calls
+are made once and that a response body error cannot create a cache entry.
+
+### `about:` URLs
+
+Define the supported allowlist in the tests rather than accepting arbitrary
+`about:` paths. For the initial blank-page behavior, cover:
+
+- the supported blank URL spelling and any explicitly equivalent spelling;
+- the chosen status, status text, response URL, media type, origin, and
+  response type;
+- the distinction between an empty readable body and an explicit null body;
+- `HEAD` and other methods at the documented validation boundary;
+- rejection of every unsupported `about:` path, malformed form, and unexpected
+  query/fragment combination before provider or transport access;
+- absence of cookie lookup, cookie storage, credentials, HTTP cache, and
+  network I/O; and
+- identical metadata and body semantics for buffered and streaming callers.
+
+When another `about:` variant is added, add it to the allowlist matrix with
+its own status, body, origin, and failure tests; do not silently broaden the
+accepted scheme.
+
+### Cross-scheme security and lifecycle matrix
+
+For every local scheme, repeat the following shared assertions:
+
+- request policy failures occur before provider calls;
+- response policy failures hide status, headers, origin, and body bytes;
+- forbidden headers, especially cookie variants, never become public;
+- origin assignment is not inferred from a URL when the scheme requires an
+  opaque or provider-supplied origin;
+- cancellation before provider resolution prevents the provider call;
+- cancellation during a provider stream ends the body with the documented
+  error and releases resources;
+- dropping, aborting, or failing a body does not insert a cache entry; and
+- successful body consumption releases all permits and leaves no provider
+  operation running.
+
+Keep one end-to-end test per scheme in `crates/net/tests/schemes.rs`, with the
+remaining parser and metadata cases beside their implementations. The suite
+should include a shared no-network assertion so future scheme handlers cannot
+accidentally regress into the HTTP path.
+
+## 5. Null-body responses
 
 Primary files:
 
@@ -288,7 +461,7 @@ Also verify that:
 - buffered and streaming paths expose identical status, URL, headers, and
   body semantics.
 
-## 5. Redirects and redirect-mode boundaries
+## 6. Redirects and redirect-mode boundaries
 
 Primary files:
 
@@ -322,7 +495,7 @@ Primary files:
 - manual-mode opaque redirect responses;
 - error-mode network errors.
 
-## 6. Credentials and browser service hooks
+## 7. Credentials and browser service hooks
 
 Primary files:
 
@@ -351,7 +524,7 @@ Assert call order, not only return values. In particular, a failed request
 must not call cookie selection, a rejected response must not store cookies,
 and a public response must never contain `Set-Cookie`.
 
-## 7. Cache behavior and lifecycle
+## 8. Cache behavior and lifecycle
 
 Primary files:
 
@@ -395,7 +568,7 @@ When standards-aware caching is implemented, add tests for:
 - stale-while-revalidate and other supported directives;
 - fresh public response views from a cloneable internal response.
 
-## 8. Cancellation and scheduler lifecycle
+## 9. Cancellation and scheduler lifecycle
 
 Primary files:
 
@@ -423,7 +596,7 @@ Use a blocking local server and a scheduler limit of one to make permit
 ownership observable. Avoid sleeps where possible; use barriers or channels
 to control when headers and chunks are released.
 
-## 9. Transport robustness
+## 10. Transport robustness
 
 Primary files:
 
@@ -491,12 +664,13 @@ Each failure test should assert both the error type and side effects: whether
 the body was partially delivered, whether the scheduler permit was released,
 whether cookies were stored, and whether the response entered the cache.
 
-## 10. Unsupported feature contract tests
+## 11. Unsupported feature contract tests
 
 Keep a focused table-driven suite for features intentionally unsupported in
 the current slice:
 
-- non-HTTP schemes;
+- unsupported URL schemes (for example `ftp:`), while supported local schemes
+  are covered in the scheme-dispatch section above;
 - navigation fetches;
 - integrity metadata;
 - keepalive execution;
