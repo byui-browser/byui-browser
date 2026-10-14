@@ -1163,12 +1163,110 @@ Implement in vertical slices so the browser retains a working network path:
 10. Cancellation/lifecycle completion.
 11. Integrity, keepalive, service-worker, CSP, CORP, timing, and other policy
     hooks; use `sha2` and `base64` for SRI primitives.
-12. Web Platform Tests and removal of compatibility shims.
+12. Later transport work such as HTTP/3, including connection-management and
+    transport-specific conformance work.
+13. Deferred WebSocket support described in section 16, after the HTTP Fetch
+    engine and the other selected transports are stable.
+14. Web Platform Tests and removal of compatibility shims.
 
 Do not begin with a wholesale rename of every type. Stabilize the internal
 response/body model and migrate callers one boundary at a time.
 
-## 16. Acceptance criteria
+## 16. Deferred WebSocket support
+
+WebSocket support is a later networking feature, not part of the initial Fetch
+engine completion criteria. Begin this work only after the HTTP request,
+response, policy, credential, cache, cancellation, and scheduling paths are
+stable, and after the transport roadmap has addressed higher-priority work
+such as HTTP/3. The goal is to make `net` provide the browser-owned networking
+and policy boundary while keeping JavaScript WebSocket objects and events in
+`webapis`.
+
+WebSockets must remain a sibling connection API to Fetch. Do not model an open
+WebSocket as a Fetch `Response` body, a cache entry, or a status-101 null body.
+The successful handshake transfers ownership of an upgraded, bidirectional
+session to the WebSocket API.
+
+### 16.1 Define the engine-level contract
+
+Add documented public types for:
+
+- WebSocket connection options and validated subprotocols;
+- text and binary messages;
+- close codes and close reasons;
+- connection, send, receive, close, and protocol-error results; and
+- an abort-aware, sendable session handle.
+
+Keep the API independent of JavaScript identity, promises, DOM events, and
+WebIDL. Define whether the session is split into a sender and receiver or
+exposes a single handle, and document ownership, backpressure, and shutdown
+behavior for each choice.
+
+### 16.2 Add URL and handshake policy
+
+Extend scheme dispatch to classify `ws:` and `wss:` URLs and route them to a
+WebSocket connector rather than `fetch_http`. Validate URL credentials,
+ports, host names, secure-context and mixed-content rules, and any browser
+restrictions before opening a socket.
+
+Create a controlled handshake-header channel. Generate and validate
+`Connection: Upgrade`, `Upgrade: websocket`, `Sec-WebSocket-Key`,
+`Sec-WebSocket-Version`, `Origin`, and negotiated subprotocol headers without
+loosening ordinary Fetch forbidden-header protections. Validate the server's
+`101 Switching Protocols` response and `Sec-WebSocket-Accept` value. Define
+redirect behavior explicitly; do not inherit the current HTTP redirect path
+by accident.
+
+WebSocket handshakes do not use ordinary Fetch response filtering or CORS
+preflight. Add the browser-owned authorization decisions needed for
+`connect-src`, origin policy, mixed content, authentication, proxy policy,
+certificates, and network state.
+
+### 16.3 Implement the transport and session lifecycle
+
+Add a dedicated transport abstraction and implementation, likely using an
+async WebSocket/TLS library rather than extending the HTTP response transport.
+The implementation must support:
+
+- HTTP Upgrade and TLS handshakes;
+- frame parsing and serialization;
+- text, binary, continuation, ping, pong, and close frames;
+- fragmentation, protocol errors, backpressure, and bounded message sizes;
+- cancellation during handshake and while connected;
+- orderly close, abortive close, peer shutdown, and transport failure; and
+- connection diagnostics without exposing transport-specific types publicly.
+
+The scheduler must retain a connection permit for the session lifetime and
+release it on close, error, cancellation, or drop. Add any required per-host
+or per-origin limits separately from ordinary request admission.
+
+### 16.4 Integrate credentials and browser services
+
+Reuse the browser-owned credential and cookie channels where policy permits,
+but add handshake-specific service hooks for authorization and response
+observation. WebSockets must never enter the HTTP response cache or the
+streamed Fetch-body cache-capture path.
+
+Update `FetchServices` and the diagnostics contract with documented default
+behavior for missing WebSocket policy providers. Security-sensitive decisions
+must fail closed or return a typed unsupported error rather than silently
+opening a connection.
+
+### 16.5 Add downstream bindings and verification
+
+After the Rust contract is stable, add the `webapis` WebSocket binding for
+JavaScript construction, events, `send`, `close`, `readyState`, and buffered
+amount reporting. The binding must adapt the `net` session and must not
+reimplement handshake, framing, origin, credential, or security policy.
+
+Add focused unit and local integration tests for URL validation, handshake
+acceptance and rejection, subprotocol negotiation, origin and cookie policy,
+`ws`/`wss` TLS, message ordering, fragmentation, ping/pong, close behavior,
+backpressure, size limits, cancellation, scheduler permit release, dropped
+connections, and cache isolation. Add Web Platform Tests only after the
+engine-level session semantics and JavaScript binding are stable.
+
+## 17. Acceptance criteria
 
 The change is complete when:
 
