@@ -1,6 +1,7 @@
 //! Scheme-specific Fetch dispatch and handlers.
 
 mod data;
+mod http;
 
 use crate::{
     api::{error::RequestError, request::Request, response::Response},

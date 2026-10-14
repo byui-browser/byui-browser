@@ -1,4 +1,4 @@
-//! Scheme provider execution paths.
+//! HTTP(S)-specific Fetch execution paths.
 
 use crate::{
     api::{
@@ -59,8 +59,7 @@ impl RequestController {
                         from_cache: true,
                         cookie_headers_processed: response.cookie_headers_processed,
                     };
-                    internal.response_type = self.inner.cors.response_type(&request, &internal)?;
-                    self.approve_response(&request, &internal)?;
+                    self.finalize_response(&request, &mut internal)?;
                     return Ok(internal.expose());
                 }
             }
@@ -104,9 +103,7 @@ impl RequestController {
             .last()
             .and_then(|url| reqwest::Url::parse(url).ok())
             .and_then(|url| crate::Origin::from_url(&url).ok());
-        response.response_type = self.inner.cors.response_type(&request, &response)?;
-        crate::policy::validate_response(&request, &response)?;
-        self.approve_response(&request, &response)?;
+        self.finalize_response(&request, &mut response)?;
         if request.credentials_allowed(&url) {
             if let Some(services) = &self.inner.services {
                 let values: Vec<http::HeaderValue> = response

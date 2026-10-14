@@ -1,8 +1,9 @@
 # Feature 4.4 plan: scheme-specific Fetch dispatch
 
-Status: provider boundary and engine-owned `data:` handler in progress; blob,
-file, byui, and about handlers remain, reviewed against the current
-`crates/net` implementation on 2026-10-14.
+Status: dispatch, provider contracts, provider metadata validation, shared
+response finalization, and the engine-owned `data:` handler are implemented;
+blob, file, byui, and about handlers plus browser composition remain. Reviewed
+against the current `crates/net` implementation on 2026-10-14.
 
 This plan records only the work that remains for feature 4.4 of the
 [`fetch-engine-implementation-plan.md`](fetch-engine-implementation-plan.md).
@@ -43,6 +44,8 @@ The initial pipeline refactor is complete:
 - Kept unsupported schemes such as `ftp:` rejected before side effects.
 - Added the controller dispatch match in `RequestController::fetch`.
 - Isolated the existing HTTP(S) implementation in `fetch_http`.
+- Moved the HTTP(S) handler under `engine/schemes/http.rs` so all scheme
+  handlers share one module boundary.
 - Restricted cache eligibility and cache partition lookup to HTTP(S).
 - Added unit coverage for scheme classification and an integration test proving
   a supported non-HTTP URL reaches the dispatcher seam.
@@ -50,14 +53,23 @@ The initial pipeline refactor is complete:
 The `data:` branch now decodes percent-encoded and base64 payloads into the
 shared response/body pipeline. Provider-backed branches fail with a typed
 `MissingProvider` error when their matching capability is absent; installed
-providers still await their scheme handlers.
+providers still await their scheme handlers. Provider error categories and
+scheme-resource validation now fail closed before public response exposure,
+and HTTP and engine-owned scheme responses use shared response finalization.
+
+The latest boundary pass also adds `ProviderErrorKind` categories for missing,
+revoked, denied, I/O, malformed-metadata, and invalid-origin outcomes, plus
+unit coverage for stable error formatting and scheme/media-type validation.
 
 ## Next steps
 
 ### 1. Define the scheme and provider boundary
 
-The URL classification and dispatcher seam are complete. Finish the boundary
-work below before implementing any provider-backed scheme handler.
+The URL classification and dispatcher seam are complete. The provider API,
+controller bundle, stable provider error categories, scheme-resource metadata
+validation, and common response finalization are also complete. Browser
+composition and provider-boundary integration coverage remain before any
+provider-backed scheme handler can be considered complete.
 
 #### 1.1 Define provider-neutral resource results — complete
 
@@ -103,7 +115,7 @@ Alternatives considered:
   origin, CORS, header, credential, null-body, and response filtering logic and
   is explicitly rejected.
 
-#### 1.2 Define narrow provider traits
+#### 1.2 Define narrow provider traits — complete
 
 Add provider traits in the `api/providers/` module alongside
 [`services.rs`](../src/api/services.rs):
@@ -120,7 +132,7 @@ accepting JavaScript or DOM types. Provider methods should be asynchronous if
 the resource may require I/O, while allowing a small synchronous adapter for
 embedded pages and tests.
 
-#### 1.3 Decide how providers enter `FetchServices`
+#### 1.3 Decide how providers enter `FetchServices` — complete
 
 Choose and document one integration shape:
 
@@ -128,12 +140,12 @@ Choose and document one integration shape:
 - a separate browser-owned provider bundle installed alongside
   `FetchServices`.
 
-A separate bundle is preferred if scheme-specific capabilities would make
-`FetchServices` a broad catch-all interface. In either design, the controller
-must receive providers through `with_services` or an equivalent constructor;
-there must be no global registry lookup.
+A separate [`SchemeProviders`](../src/api/providers/mod.rs) bundle is selected
+so scheme capabilities do not broaden `FetchServices`. The controller receives
+it through `RequestController::with_services_and_providers`; there is no global
+registry lookup.
 
-#### 1.4 Preserve existing service implementations
+#### 1.4 Preserve existing service implementations — complete
 
 New provider accessors should have default implementations that return
 `UnsupportedFeature`, or providers should be optional in the bundle. This
@@ -144,9 +156,10 @@ Document which missing-provider errors occur before any provider or transport
 side effect and which provider failures may occur after a resource has been
 opened.
 
-#### 1.5 Define failure and security semantics
+#### 1.5 Define failure and security semantics — implemented boundary
 
-Document typed behavior for:
+`ProviderErrorKind` and `RequestError::Provider` now define stable categories
+for:
 
 - provider absent;
 - resource missing;
@@ -155,16 +168,17 @@ Document typed behavior for:
 - malformed provider metadata; and
 - invalid or unavailable provider-assigned origins.
 
-Providers own authorization, sandboxing, path resolution, revocation, and
-durable state. `net` must fail closed when a required provider or security
-decision is unavailable.
+Providers still own authorization, sandboxing, path resolution, revocation, and
+durable state. `net` fails closed when a required provider or security decision
+is unavailable. End-to-end provider failures remain untested until the actual
+handlers exist.
 
-#### 1.6 Wire providers into controller state
+#### 1.6 Wire providers into controller state — complete
 
-Extend [`ControllerInner`](../src/engine/controller.rs) and
-`RequestController::with_services` so the dispatcher can obtain the selected
-provider without owning its registry. Keep provider references shareable and
-thread-safe in the same way as the existing `Arc<dyn FetchServices>`.
+[`ControllerInner`](../src/engine/controller.rs) stores the optional,
+shareable [`SchemeProviders`](../src/api/providers/mod.rs) bundle, and
+`RequestController::with_services_and_providers` installs it without owning a
+registry.
 
 The controller should also make it impossible for a `blob:` request to call a
 file provider, or for a `byui:` request to fall through to HTTP transport.
@@ -184,9 +198,11 @@ outside `net`:
 The existing [`Page`](../../browser/src/lib.rs) and embedded welcome-page
 resources are the starting point for the browser-owned page provider.
 
-#### 1.8 Add provider-boundary tests
+#### 1.8 Add provider-boundary tests — partial
 
-Before implementing the handlers, add tests proving that:
+Existing tests cover missing-provider errors, provider error-category display,
+scheme-resource scheme/media-type validation, and malformed provider metadata.
+Remaining tests must prove that:
 
 - absent providers return typed capability errors;
 - unsupported schemes do not invoke any provider;
@@ -205,9 +221,68 @@ The supported scheme classification remains:
 Http, Https, Data, Blob, File, Byui, About
 ```
 
+#### 1.9 Make provider outcomes and metadata validation explicit — implemented boundary
+
+The provider boundary now defines stable, testable outcomes rather than
+returning only an undifferentiated provider failure. It distinguishes:
+
+- provider absent, before provider lookup or other side effects;
+- resource missing or a blob URL revoked;
+- file access denied by authorization or sandbox policy;
+- provider I/O or lifecycle failure after the provider has started;
+- malformed provider metadata; and
+- invalid, unavailable, or disallowed provider-assigned origins.
+
+`ProviderErrorKind` categories are carried by `RequestError::Provider`; the
+provider name is stable routing metadata and diagnostic text does not expose
+provider implementation details.
+Do not expose filesystem, registry, storage, or provider implementation
+details through the error API.
+
+Before constructing an `InternalResponse`, `net` now validates:
+
+- the returned URL is syntactically valid and compatible with the selected
+  scheme;
+- status and status text are valid for the response representation;
+- header names and values are valid and remain in the internal header channel;
+- media type metadata is valid and agrees with the selected content type;
+- the origin is either an explicitly permitted opaque origin or a valid
+  provider-assigned origin; and
+- provider metadata cannot replace the request's scheme, URL-list state, or
+  credential policy.
+
+Malformed or unavailable security metadata fails closed before public response
+exposure. Full provider authorization and resource-existence behavior remains
+dependent on the not-yet-implemented provider handlers.
+
+#### 1.10 Define browser composition and provider lifecycle contracts
+
+Document the concrete composition path outside `net` before enabling a
+provider-backed handler:
+
+- `crates/browser` constructs the controller with browser services and the
+  provider bundle;
+- the page provider owns page registration, lookup, path normalization, and
+  page revocation or replacement rules;
+- the blob provider owns object-URL creation, creator-origin association,
+  revocation, and lifetime behavior; and
+- the file provider owns path resolution, sandbox authorization, platform
+  differences, and file-resource lifetime.
+
+Composition tests must prove that an installed provider is selected by scheme,
+called exactly once, and receives the prepared request context. They must also
+prove that a request cannot call an unrelated provider or fall back to HTTP or
+direct filesystem access when lookup fails.
+
+Provider operations must define cancellation and lifetime behavior. Cancellation
+before resolution must prevent the provider call when possible; cancellation
+after resolution must terminate a provider stream and release engine resources.
+Dropping, failing, or aborting a provider body must not create a cache entry or
+leave a provider operation running.
+
 ### 2. Replace the dispatcher placeholders with scheme handlers
 
-The controller-level seam now exists in
+The controller-level seam and shared response finalization now exist in
 [`RequestController::fetch`](../src/engine/execute.rs). Replace its non-HTTP
 placeholder branches with handlers in this order:
 
@@ -244,10 +319,27 @@ The completed dispatcher must continue to:
 - preserve the resolved response URL and request URL-list state; and
 - avoid invoking any provider for an unsupported scheme.
 
-When the first handler returns an `InternalResponse`, extract common response
-finalization before adding more handlers. Do not duplicate CORS, response
-policy, service authorization, cookie processing, or exposure logic in scheme
-handlers.
+`finalize_response` and `finalize_scheme_resource` in
+[`process_response.rs`](../src/engine/process_response.rs) now centralize CORS,
+response policy, service authorization, and public exposure preparation. New
+scheme handlers must use these helpers and must not duplicate CORS, response
+policy, service authorization, cookie processing, or exposure logic.
+
+The common finalization operation must be explicit and reusable. It must:
+
+1. validate and normalize provider or engine-owned response metadata;
+2. assign the response URL-list, origin, status, headers, body, and null-body
+   state;
+3. select the response type using the request mode and assigned origin;
+4. apply response policy and browser service authorization;
+5. leave cookie processing to the scheme-specific policy boundary: HTTP may
+   select/store cookies when credentials allow it, while local schemes bypass
+   cookies entirely;
+6. apply the existing public response filtering; and
+7. apply cache behavior only for schemes whose contract explicitly permits it.
+
+Local schemes must not obtain cookies, use HTTP cache entries, or invoke HTTP
+transport unless a later plan section explicitly changes their contract.
 
 ### 3. Implement `data:` fetching
 
@@ -267,9 +359,20 @@ Construct the result as an internal response with status 200, the resolved
 attach cookies or other credentials. `data:` responses should not enter the
 HTTP cache.
 
-Add tests for plain text, percent encoding, base64, media-type parameters,
-default type, empty payloads, malformed encoding, invalid base64, body bytes,
-response URL, origin, and credential behavior.
+The parser and handler are implemented for plain text, percent encoding,
+base64, media-type parameters, the default media type, empty payloads, and
+typed malformed-input failures. It constructs a status-200 response with an
+opaque origin and routes it through shared finalization. Add tests for plain
+text, percent encoding, base64, media-type parameters, default type, empty
+payloads, malformed encoding, invalid base64, body bytes, response URL, origin,
+and credential behavior.
+
+Remaining tests must cover payloads containing commas and non-UTF-8 bytes, duplicate base64
+markers, malformed parameters, exact default media type, and the request-method
+boundary. If `HEAD` is accepted, it must produce an explicit null response
+body while preserving response metadata; otherwise it must be rejected before
+decoding. Verify that `data:` responses do not call services for cookies,
+providers, HTTP transport, or HTTP cache.
 
 ### 4. Implement `blob:` resolution
 
@@ -287,6 +390,11 @@ Add tests for successful resolution, missing/revoked blobs, media type,
 creator origin, credential exclusion, response filtering, and body
 consumption.
 
+The tests must distinguish an absent provider from a missing or revoked blob,
+verify the creator-origin security rule, cover buffered and streamed bodies,
+and prove that cancellation, body failure, and body drop do not cache or leak
+provider resources.
+
 ### 5. Implement `file:` access through a provider
 
 Require the explicit filesystem/security provider. The handler must never read
@@ -297,6 +405,11 @@ Add tests for absent providers, denied access, missing files, provider
 failures, successful reads, origin assignment, credential behavior, response
 headers, and body/null-body semantics. Do not add filesystem state or a file
 registry to `net`.
+
+Provider-denied, missing, malformed-path, and provider-I/O outcomes must use
+the documented error categories. Tests must cover platform/path normalization
+through the fake provider contract rather than host filesystem behavior, and
+must prove that invalid provider origins or metadata fail before exposure.
 
 ### 6. Implement `byui:` page routing
 
@@ -311,6 +424,10 @@ Add tests proving that registered pages resolve, missing pages fail, query and
 path handling are deterministic, HTML metadata is preserved, response URLs and
 origins are assigned correctly, and no network or filesystem access occurs.
 
+Also test page registration and replacement/revocation behavior, malformed
+page metadata, unsupported page kinds, exact-once provider calls, and
+cancellation or body failure after page resolution.
+
 ### 7. Implement the supported `about:` cases
 
 Define an explicit allowlist. Implement the required empty/blank response
@@ -321,13 +438,18 @@ Document and test the chosen status, media type, origin, response URL, and the
 distinction between an empty readable body and a null body. Defer additional
 `about:` variants until a browser caller requires them.
 
-### 8. Generalize response metadata where HTTP assumptions remain
+The allowlist decision must be made before provider lookup, cookie lookup,
+cache access, or transport admission. Test every rejected spelling, including
+unexpected query and fragment combinations, and test the accepted method
+boundary, response type, and body lifecycle.
 
-Update [`InternalResponse`](../src/api/response/view.rs) and related response
-helpers only where necessary to support provider-assigned metadata. In
-particular, do not derive every response origin with
-`Origin::from_url` if the scheme is opaque or the provider supplies the
-origin.
+### 8. Generalize response metadata where HTTP assumptions remain — boundary implemented
+
+[`InternalResponse::from_scheme_resource`](../src/api/response/view.rs) now
+accepts the selected scheme, validates scheme-compatible URLs, status text,
+media-type metadata, and provider origins, and preserves opaque or
+provider-assigned origins. Do not derive every response origin with
+`Origin::from_url` if the scheme is opaque or the provider supplies the origin.
 
 Keep public response exposure centralized. All scheme handlers must populate:
 
@@ -340,6 +462,8 @@ Keep public response exposure centralized. All scheme handlers must populate:
 - null-body state.
 
 Do not broaden the public response API or add raw transport/provider types.
+Remaining work is end-to-end validation through real blob/file/byui handlers
+and tests for provider-origin and metadata failures.
 
 ### 9. Update documentation and regression coverage
 
@@ -347,6 +471,12 @@ Update [`crates/net/src/lib.rs`](../src/lib.rs) and the engine contract to say
 which schemes are supported and which require browser providers. Update the
 unsupported-feature table in [`fetch-engine-test-plan.md`](fetch-engine-test-plan.md)
 so it no longer treats all non-HTTP schemes as unsupported.
+
+The contract documentation must also record provider error categories,
+metadata validation rules, the browser composition path,
+cancellation/lifetime behavior, cookie/cache exclusions, and whether each
+scheme returns an empty readable body or an explicit null body for `HEAD` and
+other bodyless methods.
 
 Add a dedicated `crates/net/tests/schemes.rs` suite covering:
 
@@ -360,6 +490,17 @@ Add a dedicated `crates/net/tests/schemes.rs` suite covering:
 - empty, readable, and null-body behavior; and
 - no-network/no-unrelated-provider guarantees.
 
+The suite must include recording providers and service fakes that assert:
+
+- installed providers are invoked exactly once;
+- absent providers fail before provider or transport side effects;
+- unrelated providers are never invoked;
+- provider metadata is validated before exposure;
+- provider errors retain their documented category;
+- cancellation and body drop release provider and scheduler resources; and
+- successful local responses use the same finalization and exposure helper as
+  HTTP(S), without entering the HTTP cache.
+
 Finish with `cargo fmt --all`, the focused `net` tests, the workspace-relevant
 `cargo test` commands, and `cargo clippy --all-targets -- -D warnings`.
 
@@ -367,5 +508,10 @@ Finish with `cargo fmt --all`, the focused `net` tests, the workspace-relevant
 
 Feature 4.4 is complete when HTTP(S) behavior is unchanged, supported local
 schemes never invoke the HTTP transport, unsupported schemes fail before side
-effects, provider ownership is explicit, and every scheme reaches the same
-internal/public response filtering and body pipeline.
+effects, provider ownership and browser composition are explicit, every
+installed provider is selected exactly once by its matching scheme, provider
+outcomes and metadata are validated fail-closed, cancellation and body
+lifecycle rules are covered, and every successful scheme reaches the same
+internal/public response filtering and body pipeline. Completion also requires
+the dedicated scheme matrix, browser composition tests, focused `net` tests,
+workspace-relevant tests, formatting, and clippy with warnings denied.

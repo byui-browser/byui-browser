@@ -68,6 +68,7 @@ mod tests {
     use super::*;
     use crate::api::body::Body;
 
+    /// Builds a response with the supplied headers for CORS tests.
     fn response(headers: reqwest::header::HeaderMap) -> InternalResponse {
         InternalResponse {
             status: reqwest::StatusCode::OK,
@@ -87,6 +88,7 @@ mod tests {
         }
     }
 
+    /// Builds a request with an explicit CORS mode for policy tests.
     fn request(mode: RequestMode) -> Request {
         let mut request = Request::get("https://remote.test/data");
         request.context.environment.origin = Some(Origin::parse("https://client.test").unwrap());
@@ -95,6 +97,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies same-origin, CORS, and no-CORS cross-origin outcomes.
     fn cross_origin_modes_fail_or_filter_before_exposure() {
         let checker = CorsChecker;
         let response = response(reqwest::header::HeaderMap::new());
@@ -115,6 +118,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies simple CORS requires a matching allow-origin value.
     fn simple_cors_requires_matching_allow_origin() {
         let checker = CorsChecker;
         let mut headers = reqwest::header::HeaderMap::new();
@@ -131,6 +135,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies no-CORS responses remain opaque without a client origin.
     fn no_cors_without_client_origin_is_still_opaque() {
         let mut request = Request::get("https://remote.test/data");
         request.set_mode(RequestMode::NoCors).unwrap();

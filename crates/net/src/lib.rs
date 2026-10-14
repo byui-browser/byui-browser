@@ -48,7 +48,7 @@ pub use api::{
     body::{Blob, Body, FormData, FormDataEntry},
     cancellation::{AbortController, AbortSignal},
     config::Config,
-    error::RequestError,
+    error::{ProviderErrorKind, RequestError},
     headers::{HeaderGuard, Headers},
     providers::{
         BlobProvider, FileProvider, PageProvider, ProviderBodyStream, ProviderFuture, SchemeBody,

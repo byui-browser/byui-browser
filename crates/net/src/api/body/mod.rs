@@ -27,6 +27,7 @@ pub use form_data::{FormData, FormDataEntry};
 /// A sendable stream used by a live Fetch body.
 pub(crate) type BoxedBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, RequestError>> + Send>>;
 
+/// Storage strategy that determines whether a body can be replayed or consumed once.
 enum BodySource {
     Null,
     Replayable(Bytes),
@@ -34,6 +35,7 @@ enum BodySource {
     Stream(Option<BoxedBodyStream>),
 }
 
+/// Mutable state shared by body clones and updated while the stream is polled.
 struct BodyState {
     source: BodySource,
     content_type: Option<HeaderValue>,
@@ -57,6 +59,7 @@ pub struct Body {
 }
 
 impl Clone for Body {
+    /// Clones replayable data independently and shares one-shot consumption state.
     fn clone(&self) -> Self {
         let state = self
             .state
@@ -75,6 +78,7 @@ impl Clone for Body {
 }
 
 impl fmt::Debug for Body {
+    /// Formats body metadata without consuming or exposing its payload.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self
             .state
@@ -99,6 +103,7 @@ impl fmt::Debug for Body {
 }
 
 impl PartialEq for Body {
+    /// Compares replayable payloads by value and one-shot bodies by identity.
     fn eq(&self, other: &Self) -> bool {
         if Arc::ptr_eq(&self.state, &other.state) {
             return true;
@@ -244,12 +249,14 @@ impl Body {
     }
 
     #[cfg(test)]
+    /// Creates a single buffered body for body-state tests.
     pub(crate) fn once(body: Vec<u8>) -> Self {
         Self::from_stream(futures_util::stream::once(
             async move { Ok(Bytes::from(body)) },
         ))
     }
 
+    /// Stores a sendable response or request stream as a one-shot body.
     fn from_body_stream<S>(stream: S, content_type: Option<HeaderValue>) -> Self
     where
         S: Stream<Item = Result<Bytes, RequestError>> + Send + 'static,
@@ -261,6 +268,7 @@ impl Body {
         )
     }
 
+    /// Initializes shared body state with optional media type and byte length.
     fn new(source: BodySource, content_type: Option<HeaderValue>, length: Option<u64>) -> Self {
         Self {
             state: Arc::new(Mutex::new(BodyState {
@@ -411,6 +419,7 @@ impl Body {
 impl Stream for Body {
     type Item = Result<Bytes, RequestError>;
 
+    /// Polls the body, updating lock, used, completion, and failure state.
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut state = self
             .state

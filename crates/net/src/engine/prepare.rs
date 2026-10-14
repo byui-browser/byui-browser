@@ -14,6 +14,7 @@ use crate::{
 };
 
 impl RequestController {
+    /// Validates a request and resolves browser-owned services before execution.
     pub(crate) fn prepare_request(
         &self,
         mut request: Request,

@@ -16,6 +16,26 @@ mod tests {
     use crate::{AbortController, Body, RequestError, RequestMode};
 
     #[test]
+    fn provider_error_categories_are_stable_and_non_diagnostic() {
+        let error = RequestError::Provider {
+            provider: "file",
+            kind: crate::ProviderErrorKind::AccessDenied,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Fetch provider file failed: AccessDenied"
+        );
+        assert!(matches!(
+            error,
+            RequestError::Provider {
+                provider: "file",
+                kind: crate::ProviderErrorKind::AccessDenied
+            }
+        ));
+    }
+
+    #[test]
     fn a_pending_response_stream_ends_with_aborted_error() {
         let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
         let controller = AbortController::new();

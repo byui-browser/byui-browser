@@ -17,6 +17,7 @@ pub struct AbortSignal {
 }
 
 #[derive(Debug, Default)]
+/// Shared cancellation flag observed by all clones of an [`AbortSignal`].
 struct AbortState {
     aborted: AtomicBool,
     notify: Notify,

@@ -24,6 +24,7 @@ pub struct RequestController {
     pub(crate) inner: Arc<ControllerInner>,
 }
 
+/// Shared controller state used by fetch execution and policy stages.
 pub(crate) struct ControllerInner {
     /// Maximum accepted body size for keepalive requests.
     pub(crate) max_keepalive_body_size: u64,
@@ -42,6 +43,7 @@ pub(crate) struct ControllerInner {
 }
 
 impl std::fmt::Debug for RequestController {
+    /// Formats the controller without exposing shared services or transport state.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RequestController").finish_non_exhaustive()
     }
@@ -78,6 +80,7 @@ impl RequestController {
         Self::build(config, Some(services), providers)
     }
 
+    /// Constructs shared state and initializes the reusable HTTP transport.
     fn build(
         config: Config,
         services: Option<Arc<dyn FetchServices>>,

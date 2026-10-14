@@ -139,6 +139,7 @@ mod tests {
     use super::*;
 
     #[test]
+    /// Verifies HTTP and HTTPS URLs pass request validation.
     fn accepts_http_and_https_urls() {
         let policy = RequestPolicy;
         assert!(
@@ -154,6 +155,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies malformed URLs fail before transport dispatch.
     fn rejects_invalid_urls_before_transport() {
         let error = RequestPolicy
             .validate_request(&Request::get("not a URL"), 65_536)
@@ -163,6 +165,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies relative URLs are rejected by the network boundary.
     fn rejects_relative_urls() {
         let error = RequestPolicy
             .validate_request(&Request::get("/relative/path"), 65_536)
@@ -172,6 +175,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies invalid ports produce a typed validation error.
     fn rejects_urls_with_invalid_ports() {
         for value in [
             "http://example.test:not-a-port/",
@@ -186,6 +190,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies uppercase HTTP schemes normalize to the canonical URL.
     fn accepts_uppercase_http_urls_and_returns_normalized_url() {
         let validated = RequestPolicy
             .validate_request(&Request::get("HTTP://EXAMPLE.TEST/Path"), 65_536)
@@ -198,6 +203,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies unsupported schemes are rejected by the HTTP request policy.
     fn rejects_non_http_schemes() {
         let error = RequestPolicy
             .validate_request(&Request::get("ftp://example.test/file"), 65_536)
@@ -207,6 +213,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies supported local schemes are classified for dispatch.
     fn classifies_supported_non_http_schemes_for_dispatch() {
         for (url, expected) in [
             ("data:text/plain,hello", FetchScheme::Data),
@@ -223,6 +230,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies unsupported integrity metadata fails before transport.
     fn unsupported_integrity_is_rejected_before_transport() {
         let mut request = Request::get("https://example.test/data");
         request.set_integrity(Some("sha256-example".into()));
@@ -236,6 +244,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies unsupported cross-origin preflight fails before transport.
     fn preflight_required_cross_origin_request_is_rejected_before_transport() {
         let mut request = Request::new("https://remote.test/data", "PUT").unwrap();
         request.context.environment.origin =
@@ -250,6 +259,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies keepalive requests respect the configured body-size boundary.
     fn keepalive_request_is_rejected_until_lifetime_is_supported() {
         let mut request = Request::get("https://example.test/");
         request.set_keepalive(true);

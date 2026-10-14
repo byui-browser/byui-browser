@@ -54,12 +54,15 @@ impl SchemeProviders {
         self
     }
 
+    /// Returns the installed `blob:` provider, if any.
     pub(crate) fn blob(&self) -> Option<&Arc<dyn BlobProvider>> {
         self.blob.as_ref()
     }
+    /// Returns the installed `file:` provider, if any.
     pub(crate) fn file(&self) -> Option<&Arc<dyn FileProvider>> {
         self.file.as_ref()
     }
+    /// Returns the installed `byui:` page provider, if any.
     pub(crate) fn page(&self) -> Option<&Arc<dyn PageProvider>> {
         self.page.as_ref()
     }

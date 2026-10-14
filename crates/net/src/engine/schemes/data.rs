@@ -9,7 +9,7 @@ use crate::{
         error::RequestError,
         providers::{SchemeBody, SchemeResource},
         request::{Origin, Request},
-        response::{InternalResponse, Response},
+        response::Response,
     },
     engine::RequestController,
 };
@@ -31,13 +31,11 @@ impl RequestController {
             origin: Origin::opaque(),
             body: SchemeBody::Bytes(bytes),
         };
-        let mut response = InternalResponse::from_scheme_resource(resource, &request)?;
-        response.response_type = self.inner.cors.response_type(&request, &response)?;
-        self.approve_response(&request, &response)?;
-        Ok(response.expose())
+        self.finalize_scheme_resource(&request, resource, crate::policy::FetchScheme::Data)
     }
 }
 
+/// Parses a data URL into validated media-type metadata and decoded bytes.
 fn parse_data_url(url: &Url) -> Result<(HeaderValue, Vec<u8>), RequestError> {
     let value = url
         .as_str()
@@ -82,6 +80,7 @@ fn parse_data_url(url: &Url) -> Result<(HeaderValue, Vec<u8>), RequestError> {
     Ok((media_type, bytes))
 }
 
+/// Validates the media type embedded in a data URL.
 fn validate_media_type(value: &str) -> Result<(), RequestError> {
     let mut parts = value.split(';');
     let essence = parts.next().unwrap_or_default().trim();
@@ -102,11 +101,13 @@ fn validate_media_type(value: &str) -> Result<(), RequestError> {
     Ok(())
 }
 
+/// Percent-decodes data URL metadata and requires valid UTF-8 text.
 fn percent_decode_text(value: &str) -> Result<String, RequestError> {
     let bytes = percent_decode(value.as_bytes())?;
     String::from_utf8(bytes).map_err(|_| invalid_data("media type is not UTF-8"))
 }
 
+/// Decodes percent escapes while preserving all other payload bytes.
 fn percent_decode(value: &[u8]) -> Result<Vec<u8>, RequestError> {
     let mut output = Vec::with_capacity(value.len());
     let mut index = 0;
@@ -127,6 +128,7 @@ fn percent_decode(value: &[u8]) -> Result<Vec<u8>, RequestError> {
     Ok(output)
 }
 
+/// Converts one ASCII hexadecimal digit to its numeric value.
 fn hex(value: u8) -> Option<u8> {
     match value {
         b'0'..=b'9' => Some(value - b'0'),
@@ -136,6 +138,7 @@ fn hex(value: u8) -> Option<u8> {
     }
 }
 
+/// Creates the stable error category used for malformed data URLs.
 fn invalid_data(message: &'static str) -> RequestError {
     RequestError::InvalidResponse(message.into())
 }
@@ -145,6 +148,7 @@ mod tests {
     use super::*;
 
     #[test]
+    /// Verifies plain, percent-encoded, and base64 data payloads decode.
     fn parses_plain_percent_encoded_and_base64_data() {
         assert_eq!(
             parse_data_url(&Url::parse("data:,hello").unwrap())
@@ -167,6 +171,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies malformed payloads and media types fail with typed errors.
     fn rejects_malformed_data_payloads_and_media_types() {
         for value in [
             "data:,bad%",
