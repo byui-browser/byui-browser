@@ -7,6 +7,13 @@ pub(super) fn from_token(token: &Token) -> Option<BinaryOperator> {
         Token::Subtract => Some(BinaryOperator::Subtract),
         Token::Multiply => Some(BinaryOperator::Multiply),
         Token::Divide => Some(BinaryOperator::Divide),
+        Token::Remainder => Some(BinaryOperator::Remainder),
+        Token::BitAnd => Some(BinaryOperator::BitwiseAnd),
+        Token::BitOr => Some(BinaryOperator::BitwiseOr),
+        Token::BitXor => Some(BinaryOperator::BitwiseXor),
+        Token::ShiftLeft => Some(BinaryOperator::LeftShift),
+        Token::ShiftRight => Some(BinaryOperator::SignedRightShift),
+        Token::UnsignedShiftRight => Some(BinaryOperator::UnsignedRightShift),
         Token::LessEqual => Some(BinaryOperator::LessEqual),
         Token::GreaterEqual => Some(BinaryOperator::GreaterEqual),
         Token::BangEqual => Some(BinaryOperator::NotEqual),
@@ -20,12 +27,17 @@ pub(super) fn from_token(token: &Token) -> Option<BinaryOperator> {
 }
 
 impl BinaryOperator {
+    /// Binding power; logical operators use 1 (`||`) and 2 (`&&`).
     pub(super) fn precedence(self) -> u8 {
         match self {
-            Self::Equal | Self::NotEqual | Self::StrictEqual | Self::StrictNotEqual => 3,
-            Self::Less | Self::LessEqual | Self::Greater | Self::GreaterEqual => 4,
-            Self::Add | Self::Subtract => 5,
-            Self::Multiply | Self::Divide | Self::Remainder => 6,
+            Self::BitwiseOr => 3,
+            Self::BitwiseXor => 4,
+            Self::BitwiseAnd => 5,
+            Self::Equal | Self::NotEqual | Self::StrictEqual | Self::StrictNotEqual => 6,
+            Self::Less | Self::LessEqual | Self::Greater | Self::GreaterEqual => 7,
+            Self::LeftShift | Self::SignedRightShift | Self::UnsignedRightShift => 8,
+            Self::Add | Self::Subtract => 9,
+            Self::Multiply | Self::Divide | Self::Remainder => 10,
         }
     }
 
