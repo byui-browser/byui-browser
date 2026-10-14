@@ -9,6 +9,9 @@ pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Statement> {
     let mut params = Vec::new();
     if !parser.consume(&Token::RightParen) {
         loop {
+            if matches!(parser.peek(), Some(Token::Identifier(name)) if params.contains(name)) {
+                return Err(parser.error("Duplicate parameter name", "function parameters"));
+            }
             params.push(parser.identifier("function parameters")?);
             if !parser.consume(&Token::Comma) {
                 break;

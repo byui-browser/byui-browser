@@ -1,20 +1,20 @@
 //! Conversion from layout output to paint commands.
 
-use html::HtmlDocument;
+use html::HTMLDocument;
 use layout::{LayoutTree, Rect as LayoutRect};
 
 use crate::{Color, DisplayItem, DisplayList, Rect};
 
 const BACKGROUND: Color = Color {
-    r: 210,
-    g: 230,
-    b: 255,
+    r: 242,
+    g: 245,
+    b: 250,
     a: 255,
 };
 const TEXT: Color = Color {
-    r: 25,
-    g: 45,
-    b: 70,
+    r: 30,
+    g: 43,
+    b: 62,
     a: 255,
 };
 
@@ -42,7 +42,7 @@ fn background_item(layout_box: &layout::LayoutBox) -> DisplayItem {
 /// to device pixels for this first software-rendered slice. Descendant text is
 /// intentionally excluded here so nested elements do not paint the same text
 /// more than once.
-pub fn paint_document(tree: &LayoutTree, document: &HtmlDocument) -> DisplayList {
+pub fn paint_document(tree: &LayoutTree, document: &HTMLDocument) -> DisplayList {
     let mut items = Vec::new();
     for layout_box in &tree.root.children {
         items.push(background_item(layout_box));
