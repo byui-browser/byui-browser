@@ -2,7 +2,7 @@
 
 use crate::api::{
     error::RequestError,
-    request::{CacheMode, CredentialsMode, RedirectMode, Request, RequestPriority},
+    request::{CacheMode, CredentialsMode, Request, RequestPriority},
 };
 
 /// Validates URL and browser request/response policy at the controller boundary.
@@ -94,9 +94,6 @@ impl RequestPolicy {
         if request.integrity.is_some() {
             return Err(RequestError::UnsupportedFeature("subresource integrity"));
         }
-        if request.redirect_mode != RedirectMode::Follow {
-            return Err(RequestError::UnsupportedFeature("redirect mode"));
-        }
         if request.cache_mode == CacheMode::NoCache {
             return Err(RequestError::UnsupportedFeature("HTTP cache revalidation"));
         }
@@ -112,10 +109,23 @@ impl RequestPolicy {
                 None => return Err(RequestError::InvalidUrl(request.url.clone())),
             },
         };
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(RequestError::InvalidUrl(request.url.clone()));
-        }
+        self.validate_target(request, &url)?;
         let scheme = FetchScheme::from_url(&url)?;
+        Ok(ValidatedUrl { url, scheme })
+    }
+
+    pub(crate) fn validate_redirect_target(
+        &self,
+        request: &Request,
+        url: &reqwest::Url,
+    ) -> Result<(), RequestError> {
+        self.validate_target(request, url)
+    }
+
+    fn validate_target(&self, request: &Request, url: &reqwest::Url) -> Result<(), RequestError> {
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(RequestError::InvalidUrl(url.to_string()));
+        }
         if request.context.mode == crate::RequestMode::Cors
             && request
                 .context
@@ -123,14 +133,13 @@ impl RequestPolicy {
                 .origin
                 .as_ref()
                 .is_some_and(|origin| {
-                    crate::Origin::from_url(&url)
-                        .is_ok_and(|target| !origin.is_same_origin(&target))
+                    crate::Origin::from_url(url).is_ok_and(|target| !origin.is_same_origin(&target))
                 })
             && request.requires_cors_preflight()
         {
             return Err(RequestError::UnsupportedFeature("CORS preflight"));
         }
-        Ok(ValidatedUrl { url, scheme })
+        Ok(())
     }
 }
 

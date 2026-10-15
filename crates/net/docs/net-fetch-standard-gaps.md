@@ -13,20 +13,11 @@ committed `crates/net` implementation and the Feature 4.4 plan updates.
 
 This report compares `crates/net` with the [WHATWG Fetch Living Standard](https://fetch.spec.whatwg.org/), last updated 2026-10-06. It evaluates the networking crate as a browser-facing Fetch implementation, not merely as an HTTP client. A field or enum is counted as implemented only when it changes observable behavior at the appropriate policy boundary.
 
-The crate currently provides an HTTP(S) transport with a Fetch-shaped request
-model: environment-based relative URL resolution, structured HTTP(S) and
-opaque origins, guarded ordered request headers, replayable and one-shot
-request bodies, automatic body metadata and `Origin`/`Referer` preparation,
-filtered streamed responses, abort signaling, connection pooling, keepalive
-body-size validation, and a small in-memory cache. The dispatcher recognizes
+The crate currently provides an HTTP(S) transport with a Fetch-shaped request model: environment-based relative URL resolution, structured HTTP(S) origins, guarded ordered request headers, replayable and one-shot request bodies, automatic body metadata and `Origin`/`Referer` preparation, filtered streamed responses, controller-owned redirect handling, abort signaling, connection pooling, keepalive body-size validation, and a small in-memory cache. Redirects fail closed until the controller owns the redirect loop. Browser-context requests require a `FetchServices` provider. The crate is not yet Fetch-compatible for the full request/response algorithms.The dispatcher recognizes
 `http`, `https`, `data`, `blob`, `file`, `byui`, and `about`. `data:` is
 engine-owned and currently decodes percent-encoded and base64 payloads;
 `blob:`, `file:`, and `byui:` have public browser-owned provider contracts but
 their handlers are still placeholders; `about:` is classified but unsupported.
-Redirects fail closed until the controller owns the redirect loop.
-Browser-context requests require a `FetchServices` provider, and providers are
-installed through `with_services_and_providers`. The crate is not yet
-Fetch-compatible for the full request/response algorithms.
 
 ## Summary
 
@@ -37,7 +28,7 @@ Fetch-compatible for the full request/response algorithms.
 | Request and response bodies | Shared buffered/streaming `Body`, text/blob/form-data/JSON/array-buffer helpers, and null-body handling exist; cloning/teeing and full Fetch semantics remain | Medium       |
 | Credentials and cookies     | `FetchServices` can supply and store cookies; matching, persistence, and policy belong to its provider                                                        | Critical     |
 | CORS and response tainting  | Simple CORS checks and basic/opaque views exist; preflight and redirect checks are absent                                                                     | Critical     |
-| Redirects                   | Transport following is disabled; redirect statuses fail before public exposure until step 7                                                                   | High         |
+| Redirects                   | Controller follows validated HTTP(S) redirects with `follow`, `error`, and `manual` modes; full browser policy remains incomplete                             | High         |
 | HTTP cache                  | TTL-only in-memory cache with provider-supplied partition keys; full matching/revalidation is absent                                                          | High         |
 | Fetch policy integrations   | Browser-context requests require `FetchServices`; CSP, mixed content, CORP, SRI, and worker interception remain provider/later-step work                      | Critical     |
 | Cancellation and lifecycle  | Basic abort signal works, but Fetch controller state/reasons/timing are absent                                                                                | Medium       |
@@ -143,11 +134,11 @@ requests.
 
 ### 6. Redirect handling
 
-**Evidence:** [`ReqwestTransport::new`](../src/transport/reqwest.rs) disables automatic redirects. The controller returns `RedirectFailure` for Fetch redirect statuses before public exposure. `Request` and `InternalResponse` retain URL and redirect state for the one supported exchange; no redirect hop is followed.
+**Evidence:** [`ReqwestTransport::new`](../src/transport/reqwest.rs) disables automatic redirects, and [`RequestController::fetch`](../src/engine/execute.rs) owns the redirect loop. The controller resolves and validates `Location`, caps redirects at 20, tracks the URL list/current URL/count, applies Fetch method/body changes, strips sensitive headers on origin changes, and supports `follow`, `error`, and opaque `manual` results. 307/308 redirects reject non-replayable request bodies.
 
-The standard's HTTP-redirect fetch algorithm validates the `Location` URL, rejects non-HTTP(S) redirect targets, caps the redirect count at 20, updates the request URL list, applies method/body/header changes for status codes, strips credentials and sensitive headers when required, and re-runs policy checks for each hop. `error` and `manual` modes have distinct observable results. All of that remains for step 7; the current controller rejects redirects rather than delegating them to Reqwest.
+The standard's complete redirect algorithm still includes more detailed per-hop CORS, credentials, referrer, cache, and security integration than this crate currently provides. Redirect targets remain limited to HTTP(S), and malformed or unsupported redirects fail closed with `RedirectFailure` or the relevant typed policy error.
 
-**Required work:** implement a controller-level redirect loop that honors `RedirectMode`, tracks every URL, replays or rejects bodies correctly, and invokes CORS/security checks on each hop.
+**Required work:** complete per-hop CORS/security and credential policy, redirect-aware cache behavior, and the remaining browser integrations.
 
 ### 7. HTTP cache and cache modes
 
@@ -270,7 +261,7 @@ failure/drop, origin assignment, and cache exclusion.
 1. Finish the Feature 4.4 contract: provider error categories, metadata validation, shared response finalization, browser composition, and local-scheme lifecycle tests.
 2. Implement `blob:`, `file:`, `byui:`, and allowlisted `about:` handlers; expand `data:` edge-case and bodyless-method coverage.
 3. Implement credentials/cookie policy and strict same-origin/CORS/no-CORS response filtering across HTTP and local schemes.
-4. Move redirects into the controller and implement Fetch redirect modes, URL-list tracking, and per-hop policy.
+4. Complete per-hop redirect CORS/security and credential policy.
 5. Replace the TTL map with a partitioned HTTP cache or integrate an existing standards-aware cache.
 6. Complete shared Body cloning/teeing and JavaScript conversion semantics.
 7. Add integrity, keepalive, service-worker, CSP/mixed-content, MIME/CORP, and timing hooks as the surrounding browser subsystems become available.

@@ -10,7 +10,8 @@ pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Statement> {
     let value = if matches!(
         parser.peek(),
         None | Some(Token::Semicolon | Token::RightBrace)
-    ) {
+    ) || parser.line_terminator_before_current()
+    {
         None
     } else {
         Some(parser.parse_expression(0)?)

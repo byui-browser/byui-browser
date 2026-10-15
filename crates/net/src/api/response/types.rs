@@ -10,7 +10,7 @@ pub enum ResponseType {
     /// A no-CORS response with hidden status, URL, headers, and body.
     Opaque,
     /// A manually handled redirect with hidden metadata and body.
-    /// This variant is reserved until controller-owned redirects are implemented.
+    /// This variant is returned by manual redirect handling.
     OpaqueRedirect,
     /// A failed fetch with hidden metadata and body.
     /// This variant is reserved; current fetch failures return `RequestError`.

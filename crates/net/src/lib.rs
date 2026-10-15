@@ -22,8 +22,8 @@
 //! This first engine slice supports basic same-origin responses, simple CORS
 //! checks, opaque no-CORS views, and forbidden response-header filtering.
 //! Requests requiring absent providers or algorithms fail with a typed
-//! [`RequestError::UnsupportedFeature`] before transport. HTTP redirects fail
-//! with [`RequestError::RedirectFailure`] before public response exposure. See the
+//! [`RequestError::UnsupportedFeature`] before transport. HTTP redirects are
+//! handled by the controller according to [`RedirectMode`]. See the
 //! [engine contract](../docs/fetch-engine-contract.md) for the supported subset.
 
 // Crate-wide flags to ignore dead code warnings. Will be removed once implementation
