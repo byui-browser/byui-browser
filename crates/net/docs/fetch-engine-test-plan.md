@@ -604,22 +604,23 @@ Also verify that:
 Primary files:
 
 - `crates/net/tests/redirects.rs`
-- `crates/net/src/engine/execute.rs`
+- `crates/net/src/engine/schemes/http.rs`
+- `crates/net/src/api/request/definition.rs`
 - `crates/net/src/api/request/context.rs`
 
 ### Tests for the current implementation
 
-- `each_supported_redirect_status_is_rejected`: `301`, `302`, `303`, `307`,
-  and `308` fail with `RedirectFailure`.
-- `redirect_rejection_happens_before_public_headers`: no redirect response
-  headers or body reach callers.
-- `malformed_location_does_not_trigger_a_second_request`.
-- `relative_location_is_not_followed_by_transport`.
-- `cross_origin_location_is_not_followed_implicitly`.
-- `manual_and_error_modes_fail_at_the_documented_boundary`: currently both
-  modes are unsupported before network I/O.
+- `follow_mode_follows_redirect_and_exposes_final_response`: a `302` reaches
+  the final response and reports `redirected`.
+- `error_mode_rejects_redirect_before_exposing_headers`.
+- `manual_mode_returns_an_opaque_redirect`.
 
-### Tests when redirect following is implemented
+The current implementation also needs focused regression tests for malformed
+or missing `Location`, unsupported redirect targets, the 20-hop limit,
+absolute/relative resolution, method/body rewriting, replay failures, URL-list
+and count bookkeeping, and cross-origin sensitive-header removal.
+
+### Tests for the remaining redirect algorithm
 
 - valid relative and absolute `Location` resolution;
 - non-HTTP target rejection;
@@ -835,8 +836,8 @@ behavior boundary:
 5. Complete cache lifecycle and cache-control edge cases.
 6. Expand CORS exposure and failure tests, retaining preflight unsupported
    tests until preflight exists.
-7. Add redirect boundary tests, then replace them incrementally with redirect
-   conformance tests as controller-owned redirects are implemented.
+7. Expand the initial controller-owned redirect tests into redirect conformance
+   tests, retaining explicit coverage for the unsupported per-hop algorithms.
 8. Add transport framing, connection-failure, and response-decompression
    tests.
 9. Select a Fetch subset from Web Platform Tests after the engine API and
@@ -860,6 +861,6 @@ streaming paths agree on status, URL, headers, response type, null-body
 behavior, cancellation, and cache effects.
 
 The standards-oriented gaps remain separate work: full body consumption and
-cloning, preflight, controller-owned redirects, credential/cookie policy,
+cloning, preflight and per-hop redirect policy, credential/cookie policy,
 standards-aware HTTP caching, integrity, navigation, service-worker response
 integration, and browser policy providers.

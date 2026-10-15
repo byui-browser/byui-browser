@@ -1,8 +1,9 @@
 # Plan: Make `net` the reusable Fetch engine
 
-Status: implementation in progress as of 2026-10-10; steps 1 and 2 are complete
-and step 3 has its shared-body foundation in place for the explicitly bounded
-single-exchange HTTP(S) subset described below.
+Status: implementation in progress as of 2026-10-15; steps 1 and 2 are complete,
+step 3 has its shared-body foundation in place, and the first controller-owned
+redirect slice is implemented for the explicitly bounded HTTP(S) subset
+described below.
 
 ## Goal
 
@@ -313,10 +314,11 @@ Step 1 completion record:
 
 - [x] **Enforce the supported contract (1.1).** Client-context requests require
       browser-owned services. Navigation, keepalive lifetime, preflight,
-      integrity, priority scheduling, cache revalidation, and unsupported
-      redirect modes return typed capability errors. Reqwest does not follow
-      redirects; redirect statuses fail before public exposure. The supported
-      process-local cache modes and their limits are stated in the contract.
+      integrity, priority scheduling, and cache revalidation return typed
+      capability errors. Reqwest does not follow
+      redirects; the controller handles the supported follow/error/manual
+      redirect modes. The supported process-local cache modes and their limits
+      are stated in the contract.
 - [x] **Define replaceable provider inputs (1.1).** `FetchServices` supplies
       request/response policy decisions, credential selection and storage,
       service-worker network decisions, cache partitions, and a response
@@ -329,17 +331,18 @@ Step 1 completion record:
       responses use numeric status and guarded headers; Reqwest responses,
       header maps, status codes, errors, and transport streams stay private.
 - [x] **Populate internal response metadata (1.2).** The supported exchange
-      retains its complete one-URL list and explicit zero redirect count,
-      request/response origins, request mode and response type, null-body state,
-      cache provenance, and actual provider cookie-processing state. Cache hits
-      retain that state. Status text is explicitly the canonical phrase; a
-      custom wire phrase is not retained. Multi-hop state waits for step 7,
-      with redirects rejected until then.
+      retains its URL list, redirect count, request/response origins, request
+      mode and response type, null-body state, cache provenance, and actual
+      provider cookie-processing state. Cache hits retain that state. Status
+      text is explicitly the canonical phrase; a custom wire phrase is not
+      retained. The initial controller redirect slice now updates the URL list
+      and count for followed responses.
 - [x] **Close public exposure paths (1.2).** Buffered and streaming fetches
-      share `InternalResponse::expose`. Cache hits are rechecked, null and opaque
-      bodies yield no bytes, and redirects fail before public headers. An
-      opaque view drops its internal stream. `OpaqueRedirect` and `Error` are
-      reserved variants outside this supported slice.
+      share `InternalResponse::expose`. Cache hits are rechecked, null and
+      opaque bodies yield no bytes, and manual redirects become filtered
+      `OpaqueRedirect` responses. Error-mode redirects fail before public
+      headers. An opaque view drops its internal stream; network-error response
+      construction remains outside this supported slice.
 - [x] **Finish the supported error contract (1.3).** `RequestError` documents
       retryability, timing, and body effects by category. Redirect failure is
       emitted; response-construction and body-consumption errors are deferred
@@ -350,7 +353,7 @@ The `webapis` ownership decision belongs in step 1; implementing JavaScript
 `Headers`, `Request`, `Response`, promises, Body methods, and streams is later
 binding work. Its current binding returns a string, so the contract must not
 describe that adaptation as already complete. Likewise, the shared Body model,
-complete CORS/preflight algorithms, controller-owned redirects, and durable
+complete CORS/preflight algorithms, redirect per-hop policy, and durable
 cache/credential integrations remain in their later numbered steps. Step 1
 must provide honest capability boundaries for those features now.
 
@@ -851,24 +854,75 @@ Enforce `SameOrigin` failures before exposing a response. For `NoCors`, return
 an opaque response with hidden status, URL, headers, and body metadata while
 still allowing the internal fetch to complete when the algorithm permits it.
 
-## 7. Move redirects into the controller
+## 7. Controller-owned redirects
 
-Disable Reqwest's automatic redirect following for the Fetch transport.
-Implement a controller-owned redirect loop that:
+### 7.1 Current implementation
 
-- validates each `Location` value;
-- accepts only supported redirect schemes;
-- enforces the Fetch redirect limit of 20;
-- updates the request URL list and current URL;
-- honors `follow`, `error`, and `manual` modes;
-- rewrites methods and bodies for applicable status codes;
-- rejects or stops when a one-shot body cannot be replayed;
-- strips credentials and sensitive headers when crossing origins;
-- re-runs origin, CORS, policy, cookie, and integrity checks per hop;
-- produces an opaque-redirect result for manual mode where required.
+The first redirect slice is implemented in
+[`engine/schemes/http.rs`](../src/engine/schemes/http.rs), with Reqwest
+automatic following disabled in
+[`transport/reqwest.rs`](../src/transport/reqwest.rs). The HTTP scheme handler
+loops around one scheduled transport exchange and currently:
 
-Add redirect metadata to the internal response without exposing the complete
-URL list through filtered public responses.
+- recognizes `301`, `302`, `303`, `307`, and `308`;
+- requires and resolves a valid `Location` against the current URL;
+- supports `follow`, `error`, and filtered `manual` behavior;
+- enforces a maximum of 20 followed redirects;
+- records the URL list, current URL, and redirect count on the request and
+  final internal response;
+- rewrites `POST` on `301`/`302`, rewrites non-`GET`/`HEAD` methods on `303`,
+  and rejects non-replayable bodies on `307`/`308`;
+- removes `Authorization` and `Proxy-Authorization` when the target origin
+  changes; and
+- exposes the final response only after response finalization, while manual
+  redirects return an `OpaqueRedirect` view with hidden metadata.
+
+The focused integration coverage is in
+[`tests/redirects.rs`](../tests/redirects.rs): followed redirects reach the
+final response, error mode fails before exposure, and manual mode returns the
+opaque redirect shape.
+
+### 7.2 Remaining correctness work
+
+This is a baseline controller loop, not the complete Fetch redirect
+algorithm. Still required:
+
+- make redirect-target validation explicitly HTTP(S)-only (the shared target
+  validator also serves local-scheme dispatch and should not be the only guard);
+- add focused coverage for absolute and relative targets, redirect limits,
+  loops, method/body rewriting, replay failures, URL-list/count metadata, and
+  cross-origin sensitive-header removal;
+- re-run per-hop CORS/preflight, credentials/cookie, referrer, service-worker,
+  integrity, security, and response-policy checks;
+- define redirect-aware cache lookup/insertion behavior and cache-key rules;
+- complete redirect-specific network-error handling, cancellation, timing,
+  and body/permit lifecycle tests; and
+- verify manual-mode metadata and `Location` handling against the intended
+  filtered response contract.
+
+### 7.3 Extraction seam for the next refactor
+
+Keep transport scheduling, cache lookup/capture, and final response delivery in
+`engine/schemes/http.rs`, but move redirect decisions into a new private
+[`engine/redirect.rs`](../src/engine/redirect.rs) module. A small internal
+state machine should accept the current `Request`, URL, and candidate
+`InternalResponse`, then return one of:
+
+```text
+Continue { request, next_url }
+Return(Response)
+Fail(RequestError)
+```
+
+The module should own redirect-status detection, `Location` resolution and
+validation, mode handling, hop-limit/replay checks, method/body rewriting,
+cross-origin header stripping, and request URL-list updates. The HTTP handler
+would then only submit a prepared request, call the redirect transition, and
+either loop with the returned state or finalize/cache the terminal response.
+Keep the transition function private and unit-test it with synthetic candidate
+responses; retain a small integration suite for scheduler, cookies, transport,
+and public exposure. This gives the redirect algorithm a file-level boundary
+without prematurely splitting the HTTP scheme's cache and response lifecycle.
 
 ## 8. Complete credentials and cookie channels
 

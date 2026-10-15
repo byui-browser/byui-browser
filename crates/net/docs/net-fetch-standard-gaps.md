@@ -117,9 +117,9 @@ The implementation still lacks preflight `OPTIONS`, a preflight cache, complete 
 
 Basic, CORS, and opaque views now filter headers and metadata. CORS exposure
 parsing covers safelisted names, explicit lists, wildcard credentials rules,
-duplicates, and malformed metadata. Opaque-redirect construction awaits
-controller-owned redirects, and network-error response construction remains
-outside the current response view. Local scheme responses are not yet covered
+duplicates, and malformed metadata. Opaque-redirect construction is now
+present for manual HTTP redirects, and network-error response construction
+remains outside the current response view. Local scheme responses are not yet covered
 by a shared finalization path: `data:` performs its own CORS/service approval,
 while provider-backed responses have no handler. Provider-supplied origins,
 opaque-origin behavior, cookie exclusion, and local-scheme response filtering
@@ -134,9 +134,9 @@ requests.
 
 ### 6. Redirect handling
 
-**Evidence:** [`ReqwestTransport::new`](../src/transport/reqwest.rs) disables automatic redirects, and [`RequestController::fetch`](../src/engine/execute.rs) owns the redirect loop. The controller resolves and validates `Location`, caps redirects at 20, tracks the URL list/current URL/count, applies Fetch method/body changes, strips sensitive headers on origin changes, and supports `follow`, `error`, and opaque `manual` results. 307/308 redirects reject non-replayable request bodies.
+**Evidence:** [`ReqwestTransport::new`](../src/transport/reqwest.rs) disables automatic redirects, and [`RequestController::fetch_http`](../src/engine/schemes/http.rs) owns the redirect loop. The controller resolves and validates `Location`, caps redirects at 20, tracks the URL list/current URL/count, applies Fetch method/body changes, strips sensitive headers on origin changes, and supports `follow`, `error`, and opaque `manual` results. 307/308 redirects reject non-replayable request bodies.
 
-The standard's complete redirect algorithm still includes more detailed per-hop CORS, credentials, referrer, cache, and security integration than this crate currently provides. Redirect targets remain limited to HTTP(S), and malformed or unsupported redirects fail closed with `RedirectFailure` or the relevant typed policy error.
+The standard's complete redirect algorithm still includes more detailed per-hop CORS, credentials, referrer, cache, and security integration than this crate currently provides. Redirect targets are intended to remain limited to HTTP(S), but the redirect-specific validator still needs an explicit scheme guard because the shared target validator also serves local-scheme dispatch. Malformed or unsupported redirects otherwise fail closed with `RedirectFailure` or the relevant typed policy error.
 
 **Required work:** complete per-hop CORS/security and credential policy, redirect-aware cache behavior, and the remaining browser integrations.
 

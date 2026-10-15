@@ -76,14 +76,16 @@ work.
   `Set-Cookie` reaches only that trusted interface. Credential mode still
   decides whether the engine calls its credential methods.
 - CORS preflight, integrity, navigation fetch, keepalive lifetime, nondefault
-  priority scheduling, manual/error redirect modes, and cache revalidation
-  fail with `UnsupportedFeature`. A service-worker `Intercept` decision also
+  priority scheduling, and cache revalidation fail with `UnsupportedFeature`.
+  Manual/error redirect modes are handled by the controller. A service-worker
+  `Intercept` decision also
   fails closed until worker responses are integrated. The default standalone
   service-worker mode means no worker is installed.
-- Reqwest never follows redirects. A redirect status returns `RedirectFailure`
-  before public headers. The full redirect loop, `OpaqueRedirect` results,
-  and per-hop checks belong to step 7. Fetch errors currently return
-  `RequestError`, not a `ResponseType::Error` value.
+- Reqwest never follows redirects. The controller handles the supported
+  redirect loop and returns filtered `OpaqueRedirect` results for manual mode;
+  error mode fails before public headers. Per-hop policy checks remain
+  incomplete. Fetch errors currently return a `RequestError`, not a
+  `ResponseType::Error` value.
 - `Default`, `NoStore`, `Reload`, `ForceCache`, and `OnlyIfCached` retain their
   documented process-local cache subset; `NoCache` fails until revalidation
   exists. Browser service providers choose the partition key. This cache is
