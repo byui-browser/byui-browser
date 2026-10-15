@@ -33,7 +33,7 @@ fn render_demo(width: u32, height: u32) -> Frame {
 /// The current compositor rasterizes at 1x; nearest-neighbor scaling keeps its
 /// bitmap font at a consistent logical size on Retina. Returns `None` for an
 /// empty area.
-pub(super) fn render_page(width: u32, height: u32, scale_factor: f64) -> Option<Pixmap> {
+pub(crate) fn render_page(width: u32, height: u32, scale_factor: f64) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(width, height)?;
     let frame = render_demo(
         (width as f64 / scale_factor).ceil() as u32,

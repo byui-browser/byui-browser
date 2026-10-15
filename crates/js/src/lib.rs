@@ -261,18 +261,30 @@ pub use ast::{Program, Statement};
 pub fn parse(source: &str) -> Result<Program, parser::ParseError> {
     let entries = lexer::tokenize_spanned(source);
     let starts: Vec<_> = entries.iter().map(|entry| entry.start).collect();
+    let line_terminators_before: Vec<_> = entries
+        .iter()
+        .scan(0, |previous_end, entry| {
+            let has_line_terminator = source[*previous_end..entry.start]
+                .chars()
+                .any(|ch| matches!(ch, '\n' | '\r' | '\u{2028}' | '\u{2029}'));
+            *previous_end = entry.end;
+            Some(has_line_terminator)
+        })
+        .collect();
     let tokens: Vec<_> = entries.into_iter().map(|entry| entry.token).collect();
-    parser::parse_program(&tokens).map_err(|mut error| {
-        let offset = starts
-            .get(error.token_index)
-            .copied()
-            .unwrap_or(source.len());
-        let prefix = &source[..offset];
-        error.offset = Some(offset);
-        error.line = Some(prefix.chars().filter(|ch| *ch == '\n').count() + 1);
-        error.column = Some(prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1);
-        error
-    })
+    parser::parse_program_with_line_terminators(&tokens, &line_terminators_before).map_err(
+        |mut error| {
+            let offset = starts
+                .get(error.token_index)
+                .copied()
+                .unwrap_or(source.len());
+            let prefix = &source[..offset];
+            error.offset = Some(offset);
+            error.line = Some(prefix.chars().filter(|ch| *ch == '\n').count() + 1);
+            error.column = Some(prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1);
+            error
+        },
+    )
 }
 
 /// Parses and evaluates source text, returning the completion value.

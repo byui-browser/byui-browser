@@ -45,11 +45,21 @@ fn empty_program_evaluates_to_undefined() {
 #[test]
 fn evaluates_string_literal() {
     assert_eq!(eval("'hi'"), Ok(Value::String("hi".into())));
+    assert_eq!(eval("\"hi\""), Ok(Value::String("hi".into())));
+    assert_eq!(eval("'line\\none'"), Ok(Value::String("line\none".into())));
+    assert_eq!(eval("'a' + \"b\""), Ok(Value::String("ab".into())));
 }
 
 #[test]
 fn syntax_error_is_an_err_not_a_panic() {
-    assert!(parse("let = ;").is_err());
+    let error = parse("let = ;").unwrap_err();
+    assert_eq!(error.context, "variable declaration");
+    assert_eq!((error.line, error.column), (Some(1), Some(5)));
+
+    let error = eval("let = ;").unwrap_err();
+    assert_eq!(error.category, js::JsErrorCategory::Syntax);
+    assert_eq!(error.context.as_deref(), Some("parsing script"));
+    assert!(error.message.contains("line 1, column 5"), "{error}");
 }
 
 #[test]

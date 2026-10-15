@@ -22,7 +22,7 @@ ifeq ($(OS),Windows_NT)
 else ifneq (,$(filter Darwin darwin,$(shell uname -s)))
 	cargo run -p browser-macos
 else ifneq (,$(filter Linux linux,$(shell uname -s)))
-	$(error Linux shell is not implemented yet)
+	cargo run -p browser-linux
 else ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(shell uname -s)))
 	$(error Windows shell is not implemented yet)
 else
