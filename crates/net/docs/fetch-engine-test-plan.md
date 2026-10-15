@@ -266,7 +266,7 @@ Primary files:
 - `crates/net/src/policy/request.rs`
 - `crates/net/src/engine/execute.rs`
 - `crates/net/src/engine/schemes/`
-- `crates/net/src/engine/http.rs`
+- `crates/net/src/engine/schemes/http.rs`
 - `crates/net/src/api/providers/`
 - `crates/net/tests/schemes.rs`
 
@@ -277,9 +277,29 @@ fakes for browser-owned resources. Every local-scheme test must assert that
 the request does not reach the HTTP transport, HTTP cache, or an unrelated
 provider.
 
-### Common dispatch and response invariants
+Current coverage in `crates/net/tests/schemes.rs` and the provider-resource
+unit tests includes:
 
-Add a matrix covering every supported scheme and assert that:
+- `data:` plain, percent-encoded, binary, base64, empty, and comma-containing
+  payloads with response metadata and exact body bytes;
+- malformed `data:` separators, percent escapes, base64 markers/payloads, and
+  media-type metadata;
+- `data:` `HEAD` null-body behavior and no-CORS opaque filtering;
+- local `data:` use of request/response service approval while bypassing
+  cookies, HTTP cache partitioning, and every scheme provider;
+- unsupported schemes failing before service or provider work;
+- absent and installed-but-unimplemented provider capability boundaries; and
+- `about:` rejection before any provider invocation.
+
+Provider-resource unit coverage also verifies every recognized scheme's
+metadata classification, invalid status/status-text/media-type handling, and
+buffered, streamed, and explicit-null body conversion. Provider success and
+lifecycle coverage remains blocked on the blob, file, and page handlers.
+
+### Remaining common dispatch and response invariants
+
+Expand the current matrix as each provider-backed handler lands and assert
+that:
 
 - URL parsing selects exactly the expected internal `FetchScheme`;
 - mixed-case scheme input is normalized consistently with URL parsing;
@@ -306,9 +326,9 @@ page provider. Each fake should record calls, request URL, request headers,
 request credentials mode, and whether its body was consumed. The fixture
 should make it possible to prove both "called exactly once" and "not called".
 
-### `data:` URLs
+### `data:` URLs — implemented and covered
 
-Cover the engine-owned parser and response construction with:
+The engine-owned parser and response construction are covered with:
 
 - plain text payloads and percent-encoded bytes;
 - `;base64` payloads, including padding and an empty base64 payload;
@@ -324,10 +344,11 @@ Cover the engine-owned parser and response construction with:
 - `HEAD`, if accepted by request validation, producing a null public body
   according to the shared null-body contract.
 
-For each successful form, compare buffered and streaming consumption and verify
-that no provider or local/HTTP transport fake was invoked.
+The handler intentionally creates a buffered body; stream conversion is covered
+at the provider-resource boundary. Keep the no-provider/cookie/cache regression
+test when future refactoring changes the data path.
 
-### `blob:` URLs
+### `blob:` URLs — pending handler implementation
 
 With a recording `BlobProvider`, add tests for:
 
@@ -351,7 +372,7 @@ Also verify that a blob response is not cached by the HTTP cache and that
 repeated requests resolve through the provider each time unless a later blob
 cache contract is added.
 
-### `file:` URLs
+### `file:` URLs — pending handler implementation
 
 With a recording, authorization-aware `FileProvider`, cover:
 
@@ -372,7 +393,7 @@ With a recording, authorization-aware `FileProvider`, cover:
 The test suite should use an in-memory fake provider. Do not make tests depend
 on host filesystem state or permissions.
 
-### `byui:` browser pages
+### `byui:` browser pages — pending handler implementation
 
 With a recording `PageProvider`, add tests for:
 
@@ -391,7 +412,7 @@ Include a routing table test proving that a `byui:` request cannot fall through
 to Reqwest or the file provider when lookup fails. Verify that provider calls
 are made once and that a response body error cannot create a cache entry.
 
-### `about:` URLs
+### `about:` URLs — pending allowlist implementation
 
 Define the supported allowlist in the tests rather than accepting arbitrary
 `about:` paths. For the initial blank-page behavior, cover:
@@ -427,10 +448,11 @@ For every local scheme, repeat the following shared assertions:
 - successful body consumption releases all permits and leaves no provider
   operation running.
 
-Keep one end-to-end test per scheme in `crates/net/tests/schemes.rs`, with the
-remaining parser and metadata cases beside their implementations. The suite
-should include a shared no-network assertion so future scheme handlers cannot
-accidentally regress into the HTTP path.
+Keep one end-to-end test per implemented scheme in `crates/net/tests/schemes.rs`,
+with parser and metadata cases beside their implementations. The suite already
+has a shared no-service/provider assertion for unsupported schemes and
+unreachable-provider fakes for local dispatch; retain and extend those guards
+so future scheme handlers cannot accidentally regress into the HTTP path.
 
 ## 5. Null-body responses
 

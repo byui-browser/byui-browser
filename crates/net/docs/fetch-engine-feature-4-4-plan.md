@@ -1,9 +1,10 @@
 # Feature 4.4 plan: scheme-specific Fetch dispatch
 
 Status: dispatch, provider contracts, provider metadata validation, shared
-response finalization, and the engine-owned `data:` handler are implemented;
-blob, file, byui, and about handlers plus browser composition remain. Reviewed
-against the current `crates/net` implementation on 2026-10-14.
+response finalization, the engine-owned `data:` handler, and focused scheme
+coverage are implemented; blob, file, byui, and about handlers plus browser
+composition remain. Reviewed against the current `crates/net` implementation
+on 2026-10-15.
 
 This plan records only the work that remains for feature 4.4 of the
 [`fetch-engine-implementation-plan.md`](fetch-engine-implementation-plan.md).
@@ -47,8 +48,12 @@ The initial pipeline refactor is complete:
 - Moved the HTTP(S) handler under `engine/schemes/http.rs` so all scheme
   handlers share one module boundary.
 - Restricted cache eligibility and cache partition lookup to HTTP(S).
-- Added unit coverage for scheme classification and an integration test proving
-  a supported non-HTTP URL reaches the dispatcher seam.
+- Added unit coverage for scheme classification, provider-resource validation,
+  and bytes/stream/null resource bodies.
+- Added `tests/schemes.rs` coverage for supported `data:` forms and failures,
+  `HEAD` null bodies, opaque no-CORS views, local-scheme cookie/cache/provider
+  exclusion, unsupported-scheme side effects, provider capability boundaries,
+  and rejected `about:` URLs.
 
 The `data:` branch now decodes percent-encoded and base64 payloads into the
 shared response/body pipeline. Provider-backed branches fail with a typed
@@ -200,14 +205,14 @@ resources are the starting point for the browser-owned page provider.
 
 #### 1.8 Add provider-boundary tests — partial
 
-Existing tests cover missing-provider errors, provider error-category display,
-scheme-resource scheme/media-type validation, and malformed provider metadata.
-Remaining tests must prove that:
+Existing tests cover missing-provider errors, installed-provider placeholder
+errors, unsupported-scheme no-side-effect behavior, provider error-category
+display, scheme-resource scheme/media-type/status validation, and buffered,
+streamed, and null provider-resource bodies. Remaining tests must prove that:
 
-- absent providers return typed capability errors;
-- unsupported schemes do not invoke any provider;
-- each supported scheme can access only its matching provider;
-- provider metadata can be converted without leaking provider state;
+- each implemented provider handler calls only its matching provider exactly
+  once;
+- provider metadata reaches response exposure without leaking provider state;
 - browser-context composition uses `with_services`; and
 - existing `FetchServices` implementations remain source-compatible.
 
@@ -280,17 +285,16 @@ after resolution must terminate a provider stream and release engine resources.
 Dropping, failing, or aborting a provider body must not create a cache entry or
 leave a provider operation running.
 
-### 2. Replace the dispatcher placeholders with scheme handlers
+### 2. Replace the remaining dispatcher placeholders with scheme handlers
 
 The controller-level seam and shared response finalization now exist in
 [`RequestController::fetch`](../src/engine/execute.rs). Replace its non-HTTP
 placeholder branches with handlers in this order:
 
-1. `data:` parsing and response construction.
-2. `blob:` provider resolution.
-3. `file:` provider-authorized access.
-4. `byui:` browser-page routing.
-5. The explicitly supported `about:` cases.
+1. `blob:` provider resolution.
+2. `file:` provider-authorized access.
+3. `byui:` browser-page routing.
+4. The explicitly supported `about:` cases.
 
 Each handler must return an `InternalResponse`; it must not expose a new public
 response type or call the HTTP transport directly.
@@ -341,7 +345,7 @@ The common finalization operation must be explicit and reusable. It must:
 Local schemes must not obtain cookies, use HTTP cache entries, or invoke HTTP
 transport unless a later plan section explicitly changes their contract.
 
-### 3. Implement `data:` fetching
+### 3. Implement `data:` fetching — complete
 
 Add a focused `data:` parser/handler that supports:
 
@@ -359,20 +363,18 @@ Construct the result as an internal response with status 200, the resolved
 attach cookies or other credentials. `data:` responses should not enter the
 HTTP cache.
 
-The parser and handler are implemented for plain text, percent encoding,
-base64, media-type parameters, the default media type, empty payloads, and
-typed malformed-input failures. It constructs a status-200 response with an
-opaque origin and routes it through shared finalization. Add tests for plain
-text, percent encoding, base64, media-type parameters, default type, empty
-payloads, malformed encoding, invalid base64, body bytes, response URL, origin,
-and credential behavior.
+The parser and handler are implemented and covered for plain text, percent
+encoding, base64 (including an empty payload), media-type parameters, the
+default media type, empty payloads, commas, non-UTF-8 bytes, malformed percent
+encoding, invalid or duplicate base64 markers, malformed media types and
+parameters, body bytes, response metadata, and service behavior. `HEAD` now
+preserves response metadata while exposing an explicit null body. The suite
+also proves that `data:` uses the shared response filtering path, can become
+opaque in no-CORS mode, and bypasses cookies, HTTP cache partitioning, and all
+scheme providers.
 
-Remaining tests must cover payloads containing commas and non-UTF-8 bytes, duplicate base64
-markers, malformed parameters, exact default media type, and the request-method
-boundary. If `HEAD` is accepted, it must produce an explicit null response
-body while preserving response metadata; otherwise it must be rejected before
-decoding. Verify that `data:` responses do not call services for cookies,
-providers, HTTP transport, or HTTP cache.
+`data:` parsing intentionally materializes bytes, so streaming-output coverage
+belongs to provider-resource tests and the future provider-backed handlers.
 
 ### 4. Implement `blob:` resolution
 

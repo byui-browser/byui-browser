@@ -1,7 +1,7 @@
 //! Engine-owned Fetch scheme handlers.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use http::{HeaderName, HeaderValue};
+use http::{HeaderName, HeaderValue, Method};
 use reqwest::Url;
 
 use crate::{
@@ -29,7 +29,11 @@ impl RequestController {
             headers: vec![(HeaderName::from_static("content-type"), media_type)],
             media_type: None,
             origin: Origin::opaque(),
-            body: SchemeBody::Bytes(bytes),
+            body: if request.method() == Method::HEAD {
+                SchemeBody::Null
+            } else {
+                SchemeBody::Bytes(bytes)
+            },
         };
         self.finalize_scheme_resource(&request, resource, crate::policy::FetchScheme::Data)
     }
