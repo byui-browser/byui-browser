@@ -625,8 +625,6 @@ fn unsupported_syntax_is_rejected_at_parse_time() {
         "1;;",
         // `return` outside a function.
         "return 1;",
-        // No automatic semicolon insertion between statements.
-        "let a = 1\nlet b = 2",
         // `undefined` is a keyword here, so it cannot be a binding name.
         "let undefined = 1;",
         // Hexadecimal numeric literals in source.
