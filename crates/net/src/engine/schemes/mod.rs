@@ -2,6 +2,7 @@
 
 mod blob;
 mod data;
+mod file;
 mod http;
 
 use crate::{
@@ -25,13 +26,7 @@ impl RequestController {
             }
             FetchScheme::Data => self.fetch_data(request, url).await,
             FetchScheme::Blob => self.fetch_blob(request, url).await,
-            FetchScheme::File => {
-                if self.inner.providers.file().is_none() {
-                    Err(RequestError::MissingProvider("file"))
-                } else {
-                    Err(RequestError::UnsupportedFeature("file scheme handler"))
-                }
-            }
+            FetchScheme::File => self.fetch_file(request, url).await,
             FetchScheme::Byui => {
                 if self.inner.providers.page().is_none() {
                     Err(RequestError::MissingProvider("byui page"))

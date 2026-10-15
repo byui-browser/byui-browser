@@ -175,8 +175,8 @@ for:
 
 Providers still own authorization, sandboxing, path resolution, revocation, and
 durable state. `net` fails closed when a required provider or security decision
-is unavailable. End-to-end provider failures remain untested until the actual
-handlers exist.
+is unavailable. End-to-end provider failures are covered for blob resolution;
+file and page handler failures remain untested until those handlers exist.
 
 #### 1.6 Wire providers into controller state — complete
 
@@ -258,8 +258,9 @@ Before constructing an `InternalResponse`, `net` now validates:
   credential policy.
 
 Malformed or unavailable security metadata fails closed before public response
-exposure. Full provider authorization and resource-existence behavior remains
-dependent on the not-yet-implemented provider handlers.
+exposure. Blob authorization and resource-existence behavior is delegated to
+the installed provider; file and page behavior remains dependent on their
+not-yet-implemented handlers.
 
 #### 1.10 Define browser composition and provider lifecycle contracts
 
@@ -292,10 +293,9 @@ The controller-level seam and shared response finalization now exist in
 [`RequestController::fetch`](../src/engine/execute.rs). Replace its non-HTTP
 placeholder branches with handlers in this order:
 
-1. `blob:` provider resolution.
-2. `file:` provider-authorized access.
-3. `byui:` browser-page routing.
-4. The explicitly supported `about:` cases.
+1. `file:` provider-authorized access.
+2. `byui:` browser-page routing.
+3. The explicitly supported `about:` cases.
 
 Each handler must return an `InternalResponse`; it must not expose a new public
 response type or call the HTTP transport directly.

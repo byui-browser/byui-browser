@@ -155,6 +155,97 @@ impl BlobProvider for RecordingBlobProvider {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FileOutcome {
+    Bytes,
+    Stream,
+    Null,
+    Missing,
+    Denied,
+    Io,
+    Malformed,
+}
+
+struct RecordingFileProvider {
+    calls: AtomicUsize,
+    outcome: FileOutcome,
+}
+
+impl FileProvider for RecordingFileProvider {
+    fn open<'a>(&'a self, _request: &'a Request, url: &'a net::Url) -> ProviderFuture<'a> {
+        assert_eq!(url.as_str(), "file:///tmp/page.html");
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let outcome = self.outcome;
+        Box::pin(async move {
+            match outcome {
+                FileOutcome::Missing => Err(RequestError::Provider {
+                    provider: "file",
+                    kind: ProviderErrorKind::ResourceMissing,
+                }),
+                FileOutcome::Denied => Err(RequestError::Provider {
+                    provider: "file",
+                    kind: ProviderErrorKind::AccessDenied,
+                }),
+                FileOutcome::Io => Err(RequestError::Provider {
+                    provider: "file",
+                    kind: ProviderErrorKind::Io,
+                }),
+                FileOutcome::Malformed => Ok(file_resource(
+                    net::Url::parse("https://wrong.test/page.html").unwrap(),
+                    SchemeBody::Bytes(b"must-not-expose".to_vec()),
+                )),
+                FileOutcome::Bytes => Ok(file_resource(
+                    net::Url::parse("file:///tmp/page.html").unwrap(),
+                    SchemeBody::Bytes(b"file-bytes".to_vec()),
+                )),
+                FileOutcome::Stream => Ok(file_resource(
+                    net::Url::parse("file:///tmp/page.html").unwrap(),
+                    SchemeBody::Stream(Box::pin(futures_util::stream::iter([
+                        Ok(b"file-".to_vec()),
+                        Ok(b"stream".to_vec()),
+                    ]))),
+                )),
+                FileOutcome::Null => Ok(file_resource(
+                    net::Url::parse("file:///tmp/page.html").unwrap(),
+                    SchemeBody::Null,
+                )),
+            }
+        })
+    }
+}
+
+fn file_resource(url: net::Url, body: SchemeBody) -> SchemeResource {
+    SchemeResource {
+        url,
+        status: 200,
+        status_text: Some("OK".into()),
+        headers: vec![(
+            net::HeaderName::from_static("x-file"),
+            net::HeaderValue::from_static("yes"),
+        )],
+        media_type: Some(net::HeaderValue::from_static("text/plain")),
+        origin: Origin::opaque(),
+        body,
+    }
+}
+
+fn controller_with_file_provider(
+    provider: Arc<RecordingFileProvider>,
+) -> (RequestController, Arc<RecordingServices>) {
+    let services = Arc::new(RecordingServices::default());
+    let providers = SchemeProviders::new()
+        .with_blob(Arc::new(UnreachableProvider))
+        .with_file(provider)
+        .with_page(Arc::new(UnreachableProvider));
+    let controller = RequestController::with_services_and_providers(
+        Config::default(),
+        services.clone(),
+        providers,
+    )
+    .expect("controller should initialize");
+    (controller, services)
+}
+
 fn blob_resource(body: SchemeBody) -> SchemeResource {
     SchemeResource {
         url: net::Url::parse("blob:https://creator.test/object-1").unwrap(),
@@ -472,15 +563,13 @@ fn provider_backed_schemes_distinguish_absent_and_installed_capabilities() {
     }
 
     let (installed_controller, _) = controller_with_services_and_providers();
-    for (url, handler) in [
-        ("file:///tmp/page.html", "file scheme handler"),
-        ("byui://welcome", "byui scheme handler"),
-    ] {
-        let error = runtime()
-            .block_on(installed_controller.fetch(Request::get(url)))
-            .unwrap_err();
-        assert!(matches!(error, RequestError::UnsupportedFeature(feature) if feature == handler));
-    }
+    let error = runtime()
+        .block_on(installed_controller.fetch(Request::get("byui://welcome")))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RequestError::UnsupportedFeature("byui scheme handler")
+    ));
 }
 
 #[test]
@@ -581,4 +670,119 @@ fn blob_provider_failures_are_typed_and_do_not_expose_a_response() {
         ));
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
+}
+
+#[test]
+fn file_fetches_resolve_once_and_use_shared_response_finalization() {
+    let provider = Arc::new(RecordingFileProvider {
+        calls: AtomicUsize::new(0),
+        outcome: FileOutcome::Bytes,
+    });
+    let (controller, services) = controller_with_file_provider(provider.clone());
+
+    let response = runtime()
+        .block_on(controller.fetch(Request::get("file:///tmp/page.html")))
+        .unwrap();
+
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.url, "file:///tmp/page.html");
+    assert_eq!(response.headers.get("x-file").as_deref(), Some("yes"));
+    assert_eq!(
+        response.headers.get("content-type").as_deref(),
+        Some("text/plain")
+    );
+    assert_eq!(response.response_type, ResponseType::Basic);
+    assert_eq!(
+        runtime().block_on(response.body.bytes()).unwrap(),
+        b"file-bytes"
+    );
+    assert_eq!(
+        services.response_origins.lock().unwrap().as_slice(),
+        &[Some(Origin::opaque())]
+    );
+    assert_eq!(services.cookie_lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(services.cookie_stores.load(Ordering::SeqCst), 0);
+    assert_eq!(services.cache_partitions.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn file_fetches_support_streams_and_explicit_null_bodies() {
+    for (outcome, method, expected_body, expected_null) in [
+        (FileOutcome::Stream, "GET", b"file-stream".as_slice(), false),
+        (FileOutcome::Null, "HEAD", b"".as_slice(), true),
+    ] {
+        let provider = Arc::new(RecordingFileProvider {
+            calls: AtomicUsize::new(0),
+            outcome,
+        });
+        let (controller, _) = controller_with_file_provider(provider.clone());
+        let request = Request::new("file:///tmp/page.html", method).unwrap();
+        let response = runtime().block_on(controller.fetch(request)).unwrap();
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(response.body.is_null(), expected_null);
+        assert_eq!(
+            runtime().block_on(response.body.bytes()).unwrap(),
+            expected_body
+        );
+    }
+}
+
+#[test]
+fn file_provider_failures_retain_stable_categories() {
+    for (outcome, expected_kind) in [
+        (FileOutcome::Missing, ProviderErrorKind::ResourceMissing),
+        (FileOutcome::Denied, ProviderErrorKind::AccessDenied),
+        (FileOutcome::Io, ProviderErrorKind::Io),
+    ] {
+        let provider = Arc::new(RecordingFileProvider {
+            calls: AtomicUsize::new(0),
+            outcome,
+        });
+        let (controller, _) = controller_with_file_provider(provider.clone());
+        let error = runtime()
+            .block_on(controller.fetch(Request::get("file:///tmp/page.html")))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RequestError::Provider {
+                provider: "file",
+                kind
+            } if kind == expected_kind
+        ));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn file_provider_metadata_is_validated_before_exposure() {
+    let provider = Arc::new(RecordingFileProvider {
+        calls: AtomicUsize::new(0),
+        outcome: FileOutcome::Malformed,
+    });
+    let (controller, _) = controller_with_file_provider(provider.clone());
+    let error = runtime()
+        .block_on(controller.fetch(Request::get("file:///tmp/page.html")))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RequestError::Provider {
+            provider: "file",
+            kind: ProviderErrorKind::MalformedMetadata
+        }
+    ));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn file_requests_without_a_provider_fail_before_provider_or_transport_work() {
+    let controller = RequestController::new(Config::default()).unwrap();
+    let error = runtime()
+        .block_on(controller.fetch(Request::get("file:///tmp/page.html")))
+        .unwrap_err();
+
+    assert!(matches!(error, RequestError::MissingProvider("file")));
 }

@@ -8,22 +8,23 @@ null-body rules. The detailed audit below records the wider unfinished Fetch
 algorithms; see `fetch-engine-contract.md` for the current supported subset and
 capability errors.
 
-Status: audit of the implementation as of 2026-10-14, including the current
+Status: audit of the implementation as of 2026-10-15, including the current
 committed `crates/net` implementation and the Feature 4.4 plan updates.
 
 This report compares `crates/net` with the [WHATWG Fetch Living Standard](https://fetch.spec.whatwg.org/), last updated 2026-10-06. It evaluates the networking crate as a browser-facing Fetch implementation, not merely as an HTTP client. A field or enum is counted as implemented only when it changes observable behavior at the appropriate policy boundary.
 
-The crate currently provides an HTTP(S) transport with a Fetch-shaped request model: environment-based relative URL resolution, structured HTTP(S) origins, guarded ordered request headers, replayable and one-shot request bodies, automatic body metadata and `Origin`/`Referer` preparation, filtered streamed responses, controller-owned redirect handling, abort signaling, connection pooling, keepalive body-size validation, and a small in-memory cache. Redirects fail closed until the controller owns the redirect loop. Browser-context requests require a `FetchServices` provider. The crate is not yet Fetch-compatible for the full request/response algorithms.The dispatcher recognizes
+The crate currently provides an HTTP(S) transport with a Fetch-shaped request model: environment-based relative URL resolution, structured HTTP(S) origins, guarded ordered request headers, replayable and one-shot request bodies, automatic body metadata and `Origin`/`Referer` preparation, filtered streamed responses, controller-owned redirect handling, abort signaling, connection pooling, keepalive body-size validation, and a small in-memory cache. Browser-context requests require a `FetchServices` provider. The crate is not yet Fetch-compatible for the full request/response algorithms. The dispatcher recognizes
 `http`, `https`, `data`, `blob`, `file`, `byui`, and `about`. `data:` is
 engine-owned and currently decodes percent-encoded and base64 payloads;
-`blob:`, `file:`, and `byui:` have public browser-owned provider contracts but
+`blob:` resolves through the installed browser-owned provider and reaches the
+shared response pipeline; `file:` and `byui:` have provider contracts but
 their handlers are still placeholders; `about:` is classified but unsupported.
 
 ## Summary
 
 | Area                        | Current state                                                                                                                                                 | Gap severity |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
-| URL and scheme fetch        | HTTP(S), relative URLs, and partial `data:` fetch work; provider-backed `blob:`/`file:`/`byui:` handlers and `about:` remain incomplete                       | High         |
+| URL and scheme fetch        | HTTP(S), relative URLs, `data:`, and `blob:` fetch work; `file:`/`byui:` handlers and `about:` remain incomplete                                                  | High         |
 | Request headers and methods | Method validation, request/no-CORS guards, internal generated-header channels, and response filtering exist; later redirect/header rules remain               | Medium       |
 | Request and response bodies | Shared buffered/streaming `Body`, text/blob/form-data/JSON/array-buffer helpers, and null-body handling exist; cloning/teeing and full Fetch semantics remain | Medium       |
 | Credentials and cookies     | `FetchServices` can supply and store cookies; matching, persistence, and policy belong to its provider                                                        | Critical     |
@@ -51,22 +52,23 @@ payloads, assigns a generated content type, creates a status-200 internal
 response, and uses the shared response/body exposure path. Provider-neutral
 resource results plus `BlobProvider`, `FileProvider`, and `PageProvider` are
 public APIs in [`api/providers`](../src/api/providers/mod.rs), and
-`SchemeProviders` is stored by the controller. However, installed providers
-are not invoked yet: `blob:`, `file:`, and `byui:` return
-`UnsupportedFeature("... scheme handler")`; absent matching providers return
-`MissingProvider`. `about:` is classified but every case currently returns
-`UnsupportedFeature`.
+`SchemeProviders` is stored by the controller. The installed `blob:` provider
+is invoked exactly once and its resource is validated and finalized through
+the shared response path. `file:` and `byui:` still return
+`UnsupportedFeature("... scheme handler")` when installed; absent matching
+providers return `MissingProvider`. `about:` is classified but every case
+currently returns `UnsupportedFeature`.
 
-Relative URLs and HTTP(S) origins work, and opaque origins are representable,
-but redirects do not update the URL list/current URL through a controller-owned
-loop. Provider-assigned origins and local-scheme URL-list, credential, body,
-and filtering semantics are not yet validated end to end.
+Relative URLs and HTTP(S) origins work, and opaque origins are representable.
+The HTTP controller updates the URL list/current URL through its redirect loop;
+provider-assigned origins and file/page local-scheme URL-list, credential,
+body, and filtering semantics are not yet validated end to end.
 
-**Required work:** complete the `data:` edge-case and method contract;
-implement blob, file, byui, and allowlisted about handlers; validate provider
-URLs, headers, status, media types, and origins before exposure; compose the
-browser-owned providers; and then track URL-list/current-URL/redirect state
-through every redirect.
+**Required work:** finish the remaining `data:` edge cases; implement file,
+byui, and allowlisted about handlers; compose the browser-owned providers; and
+track URL-list/current-URL/redirect state through every redirect. Blob
+provider metadata and the shared finalization path are already implemented,
+with lifecycle coverage still incomplete.
 
 ### 2. Request methods and header guards
 
@@ -95,7 +97,7 @@ It still lacks Fetch-compatible stream teeing/cloning, a public response clone
 operation, typed-array/JavaScript conversion (which belongs in `webapis`),
 `duplex`, keepalive aggregate quotas, and the Fetch rule that a successful
 `CONNECT` response has no body. The provider stream variant is defined, but
-local scheme handlers do not yet exercise it.
+the file and page handlers do not yet exercise it.
 
 **Required work:** finish body cloning/teeing and lifecycle semantics, define
 the Rust-to-JavaScript body conversion boundary, add aggregate keepalive
@@ -119,11 +121,10 @@ Basic, CORS, and opaque views now filter headers and metadata. CORS exposure
 parsing covers safelisted names, explicit lists, wildcard credentials rules,
 duplicates, and malformed metadata. Opaque-redirect construction is now
 present for manual HTTP redirects, and network-error response construction
-remains outside the current response view. Local scheme responses are not yet covered
-by a shared finalization path: `data:` performs its own CORS/service approval,
-while provider-backed responses have no handler. Provider-supplied origins,
-opaque-origin behavior, cookie exclusion, and local-scheme response filtering
-therefore remain unverified.
+remains outside the current response view. `data:` and `blob:` use the shared
+finalization path, including provider-supplied origins, opaque-origin behavior,
+cookie/cache exclusion, and response filtering. File and page local-scheme
+response coverage remains unimplemented.
 
 **Required work:** implement request tainting and the CORS-preflight/CORS-check
 algorithms before exposing response data, extract one reusable response
@@ -185,7 +186,8 @@ revocation state, authorized file access and sandbox policy, and registered
 `RequestController::new` and does not install `FetchServices` or
 `SchemeProviders`. Provider errors, provider-assigned origins, metadata
 validation, exact-once provider selection, and cancellation/lifetime behavior
-are not yet implemented or covered by integration tests.
+are implemented for the blob path and covered by focused scheme tests; file
+and page handlers, browser composition, and provider lifecycle coverage remain.
 
 `Config.max_keepalive_body_size` still checks the known body length, but even
 an in-quota keepalive request fails with `UnsupportedFeature` until lifetime
@@ -238,28 +240,23 @@ provider-neutral URL, status, headers, origin, media type, and body; and
 [`InternalResponse::from_scheme_resource`](../src/api/response/view.rs)
 converts that data into the private response representation.
 
-The boundary is present, but the contract is incomplete. The provider API has
-no dedicated stable categories for missing resources, revoked blobs, denied
-files, provider I/O failure, malformed metadata, or invalid origins. The
-conversion currently validates the status code but does not fully validate
-scheme-compatible URLs, provider metadata, or origin policy. No blob, file, or
-page handler invokes an installed provider, and no `about:` allowlist exists.
-The `data:` handler reaches exposure, but common response finalization is not
-yet extracted and its method, credential, cookie, cache, and opaque-origin
-matrix is not fully tested. The browser executable has not been composed with
-the provider bundle.
+The boundary is present and the blob slice is implemented. The provider API
+defines stable categories for missing resources, revoked blobs, denied files,
+provider I/O failure, malformed metadata, and invalid origins. Conversion
+validates scheme-compatible URLs, provider metadata, and origin policy before
+exposure. File and page handlers do not yet invoke installed providers, and no
+`about:` allowlist exists. The browser executable has not been composed with
+the provider bundle. Provider lifecycle coverage remains incomplete.
 
-**Required work:** define stable provider error categories; validate all
-provider response metadata fail-closed; implement matching blob/file/byui
-handlers and the supported about cases; extract shared response finalization;
-compose browser-owned providers; and add recording-provider tests for exact
-selection, no unrelated-provider/network fallback, cancellation, body
-failure/drop, origin assignment, and cache exclusion.
+**Required work:** implement matching file/byui handlers and the supported
+about cases; compose browser-owned providers; and add recording-provider tests
+for cancellation, body failure/drop, origin assignment, and cache exclusion
+across every provider-backed scheme.
 
 ## Recommended implementation order
 
-1. Finish the Feature 4.4 contract: provider error categories, metadata validation, shared response finalization, browser composition, and local-scheme lifecycle tests.
-2. Implement `blob:`, `file:`, `byui:`, and allowlisted `about:` handlers; expand `data:` edge-case and bodyless-method coverage.
+1. Finish the Feature 4.4 contract: browser composition and local-scheme lifecycle tests.
+2. Implement `file:`, `byui:`, and allowlisted `about:` handlers; expand remaining `data:` and blob lifecycle coverage.
 3. Implement credentials/cookie policy and strict same-origin/CORS/no-CORS response filtering across HTTP and local schemes.
 4. Complete per-hop redirect CORS/security and credential policy.
 5. Replace the TTL map with a partitioned HTTP cache or integrate an existing standards-aware cache.

@@ -1,8 +1,8 @@
 # Plan: Make `net` the reusable Fetch engine
 
 Status: implementation in progress as of 2026-10-15; steps 1 and 2 are complete,
-step 3 has its shared-body foundation in place, and the first controller-owned
-redirect slice is implemented for the explicitly bounded HTTP(S) subset
+step 3 has its shared-body foundation in place, scheme dispatch includes
+`data:` and `blob:`, and the first controller-owned redirect slice is implemented for the explicitly bounded HTTP(S) subset
 described below.
 
 ## Goal
@@ -733,6 +733,11 @@ Caller-visible headers must not gain the internally generated `Origin`,
 
 ### 4.4 Add scheme-specific fetch dispatch
 
+The dispatcher seam, engine-owned `data:` handler, provider-neutral resource
+boundary, shared response finalization, and `blob:` handler are implemented.
+The remaining provider-backed work is `file:` and `byui:`; `about:` remains
+classified but unsupported.
+
 Add a controller-level scheme dispatcher so request construction and execution
 do not assume that every valid URL is an HTTP(S) transport request. The
 dispatcher must:
@@ -740,8 +745,8 @@ dispatcher must:
 - retain HTTP(S) as the existing network path;
 - implement `data:` fetches, including percent- and base64-encoded payloads,
   media-type/default-type handling, decoded bytes, and invalid-payload errors;
-- implement `blob:` resolution through an explicit browser-owned object-URL
-  or blob provider, without making `net` own the blob registry;
+- preserve `blob:` resolution through an explicit browser-owned object-URL or
+  blob provider, without making `net` own the blob registry;
 - implement `file:` access only through an explicit filesystem/security
   provider, with local-file authorization, origin assignment, and failure
   behavior defined by that provider;
@@ -769,7 +774,7 @@ semantics.
 
 ### 5.1 Add response metadata
 
-Replace the current raw fields in [`Response`](../src/api/response/types.rs) with a
+The current [`Response`](../src/api/response/types.rs) already uses a
 Fetch-oriented representation containing:
 
 - response type;
@@ -781,12 +786,13 @@ Fetch-oriented representation containing:
 - body;
 - cache provenance if retained as a Rust diagnostic field.
 
-Add derived helpers such as `ok` and explicit methods for checking whether the
-response has a body.
+Remaining response work is to add derived helpers such as `ok` and explicit
+methods for checking whether the response has a body.
 
 ### 5.2 Add response constructors
 
-Provide documented constructors for engine consumers where appropriate:
+The internal response path now constructs ordinary, filtered, opaque, and
+null-body responses. Remaining constructor work for engine consumers includes:
 
 - ordinary responses from internal network results;
 - network-error responses;
@@ -822,7 +828,8 @@ cloning, teeing, cancellation, and cache capture.
 
 ### 6.1 Complete request tainting and response types
 
-Extend the current CORS and policy modules to determine:
+The current CORS and policy modules already determine the supported basic,
+opaque, and simple-CORS response views. Extend them to determine:
 
 - same-origin versus cross-origin requests;
 - request mode and credentials interaction;
@@ -834,7 +841,7 @@ type that requires filtering.
 
 ### 6.2 Implement CORS checks
 
-Complete the controller path around the currently permissive
+Complete the remaining controller path around the currently partial
 [`CorsChecker::response_type`](../src/policy/cors.rs) by adding:
 
 - simple-request checks;
@@ -843,7 +850,7 @@ Complete the controller path around the currently permissive
 - credentials validation;
 - allowed-method validation;
 - allowed-header validation;
-- exposed-header parsing;
+- the remaining exposed-header and preflight behavior;
 - preflight cache;
 - cross-origin redirect checks;
 - network-error conversion on failure.
@@ -923,6 +930,50 @@ Keep the transition function private and unit-test it with synthetic candidate
 responses; retain a small integration suite for scheduler, cookies, transport,
 and public exposure. This gives the redirect algorithm a file-level boundary
 without prematurely splitting the HTTP scheme's cache and response lifecycle.
+
+### 7.4 Structural audit follow-up
+
+The current crate-structure audit identified the following cleanup work. These
+items are part of the implementation plan rather than optional refactoring:
+
+- **Keep redirects inside the HTTP(S) algorithm.** The redirect transition must
+  reject any target whose scheme is not `http` or `https` before the next
+  transport submission. Add focused regression tests for redirects to `data:`,
+  `blob:`, `file:`, `byui:`, and `about:` URLs; they must fail as redirect
+  failures and must not enter a local-scheme provider or the HTTP transport
+  path.
+- **Consolidate internal response construction.** The cached-response path and
+  `ReqwestTransport` currently assemble overlapping `InternalResponse` fields
+  independently. Introduce one private constructor/conversion seam for
+  status, status text, URL/origin, null-body classification, credentials,
+  response type, and cache metadata, then test that cached, streamed, and
+  provider-backed responses preserve equivalent metadata.
+- **Make request authorization stages explicit.** Preparation currently calls
+  `FetchServices::check_request`, while the HTTP redirect loop calls it again
+  on every hop. Retain the required per-hop check, but separate the one-time
+  request admission stage from redirect-hop authorization with clearly named
+  helpers and focused tests proving the intended call count and ordering around
+  cache lookup, cookies, and transport.
+- **Remove the crate-wide dead-code escape hatch.** Replace
+  `#![allow(dead_code)]` with narrow, temporary allowances at the incomplete
+  item or module boundary, and remove them as each planned feature lands. The
+  completion gate must run with dead-code warnings visible so unused modules
+  and APIs cannot accumulate unnoticed.
+- **Give response policy a real ownership boundary.** The current
+  `policy::response::validate_response` is a no-op placeholder. Either move
+  its checks into the established response-policy implementation or implement
+  the response invariants it is intended to own; do not retain a module that
+  only returns `Ok(())`. Add focused tests for each invariant before marking
+  the module complete.
+- **Deduplicate cache tests.** Replace the second
+  `expired_entries_are_not_returned2` test with a table-driven or meaningfully
+  distinct case. The cache test suite should cover expiration once and use
+  separate tests for independent behavior such as non-success insertion
+  rejection.
+
+The cleanup is complete only when the module boundaries, response construction,
+authorization stages, warning policy, and test names describe distinct
+responsibilities and the focused regressions above pass.
 
 ## 8. Complete credentials and cookie channels
 
