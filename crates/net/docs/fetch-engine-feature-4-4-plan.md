@@ -1,8 +1,8 @@
 # Feature 4.4 plan: scheme-specific Fetch dispatch
 
 Status: dispatch, provider contracts, provider metadata validation, shared
-response finalization, the engine-owned `data:` handler, and focused scheme
-coverage are implemented; blob, file, byui, and about handlers plus browser
+response finalization, the engine-owned `data:` handler, the `blob:` handler,
+and focused scheme coverage are implemented; file, byui, and about handlers plus browser
 composition remain. Reviewed against the current `crates/net` implementation
 on 2026-10-15.
 
@@ -205,10 +205,11 @@ resources are the starting point for the browser-owned page provider.
 
 #### 1.8 Add provider-boundary tests — partial
 
-Existing tests cover missing-provider errors, installed-provider placeholder
-errors, unsupported-scheme no-side-effect behavior, provider error-category
-display, scheme-resource scheme/media-type/status validation, and buffered,
-streamed, and null provider-resource bodies. Remaining tests must prove that:
+Existing tests cover missing-provider errors, installed blob resolution and
+typed blob failures, unsupported-scheme no-side-effect behavior, provider
+error-category display, scheme-resource scheme/media-type/status validation,
+and buffered, streamed, and null provider-resource bodies. Remaining tests must
+prove that:
 
 - each implemented provider handler calls only its matching provider exactly
   once;
@@ -376,7 +377,7 @@ scheme providers.
 `data:` parsing intentionally materializes bytes, so streaming-output coverage
 belongs to provider-resource tests and the future provider-backed handlers.
 
-### 4. Implement `blob:` resolution
+### 4. Implement `blob:` resolution — complete
 
 Call the browser-owned blob provider and convert its result into an internal
 response. The handler must:
@@ -392,10 +393,11 @@ Add tests for successful resolution, missing/revoked blobs, media type,
 creator origin, credential exclusion, response filtering, and body
 consumption.
 
-The tests must distinguish an absent provider from a missing or revoked blob,
-verify the creator-origin security rule, cover buffered and streamed bodies,
-and prove that cancellation, body failure, and body drop do not cache or leak
-provider resources.
+The focused suite now distinguishes an absent provider from revoked/provider
+metadata failures, verifies creator-origin metadata through response services,
+covers buffered, streamed, and explicit-null bodies, and proves that blob
+responses bypass cookies and HTTP cache partitioning. Cancellation and
+body-drop coverage remains part of the broader provider lifecycle work below.
 
 ### 5. Implement `file:` access through a provider
 

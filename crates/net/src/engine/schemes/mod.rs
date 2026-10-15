@@ -1,5 +1,6 @@
 //! Scheme-specific Fetch dispatch and handlers.
 
+mod blob;
 mod data;
 mod http;
 
@@ -23,13 +24,7 @@ impl RequestController {
                 self.fetch_http(request, url, cacheable).await
             }
             FetchScheme::Data => self.fetch_data(request, url).await,
-            FetchScheme::Blob => {
-                if self.inner.providers.blob().is_none() {
-                    Err(RequestError::MissingProvider("blob"))
-                } else {
-                    Err(RequestError::UnsupportedFeature("blob scheme handler"))
-                }
-            }
+            FetchScheme::Blob => self.fetch_blob(request, url).await,
             FetchScheme::File => {
                 if self.inner.providers.file().is_none() {
                     Err(RequestError::MissingProvider("file"))

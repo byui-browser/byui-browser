@@ -1,14 +1,14 @@
 //! End-to-end coverage for Fetch scheme dispatch and local resources.
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
 use net::{
-    BlobProvider, Body, Config, FetchServices, FileProvider, PageProvider, ProviderFuture, Request,
-    RequestController, RequestError, RequestMode, ResponseInfo, ResponseType, SchemeProviders,
-    ServiceWorkerDecision,
+    BlobProvider, Body, Config, FetchServices, FileProvider, Origin, PageProvider,
+    ProviderErrorKind, ProviderFuture, Request, RequestController, RequestError, RequestMode,
+    ResponseInfo, ResponseType, SchemeBody, SchemeProviders, SchemeResource, ServiceWorkerDecision,
 };
 
 mod common;
@@ -23,6 +23,7 @@ struct RecordingServices {
     cookie_stores: AtomicUsize,
     cache_partitions: AtomicUsize,
     worker_checks: AtomicUsize,
+    response_origins: Mutex<Vec<Option<Origin>>>,
 }
 
 enum FailurePoint {
@@ -81,8 +82,12 @@ impl FetchServices for RecordingServices {
         Ok(())
     }
 
-    fn check_response(&self, _request: &Request, _info: &ResponseInfo) -> Result<(), RequestError> {
+    fn check_response(&self, _request: &Request, info: &ResponseInfo) -> Result<(), RequestError> {
         self.response_checks.fetch_add(1, Ordering::SeqCst);
+        self.response_origins
+            .lock()
+            .unwrap()
+            .push(info.response_origin.clone());
         Ok(())
     }
 
@@ -109,6 +114,77 @@ impl FetchServices for RecordingServices {
         self.cache_partitions.fetch_add(1, Ordering::SeqCst);
         Ok("local-scheme-test".into())
     }
+}
+
+#[derive(Clone, Copy)]
+enum BlobOutcome {
+    Bytes,
+    Stream,
+    Null,
+    Revoked,
+    Malformed,
+}
+
+struct RecordingBlobProvider {
+    calls: AtomicUsize,
+    outcome: BlobOutcome,
+}
+
+impl BlobProvider for RecordingBlobProvider {
+    fn resolve<'a>(&'a self, _request: &'a Request, url: &'a net::Url) -> ProviderFuture<'a> {
+        assert_eq!(url.as_str(), "blob:https://creator.test/object-1");
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let outcome = self.outcome;
+        Box::pin(async move {
+            match outcome {
+                BlobOutcome::Revoked => Err(RequestError::Provider {
+                    provider: "blob",
+                    kind: ProviderErrorKind::Revoked,
+                }),
+                BlobOutcome::Malformed => Err(RequestError::Provider {
+                    provider: "blob",
+                    kind: ProviderErrorKind::MalformedMetadata,
+                }),
+                BlobOutcome::Bytes => Ok(blob_resource(SchemeBody::Bytes(b"blob-bytes".to_vec()))),
+                BlobOutcome::Stream => Ok(blob_resource(SchemeBody::Stream(Box::pin(
+                    futures_util::stream::iter([Ok(b"blob-".to_vec()), Ok(b"stream".to_vec())]),
+                )))),
+                BlobOutcome::Null => Ok(blob_resource(SchemeBody::Null)),
+            }
+        })
+    }
+}
+
+fn blob_resource(body: SchemeBody) -> SchemeResource {
+    SchemeResource {
+        url: net::Url::parse("blob:https://creator.test/object-1").unwrap(),
+        status: 200,
+        status_text: Some("OK".into()),
+        headers: vec![(
+            net::HeaderName::from_static("x-blob"),
+            net::HeaderValue::from_static("yes"),
+        )],
+        media_type: Some(net::HeaderValue::from_static("text/plain")),
+        origin: Origin::parse("https://creator.test").unwrap(),
+        body,
+    }
+}
+
+fn controller_with_blob_provider(
+    provider: Arc<RecordingBlobProvider>,
+) -> (RequestController, Arc<RecordingServices>) {
+    let services = Arc::new(RecordingServices::default());
+    let providers = SchemeProviders::new()
+        .with_blob(provider)
+        .with_file(Arc::new(UnreachableProvider))
+        .with_page(Arc::new(UnreachableProvider));
+    let controller = RequestController::with_services_and_providers(
+        Config::default(),
+        services.clone(),
+        providers,
+    )
+    .expect("controller should initialize");
+    (controller, services)
 }
 
 /// A provider whose methods panic so a test fails if dispatch reaches it.
@@ -397,7 +473,6 @@ fn provider_backed_schemes_distinguish_absent_and_installed_capabilities() {
 
     let (installed_controller, _) = controller_with_services_and_providers();
     for (url, handler) in [
-        ("blob:https://example.test/id", "blob scheme handler"),
         ("file:///tmp/page.html", "file scheme handler"),
         ("byui://welcome", "byui scheme handler"),
     ] {
@@ -419,5 +494,91 @@ fn about_urls_are_rejected_without_calling_scheme_providers() {
             error,
             RequestError::UnsupportedFeature("about scheme handler")
         ));
+    }
+}
+
+#[test]
+fn blob_fetches_resolve_once_and_preserve_provider_metadata() {
+    let provider = Arc::new(RecordingBlobProvider {
+        calls: AtomicUsize::new(0),
+        outcome: BlobOutcome::Bytes,
+    });
+    let (controller, services) = controller_with_blob_provider(provider.clone());
+
+    let response = runtime()
+        .block_on(controller.fetch(Request::get("blob:https://creator.test/object-1")))
+        .unwrap();
+
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.url, "blob:https://creator.test/object-1");
+    assert_eq!(response.headers.get("x-blob").as_deref(), Some("yes"));
+    assert_eq!(
+        response.headers.get("content-type").as_deref(),
+        Some("text/plain")
+    );
+    assert_eq!(
+        runtime().block_on(response.body.bytes()).unwrap(),
+        b"blob-bytes"
+    );
+    assert_eq!(
+        services.response_origins.lock().unwrap().as_slice(),
+        &[Some(Origin::parse("https://creator.test").unwrap())]
+    );
+    assert_eq!(services.cookie_lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(services.cookie_stores.load(Ordering::SeqCst), 0);
+    assert_eq!(services.cache_partitions.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn blob_fetches_support_streams_and_explicit_null_bodies() {
+    for (outcome, expected_body, expected_null) in [
+        (BlobOutcome::Stream, b"blob-stream".as_slice(), false),
+        (BlobOutcome::Null, b"".as_slice(), true),
+    ] {
+        let provider = Arc::new(RecordingBlobProvider {
+            calls: AtomicUsize::new(0),
+            outcome,
+        });
+        let (controller, _) = controller_with_blob_provider(provider.clone());
+        let request = if expected_null {
+            Request::new("blob:https://creator.test/object-1", "HEAD").unwrap()
+        } else {
+            Request::get("blob:https://creator.test/object-1")
+        };
+        let response = runtime().block_on(controller.fetch(request)).unwrap();
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(response.body.is_null(), expected_null);
+        assert_eq!(
+            runtime().block_on(response.body.bytes()).unwrap(),
+            expected_body
+        );
+    }
+}
+
+#[test]
+fn blob_provider_failures_are_typed_and_do_not_expose_a_response() {
+    for (outcome, expected_kind) in [
+        (BlobOutcome::Revoked, ProviderErrorKind::Revoked),
+        (BlobOutcome::Malformed, ProviderErrorKind::MalformedMetadata),
+    ] {
+        let provider = Arc::new(RecordingBlobProvider {
+            calls: AtomicUsize::new(0),
+            outcome,
+        });
+        let (controller, _) = controller_with_blob_provider(provider.clone());
+        let error = runtime()
+            .block_on(controller.fetch(Request::get("blob:https://creator.test/object-1")))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RequestError::Provider {
+                provider: "blob",
+                kind
+            } if kind == expected_kind
+        ));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 }

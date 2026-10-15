@@ -292,13 +292,15 @@ unit tests includes:
 - local `data:` use of request/response service approval while bypassing
   request bodies, cookies, HTTP cache partitioning, and every scheme provider;
 - unsupported schemes failing before service or provider work;
-- absent and installed-but-unimplemented provider capability boundaries; and
+- absent provider and installed file/page capability boundaries; and
 - `about:` rejection before any provider invocation.
 
 Provider-resource unit coverage also verifies every recognized scheme's
 metadata classification, invalid status/status-text/media-type handling, and
-buffered, streamed, and explicit-null body conversion. Provider success and
-lifecycle coverage remains blocked on the blob, file, and page handlers.
+buffered, streamed, and explicit-null body conversion. Blob success coverage
+now exercises exact-once provider dispatch, creator-origin metadata, exposed
+media type, typed provider failures, and cookie/cache exclusion. Provider
+lifecycle coverage remains incomplete for blob, file, and page handlers.
 
 ### Remaining common dispatch and response invariants
 
@@ -369,9 +371,9 @@ The remaining `data:` coverage is intentionally tracked separately:
 - cancellation, body dropping, repeated body consumption, and explicit cache
   mode behavior for local schemes.
 
-### `blob:` URLs — pending handler implementation
+### `blob:` URLs — implemented handler; lifecycle follow-up remains
 
-With a recording `BlobProvider`, add tests for:
+The complete blob test target includes:
 
 - successful resolution of a registered blob and exact provider URL/request
   arguments;
@@ -381,17 +383,110 @@ With a recording `BlobProvider`, add tests for:
 - creator-origin assignment versus an opaque origin, including cross-origin
   blob URLs whose creator origin is not the URL's serialized origin;
 - byte, streamed, empty, and explicit null-body resources;
-- provider failure before any body exposure and body-stream failure after
-  headers, including permit release and cache exclusion;
+- provider failure before any body exposure and cache exclusion;
 - `credentials: omit`, `same-origin`, and `include` never causing HTTP cookie
   lookup or `Set-Cookie` storage for the blob path;
 - response filtering, forbidden response headers, and policy rejection being
   applied exactly as for other internal responses; and
 - no HTTP transport, file provider, or page provider call for a blob request.
 
-Also verify that a blob response is not cached by the HTTP cache and that
-repeated requests resolve through the provider each time unless a later blob
-cache contract is added.
+The detailed outstanding matrix below separates the currently implemented
+checks from this full target, including body-stream failure/drop, cancellation,
+and repeated-resolution coverage.
+
+#### Remaining `blob:` test matrix
+
+Current coverage in `crates/net/tests/schemes.rs` proves one successful
+buffered response, one successful stream, one explicit null body, a revoked
+provider failure, provider-returned malformed-metadata failure, exact-once
+dispatch for one request, exposed `Content-Type`, creator-origin delivery to
+response services, and the default local-scheme cookie/cache exclusions. The
+following tests remain required before treating the blob slice as complete.
+
+##### Dispatch, capability, and request context
+
+- Missing `BlobProvider` returns `MissingProvider("blob")` before blob lookup,
+  HTTP transport admission, cookie lookup, cache partition lookup, or any file
+  or page provider call.
+- A valid blob provider is called exactly once per fetch, including repeated
+  requests for the same URL; each request resolves through the provider and
+  cannot reuse an HTTP-cache entry.
+- The recording provider receives the prepared request: normalized current URL,
+  one-element URL list, method, caller headers, credentials mode, client
+  environment, destination, and abort signal. Verify that request preparation
+  does not mutate caller-visible request headers.
+- URL variations preserve Fetch URL semantics at the provider boundary:
+  mixed-case scheme normalization, opaque path parsing, query/fragment handling,
+  percent-encoded object identifiers, and syntactically valid but unregistered
+  URLs. The provider, rather than `net`, decides registration and revocation.
+- With all three providers installed, a blob fetch calls only `BlobProvider`;
+  failures never fall through to HTTP, `FileProvider`, or `PageProvider`.
+- Add browser-composition coverage that constructs the controller with
+  `with_services_and_providers` and proves a browser-installed blob provider
+  receives the same prepared context.
+
+##### Provider outcomes and metadata validation
+
+- Cover every blob-relevant stable outcome: `ResourceMissing`, `Revoked`, and
+  `Io`. Each must be returned without exposing a partial response or consuming
+  a request body.
+- Verify provider metadata failures fail closed through the engine validator,
+  rather than only by returning `ProviderErrorKind::MalformedMetadata` from the
+  fake. Include a wrong-scheme response URL, invalid status, control characters
+  in status text, conflicting or invalid media type/`Content-Type`, and an
+  invalid provider origin.
+- Verify a provider may assign either its creator tuple origin or an opaque
+  origin. In particular, a blob URL whose serialized inner URL differs from the
+  creator origin must use the provider-assigned origin, never a derived origin.
+- Verify status, status text, response URL, repeated internal headers, and
+  media type reach trusted response services and public exposure as applicable.
+  `media_type` without a `Content-Type` header must expose `Content-Type`; a
+  matching explicit header must not be duplicated.
+
+##### Response policy, filtering, and credentials
+
+- Exercise `Cors`, `SameOrigin`, and `NoCors` using creator origins that are
+  same-origin, cross-origin with valid CORS headers, and cross-origin without
+  them. Assert the expected basic, CORS, opaque, or rejected result before body
+  exposure.
+- Assert ordinary response-header filtering for blob results: `Set-Cookie` and
+  other forbidden response headers remain private; CORS-safelisted and
+  explicitly exposed headers follow the existing exposure rules.
+- Verify request-policy rejection, service-worker interception, and
+  response-service rejection prevent a public response and do not leave a live
+  provider body.
+- Run `CredentialsMode::Omit`, `SameOrigin`, and `Include` with a client
+  environment. None may invoke cookie selection or `Set-Cookie` storage, even
+  when the creator origin equals the client origin.
+- Exercise every local-scheme cache mode that request validation currently
+  accepts. None may consult an HTTP cache partition, create an HTTP-cache
+  entry, or change the requirement to resolve again on the next fetch.
+
+##### Body, cancellation, and lifetime
+
+- Cover bytes, successful streams, empty readable byte/stream bodies, and
+  explicit null bodies for both `GET` and `HEAD`. Decide and document whether a
+  provider-supplied non-null `HEAD` body is discarded by `net` or forbidden by
+  the provider contract; test that decision directly.
+- A stream that fails after headers must surface its typed error to the body
+  reader, mark the body spent, release provider-owned resources, and never
+  create an HTTP-cache entry.
+- Dropping an unread or partially read stream must drop the provider stream
+  exactly once and release any provider-held guard, handle, or task. A later
+  blob fetch must still resolve normally.
+- An already-aborted signal must prevent provider invocation. Aborting while
+  resolution is pending and after headers but before stream completion must
+  cancel/terminate the provider operation according to the lifecycle contract,
+  return `Aborted` at the appropriate boundary, and release provider resources.
+- Repeated body consumption after success, stream failure, explicit null, and
+  abort must retain the shared `Body` consumption rules without replaying the
+  provider or leaking a resource.
+
+Use an instrumented in-memory `BlobProvider` and stream in these tests. It
+should record calls, received request state, stream polling, cancellation, and
+`Drop` events; it must not depend on a real object-URL registry, filesystem, or
+network transport. Keep production registry/revocation behavior in browser or
+storage tests once that owner exists.
 
 ### `file:` URLs — pending handler implementation
 

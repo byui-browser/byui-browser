@@ -52,6 +52,11 @@ impl InternalResponse {
         let content_type = resource
             .media_type
             .or_else(|| headers.get(http::header::CONTENT_TYPE).cloned());
+        if let Some(content_type) = &content_type {
+            headers
+                .entry(http::header::CONTENT_TYPE)
+                .or_insert_with(|| content_type.clone());
+        }
         let (mut body, body_is_null) = resource.body.into_body();
         body.set_content_type(content_type);
         let status_text = resource
