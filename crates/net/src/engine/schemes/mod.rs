@@ -1,6 +1,7 @@
 //! Scheme-specific Fetch dispatch and handlers.
 
 mod blob;
+mod byui;
 mod data;
 mod file;
 mod http;
@@ -27,13 +28,7 @@ impl RequestController {
             FetchScheme::Data => self.fetch_data(request, url).await,
             FetchScheme::Blob => self.fetch_blob(request, url).await,
             FetchScheme::File => self.fetch_file(request, url).await,
-            FetchScheme::Byui => {
-                if self.inner.providers.page().is_none() {
-                    Err(RequestError::MissingProvider("byui page"))
-                } else {
-                    Err(RequestError::UnsupportedFeature("byui scheme handler"))
-                }
-            }
+            FetchScheme::Byui => self.fetch_byui(request, url).await,
             FetchScheme::About => Err(RequestError::UnsupportedFeature("about scheme handler")),
         }
     }
