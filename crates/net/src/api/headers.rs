@@ -287,6 +287,10 @@ impl Headers {
         Ok(())
     }
 
+    pub(crate) fn remove_internal_header(&mut self, name: HeaderName) {
+        self.entries.retain(|(existing, _)| existing != name);
+    }
+
     fn combined_entries(&self) -> Vec<(HeaderName, String)> {
         let mut combined = Vec::new();
         for (index, (name, value)) in self.entries.iter().enumerate() {

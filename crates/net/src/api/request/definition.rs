@@ -116,12 +116,10 @@ impl Request {
         &self.context.environment
     }
     /// Returns all URLs visited by this request, in order.
-    /// The supported single-exchange path never follows a redirect.
     pub fn url_list(&self) -> &[Url] {
         &self.url_list
     }
     /// Returns the number of redirects followed so far.
-    /// This remains zero until controller-owned redirects are implemented.
     pub fn redirect_count(&self) -> usize {
         self.redirect_count
     }
@@ -276,6 +274,30 @@ impl Request {
             self.url_list.push(url.clone());
         }
         self.current_url = Some(url);
+    }
+
+    pub(crate) fn follow_url(&mut self, url: Url) {
+        self.url_list.push(url.clone());
+        self.current_url = Some(url);
+        self.redirect_count += 1;
+    }
+
+    pub(crate) fn rewrite_for_redirect(&mut self) -> Result<(), RequestError> {
+        self.set_method("GET")?;
+        self.body = None;
+        self.headers.remove_internal_header(CONTENT_TYPE);
+        self.headers
+            .remove_internal_header(HeaderName::from_static("content-length"));
+        Ok(())
+    }
+
+    pub(crate) fn strip_sensitive_redirect_headers(&mut self) {
+        for name in [
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("proxy-authorization"),
+        ] {
+            self.headers.remove_internal_header(name);
+        }
     }
     /// Builds the internal transport header channel without changing caller headers.
     pub(crate) fn fetch_headers(&self) -> Result<Headers, RequestError> {
