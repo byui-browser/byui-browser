@@ -282,11 +282,15 @@ unit tests includes:
 
 - `data:` plain, percent-encoded, binary, base64, empty, and comma-containing
   payloads with response metadata and exact body bytes;
-- malformed `data:` separators, percent escapes, base64 markers/payloads, and
-  media-type metadata;
-- `data:` `HEAD` null-body behavior and no-CORS opaque filtering;
+- malformed `data:` separators, percent escapes, base64 markers/payloads,
+  invalid UTF-8, and media-type metadata and parameters;
+- `data:` query and fragment exclusion from payload bytes;
+- `data:` `GET`, `POST`, `OPTIONS`, `PUT`, and `HEAD` body behavior, including
+  the `HEAD` null-body contract;
+- `data:` no-CORS opaque filtering and service-request, service-worker, and
+  response-approval failure timing;
 - local `data:` use of request/response service approval while bypassing
-  cookies, HTTP cache partitioning, and every scheme provider;
+  request bodies, cookies, HTTP cache partitioning, and every scheme provider;
 - unsupported schemes failing before service or provider work;
 - absent and installed-but-unimplemented provider capability boundaries; and
 - `about:` rejection before any provider invocation.
@@ -326,7 +330,7 @@ page provider. Each fake should record calls, request URL, request headers,
 request credentials mode, and whether its body was consumed. The fixture
 should make it possible to prove both "called exactly once" and "not called".
 
-### `data:` URLs — implemented and covered
+### `data:` URLs — implemented and substantially covered
 
 The engine-owned parser and response construction are covered with:
 
@@ -336,17 +340,34 @@ The engine-owned parser and response construction are covered with:
   `text/plain;charset=US-ASCII` type;
 - empty payloads, non-UTF-8 payload bytes, and payloads containing commas;
 - malformed percent escapes, a missing comma separator, invalid base64,
-  duplicate `base64` markers, malformed media types, and invalid parameters;
+  duplicate `base64` markers, invalid UTF-8, malformed media types, and invalid
+  parameters;
+- URL query and fragment components excluded from the decoded payload;
 - status `200`, the resolved `data:` response URL, generated `Content-Type`,
   and exact body bytes;
 - opaque-origin behavior and the absence of cookies, credentials, and cache
   entries; and
-- `HEAD`, if accepted by request validation, producing a null public body
-  according to the shared null-body contract.
+- `GET`, `POST`, `OPTIONS`, and `PUT` returning the decoded payload, with
+  `HEAD` producing a null public body according to the shared null-body
+  contract;
+- request-policy, service-worker, and response-approval failures preventing
+  public response exposure.
 
 The handler intentionally creates a buffered body; stream conversion is covered
 at the provider-resource boundary. Keep the no-provider/cookie/cache regression
 test when future refactoring changes the data path.
+
+The remaining `data:` coverage is intentionally tracked separately:
+
+- mixed-case scheme normalization and percent-escape case combinations;
+- base64 padding boundaries and additional malformed padding forms;
+- every media-type validation branch, including control characters, subtype
+  whitespace, repeated empty metadata segments, and unusual parameter syntax;
+- explicit `Cors`/`SameOrigin` response-policy behavior and `include` credentials
+  with a client environment;
+- response-header observer ordering and metadata assertions;
+- cancellation, body dropping, repeated body consumption, and explicit cache
+  mode behavior for local schemes.
 
 ### `blob:` URLs — pending handler implementation
 

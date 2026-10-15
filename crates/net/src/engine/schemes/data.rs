@@ -41,10 +41,9 @@ impl RequestController {
 
 /// Parses a data URL into validated media-type metadata and decoded bytes.
 fn parse_data_url(url: &Url) -> Result<(HeaderValue, Vec<u8>), RequestError> {
-    let value = url
-        .as_str()
-        .strip_prefix("data:")
-        .ok_or_else(|| RequestError::InvalidUrl(url.to_string()))?;
+    // `Url::path()` excludes the URL query and fragment. They are URL
+    // components, not bytes in the data payload.
+    let value = url.path();
     let (metadata, payload) = value
         .split_once(',')
         .ok_or_else(|| invalid_data("missing comma separator"))?;
@@ -175,12 +174,41 @@ mod tests {
     }
 
     #[test]
+    /// Verifies empty payloads, case-insensitive markers, and escaped base64.
+    fn parses_empty_and_escaped_base64_forms() {
+        assert_eq!(
+            parse_data_url(&Url::parse("data:,").unwrap()).unwrap().1,
+            b""
+        );
+        assert_eq!(
+            parse_data_url(&Url::parse("data:text/plain;BASE64,SGVsbG8=").unwrap())
+                .unwrap()
+                .1,
+            b"Hello"
+        );
+        assert_eq!(
+            parse_data_url(&Url::parse("data:text/plain;base64,%53%47%56%73%62%47%38%3D").unwrap())
+                .unwrap()
+                .1,
+            b"Hello"
+        );
+    }
+
+    #[test]
     /// Verifies malformed payloads and media types fail with typed errors.
     fn rejects_malformed_data_payloads_and_media_types() {
         for value in [
             "data:,bad%",
             "data:text/plain;base64,not-base64!",
+            "data:text/plain;base64,%FF",
             "data:textplain,x",
+            "data:/plain,x",
+            "data:text/,x",
+            "data:text /plain,x",
+            "data:text/plain;=utf-8,x",
+            "data:text/plain;charset=,x",
+            "data:text/plain%FF,x",
+            "data:text/plain%0A,x",
         ] {
             assert!(parse_data_url(&Url::parse(value).unwrap()).is_err());
         }

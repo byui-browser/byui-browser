@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 use net::{
-    BlobProvider, Config, FetchServices, FileProvider, PageProvider, ProviderFuture, Request,
+    BlobProvider, Body, Config, FetchServices, FileProvider, PageProvider, ProviderFuture, Request,
     RequestController, RequestError, RequestMode, ResponseInfo, ResponseType, SchemeProviders,
     ServiceWorkerDecision,
 };
@@ -23,6 +23,56 @@ struct RecordingServices {
     cookie_stores: AtomicUsize,
     cache_partitions: AtomicUsize,
     worker_checks: AtomicUsize,
+}
+
+enum FailurePoint {
+    Request,
+    Response,
+    Worker,
+}
+
+struct FailingServices(FailurePoint);
+
+impl FetchServices for FailingServices {
+    fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
+        if matches!(self.0, FailurePoint::Request) {
+            Err(RequestError::InvalidResponse("request denied".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_response(&self, _request: &Request, _info: &ResponseInfo) -> Result<(), RequestError> {
+        if matches!(self.0, FailurePoint::Response) {
+            Err(RequestError::InvalidResponse("response denied".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
+        panic!("data: fetches must not request cookies")
+    }
+
+    fn store_set_cookie(
+        &self,
+        _request: &Request,
+        _values: &[net::HeaderValue],
+    ) -> Result<(), RequestError> {
+        panic!("data: fetches must not store cookies")
+    }
+
+    fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
+        if matches!(self.0, FailurePoint::Worker) {
+            Ok(ServiceWorkerDecision::Intercept)
+        } else {
+            Ok(ServiceWorkerDecision::Network)
+        }
+    }
+
+    fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
+        panic!("data: fetches must not request a cache partition")
+    }
 }
 
 impl FetchServices for RecordingServices {
@@ -173,6 +223,85 @@ fn data_urls_reject_malformed_payload_and_media_type_inputs() {
             matches!(error, RequestError::InvalidResponse(_)),
             "{url}: {error}"
         );
+    }
+}
+
+#[test]
+fn data_urls_keep_url_components_out_of_the_payload() {
+    for (url, expected_body) in [
+        ("data:,hello?query", b"hello".as_slice()),
+        ("data:,hello#fragment", b"hello".as_slice()),
+    ] {
+        let controller = RequestController::new(Config::default()).unwrap();
+        let response = runtime()
+            .block_on(controller.fetch(Request::get(url)))
+            .unwrap();
+
+        assert_eq!(response.url, url);
+        assert_eq!(
+            runtime().block_on(response.body.bytes()).unwrap(),
+            expected_body
+        );
+    }
+}
+
+#[test]
+fn data_urls_define_body_behavior_for_non_head_methods() {
+    for method in ["POST", "OPTIONS", "PUT"] {
+        let request = Request::new("data:text/plain,payload", method).unwrap();
+        let controller = RequestController::new(Config::default()).unwrap();
+        let response = runtime().block_on(controller.fetch(request)).unwrap();
+
+        assert_eq!(
+            runtime().block_on(response.body.bytes()).unwrap(),
+            b"payload"
+        );
+    }
+
+    let controller = RequestController::new(Config::default()).unwrap();
+    let response = runtime()
+        .block_on(controller.fetch(Request::new("data:text/plain,payload", "HEAD").unwrap()))
+        .unwrap();
+    assert!(response.body.is_null());
+}
+
+#[test]
+fn data_urls_ignore_request_bodies_and_credentials_for_local_fetching() {
+    let (controller, services) = controller_with_services_and_providers();
+    for credentials in [net::CredentialsMode::Omit, net::CredentialsMode::SameOrigin] {
+        let mut request = Request::new("data:text/plain,payload", "POST").unwrap();
+        request.set_credentials_mode(credentials);
+        request
+            .set_body(Some(Body::from_bytes(b"request-body".to_vec())))
+            .unwrap();
+        let response = runtime().block_on(controller.fetch(request)).unwrap();
+        assert_eq!(
+            runtime().block_on(response.body.bytes()).unwrap(),
+            b"payload"
+        );
+    }
+
+    assert_eq!(services.cookie_lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(services.cookie_stores.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn data_url_service_failures_do_not_expose_a_response() {
+    for failure in [
+        FailurePoint::Request,
+        FailurePoint::Worker,
+        FailurePoint::Response,
+    ] {
+        let services = Arc::new(FailingServices(failure));
+        let controller = RequestController::with_services(Config::default(), services).unwrap();
+        let error = runtime()
+            .block_on(controller.fetch(Request::get("data:text/plain,private")))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RequestError::InvalidResponse(_) | RequestError::UnsupportedFeature(_)
+        ));
     }
 }
 
