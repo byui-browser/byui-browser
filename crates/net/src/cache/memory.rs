@@ -274,4 +274,29 @@ mod tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn expired_entries_are_not_returned2() {
+        let cache = ResponseCache::default();
+        let request = Request::get("https://example.test/expired2");
+        let response = StoredResponse {
+            status: StatusCode::FOUND,
+            headers: HeaderMap::new(),
+            url: request.url.clone(),
+            body: b"stale".to_vec(),
+            cookie_headers_processed: false,
+        };
+        let cached = CachedResponse::from_response(&response, Duration::ZERO);
+
+        cache.entries.write().unwrap().insert(
+            cache_key(&request, &Url::parse(&request.url).unwrap()),
+            cached,
+        );
+
+        assert!(
+            cache
+                .get(&request, &Url::parse(&request.url).unwrap())
+                .is_none()
+        );
+    }
 }
