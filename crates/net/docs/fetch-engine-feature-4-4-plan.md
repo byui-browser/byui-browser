@@ -2,9 +2,11 @@
 
 Status: dispatch, provider contracts, provider metadata validation, shared
 response finalization, the engine-owned `data:` handler, and the `blob:`,
-`file:`, `byui:`, and the first-pass `about:blank` handler are implemented.
-Browser composition and provider lifecycle coverage remain. Reviewed against
-the current implementation on 2026-10-15.
+`file:`, `byui:`, and first-pass `about:blank` handlers are implemented.
+Browser-side `byui:` composition is also wired through the provider-only
+controller constructor. Browser-wide service composition, blob/file provider
+ownership, and provider lifecycle coverage remain. Reviewed against the
+current implementation on 2026-10-15.
 
 This plan records only the work that remains for feature 4.4 of the
 [`fetch-engine-implementation-plan.md`](fetch-engine-implementation-plan.md).
@@ -189,33 +191,46 @@ registry.
 The controller should also make it impossible for a `blob:` request to call a
 file provider, or for a `byui:` request to fall through to HTTP transport.
 
-#### 1.7 Add browser-side composition points — remaining
+#### 1.7 Add browser-side composition points — partial
 
-The browser currently creates a standalone controller with
-`RequestController::new` in [`crates/browser/src/main.rs`](../../browser/src/main.rs).
-Add the composition point for `with_services` and keep concrete implementations
-outside `net`:
+The browser now has a provider-only composition path. Both
+[`crates/browser/src/lib.rs`](../../browser/src/lib.rs) and
+[`crates/browser/src/main.rs`](../../browser/src/main.rs) install the embedded
+`byui:` provider with `RequestController::with_providers`; the page loader
+fetches its HTML, stylesheet, and script through that path. Keep concrete
+implementations outside `net` and add the remaining browser-wide composition
+points:
 
 - `crates/browser` owns the `byui:` page provider and page registration;
 - browser/storage owns the blob URL registry and revocation state; and
 - browser/security or the designated filesystem owner handles authorized
   `file:` access, sandboxing, and origin policy.
 
-The existing [`Page`](../../browser/src/lib.rs) and embedded welcome-page
-resources are the starting point for the browser-owned page provider.
+When browser client context is available, compose the controller with
+`RequestController::with_services_and_providers`. The current browser paths do
+not yet provide a concrete `FetchServices` implementation and therefore use
+`with_providers` only.
+
+The existing [`Page`](../../browser/src/lib.rs),
+[`byui_provider::provider`](../../browser/src/byui_provider/provider.rs), and
+embedded welcome-page resources now form the working browser-owned page
+provider path.
 
 #### 1.8 Add provider-boundary tests — partial
 
-Existing tests cover missing-provider errors, installed blob/file/page
-resolution and typed provider failures, unsupported-scheme no-side-effect
-behavior, provider error-category display, scheme-resource
+Existing `net` tests cover missing-provider errors, fake installed
+blob/file/page resolution and typed provider failures, unsupported-scheme
+no-side-effect behavior, provider error-category display, scheme-resource
 scheme/media-type/status validation, and buffered, streamed, and null
-provider-resource bodies. Remaining tests must prove that:
+provider-resource bodies. Browser tests additionally cover the embedded
+`byui:` registry and the welcome-page composition path. Remaining tests must
+prove that:
 
 - each implemented provider handler calls only its matching provider exactly
   once;
 - provider metadata reaches response exposure without leaking provider state;
-- browser-context composition uses `with_services`; and
+- browser-context composition uses `with_services_and_providers` once concrete
+  browser services exist; and
 - existing `FetchServices` implementations remain source-compatible.
 
 These tests belong beside the service/dispatcher integration tests. Actual
@@ -262,13 +277,16 @@ Malformed or unavailable security metadata fails closed before public response
 exposure. Blob, file, and page authorization/resource behavior is delegated to
 the installed providers; their net-level handlers are implemented.
 
-#### 1.10 Define browser composition and provider lifecycle contracts
+#### 1.10 Define browser composition and provider lifecycle contracts — partial
 
-Document and wire the concrete composition path outside `net`; the
-provider-backed net handlers are already enabled:
+The provider-backed net handlers and the provider-only `byui:` browser path are
+enabled. Complete and document the remaining concrete composition path outside
+`net`:
 
 - `crates/browser` constructs the controller with browser services and the
-  provider bundle;
+  provider bundle when browser services are available. Today its page-loading
+  and binary entry points install only the page provider with
+  `with_providers`;
 - the page provider owns page registration, lookup, path normalization, and
   page revocation or replacement rules;
 - the blob provider owns object-URL creation, creator-origin association,
@@ -276,16 +294,63 @@ provider-backed net handlers are already enabled:
 - the file provider owns path resolution, sandbox authorization, platform
   differences, and file-resource lifetime.
 
-Composition tests must prove that an installed provider is selected by scheme,
+Net integration tests already prove exact-once scheme selection for fake
+providers and that unrelated providers are not called. Browser composition
+tests must additionally prove that an installed provider is selected by scheme,
 called exactly once, and receives the prepared request context. They must also
 prove that a request cannot call an unrelated provider or fall back to HTTP or
 direct filesystem access when lookup fails.
 
-Provider operations must define cancellation and lifetime behavior. Cancellation
-before resolution must prevent the provider call when possible; cancellation
-after resolution must terminate a provider stream and release engine resources.
-Dropping, failing, or aborting a provider body must not create a cache entry or
-leave a provider operation running.
+Provider operations still need explicit cancellation and lifetime contracts.
+The current provider traits receive only `Request` and `Url`; they do not yet
+expose an abort signal or a provider-specific cancellation hook. Define how
+cancellation before resolution, cancellation during streaming, body drop,
+provider failure, and controller shutdown release provider resources. Dropping,
+failing, or aborting a provider body must not create a cache entry or leave a
+provider operation running.
+
+#### 1.11 Optimize and harden browser-owned `byui:` composition — planned
+
+The current browser provider path is correct for the embedded welcome page, but
+its composition layer does unnecessary work on every page load. Complete the
+following browser-owned improvements without moving page registration or browser
+policy into `net`:
+
+- Reuse the `RequestController` and Tokio runtime (or the browser's existing
+  async executor) across page loads, reloads, and resizes. `welcome_page()` must
+  not construct a new controller and runtime for every render;
+- resolve independent stylesheet and script resources concurrently after the
+  document has been parsed, while preserving document order for script
+  evaluation and returning deterministic errors;
+- avoid copying compile-time embedded bytes into a fresh `Vec` for every
+  request. Extend the provider body representation with shared immutable bytes,
+  or use an equivalent ownership model, while retaining explicit null bodies
+  for `HEAD` and the existing streaming contract;
+- enforce the static-page method boundary explicitly: `GET` and `HEAD` are
+  supported, while mutating or unsupported methods fail before resource
+  exposure. The provider must continue to receive the request context needed
+  for this decision;
+- make page loading resolve relative stylesheet and script URLs against the
+  document URL instead of hard-coding `welcome` paths and requiring exactly one
+  stylesheet and one script. Support multiple declared resources where the
+  browser composition API permits them, and return structured load errors rather
+  than panicking on page-authored markup;
+- keep route lookup declarative and exact. A linear static registry is adequate
+  for a small number of pages; if the registry grows, use generated host/path
+  matching or another static lookup structure rather than adding page-specific
+  conditionals; and
+- make the origin policy an explicit page-registration decision. Opaque origins
+  preserve isolation, but trusted browser UI pages may require a stable
+  browser-owned origin for same-origin links, scripts, and APIs. Do not change
+  the default without documenting the security and usability trade-off.
+
+Add focused browser and `net` coverage for method rejection, `GET`/`HEAD` body
+semantics, query and fragment preservation, relative URL resolution, multiple
+subresources, shared-body ownership, repeated loads, and origin policy. Add a
+small benchmark or measurement path for repeated page loads so registry lookup
+optimizations are justified by resource counts rather than assumed to be the
+primary bottleneck. Verify that controller/runtime reuse and concurrent loads
+do not violate provider exact-once, cancellation, or body-drop guarantees.
 
 ### 2. Complete scheme dispatch and provider-backed handlers
 
@@ -522,6 +587,10 @@ effects, provider ownership and browser composition are explicit, every
 installed provider is selected exactly once by its matching scheme, provider
 outcomes and metadata are validated fail-closed, cancellation and body
 lifecycle rules are covered, and every successful scheme reaches the same
-internal/public response filtering and body pipeline. Completion also requires
-the dedicated scheme matrix, browser composition tests, focused `net` tests,
+internal/public response filtering and body pipeline. Browser-owned `byui:`
+composition must also reuse its controller/runtime, load independent
+subresources concurrently, avoid repeated embedded-body copies, enforce the
+static method boundary, resolve declared resources generically, and document
+the chosen origin policy. Completion also requires the dedicated scheme matrix,
+browser composition and repeated-load tests, focused `net` tests,
 workspace-relevant tests, formatting, and clippy with warnings denied.
