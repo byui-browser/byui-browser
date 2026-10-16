@@ -1,10 +1,10 @@
 # Feature 4.4 plan: scheme-specific Fetch dispatch
 
 Status: dispatch, provider contracts, provider metadata validation, shared
-response finalization, the engine-owned `data:` handler, the `blob:` handler,
-and focused scheme coverage are implemented; file, byui, and about handlers plus browser
-composition remain. Reviewed against the current `crates/net` implementation
-on 2026-10-15.
+response finalization, the engine-owned `data:` handler, and the `blob:`,
+`file:`, `byui:`, and the first-pass `about:blank` handler are implemented.
+Browser composition and provider lifecycle coverage remain. Reviewed against
+the current implementation on 2026-10-15.
 
 This plan records only the work that remains for feature 4.4 of the
 [`fetch-engine-implementation-plan.md`](fetch-engine-implementation-plan.md).
@@ -50,15 +50,16 @@ The initial pipeline refactor is complete:
 - Restricted cache eligibility and cache partition lookup to HTTP(S).
 - Added unit coverage for scheme classification, provider-resource validation,
   and bytes/stream/null resource bodies.
-- Added `tests/schemes.rs` coverage for supported `data:` forms and failures,
+- Added per-scheme integration coverage under `tests/schemes/` for supported
+  `data:` forms and failures,
   `HEAD` null bodies, opaque no-CORS views, local-scheme cookie/cache/provider
   exclusion, unsupported-scheme side effects, provider capability boundaries,
-  and rejected `about:` URLs.
+  and rejected non-allowlisted `about:` URLs.
 
 The `data:` branch now decodes percent-encoded and base64 payloads into the
 shared response/body pipeline. Provider-backed branches fail with a typed
 `MissingProvider` error when their matching capability is absent; installed
-providers still await their scheme handlers. Provider error categories and
+providers resolve through their matching scheme handlers. Provider error categories and
 scheme-resource validation now fail closed before public response exposure,
 and HTTP and engine-owned scheme responses use shared response finalization.
 
@@ -188,7 +189,7 @@ registry.
 The controller should also make it impossible for a `blob:` request to call a
 file provider, or for a `byui:` request to fall through to HTTP transport.
 
-#### 1.7 Add browser-side composition points
+#### 1.7 Add browser-side composition points — remaining
 
 The browser currently creates a standalone controller with
 `RequestController::new` in [`crates/browser/src/main.rs`](../../browser/src/main.rs).
@@ -205,11 +206,11 @@ resources are the starting point for the browser-owned page provider.
 
 #### 1.8 Add provider-boundary tests — partial
 
-Existing tests cover missing-provider errors, installed blob resolution and
-typed blob failures, unsupported-scheme no-side-effect behavior, provider
-error-category display, scheme-resource scheme/media-type/status validation,
-and buffered, streamed, and null provider-resource bodies. Remaining tests must
-prove that:
+Existing tests cover missing-provider errors, installed blob/file/page
+resolution and typed provider failures, unsupported-scheme no-side-effect
+behavior, provider error-category display, scheme-resource
+scheme/media-type/status validation, and buffered, streamed, and null
+provider-resource bodies. Remaining tests must prove that:
 
 - each implemented provider handler calls only its matching provider exactly
   once;
@@ -217,9 +218,9 @@ prove that:
 - browser-context composition uses `with_services`; and
 - existing `FetchServices` implementations remain source-compatible.
 
-These tests belong beside the service/dispatcher integration tests. Tests for
-actual decoding, file reads, blob resolution, page lookup, and `about:` body
-semantics belong to the later scheme-handler steps.
+These tests belong beside the service/dispatcher integration tests. Actual
+filesystem/browser composition and `about:` body semantics remain outside the
+implemented net-level slices.
 
 The supported scheme classification remains:
 
@@ -258,14 +259,13 @@ Before constructing an `InternalResponse`, `net` now validates:
   credential policy.
 
 Malformed or unavailable security metadata fails closed before public response
-exposure. Blob authorization and resource-existence behavior is delegated to
-the installed provider; file and page behavior remains dependent on their
-not-yet-implemented handlers.
+exposure. Blob, file, and page authorization/resource behavior is delegated to
+the installed providers; their net-level handlers are implemented.
 
 #### 1.10 Define browser composition and provider lifecycle contracts
 
-Document the concrete composition path outside `net` before enabling a
-provider-backed handler:
+Document and wire the concrete composition path outside `net`; the
+provider-backed net handlers are already enabled:
 
 - `crates/browser` constructs the controller with browser services and the
   provider bundle;
@@ -287,15 +287,16 @@ after resolution must terminate a provider stream and release engine resources.
 Dropping, failing, or aborting a provider body must not create a cache entry or
 leave a provider operation running.
 
-### 2. Replace the remaining dispatcher placeholders with scheme handlers
+### 2. Complete scheme dispatch and provider-backed handlers
 
 The controller-level seam and shared response finalization now exist in
-[`RequestController::fetch`](../src/engine/execute.rs). Replace its non-HTTP
-placeholder branches with handlers in this order:
+[`RequestController::fetch`](../src/engine/execute.rs). Its provider-backed
+`file:` and `byui:` branches are implemented; the remaining non-HTTP handler
+is the explicitly supported `about:` slice:
 
-1. `file:` provider-authorized access.
-2. `byui:` browser-page routing.
-3. The explicitly supported `about:` cases.
+1. `file:` provider-authorized access — complete.
+2. `byui:` browser-page routing — complete in `net`.
+3. `about:blank` — complete; other `about:` URLs remain rejected.
 
 Each handler must return an `InternalResponse`; it must not expose a new public
 response type or call the HTTP transport directly.
@@ -399,23 +400,24 @@ covers buffered, streamed, and explicit-null bodies, and proves that blob
 responses bypass cookies and HTTP cache partitioning. Cancellation and
 body-drop coverage remains part of the broader provider lifecycle work below.
 
-### 5. Implement `file:` access through a provider
+### 5. Implement `file:` access through a provider — complete
 
 Require the explicit filesystem/security provider. The handler must never read
 the filesystem directly. The provider defines path resolution, authorization,
 origin assignment, media type, and failure behavior.
 
-Add tests for absent providers, denied access, missing files, provider
-failures, successful reads, origin assignment, credential behavior, response
-headers, and body/null-body semantics. Do not add filesystem state or a file
-registry to `net`.
+The handler in `engine/schemes/file.rs` routes provider resources through
+`finalize_scheme_resource`. Tests cover absent providers, denied/missing/I/O
+outcomes, successful bytes and streams, explicit null bodies, metadata
+validation, origin assignment, credential/cache exclusion, and exact-once
+dispatch. `net` owns no filesystem state.
 
 Provider-denied, missing, malformed-path, and provider-I/O outcomes must use
 the documented error categories. Tests must cover platform/path normalization
 through the fake provider contract rather than host filesystem behavior, and
 must prove that invalid provider origins or metadata fail before exposure.
 
-### 6. Implement `byui:` page routing
+### 6. Implement `byui:` page routing — complete in `net`
 
 Add a browser-owned page provider for registered local browser pages. Route
 `byui:` paths only through this provider, never through Reqwest or the
@@ -424,28 +426,30 @@ filesystem.
 The provider contract must define page lookup, path normalization, response
 status, media type, headers, origin, and access-control behavior.
 
-Add tests proving that registered pages resolve, missing pages fail, query and
-path handling are deterministic, HTML metadata is preserved, response URLs and
-origins are assigned correctly, and no network or filesystem access occurs.
+The handler in `engine/schemes/byui.rs` routes page resources through shared
+finalization. Tests cover successful resolution, query-bearing URLs, HTML
+metadata, provider origins, streamed/null bodies, typed provider failures,
+metadata rejection, and no network, filesystem, cookie, cache, or unrelated
+provider access.
 
-Also test page registration and replacement/revocation behavior, malformed
-page metadata, unsupported page kinds, exact-once provider calls, and
-cancellation or body failure after page resolution.
+Page registration/replacement behavior and concrete browser composition remain
+owned by the browser provider rather than `net`.
 
-### 7. Implement the supported `about:` cases
+### 7. Implement the supported `about:` cases — first pass complete
 
-Define an explicit allowlist. Implement the required empty/blank response
-behavior, beginning with the supported blank URL, and reject all other
-`about:` URLs before provider or transport access.
+The first-pass allowlist contains exactly `about:blank`. The engine-owned
+handler returns an empty HTML response for `GET`, an explicit null body for
+`HEAD`, and rejects every other `about:` spelling before provider or transport
+access.
 
-Document and test the chosen status, media type, origin, response URL, and the
-distinction between an empty readable body and a null body. Defer additional
-`about:` variants until a browser caller requires them.
+The current response is status 200 `OK`, `text/html;charset=utf-8`, the exact
+`about:blank` response URL, and an opaque origin. Additional `about:` variants
+remain deferred until a browser caller requires them.
 
-The allowlist decision must be made before provider lookup, cookie lookup,
-cache access, or transport admission. Test every rejected spelling, including
-unexpected query and fragment combinations, and test the accepted method
-boundary, response type, and body lifecycle.
+The allowlist decision is made before provider lookup, cookie lookup, cache
+access, or transport admission. Tests cover `about:srcdoc`, unknown values,
+query/fragment variants, non-hierarchical forms, the accepted method boundary,
+response type, and body lifecycle.
 
 ### 8. Generalize response metadata where HTTP assumptions remain — boundary implemented
 
@@ -466,8 +470,9 @@ Keep public response exposure centralized. All scheme handlers must populate:
 - null-body state.
 
 Do not broaden the public response API or add raw transport/provider types.
-Remaining work is end-to-end validation through real blob/file/byui handlers
-and tests for provider-origin and metadata failures.
+Remaining work is browser composition and provider lifecycle validation; the
+net-level blob/file/byui/about handlers and metadata failure tests are
+implemented.
 
 ### 9. Update documentation and regression coverage
 
@@ -482,7 +487,8 @@ cancellation/lifetime behavior, cookie/cache exclusions, and whether each
 scheme returns an empty readable body or an explicit null body for `HEAD` and
 other bodyless methods.
 
-Add a dedicated `crates/net/tests/schemes.rs` suite covering:
+The dedicated `crates/net/tests/schemes.rs` suite is split into per-scheme
+modules under `crates/net/tests/schemes/` plus shared provider fakes, covering:
 
 - HTTP(S) regression behavior;
 - each supported scheme;

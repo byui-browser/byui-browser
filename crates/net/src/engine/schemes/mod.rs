@@ -1,5 +1,6 @@
 //! Scheme-specific Fetch dispatch and handlers.
 
+mod about;
 mod blob;
 mod byui;
 mod data;
@@ -29,7 +30,7 @@ impl RequestController {
             FetchScheme::Blob => self.fetch_blob(request, url).await,
             FetchScheme::File => self.fetch_file(request, url).await,
             FetchScheme::Byui => self.fetch_byui(request, url).await,
-            FetchScheme::About => Err(RequestError::UnsupportedFeature("about scheme handler")),
+            FetchScheme::About => self.fetch_about(request, url).await,
         }
     }
 }

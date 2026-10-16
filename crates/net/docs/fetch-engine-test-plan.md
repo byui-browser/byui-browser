@@ -269,6 +269,8 @@ Primary files:
 - `crates/net/src/engine/schemes/http.rs`
 - `crates/net/src/api/providers/`
 - `crates/net/tests/schemes.rs`
+- `crates/net/tests/schemes/{http,data,blob,file,byui,about}.rs`
+- `crates/net/tests/schemes/support.rs`
 
 The supported scheme set is `http`, `https`, `data`, `blob`, `file`, `byui`,
 and the explicitly allowlisted `about` cases. Scheme tests should be
@@ -277,8 +279,8 @@ fakes for browser-owned resources. Every local-scheme test must assert that
 the request does not reach the HTTP transport, HTTP cache, or an unrelated
 provider.
 
-Current coverage in `crates/net/tests/schemes.rs` and the provider-resource
-unit tests includes:
+Current coverage in the per-scheme modules under `crates/net/tests/schemes/`
+and the provider-resource unit tests includes:
 
 - `data:` plain, percent-encoded, binary, base64, empty, and comma-containing
   payloads with response metadata and exact body bytes;
@@ -292,7 +294,7 @@ unit tests includes:
 - local `data:` use of request/response service approval while bypassing
   request bodies, cookies, HTTP cache partitioning, and every scheme provider;
 - unsupported schemes failing before service or provider work;
-- absent provider and installed file/page capability boundaries; and
+- absent provider and installed file/page handler behavior; and
 - `about:` rejection before any provider invocation.
 
 Provider-resource unit coverage also verifies every recognized scheme's
@@ -396,7 +398,7 @@ and repeated-resolution coverage.
 
 #### Remaining `blob:` test matrix
 
-Current coverage in `crates/net/tests/schemes.rs` proves one successful
+Current coverage in `crates/net/tests/schemes/blob.rs` proves one successful
 buffered response, one successful stream, one explicit null body, a revoked
 provider failure, provider-returned malformed-metadata failure, exact-once
 dispatch for one request, exposed `Content-Type`, creator-origin delivery to
@@ -488,9 +490,17 @@ should record calls, received request state, stream polling, cancellation, and
 network transport. Keep production registry/revocation behavior in browser or
 storage tests once that owner exists.
 
-### `file:` URLs — pending handler implementation
+### `file:` URLs — implemented handler; lifecycle follow-up remains
 
-With a recording, authorization-aware `FileProvider`, cover:
+Current recording-provider coverage in `schemes/file.rs` covers:
+
+- exact-once dispatch and missing-provider behavior;
+- successful bytes, streams, and explicit null bodies;
+- denied, missing, and provider-I/O outcomes;
+- provider metadata rejection, opaque-origin delivery, and response metadata;
+- credential, cookie, cache, HTTP transport, and unrelated-provider exclusion.
+
+Remaining lifecycle and provider-contract coverage should include:
 
 - absent provider, denied access, missing file, malformed path, and provider
   failure;
@@ -509,9 +519,18 @@ With a recording, authorization-aware `FileProvider`, cover:
 The test suite should use an in-memory fake provider. Do not make tests depend
 on host filesystem state or permissions.
 
-### `byui:` browser pages — pending handler implementation
+### `byui:` browser pages — implemented handler; browser composition remains
 
-With a recording `PageProvider`, add tests for:
+Current recording-provider coverage in `schemes/byui.rs` covers:
+
+- exact-once page lookup and missing-provider behavior;
+- successful page metadata, HTML media type, query-bearing URLs, streams, and
+  explicit null bodies;
+- missing, denied, and provider-I/O outcomes;
+- malformed provider metadata and opaque-origin delivery; and
+- no HTTP transport/cache, cookies, filesystem, or unrelated-provider access.
+
+Remaining browser-provider coverage should include:
 
 - registered page lookup and exact path normalization;
 - missing pages, malformed URLs, unsupported page kinds, and provider errors;
@@ -528,21 +547,20 @@ Include a routing table test proving that a `byui:` request cannot fall through
 to Reqwest or the file provider when lookup fails. Verify that provider calls
 are made once and that a response body error cannot create a cache entry.
 
-### `about:` URLs — pending allowlist implementation
+### `about:` URLs — first-pass `about:blank` allowlist implemented
 
-Define the supported allowlist in the tests rather than accepting arbitrary
-`about:` paths. For the initial blank-page behavior, cover:
+The first-pass allowlist contains exactly `about:blank`. Current coverage in
+`schemes/about.rs` covers:
 
-- the supported blank URL spelling and any explicitly equivalent spelling;
-- the chosen status, status text, response URL, media type, origin, and
-  response type;
-- the distinction between an empty readable body and an explicit null body;
-- `HEAD` and other methods at the documented validation boundary;
-- rejection of every unsupported `about:` path, malformed form, and unexpected
-  query/fragment combination before provider or transport access;
-- absence of cookie lookup, cookie storage, credentials, HTTP cache, and
-  network I/O; and
-- identical metadata and body semantics for buffered and streaming callers.
+- `GET about:blank` returning status 200, HTML metadata, an opaque origin, and
+  an empty readable body;
+- `HEAD about:blank` preserving metadata with an explicit null body;
+- rejection of `about:srcdoc`, unknown values, query/fragment variants, and
+  hierarchical forms; and
+- rejection of methods other than `GET` and `HEAD`.
+
+The handler is engine-owned and performs no provider, cookie, cache, or
+network work.
 
 When another `about:` variant is added, add it to the allowlist matrix with
 its own status, body, origin, and failure tests; do not silently broaden the
@@ -564,8 +582,9 @@ For every local scheme, repeat the following shared assertions:
 - successful body consumption releases all permits and leaves no provider
   operation running.
 
-Keep one end-to-end test per implemented scheme in `crates/net/tests/schemes.rs`,
-with parser and metadata cases beside their implementations. The suite already
+Keep one end-to-end test module per implemented scheme under
+`crates/net/tests/schemes/`, with parser and metadata cases beside their
+implementations. The suite already
 has a shared no-service/provider assertion for unsupported schemes and
 unreachable-provider fakes for local dispatch; retain and extend those guards
 so future scheme handlers cannot accidentally regress into the HTTP path.

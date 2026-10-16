@@ -2,8 +2,9 @@
 
 Status: implementation in progress as of 2026-10-15; steps 1 and 2 are complete,
 step 3 has its shared-body foundation in place, scheme dispatch includes
-`data:` and `blob:`, and the first controller-owned redirect slice is implemented for the explicitly bounded HTTP(S) subset
-described below.
+`data:`, `blob:`, `file:`, `byui:`, and `about:blank`, and the first
+controller-owned redirect slice is implemented for the explicitly bounded
+HTTP(S) subset described below.
 
 ## Goal
 
@@ -734,9 +735,9 @@ Caller-visible headers must not gain the internally generated `Origin`,
 ### 4.4 Add scheme-specific fetch dispatch
 
 The dispatcher seam, engine-owned `data:` handler, provider-neutral resource
-boundary, shared response finalization, and `blob:` handler are implemented.
-The remaining provider-backed work is `file:` and `byui:`; `about:` remains
-classified but unsupported.
+boundary, shared response finalization, and `blob:`, `file:`, and `byui:`
+handlers and the engine-owned `about:blank` case are implemented. Other
+`about:` URLs remain rejected.
 
 Add a controller-level scheme dispatcher so request construction and execution
 do not assume that every valid URL is an HTTP(S) transport request. The
@@ -747,15 +748,15 @@ dispatcher must:
   media-type/default-type handling, decoded bytes, and invalid-payload errors;
 - preserve `blob:` resolution through an explicit browser-owned object-URL or
   blob provider, without making `net` own the blob registry;
-- implement `file:` access only through an explicit filesystem/security
-  provider, with local-file authorization, origin assignment, and failure
-  behavior defined by that provider;
-- implement the browser-specific `byui:` scheme for local browser pages,
-  routing registered page paths through a browser-owned page provider rather
-  than the filesystem or HTTP transport. The provider must define page
-  lookup, response metadata, origin assignment, and access-control behavior;
-- implement the supported `about:` fetch cases, including the required
-  empty/blank response behavior, and reject unsupported `about:` URLs;
+- retain `file:` access only through an explicit filesystem/security provider,
+  with local-file authorization, origin assignment, and failure behavior
+  defined by that provider;
+- retain the browser-specific `byui:` scheme for local browser pages, routing
+  registered page paths through a browser-owned page provider rather than the
+  filesystem or HTTP transport. The provider defines page lookup, response
+  metadata, origin assignment, and access-control behavior;
+- implement the first-pass `about:blank` fetch case with an explicit empty
+  HTML response and reject every other `about:` URL;
 - assign the resulting response URL, origin, status, headers, body, and
   null-body state through the same internal response and public exposure
   pipeline used by HTTP(S);
