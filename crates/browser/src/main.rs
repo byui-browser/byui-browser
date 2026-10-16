@@ -22,8 +22,9 @@ impl ConsoleSink for StdoutConsole {
 fn main() {
     // Keep the standalone binary useful while native platform shells are
     // brought online. `make run` selects the platform shell below.
+    let providers = net::SchemeProviders::new().with_page(browser::byui_provider::provider());
     let controller = Arc::new(
-        net::RequestController::new(net::Config::default())
+        net::RequestController::with_providers(net::Config::default(), providers)
             .expect("network client should initialize"),
     );
     evaluate_page_scripts(

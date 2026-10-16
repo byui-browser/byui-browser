@@ -60,6 +60,19 @@ impl RequestController {
         Self::build(config, None, SchemeProviders::default())
     }
 
+    /// Creates a standalone controller with browser-owned scheme providers.
+    ///
+    /// This constructor is for embedders that need local schemes such as
+    /// `byui:` but do not yet have browser-wide [`FetchServices`] decisions.
+    /// Requests carrying browser client context still fail closed until a
+    /// service-aware constructor is used.
+    pub fn with_providers(
+        config: Config,
+        providers: SchemeProviders,
+    ) -> Result<Self, RequestError> {
+        Self::build(config, None, providers)
+    }
+
     /// Creates a controller with browser-owned service decisions.
     ///
     /// The service is shared by controller clones and must own any durable
