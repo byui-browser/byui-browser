@@ -1,8 +1,8 @@
 //! Window, toolbar, and page rendering shared by the native shells.
 //!
 //! The platform crates (`browser-macos`, `browser-linux`) stay thin: each
-//! describes how its window should look through a [`Platform`] and calls
-//! [`run`]. Everything else, from the winit event loop to the software-painted
+//! describes how its window should look through `Platform` and calls `run`.
+//! Everything else, from the winit event loop to the software-painted
 //! chrome and the welcome-page demo, lives here so the shells behave the same
 //! on every desktop.
 //!
