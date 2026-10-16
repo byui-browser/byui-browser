@@ -73,54 +73,6 @@ impl RequestController {
             providers: SchemeProviders::default(),
         }
     }
-
-    /// Creates a controller with the supplied transport, cache, and scheduling
-    /// configuration.
-    ///
-    /// The controller does not perform network I/O during construction. A
-    /// [`RequestError::Initialization`] is returned if the underlying HTTP
-    /// client cannot be initialized.
-    pub fn new(config: Config) -> Result<Self, RequestError> {
-        Self::builder(config).build()
-    }
-
-    /// Creates a standalone controller with browser-owned scheme providers.
-    ///
-    /// This constructor is for embedders that need local schemes such as
-    /// `byui:` but do not yet have browser-wide [`FetchServices`] decisions.
-    /// Requests carrying browser client context still fail closed until a
-    /// service-aware constructor is used.
-    pub fn with_providers(
-        config: Config,
-        providers: SchemeProviders,
-    ) -> Result<Self, RequestError> {
-        Self::builder(config)
-            .with_scheme_providers(providers)
-            .build()
-    }
-
-    /// Creates a controller with browser-owned service decisions.
-    ///
-    /// The service is shared by controller clones and must own any durable
-    /// storage or policy data outside this process-local Fetch engine.
-    pub fn with_services(
-        config: Config,
-        services: Arc<dyn FetchServices>,
-    ) -> Result<Self, RequestError> {
-        Self::builder(config).with_fetch_services(services).build()
-    }
-
-    /// Creates a controller with browser services and scheme-specific providers.
-    pub fn with_services_and_providers(
-        config: Config,
-        services: Arc<dyn FetchServices>,
-        providers: SchemeProviders,
-    ) -> Result<Self, RequestError> {
-        Self::builder(config)
-            .with_fetch_services(services)
-            .with_scheme_providers(providers)
-            .build()
-    }
 }
 
 impl RequestControllerBuilder {
