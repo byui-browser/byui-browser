@@ -470,6 +470,9 @@ impl Stream for Body {
         };
         match item {
             None | Some(Poll::Ready(None)) => {
+                if let BodySource::Stream(stream) = &mut state.source {
+                    *stream = None;
+                }
                 state.used = true;
                 state.completed = true;
                 state.permit = None;
@@ -481,6 +484,9 @@ impl Stream for Body {
                 Poll::Ready(Some(Ok(chunk)))
             }
             Some(Poll::Ready(Some(Err(error)))) => {
+                if let BodySource::Stream(stream) = &mut state.source {
+                    *stream = None;
+                }
                 state.used = true;
                 state.failed = !matches!(error, RequestError::Aborted);
                 state.aborted = matches!(error, RequestError::Aborted);

@@ -301,8 +301,11 @@ Provider-resource unit coverage also verifies every recognized scheme's
 metadata classification, invalid status/status-text/media-type handling, and
 buffered, streamed, and explicit-null body conversion. Blob success coverage
 now exercises exact-once provider dispatch, creator-origin metadata, exposed
-media type, typed provider failures, and cookie/cache exclusion. Provider
-lifecycle coverage remains incomplete for blob, file, and page handlers.
+media type, typed provider failures, and cookie/cache exclusion. The shared
+provider path is also covered for an already-aborted request, cancellation of
+pending resolution, cancellation during streaming, and unread or partially
+read body drop. File and page use the same cancellation and body conversion
+helpers.
 
 ### Remaining common dispatch and response invariants
 
@@ -373,7 +376,7 @@ The remaining `data:` coverage is intentionally tracked separately:
 - cancellation, body dropping, repeated body consumption, and explicit cache
   mode behavior for local schemes.
 
-### `blob:` URLs — implemented handler; lifecycle follow-up remains
+### `blob:` URLs — implemented handler and core lifecycle coverage
 
 The complete blob test target includes:
 
@@ -392,18 +395,22 @@ The complete blob test target includes:
   applied exactly as for other internal responses; and
 - no HTTP transport, file provider, or page provider call for a blob request.
 
-The detailed outstanding matrix below separates the currently implemented
-checks from this full target, including body-stream failure/drop, cancellation,
-and repeated-resolution coverage.
+The detailed matrix below records additional conformance expansion beyond the
+implemented feature slice, including broader metadata, policy, and
+repeated-resolution combinations.
 
-#### Remaining `blob:` test matrix
+#### Additional `blob:` conformance matrix
 
 Current coverage in `crates/net/tests/schemes/blob.rs` proves one successful
 buffered response, one successful stream, one explicit null body, a revoked
 provider failure, provider-returned malformed-metadata failure, exact-once
-dispatch for one request, exposed `Content-Type`, creator-origin delivery to
-response services, and the default local-scheme cookie/cache exclusions. The
-following tests remain required before treating the blob slice as complete.
+dispatch for one request, prepared URL-list state, exposed `Content-Type`,
+creator-origin delivery to response services, and the default local-scheme
+cookie/cache exclusions. It also proves that `HEAD` discards provider bytes,
+an already-aborted request skips the provider, pending resolution and streaming
+observe abort, and unread or partially read streams are dropped exactly once.
+The following cases remain useful conformance hardening rather than blockers
+for the implemented feature slice.
 
 ##### Dispatch, capability, and request context
 
@@ -490,15 +497,19 @@ should record calls, received request state, stream polling, cancellation, and
 network transport. Keep production registry/revocation behavior in browser or
 storage tests once that owner exists.
 
-### `file:` URLs — implemented handler; lifecycle follow-up remains
+### `file:` URLs — implemented handler; shared lifecycle contract applied
 
 Current recording-provider coverage in `schemes/file.rs` covers:
 
 - exact-once dispatch and missing-provider behavior;
+- `GET`/`HEAD` success and rejection of every non-read method before provider
+  lookup;
 - successful bytes, streams, and explicit null bodies;
 - denied, missing, and provider-I/O outcomes;
 - provider metadata rejection, opaque-origin delivery, and response metadata;
-- credential, cookie, cache, HTTP transport, and unrelated-provider exclusion.
+- credential, cookie, cache, HTTP transport, and unrelated-provider exclusion;
+- pending-resolution abort, stream abort, and unread or partially read body
+  drop cleanup.
 
 Remaining lifecycle and provider-contract coverage should include:
 
@@ -524,11 +535,15 @@ on host filesystem state or permissions.
 Current recording-provider coverage in `schemes/byui.rs` covers:
 
 - exact-once page lookup and missing-provider behavior;
+- `GET`/`HEAD` success and rejection of every non-read method before provider
+  lookup;
 - successful page metadata, HTML media type, query-bearing URLs, streams, and
   explicit null bodies;
 - missing, denied, and provider-I/O outcomes;
 - malformed provider metadata and opaque-origin delivery; and
-- no HTTP transport/cache, cookies, filesystem, or unrelated-provider access.
+- no HTTP transport/cache, cookies, filesystem, or unrelated-provider access;
+- pending-resolution abort, stream abort, and unread or partially read body
+  drop cleanup.
 
 Remaining browser-provider coverage should include:
 

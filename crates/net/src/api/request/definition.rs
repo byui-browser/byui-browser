@@ -123,6 +123,13 @@ impl Request {
     pub fn redirect_count(&self) -> usize {
         self.redirect_count
     }
+    /// Returns the cancellation signal associated with this request.
+    ///
+    /// Scheme providers may clone the signal when provider-owned work must
+    /// outlive the initial resolution future.
+    pub fn signal(&self) -> &AbortSignal {
+        &self.signal
+    }
     /// Replaces the method after Fetch token and forbidden-method validation.
     pub fn set_method(&mut self, method: impl AsRef<str>) -> Result<(), RequestError> {
         let method = method.as_ref();

@@ -44,7 +44,10 @@ impl AbortSignal {
     }
 
     /// Waits until this signal is aborted.
-    pub(crate) async fn cancelled(&self) {
+    ///
+    /// Scheme providers may use this to stop provider-owned I/O or background
+    /// work when the request that initiated it is cancelled.
+    pub async fn cancelled(&self) {
         if self.is_aborted() {
             return;
         }

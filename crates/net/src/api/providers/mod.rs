@@ -15,6 +15,9 @@ pub use file::FileProvider;
 pub use page::PageProvider;
 
 /// A boxed asynchronous provider operation.
+///
+/// The engine drops this future when its request is aborted. Implementations
+/// must therefore release handles, tasks, and other operation state on drop.
 pub type ProviderFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SchemeResource, RequestError>> + Send + 'a>>;
 
@@ -22,7 +25,9 @@ pub type ProviderFuture<'a> =
 ///
 /// Providers are optional capabilities. They are held by shared, thread-safe
 /// references and are selected strictly by URL scheme; `net` never performs a
-/// global registry lookup or opens files itself.
+/// global registry lookup or opens files itself. Provider resolution futures
+/// and body streams are dropped when requests are aborted or response bodies
+/// are discarded.
 #[derive(Clone, Default)]
 pub struct SchemeProviders {
     blob: Option<Arc<dyn BlobProvider>>,

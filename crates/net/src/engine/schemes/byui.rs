@@ -20,12 +20,13 @@ impl RequestController {
         request: Request,
         url: Url,
     ) -> Result<Response, RequestError> {
+        super::require_read_method(&request, "byui scheme method")?;
         let provider = self
             .inner
             .providers
             .page()
             .ok_or(RequestError::MissingProvider("byui page"))?;
-        let resource = provider.resolve(&request, &url).await?;
+        let resource = super::await_provider(&request, provider.resolve(&request, &url)).await?;
         self.finalize_scheme_resource(&request, resource, FetchScheme::Byui)
     }
 }

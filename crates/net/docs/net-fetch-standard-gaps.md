@@ -201,16 +201,15 @@ implementations remain outside this crate.
 
 **Evidence:** [`AbortSignal`](../src/api/cancellation.rs) is an atomic boolean plus notification, and transport/response streaming maps it to `RequestError::Aborted` in [`ReqwestTransport::send`](../src/transport/reqwest.rs) and [`Body::from_stream_with_signal`](../src/api/body/mod.rs).
 
-Basic cancellation is implemented, but Fetch controllers distinguish ongoing,
-terminated, and aborted states, preserve a serialized abort reason, cancel all
-fetch stages, and coordinate body/error handover. The crate has no abort
-reason, no distinction between termination and abort, no lifecycle callbacks,
-and no timing/reporting hooks. Cancellation during a redirect, cache
-revalidation, cookie processing, or body capture is not modeled as a Fetch
-algorithm state transition. Provider operations have no completed cancellation
-contract yet: cancellation before resolution, cancellation during a provider
-stream, body failure, and body drop still need tests proving that provider and
-scheduler resources are released and that no local response is cached.
+Basic cancellation is implemented, including provider resolution and returned
+provider streams: abort drops a pending provider future, terminates a provider
+body with `RequestError::Aborted`, and body failure or drop releases its stream.
+The blob, file, and page suites cover those lifecycle paths. Fetch controllers
+still do not distinguish ongoing, terminated, and aborted states, preserve a
+serialized abort reason, expose lifecycle callbacks, or provide
+timing/reporting hooks. Cancellation during a redirect, cache revalidation,
+cookie processing, or body capture is not modeled as a complete Fetch
+algorithm state transition.
 
 ### 11. Response representation and Fetch API behavior
 
@@ -236,7 +235,8 @@ The semaphore provides concurrency admission, and Fetch priority now reaches the
 **Evidence:** [`SchemeProviders`](../src/api/providers/mod.rs) holds optional,
 thread-safe `BlobProvider`, `FileProvider`, and `PageProvider` capabilities;
 [`RequestController::with_services_and_providers`](../src/engine/controller.rs)
-installs them; [`SchemeResource`](../src/api/providers/body.rs) carries the
+or the provider-only `with_providers` constructor installs them;
+[`SchemeResource`](../src/api/providers/body.rs) carries the
 provider-neutral URL, status, headers, origin, media type, and body; and
 [`InternalResponse::from_scheme_resource`](../src/api/response/view.rs)
 converts that data into the private response representation.
@@ -248,16 +248,18 @@ provider I/O failure, malformed metadata, and invalid origins. Conversion
 validates scheme-compatible URLs, provider metadata, and origin policy before
 exposure. The handlers invoke only their matching installed providers, while
 the engine-owned `about:blank` handler invokes none. Other `about:` URLs are
-rejected. The browser executable has not been composed with the provider
-bundle. Provider lifecycle coverage remains incomplete.
+rejected. The browser installs its `byui:` provider, while concrete blob/file
+providers and browser-wide `FetchServices` composition remain outside `net`.
+Provider resolution and streams observe request cancellation, and focused
+tests cover pending-resolution abort, stream abort/failure, and unread or
+partially read body drop.
 
-**Required work:** compose browser-owned providers; and add recording-provider tests
-for cancellation, body failure/drop, origin assignment, and cache exclusion
-across every provider-backed scheme.
+**Required work:** compose the remaining browser-owned providers and expand
+the recording-provider conformance matrix across every provider-backed scheme.
 
 ## Recommended implementation order
 
-1. Finish the Feature 4.4 contract: browser composition and local-scheme lifecycle tests.
+1. Finish the browser-owned Feature 4.4 composition and provider conformance tests.
 2. Expand remaining `data:`, blob, file, page, and `about:blank` lifecycle
    coverage.
 3. Implement credentials/cookie policy and strict same-origin/CORS/no-CORS response filtering across HTTP and local schemes.

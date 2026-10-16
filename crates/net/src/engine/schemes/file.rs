@@ -21,12 +21,13 @@ impl RequestController {
         request: Request,
         url: Url,
     ) -> Result<Response, RequestError> {
+        super::require_read_method(&request, "file scheme method")?;
         let provider = self
             .inner
             .providers
             .file()
             .ok_or(RequestError::MissingProvider("file"))?;
-        let resource = provider.open(&request, &url).await?;
+        let resource = super::await_provider(&request, provider.open(&request, &url)).await?;
         self.finalize_scheme_resource(&request, resource, FetchScheme::File)
     }
 }

@@ -57,7 +57,11 @@ impl InternalResponse {
                 .entry(http::header::CONTENT_TYPE)
                 .or_insert_with(|| content_type.clone());
         }
-        let (mut body, body_is_null) = resource.body.into_body();
+        let force_null = request.method() == http::Method::HEAD
+            || matches!(status.as_u16(), 101 | 204 | 205 | 304);
+        let (mut body, body_is_null) = resource
+            .body
+            .into_body(request.signal().clone(), force_null);
         body.set_content_type(content_type);
         let status_text = resource
             .status_text
