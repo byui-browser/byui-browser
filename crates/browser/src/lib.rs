@@ -11,6 +11,7 @@ use net::{Request, RequestController, SchemeProviders};
 use webapis::{ConsoleSink, register_fetch, register_print};
 
 pub mod byui_provider;
+pub mod file_provider;
 
 /// A browser page and the resources referenced by its HTML source.
 ///
