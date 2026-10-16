@@ -5,8 +5,61 @@ mod common;
 use common::{TestServer, runtime};
 use net::{
     Body, Config, FetchEnvironment, FetchServices, Request, RequestController, RequestError,
-    ResponseInfo, ServiceWorkerDecision,
+    ResponseInfo, SchemeProviders, ServiceWorkerDecision,
 };
+use std::sync::Arc;
+
+struct NoopServices;
+
+impl FetchServices for NoopServices {
+    fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
+        panic!("builder must not invoke services")
+    }
+
+    fn check_response(&self, _request: &Request, _info: &ResponseInfo) -> Result<(), RequestError> {
+        panic!("builder must not invoke services")
+    }
+
+    fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
+        panic!("builder must not invoke services")
+    }
+
+    fn store_set_cookie(
+        &self,
+        _request: &Request,
+        _values: &[net::HeaderValue],
+    ) -> Result<(), RequestError> {
+        panic!("builder must not invoke services")
+    }
+
+    fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
+        panic!("builder must not invoke services")
+    }
+
+    fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
+        panic!("builder must not invoke services")
+    }
+}
+
+#[test]
+fn controller_builder_supports_all_capability_combinations() {
+    RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+    RequestController::builder(Config::default())
+        .with_fetch_services(Arc::new(NoopServices))
+        .build()
+        .unwrap();
+    RequestController::builder(Config::default())
+        .with_scheme_providers(SchemeProviders::new())
+        .build()
+        .unwrap();
+    RequestController::builder(Config::default())
+        .with_fetch_services(Arc::new(NoopServices))
+        .with_scheme_providers(SchemeProviders::new())
+        .build()
+        .unwrap();
+}
 
 #[test]
 fn body_consumption_propagates_a_post_header_transport_error() {
