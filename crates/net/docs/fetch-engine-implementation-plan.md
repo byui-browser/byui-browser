@@ -91,9 +91,24 @@ explicitly changes that boundary.
 
 ### 7. Public API and downstream migration
 
-Add or finish documented Rust APIs for response cloning, body state where it
-is intentionally public, response helpers, and request initialization. Add a
-Rust-consumer guide and document IPC-safe versus process-local types. Update
+Make controller construction a single Fetch-oriented interface rather than a
+four-constructor capability matrix. Add a `RequestController::builder(config)`
+that provides optional `FetchServices` and `SchemeProviders` setters and a
+fallible `build()` method. Preserve the existing constructors as delegating
+compatibility conveniences while callers migrate; consider eventually
+deprecating them and use names such as `with_fetch_services` and
+`with_scheme_providers` if specialized convenience constructors remain.
+
+The builder must preserve the current capability rules: standalone requests
+may omit services, local schemes require matching scheme providers, and
+requests carrying browser client context require `FetchServices`. It should
+also make the ownership distinction explicit without exposing controller
+internals. Add constructor/builder tests for all capability combinations and
+for failures before transport or provider side effects.
+
+Then add or finish documented Rust APIs for response cloning, body state where
+it is intentionally public, response helpers, and request initialization. Add
+a Rust-consumer guide and document IPC-safe versus process-local types. Update
 the browser architecture documentation and record the ownership decision in an
 ADR. Keep raw Reqwest types private and migrate callers incrementally.
 
