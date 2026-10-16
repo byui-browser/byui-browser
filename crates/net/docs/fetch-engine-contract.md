@@ -24,7 +24,7 @@ Error timing and retry behavior are part of this boundary:
 
 The private `InternalResponse` retains the transport status and canonical
 reason phrase, every header (including `Set-Cookie` and obsolete `Set-Cookie2`), complete URL-list and
-redirect state for the supported single exchange, origin and tainting state,
+redirect state for the supported exchange/redirect slice, origin and tainting state,
 null-body state, cache provenance, cookie-processing state, and the live body.
 Policy and cookie processing run on that representation. Exposure constructs
 an immutable header list and removes forbidden response headers, including the

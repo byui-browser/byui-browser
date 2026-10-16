@@ -62,13 +62,14 @@ Relative URLs and HTTP(S) origins work, and opaque origins are representable.
 The HTTP controller updates the URL list/current URL through its redirect loop;
 provider-assigned origins and local-scheme URL-list, credential, body, and
 filtering semantics are covered for the current provider-backed handlers;
-browser composition and lifecycle edge cases remain.
+browser composition and browser-owned provider edge cases remain.
 
 **Required work:** finish the remaining `data:` edge cases; compose the
 browser-owned providers; and track
-URL-list/current-URL/redirect state through every redirect. Provider metadata
-and the shared finalization path are implemented, with lifecycle coverage still
-incomplete.
+URL-list/current-URL/redirect state and policy through every redirect. Provider
+metadata and the shared finalization path are implemented. Provider resolution,
+stream cancellation, failure, and body-drop cleanup are covered for the current
+local handlers.
 
 ### 2. Request methods and header guards
 
@@ -96,11 +97,12 @@ handling for `HEAD` plus supported null-body status codes.
 It still lacks Fetch-compatible stream teeing/cloning, a public response clone
 operation, typed-array/JavaScript conversion (which belongs in `webapis`),
 `duplex`, keepalive aggregate quotas, and the Fetch rule that a successful
-`CONNECT` response has no body. The provider stream variant is defined, but
-the file and page handlers now exercise it; stream cancellation/drop lifecycle
-coverage remains incomplete.
+`CONNECT` response has no body. The provider stream variant is defined, and the
+blob, file, and page handlers exercise it; stream cancellation, failure, and
+unread/partial body-drop cleanup are covered for that provider boundary.
 
-**Required work:** finish body cloning/teeing and lifecycle semantics, define
+**Required work:** finish body cloning/teeing and the remaining general
+lifecycle semantics, define
 the Rust-to-JavaScript body conversion boundary, add aggregate keepalive
 quotas, and apply the body rules consistently to every scheme handler.
 
@@ -183,12 +185,14 @@ Feature 4.4 adds another explicit integration boundary. `net` owns only the
 provider-neutral `SchemeResource`/`SchemeBody` representation and provider
 traits. Browser/storage/security owners must provide blob registry and
 revocation state, authorized file access and sandbox policy, and registered
-`byui:` page lookup. The browser executable still constructs a standalone
-`RequestController::new` and does not install `FetchServices` or
-`SchemeProviders`. Provider errors, provider-assigned origins, metadata
+`byui:` page lookup. The browser executable now installs its browser-owned
+`byui:` provider through `RequestController::with_providers`; browser-wide
+`FetchServices` composition and concrete blob/file providers remain outside
+`net`. Provider errors, provider-assigned origins, metadata
 validation, exact-once provider selection, and cancellation/lifetime behavior
 are implemented for the blob, file, and page paths and covered by focused
-scheme tests; browser composition and provider lifecycle coverage remain.
+scheme tests; browser-wide composition and concrete provider implementations
+remain outside `net`.
 
 `Config.max_keepalive_body_size` still checks the known body length, but even
 an in-quota keepalive request fails with `UnsupportedFeature` until lifetime
@@ -220,8 +224,9 @@ constructors, a public response clone operation, Fetch-compatible stream
 teeing, and complete network-error construction. `Body::array_buffer`,
 `Body::form_data`, and `Body::json` exist for the supported Rust subset, but
 their JavaScript-facing conversion belongs to `webapis`. Local scheme response
-construction, provider metadata validation, and shared finalization are also
-unfinished. The supported Rust subset and limitations are stated in
+construction, provider metadata validation, and shared finalization are
+implemented for the current provider-backed handlers. The supported Rust
+subset and limitations are stated in
 `fetch-engine-contract.md`.
 
 ### 12. Scheduling and transport coverage
