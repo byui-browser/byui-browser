@@ -168,12 +168,11 @@ fn controller(provider: Arc<dyn FileProvider>) -> (RequestController, Arc<Record
         .with_file(provider)
         .with_page(Arc::new(UnreachableProvider));
     (
-        RequestController::with_services_and_providers(
-            Config::default(),
-            services.clone(),
-            providers,
-        )
-        .unwrap(),
+        RequestController::builder(Config::default())
+            .with_fetch_services(services.clone())
+            .with_scheme_providers(providers)
+            .build()
+            .unwrap(),
         services,
     )
 }
@@ -370,7 +369,9 @@ fn file_provider_metadata_is_validated_before_exposure() {
 
 #[test]
 fn file_requests_without_a_provider_fail_before_side_effects() {
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
     let error = runtime()
         .block_on(controller.fetch(Request::get("file:///tmp/page.html")))
         .unwrap_err();

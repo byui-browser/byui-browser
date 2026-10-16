@@ -67,7 +67,9 @@ fn body_consumption_propagates_a_post_header_transport_error() {
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nshort\r\n"
             .to_vec()
     });
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
 
     let error = runtime().block_on(async {
         let response = controller.fetch(Request::get(server.url())).await.unwrap();
@@ -80,7 +82,9 @@ fn body_consumption_propagates_a_post_header_transport_error() {
 
 #[test]
 fn unsupported_schemes_are_rejected_without_network_io() {
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
     let error = runtime()
         .block_on(controller.fetch(Request::get("ftp://example.test/file")))
         .unwrap_err();
@@ -90,7 +94,9 @@ fn unsupported_schemes_are_rejected_without_network_io() {
 
 #[test]
 fn data_urls_are_decoded_without_network_io() {
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
     let response = runtime()
         .block_on(controller.fetch(Request::get("data:text/plain,hello%20world")))
         .unwrap();
@@ -106,7 +112,9 @@ fn data_urls_are_decoded_without_network_io() {
 
 #[test]
 fn provider_backed_schemes_fail_with_typed_missing_capabilities() {
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
     for (url, provider) in [
         ("blob:https://example.test/id", "blob"),
         ("file:///tmp/page.html", "file"),
@@ -132,7 +140,9 @@ fn non_cacheable_post_requests_are_sent_each_time() {
         observed_hits.fetch_add(1, Ordering::SeqCst);
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
     });
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
 
     runtime().block_on(async {
         let mut request = Request::get(server.url());
@@ -156,7 +166,8 @@ fn browser_context_without_services_fails_before_network_io() {
     );
     let error = runtime()
         .block_on(
-            RequestController::new(Config::default())
+            RequestController::builder(Config::default())
+                .build()
                 .unwrap()
                 .fetch(request),
         )
@@ -209,9 +220,10 @@ fn cached_browser_response_is_rechecked_before_exposure() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
     });
-    let controller =
-        RequestController::with_services(Config::default(), std::sync::Arc::new(RejectCached))
-            .unwrap();
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(std::sync::Arc::new(RejectCached))
+        .build()
+        .unwrap();
     let mut request = Request::get(server.url());
     request.set_environment(
         FetchEnvironment::from_url(reqwest::Url::parse(&server.url()).unwrap()).unwrap(),

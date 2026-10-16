@@ -175,12 +175,11 @@ fn controller(provider: Arc<dyn BlobProvider>) -> (RequestController, Arc<Record
         .with_file(Arc::new(UnreachableProvider))
         .with_page(Arc::new(UnreachableProvider));
     (
-        RequestController::with_services_and_providers(
-            Config::default(),
-            services.clone(),
-            providers,
-        )
-        .unwrap(),
+        RequestController::builder(Config::default())
+            .with_fetch_services(services.clone())
+            .with_scheme_providers(providers)
+            .build()
+            .unwrap(),
         services,
     )
 }

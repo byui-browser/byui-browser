@@ -10,7 +10,9 @@ use super::support::{
 
 #[test]
 fn data_urls_decode_standard_payload_forms_and_metadata() {
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
     let cases = [
         (
             "data:,hello",
@@ -59,7 +61,9 @@ fn data_urls_decode_standard_payload_forms_and_metadata() {
 
 #[test]
 fn data_urls_reject_malformed_payload_and_media_type_inputs() {
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
     for url in [
         "data:text/plain",
         "data:,bad%",
@@ -84,7 +88,9 @@ fn data_urls_keep_url_components_out_of_the_payload() {
         ("data:,hello?query", b"hello".as_slice()),
         ("data:,hello#fragment", b"hello".as_slice()),
     ] {
-        let controller = RequestController::new(Config::default()).unwrap();
+        let controller = RequestController::builder(Config::default())
+            .build()
+            .unwrap();
         let response = runtime()
             .block_on(controller.fetch(Request::get(url)))
             .unwrap();
@@ -98,7 +104,9 @@ fn data_urls_keep_url_components_out_of_the_payload() {
 #[test]
 fn data_urls_define_body_behavior_for_non_head_methods() {
     for method in ["POST", "OPTIONS", "PUT"] {
-        let controller = RequestController::new(Config::default()).unwrap();
+        let controller = RequestController::builder(Config::default())
+            .build()
+            .unwrap();
         let response = runtime()
             .block_on(controller.fetch(Request::new("data:text/plain,payload", method).unwrap()))
             .unwrap();
@@ -107,7 +115,9 @@ fn data_urls_define_body_behavior_for_non_head_methods() {
             b"payload"
         );
     }
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
     let response = runtime()
         .block_on(controller.fetch(Request::new("data:text/plain,payload", "HEAD").unwrap()))
         .unwrap();
@@ -146,7 +156,10 @@ fn data_url_service_failures_do_not_expose_a_response() {
         FailurePoint::Response,
     ] {
         let services = Arc::new(FailingServices(failure));
-        let controller = RequestController::with_services(Config::default(), services).unwrap();
+        let controller = RequestController::builder(Config::default())
+            .with_fetch_services(services)
+            .build()
+            .unwrap();
         let error = runtime()
             .block_on(controller.fetch(Request::get("data:text/plain,private")))
             .unwrap_err();
@@ -159,7 +172,9 @@ fn data_url_service_failures_do_not_expose_a_response() {
 
 #[test]
 fn data_no_cors_responses_use_the_existing_opaque_filter() {
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
     let mut request = Request::get("data:text/plain,private");
     request.set_mode(RequestMode::NoCors).unwrap();
     let response = runtime().block_on(controller.fetch(request)).unwrap();

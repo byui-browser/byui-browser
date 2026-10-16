@@ -20,7 +20,9 @@ fn cache_serves_a_fresh_get_without_a_second_network_request() {
     // should therefore be served from the client's cache.
     let (address, request_count, server) = start_cached_server();
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
 
     let (first_status, first_from_cache, first_body, second) = runtime.block_on(async {
         let first = client
