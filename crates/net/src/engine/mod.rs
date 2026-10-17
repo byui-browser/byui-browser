@@ -7,4 +7,4 @@ mod prepare;
 mod process_response;
 mod schemes;
 
-pub use controller::RequestController;
+pub use controller::{RequestController, RequestControllerBuilder};

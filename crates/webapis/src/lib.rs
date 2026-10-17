@@ -550,7 +550,9 @@ mod tests {
 
     #[test]
     fn fetch_requires_one_url_string() {
-        let controller = RequestController::new(Config::default()).unwrap();
+        let controller = RequestController::builder(Config::default())
+            .build()
+            .unwrap();
 
         assert_eq!(
             fetch(&controller, &[]).unwrap_err().to_string(),
@@ -566,7 +568,11 @@ mod tests {
 
     #[test]
     fn registration_exposes_fetch_to_the_realm() {
-        let controller = std::sync::Arc::new(RequestController::new(Config::default()).unwrap());
+        let controller = std::sync::Arc::new(
+            RequestController::builder(Config::default())
+                .build()
+                .unwrap(),
+        );
         let mut realm = Realm::new();
         register_fetch(&mut realm, controller).unwrap();
 

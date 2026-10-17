@@ -142,11 +142,10 @@ pub(crate) fn controller_with_services_and_providers() -> (RequestController, Ar
         .with_blob(Arc::new(UnreachableProvider))
         .with_file(Arc::new(UnreachableProvider))
         .with_page(Arc::new(UnreachableProvider));
-    let controller = RequestController::with_services_and_providers(
-        Config::default(),
-        services.clone(),
-        providers,
-    )
-    .expect("controller should initialize");
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(services.clone())
+        .with_scheme_providers(providers)
+        .build()
+        .expect("controller should initialize");
     (controller, services)
 }

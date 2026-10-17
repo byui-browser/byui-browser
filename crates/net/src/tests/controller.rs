@@ -62,7 +62,7 @@ fn custom_request_preserves_headers_and_body() {
 /// Verifies default configuration provides usable pool and identity values.
 fn default_config_sets_pool_and_identity() {
     // These defaults define the initial connection-management behavior used by
-    // RequestController::new.
+    // RequestController::builder.
     let config = Config::default();
 
     assert_eq!(config.pool_max_idle_per_host, 8);
@@ -76,7 +76,9 @@ fn invalid_urls_return_typed_errors() {
     // URL validation happens before reqwest is asked to perform network I/O,
     // so malformed input should produce a stable crate-level error variant.
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
 
     let error = runtime
         .block_on(client.fetch(Request::get("not a URL")))
@@ -89,7 +91,9 @@ fn invalid_urls_return_typed_errors() {
 /// Verifies an already-aborted request performs no network work.
 fn an_aborted_request_fails_before_network_work() {
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
     let controller = AbortController::new();
     let mut request = Request::get("http://127.0.0.1:1");
     request.signal = controller.signal();
@@ -106,7 +110,9 @@ fn only_if_cached_reports_a_cache_miss_without_network_access() {
     // OnlyIfCached is useful to callers that must avoid network access entirely;
     // an empty cache should fail immediately rather than attempting the URL.
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
     let mut request = Request::get("http://127.0.0.1:1");
     request.cache_mode = CacheMode::OnlyIfCached;
 
@@ -143,7 +149,9 @@ fn can_fetch_resource_from_local_server() {
     });
 
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
 
     let response = runtime
         .block_on(client.fetch(Request::get(&address)))
@@ -196,7 +204,9 @@ fn fetch_returns_headers_before_body_and_forwards_body_bytes() {
     });
 
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
     let mut response = runtime
         .block_on(client.fetch(Request::get(&address)))
         .expect("streaming request should succeed");
@@ -251,7 +261,9 @@ fn fetch_is_cached_only_after_body_completion() {
     });
 
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
     let (first, second) = runtime.block_on(async {
         let mut first = client
             .fetch(Request::get(&address))

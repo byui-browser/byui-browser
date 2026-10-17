@@ -29,11 +29,10 @@ pub struct Page {
 
 /// Loads the welcome page and resolves its local stylesheet and script links.
 pub fn welcome_page() -> Page {
-    let controller = RequestController::with_providers(
-        net::Config::default(),
-        SchemeProviders::new().with_page(byui_provider::provider()),
-    )
-    .expect("network controller should initialize");
+    let controller = RequestController::builder(net::Config::default())
+        .with_scheme_providers(SchemeProviders::new().with_page(byui_provider::provider()))
+        .build()
+        .expect("network controller should initialize");
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
     let html = runtime
         .block_on(fetch_text(&controller, "byui://welcome/page"))

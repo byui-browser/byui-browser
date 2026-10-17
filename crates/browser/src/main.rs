@@ -24,7 +24,9 @@ fn main() {
     // brought online. `make run` selects the platform shell below.
     let providers = net::SchemeProviders::new().with_page(browser::byui_provider::provider());
     let controller = Arc::new(
-        net::RequestController::with_providers(net::Config::default(), providers)
+        net::RequestController::builder(net::Config::default())
+            .with_scheme_providers(providers)
+            .build()
             .expect("network client should initialize"),
     );
     evaluate_page_scripts(
