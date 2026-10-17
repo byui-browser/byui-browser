@@ -36,6 +36,37 @@ fn unsupported_schemes_are_rejected_without_network_io() {
 }
 
 #[test]
+fn data_urls_are_decoded_without_network_io() {
+    let controller = RequestController::new(Config::default()).unwrap();
+    let response = runtime()
+        .block_on(controller.fetch(Request::get("data:text/plain,hello%20world")))
+        .unwrap();
+
+    assert_eq!(response.status, 200);
+    assert_eq!(response.url, "data:text/plain,hello%20world");
+    assert_eq!(response.headers.get("content-type").unwrap(), "text/plain");
+    assert_eq!(
+        runtime().block_on(response.body.bytes()).unwrap(),
+        b"hello world"
+    );
+}
+
+#[test]
+fn provider_backed_schemes_fail_with_typed_missing_capabilities() {
+    let controller = RequestController::new(Config::default()).unwrap();
+    for (url, provider) in [
+        ("blob:https://example.test/id", "blob"),
+        ("file:///tmp/page.html", "file"),
+        ("byui://welcome", "byui page"),
+    ] {
+        let error = runtime()
+            .block_on(controller.fetch(Request::get(url)))
+            .unwrap_err();
+        assert!(matches!(error, RequestError::MissingProvider(name) if name == provider));
+    }
+}
+
+#[test]
 fn non_cacheable_post_requests_are_sent_each_time() {
     use std::sync::{
         Arc,

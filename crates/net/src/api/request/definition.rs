@@ -123,6 +123,13 @@ impl Request {
     pub fn redirect_count(&self) -> usize {
         self.redirect_count
     }
+    /// Returns the cancellation signal associated with this request.
+    ///
+    /// Scheme providers may clone the signal when provider-owned work must
+    /// outlive the initial resolution future.
+    pub fn signal(&self) -> &AbortSignal {
+        &self.signal
+    }
     /// Replaces the method after Fetch token and forbidden-method validation.
     pub fn set_method(&mut self, method: impl AsRef<str>) -> Result<(), RequestError> {
         let method = method.as_ref();
@@ -254,6 +261,7 @@ impl Request {
             }
         }
     }
+    /// Reports whether method or headers require a CORS preflight.
     pub(crate) fn requires_cors_preflight(&self) -> bool {
         !matches!(self.method, Method::GET | Method::HEAD | Method::POST)
             || self
@@ -269,6 +277,7 @@ impl Request {
             RequestPriority::High => crate::scheduling::RequestPriority::High,
         }
     }
+    /// Records the validated URL as the current and initial request URL.
     pub(crate) fn prepare_url(&mut self, url: Url) {
         if self.url_list.is_empty() {
             self.url_list.push(url.clone());
@@ -347,6 +356,7 @@ impl Request {
             ReferrerPolicy::Empty => Some(source_origin),
         }
     }
+    /// Validates method, no-CORS, and keepalive constraints for the body.
     pub(crate) fn validate_body_state(
         &self,
         max_keepalive_body_size: u64,

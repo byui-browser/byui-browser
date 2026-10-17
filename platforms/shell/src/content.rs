@@ -8,12 +8,12 @@ use tiny_skia::Pixmap;
 fn render_demo(width: u32, height: u32) -> Frame {
     let page = browser::welcome_page();
     let document = html::parse_raw_html(page.html.to_owned());
-    let stylesheet = css::parse_stylesheet(page.css);
+    let stylesheet = css::parse_stylesheet(&page.css);
     assert!(
         !stylesheet.rules.is_empty(),
         "the welcome page should have a stylesheet"
     );
-    let script_result = js::eval(page.js).expect("the welcome page script should execute");
+    let script_result = js::eval(&page.js).expect("the welcome page script should execute");
     assert_eq!(
         script_result,
         js::Value::String("Welcome to BYUI Browser!".into())

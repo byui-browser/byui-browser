@@ -6,6 +6,7 @@ use http::header::HeaderValue;
 use super::*;
 
 #[test]
+/// Verifies replayable body clones consume independently.
 fn replayable_clones_have_independent_consumption_state() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let body = Body::from_bytes(b"replayable".to_vec());
@@ -16,6 +17,7 @@ fn replayable_clones_have_independent_consumption_state() {
 }
 
 #[test]
+/// Verifies one-shot body clones share consumption state.
 fn one_shot_clones_share_consumption_state() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let body = Body::one_shot_bytes(b"once".to_vec());
@@ -32,6 +34,7 @@ fn one_shot_clones_share_consumption_state() {
 }
 
 #[test]
+/// Verifies body constructors preserve text and blob metadata.
 fn body_helpers_preserve_text_and_blob_metadata() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let text = Body::from_text("hello");
@@ -50,6 +53,7 @@ fn body_helpers_preserve_text_and_blob_metadata() {
 }
 
 #[test]
+/// Verifies body helpers decode bytes and preserve form entries.
 fn body_consumption_helpers_decode_parse_and_preserve_form_entries() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let latin = Body::from_bytes_with_content_type(
@@ -77,6 +81,7 @@ fn body_consumption_helpers_decode_parse_and_preserve_form_entries() {
 }
 
 #[test]
+/// Verifies multipart parsing creates text and file entries.
 fn multipart_form_data_parses_text_and_file_parts() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let body = Body::from_bytes_with_content_type(
@@ -92,6 +97,7 @@ fn multipart_form_data_parses_text_and_file_parts() {
 }
 
 #[test]
+/// Verifies form-data serialization selects the correct encoding.
 fn form_data_constructor_selects_url_encoded_or_multipart() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let mut text = FormData::new();
@@ -124,6 +130,7 @@ fn form_data_constructor_selects_url_encoded_or_multipart() {
 }
 
 #[test]
+/// Verifies a stream failure marks shared body state as used.
 fn response_stream_failure_marks_the_shared_body_used() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let body = Body::stream(stream::once(async {

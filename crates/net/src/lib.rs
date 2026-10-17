@@ -15,8 +15,15 @@
 //! [`FetchServices`]. Renderer processes do not open sockets directly.
 //!
 //! The current transport executes HTTP(S) requests. Relative URLs require a
-//! [`FetchEnvironment`] with a base URL; `about:`, `blob:`, `data:`, and `file:`
-//! fetching are unsupported and return [`RequestError::UnsupportedScheme`].
+//! [`FetchEnvironment`] with a base URL. Engine-owned `data:` and the exact
+//! `about:blank` URL are resolved locally; `blob:`, `file:`, and `byui:` require
+//! matching providers installed with [`RequestController::with_providers`] or
+//! [`RequestController::with_services_and_providers`]. Unsupported schemes
+//! return [`RequestError::UnsupportedScheme`]. Local schemes bypass HTTP
+//! transport, cookies, and the HTTP cache. Provider resolution and streams
+//! observe request cancellation, and provider metadata is validated before
+//! public response exposure. Provider-backed local resources accept only `GET`
+//! and `HEAD`; other methods fail before provider lookup.
 //! This first engine slice supports basic same-origin responses, simple CORS
 //! checks, opaque no-CORS views, and forbidden response-header filtering.
 //! Requests requiring absent providers or algorithms fail with a typed
@@ -46,8 +53,12 @@ pub use api::{
     body::{Blob, Body, FormData, FormDataEntry},
     cancellation::{AbortController, AbortSignal},
     config::Config,
-    error::RequestError,
+    error::{ProviderErrorKind, RequestError},
     headers::{HeaderGuard, Headers},
+    providers::{
+        BlobProvider, FileProvider, PageProvider, ProviderBodyStream, ProviderFuture, SchemeBody,
+        SchemeProviders, SchemeResource,
+    },
     request::{
         CacheMode, CredentialsMode, FetchContext, FetchEnvironment, InitiatorType,
         NetworkPartitionKey, Origin, RedirectMode, Referrer, ReferrerPolicy, Request,

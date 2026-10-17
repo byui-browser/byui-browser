@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use crate::{
-    api::{config::Config, error::RequestError, services::FetchServices},
+    api::{
+        config::Config, error::RequestError, providers::SchemeProviders, services::FetchServices,
+    },
     cache::ResponseCache,
     policy::{CorsChecker, RequestPolicy},
     scheduling::RequestScheduler,
@@ -22,6 +24,7 @@ pub struct RequestController {
     pub(crate) inner: Arc<ControllerInner>,
 }
 
+/// Shared controller state used by fetch execution and policy stages.
 pub(crate) struct ControllerInner {
     /// Maximum accepted body size for keepalive requests.
     pub(crate) max_keepalive_body_size: u64,
@@ -29,6 +32,8 @@ pub(crate) struct ControllerInner {
     pub(crate) cache: ResponseCache,
     /// Browser-owned policy, credential, cache-partition, and worker decisions.
     pub(crate) services: Option<Arc<dyn FetchServices>>,
+    /// Browser-owned scheme providers selected by the dispatcher.
+    pub(crate) providers: SchemeProviders,
     /// Cross-origin response validation boundary.
     pub(crate) cors: CorsChecker,
     /// Request and response policy validation boundary.
@@ -38,6 +43,7 @@ pub(crate) struct ControllerInner {
 }
 
 impl std::fmt::Debug for RequestController {
+    /// Formats the controller without exposing shared services or transport state.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RequestController").finish_non_exhaustive()
     }
@@ -51,7 +57,20 @@ impl RequestController {
     /// [`RequestError::Initialization`] is returned if the underlying HTTP
     /// client cannot be initialized.
     pub fn new(config: Config) -> Result<Self, RequestError> {
-        Self::build(config, None)
+        Self::build(config, None, SchemeProviders::default())
+    }
+
+    /// Creates a standalone controller with browser-owned scheme providers.
+    ///
+    /// This constructor is for embedders that need local schemes such as
+    /// `byui:` but do not yet have browser-wide [`FetchServices`] decisions.
+    /// Requests carrying browser client context still fail closed until a
+    /// service-aware constructor is used.
+    pub fn with_providers(
+        config: Config,
+        providers: SchemeProviders,
+    ) -> Result<Self, RequestError> {
+        Self::build(config, None, providers)
     }
 
     /// Creates a controller with browser-owned service decisions.
@@ -62,12 +81,23 @@ impl RequestController {
         config: Config,
         services: Arc<dyn FetchServices>,
     ) -> Result<Self, RequestError> {
-        Self::build(config, Some(services))
+        Self::build(config, Some(services), SchemeProviders::default())
     }
 
+    /// Creates a controller with browser services and scheme-specific providers.
+    pub fn with_services_and_providers(
+        config: Config,
+        services: Arc<dyn FetchServices>,
+        providers: SchemeProviders,
+    ) -> Result<Self, RequestError> {
+        Self::build(config, Some(services), providers)
+    }
+
+    /// Constructs shared state and initializes the reusable HTTP transport.
     fn build(
         config: Config,
         services: Option<Arc<dyn FetchServices>>,
+        providers: SchemeProviders,
     ) -> Result<Self, RequestError> {
         let max_in_flight = config.max_in_flight;
         let max_keepalive_body_size = config.max_keepalive_body_size;
@@ -78,6 +108,7 @@ impl RequestController {
                 max_keepalive_body_size,
                 cache: ResponseCache::default(),
                 services,
+                providers,
                 cors: CorsChecker,
                 policy: RequestPolicy,
                 scheduler: RequestScheduler::new(transport, max_in_flight),

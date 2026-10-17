@@ -24,7 +24,7 @@ Error timing and retry behavior are part of this boundary:
 
 The private `InternalResponse` retains the transport status and canonical
 reason phrase, every header (including `Set-Cookie` and obsolete `Set-Cookie2`), complete URL-list and
-redirect state for the supported single exchange, origin and tainting state,
+redirect state for the supported exchange/redirect slice, origin and tainting state,
 null-body state, cache provenance, cookie-processing state, and the live body.
 Policy and cookie processing run on that representation. Exposure constructs
 an immutable header list and removes forbidden response headers, including the
@@ -68,22 +68,48 @@ work.
 - HTTP(S), relative URL resolution, request method/header guards, replayable
   and one-shot input bodies, abort signals, simple same-origin and CORS checks,
   basic/opaque response views, and a small process-local cache are supported.
+- `data:` and the exact `about:blank` URL are engine-owned local schemes.
+  `blob:`, `file:`, and `byui:` are supported when their matching
+  `SchemeProviders` capability is installed. Other `about:` URLs and
+  unclassified schemes fail before provider or transport side effects.
+- Local schemes never use HTTP transport, cookie selection or storage, or the
+  HTTP response cache. Successful local results still pass through the common
+  response policy, browser-service approval, filtering, and body pipeline.
+- Provider-backed `blob:`, `file:`, and `byui:` resources are read-only:
+  `GET` and `HEAD` are accepted before provider lookup; other methods fail with
+  `UnsupportedFeature` and cannot invoke a provider.
+- Provider resources carry only response URL, status, headers, media type,
+  origin, and body data. The engine rejects wrong-scheme URLs, invalid status
+  metadata, conflicting media types, and invalid origins before public
+  exposure. Missing capabilities use `MissingProvider`; provider failures use
+  stable `ProviderErrorKind` categories without exposing implementation data.
+- `GET` may expose provider bytes or a provider stream. `HEAD`, status 101,
+  204, 205, and 304 always expose a null body even if a provider supplied body
+  data. An explicit `SchemeBody::Null` remains null for every method.
+- Provider resolution futures are dropped when a request is aborted. Returned
+  byte and streaming bodies observe the same abort signal; aborting, failing,
+  or discarding a body drops its provider stream. Providers must release their
+  own handles, tasks, and other resources when those futures or streams drop.
 - A controller created with `new` is for standalone requests without client
-  context. A request carrying a client origin requires `with_services` and a
-  browser-owned `FetchServices` implementation. That interface supplies
-  security decisions, credential selection and storage, a service-worker
-  network decision, a cache partition, and a response-header observation hook.
-  `Set-Cookie` reaches only that trusted interface. Credential mode still
-  decides whether the engine calls its credential methods.
+  context. `with_providers` adds local-scheme capabilities without browser
+  services. A request carrying browser client context requires `with_services`
+  or `with_services_and_providers` and a browser-owned `FetchServices`
+  implementation. That interface supplies security decisions, credential
+  selection and storage, a service-worker network decision, a cache partition,
+  and a response-header observation hook. `Set-Cookie` reaches only that
+  trusted interface. Credential mode still decides whether the engine calls
+  its credential methods.
 - CORS preflight, integrity, navigation fetch, keepalive lifetime, nondefault
-  priority scheduling, manual/error redirect modes, and cache revalidation
-  fail with `UnsupportedFeature`. A service-worker `Intercept` decision also
+  priority scheduling, and cache revalidation fail with `UnsupportedFeature`.
+  Manual/error redirect modes are handled by the controller. A service-worker
+  `Intercept` decision also
   fails closed until worker responses are integrated. The default standalone
   service-worker mode means no worker is installed.
-- Reqwest never follows redirects. A redirect status returns `RedirectFailure`
-  before public headers. The full redirect loop, `OpaqueRedirect` results,
-  and per-hop checks belong to step 7. Fetch errors currently return
-  `RequestError`, not a `ResponseType::Error` value.
+- Reqwest never follows redirects. The controller handles the supported
+  redirect loop and returns filtered `OpaqueRedirect` results for manual mode;
+  error mode fails before public headers. Per-hop policy checks remain
+  incomplete. Fetch errors currently return a `RequestError`, not a
+  `ResponseType::Error` value.
 - `Default`, `NoStore`, `Reload`, `ForceCache`, and `OnlyIfCached` retain their
   documented process-local cache subset; `NoCache` fails until revalidation
   exists. Browser service providers choose the partition key. This cache is

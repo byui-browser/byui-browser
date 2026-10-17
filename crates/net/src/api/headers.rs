@@ -262,6 +262,7 @@ impl Headers {
         headers
     }
 
+    /// Validates a mutation against the current guard and Fetch header rules.
     fn check(&self, name: &HeaderName, value: &HeaderValue) -> Result<(), RequestError> {
         if self.guard == HeaderGuard::Immutable {
             return Err(RequestError::ImmutableHeaders);
@@ -273,6 +274,7 @@ impl Headers {
         }
     }
 
+    /// Inserts an engine-managed header while retaining the current guard.
     pub(crate) fn insert_internal_header(
         &mut self,
         name: HeaderName,
@@ -291,6 +293,7 @@ impl Headers {
         self.entries.retain(|(existing, _)| existing != name);
     }
 
+    /// Combines ordinary duplicate values for the public iterator.
     fn combined_entries(&self) -> Vec<(HeaderName, String)> {
         let mut combined = Vec::new();
         for (index, (name, value)) in self.entries.iter().enumerate() {
@@ -317,15 +320,18 @@ impl Headers {
     }
 }
 
+/// Parses a header name and maps invalid syntax to the public request error.
 fn parse_name(name: &str) -> Result<HeaderName, RequestError> {
     HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| RequestError::InvalidHeaderName(name.to_owned()))
 }
 
+/// Parses a header value and associates failures with its header name.
 fn parse_value(name: &str, value: &str) -> Result<HeaderValue, RequestError> {
     HeaderValue::try_from(value).map_err(|_| RequestError::InvalidHeaderValue(name.to_owned()))
 }
 
+/// Trims optional surrounding horizontal whitespace from a header value.
 fn normalize_value(value: HeaderValue) -> HeaderValue {
     let bytes = value.as_bytes();
     let start = bytes
@@ -339,14 +345,17 @@ fn normalize_value(value: HeaderValue) -> HeaderValue {
     HeaderValue::from_bytes(&bytes[start..end]).expect("trimmed header value remains valid")
 }
 
+/// Converts a validated header value into the string form exposed by [`Headers`].
 fn header_value_string(value: &HeaderValue) -> String {
     String::from_utf8_lossy(value.as_bytes()).into_owned()
 }
 
+/// Identifies response headers that must retain separate entries.
 fn is_non_combinable(name: &HeaderName) -> bool {
     matches!(name.as_str(), "set-cookie" | "set-cookie2")
 }
 
+/// Checks whether a header guard may move to a stricter state.
 fn guard_transition_allowed(from: HeaderGuard, to: HeaderGuard) -> bool {
     matches!(
         (from, to),
@@ -361,12 +370,14 @@ fn guard_transition_allowed(from: HeaderGuard, to: HeaderGuard) -> bool {
 }
 
 #[derive(Default)]
+/// Parsed `Access-Control-Expose-Headers` state used during response filtering.
 struct CorsExposure {
     wildcard: bool,
     names: Vec<HeaderName>,
 }
 
 impl CorsExposure {
+    /// Parses exposed names, applying the credential-sensitive wildcard rule.
     fn parse(headers: &HeaderMap, credentials_mode: CredentialsMode) -> Self {
         let mut names = Vec::new();
         let mut wildcard = false;
@@ -394,11 +405,13 @@ impl CorsExposure {
         Self { wildcard, names }
     }
 
+    /// Reports whether a response header is visible to the caller.
     fn includes(&self, name: &HeaderName) -> bool {
         is_cors_safelisted_response_header(name) || self.wildcard || self.names.contains(name)
     }
 }
 
+/// Reports whether a response header is always exposed by CORS.
 fn is_cors_safelisted_response_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -412,6 +425,7 @@ fn is_cors_safelisted_response_header(name: &HeaderName) -> bool {
     )
 }
 
+/// Applies the selected guard's request or response mutation restrictions.
 fn allowed_header(guard: HeaderGuard, name: &HeaderName, value: &HeaderValue) -> bool {
     match guard {
         HeaderGuard::None => true,
@@ -424,6 +438,7 @@ fn allowed_header(guard: HeaderGuard, name: &HeaderName, value: &HeaderValue) ->
     }
 }
 
+/// Reports whether a caller is forbidden from setting a request header.
 fn is_forbidden_request_header(name: &HeaderName) -> bool {
     let name = name.as_str();
     matches!(
@@ -456,6 +471,7 @@ fn is_forbidden_request_header(name: &HeaderName) -> bool {
         || name.starts_with("sec-")
 }
 
+/// Reports whether a request header/value pair is CORS-safelisted.
 pub(crate) fn is_cors_safelisted_header(name: &HeaderName, value: &HeaderValue) -> bool {
     let raw = value.as_bytes();
     if raw.len() > 128
@@ -498,11 +514,13 @@ pub(crate) fn is_cors_safelisted_header(name: &HeaderName, value: &HeaderValue) 
 mod tests {
     use super::*;
 
+    /// Builds a valid static header value for header behavior tests.
     fn value(value: &'static str) -> HeaderValue {
         HeaderValue::from_static(value)
     }
 
     #[test]
+    /// Verifies ordinary duplicates combine while cookie values stay separate.
     fn headers_combine_duplicate_values_and_preserve_cookie_values() {
         let mut headers = Headers::with_guard(HeaderGuard::None);
         headers
@@ -530,6 +548,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies set and delete follow guarded Fetch mutation semantics.
     fn set_and_delete_have_fetch_mutation_semantics() {
         let mut headers = Headers::new();
         headers
@@ -547,6 +566,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies immutable headers reject every public mutation path.
     fn immutable_headers_reject_all_mutation() {
         let mut headers = Headers::with_guard(HeaderGuard::Immutable);
         assert!(matches!(
@@ -560,6 +580,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies changing to no-CORS removes headers that are no longer allowed.
     fn no_cors_guard_removes_existing_unsafelisted_headers() {
         let mut headers = Headers::new();
         headers
@@ -574,6 +595,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies string construction validates names and normalizes values.
     fn string_construction_validates_normalizes_and_trims() {
         let headers = Headers::try_from_strings([
             ("X-First", "  one\t"),
@@ -601,6 +623,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies map construction preserves duplicate entries and the guard.
     fn map_and_headers_construction_preserve_duplicates_and_guard() {
         let mut map = HeaderMap::new();
         map.append("x-test", value("one"));
@@ -614,6 +637,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies public iteration exposes combined values and separate cookies.
     fn public_iteration_combines_ordinary_values_but_not_set_cookie() {
         let mut headers = Headers::with_guard(HeaderGuard::None);
         headers.append_str("x-first", "one").unwrap();
@@ -636,6 +660,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies header guards can only transition toward stricter states.
     fn guard_transitions_are_monotonic() {
         let allowed = [
             (HeaderGuard::None, HeaderGuard::Request),
@@ -675,6 +700,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies immutable guards reject typed, string, and internal mutations.
     fn immutable_headers_reject_typed_string_and_internal_mutations() {
         let mut headers = Headers::with_guard(HeaderGuard::Immutable);
         assert!(matches!(
@@ -696,6 +722,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies CORS exposure handles wildcard, credential, duplicate, and malformed cases.
     fn cors_exposure_handles_wildcards_credentials_duplicates_and_malformed_values() {
         let mut headers = HeaderMap::new();
         headers.append("access-control-expose-headers", value("X-Visible"));
@@ -730,6 +757,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies basic response filtering hides all cookie response headers.
     fn basic_response_filter_removes_all_cookie_response_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("set-cookie", value("a=1"));

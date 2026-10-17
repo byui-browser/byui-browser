@@ -183,6 +183,7 @@ dependencies = [
  "render",
  "security",
  "storage",
+ "tokio",
  "webapis",
 ]
 
@@ -1200,6 +1201,7 @@ dependencies = [
 name = "net"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "common",
  "encoding_rs",
