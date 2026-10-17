@@ -1,8 +1,21 @@
 # File provider hardening plan
 
-`BrowserFileProvider` is currently a compiling scaffold that adapts the
-security crate's filesystem policy to `net::FileProvider`. The implementation
-must remain fail-closed and must not move filesystem policy into `net`.
+`BrowserFileProvider` adapts the security crate's filesystem policy to
+`net::FileProvider`. The implementation must remain fail-closed and must not
+move filesystem policy into `net`.
+
+## Current baseline
+
+The module now has an `OpenedFile` capability. Callers use
+`FileAccessPolicy::open_file` to authorize a requested path and obtain an
+opened handle, then read from that handle with `OpenedFile::read_all`.
+`BrowserFileProvider` follows this path and no longer calls `fs::read` on an
+already-authorized pathname.
+
+`LocalFileSystem` remains a deliberately partial backend. It retains the
+handle it opens and rejects non-regular files where the platform permits
+inspection, but `std::fs::File::open` cannot constrain resolution of every path
+component. It is not sufficient sandbox containment for untrusted paths.
 
 ## 1. Harden path authorization
 
@@ -16,19 +29,25 @@ Expand `security::file_access::FileAccessPolicy` and its tests to cover:
 Keep the default policy deny-by-default. The approved path should remain an
 opaque `AuthorizedPath` rather than a caller-constructed `PathBuf`.
 
-## 2. Close the authorization/read TOCTOU gap
+## 2. Implement native path-containment backends
 
-The current flow canonicalizes a path and then later reopens it with
-`fs::read`. A file or symlink could change between those operations.
+The retained-handle model prevents a second pathname lookup after opening, but
+the standard-library backend cannot atomically constrain path resolution.
+Replace it in production with platform backends that enforce containment while
+opening the file:
 
-Replace this with one of the following, depending on the platform backend:
+- On Unix, anchor resolution at an opened allowed-root directory and use the
+  strongest available no-follow or open-beneath primitive for every component.
+- On Windows, open through handles that reject reparse-point and junction
+  escapes, including drive-letter and UNC paths.
+- Keep these details behind `FileSystem`; callers continue to receive only an
+  `OpenedFile` and must never reopen an authorized pathname.
+- Define a fail-closed fallback only when it opens once, revalidates that exact
+  handle, and reads from that same handle. Revalidating a pathname and then
+  reopening it is not acceptable.
 
-1. authorize and open the file as one operation, carrying the opened handle;
-2. use platform-specific no-follow/open-beneath APIs; or
-3. revalidate the opened file before reading it.
-
-The chosen approach must prevent a path authorized inside the sandbox from
-being replaced with a path outside it before bytes are read.
+Add platform-specific regression tests for symlink, junction, and replacement
+races before enabling each backend for browser `file:` access.
 
 ## 3. Apply request and origin authorization
 
@@ -46,8 +65,8 @@ context. The security crate should not depend on `net`.
 
 ## 4. Make reads asynchronous and cancellable
 
-`LocalFileSystem::read` currently performs synchronous `fs::read`, and the
-work happens before the provider future is returned. This can block the async
+`OpenedFile::read_all` currently performs synchronous I/O and materializes the
+complete file before the provider future is returned. This can block the async
 executor and prevents cancellation during the read.
 
 Introduce an asynchronous filesystem boundary or move blocking operations to a
@@ -119,11 +138,22 @@ The minimum matrix is:
 - cancellation and body-drop cleanup; and
 - no HTTP transport, cache, cookie, or unrelated-provider side effects.
 
+## Future hardening
+
+- Retain allowed roots as directory capabilities rather than canonicalized
+  paths where platform support permits it.
+- Set explicit file-size, stream-duration, and concurrent-read limits to bound
+  resource use by local content.
+- Audit hard-link, mount-point, network-share, and removable-media semantics
+  for each supported platform before broadening allowed-root configuration.
+- Add fuzzing or property tests for path parsing and backend containment,
+  especially Windows reparse-point and UNC cases.
+
 ## Recommended order
 
-1. Fix path and symlink authorization, including the TOCTOU design.
-2. Add request/origin authorization.
-3. Introduce asynchronous reads and streaming.
-4. Harden metadata and error mapping.
-5. Wire the provider into browser composition.
-6. Complete the security, browser, and net conformance tests.
+1. Implement and validate native path-containment backends.
+2. Complete path-authorization and race-regression coverage.
+3. Add request/origin authorization.
+4. Introduce asynchronous reading and streaming.
+5. Harden metadata and error mapping.
+6. Wire the provider into browser composition and complete conformance tests.

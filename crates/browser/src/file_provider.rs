@@ -28,8 +28,11 @@ impl FileProvider for BrowserFileProvider {
             let path = url
                 .to_file_path()
                 .map_err(|_| provider_error(FileAccessError::InvalidPath))?;
-            let authorized = self.policy.authorize_path(path).map_err(provider_error)?;
-            let resource = self.filesystem.read(&authorized).map_err(provider_error)?;
+            let resource = self
+                .policy
+                .open_file(path, self.filesystem.as_ref())
+                .and_then(|opened| opened.read_all())
+                .map_err(provider_error)?;
             let length =
                 HeaderValue::from_str(&resource.bytes.len().to_string()).map_err(|_| {
                     RequestError::Provider {
@@ -64,6 +67,7 @@ fn provider_error(error: FileAccessError) -> RequestError {
         FileAccessError::Missing => ProviderErrorKind::ResourceMissing,
         FileAccessError::Denied => ProviderErrorKind::AccessDenied,
         FileAccessError::InvalidPath => ProviderErrorKind::MalformedMetadata,
+        FileAccessError::UnsupportedFile => ProviderErrorKind::Io,
         FileAccessError::Io => ProviderErrorKind::Io,
     };
     RequestError::Provider {

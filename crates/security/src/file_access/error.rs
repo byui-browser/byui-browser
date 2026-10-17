@@ -11,6 +11,8 @@ pub enum FileAccessError {
     Denied,
     /// The requested path could not be safely normalized.
     InvalidPath,
+    /// The opened path is not a regular file that can be served.
+    UnsupportedFile,
     /// The filesystem returned an I/O failure unrelated to authorization.
     Io,
 }
@@ -21,6 +23,7 @@ impl fmt::Display for FileAccessError {
             Self::Missing => "file is missing",
             Self::Denied => "file access was denied",
             Self::InvalidPath => "file path is invalid",
+            Self::UnsupportedFile => "file type is unsupported",
             Self::Io => "file I/O failed",
         };
         f.write_str(message)

@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::FileAccessError;
+use super::{FileAccessError, FileSystem, OpenedFile};
 
 /// A filesystem path that has passed the configured access policy.
 ///
@@ -56,6 +56,20 @@ impl FileAccessPolicy {
         } else {
             Err(FileAccessError::Denied)
         }
+    }
+
+    /// Authorizes `requested` and opens it through `filesystem`.
+    ///
+    /// The returned [`OpenedFile`] owns the handle that callers must use for
+    /// subsequent reads. This prevents callers from authorizing one pathname
+    /// and later reopening that pathname for its contents.
+    pub fn open_file(
+        &self,
+        requested: impl AsRef<Path>,
+        filesystem: &dyn FileSystem,
+    ) -> Result<OpenedFile, FileAccessError> {
+        let path = self.authorize_path(requested)?;
+        filesystem.open(&path)
     }
 }
 
