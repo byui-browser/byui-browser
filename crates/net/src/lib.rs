@@ -17,8 +17,7 @@
 //! The current transport executes HTTP(S) requests. Relative URLs require a
 //! [`FetchEnvironment`] with a base URL. Engine-owned `data:` and the exact
 //! `about:blank` URL are resolved locally; `blob:`, `file:`, and `byui:` require
-//! matching providers installed with [`RequestController::with_providers`] or
-//! [`RequestController::with_services_and_providers`]. Unsupported schemes
+//! matching providers installed with [`RequestController::builder`]. Unsupported schemes
 //! return [`RequestError::UnsupportedScheme`]. Local schemes bypass HTTP
 //! transport, cookies, and the HTTP cache. Provider resolution and streams
 //! observe request cancellation, and provider metadata is validated before
@@ -67,6 +66,6 @@ pub use api::{
     response::{Response, ResponseType},
     services::{FetchServices, ResponseInfo, ServiceWorkerDecision},
 };
-pub use engine::RequestController;
+pub use engine::{RequestController, RequestControllerBuilder};
 pub use http::{HeaderName, HeaderValue, Method};
 pub use url::Url;

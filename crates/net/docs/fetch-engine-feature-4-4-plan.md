@@ -6,7 +6,7 @@ shared response pipeline. Provider contracts, metadata validation, typed
 provider errors, local-scheme HTTP/cache/cookie exclusion, `GET`/`HEAD`
 enforcement, response filtering, null-body handling, cancellation, and
 body-drop cleanup are implemented and tested. The browser installs its
-embedded `byui:` provider through `RequestController::with_providers`.
+embedded `byui:` provider through `RequestController::builder`.
 
 This document tracks only the remaining work for Feature 4.4. Full CORS,
 redirect, cookie, cache, and body-cloning behavior remains in the broader

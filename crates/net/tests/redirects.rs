@@ -15,7 +15,9 @@ fn follow_mode_follows_redirect_and_exposes_final_response() {
                 .to_vec()
         }
     });
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
 
     let response = runtime()
         .block_on(controller.fetch(Request::get(format!("{}/start", server.url()))))
@@ -33,7 +35,9 @@ fn error_mode_rejects_redirect_before_exposing_headers() {
         b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://remote.test/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
     });
 
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
     let mut request = Request::get(server.url());
     request.set_redirect_mode(RedirectMode::Error);
     let error = runtime().block_on(controller.fetch(request)).unwrap_err();
@@ -47,7 +51,9 @@ fn manual_mode_returns_an_opaque_redirect() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 301 Moved Permanently\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
     });
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
     let mut request = Request::get(server.url());
     request.set_redirect_mode(RedirectMode::Manual);
 

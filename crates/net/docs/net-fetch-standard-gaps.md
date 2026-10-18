@@ -186,7 +186,7 @@ provider-neutral `SchemeResource`/`SchemeBody` representation and provider
 traits. Browser/storage/security owners must provide blob registry and
 revocation state, authorized file access and sandbox policy, and registered
 `byui:` page lookup. The browser executable now installs its browser-owned
-`byui:` provider through `RequestController::with_providers`; browser-wide
+`byui:` provider through `RequestController::builder`; browser-wide
 `FetchServices` composition and concrete blob/file providers remain outside
 `net`. Provider errors, provider-assigned origins, metadata
 validation, exact-once provider selection, and cancellation/lifetime behavior
@@ -239,8 +239,8 @@ The semaphore provides concurrency admission, and Fetch priority now reaches the
 
 **Evidence:** [`SchemeProviders`](../src/api/providers/mod.rs) holds optional,
 thread-safe `BlobProvider`, `FileProvider`, and `PageProvider` capabilities;
-[`RequestController::with_services_and_providers`](../src/engine/controller.rs)
-or the provider-only `with_providers` constructor installs them;
+[`RequestController::builder`](../src/engine/controller.rs)
+the builder's `with_scheme_providers` setter installs them;
 [`SchemeResource`](../src/api/providers/body.rs) carries the
 provider-neutral URL, status, headers, origin, media type, and body; and
 [`InternalResponse::from_scheme_resource`](../src/api/response/view.rs)

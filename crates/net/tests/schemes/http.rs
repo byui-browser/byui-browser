@@ -33,7 +33,9 @@ fn unsupported_schemes_fail_before_services_or_providers() {
 
 #[test]
 fn provider_capabilities_are_reported_before_handler_side_effects() {
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
     for (url, provider) in [
         ("blob:https://example.test/id", "blob"),
         ("file:///tmp/page.html", "file"),
