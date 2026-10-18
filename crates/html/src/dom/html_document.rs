@@ -84,8 +84,15 @@ impl HTMLDocument {
         Ok(self.push_node(NodeKind::Element(element), None))
     }
 
-    pub fn text_content(&self, id: NodeId) -> String {
-        fn collect(document: &HTMLDocument, id: NodeId, output: &mut String) {
+    /// Returns the DOM `textContent` value for a node.
+    ///
+    /// Element nodes return the concatenation of descendant text nodes in tree
+    /// order. Text and comment nodes return their own data. Document and
+    /// doctype nodes return `None`, matching the DOM Standard; invalid node IDs
+    /// also return `None`. This is a read-only snapshot and does not mutate the
+    /// document.
+    pub fn text_content(&self, id: NodeId) -> Option<String> {
+        fn descendant_text(document: &HTMLDocument, id: NodeId, output: &mut String) {
             let Some(node) = document.node(id) else {
                 return;
             };
@@ -93,12 +100,22 @@ impl HTMLDocument {
                 output.push_str(text);
             }
             for child in &node.children {
-                collect(document, *child, output);
+                descendant_text(document, *child, output);
             }
         }
-        let mut output = String::new();
-        collect(self, id, &mut output);
-        output
+
+        let node = self.node(id)?;
+        match &node.kind {
+            NodeKind::Element(_) => {
+                let mut output = String::new();
+                for child in &node.children {
+                    descendant_text(self, *child, &mut output);
+                }
+                Some(output)
+            }
+            NodeKind::Text(text) | NodeKind::Comment(text) => Some(text.clone()),
+            NodeKind::Document | NodeKind::Doctype { .. } => None,
+        }
     }
 
     /// Returns the source text of inline `script` elements in tree order.
@@ -114,7 +131,8 @@ impl HTMLDocument {
                 let NodeKind::Element(element) = &node.kind else {
                     return None;
                 };
-                (element.name == "script").then(|| self.text_content(NodeId(index)))
+                (element.name == "script")
+                    .then(|| self.text_content(NodeId(index)).unwrap_or_default())
             })
             .collect()
     }
