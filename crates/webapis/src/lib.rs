@@ -109,6 +109,17 @@ impl Document {
         }
     }
 
+    /// Returns this document node's DOM `textContent` value.
+    ///
+    /// The DOM Standard defines `textContent` for a `Document` as `null`, so
+    /// this method returns `None`. Use [`HTMLDocument::text_content`] with an
+    /// element or character-data node ID to retrieve text from a node.
+    pub fn text_content(&self) -> Option<String> {
+        self.source_document
+            .as_ref()
+            .and_then(|document| document.text_content(document.root))
+    }
+
     /// Implements `document.createElement(localName)` for an HTML document.
     ///
     /// The returned element is detached until a later tree mutation appends
@@ -598,6 +609,17 @@ mod tests {
     #[test]
     fn empty_document_has_no_element_by_id() {
         assert_eq!(super::Document::new().get_element_by_id("main"), None);
+    }
+
+    #[test]
+    fn document_text_content_is_null_per_dom_standard() {
+        let empty = super::Document::new();
+        assert_eq!(empty.text_content(), None);
+
+        let parsed = super::Document::from_html_document(&parse_raw_html(
+            "<main>document text</main>".to_owned(),
+        ));
+        assert_eq!(parsed.text_content(), None);
     }
 
     #[test]
