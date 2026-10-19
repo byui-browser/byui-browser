@@ -5,8 +5,11 @@ use html::{HTMLDocument, NodeKind};
 
 /// The layout-facing projection of an HTML document.
 ///
-/// Until the CSS stage exists, this contains one shared arena index for each
-/// HTML element and no computed style information.
+/// Until the CSS stage exists, this holds one shared arena index for each
+/// visible HTML element and no computed style information. Document
+/// metadata (`html`, `head`, `link`, `meta`, `script`, `style`, `title`) is
+/// omitted, and `body` is kept only when it owns direct non-whitespace text;
+/// see [`StyledDom::from_html_document`] for the rule.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StyledDom {
     /// HTML arena indices represented as layout nodes.

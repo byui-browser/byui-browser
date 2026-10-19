@@ -3,7 +3,7 @@
 Pull requests targeting `main` run the GitHub Actions workflow in
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
 
-The workflow has five checks:
+The workflow has six jobs:
 
 - `lint` runs `cargo fmt --all -- --check` and
   `cargo clippy --workspace --all-targets -- -D warnings`.
