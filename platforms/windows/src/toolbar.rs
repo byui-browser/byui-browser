@@ -138,6 +138,7 @@ pub(super) fn hit_test(x: f64, y: f64, width: f64) -> Option<Control> {
 
 /// Loads the system UI font for toolbar text, or `None` if no known Windows
 /// font file is readable; the chrome then omits its text.
+#[cfg(target_os = "windows")]
 pub(super) fn load_ui_font() -> Option<FontVec> {
     [
         r"C:\Windows\Fonts\segoeui.ttf",
