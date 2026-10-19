@@ -13,12 +13,24 @@ use super::{FileAccessError, FileSystem, OpenedFile};
 /// [`FileAccessPolicy`]. Callers should retain this value instead of
 /// re-authorizing or reconstructing the path from an untrusted URL.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuthorizedPath(PathBuf);
+pub struct AuthorizedPath {
+    canonical: PathBuf,
+    root: PathBuf,
+    relative: PathBuf,
+}
 
 impl AuthorizedPath {
     /// Returns the canonical path approved by the policy.
     pub fn as_path(&self) -> &Path {
-        &self.0
+        &self.canonical
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn relative(&self) -> &Path {
+        &self.relative
     }
 }
 
@@ -42,20 +54,41 @@ impl FileAccessPolicy {
     }
 
     /// Authorizes and canonicalizes one requested path.
+    ///
+    /// A request is allowed only when its canonical path is the configured
+    /// root or a descendant of that root. Canonicalization resolves `..` and
+    /// symlinks before the containment check, so a link that resolves outside
+    /// an allowed root is denied.
+    ///
+    /// This check is not an atomic filesystem-containment operation. Callers
+    /// must open the returned path through a [`FileSystem`] backend that
+    /// preserves the authorization boundary.
     pub fn authorize_path(
         &self,
         requested: impl AsRef<Path>,
     ) -> Result<AuthorizedPath, FileAccessError> {
         let canonical = fs::canonicalize(requested).map_err(FileAccessError::from)?;
-        if self
+        let Some(root) = self
             .allowed_roots
             .iter()
-            .any(|root| canonical.starts_with(root))
-        {
-            Ok(AuthorizedPath(canonical))
-        } else {
-            Err(FileAccessError::Denied)
-        }
+            .filter(|root| is_within_root(&canonical, root))
+            .max_by_key(|root| root.components().count())
+        else {
+            return Err(FileAccessError::Denied);
+        };
+        let relative = canonical
+            .strip_prefix(root)
+            .map(Path::to_path_buf)
+            .map_err(|_| FileAccessError::InvalidPath)?;
+        Ok(AuthorizedPath {
+            canonical,
+            root: root.clone(),
+            relative: if relative.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                relative
+            },
+        })
     }
 
     /// Authorizes `requested` and opens it through `filesystem`.
@@ -73,9 +106,37 @@ impl FileAccessPolicy {
     }
 }
 
+/// Returns whether `candidate` is a root or descendant of `root`.
+///
+/// [`Path::starts_with`] compares path components rather than string prefixes,
+/// which keeps similarly named sibling directories distinct (for example,
+/// `/allowed` and `/allowed-sibling`). Both paths are canonicalized by the
+/// policy before this helper is used.
+fn is_within_root(candidate: &Path, root: &Path) -> bool {
+    candidate.starts_with(root)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
+
+    static NEXT_TEMP_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    fn temporary_directory() -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "byui-browser-file-access-policy-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        directory
+    }
 
     #[test]
     fn empty_policy_denies_existing_paths() {
@@ -84,5 +145,124 @@ mod tests {
             policy.authorize_path(std::env::temp_dir()),
             Err(FileAccessError::Denied)
         );
+    }
+
+    #[test]
+    fn authorizes_allowed_roots_and_descendants_but_not_similarly_named_siblings() {
+        let directory = temporary_directory();
+        let allowed_root = directory.join("allowed");
+        let sibling_root = directory.join("allowed-sibling");
+        let nested_file = allowed_root.join("nested").join("file.txt");
+        let sibling_file = sibling_root.join("file.txt");
+        fs::create_dir(&allowed_root).unwrap();
+        fs::create_dir_all(nested_file.parent().unwrap()).unwrap();
+        fs::create_dir(&sibling_root).unwrap();
+        fs::write(&nested_file, b"allowed").unwrap();
+        fs::write(&sibling_file, b"denied").unwrap();
+        let policy = FileAccessPolicy::new([allowed_root.clone()]).unwrap();
+
+        assert_eq!(
+            policy.authorize_path(&allowed_root).unwrap().as_path(),
+            fs::canonicalize(&allowed_root).unwrap()
+        );
+        assert_eq!(
+            policy.authorize_path(&nested_file).unwrap().as_path(),
+            fs::canonicalize(&nested_file).unwrap()
+        );
+        assert_eq!(
+            policy.authorize_path(&sibling_file),
+            Err(FileAccessError::Denied)
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resolves_traversal_before_authorizing_absolute_paths() {
+        let directory = temporary_directory();
+        let allowed_root = directory.join("allowed");
+        let nested_directory = allowed_root.join("nested");
+        let allowed_file = allowed_root.join("allowed.txt");
+        let outside_file = directory.join("outside.txt");
+        fs::create_dir(&allowed_root).unwrap();
+        fs::create_dir(&nested_directory).unwrap();
+        fs::write(&allowed_file, b"allowed").unwrap();
+        fs::write(&outside_file, b"denied").unwrap();
+        let policy = FileAccessPolicy::new([allowed_root.clone()]).unwrap();
+
+        assert_eq!(
+            policy
+                .authorize_path(nested_directory.join("..").join("allowed.txt"))
+                .unwrap()
+                .as_path(),
+            fs::canonicalize(&allowed_file).unwrap()
+        );
+        assert_eq!(
+            policy.authorize_path(allowed_root.join("..").join("outside.txt")),
+            Err(FileAccessError::Denied)
+        );
+        assert_eq!(
+            policy.authorize_path(&outside_file),
+            Err(FileAccessError::Denied)
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denies_symlinks_that_resolve_outside_the_allowed_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        let allowed_root = directory.join("allowed");
+        let outside_directory = directory.join("outside");
+        let outside_file = outside_directory.join("file.txt");
+        fs::create_dir(&allowed_root).unwrap();
+        fs::create_dir(&outside_directory).unwrap();
+        fs::write(&outside_file, b"denied").unwrap();
+        symlink(&outside_file, allowed_root.join("file-link.txt")).unwrap();
+        symlink(&outside_directory, allowed_root.join("directory-link")).unwrap();
+        let policy = FileAccessPolicy::new([allowed_root.clone()]).unwrap();
+
+        assert_eq!(
+            policy.authorize_path(allowed_root.join("file-link.txt")),
+            Err(FileAccessError::Denied)
+        );
+        assert_eq!(
+            policy.authorize_path(allowed_root.join("directory-link").join("file.txt")),
+            Err(FileAccessError::Denied)
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn containment_distinguishes_windows_drive_and_unc_path_components() {
+        assert!(is_within_root(
+            std::path::Path::new(r"C:\allowed\file.txt"),
+            std::path::Path::new(r"C:\allowed")
+        ));
+        assert!(!is_within_root(
+            std::path::Path::new(r"C:\allowed-sibling\file.txt"),
+            std::path::Path::new(r"C:\allowed")
+        ));
+        assert!(!is_within_root(
+            std::path::Path::new(r"D:\allowed\file.txt"),
+            std::path::Path::new(r"C:\allowed")
+        ));
+        assert!(is_within_root(
+            std::path::Path::new(r"\\server\share\allowed\file.txt"),
+            std::path::Path::new(r"\\server\share\allowed")
+        ));
+        assert!(!is_within_root(
+            std::path::Path::new(r"\\server\share\allowed-sibling\file.txt"),
+            std::path::Path::new(r"\\server\share\allowed")
+        ));
+        assert!(!is_within_root(
+            std::path::Path::new(r"\\server\other-share\allowed\file.txt"),
+            std::path::Path::new(r"\\server\share\allowed")
+        ));
     }
 }
