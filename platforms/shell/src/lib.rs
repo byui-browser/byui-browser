@@ -1,6 +1,7 @@
 //! Window, toolbar, and page rendering shared by the native shells.
 //!
-//! The platform crates (`browser-macos`, `browser-linux`) stay thin: each
+//! The platform crates (`browser-macos`, `browser-linux`,
+//! `byui-browser-windows`) stay thin: each
 //! describes how its window should look through `Platform` and calls `run`.
 //! Everything else, from the winit event loop to the software-painted
 //! chrome and the welcome-page demo, lives here so the shells behave the same
@@ -14,13 +15,13 @@
 // The drawing code is only used by `app`, so on unsupported operating systems
 // it is compiled for tests alone; building it there would otherwise fail
 // `-D warnings` with dead-code errors.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 mod content;
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 mod toolbar;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod app;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub use app::{Platform, run};

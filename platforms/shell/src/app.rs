@@ -99,6 +99,22 @@ impl App {
         }
     }
 
+    fn refresh_hover(&mut self) {
+        let (Some(window), Some((x, y))) = (&self.window, self.cursor) else {
+            return;
+        };
+        let width = window
+            .inner_size()
+            .to_logical::<f64>(window.scale_factor())
+            .width;
+        self.set_hovered(toolbar::hit_test(
+            x,
+            y,
+            width,
+            self.platform.window_controls_inset,
+        ));
+    }
+
     fn activate(&mut self, control: Control) {
         match control {
             Control::Reload => {
@@ -205,6 +221,18 @@ impl App {
             .cursor
             .is_some_and(|(_, y)| y < toolbar::TOOLBAR_HEIGHT)
         {
+            let cursor_control = self.cursor.and_then(|(x, y)| {
+                let width = window
+                    .inner_size()
+                    .to_logical::<f64>(window.scale_factor())
+                    .width;
+                toolbar::hit_test(x, y, width, self.platform.window_controls_inset)
+            });
+            // Disabled controls still occupy toolbar space. Do not let a
+            // click on Back or Forward fall through to dragging or zooming.
+            if cursor_control.is_some() {
+                return;
+            }
             let now = Instant::now();
             let double = self
                 .last_toolbar_click
@@ -258,7 +286,10 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(_)
             | WindowEvent::ScaleFactorChanged { .. }
-            | WindowEvent::ThemeChanged(_) => self.redraw(),
+            | WindowEvent::ThemeChanged(_) => {
+                self.refresh_hover();
+                self.redraw();
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let Some(window) = &self.window else {
                     return;

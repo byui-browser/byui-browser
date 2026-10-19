@@ -41,8 +41,8 @@ presented through `softbuffer` and `winit`.
 
 ## Rendered content demo
 
-The same command above displays **WELCOME TO BYUI BROWSER!** in a light-blue
-block at the top of the page card, with white content beneath it. The startup page is
+The same command above displays **WELCOME TO BYUI BROWSER!** in a near-white
+(`#f2f5fa`) block at the top of the page card, with white content beneath it. The startup page is
 defined as HTML, has a CSS stylesheet parsed by the CSS crate, and runs a
 JavaScript startup script through the JS crate. CSS cascade/layout and DOM
 script bindings are not connected yet, so the current renderer uses its

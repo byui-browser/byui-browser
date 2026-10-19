@@ -8,13 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-render = { workspace = true }
-tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
-ab_glyph = "0.2"
-
-[target.'cfg(target_os = "windows")'.dependencies]
-winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
-softbuffer = { version = "0.4", default-features = false }
+browser-shell = { path = "../shell" }
 
 [[bin]]
 name = "byui-browser-windows"
