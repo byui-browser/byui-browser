@@ -218,4 +218,63 @@ mod tests {
         drop(filesystem);
         fs::remove_dir_all(directory).unwrap();
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_filesystem_denies_a_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        let allowed = directory.join("allowed");
+        let outside = directory.join("outside");
+        let outside_file = outside.join("secret.txt");
+        let link = allowed.join("escape");
+        fs::create_dir(&allowed).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(&outside_file, b"denied").unwrap();
+        symlink(&outside, &link).unwrap();
+        let policy = FileAccessPolicy::new([allowed.clone()]).unwrap();
+        let filesystem = CapFileSystem::new([allowed]).unwrap();
+
+        assert!(matches!(
+            policy.open_file(link.join("secret.txt"), &filesystem),
+            Err(FileAccessError::Denied)
+        ));
+        drop(filesystem);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capability_filesystem_denies_a_junction_escape() {
+        use std::process::Command;
+
+        let directory = temporary_directory();
+        let allowed = directory.join("allowed");
+        let outside = directory.join("outside");
+        let junction = allowed.join("escape");
+        fs::create_dir(&allowed).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), b"denied").unwrap();
+        let status = Command::new("cmd.exe")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                junction.to_str().unwrap(),
+                outside.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "junction creation failed");
+        let policy = FileAccessPolicy::new([allowed.clone()]).unwrap();
+        let filesystem = CapFileSystem::new([allowed]).unwrap();
+
+        assert!(matches!(
+            policy.open_file(junction.join("secret.txt"), &filesystem),
+            Err(FileAccessError::Denied)
+        ));
+        drop(filesystem);
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

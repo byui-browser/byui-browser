@@ -30,8 +30,8 @@ The network engine dispatches `file:` requests only through an installed
 provider, accepts only `GET` and `HEAD`, and does not invoke HTTP transport,
 cookies, or the HTTP cache. It validates provider response metadata and has
 tests for provider-future cancellation, stream cancellation, and unread or
-partially consumed stream cleanup. `SchemeBody::Stream` is therefore available
-to a future filesystem backend.
+partially consumed stream cleanup. `SchemeBody::Stream` is available when the
+filesystem layer later adds streaming.
 
 ### Native containment backend and browser composition
 
@@ -42,25 +42,39 @@ including replacement races, while preserving the retained-handle boundary.
 The browser crate exposes `request_controller`, which installs the file
 provider only when explicit policy and filesystem configuration is supplied.
 
+### Containment and adapter test coverage
+
+Security tests now cover regular-file reads, default-deny behavior, directory
+rejection, Unix symlink escapes, Windows junction escapes, and reads from the
+original opened handle after a pathname replacement. Browser integration tests
+cover explicit provider configuration, allowed reads, denied reads, missing
+files, directories, malformed file URLs, content length, and `GET`/`HEAD`
+behavior.
+
 ## Remaining work
 
-### 1. Expand native containment coverage
+### 1. Validate native containment across platforms
 
-The capability backend is now used for production-configured browser file
-access. Continue platform-specific validation while broadening support:
+`CapFileSystem` is the production filesystem backend. It delegates the
+platform-specific directory-capability and handle-opening details to
+`cap-std`; this project does not need separate `UnixFileSystem` and
+`WindowsFileSystem` implementations unless a future platform requirement is
+not covered by that dependency.
 
-- On Unix, anchor resolution at an opened allowed-root directory and use the
-  strongest available no-follow or open-beneath primitive for every component.
-- On Windows, open through handles that reject reparse-point and junction
-  escapes, including drive-letter and UNC paths.
-- Keep these details behind `FileSystem`; callers continue to receive only an
-  `OpenedFile` and must never reopen an authorized pathname.
-- Define a fail-closed fallback only when it opens once, revalidates that exact
-  handle, and reads from that same handle. Revalidating a pathname and then
+The remaining work is platform-specific validation and regression coverage:
+
+- On Unix, verify symlink, mount, and replacement-race behavior.
+- On Windows, verify junction and reparse-point rejection, including
+  drive-letter and UNC paths.
+- Confirm that all platforms return an `OpenedFile` whose handle is retained
+  for reading and that no caller reopens the authorized pathname.
+- Keep any fallback fail-closed: it may open once, revalidate that exact
+  handle, and read from that same handle. Revalidating a pathname and then
   reopening it is not acceptable.
 
-Add platform-specific regression tests for symlink, junction, and replacement
-races before enabling each backend for browser `file:` access.
+Additional platform coverage is still needed for mount points, hard links,
+network shares, and removable media before expanding the set of filesystem
+features that can be configured as browser file roots.
 
 ### 2. Apply request and origin authorization
 
@@ -132,26 +146,27 @@ and any future request-context authorization.
 Construct the provider explicitly from:
 
 - a configured `FileAccessPolicy`;
-- the platform filesystem backend; and
+- `CapFileSystem` configured with the same allowed roots; and
 - `BrowserFileProvider`.
 
 Install it with `SchemeProviders::with_file(...)` when creating the request
 controller. No roots or policy should mean no file capability; missing lookup
 must never fall back to HTTP or unrestricted filesystem access.
 
-### 8. Add security and browser integration coverage
+### 8. Extend security and browser integration coverage
 
-Keep the existing `net` provider-boundary tests, then add security tests for
-the native backends and browser tests for the concrete adapter. There are not
-yet browser-level tests that exercise `BrowserFileProvider` with a real policy
-and filesystem backend.
+The initial security and browser integration coverage is complete. Keep the
+existing `net` provider-boundary tests and extend the concrete adapter tests as
+new policy and metadata behavior is added.
 
 The minimum matrix is:
 
 - default-deny and allowed-root reads;
-- traversal, sibling-prefix, symlink, junction, and replacement-race rejection;
+- traversal, sibling-prefix, symlink, junction, and replacement-race rejection
+  (covered for the current capability backend);
 - missing, denied, directory, unsupported-file, and I/O failures;
-- valid and invalid media types;
+- valid and invalid media types (once filesystem media-type metadata is
+  configurable);
 - content length and response origin;
 - `GET` and `HEAD` behavior;
 - cancellation and body-drop cleanup; and
@@ -159,8 +174,8 @@ The minimum matrix is:
 
 ## Future hardening
 
-- Retain allowed roots as directory capabilities rather than canonicalized
-  paths where platform support permits it.
+- Extend capability-root handling to additional platform-specific filesystem
+  semantics where `cap-std` does not yet provide the required guarantee.
 - Set explicit file-size, stream-duration, and concurrent-read limits to bound
   resource use by local content.
 - Audit hard-link, mount-point, network-share, and removable-media semantics
