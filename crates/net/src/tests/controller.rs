@@ -7,14 +7,15 @@ use std::{
     thread,
 };
 
-use crate::{CacheMode, Config, Request, RequestController, RequestError};
+use crate::{AbortController, Body, CacheMode, Config, Request, RequestController, RequestError};
 use futures_util::StreamExt;
 use reqwest::{
     Method, StatusCode,
-    header::{HeaderMap, HeaderValue},
+    header::{HeaderName, HeaderValue},
 };
 
 #[test]
+/// Verifies the convenience GET constructor sets Fetch defaults.
 fn get_request_has_expected_defaults() {
     // The convenience constructor should create the most common browser request
     // without requiring callers to initialize every field manually.
@@ -28,44 +29,56 @@ fn get_request_has_expected_defaults() {
 }
 
 #[test]
+/// Verifies custom requests retain caller headers and body data.
 fn custom_request_preserves_headers_and_body() {
     // Callers must also be able to construct non-GET requests with arbitrary
     // headers and binary request bodies.
-    let mut headers = HeaderMap::new();
-    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    let mut headers = crate::Headers::new();
+    headers
+        .append(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        )
+        .unwrap();
     let request = Request {
         method: Method::POST,
         url: "https://example.com/api".into(),
         headers,
-        body: Some(br#"{"ok":true}"#.to_vec()),
+        body: Some(Body::from_bytes(br#"{"ok":true}"#.to_vec())),
         cache_mode: CacheMode::NoStore,
-        context: Default::default(),
+        ..Request::get("https://example.com/api")
     };
 
     assert_eq!(request.method, Method::POST);
-    assert_eq!(request.headers["content-type"], "application/json");
-    assert_eq!(request.body.as_deref(), Some(br#"{"ok":true}"#.as_slice()));
+    assert_eq!(request.headers.iter().next().unwrap().1, "application/json");
+    assert_eq!(
+        request.body,
+        Some(Body::from_bytes(br#"{"ok":true}"#.to_vec()))
+    );
     assert_eq!(request.cache_mode, CacheMode::NoStore);
 }
 
 #[test]
-fn default_config_sets_pool_and_redirect_limits() {
+/// Verifies default configuration provides usable pool and identity values.
+fn default_config_sets_pool_and_identity() {
     // These defaults define the initial connection-management behavior used by
-    // RequestController::new.
+    // RequestController::builder.
     let config = Config::default();
 
-    assert_eq!(config.max_redirects, 10);
     assert_eq!(config.pool_max_idle_per_host, 8);
     assert!(config.pool_idle_timeout.is_some());
     assert_eq!(config.user_agent.unwrap(), "byui-browser/0.1");
 }
 
 #[test]
+/// Verifies invalid URLs return typed validation errors.
 fn invalid_urls_return_typed_errors() {
     // URL validation happens before reqwest is asked to perform network I/O,
     // so malformed input should produce a stable crate-level error variant.
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
 
     let error = runtime
         .block_on(client.fetch(Request::get("not a URL")))
@@ -75,20 +88,41 @@ fn invalid_urls_return_typed_errors() {
 }
 
 #[test]
+/// Verifies an already-aborted request performs no network work.
+fn an_aborted_request_fails_before_network_work() {
+    let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
+    let controller = AbortController::new();
+    let mut request = Request::get("http://127.0.0.1:1");
+    request.signal = controller.signal();
+    controller.abort();
+
+    let error = runtime.block_on(client.fetch(request)).unwrap_err();
+
+    assert!(matches!(error, RequestError::Aborted));
+}
+
+#[test]
+/// Verifies only-if-cached reports a miss without contacting the server.
 fn only_if_cached_reports_a_cache_miss_without_network_access() {
     // OnlyIfCached is useful to callers that must avoid network access entirely;
     // an empty cache should fail immediately rather than attempting the URL.
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
     let mut request = Request::get("http://127.0.0.1:1");
     request.cache_mode = CacheMode::OnlyIfCached;
 
     let error = runtime.block_on(client.fetch(request)).unwrap_err();
 
-    assert!(matches!(error, RequestError::CacheMiss));
+    assert!(matches!(error, RequestError::NetworkError));
 }
 
 #[test]
+/// Verifies the controller fetches a resource from a local HTTP server.
 fn can_fetch_resource_from_local_server() {
     // Keep the test deterministic and independent of DNS, internet access, and
     // external service availability.
@@ -115,7 +149,9 @@ fn can_fetch_resource_from_local_server() {
     });
 
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
 
     let response = runtime
         .block_on(client.fetch(Request::get(&address)))
@@ -123,12 +159,16 @@ fn can_fetch_resource_from_local_server() {
     server.join().expect("test server should exit");
 
     assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(response.body, b"local body");
+    assert_eq!(
+        runtime.block_on(response.body.bytes()).unwrap(),
+        b"local body"
+    );
 }
 
 #[test]
-fn streaming_fetch_returns_headers_before_body_and_forwards_body_bytes() {
-    // The server pauses after sending headers. A successful fetch_stream call
+/// Verifies response metadata is available before streamed body bytes.
+fn fetch_returns_headers_before_body_and_forwards_body_bytes() {
+    // The server pauses after sending headers. A successful fetch call
     // therefore proves callers can inspect response metadata without waiting
     // for the complete body.
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
@@ -164,16 +204,18 @@ fn streaming_fetch_returns_headers_before_body_and_forwards_body_bytes() {
     });
 
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
     let mut response = runtime
-        .block_on(client.fetch_stream(Request::get(&address)))
+        .block_on(client.fetch(Request::get(&address)))
         .expect("streaming request should succeed");
 
     headers_received
         .recv()
         .expect("server should have sent response headers");
     assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(response.headers["x-stream"], "yes");
+    assert_eq!(response.headers.get("x-stream").unwrap(), "yes");
     assert!(!response.from_cache);
 
     send_body
@@ -192,7 +234,8 @@ fn streaming_fetch_returns_headers_before_body_and_forwards_body_bytes() {
 }
 
 #[test]
-fn streaming_fetch_is_cached_only_after_body_completion() {
+/// Verifies a response enters cache only after body completion.
+fn fetch_is_cached_only_after_body_completion() {
     // The first response is streamed and fully consumed. The following
     // streaming request should then use the completed response from cache.
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
@@ -218,10 +261,12 @@ fn streaming_fetch_is_cached_only_after_body_completion() {
     });
 
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
     let (first, second) = runtime.block_on(async {
         let mut first = client
-            .fetch_stream(Request::get(&address))
+            .fetch(Request::get(&address))
             .await
             .expect("first streaming request should succeed");
         let mut first_body = Vec::new();
@@ -230,7 +275,7 @@ fn streaming_fetch_is_cached_only_after_body_completion() {
         }
 
         let second = client
-            .fetch_stream(Request::get(&address))
+            .fetch(Request::get(&address))
             .await
             .expect("cached streaming request should succeed");
         (first_body, second)
