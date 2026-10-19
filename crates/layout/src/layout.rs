@@ -54,4 +54,27 @@ mod tests {
         assert_eq!(tree.root.rect.height, 600.0);
         assert!(tree.root.children.is_empty());
     }
+
+    #[test]
+    fn block_children_have_expected_positions_and_dimensions() {
+        let tree = layout_tree(
+            &StyledDom {
+                nodes: vec![common::ids::NodeId::new(0), common::ids::NodeId::new(1)],
+            },
+            Size {
+                width: 320.0,
+                height: 240.0,
+            },
+        );
+
+        assert_eq!(tree.root.children.len(), 2);
+        assert_eq!(tree.root.children[0].rect.x, 0.0);
+        assert_eq!(tree.root.children[0].rect.y, 0.0);
+        assert_eq!(tree.root.children[0].rect.width, 320.0);
+        assert_eq!(tree.root.children[0].rect.height, 100.0);
+        assert_eq!(tree.root.children[1].rect.x, 0.0);
+        assert_eq!(tree.root.children[1].rect.y, 100.0);
+        assert_eq!(tree.root.children[1].rect.width, 320.0);
+        assert_eq!(tree.root.children[1].rect.height, 100.0);
+    }
 }

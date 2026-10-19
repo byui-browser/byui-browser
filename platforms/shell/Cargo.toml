@@ -23,6 +23,10 @@ ab_glyph = "0.2"
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 softbuffer = { version = "0.4", default-features = false }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+softbuffer = { version = "0.4", default-features = false }
+
 # Both display servers are supported; winit picks Wayland when
 # `WAYLAND_DISPLAY` is set and falls back to X11 (or XWayland) otherwise.
 # `wayland-csd-adwaita` draws a titlebar on compositors such as GNOME's that
