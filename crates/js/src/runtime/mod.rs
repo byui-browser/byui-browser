@@ -100,6 +100,10 @@ struct Binding {
     mutable: bool,
     /// Whether the binding came from `let`, `const`, or a block function.
     lexical: bool,
+    /// Whether the host registered this global and no script has declared it
+    /// since. A script-level `let`/`const` may shadow a host binding but not a
+    /// script-declared one.
+    host: bool,
 }
 
 #[derive(Default)]
@@ -167,9 +171,12 @@ fn already_declared(name: &str) -> JsError {
 /// `var` binding of the same name.
 fn declare_var(scope: &ScopeRef, name: &str) -> JsResult<()> {
     let mut scope = scope.lock_scope();
-    match scope.bindings.get(name) {
+    match scope.bindings.get_mut(name) {
         Some(binding) if binding.lexical => Err(already_declared(name)),
-        Some(_) => Ok(()),
+        Some(binding) => {
+            binding.host = false;
+            Ok(())
+        }
         None => {
             scope.bindings.insert(
                 name.to_owned(),
@@ -177,6 +184,7 @@ fn declare_var(scope: &ScopeRef, name: &str) -> JsResult<()> {
                     value: Some(Value::Undefined),
                     mutable: true,
                     lexical: false,
+                    host: false,
                 },
             );
             Ok(())
@@ -201,6 +209,7 @@ fn declare_lexical(
             value,
             mutable,
             lexical: true,
+            host: false,
         },
     );
     Ok(())
@@ -347,43 +356,128 @@ pub fn evaluate_program_with_step_limit(program: &Program, step_limit: u64) -> J
     )
 }
 
-/// Evaluates a program with caller-provided resource limits.
+/// Evaluates a program with caller-provided resource limits, in a fresh
+/// global state that is discarded afterwards.
 pub fn evaluate_program_with_limits(program: &Program, limits: ExecutionLimits) -> JsResult<Value> {
-    evaluate_program_with_globals(program, &HashMap::new(), &HashMap::new(), limits)
+    GlobalState::new().evaluate(program, limits)
 }
 
-/// Evaluates a program with `functions` and `values` installed in a scope
-/// enclosing the script, so scripts may shadow them with `let`.
-pub(crate) fn evaluate_program_with_globals(
-    program: &Program,
-    functions: &HashMap<String, HostFunction>,
-    values: &HashMap<String, Value>,
-    limits: ExecutionLimits,
-) -> JsResult<Value> {
-    with_engine_stack(|| {
-        let global_scope: ScopeRef = Arc::default();
-        let functions = functions.iter().map(|(name, function)| {
-            let function = Function::from_host(name, Arc::clone(function));
-            (name, Value::Function(function))
-        });
-        let values = values.iter().map(|(name, value)| (name, value.clone()));
-        for (name, value) in functions.chain(values) {
-            global_scope.lock_scope().bindings.insert(
-                name.clone(),
-                Binding {
-                    value: Some(value),
-                    mutable: true,
-                    lexical: false,
-                },
-            );
-        }
-        let script_scope = child_scope(&global_scope);
-        let completion = Interpreter::new(limits).run_body(&script_scope, &program.body)?;
-        Ok(match completion {
-            Completion::Normal(value) => value.unwrap_or(Value::Undefined),
-            Completion::Return(value) => value,
+/// The persistent global environment of one realm.
+///
+/// Globals live in two layers so scripts can be evaluated repeatedly:
+/// `object` holds host globals plus `var` and function declarations, and
+/// `lexical` (a child of `object`) holds top-level `let` and `const`. Lookups
+/// check `lexical` first, so a `let` shadows a host global of the same name.
+pub(crate) struct GlobalState {
+    object: ScopeRef,
+    lexical: ScopeRef,
+}
+
+impl GlobalState {
+    /// Creates an empty global state with no host or script bindings.
+    pub(crate) fn new() -> Self {
+        let object: ScopeRef = Arc::default();
+        let lexical = child_scope(&object);
+        Self { object, lexical }
+    }
+
+    /// Binds a host-provided global, replacing any binding in the object
+    /// layer. A script `let`/`const` of the same name still shadows it.
+    pub(crate) fn install_host(&self, name: &str, value: Value) {
+        self.object.lock_scope().bindings.insert(
+            name.to_owned(),
+            Binding {
+                value: Some(value),
+                mutable: true,
+                lexical: false,
+                host: true,
+            },
+        );
+    }
+
+    /// Evaluates `program` against the persistent globals.
+    ///
+    /// Declarations are validated before any is applied, so a redeclaration
+    /// error leaves the globals untouched. Errors thrown while running keep
+    /// the effects that happened before them, as in JavaScript.
+    pub(crate) fn evaluate(&self, program: &Program, limits: ExecutionLimits) -> JsResult<Value> {
+        with_engine_stack(|| {
+            self.declare_globals(&program.body)?;
+            let completion =
+                Interpreter::new(limits).execute_statements(&self.lexical, &program.body)?;
+            Ok(match completion {
+                Completion::Normal(value) => value.unwrap_or(Value::Undefined),
+                Completion::Return(value) => value,
+            })
         })
-    })
+    }
+
+    /// Global declaration instantiation: checks every conflict first, then
+    /// hoists `var`s, functions, and uninitialized `let`/`const` bindings.
+    fn declare_globals(&self, statements: &[Statement]) -> JsResult<()> {
+        let probe: ScopeRef = Arc::default();
+        hoist_var_declarations(&probe, statements)?;
+        let mut var_names: Vec<String> = probe.lock_scope().bindings.keys().cloned().collect();
+        let mut lexical_names: Vec<&str> = Vec::new();
+        for statement in statements {
+            match statement {
+                Statement::FunctionDeclaration { name, .. } => var_names.push(name.clone()),
+                Statement::VariableDeclaration {
+                    kind: VarKind::Let | VarKind::Const,
+                    name,
+                    ..
+                } => lexical_names.push(name),
+                _ => {}
+            }
+        }
+
+        {
+            let lexical = self.lexical.lock_scope();
+            let object = self.object.lock_scope();
+            for (index, name) in lexical_names.iter().enumerate() {
+                let conflicts = lexical_names[..index].contains(name)
+                    || var_names.iter().any(|var| var == name)
+                    || lexical.bindings.contains_key(*name)
+                    || object
+                        .bindings
+                        .get(*name)
+                        .is_some_and(|binding| !binding.host);
+                if conflicts {
+                    return Err(already_declared(name));
+                }
+            }
+            if let Some(name) = var_names
+                .iter()
+                .find(|name| lexical.bindings.contains_key(name.as_str()))
+            {
+                return Err(already_declared(name));
+            }
+        }
+
+        for name in &var_names {
+            declare_var(&self.object, name)?;
+        }
+        for statement in statements {
+            match statement {
+                Statement::VariableDeclaration {
+                    kind: kind @ (VarKind::Let | VarKind::Const),
+                    name,
+                    ..
+                } => declare_lexical(&self.lexical, name, *kind == VarKind::Let, None)?,
+                Statement::FunctionDeclaration { name, params, body } => {
+                    let function = Value::Function(Function(Arc::new(FunctionKind::Script {
+                        name: name.clone(),
+                        params: params.clone(),
+                        body: body.clone(),
+                        closure: Arc::clone(&self.lexical),
+                    })));
+                    initialize(&self.object, name, function);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Evaluates one expression in a fresh, empty environment.

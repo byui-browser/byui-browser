@@ -587,12 +587,12 @@ fn host_errors_propagate_unchanged_and_stop_the_script() {
 }
 
 #[test]
-fn each_realm_script_starts_with_fresh_script_bindings() {
+fn realm_script_bindings_persist_between_scripts() {
     let (realm, _) = counting_realm();
     realm.evaluate_script("let kept = 1;").unwrap();
-    let error = realm.evaluate_script("kept").unwrap_err();
-    assert_eq!(error.message, "`kept` is not defined");
-    assert_eq!(realm.evaluate_script("let kept = 2; kept"), number(2.0));
+    assert_eq!(realm.evaluate_script("kept"), number(1.0));
+    let error = realm.evaluate_script("let kept = 2;").unwrap_err();
+    assert_eq!(error.message, "`kept` has already been declared");
 }
 
 // Intentionally unsupported JavaScript --------------------------------------------
