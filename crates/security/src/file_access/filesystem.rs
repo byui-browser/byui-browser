@@ -1,6 +1,14 @@
 //! Filesystem abstraction used to open files approved by security policy.
 
-use std::{fs, io::Read, sync::Arc};
+use std::{
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 
 use super::{AuthorizedPath, FileAccessError};
 
@@ -51,20 +59,46 @@ pub trait FileSystem: Send + Sync {
     fn open(&self, path: &AuthorizedPath) -> Result<OpenedFile, FileAccessError>;
 }
 
-/// Standard-library filesystem implementation for the initial browser shell.
+/// Capability-oriented filesystem backend for browser-authorized files.
 ///
-/// This backend keeps and reads the file handle it opens, preventing a second
-/// pathname lookup after opening. It is intentionally a partial platform
-/// backend: `std::fs::File::open` cannot enforce no-follow/open-beneath
-/// resolution for every path component. Production platform backends must use
-/// their native containment primitive before this type is used for untrusted
-/// paths.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LocalFileSystem;
+/// Each configured root is opened as a directory capability. Requests are
+/// then resolved relative to that capability, so path components cannot
+/// escape through a junction or symlink race. The roots passed here must be
+/// the same configured roots used to construct the corresponding
+/// [`FileAccessPolicy`].
+#[derive(Debug)]
+pub struct CapFileSystem {
+    roots: Vec<(PathBuf, Dir)>,
+}
 
-impl FileSystem for LocalFileSystem {
+impl CapFileSystem {
+    /// Opens directory capabilities for the configured allowed roots.
+    pub fn new(allowed_roots: impl IntoIterator<Item = PathBuf>) -> Result<Self, FileAccessError> {
+        let roots = allowed_roots
+            .into_iter()
+            .map(|root| {
+                let canonical = fs::canonicalize(root).map_err(FileAccessError::from)?;
+                let directory = Dir::open_ambient_dir(&canonical, ambient_authority())
+                    .map_err(FileAccessError::from)?;
+                Ok((canonical, directory))
+            })
+            .collect::<Result<Vec<_>, FileAccessError>>()?;
+        Ok(Self { roots })
+    }
+}
+
+impl FileSystem for CapFileSystem {
     fn open(&self, path: &AuthorizedPath) -> Result<OpenedFile, FileAccessError> {
-        let file = fs::File::open(path.as_path()).map_err(FileAccessError::from)?;
+        if path.relative() == Path::new(".") {
+            return Err(FileAccessError::UnsupportedFile);
+        }
+        let (_, root) = self
+            .roots
+            .iter()
+            .find(|(configured_root, _)| configured_root == path.root())
+            .ok_or(FileAccessError::Denied)?;
+        let file = root.open(path.relative()).map_err(FileAccessError::from)?;
+        let file = file.into_std();
         if !file
             .metadata()
             .map_err(FileAccessError::from)?
@@ -106,49 +140,82 @@ mod tests {
     }
 
     #[test]
-    fn local_filesystem_reads_regular_files_from_opened_handles() {
+    fn capability_filesystem_reads_regular_files_from_opened_handles() {
         let directory = temporary_directory();
         let path = directory.join("allowed.txt");
         fs::write(&path, b"authorized bytes").unwrap();
         let policy = FileAccessPolicy::new([directory.clone()]).unwrap();
+        let filesystem = CapFileSystem::new([directory.clone()]).unwrap();
 
         let resource = policy
-            .open_file(&path, &LocalFileSystem)
+            .open_file(&path, &filesystem)
             .unwrap()
             .read_all()
             .unwrap();
 
         assert_eq!(resource.bytes, b"authorized bytes");
+        drop(filesystem);
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn local_filesystem_rejects_directories() {
+    fn capability_filesystem_reads_only_from_the_configured_root() {
+        let directory = temporary_directory();
+        let allowed = directory.join("allowed");
+        let outside = directory.join("outside.txt");
+        let path = allowed.join("nested.txt");
+        fs::create_dir(&allowed).unwrap();
+        fs::write(&path, b"authorized bytes").unwrap();
+        fs::write(&outside, b"denied bytes").unwrap();
+        let policy = FileAccessPolicy::new([allowed.clone()]).unwrap();
+        let filesystem = CapFileSystem::new([allowed.clone()]).unwrap();
+
+        let resource = policy
+            .open_file(&path, &filesystem)
+            .unwrap()
+            .read_all()
+            .unwrap();
+
+        assert_eq!(resource.bytes, b"authorized bytes");
+        assert!(matches!(
+            policy.open_file(&outside, &filesystem),
+            Err(FileAccessError::Denied)
+        ));
+        drop(filesystem);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn capability_filesystem_rejects_directories() {
         let directory = temporary_directory();
         let policy = FileAccessPolicy::new([directory.clone()]).unwrap();
+        let filesystem = CapFileSystem::new([directory.clone()]).unwrap();
         let authorized = policy.authorize_path(&directory).unwrap();
 
         assert!(matches!(
-            LocalFileSystem.open(&authorized),
-            Err(FileAccessError::UnsupportedFile | FileAccessError::Denied)
+            filesystem.open(&authorized),
+            Err(FileAccessError::UnsupportedFile)
         ));
+        drop(filesystem);
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
-    fn opened_handle_reads_original_file_after_path_replacement() {
+    fn capability_filesystem_reads_the_opened_file_after_path_replacement() {
         let directory = temporary_directory();
         let path = directory.join("allowed.txt");
         let replacement = directory.join("replacement.txt");
         fs::write(&path, b"authorized bytes").unwrap();
         fs::write(&replacement, b"replacement bytes").unwrap();
         let policy = FileAccessPolicy::new([directory.clone()]).unwrap();
+        let filesystem = CapFileSystem::new([directory.clone()]).unwrap();
 
-        let opened = policy.open_file(&path, &LocalFileSystem).unwrap();
+        let opened = policy.open_file(&path, &filesystem).unwrap();
         fs::rename(&replacement, &path).unwrap();
 
         assert_eq!(opened.read_all().unwrap().bytes, b"authorized bytes");
+        drop(filesystem);
         fs::remove_dir_all(directory).unwrap();
     }
 }

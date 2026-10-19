@@ -13,8 +13,8 @@ move filesystem policy into `net`.
 adapter uses this path, so it no longer authorizes a pathname and subsequently
 reads it with `fs::read`.
 
-`LocalFileSystem` rejects non-regular files when the platform allows it to
-inspect the opened handle. It remains a partial backend, as described below.
+`CapFileSystem` rejects non-regular files and resolves paths through opened
+allowed-root capabilities rather than reopening authorized absolute paths.
 
 ### Policy coverage
 
@@ -33,14 +33,21 @@ tests for provider-future cancellation, stream cancellation, and unread or
 partially consumed stream cleanup. `SchemeBody::Stream` is therefore available
 to a future filesystem backend.
 
+### Native containment backend and browser composition
+
+`CapFileSystem` opens each configured root as a capability directory and
+resolves authorized paths relative to that directory. This supplies the
+multi-component containment needed to reject junction and symlink escapes,
+including replacement races, while preserving the retained-handle boundary.
+The browser crate exposes `request_controller`, which installs the file
+provider only when explicit policy and filesystem configuration is supplied.
+
 ## Remaining work
 
-### 1. Implement native path-containment backends
+### 1. Expand native containment coverage
 
-The retained-handle model prevents a second pathname lookup after opening, but
-the standard-library backend cannot atomically constrain path resolution.
-Replace it in production with platform backends that enforce containment while
-opening the file:
+The capability backend is now used for production-configured browser file
+access. Continue platform-specific validation while broadening support:
 
 - On Unix, anchor resolution at an opened allowed-root directory and use the
   strongest available no-follow or open-beneath primitive for every component.
@@ -163,10 +170,7 @@ The minimum matrix is:
 
 ## Recommended order
 
-1. Implement and validate native path-containment backends, including Windows
-   junction/reparse-point coverage.
-2. Add browser-adapter tests for the real policy and backend, then wire the
-   provider into browser composition behind explicit configuration.
-3. Add request/origin authorization.
-4. Introduce asynchronous reading and streaming from the retained handle.
-5. Finish metadata, error mapping, origin policy, and conformance coverage.
+1. Expand platform-specific junction/reparse-point coverage.
+2. Add request/origin authorization.
+3. Introduce asynchronous reading and streaming from the retained handle.
+4. Finish metadata, error mapping, origin policy, and conformance coverage.

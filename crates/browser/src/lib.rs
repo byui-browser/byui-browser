@@ -8,10 +8,32 @@ use std::sync::Arc;
 use html::Query;
 use js::{JsResult, Realm, Value};
 use net::{Request, RequestController, SchemeProviders};
+use security::file_access::{FileAccessPolicy, SharedFileSystem};
 use webapis::{ConsoleSink, register_fetch, register_print};
 
 pub mod byui_provider;
 pub mod file_provider;
+
+/// Builds a browser request controller with the built-in page provider and an
+/// optional explicitly configured local-file capability.
+///
+/// When `file_access` is `None`, no `file:` provider is installed. When it is
+/// present, callers must supply the policy and filesystem backend that enforce
+/// the allowed roots; this function does not infer roots from process state.
+pub fn request_controller(
+    file_access: Option<(Arc<FileAccessPolicy>, SharedFileSystem)>,
+) -> Arc<RequestController> {
+    let mut providers = SchemeProviders::new().with_page(byui_provider::provider());
+    if let Some((policy, filesystem)) = file_access {
+        providers = providers.with_file(file_provider::provider(policy, filesystem));
+    }
+    Arc::new(
+        RequestController::builder(net::Config::default())
+            .with_scheme_providers(providers)
+            .build()
+            .expect("network controller should initialize"),
+    )
+}
 
 /// A browser page and the resources referenced by its HTML source.
 ///
@@ -30,10 +52,7 @@ pub struct Page {
 
 /// Loads the welcome page and resolves its local stylesheet and script links.
 pub fn welcome_page() -> Page {
-    let controller = RequestController::builder(net::Config::default())
-        .with_scheme_providers(SchemeProviders::new().with_page(byui_provider::provider()))
-        .build()
-        .expect("network controller should initialize");
+    let controller = request_controller(None);
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
     let html = runtime
         .block_on(fetch_text(&controller, "byui://welcome/page"))

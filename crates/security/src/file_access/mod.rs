@@ -9,5 +9,5 @@ mod filesystem;
 mod policy;
 
 pub use error::FileAccessError;
-pub use filesystem::{FileResource, FileSystem, LocalFileSystem, OpenedFile, SharedFileSystem};
+pub use filesystem::{CapFileSystem, FileResource, FileSystem, OpenedFile, SharedFileSystem};
 pub use policy::{AuthorizedPath, FileAccessPolicy};

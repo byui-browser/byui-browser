@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use browser::evaluate_page_scripts;
+use browser::{evaluate_page_scripts, request_controller};
 use webapis::ConsoleSink;
 
 struct StdoutConsole;
@@ -22,13 +22,7 @@ impl ConsoleSink for StdoutConsole {
 fn main() {
     // Keep the standalone binary useful while native platform shells are
     // brought online. `make run` selects the platform shell below.
-    let providers = net::SchemeProviders::new().with_page(browser::byui_provider::provider());
-    let controller = Arc::new(
-        net::RequestController::builder(net::Config::default())
-            .with_scheme_providers(providers)
-            .build()
-            .expect("network client should initialize"),
-    );
+    let controller = request_controller(None);
     evaluate_page_scripts(
         "<script>print()</script>",
         Arc::new(StdoutConsole),
