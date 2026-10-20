@@ -47,6 +47,10 @@ struct App {
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     font: Option<FontVec>,
     chrome: ChromeState,
+    /// Session history shared by all desktop platforms.
+    browser_state: chrome::BrowserState,
+    /// Loaded document, retained independently of the size-dependent pixmap.
+    loaded_page: Option<browser::Page>,
     /// Pointer position in logical pixels while it is over the window.
     cursor: Option<(f64, f64)>,
     /// The rendered page and the device size it was rendered for.
@@ -71,6 +75,8 @@ impl App {
                 ..ChromeState::default()
             },
             cursor: None,
+            browser_state: chrome::BrowserState::new(),
+            loaded_page: None,
             page: None,
             frame: Vec::new(),
             frame_key: None,
@@ -81,6 +87,26 @@ impl App {
     fn redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
+        }
+    }
+
+    /// Accepts a successfully loaded document and records one visit.
+    ///
+    /// Future navigation should call this only after loading succeeds.
+    /// Repaints and Reload must not call it. The current loader and renderer
+    /// support only the welcome page; this method does not implement navigation.
+    fn page_loaded(&mut self, url: &str, page: browser::Page) {
+        self.loaded_page = Some(page);
+        self.browser_state.record_visit(url);
+        self.page = None;
+        self.redraw();
+    }
+
+    fn ensure_welcome_loaded(&mut self) {
+        if self.loaded_page.is_none() {
+            // Record only after the existing loader returns successfully.
+            let page = browser::welcome_page();
+            self.page_loaded("byui://welcome", page);
         }
     }
 
@@ -132,6 +158,10 @@ impl App {
     }
 
     fn paint(&mut self) {
+        if self.window.is_none() || self.surface.is_none() {
+            return;
+        }
+        self.ensure_welcome_loaded();
         let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
             return;
         };
@@ -148,8 +178,13 @@ impl App {
         let mut full = self.page.is_none();
         if self.page.as_ref().map(|(size, _)| *size) != card_size {
             self.page = card.and_then(|card| {
-                crate::content::render_page(card.width, card.height, scale)
-                    .map(|page| ((card.width, card.height), page))
+                crate::content::render_page(
+                    self.loaded_page.as_ref().expect("page was loaded"),
+                    card.width,
+                    card.height,
+                    scale,
+                )
+                .map(|page| ((card.width, card.height), page))
             });
             full = true;
         }
@@ -328,4 +363,72 @@ pub fn run(platform: Platform) -> Result<(), EventLoopError> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop.run_app(&mut App::new(platform))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(Platform {
+            configure_window: |attributes| attributes,
+            ui_font_files: Vec::new,
+            window_controls_inset: 0.0,
+        })
+    }
+
+    #[test]
+    fn welcome_is_recorded_only_after_loading() {
+        let mut app = app();
+        assert!(app.loaded_page.is_none());
+        assert!(app.browser_state.visited_urls().is_empty());
+
+        app.ensure_welcome_loaded();
+
+        assert!(app.loaded_page.is_some());
+        assert_eq!(app.browser_state.current_url(), Some("byui://welcome"));
+        assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);
+    }
+
+    #[test]
+    fn repaint_resize_and_reload_do_not_record_visits() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let original = app.loaded_page.clone();
+
+        // Exercise the same load guard and renderer used by paint, including
+        // an empty content area, changed dimensions, and a changed scale.
+        for (width, height, scale) in [(0, 0, 1.0), (160, 120, 1.0), (320, 240, 2.0)] {
+            app.ensure_welcome_loaded();
+            let rendered = crate::content::render_page(
+                app.loaded_page.as_ref().unwrap(),
+                width,
+                height,
+                scale,
+            );
+            assert_eq!(rendered.is_some(), width > 0 && height > 0);
+            app.page = rendered.map(|page| ((width, height), page));
+            app.activate(Control::Reload);
+            assert!(app.page.is_none());
+            app.ensure_welcome_loaded();
+        }
+
+        assert_eq!(app.loaded_page, original);
+        assert_eq!(app.browser_state.current_url(), Some("byui://welcome"));
+        assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);
+    }
+
+    #[test]
+    fn successful_page_completions_record_repeated_visits() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        // A distinct successful visit to the same page is retained; unlike
+        // Reload it explicitly passes through the page-completion boundary.
+        app.page_loaded("byui://welcome", browser::welcome_page());
+        assert_eq!(app.browser_state.current_url(), Some("byui://welcome"));
+        assert_eq!(
+            app.browser_state.visited_urls(),
+            &["byui://welcome", "byui://welcome"]
+        );
+    }
 }
