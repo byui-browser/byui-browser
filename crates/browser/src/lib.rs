@@ -8,7 +8,10 @@ use std::sync::Arc;
 use html::Query;
 use js::{JsResult, Realm, Value};
 use net::{Request, RequestController, SchemeProviders};
-use webapis::{ConsoleSink, Document, register_document, register_fetch, register_print};
+use webapis::{
+    AlertSink, ConsoleSink, Document, register_alert, register_document, register_fetch,
+    register_print,
+};
 
 pub mod byui_provider;
 
@@ -105,11 +108,13 @@ impl ElementAttributes for html::NodeKind {
 pub fn evaluate_page_scripts(
     html_source: &str,
     console: Arc<dyn ConsoleSink>,
+    alert_sink: Arc<dyn AlertSink>,
     controller: Arc<RequestController>,
 ) -> JsResult<Vec<Value>> {
     let document = html::parse_raw_html(html_source.to_owned());
     let mut realm = Realm::new();
     register_print(&mut realm, console)?;
+    register_alert(&mut realm, alert_sink)?;
     register_fetch(&mut realm, controller)?;
     register_document(&mut realm, Document::from_html_document(&document))?;
 
