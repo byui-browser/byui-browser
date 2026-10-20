@@ -7,3 +7,23 @@ pub struct Node {
     pub kind: NodeKind,
     pub span: Option<SourceSpan>,
 }
+
+impl Node {
+
+    pub fn new() -> Self{
+        return Self {
+            parent: Option::None,
+            children: vec![],
+            kind: NodeKind::None,
+            span: Option::None
+        };
+    }
+
+    pub fn append_child(node : Node){
+
+    }
+
+    pub fn remove() {
+        
+    }
+}
