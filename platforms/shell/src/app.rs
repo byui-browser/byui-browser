@@ -54,8 +54,9 @@ struct App {
     /// Last presented window contents in softbuffer's 0x00RRGGBB format,
     /// kept so chrome-only changes repaint just the toolbar strip.
     frame: Vec<u32>,
-    /// Window size, scale-factor bits, and theme `frame` was painted for.
-    frame_key: Option<(u32, u32, u64, bool)>,
+    /// Window size, scale-factor bits, theme, and popover state `frame` was
+    /// painted for.
+    frame_key: Option<(u32, u32, u64, bool, bool)>,
     last_toolbar_click: Option<Instant>,
 }
 
@@ -121,6 +122,10 @@ impl App {
                 self.page = None;
                 self.redraw();
             }
+            Control::Security => {
+                self.chrome.security_popover = !self.chrome.security_popover;
+                self.redraw();
+            }
             // Navigation, tabs, address entry, and the menu are not
             // implemented yet; these controls only give visual feedback.
             Control::Back
@@ -153,7 +158,13 @@ impl App {
             });
             full = true;
         }
-        let key = (size.width, size.height, scale.to_bits(), self.chrome.dark);
+        let key = (
+            size.width,
+            size.height,
+            scale.to_bits(),
+            self.chrome.dark,
+            self.chrome.security_popover,
+        );
         if self.frame_key != Some(key) {
             full = true;
         }
@@ -214,6 +225,10 @@ impl App {
         let Some(window) = &self.window else {
             return;
         };
+        if self.chrome.security_popover && self.chrome.hovered != Some(Control::Security) {
+            self.chrome.security_popover = false;
+            self.redraw();
+        }
         if let Some(control) = self.chrome.hovered {
             self.chrome.pressed = Some(control);
             self.redraw();

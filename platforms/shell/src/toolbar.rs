@@ -6,8 +6,8 @@
 //! a transparent titlebar) the controls shift right by
 //! [`ChromeState::window_controls_inset`]. Navigation is not implemented yet:
 //! Back and Forward are drawn disabled, and Reload, the address field, New
-//! Tab, and the menu only show hover and press feedback. The address text is a
-//! fixed label for the welcome page.
+//! Tab, and the menu only show hover and press feedback. The address text and
+//! connection details are fixed for the welcome page.
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform};
@@ -38,6 +38,8 @@ const TRAILING_MIN_WIDTH: f32 = 360.0;
 const TEXT_SIZE: f32 = 13.0;
 const ADDRESS_SCHEME: &str = "byui://";
 const ADDRESS_PAGE: &str = "welcome";
+const SECURITY_POPOVER_WIDTH: f32 = 320.0;
+const SECURITY_POPOVER_HEIGHT: f32 = 224.0;
 
 /// A clickable region of the chrome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +52,8 @@ pub(crate) enum Control {
     Reload,
     /// Address field; text entry is not implemented yet.
     Address,
+    /// Connection lock at the leading edge of the address field.
+    Security,
     /// New tab placeholder; tabs are not implemented yet.
     NewTab,
     /// Overflow menu placeholder.
@@ -86,6 +90,8 @@ pub(crate) struct ChromeState {
     /// traffic lights do on a transparent titlebar. Zero when the system draws
     /// its buttons in a separate titlebar above the toolbar.
     pub window_controls_inset: f32,
+    /// Whether the connection details popover is visible.
+    pub security_popover: bool,
 }
 
 /// A rectangle in device pixels.
@@ -121,6 +127,12 @@ pub(crate) fn page_rect(width: u32, height: u32, scale_factor: f64) -> Option<Pi
 /// `inset` logical pixels in (see [`ChromeState::window_controls_inset`]).
 pub(crate) fn hit_test(x: f64, y: f64, width: f64, inset: f32) -> Option<Control> {
     let (x, y) = (x as f32, y as f32);
+    if let Some(address) = control_rect(Control::Address, width as f32, inset) {
+        let lock = Rect::from_xywh(address.x(), address.y(), 34.0, address.height())?;
+        if x >= lock.left() && x < lock.right() && y >= lock.top() && y < lock.bottom() {
+            return Some(Control::Security);
+        }
+    }
     CONTROLS.into_iter().find(|control| {
         control_rect(*control, width as f32, inset).is_some_and(|rect| {
             x >= rect.left() && x < rect.right() && y >= rect.top() && y < rect.bottom()
@@ -176,6 +188,16 @@ pub(crate) fn compose(
         palette,
         font,
     );
+    if state.security_popover {
+        draw_security_popover(
+            &mut pixmap,
+            width as f32 / scale,
+            scale,
+            state,
+            palette,
+            font,
+        );
+    }
     Some(pixmap)
 }
 
@@ -422,7 +444,7 @@ fn draw_address_field(
     font: Option<&FontVec>,
 ) {
     let transform = Transform::from_scale(scale, scale);
-    let hovered = state.hovered == Some(Control::Address);
+    let hovered = matches!(state.hovered, Some(Control::Address | Control::Security));
     let Some(shape) = rounded_rect(rect.x(), rect.y(), rect.width(), rect.height(), 10.0) else {
         return;
     };
@@ -498,6 +520,125 @@ fn draw_address_field(
             clip,
             palette.text,
             ADDRESS_PAGE,
+        );
+    }
+}
+
+fn draw_security_popover(
+    pixmap: &mut Pixmap,
+    width: f32,
+    scale: f32,
+    state: &ChromeState,
+    palette: &Palette,
+    font: Option<&FontVec>,
+) {
+    let Some(address) = control_rect(Control::Address, width, state.window_controls_inset) else {
+        return;
+    };
+    let x = (address.x() - 4.0).clamp(8.0, (width - SECURITY_POPOVER_WIDTH - 8.0).max(8.0));
+    let y = TOOLBAR_HEIGHT as f32 + 8.0;
+    let transform = Transform::from_scale(scale, scale);
+    if let Some(shadow) = rounded_rect(
+        x + 2.0,
+        y + 3.0,
+        SECURITY_POPOVER_WIDTH,
+        SECURITY_POPOVER_HEIGHT,
+        12.0,
+    ) {
+        fill(pixmap, &shadow, palette.shadow, transform);
+    }
+    let Some(panel) = rounded_rect(x, y, SECURITY_POPOVER_WIDTH, SECURITY_POPOVER_HEIGHT, 12.0)
+    else {
+        return;
+    };
+    fill(pixmap, &panel, palette.field_hover, transform);
+    stroke(pixmap, &panel, palette.field_border, 1.0 / scale, transform);
+
+    if let Some(font) = font {
+        let body = palette.text;
+        let muted = palette.text_muted;
+        let size = TEXT_SIZE * scale;
+        let small = 11.0 * scale;
+        let baseline = |logical_y: f32| logical_y * scale;
+        draw_text(
+            pixmap,
+            font,
+            16.0 * scale,
+            (x + 20.0) * scale,
+            baseline(y + 31.0),
+            f32::MAX,
+            body,
+            "Connection is secure",
+        );
+        draw_text(
+            pixmap,
+            font,
+            small,
+            (x + 20.0) * scale,
+            baseline(y + 53.0),
+            f32::MAX,
+            muted,
+            "This page is using a secure connection.",
+        );
+        draw_text(
+            pixmap,
+            font,
+            size,
+            (x + 20.0) * scale,
+            baseline(y + 84.0),
+            f32::MAX,
+            body,
+            "Certificate",
+        );
+        draw_text(
+            pixmap,
+            font,
+            small,
+            (x + 20.0) * scale,
+            baseline(y + 105.0),
+            f32::MAX,
+            muted,
+            "Issued to: byui://welcome",
+        );
+        draw_text(
+            pixmap,
+            font,
+            small,
+            (x + 20.0) * scale,
+            baseline(y + 124.0),
+            f32::MAX,
+            muted,
+            "Issued by: BYUI Browser",
+        );
+        draw_text(
+            pixmap,
+            font,
+            small,
+            (x + 20.0) * scale,
+            baseline(y + 143.0),
+            f32::MAX,
+            muted,
+            "Valid: browser-managed",
+        );
+        draw_text(
+            pixmap,
+            font,
+            size,
+            (x + 20.0) * scale,
+            baseline(y + 178.0),
+            f32::MAX,
+            body,
+            "URL",
+        );
+        draw_text(
+            pixmap,
+            font,
+            small,
+            (x + 20.0) * scale,
+            baseline(y + 199.0),
+            f32::MAX,
+            muted,
+            "byui://welcome",
         );
     }
 }
@@ -582,6 +723,7 @@ fn control_rect(control: Control, width: f32, inset: f32) -> Option<Rect> {
                 ADDRESS_HEIGHT,
             )
         }
+        Control::Security => None,
     }
 }
 
@@ -734,6 +876,7 @@ mod tests {
     fn hit_testing_finds_toolbar_controls() {
         assert_eq!(hit_test(26.0, 26.0, 1000.0, 0.0), Some(Control::Back));
         assert_eq!(hit_test(90.0, 26.0, 1000.0, 0.0), Some(Control::Reload));
+        assert_eq!(hit_test(190.0, 26.0, 1000.0, 0.0), Some(Control::Security));
         assert_eq!(hit_test(500.0, 26.0, 1000.0, 0.0), Some(Control::Address));
         assert_eq!(
             hit_test(1000.0 - 30.0, 26.0, 1000.0, 0.0),
@@ -792,12 +935,23 @@ mod tests {
                         pressed: hovered,
                         dark,
                         window_controls_inset: if dark { 72.0 } else { 0.0 },
+                        ..ChromeState::default()
                     };
                     let out = compose(width, height, 1.5, &state, None, None).unwrap();
                     assert_eq!(out.width(), width);
                 }
             }
         }
+    }
+
+    #[test]
+    fn security_popover_paints_below_toolbar() {
+        let state = ChromeState {
+            security_popover: true,
+            ..ChromeState::default()
+        };
+        let out = compose(640, 480, 1.0, &state, None, None).unwrap();
+        assert_ne!(pixel(&out, 190, 80), pixel(&out, 190, 40));
     }
 
     #[test]
