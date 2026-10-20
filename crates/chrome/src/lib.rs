@@ -7,6 +7,10 @@
 
 #![forbid(unsafe_code)]
 
+mod state;
+
+pub use state::BrowserState;
+
 /// Label for a newly opened tab before navigating to a page.
 pub const DEFAULT_TAB_TITLE: &str = "New Tab";
 

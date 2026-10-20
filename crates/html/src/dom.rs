@@ -12,7 +12,9 @@ pub mod attribute;
 pub mod namespace;
 
 pub mod dom_error;
+pub mod dom_token_list;
 
+pub use dom_token_list::DOMTokenList;
 pub use {
     attribute::Attribute, dom_error::DomError, element_data::ElementData,
     html_document::HTMLDocument, namespace::Namespace, node::Node, node_id::NodeId,

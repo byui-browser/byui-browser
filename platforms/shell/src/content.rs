@@ -36,26 +36,26 @@ impl ConsoleSink for NoopConsole {
 }
 
 fn render_demo(
+    page: &browser::Page,
     width: u32,
     height: u32,
     alert_sink: Arc<dyn AlertSink>,
     scripts_evaluated: &mut bool,
 ) -> Frame {
-    let page = browser::welcome_page();
     let stylesheet = css::parse_stylesheet(&page.css);
     assert!(
         !stylesheet.rules.is_empty(),
         "the welcome page should have a stylesheet"
     );
     if !*scripts_evaluated {
-        let script_result = evaluate_page_script(&page, Arc::clone(&alert_sink));
+        let script_result = evaluate_page_script(page, Arc::clone(&alert_sink));
         assert_eq!(
             script_result.as_slice(),
             [js::Value::String("Welcome to BYUI Browser!".into())]
         );
         *scripts_evaluated = true;
     }
-    render_document(&page, width, height, alert_sink, scripts_evaluated)
+    render_document(page, width, height, alert_sink, scripts_evaluated)
 }
 
 fn render_document(
@@ -100,6 +100,7 @@ fn evaluate_page_script(page: &Page, alert_sink: Arc<dyn AlertSink>) -> Vec<js::
 /// bitmap font at a consistent logical size on Retina. Returns `None` for an
 /// empty area.
 pub(crate) fn render_page(
+    page: &browser::Page,
     width: u32,
     height: u32,
     scale_factor: f64,
@@ -108,6 +109,7 @@ pub(crate) fn render_page(
 ) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(width, height)?;
     let frame = render_demo(
+        page,
         (width as f64 / scale_factor).ceil() as u32,
         (height as f64 / scale_factor).ceil() as u32,
         alert_sink,
@@ -143,8 +145,9 @@ mod tests {
 
     #[test]
     fn demo_produces_layout_background_and_renderer_text() {
+        let page = browser::welcome_page();
         let mut scripts_evaluated = false;
-        let frame = render_demo(160, 120, test_alert_sink(), &mut scripts_evaluated);
+        let frame = render_demo(&page, 160, 120, test_alert_sink(), &mut scripts_evaluated);
         assert_eq!((frame.width, frame.height), (160, 120));
         assert_eq!(&frame.pixels[..4], &[242, 245, 250, 255]);
         assert!(frame.pixels.chunks_exact(4).any(|p| p == [30, 43, 62, 255]));
@@ -153,10 +156,12 @@ mod tests {
 
     #[test]
     fn page_is_scaled_to_device_pixels() {
+        let page_source = browser::welcome_page();
         let mut scripts_evaluated = false;
         for scale in [1.0, 1.5, 2.0] {
             let (width, height) = ((160.0 * scale) as u32, (120.0 * scale) as u32);
             let page = render_page(
+                &page_source,
                 width,
                 height,
                 scale,
@@ -175,11 +180,15 @@ mod tests {
 
     #[test]
     fn tiny_and_empty_pages_are_safe() {
+        let page = browser::welcome_page();
         let mut scripts_evaluated = false;
-        assert!(render_page(0, 10, 1.0, test_alert_sink(), &mut scripts_evaluated).is_none());
+        assert!(
+            render_page(&page, 0, 10, 1.0, test_alert_sink(), &mut scripts_evaluated,).is_none()
+        );
         for (width, height) in [(1, 1), (3, 48), (17, 70)] {
             assert!(
                 render_page(
+                    &page,
                     width,
                     height,
                     2.0,

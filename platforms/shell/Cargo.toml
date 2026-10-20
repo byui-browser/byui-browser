@@ -11,6 +11,7 @@ rust-version.workspace = true
 browser = { path = "../../crates/browser" }
 net = { workspace = true }
 webapis = { workspace = true }
+chrome = { workspace = true }
 css = { workspace = true }
 html = { workspace = true }
 js = { workspace = true }

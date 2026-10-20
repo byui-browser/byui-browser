@@ -13,7 +13,7 @@ pub mod local_storage;
 use std::sync::Arc;
 
 use common::ids::NodeId;
-use html::{HTMLDocument, NodeKind};
+use html::{DOMTokenList, HTMLDocument, NodeKind};
 use js::{HostFunction, JsError, JsResult, Realm, Value};
 use net::{Request, RequestController};
 
@@ -183,6 +183,16 @@ impl Document {
         self.elements
             .iter()
             .find(|element| element.id_attr.as_deref() == Some(id))
+    }
+
+    /// Implements the DOM `Element.classList` getter for an element in this
+    /// document. The returned live token list mutates the element's `class`
+    /// attribute through the DOM Standard operations.
+    pub fn class_list(&mut self, element: NodeId) -> JsResult<DOMTokenList<'_>> {
+        self.source_document
+            .get_or_insert_with(HTMLDocument::new)
+            .class_list(html::NodeId(element.index() as usize))
+            .map_err(|error| JsError::new(error.to_string()))
     }
 
     /// Removes an element node from this document's tree.
