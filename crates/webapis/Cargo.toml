@@ -12,6 +12,8 @@ common = { workspace = true }
 html = { workspace = true }
 js = { workspace = true }
 net = { workspace = true }
+security = { workspace = true }
+storage = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [lints]

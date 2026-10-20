@@ -58,7 +58,10 @@ pub fn fetch(controller: &RequestController, arguments: &[Value]) -> JsResult<Va
         .block_on(controller.fetch(Request::get(url)))
         .map_err(|error| JsError::new(error.to_string()))?;
 
-    let body = String::from_utf8(response.body)
+    let body = runtime
+        .block_on(response.body.bytes())
+        .map_err(|error| JsError::new(error.to_string()))?;
+    let body = String::from_utf8(body)
         .map_err(|_| JsError::new("fetch() response body is not valid UTF-8"))?;
     Ok(Value::String(body))
 }
@@ -104,6 +107,17 @@ impl Document {
             elements: collect_elements(document),
             source_document: Some(document.clone()),
         }
+    }
+
+    /// Returns this document node's DOM `textContent` value.
+    ///
+    /// The DOM Standard defines `textContent` for a `Document` as `null`, so
+    /// this method returns `None`. Use [`HTMLDocument::text_content`] with an
+    /// element or character-data node ID to retrieve text from a node.
+    pub fn text_content(&self) -> Option<String> {
+        self.source_document
+            .as_ref()
+            .and_then(|document| document.text_content(document.root))
     }
 
     /// Implements `document.createElement(localName)` for an HTML document.
@@ -547,7 +561,9 @@ mod tests {
 
     #[test]
     fn fetch_requires_one_url_string() {
-        let controller = RequestController::new(Config::default()).unwrap();
+        let controller = RequestController::builder(Config::default())
+            .build()
+            .unwrap();
 
         assert_eq!(
             fetch(&controller, &[]).unwrap_err().to_string(),
@@ -563,7 +579,11 @@ mod tests {
 
     #[test]
     fn registration_exposes_fetch_to_the_realm() {
-        let controller = std::sync::Arc::new(RequestController::new(Config::default()).unwrap());
+        let controller = std::sync::Arc::new(
+            RequestController::builder(Config::default())
+                .build()
+                .unwrap(),
+        );
         let mut realm = Realm::new();
         register_fetch(&mut realm, controller).unwrap();
 
@@ -589,6 +609,17 @@ mod tests {
     #[test]
     fn empty_document_has_no_element_by_id() {
         assert_eq!(super::Document::new().get_element_by_id("main"), None);
+    }
+
+    #[test]
+    fn document_text_content_is_null_per_dom_standard() {
+        let empty = super::Document::new();
+        assert_eq!(empty.text_content(), None);
+
+        let parsed = super::Document::from_html_document(&parse_raw_html(
+            "<main>document text</main>".to_owned(),
+        ));
+        assert_eq!(parsed.text_content(), None);
     }
 
     #[test]

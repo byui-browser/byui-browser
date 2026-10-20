@@ -40,7 +40,9 @@ fn attribute_value<'a>(
 ///
 /// Panics when the document has no paragraph element.
 fn paragraph_text(document: &HTMLDocument) -> String {
-    document.text_content(element_id(document, "p"))
+    document
+        .text_content(element_id(document, "p"))
+        .expect("paragraph text")
 }
 
 /// Parses `source` as paragraph text and returns its decoded text content.
@@ -78,7 +80,9 @@ fn text_references_render_as_text_without_creating_markup() {
         let document = parse_raw_html(format!("<main>{source}</main>"));
         document.query("main").pop().unwrap();
         assert_eq!(
-            document.text_content(element_id(&document, "main")),
+            document
+                .text_content(element_id(&document, "main"))
+                .expect("main text"),
             expected
         );
         assert_eq!(document.query("script").len(), 0);
@@ -191,7 +195,7 @@ fn decoded_less_than_stays_a_text_node() {
     assert_eq!(document.query("h1").len(), 0);
     document.query("p").pop().unwrap();
     let id = element_id(&document, "p");
-    assert_eq!(document.text_content(id), "<h1>hello</h1>");
+    assert_eq!(document.text_content(id), Some("<h1>hello</h1>".into()));
     assert!(
         document
             .nodes
