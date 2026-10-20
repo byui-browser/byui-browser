@@ -1,6 +1,7 @@
 use super::{
-    dom_error::DomError, element_data::ElementData, namespace::Namespace, node::Node,
-    node_id::NodeId, node_kind::NodeKind, source_span::SourceSpan,
+    dom_error::DomError, dom_token_list::DOMTokenList, element_data::ElementData,
+    namespace::Namespace, node::Node, node_id::NodeId, node_kind::NodeKind,
+    source_span::SourceSpan,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +63,26 @@ impl HTMLDocument {
 
     pub fn node(&self, id: NodeId) -> Option<&Node> {
         self.nodes.get(id.0)
+    }
+
+    /// Returns a live `DOMTokenList` for an element's `class` attribute.
+    ///
+    /// The handle mutates the associated element through its `add`, `remove`,
+    /// `toggle`, `replace`, and `value` operations. The document is borrowed
+    /// mutably for the lifetime of the handle, matching the exclusive access
+    /// required for DOM mutations in this Rust model.
+    pub fn class_list(&mut self, element: NodeId) -> Result<DOMTokenList<'_>, DomError> {
+        if !matches!(
+            self.node(element).map(|node| &node.kind),
+            Some(NodeKind::Element(_))
+        ) {
+            return Err(DomError::NotFound);
+        }
+        Ok(DOMTokenList::new(self, element))
+    }
+
+    pub(crate) fn node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        self.nodes.get_mut(id.0)
     }
 
     /// Creates a detached HTML element using the DOM `createElement` rules.
