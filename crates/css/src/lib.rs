@@ -7,6 +7,14 @@
 
 #![forbid(unsafe_code)]
 
+/// Parsing of CSS selector syntax into a structured abstract syntax tree.
+pub mod selector;
+pub use selector::{
+    AttributeOperator, AttributeSelector, Combinator, ComplexSelector, CompoundSelector,
+    PseudoSelector, SelectorList, SelectorParseError, SimpleSelector, TypeSelector,
+    parse_selector_list,
+};
+
 use common::ids::NodeId;
 
 /// A selector as written in the stylesheet, e.g. `div.card#main`.

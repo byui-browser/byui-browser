@@ -1,41 +1,71 @@
-//! Browser networking boundary for HTTP requests and responses.
+//! Rust Fetch engine boundary for browser and other Rust consumers.
 //!
 //! **Owning team**: Networking Team
 //!
-//! The public entry point is [`RequestController`], which coordinates request
-//! validation, cache access, cookie handling, CORS checks, scheduling, and the
-//! underlying HTTP transport.
-//! Renderer processes never open raw sockets; all network goes through
-//! the Network process. Cookie jar / cache policy decisions are owned by
-//! Security & Storage.
+//! [`RequestController::fetch`] returns a filtered [`Response`] as soon as its
+//! response headers pass Fetch filtering. [`Body`] is the sole body channel;
+//! it is abort-aware and network errors can arrive while it is consumed.
+//! The transport and its Reqwest header/status/stream types stay behind this
+//! response boundary. The `webapis` crate adapts these Rust values to
+//! JavaScript objects, promises, and streams; this crate owns no JS identity.
+//!
+//! The engine coordinates process-local scheduling and a small in-memory cache.
+//! Durable storage, security policy, service workers, client context, and
+//! diagnostics belong to their browser services and enter through
+//! [`FetchServices`]. Renderer processes do not open sockets directly.
+//!
+//! The current transport executes HTTP(S) requests. Relative URLs require a
+//! [`FetchEnvironment`] with a base URL. Engine-owned `data:` and the exact
+//! `about:blank` URL are resolved locally; `blob:`, `file:`, and `byui:` require
+//! matching providers installed with [`RequestController::builder`]. Unsupported schemes
+//! return [`RequestError::UnsupportedScheme`]. Local schemes bypass HTTP
+//! transport, cookies, and the HTTP cache. Provider resolution and streams
+//! observe request cancellation, and provider metadata is validated before
+//! public response exposure. Provider-backed local resources accept only `GET`
+//! and `HEAD`; other methods fail before provider lookup.
+//! This first engine slice supports basic same-origin responses, simple CORS
+//! checks, opaque no-CORS views, and forbidden response-header filtering.
+//! Requests requiring absent providers or algorithms fail with a typed
+//! [`RequestError::UnsupportedFeature`] before transport. HTTP redirects are
+//! handled by the controller according to [`RedirectMode`]. See the
+//! [engine contract](../docs/fetch-engine-contract.md) for the supported subset.
 
-// Crate-wide flags to ignore dead code and unused imports warnings. Will be
-// removed once implementation is finished, but is required for now to prevent
-// the integration tests from failing.
+// Crate-wide flags to ignore dead code warnings. Will be removed once implementation
+// is finished, but is required for now to prevent the integration tests from failing.
 #![allow(dead_code)]
-#![allow(unused_imports)]
 // Flag to forbid unsafe code. This is security-critical and permanant.
 #![forbid(unsafe_code)]
 
 // TODO(net): Add persistent cookie storage, strict CORS, and HTTP/3 transport.
 
+mod api;
 mod cache;
-mod config;
-mod controller;
-mod cookies;
-mod cors;
-mod error;
+mod engine;
 mod policy;
-mod request;
-mod response;
-mod scheduler;
+mod scheduling;
 mod transport;
 
 #[cfg(test)]
 mod tests;
 
-pub use config::Config;
-pub use controller::RequestController;
-pub use error::RequestError;
-pub use request::{CacheMode, CredentialsMode, FetchContext, Request, RequestMode};
-pub use response::Response;
+pub use api::{
+    body::{Blob, Body, FormData, FormDataEntry},
+    cancellation::{AbortController, AbortSignal},
+    config::Config,
+    error::{ProviderErrorKind, RequestError},
+    headers::{HeaderGuard, Headers},
+    providers::{
+        BlobProvider, FileProvider, PageProvider, ProviderBodyStream, ProviderFuture, SchemeBody,
+        SchemeProviders, SchemeResource,
+    },
+    request::{
+        CacheMode, CredentialsMode, FetchContext, FetchEnvironment, InitiatorType,
+        NetworkPartitionKey, Origin, RedirectMode, Referrer, ReferrerPolicy, Request,
+        RequestDestination, RequestMode, RequestPriority, ServiceWorkersMode,
+    },
+    response::{Response, ResponseType},
+    services::{FetchServices, ResponseInfo, ServiceWorkerDecision},
+};
+pub use engine::{RequestController, RequestControllerBuilder};
+pub use http::{HeaderName, HeaderValue, Method};
+pub use url::Url;

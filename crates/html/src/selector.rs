@@ -1,62 +1,46 @@
-use common::ids::NodeId as CommonNodeId;
-use std::collections::BTreeMap;
+use crate::{ElementData, HTMLDocument, Node, NodeKind};
 
-use crate::{ElementData, HTMLDocument, HTMLElement, NodeKind};
+// #[derive(Debug, Clone, PartialEq, Eq)]
+// pub struct SelectorError {
+//     /// A description of the invalid selector.
+//     pub message: String,
+// }
+
+// impl SelectorError {
+//     fn new(message: impl Into<String>) -> Self {
+//         Self {
+//             message: message.into(),
+//         }
+//     }
+// }
+
+// impl std::fmt::Display for SelectorError {
+//     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+//         formatter.write_str(&self.message)
+//     }
+// }
+
+// impl std::error::Error for SelectorError {}
 
 pub trait Query {
-    fn query(&self, selector: &str) -> Vec<HTMLElement>;
+    fn query(&self, selector: &str) -> Vec<Node>;
 
     #[allow(non_snake_case)]
-    fn Query(&self, selector: String) -> Vec<HTMLElement> {
+    fn Query(&self, selector: String) -> Vec<Node> {
         self.query(&selector)
     }
 }
 
 impl Query for HTMLDocument {
-    fn query(&self, selector: &str) -> Vec<HTMLElement> {
+    fn query(&self, selector: &str) -> Vec<Node> {
         self.nodes
             .iter()
-            .enumerate()
-            .filter_map(|(index, node)| {
-                let NodeKind::Element(element) = &node.kind else {
-                    return None;
-                };
-                matches_selector(element, selector)
-                    .then(|| project_element(self, CommonNodeId::new(index as u32), index, element))
+            .filter(|node| match &node.kind {
+                NodeKind::Element(element) => matches_selector(element, selector),
+                _ => false,
             })
+            .cloned()
             .collect()
-    }
-}
-
-fn project_element(
-    document: &HTMLDocument,
-    id: CommonNodeId,
-    index: usize,
-    element: &ElementData,
-) -> HTMLElement {
-    let parent = document.nodes[index]
-        .parent
-        .map(|parent| CommonNodeId::new(parent.0 as u32));
-    let children = document.nodes[index]
-        .children
-        .iter()
-        .filter_map(|child| match document.nodes[child.0].kind {
-            NodeKind::Element(_) => Some(CommonNodeId::new(child.0 as u32)),
-            _ => None,
-        })
-        .collect();
-    let attributes = element
-        .attributes
-        .iter()
-        .map(|attribute| (attribute.name.clone(), attribute.value.clone()))
-        .collect::<BTreeMap<_, _>>();
-    HTMLElement {
-        id,
-        name: element.name.clone(),
-        attributes,
-        parent,
-        children,
-        text: document.text_content(crate::NodeId(index)),
     }
 }
 

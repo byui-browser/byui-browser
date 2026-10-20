@@ -5,36 +5,114 @@
 //! Owns the VM and values. DOM bindings live in `webapis`, not here.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 pub mod ast;
+pub mod bytecode;
 pub mod lexer;
 pub mod parser;
 pub mod runtime;
+mod stack;
+pub mod vm;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-/// Values that can cross the host-function boundary.
+pub use runtime::{Function, Object};
+pub use vm::Vm;
+
+/// A JavaScript value produced by evaluation or passed to host functions.
+///
+/// Primitive variants own their data. [`Value::Function`] and
+/// [`Value::Object`] are reference handles: cloning the value shares the same
+/// function or property table, and `==`/`===` compare them by identity.
+///
+/// Unsupported: symbols, bigints, arrays, and other built-in object kinds.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
+    /// The `undefined` value.
     Undefined,
+    /// The `null` value.
     Null,
+    /// A boolean.
     Boolean(bool),
+    /// An IEEE 754 double-precision number, as used by all JS numbers.
     Number(f64),
+    /// An owned string.
     String(String),
+    /// A callable function, compared by identity.
+    Function(Function),
+    /// A plain object with string-keyed properties, compared by identity.
+    /// See [`Object`] for its sharing rules and limitations.
+    Object(Object),
 }
 
-/// Errors raised while resolving or invoking JavaScript host functions.
+/// Formats the value as JavaScript's `ToString` would, so numbers print as
+/// `1`, `1e+21`, or `Infinity` rather than using Rust float formatting.
+impl fmt::Display for Value {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Undefined => formatter.write_str("undefined"),
+            Self::Null => formatter.write_str("null"),
+            Self::Boolean(value) => write!(formatter, "{value}"),
+            Self::Number(number) => formatter.write_str(&runtime::number_to_string(*number)),
+            Self::String(text) => formatter.write_str(text),
+            Self::Function(function) => write!(formatter, "{function}"),
+            Self::Object(object) => write!(formatter, "{object}"),
+        }
+    }
+}
+
+/// The broad category of a JavaScript engine error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JsErrorCategory {
+    /// The source could not be parsed.
+    Syntax,
+    /// The program performed an invalid operation.
+    Runtime,
+    /// The program exceeded a configured execution limit.
+    Limit,
+    /// A registered host function reported a failure.
+    Host,
+}
+
+/// Errors raised while parsing, evaluating, or invoking host functions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JsError {
+    /// The broad category of the failure.
+    pub category: JsErrorCategory,
+    /// Human-readable description of the failure.
     pub message: String,
+    /// The interpreter operation that failed, when known.
+    pub context: Option<String>,
 }
 
 impl JsError {
+    /// Creates an error carrying `message`.
     pub fn new(message: impl Into<String>) -> Self {
+        Self::runtime(message)
+    }
+
+    /// Creates a runtime error carrying `message`.
+    pub fn runtime(message: impl Into<String>) -> Self {
         Self {
+            category: JsErrorCategory::Runtime,
             message: message.into(),
+            context: None,
+        }
+    }
+
+    /// Creates a categorized error with an interpreter operation as context.
+    pub fn with_context(
+        category: JsErrorCategory,
+        message: impl Into<String>,
+        context: impl Into<String>,
+    ) -> Self {
+        Self {
+            category,
+            message: message.into(),
+            context: Some(context.into()),
         }
     }
 }
@@ -47,23 +125,87 @@ impl fmt::Display for JsError {
 
 impl std::error::Error for JsError {}
 
+/// Result type used throughout the engine, failing with [`JsError`].
 pub type JsResult<T> = Result<T, JsError>;
 
 /// A Rust function that can be exposed as a JavaScript global.
 pub type HostFunction = Arc<dyn Fn(&[Value]) -> JsResult<Value> + Send + Sync>;
 
-/// A JavaScript execution realm with a global host-function table.
-#[derive(Default)]
+/// A JavaScript execution realm with a table of host-provided globals.
+///
+/// A realm is a persistent global environment. Every [`Realm::evaluate_script`]
+/// call runs against the same globals, so a `var`, function, `let`, or `const`
+/// declared by one script is visible to later scripts, and host globals and
+/// script globals resolve through the same environment. Separate realms share
+/// no script state. Function bodies and blocks keep their own scopes.
+///
+/// Redeclaration rules, checked before a script runs so a failing script
+/// declares nothing:
+/// - `var` and function declarations may repeat across scripts; a repeated
+///   `var` without an initializer keeps its value.
+/// - `let` and `const` may not repeat a global `let`/`const`, `var`, or
+///   function name, nor repeat a name within one script.
+/// - `var` or a function may not redeclare a global `let`/`const`.
+/// - `let`/`const` may shadow a host global that no script has redeclared;
+///   the host global stays reachable through [`Realm::call_global`].
+/// - Assigning to a global name changes the persistent binding, and
+///   assigning to an undeclared name is still an error.
+///
+/// A script that throws keeps the effects that ran before the error, and its
+/// `let`/`const` names stay uninitialized afterwards. Use
+/// [`Realm::reset_script_state`] to start a new document. Modules, imports,
+/// workers, and sharing state between realms are not supported.
 pub struct Realm {
-    globals: HashMap<String, HostFunction>,
+    functions: HashMap<String, HostFunction>,
+    values: HashMap<String, Value>,
+    limits: runtime::ExecutionLimits,
+    globals: runtime::GlobalState,
+}
+
+impl Default for Realm {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Realm {
+    /// Creates a realm with no registered globals.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            functions: HashMap::new(),
+            values: HashMap::new(),
+            limits: runtime::ExecutionLimits::default(),
+            globals: runtime::GlobalState::new(),
+        }
     }
 
-    /// Registers a host function under a global JavaScript name.
+    /// Discards every binding scripts have declared or reassigned, so the next
+    /// [`Realm::evaluate_script`] starts as a new document would.
+    ///
+    /// Host globals stay registered and are reinstalled with the values they
+    /// were registered with. Objects registered as globals are shared handles,
+    /// so properties scripts set on them are not undone; register a new
+    /// [`Object`] to start clean. Use [`Realm::new`] for a realm with no host
+    /// globals at all.
+    pub fn reset_script_state(&mut self) {
+        self.globals = runtime::GlobalState::new();
+        for (name, function) in &self.functions {
+            self.globals.install_host(name, host_value(name, function));
+        }
+        for (name, value) in &self.values {
+            self.globals.install_host(name, value.clone());
+        }
+    }
+
+    /// Registers a host function under a global JavaScript name, replacing
+    /// any global previously registered under that name.
+    ///
+    /// The realm keeps its own reference to `function` and shares it with
+    /// every script. Scripts can only reach names that are valid identifiers;
+    /// a dotted name such as `localStorage.setItem` is a single global reachable
+    /// only through [`Realm::call_global`]. To expose `localStorage.setItem` to
+    /// scripts, register an [`Object`] named `localStorage` with a
+    /// `setItem` method instead (see [`Realm::register_global_value`]).
     pub fn register_global_function(
         &mut self,
         name: impl Into<String>,
@@ -74,63 +216,143 @@ impl Realm {
             return Err(JsError::new("global function name cannot be empty"));
         }
 
-        self.globals.insert(name, function);
+        self.values.remove(&name);
+        self.globals
+            .install_host(&name, host_value(&name, &function));
+        self.functions.insert(name, function);
         Ok(())
     }
 
-    /// Calls a registered global function.
+    /// Registers any value, such as an [`Object`] namespace like `console` or
+    /// `document`, under a global JavaScript name, replacing any global
+    /// previously registered under that name.
+    ///
+    /// The realm stores `value` and gives each script a clone of it. For an
+    /// [`Object`] that clone is the same shared handle, so the host can keep
+    /// its own clone to read properties scripts set, and scripts see
+    /// properties the host sets between evaluations. Methods are added with
+    /// [`Object::set_method`] and receive only their call arguments, not the
+    /// object as `this`.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use js::{Object, Realm, Value};
+    ///
+    /// let console = Object::new();
+    /// console.set_method("log", Arc::new(|_| Ok(Value::Undefined)));
+    /// let mut realm = Realm::new();
+    /// realm.register_global_value("console", Value::Object(console.clone())).unwrap();
+    ///
+    /// realm.evaluate_script("console.log('hi'); console.level = 2;").unwrap();
+    /// assert_eq!(console.get("level"), Some(Value::Number(2.0)));
+    /// ```
+    pub fn register_global_value(&mut self, name: impl Into<String>, value: Value) -> JsResult<()> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(JsError::new("global value name cannot be empty"));
+        }
+
+        self.functions.remove(&name);
+        self.globals.install_host(&name, value.clone());
+        self.values.insert(name, value);
+        Ok(())
+    }
+
+    /// Calls a global registered with [`Realm::register_global_function`].
+    /// Values registered with [`Realm::register_global_value`] are not
+    /// callable through this method, even if they are functions.
     pub fn call_global(&self, name: &str, arguments: &[Value]) -> JsResult<Value> {
         let function = self
-            .globals
+            .functions
             .get(name)
             .ok_or_else(|| JsError::new(format!("global function `{name}` is not defined")))?;
         function(arguments)
     }
 
-    /// Evaluates the minimal call expression needed by the first Web API slice.
+    /// Replaces the limits used by future script evaluations.
+    pub fn set_execution_limits(&mut self, limits: runtime::ExecutionLimits) {
+        self.limits = limits;
+    }
+
+    /// Returns the limits used by this realm.
+    pub fn execution_limits(&self) -> runtime::ExecutionLimits {
+        self.limits
+    }
+
+    /// Parses and evaluates a script with the registered host functions in
+    /// scope, returning its completion value.
     ///
-    /// The full parser and VM are still future work. This deliberately supports
-    /// only a global identifier followed by an empty argument list, such as
-    /// `print()`, so the host-function path can be exercised end to end.
+    /// Supports the same language subset as [`eval`]. Declarations persist in
+    /// the realm's globals for later calls; see [`Realm`] for the
+    /// redeclaration rules and [`Realm::reset_script_state`] to clear them.
     pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
-        let expression = source.trim().trim_end_matches(';').trim();
-        let call = expression
-            .strip_suffix(')')
-            .and_then(|prefix| prefix.strip_suffix('('))
-            .ok_or_else(|| JsError::new("expected a function call expression"))?;
-        let name = call.trim();
-
-        if name.is_empty() || name.contains(char::is_whitespace) {
-            return Err(JsError::new("expected a global function name"));
-        }
-
-        self.call_global(name, &[])
+        let program = parse(source).map_err(|error| {
+            JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+        })?;
+        self.globals.evaluate(&program, self.limits)
     }
 }
 
-/// A parsed program. The full statement shape is still under development.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Program {
-    pub statements: Vec<Statement>,
+/// Wraps a registered host function as the script-visible function value.
+fn host_value(name: &str, function: &HostFunction) -> Value {
+    Value::Function(Function::from_host(name, Arc::clone(function)))
 }
 
-/// One statement in the AST.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Statement {}
+/// The owned statement and expression tree produced by parsing.
+pub use ast::{Program, Statement};
 
-/// Parses source text into a [`Program`].
-pub fn parse(source: &str) -> JsResult<Program> {
-    if source.trim().is_empty() {
-        return Ok(Program::default());
-    }
-    Err(JsError::new("JavaScript parsing is not implemented"))
+/// Parses source text into an owned [`Program`].
+///
+/// Uses the subset and semicolon policy documented by [`parser::parse_program`].
+/// Syntax errors carry a token index, UTF-8 byte offset, and one-based line and
+/// character column. Locations at end of input point just past the source.
+pub fn parse(source: &str) -> Result<Program, parser::ParseError> {
+    let entries = lexer::tokenize_spanned(source);
+    let starts: Vec<_> = entries.iter().map(|entry| entry.start).collect();
+    let line_terminators_before: Vec<_> = entries
+        .iter()
+        .scan(0, |previous_end, entry| {
+            let has_line_terminator = source[*previous_end..entry.start]
+                .chars()
+                .any(|ch| matches!(ch, '\n' | '\r' | '\u{2028}' | '\u{2029}'));
+            *previous_end = entry.end;
+            Some(has_line_terminator)
+        })
+        .collect();
+    let tokens: Vec<_> = entries.into_iter().map(|entry| entry.token).collect();
+    parser::parse_program_with_line_terminators(&tokens, &line_terminators_before).map_err(
+        |mut error| {
+            let offset = starts
+                .get(error.token_index)
+                .copied()
+                .unwrap_or(source.len());
+            let prefix = &source[..offset];
+            error.offset = Some(offset);
+            error.line = Some(prefix.chars().filter(|ch| *ch == '\n').count() + 1);
+            error.column = Some(prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1);
+            error
+        },
+    )
 }
 
 /// Parses and evaluates source text, returning the completion value.
+///
+/// Runs the tree-walk interpreter described in [`runtime`]: expressions,
+/// member access, declarations, blocks, `if`, `while`, functions, calls, and
+/// `return`. Scripts cannot create objects themselves yet (there are no
+/// object literals), so member access needs objects from a [`Realm`]. Syntax
+/// errors and runtime errors are both returned as [`JsError`].
 pub fn eval(source: &str) -> JsResult<Value> {
-    let program = parse(source)?;
-    if program.statements.is_empty() {
-        return Ok(Value::Undefined);
-    }
-    Err(JsError::new("JavaScript evaluation is not implemented"))
+    let program = parse(source).map_err(|error| {
+        JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+    })?;
+    runtime::evaluate_program(&program)
+}
+
+/// Parses and evaluates source text using caller-provided execution limits.
+pub fn eval_with_limits(source: &str, limits: runtime::ExecutionLimits) -> JsResult<Value> {
+    let program = parse(source).map_err(|error| {
+        JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+    })?;
+    runtime::evaluate_program_with_limits(&program, limits)
 }
