@@ -14,6 +14,30 @@ fn arena_document_starts_with_a_document_root() {
 }
 
 #[test]
+fn inner_html_serializes_markup_and_escapes_text_and_attributes() {
+    let mut document = HTMLDocument::new();
+    let paragraph = document.push_node(
+        NodeKind::Element(html::ElementData {
+            name: "p".into(),
+            namespace: Namespace::Html,
+            attributes: vec![Attribute {
+                name: "title".into(),
+                value: "A & \"B\"".into(),
+            }],
+        }),
+        None,
+    );
+    let text = document.push_node(NodeKind::Text("<hello & goodbye>".into()), None);
+    document.append_child(document.root, paragraph);
+    document.append_child(paragraph, text);
+
+    assert_eq!(
+        document.inner_html(),
+        "<p title=\"A &amp; &quot;B&quot;\">&lt;hello &amp; goodbye></p>"
+    );
+}
+
+#[test]
 fn create_element_follows_html_document_rules() {
     let mut document = HTMLDocument::new();
 

@@ -157,6 +157,20 @@ impl Document {
             .find(|element| element.id_attr.as_deref() == Some(id))
     }
 
+    /// Returns this document's child nodes serialized as an HTML fragment.
+    ///
+    /// This getter uses the HTML fragment serialization behavior implemented
+    /// by the backing arena. The HTML Standard exposes `innerHTML` on elements
+    /// and shadow roots rather than on `Document`; this document-level helper
+    /// serializes the document's children for the browser's current API model.
+    /// It does not parse or replace markup, and template contents, shadow roots,
+    /// and complete namespace-specific serialization are not supported.
+    pub fn inner_html(&self) -> String {
+        self.source_document
+            .as_ref()
+            .map_or_else(String::new, HTMLDocument::inner_html)
+    }
+
     /// Removes an element node from this document's tree.
     ///
     /// The node and its descendants remain allocated and retain their stable
@@ -831,6 +845,20 @@ mod tests {
         assert_eq!(
             document.append_child(NodeId::new(99)),
             Err(DomException::NotFoundError)
+        );
+    }
+
+    #[test]
+    fn document_inner_html_serializes_its_children() {
+        let html_document = parse_raw_html(
+            "<!doctype html><main id=\"content\"><p>A &amp; B</p><!-- note --><br></main>"
+                .to_owned(),
+        );
+        let document = super::Document::from_html_document(&html_document);
+
+        assert_eq!(
+            document.inner_html(),
+            "<!DOCTYPE html><main id=\"content\"><p>A &amp; B</p><!-- note --><br></main>"
         );
     }
 

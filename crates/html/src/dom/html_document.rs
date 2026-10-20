@@ -118,6 +118,99 @@ impl HTMLDocument {
         }
     }
 
+    /// Serializes the document's child nodes as an HTML fragment.
+    ///
+    /// This follows the HTML fragment serialization rules for the node kinds
+    /// represented by this arena. It escapes text and attribute data, emits
+    /// comments and doctypes, and omits end tags for HTML void elements. The
+    /// arena does not model template contents, shadow roots, or all namespace-
+    /// specific serialization details, so those parts of the HTML Standard
+    /// are not implemented.
+    pub fn inner_html(&self) -> String {
+        let mut output = String::new();
+        if let Some(root) = self.node(self.root) {
+            for child in &root.children {
+                self.serialize_node(*child, &mut output, false);
+            }
+        }
+        output
+    }
+
+    fn serialize_node(&self, id: NodeId, output: &mut String, raw_text: bool) {
+        let Some(node) = self.node(id) else {
+            return;
+        };
+        match &node.kind {
+            NodeKind::Document => {
+                for child in &node.children {
+                    self.serialize_node(*child, output, false);
+                }
+            }
+            NodeKind::Doctype {
+                name,
+                public_id,
+                system_id,
+            } => {
+                output.push_str("<!DOCTYPE");
+                if let Some(name) = name {
+                    output.push(' ');
+                    output.push_str(name);
+                }
+                if let Some(public_id) = public_id {
+                    output.push_str(" PUBLIC \"");
+                    output.push_str(&escape_attribute(public_id));
+                    output.push('"');
+                    if let Some(system_id) = system_id {
+                        output.push_str(" \"");
+                        output.push_str(&escape_attribute(system_id));
+                        output.push('"');
+                    }
+                } else if let Some(system_id) = system_id {
+                    output.push_str(" SYSTEM \"");
+                    output.push_str(&escape_attribute(system_id));
+                    output.push('"');
+                }
+                output.push('>');
+            }
+            NodeKind::Element(element) => {
+                output.push('<');
+                output.push_str(&element.name);
+                for attribute in &element.attributes {
+                    output.push(' ');
+                    output.push_str(&attribute.name);
+                    output.push_str("=\"");
+                    output.push_str(&escape_attribute(&attribute.value));
+                    output.push('"');
+                }
+                output.push('>');
+                let is_void =
+                    element.namespace == Namespace::Html && is_void_html_element(&element.name);
+                if !is_void {
+                    let child_raw_text = element.namespace == Namespace::Html
+                        && matches!(element.name.as_str(), "script" | "style");
+                    for child in &node.children {
+                        self.serialize_node(*child, output, child_raw_text);
+                    }
+                    output.push_str("</");
+                    output.push_str(&element.name);
+                    output.push('>');
+                }
+            }
+            NodeKind::Text(text) => {
+                if raw_text {
+                    output.push_str(text);
+                } else {
+                    output.push_str(&escape_text(text));
+                }
+            }
+            NodeKind::Comment(comment) => {
+                output.push_str("<!--");
+                output.push_str(comment);
+                output.push_str("-->");
+            }
+        }
+    }
+
     /// Returns the source text of inline `script` elements in tree order.
     ///
     /// External scripts are not fetched yet, so only the text contained by
@@ -164,6 +257,37 @@ impl HTMLDocument {
         // node itself is not an element and therefore is never a candidate.
         find_in_tree(self, self.root, value)
     }
+}
+
+fn escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('\u{00a0}', "&nbsp;")
+        .replace('<', "&lt;")
+}
+
+fn escape_attribute(value: &str) -> String {
+    escape_text(value).replace('"', "&quot;")
+}
+
+fn is_void_html_element(name: &str) -> bool {
+    matches!(
+        name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
 }
 
 fn is_ascii_whitespace(character: char) -> bool {
