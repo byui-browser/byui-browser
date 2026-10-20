@@ -11,20 +11,23 @@ depend on `net`.
 ### Authorization and composition
 
 - `FileAccessPolicy` is default-deny and canonicalizes configured roots.
-- `FileAccessPolicy::authorize_request` requires granted permission, the
-  configured `FileSandboxId`, a `file:` target origin, and a top-level
-  navigation request before a path is opened.
+- `FileAccessPolicy::open_authorized_file` requires a grant issued by that
+  policy, a `file:` target origin, and a top-level navigation request before it
+  canonicalizes or opens a path. The opaque grant binds authorization to one
+  policy and therefore to its browser sandbox/container capability.
 - `FileRequestContext` carries the initiating origin, requested origin,
-  navigation/subresource kind, permission state, and sandbox identity. The
-  initiating origin is preserved for the later file-document origin policy;
-  the current policy denies subresource requests.
+  and navigation/subresource kind. The initiating origin is preserved for the
+  later file-document origin policy; the current policy denies subresource
+  requests.
 - `BrowserFileProvider` translates `net::Request` into that context through an
   explicit `FileAccessGrantSource`. `FileAccessConfiguration` makes policy,
-  filesystem, and shared permission/sandbox state explicit when composing the
+  filesystem, and shared policy-bound grant state explicit when composing the
   browser request controller.
 - `FileAccessGrantSource` snapshots its state immediately before authorization.
   Revoking it denies future opens; already opened streams retain their existing
   capability until EOF, error, abort, or drop.
+- A poisoned, empty, or revoked grant source fails closed. Replacing or
+  revoking a grant only affects future opens.
 - Browser controllers install `BrowserFetchServices`, allowing requests with a
   client environment to reach the provider. Its current policy is conservative:
   no cookies, no service-worker interception, and a process-local default cache
@@ -35,14 +38,22 @@ depend on `net`.
 ### Capability-based filesystem access
 
 - `CapFileSystem` opens each configured root as a directory capability.
-- `FileAccessPolicy::open_file` authorizes a canonical path and passes an
-  `AuthorizedPath` to the filesystem backend.
+- `FileAccessPolicy::open_authorized_file` atomically verifies the request
+  context and policy-bound grant before canonicalizing the requested path or
+  opening a file. Its capability-backed filesystem parameter and internal
+  `AuthorizedPath` keep lower-level pathname opening out of the public API.
 - The backend opens the file once and returns an `OpenedFile`; all reads use
   that retained handle rather than reopening the authorized pathname.
 - Root containment uses path components, so similarly named sibling roots are
   distinct. Canonicalization rejects traversal and symlink escapes.
-- Current tests cover regular files, denied siblings, directories, replacement
-  races, Unix symlink escapes, and Windows junction escapes.
+- The current backend exposes no media type, so responses include
+  `Content-Length` but no `Content-Type`. The adapter will include a media type
+  only when a future backend supplies a valid header value.
+- Tests cover regular files, denied siblings, directories, retained handles
+  after Unix pathname replacement, Unix symlink escapes, and Windows junction
+  escapes. A denied request for a missing path is also verified to return
+  `AccessDenied` before path canonicalization can reveal that the path is
+  missing.
 
 ### Provider response and body lifecycle
 
@@ -52,8 +63,7 @@ For an authorized `GET`, `BrowserFileProvider`:
 - performs authorization, opening, and metadata lookup on Tokio's blocking
   executor;
 - returns the `200 OK` response metadata immediately, including
-  `Content-Length`, optional filesystem-supplied `Content-Type`, and an opaque
-  response origin;
+  `Content-Length` and an opaque response origin;
 - moves the opened handle and read-slot permit into a separate blocking reader;
 - streams 64 KiB chunks through a bounded two-chunk channel as
   `SchemeBody::Stream`; and
@@ -72,10 +82,13 @@ reader and returns `SchemeBody::Null`.
 
 The shared `net` pipeline enforces `GET`/`HEAD`, validates response metadata,
 and maps failures to stable provider error categories without exposing
-filesystem paths or OS diagnostics. Browser tests cover allowed reads, default
-denial, missing files, directories, malformed URLs, content length, live
-chunked bodies, `GET`/`HEAD`, aborted-reader cleanup, denied permissions,
-sandbox mismatches, and subresource rejection.
+filesystem paths or OS diagnostics. Missing files map to `ResourceMissing`,
+denied requests map to `AccessDenied`, malformed file paths map to
+`MalformedMetadata`, and directories or filesystem I/O failures map to `Io`.
+Browser tests cover allowed reads, default denial, missing files, directories,
+malformed URLs, content length, live chunked bodies, `GET`/`HEAD`,
+aborted-reader cleanup, revoked grants, foreign-policy grants, and subresource
+rejection.
 
 ## Remaining work
 
@@ -84,8 +97,7 @@ sandbox mismatches, and subresource rejection.
 The current bounded-reader streaming contract is implemented. Add
 browser-provider regression tests for unread and partially read body drops,
 worker-side read failures, full-channel backpressure, and the four-reader
-concurrency limit. Define and enforce product limits for total file size, read
-duration, and acceptable chunk/channel memory.
+concurrency limit.
 
 ### File-document origins and request policy
 
@@ -97,10 +109,11 @@ preserving fail-closed behavior.
 
 ### Metadata and resource limits
 
-Decide whether invalid filesystem media metadata should fail the request or be
-omitted, rather than silently dropping an invalid `Content-Type` during header
-construction. Complete handling for unreadable files and unsupported file
-types under the streaming path.
+Add filesystem media-type detection and decide whether an invalid detected
+value should fail the request or be omitted. Define and enforce product limits
+for total file size, read duration, and acceptable chunk/channel memory.
+Consider whether directories and other unsupported file types should retain the
+current non-diagnostic `Io` category or receive a dedicated provider category.
 
 ### Platform hardening and conformance
 
@@ -119,25 +132,47 @@ unrelated scheme providers.
 The following issues remain before treating the provider as a complete browser
 capability:
 
-1. **Make grants and sandbox identity trustworthy.** `Granted` permission and
-   `FileSandboxId` values are currently constructible by callers. Define the
-   trust boundary for `FileAccessGrant` and sandbox identities, or replace
-   forgeable values with browser-owned capabilities or tokens that untrusted
-   code cannot manufacture.
-2. **Prevent request-policy bypass through lower-level APIs.**
-   `FileAccessPolicy::open_file` performs path authorization without requiring
-   a `FileRequestContext`. Either enforce request authorization in the API
-   boundary or make the lower-level path-opening API explicitly private to the
-   browser adapter and document the invariant.
-3. **Harden the `FileSystem` backend contract.** A custom `FileSystem`
-   implementation can ignore the supplied `AuthorizedPath` and open an
-   unrelated ambient path. Restrict implementations, strengthen the capability
-   type, or add validation/tests so the security boundary does not rely only on
-   an unenforced implementation contract.
+1. **Keep root configuration inside trusted browser code.** `FileAccessPolicy::new`
+   and `CapFileSystem::new` accept arbitrary filesystem paths and therefore
+   represent a powerful ambient capability. Ensure renderers and other
+   untrusted callers cannot configure allowed roots; expose only a trusted
+   browser/platform composition path, preferably backed by user-selected
+   handles or an equivalent narrow capability.
+2. **Define file-document origin and subresource semantics before enabling
+   subresources.** The current top-level-navigation-only rule is fail-closed,
+   but the initiating origin is not yet used to decide access. Specify file
+   document origin identity, same-origin relationships, directory sharing,
+   cross-origin navigation behavior, and sandbox/container binding before
+   allowing scripts, workers, stylesheets, or other subresources to read local
+   files.
+3. **Complete platform containment hardening.** Authorization canonicalizes a
+   path before the capability backend opens its relative path. Preserve the
+   single-open/retained-handle invariant and add conformance tests for Unix
+   mount changes and hard links, Windows reparse-point variants, drive-letter
+   and UNC paths, network shares, removable media, and races involving root
+   replacement. Any fallback must fail closed rather than re-authorizing and
+   reopening a pathname.
+4. **Add file resource limits.** Define and enforce maximum file size, read
+   duration, total bytes served, and aggregate blocking-reader/channel memory.
+   The current four-reader semaphore and bounded channel limit concurrency and
+   buffering, but they do not prevent a permitted path from consuming
+   resources for an unbounded duration.
+5. **Define safe file metadata and content handling.** Add filesystem media-type
+   detection and decide whether invalid metadata fails the request or is
+   omitted. Before local HTML, script, image, or similar content is interpreted,
+   define MIME sniffing, `nosniff`, and executable-content policy so a local
+   file cannot acquire an unintended active-content interpretation.
+6. **Define permission lifetime and revocation semantics.** Revocation currently
+   blocks future opens while already-open streams retain their handles until
+   completion, failure, abort, or drop. Specify behavior for tab/document
+   close, navigation, process shutdown, user-grant expiry, and audit logging;
+   add tests for each lifecycle transition.
 
 ## Recommended order
 
-1. Close request-policy and filesystem-backend bypasses.
-2. Add streaming lifecycle, concurrency-limit, and read-failure coverage.
-3. Finalize file-document origin and subresource authorization semantics.
-4. Extend platform hardening and broader conformance coverage.
+1. Keep root configuration in trusted browser composition and complete
+   platform containment hardening.
+2. Finalize file-document origin and subresource authorization semantics.
+3. Add resource limits, safe metadata/content handling, and permission-lifetime
+   coverage.
+4. Add streaming lifecycle, concurrency-limit, and read-failure coverage.

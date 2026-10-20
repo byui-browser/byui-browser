@@ -4,13 +4,13 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 
-use super::{AuthorizedPath, FileAccessError};
+use super::FileAccessError;
+use super::policy::AuthorizedPath;
 
 /// Materialized data read from an authorized file.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,7 +21,7 @@ pub struct FileResource {
     pub media_type: Option<String>,
 }
 
-/// An opened regular file that was accepted by a [`FileSystem`] backend.
+/// An opened regular file accepted by the capability-backed filesystem.
 ///
 /// The handle is intentionally private. Callers can materialize it with
 /// [`Self::read_all`] now, while a future streaming API can retain ownership of
@@ -75,15 +75,6 @@ impl OpenedFile {
     }
 }
 
-/// Opens files after authorization has produced an [`AuthorizedPath`].
-pub trait FileSystem: Send + Sync {
-    /// Opens one authorized regular file and transfers ownership of its handle.
-    ///
-    /// Implementations must reject unsupported file types and must not return
-    /// a handle that will later be replaced by a pathname-based read.
-    fn open(&self, path: &AuthorizedPath) -> Result<OpenedFile, FileAccessError>;
-}
-
 /// Capability-oriented filesystem backend for browser-authorized files.
 ///
 /// Each configured root is opened as a directory capability. Requests are
@@ -112,8 +103,8 @@ impl CapFileSystem {
     }
 }
 
-impl FileSystem for CapFileSystem {
-    fn open(&self, path: &AuthorizedPath) -> Result<OpenedFile, FileAccessError> {
+impl CapFileSystem {
+    pub(crate) fn open(&self, path: &AuthorizedPath) -> Result<OpenedFile, FileAccessError> {
         if path.relative() == Path::new(".") {
             return Err(FileAccessError::UnsupportedFile);
         }
@@ -136,9 +127,6 @@ impl FileSystem for CapFileSystem {
     }
 }
 
-/// Convenience handle for sharing a filesystem implementation.
-pub type SharedFileSystem = Arc<dyn FileSystem>;
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -147,7 +135,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::file_access::FileAccessPolicy;
+    use crate::file_access::{FileAccessPolicy, FileOrigin, FileRequestContext, FileRequestKind};
 
     static NEXT_TEMP_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -161,6 +149,14 @@ mod tests {
         directory
     }
 
+    fn navigation_context() -> FileRequestContext {
+        FileRequestContext {
+            initiating_origin: FileOrigin::Absent,
+            requested_origin: FileOrigin::LocalFile,
+            kind: FileRequestKind::Navigation,
+        }
+    }
+
     #[test]
     fn capability_filesystem_reads_regular_files_from_opened_handles() {
         let directory = temporary_directory();
@@ -170,7 +166,12 @@ mod tests {
         let filesystem = CapFileSystem::new([directory.clone()]).unwrap();
 
         let resource = policy
-            .open_file(&path, &filesystem)
+            .open_authorized_file(
+                &navigation_context(),
+                &policy.issue_grant(),
+                &path,
+                &filesystem,
+            )
             .unwrap()
             .read_all()
             .unwrap();
@@ -188,7 +189,14 @@ mod tests {
         let policy = FileAccessPolicy::new([directory.clone()]).unwrap();
         let filesystem = CapFileSystem::new([directory.clone()]).unwrap();
 
-        let mut opened = policy.open_file(&path, &filesystem).unwrap();
+        let mut opened = policy
+            .open_authorized_file(
+                &navigation_context(),
+                &policy.issue_grant(),
+                &path,
+                &filesystem,
+            )
+            .unwrap();
         let mut first = [0; 5];
         let mut second = [0; 32];
         let first_len = opened.read_chunk(&mut first).unwrap();
@@ -215,14 +223,24 @@ mod tests {
         let filesystem = CapFileSystem::new([allowed.clone()]).unwrap();
 
         let resource = policy
-            .open_file(&path, &filesystem)
+            .open_authorized_file(
+                &navigation_context(),
+                &policy.issue_grant(),
+                &path,
+                &filesystem,
+            )
             .unwrap()
             .read_all()
             .unwrap();
 
         assert_eq!(resource.bytes, b"authorized bytes");
         assert!(matches!(
-            policy.open_file(&outside, &filesystem),
+            policy.open_authorized_file(
+                &navigation_context(),
+                &policy.issue_grant(),
+                &outside,
+                &filesystem,
+            ),
             Err(FileAccessError::Denied)
         ));
         drop(filesystem);
@@ -234,10 +252,13 @@ mod tests {
         let directory = temporary_directory();
         let policy = FileAccessPolicy::new([directory.clone()]).unwrap();
         let filesystem = CapFileSystem::new([directory.clone()]).unwrap();
-        let authorized = policy.authorize_path(&directory).unwrap();
-
         assert!(matches!(
-            filesystem.open(&authorized),
+            policy.open_authorized_file(
+                &navigation_context(),
+                &policy.issue_grant(),
+                &directory,
+                &filesystem,
+            ),
             Err(FileAccessError::UnsupportedFile)
         ));
         drop(filesystem);
@@ -255,7 +276,14 @@ mod tests {
         let policy = FileAccessPolicy::new([directory.clone()]).unwrap();
         let filesystem = CapFileSystem::new([directory.clone()]).unwrap();
 
-        let opened = policy.open_file(&path, &filesystem).unwrap();
+        let opened = policy
+            .open_authorized_file(
+                &navigation_context(),
+                &policy.issue_grant(),
+                &path,
+                &filesystem,
+            )
+            .unwrap();
         fs::rename(&replacement, &path).unwrap();
 
         assert_eq!(opened.read_all().unwrap().bytes, b"authorized bytes");
@@ -281,7 +309,12 @@ mod tests {
         let filesystem = CapFileSystem::new([allowed]).unwrap();
 
         assert!(matches!(
-            policy.open_file(link.join("secret.txt"), &filesystem),
+            policy.open_authorized_file(
+                &navigation_context(),
+                &policy.issue_grant(),
+                link.join("secret.txt"),
+                &filesystem
+            ),
             Err(FileAccessError::Denied)
         ));
         drop(filesystem);
@@ -315,7 +348,12 @@ mod tests {
         let filesystem = CapFileSystem::new([allowed]).unwrap();
 
         assert!(matches!(
-            policy.open_file(junction.join("secret.txt"), &filesystem),
+            policy.open_authorized_file(
+                &navigation_context(),
+                &policy.issue_grant(),
+                junction.join("secret.txt"),
+                &filesystem,
+            ),
             Err(FileAccessError::Denied)
         ));
         drop(filesystem);

@@ -16,32 +16,17 @@ use net::{
     Request, RequestError, SchemeBody, SchemeResource, Url,
 };
 use security::file_access::{
-    FileAccessError, FileAccessPermission, FileAccessPolicy, FileOrigin, FileRequestContext,
-    FileRequestKind, FileSandboxId, SharedFileSystem,
+    CapFileSystem, FileAccessError, FileAccessPolicy, FileOrigin, FileRequestContext,
+    FileRequestKind,
 };
 use tokio::sync::{Semaphore, mpsc};
+
+pub use security::file_access::FileAccessGrant;
 
 const FILE_READ_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_CONCURRENT_FILE_READS: usize = 4;
 const FILE_READ_CHANNEL_CAPACITY: usize = 2;
 const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(1);
-
-/// Explicit browser-owned grant used when composing a local-file capability.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FileAccessGrant {
-    permission: FileAccessPermission,
-    sandbox: FileSandboxId,
-}
-
-impl FileAccessGrant {
-    /// Creates the permission and sandbox state for a local-file capability.
-    pub fn new(permission: FileAccessPermission, sandbox: FileSandboxId) -> Self {
-        Self {
-            permission,
-            sandbox,
-        }
-    }
-}
 
 /// Mutable browser-owned source for local-file authorization state.
 ///
@@ -50,14 +35,14 @@ impl FileAccessGrant {
 /// stream retains its existing handle until it completes, fails, or is dropped.
 #[derive(Clone, Debug)]
 pub struct FileAccessGrantSource {
-    grant: Arc<RwLock<FileAccessGrant>>,
+    grant: Arc<RwLock<Option<FileAccessGrant>>>,
 }
 
 impl FileAccessGrantSource {
     /// Creates a shared source with `grant` as its initial authorization state.
     pub fn new(grant: FileAccessGrant) -> Self {
         Self {
-            grant: Arc::new(RwLock::new(grant)),
+            grant: Arc::new(RwLock::new(Some(grant))),
         }
     }
 
@@ -67,24 +52,19 @@ impl FileAccessGrantSource {
     /// unchanged and future snapshots are denied.
     pub fn replace(&self, grant: FileAccessGrant) {
         if let Ok(mut current) = self.grant.write() {
-            *current = grant;
+            *current = Some(grant);
         }
     }
 
-    /// Revokes local-file access for future opens while retaining the sandbox identity.
+    /// Revokes local-file access for future opens by removing its policy-issued grant.
     pub fn revoke(&self) {
         if let Ok(mut grant) = self.grant.write() {
-            grant.permission = FileAccessPermission::Denied;
+            *grant = None;
         }
     }
 
-    fn snapshot(&self) -> FileAccessGrant {
-        self.grant
-            .read()
-            .map(|grant| grant.clone())
-            .unwrap_or_else(|_| {
-                FileAccessGrant::new(FileAccessPermission::Denied, FileSandboxId::default())
-            })
+    fn snapshot(&self) -> Option<FileAccessGrant> {
+        self.grant.read().map(|grant| grant.clone()).unwrap_or(None)
     }
 }
 
@@ -92,7 +72,7 @@ impl FileAccessGrantSource {
 #[derive(Clone)]
 pub struct BrowserFileProvider {
     policy: Arc<FileAccessPolicy>,
-    filesystem: SharedFileSystem,
+    filesystem: Arc<CapFileSystem>,
     grants: FileAccessGrantSource,
     read_slots: Arc<Semaphore>,
 }
@@ -101,7 +81,7 @@ impl BrowserFileProvider {
     /// Creates a provider using the supplied security policy and filesystem.
     pub fn new(
         policy: Arc<FileAccessPolicy>,
-        filesystem: SharedFileSystem,
+        filesystem: Arc<CapFileSystem>,
         grants: FileAccessGrantSource,
     ) -> Self {
         Self {
@@ -135,14 +115,20 @@ impl FileProvider for BrowserFileProvider {
                 .to_file_path()
                 .map_err(|_| provider_error(FileAccessError::InvalidPath))?;
             let grant = grants.snapshot();
-            let context = request_context(request, &grant);
+            let context = request_context(request);
             let task = tokio::task::spawn_blocking(move || {
                 if preparation_cancelled.load(Ordering::Acquire) {
                     return Err(RequestError::Aborted);
                 }
-                policy.authorize_request(&context).map_err(provider_error)?;
                 let opened = policy
-                    .open_file(path, filesystem.as_ref())
+                    .open_authorized_file(
+                        &context,
+                        grant
+                            .as_ref()
+                            .ok_or_else(|| provider_error(FileAccessError::Denied))?,
+                        path,
+                        filesystem.as_ref(),
+                    )
                     .map_err(provider_error)?;
                 let length = opened.length();
                 let media_type = opened.media_type().map(str::to_owned);
@@ -293,7 +279,7 @@ fn provider_io_error() -> RequestError {
 }
 
 /// Translates networking request state into the security crate's file-access context.
-fn request_context(request: &Request, grant: &FileAccessGrant) -> FileRequestContext {
+fn request_context(request: &Request) -> FileRequestContext {
     let initiating_origin = match request.environment().origin.as_ref() {
         None => FileOrigin::Absent,
         Some(origin) if origin.is_opaque() => FileOrigin::Opaque,
@@ -308,8 +294,6 @@ fn request_context(request: &Request, grant: &FileAccessGrant) -> FileRequestCon
         initiating_origin,
         requested_origin: FileOrigin::LocalFile,
         kind,
-        permission: grant.permission,
-        sandbox: grant.sandbox.clone(),
     }
 }
 
@@ -330,7 +314,7 @@ fn provider_error(error: FileAccessError) -> RequestError {
 /// Creates a provider from a policy and filesystem backend.
 pub fn provider(
     policy: Arc<FileAccessPolicy>,
-    filesystem: SharedFileSystem,
+    filesystem: Arc<CapFileSystem>,
     grants: FileAccessGrantSource,
 ) -> Arc<dyn FileProvider> {
     Arc::new(BrowserFileProvider::new(policy, filesystem, grants))

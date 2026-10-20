@@ -10,8 +10,6 @@ mod policy;
 mod request;
 
 pub use error::FileAccessError;
-pub use filesystem::{CapFileSystem, FileResource, FileSystem, OpenedFile, SharedFileSystem};
-pub use policy::{AuthorizedPath, FileAccessPolicy};
-pub use request::{
-    FileAccessPermission, FileOrigin, FileRequestContext, FileRequestKind, FileSandboxId,
-};
+pub use filesystem::{CapFileSystem, FileResource, OpenedFile};
+pub use policy::FileAccessPolicy;
+pub use request::{FileAccessGrant, FileOrigin, FileRequestContext, FileRequestKind};

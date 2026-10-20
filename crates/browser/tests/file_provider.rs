@@ -5,14 +5,10 @@ use std::{
     time::Duration,
 };
 
-use browser::{
-    FileAccessConfiguration,
-    file_provider::{FileAccessGrant, FileAccessGrantSource},
-    request_controller,
-};
+use browser::{FileAccessConfiguration, file_provider::FileAccessGrantSource, request_controller};
 use futures_util::StreamExt;
 use net::AbortController;
-use security::file_access::{CapFileSystem, FileAccessPermission, FileAccessPolicy, FileSandboxId};
+use security::file_access::{CapFileSystem, FileAccessPolicy};
 
 static NEXT_TEMP_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -29,13 +25,9 @@ fn temporary_directory() -> std::path::PathBuf {
 fn file_access(
     policy: Arc<FileAccessPolicy>,
     filesystem: Arc<CapFileSystem>,
-    permission: FileAccessPermission,
 ) -> FileAccessConfiguration {
-    FileAccessConfiguration::new(
-        policy,
-        filesystem,
-        FileAccessGrant::new(permission, FileSandboxId::default()),
-    )
+    let grants = FileAccessGrantSource::new(policy.issue_grant());
+    FileAccessConfiguration::with_grant_source(policy, filesystem, grants)
 }
 
 fn navigation(url: impl Into<String>) -> net::Request {
@@ -65,11 +57,7 @@ fn configured_file_provider_reads_allowed_files_and_keeps_default_deny() {
 
     let policy = Arc::new(FileAccessPolicy::new([allowed.clone()]).unwrap());
     let filesystem = Arc::new(CapFileSystem::new([allowed.clone()]).unwrap());
-    let controller = request_controller(Some(file_access(
-        policy,
-        filesystem,
-        FileAccessPermission::Granted,
-    )));
+    let controller = request_controller(Some(file_access(policy, filesystem)));
     let runtime = tokio::runtime::Runtime::new().unwrap();
 
     let allowed_url = net::Url::from_file_path(&file).unwrap();
@@ -116,11 +104,7 @@ fn configured_file_provider_accepts_navigation_with_a_client_origin() {
     fs::write(&file, b"context-aware").unwrap();
     let policy = Arc::new(FileAccessPolicy::new([allowed.clone()]).unwrap());
     let filesystem = Arc::new(CapFileSystem::new([allowed]).unwrap());
-    let controller = request_controller(Some(file_access(
-        policy,
-        filesystem,
-        FileAccessPermission::Granted,
-    )));
+    let controller = request_controller(Some(file_access(policy, filesystem)));
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let url = net::Url::from_file_path(&file).unwrap();
 
@@ -145,10 +129,7 @@ fn revoking_a_file_access_grant_denies_subsequent_opens() {
     fs::write(&file, b"revocable").unwrap();
     let policy = Arc::new(FileAccessPolicy::new([allowed.clone()]).unwrap());
     let filesystem = Arc::new(CapFileSystem::new([allowed]).unwrap());
-    let grants = FileAccessGrantSource::new(FileAccessGrant::new(
-        FileAccessPermission::Granted,
-        FileSandboxId::default(),
-    ));
+    let grants = FileAccessGrantSource::new(policy.issue_grant());
     let controller = request_controller(Some(FileAccessConfiguration::with_grant_source(
         policy,
         filesystem,
@@ -189,11 +170,7 @@ fn configured_file_provider_returns_a_live_chunked_body() {
 
     let policy = Arc::new(FileAccessPolicy::new([allowed.clone()]).unwrap());
     let filesystem = Arc::new(CapFileSystem::new([allowed]).unwrap());
-    let controller = request_controller(Some(file_access(
-        policy,
-        filesystem,
-        FileAccessPermission::Granted,
-    )));
+    let controller = request_controller(Some(file_access(policy, filesystem)));
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let url = net::Url::from_file_path(&file).unwrap();
 
@@ -229,11 +206,7 @@ fn aborting_a_live_file_body_stops_the_blocking_reader() {
 
     let policy = Arc::new(FileAccessPolicy::new([allowed.clone()]).unwrap());
     let filesystem = Arc::new(CapFileSystem::new([allowed]).unwrap());
-    let controller = request_controller(Some(file_access(
-        policy,
-        filesystem,
-        FileAccessPermission::Granted,
-    )));
+    let controller = request_controller(Some(file_access(policy, filesystem)));
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let url = net::Url::from_file_path(&file).unwrap();
 
@@ -280,11 +253,7 @@ fn file_provider_maps_missing_directories_and_malformed_urls() {
     fs::write(&file, b"allowed").unwrap();
     let policy = Arc::new(FileAccessPolicy::new([allowed.clone()]).unwrap());
     let filesystem = Arc::new(CapFileSystem::new([allowed.clone()]).unwrap());
-    let controller = request_controller(Some(file_access(
-        policy,
-        filesystem,
-        FileAccessPermission::Granted,
-    )));
+    let controller = request_controller(Some(file_access(policy, filesystem)));
     let runtime = tokio::runtime::Runtime::new().unwrap();
 
     let missing = net::Url::from_file_path(directory.join("missing.html")).unwrap();
@@ -319,57 +288,50 @@ fn file_provider_maps_missing_directories_and_malformed_urls() {
 }
 
 #[test]
-fn file_provider_denies_subresources_permissions_and_sandbox_mismatches_before_opening() {
+fn file_provider_denies_revoked_foreign_and_subresource_requests_before_opening() {
     let directory = temporary_directory();
     let file = directory.join("page.html");
     fs::write(&file, b"must not be exposed").unwrap();
-    let policy = Arc::new(
-        FileAccessPolicy::new_in_sandbox([directory.clone()], FileSandboxId::new("profile-a"))
-            .unwrap(),
-    );
+    let policy = Arc::new(FileAccessPolicy::new([directory.clone()]).unwrap());
+    let foreign_policy = FileAccessPolicy::new([directory.clone()]).unwrap();
     let filesystem = Arc::new(CapFileSystem::new([directory.clone()]).unwrap());
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let url = net::Url::from_file_path(&file).unwrap();
+    let missing_url = net::Url::from_file_path(directory.join("missing.html")).unwrap();
 
-    let denied_permission = request_controller(Some(FileAccessConfiguration::new(
+    let revoked_grants = FileAccessGrantSource::new(policy.issue_grant());
+    revoked_grants.revoke();
+    let revoked = request_controller(Some(FileAccessConfiguration::with_grant_source(
         policy.clone(),
         filesystem.clone(),
-        FileAccessGrant::new(
-            FileAccessPermission::Denied,
-            FileSandboxId::new("profile-a"),
-        ),
+        revoked_grants,
     )));
     assert!(matches!(
-        runtime.block_on(denied_permission.fetch(navigation(url.clone()))),
+        runtime.block_on(revoked.fetch(navigation(missing_url))),
         Err(net::RequestError::Provider {
             provider: "file",
             kind: net::ProviderErrorKind::AccessDenied
         })
     ));
 
-    let mismatched_sandbox = request_controller(Some(FileAccessConfiguration::new(
+    let foreign_grant = request_controller(Some(FileAccessConfiguration::with_grant_source(
         policy.clone(),
         filesystem.clone(),
-        FileAccessGrant::new(
-            FileAccessPermission::Granted,
-            FileSandboxId::new("profile-b"),
-        ),
+        FileAccessGrantSource::new(foreign_policy.issue_grant()),
     )));
     assert!(matches!(
-        runtime.block_on(mismatched_sandbox.fetch(navigation(url.clone()))),
+        runtime.block_on(foreign_grant.fetch(navigation(url.clone()))),
         Err(net::RequestError::Provider {
             provider: "file",
             kind: net::ProviderErrorKind::AccessDenied
         })
     ));
 
-    let subresource = request_controller(Some(FileAccessConfiguration::new(
+    let grant = policy.issue_grant();
+    let subresource = request_controller(Some(FileAccessConfiguration::with_grant_source(
         policy,
         filesystem,
-        FileAccessGrant::new(
-            FileAccessPermission::Granted,
-            FileSandboxId::new("profile-a"),
-        ),
+        FileAccessGrantSource::new(grant),
     )));
     assert!(matches!(
         runtime.block_on(subresource.fetch(net::Request::get(url))),
@@ -380,7 +342,7 @@ fn file_provider_denies_subresources_permissions_and_sandbox_mismatches_before_o
     ));
 
     drop(subresource);
-    drop(mismatched_sandbox);
-    drop(denied_permission);
+    drop(foreign_grant);
+    drop(revoked);
     fs::remove_dir_all(directory).unwrap();
 }

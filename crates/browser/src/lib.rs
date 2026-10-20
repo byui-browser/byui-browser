@@ -8,7 +8,7 @@ use std::sync::Arc;
 use html::Query;
 use js::{JsResult, Realm, Value};
 use net::{Request, RequestController, SchemeProviders};
-use security::file_access::{FileAccessPolicy, SharedFileSystem};
+use security::file_access::{CapFileSystem, FileAccessPolicy};
 use webapis::{ConsoleSink, register_fetch, register_print};
 
 pub mod byui_provider;
@@ -19,28 +19,16 @@ pub mod file_provider;
 #[derive(Clone)]
 pub struct FileAccessConfiguration {
     policy: Arc<FileAccessPolicy>,
-    filesystem: SharedFileSystem,
+    filesystem: Arc<CapFileSystem>,
     grants: file_provider::FileAccessGrantSource,
 }
 
 impl FileAccessConfiguration {
-    /// Creates a local-file configuration with policy, filesystem, and browser grant.
-    pub fn new(
-        policy: Arc<FileAccessPolicy>,
-        filesystem: SharedFileSystem,
-        grant: file_provider::FileAccessGrant,
-    ) -> Self {
-        Self::with_grant_source(
-            policy,
-            filesystem,
-            file_provider::FileAccessGrantSource::new(grant),
-        )
-    }
-
-    /// Creates a local-file configuration backed by a shared, revocable grant source.
+    /// Creates a local-file configuration backed by a policy-issued,
+    /// shared, revocable grant source.
     pub fn with_grant_source(
         policy: Arc<FileAccessPolicy>,
-        filesystem: SharedFileSystem,
+        filesystem: Arc<CapFileSystem>,
         grants: file_provider::FileAccessGrantSource,
     ) -> Self {
         Self {
@@ -56,7 +44,7 @@ impl FileAccessConfiguration {
 ///
 /// When `file_access` is `None`, no `file:` provider is installed. When it is
 /// present, callers must supply the policy, filesystem backend, and explicit
-/// permission/container grant source; this function does not infer them from
+/// policy-issued grant source; this function does not infer them from
 /// process state. Browser services use a conservative no-cookie, no-worker
 /// default and permit requests carrying browser client context.
 pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<RequestController> {

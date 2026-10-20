@@ -3,12 +3,15 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
+use super::CapFileSystem;
 use super::{
-    FileAccessError, FileAccessPermission, FileOrigin, FileRequestContext, FileRequestKind,
-    FileSandboxId, FileSystem, OpenedFile,
+    FileAccessError, FileAccessGrant, FileOrigin, FileRequestContext, FileRequestKind, OpenedFile,
 };
+
+static NEXT_POLICY_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A filesystem path that has passed the configured access policy.
 ///
@@ -16,7 +19,7 @@ use super::{
 /// [`FileAccessPolicy`]. Callers should retain this value instead of
 /// re-authorizing or reconstructing the path from an untrusted URL.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuthorizedPath {
+pub(crate) struct AuthorizedPath {
     canonical: PathBuf,
     root: PathBuf,
     relative: PathBuf,
@@ -24,7 +27,8 @@ pub struct AuthorizedPath {
 
 impl AuthorizedPath {
     /// Returns the canonical path approved by the policy.
-    pub fn as_path(&self) -> &Path {
+    #[cfg(test)]
+    pub(crate) fn as_path(&self) -> &Path {
         &self.canonical
     }
 
@@ -38,10 +42,20 @@ impl AuthorizedPath {
 }
 
 /// Default-deny policy for browser-authorized local files.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileAccessPolicy {
     allowed_roots: Vec<PathBuf>,
-    sandbox: FileSandboxId,
+    policy_id: u64,
+}
+
+impl Default for FileAccessPolicy {
+    /// Creates a policy that denies every path and issues its own grants.
+    fn default() -> Self {
+        Self {
+            allowed_roots: Vec::new(),
+            policy_id: next_policy_id(),
+        }
+    }
 }
 
 impl FileAccessPolicy {
@@ -56,37 +70,31 @@ impl FileAccessPolicy {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             allowed_roots,
-            sandbox: FileSandboxId::default(),
+            policy_id: next_policy_id(),
         })
     }
 
-    /// Creates a policy allowing reads below `allowed_roots` in `sandbox`.
+    /// Issues a grant accepted only by this policy.
     ///
-    /// Browser composition must supply this same sandbox identity in each
-    /// [`FileRequestContext`] before the policy will authorize a request.
-    pub fn new_in_sandbox(
-        allowed_roots: impl IntoIterator<Item = PathBuf>,
-        sandbox: FileSandboxId,
-    ) -> Result<Self, FileAccessError> {
-        let mut policy = Self::new(allowed_roots)?;
-        policy.sandbox = sandbox;
-        Ok(policy)
-    }
-
-    /// Returns the sandbox identity that owns this policy's file capability.
-    pub fn sandbox(&self) -> &FileSandboxId {
-        &self.sandbox
+    /// The caller that receives this grant is the trusted browser/embedder
+    /// boundary. It must retain the grant in browser-owned state and must not
+    /// expose it to web-content or request-construction code.
+    pub fn issue_grant(&self) -> FileAccessGrant {
+        FileAccessGrant::new(self.policy_id)
     }
 
     /// Authorizes the browser context before any filesystem path is opened.
     ///
-    /// Access is default-deny. The caller must provide an explicitly granted
-    /// permission, the configured sandbox identity, and a local-file target.
-    /// This initial policy supports only top-level navigations; subresource
-    /// access remains denied until file-document origin semantics are defined.
-    pub fn authorize_request(&self, context: &FileRequestContext) -> Result<(), FileAccessError> {
-        if context.permission != FileAccessPermission::Granted
-            || context.sandbox != self.sandbox
+    /// Access is default-deny. The caller must provide a grant issued by this
+    /// policy and a local-file navigation target. This initial policy supports
+    /// only top-level navigations; subresource access remains denied until
+    /// file-document origin semantics are defined.
+    pub(crate) fn authorize_request(
+        &self,
+        context: &FileRequestContext,
+        grant: &FileAccessGrant,
+    ) -> Result<(), FileAccessError> {
+        if grant.policy_id != self.policy_id
             || context.requested_origin != FileOrigin::LocalFile
             || context.kind != FileRequestKind::Navigation
         {
@@ -102,10 +110,10 @@ impl FileAccessPolicy {
     /// symlinks before the containment check, so a link that resolves outside
     /// an allowed root is denied.
     ///
-    /// This check is not an atomic filesystem-containment operation. Callers
-    /// must open the returned path through a [`FileSystem`] backend that
-    /// preserves the authorization boundary.
-    pub fn authorize_path(
+    /// This check is not an atomic filesystem-containment operation. It remains
+    /// crate-internal so callers use [`Self::open_authorized_file`], which
+    /// preserves both request-policy and capability boundaries.
+    pub(crate) fn authorize_path(
         &self,
         requested: impl AsRef<Path>,
     ) -> Result<AuthorizedPath, FileAccessError> {
@@ -133,16 +141,20 @@ impl FileAccessPolicy {
         })
     }
 
-    /// Authorizes `requested` and opens it through `filesystem`.
+    /// Authorizes one browser request and opens its requested file capability.
     ///
-    /// The returned [`OpenedFile`] owns the handle that callers must use for
-    /// subsequent reads. This prevents callers from authorizing one pathname
-    /// and later reopening that pathname for its contents.
-    pub fn open_file(
+    /// Request authorization runs before path canonicalization or filesystem
+    /// access. The returned [`OpenedFile`] owns the handle that callers must
+    /// use for subsequent reads. This prevents callers from authorizing one
+    /// pathname and later reopening that pathname for its contents.
+    pub fn open_authorized_file(
         &self,
+        context: &FileRequestContext,
+        grant: &FileAccessGrant,
         requested: impl AsRef<Path>,
-        filesystem: &dyn FileSystem,
+        filesystem: &CapFileSystem,
     ) -> Result<OpenedFile, FileAccessError> {
+        self.authorize_request(context, grant)?;
         let path = self.authorize_path(requested)?;
         filesystem.open(&path)
     }
@@ -156,6 +168,10 @@ impl FileAccessPolicy {
 /// policy before this helper is used.
 fn is_within_root(candidate: &Path, root: &Path) -> bool {
     candidate.starts_with(root)
+}
+
+fn next_policy_id() -> u64 {
+    NEXT_POLICY_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -190,24 +206,18 @@ mod tests {
     }
 
     #[test]
-    fn request_authorization_requires_granted_navigation_in_matching_sandbox() {
-        let sandbox = FileSandboxId::new("profile-a");
-        let policy = FileAccessPolicy::new_in_sandbox([], sandbox.clone()).unwrap();
+    fn request_authorization_requires_a_policy_grant_and_navigation() {
+        let policy = FileAccessPolicy::new([]).unwrap();
+        let grant = policy.issue_grant();
         let allowed = FileRequestContext {
             initiating_origin: FileOrigin::Tuple("https://example.test".into()),
             requested_origin: FileOrigin::LocalFile,
             kind: FileRequestKind::Navigation,
-            permission: FileAccessPermission::Granted,
-            sandbox: sandbox.clone(),
         };
 
-        assert_eq!(policy.authorize_request(&allowed), Ok(()));
+        assert_eq!(policy.authorize_request(&allowed, &grant), Ok(()));
 
         for context in [
-            FileRequestContext {
-                permission: FileAccessPermission::Denied,
-                ..allowed.clone()
-            },
             FileRequestContext {
                 kind: FileRequestKind::Subresource,
                 ..allowed.clone()
@@ -216,16 +226,44 @@ mod tests {
                 requested_origin: FileOrigin::Opaque,
                 ..allowed.clone()
             },
-            FileRequestContext {
-                sandbox: FileSandboxId::new("profile-b"),
-                ..allowed
-            },
         ] {
             assert_eq!(
-                policy.authorize_request(&context),
+                policy.authorize_request(&context, &grant),
                 Err(FileAccessError::Denied)
             );
         }
+
+        let other_policy = FileAccessPolicy::new([]).unwrap();
+        assert_eq!(
+            policy.authorize_request(&allowed, &other_policy.issue_grant()),
+            Err(FileAccessError::Denied)
+        );
+    }
+
+    #[test]
+    fn denied_request_precedes_path_canonicalization() {
+        let directory = temporary_directory();
+        let policy = FileAccessPolicy::new([directory.clone()]).unwrap();
+        let filesystem = CapFileSystem::new([directory.clone()]).unwrap();
+        let context = FileRequestContext {
+            initiating_origin: FileOrigin::Absent,
+            requested_origin: FileOrigin::LocalFile,
+            kind: FileRequestKind::Navigation,
+        };
+        let foreign_policy = FileAccessPolicy::new([]).unwrap();
+
+        assert!(matches!(
+            policy.open_authorized_file(
+                &context,
+                &foreign_policy.issue_grant(),
+                directory.join("missing.txt"),
+                &filesystem,
+            ),
+            Err(FileAccessError::Denied)
+        ));
+
+        drop(filesystem);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -28,44 +28,28 @@ pub enum FileRequestKind {
     Subresource,
 }
 
-/// Permission state for one attempted local-file access.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FileAccessPermission {
-    /// The browser has not granted local-file access.
-    Denied,
-    /// The browser has explicitly granted local-file access.
-    Granted,
-}
-
-/// Browser sandbox or container identity associated with a local-file capability.
+/// Opaque authorization issued by one [`FileAccessPolicy`].
 ///
-/// The value is opaque to the security policy. Browser composition must use the
-/// same value when creating the policy and when translating a request.
+/// Only the policy that issued this value accepts it. Browser composition must
+/// retain grants exclusively in browser-owned state and never expose them to
+/// request or web-content code. Dropping a grant source denies future opens.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FileSandboxId(String);
-
-impl FileSandboxId {
-    /// Creates an opaque sandbox or container identity.
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
+pub struct FileAccessGrant {
+    pub(crate) policy_id: u64,
 }
 
-impl Default for FileSandboxId {
-    /// Returns the process-local default container identity.
-    ///
-    /// Browser composition must still explicitly provide a matching identity
-    /// and a granted permission before a request can access a file.
-    fn default() -> Self {
-        Self::new("default-file-container")
+impl FileAccessGrant {
+    pub(crate) fn new(policy_id: u64) -> Self {
+        Self { policy_id }
     }
 }
 
 /// Security-relevant context for one attempted local-file access.
 ///
-/// This initial vertical slice intentionally supports only explicitly granted
-/// top-level navigations. Subresource access is denied until file-document
-/// origin semantics are available end-to-end.
+/// This initial vertical slice intentionally supports only top-level
+/// navigations authorized by a policy-issued [`FileAccessGrant`]. Subresource
+/// access is denied until file-document origin semantics are available
+/// end-to-end.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileRequestContext {
     /// Origin of the document or worker that initiated the request.
@@ -75,8 +59,4 @@ pub struct FileRequestContext {
     pub requested_origin: FileOrigin,
     /// Whether the request is a navigation or subresource access.
     pub kind: FileRequestKind,
-    /// Permission state supplied by browser composition for this request.
-    pub permission: FileAccessPermission,
-    /// Sandbox or container identity supplied by browser composition.
-    pub sandbox: FileSandboxId,
 }
