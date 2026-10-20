@@ -283,10 +283,13 @@ dependencies = [
  "html",
  "js",
  "layout",
+ "net",
  "paint",
  "render",
+ "rfd",
  "softbuffer",
  "tiny-skia",
+ "webapis",
  "winit",
 ]
 
