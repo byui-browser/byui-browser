@@ -5,8 +5,7 @@ use layout::{Size, StyledDom, layout_tree};
 use render::{Compositor, Frame};
 use tiny_skia::Pixmap;
 
-fn render_demo(width: u32, height: u32) -> Frame {
-    let page = browser::welcome_page();
+fn render_demo(page: &browser::Page, width: u32, height: u32) -> Frame {
     let document = html::parse_raw_html(page.html.to_owned());
     let stylesheet = css::parse_stylesheet(&page.css);
     assert!(
@@ -33,9 +32,15 @@ fn render_demo(width: u32, height: u32) -> Frame {
 /// The current compositor rasterizes at 1x; nearest-neighbor scaling keeps its
 /// bitmap font at a consistent logical size on Retina. Returns `None` for an
 /// empty area.
-pub(crate) fn render_page(width: u32, height: u32, scale_factor: f64) -> Option<Pixmap> {
+pub(crate) fn render_page(
+    page: &browser::Page,
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(width, height)?;
     let frame = render_demo(
+        page,
         (width as f64 / scale_factor).ceil() as u32,
         (height as f64 / scale_factor).ceil() as u32,
     );
@@ -65,7 +70,7 @@ mod tests {
 
     #[test]
     fn demo_produces_layout_background_and_renderer_text() {
-        let frame = render_demo(160, 120);
+        let frame = render_demo(&browser::welcome_page(), 160, 120);
         assert_eq!((frame.width, frame.height), (160, 120));
         assert_eq!(&frame.pixels[..4], &[242, 245, 250, 255]);
         assert!(frame.pixels.chunks_exact(4).any(|p| p == [30, 43, 62, 255]));
@@ -76,7 +81,7 @@ mod tests {
     fn page_is_scaled_to_device_pixels() {
         for scale in [1.0, 1.5, 2.0] {
             let (width, height) = ((160.0 * scale) as u32, (120.0 * scale) as u32);
-            let page = render_page(width, height, scale).unwrap();
+            let page = render_page(&browser::welcome_page(), width, height, scale).unwrap();
             assert_eq!((page.width(), page.height()), (width, height));
             let data = page.data();
             assert_eq!(&data[..4], &[242, 245, 250, 255]);
@@ -88,9 +93,10 @@ mod tests {
 
     #[test]
     fn tiny_and_empty_pages_are_safe() {
-        assert!(render_page(0, 10, 1.0).is_none());
+        let page = browser::welcome_page();
+        assert!(render_page(&page, 0, 10, 1.0).is_none());
         for (width, height) in [(1, 1), (3, 48), (17, 70)] {
-            assert!(render_page(width, height, 2.0).is_some());
+            assert!(render_page(&page, width, height, 2.0).is_some());
         }
     }
 }
