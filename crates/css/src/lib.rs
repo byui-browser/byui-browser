@@ -15,7 +15,7 @@ pub use selector::{
 };
 
 use common::ids::NodeId;
-use html::{HtmlDocument, NodeKind};
+use html::{HTMLDocument, NodeKind};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +60,7 @@ pub struct Stylesheet {
 }
 
 /// CSS's view of the HTML team's arena-backed DOM.
-pub type Dom = HtmlDocument;
+pub type Dom = HTMLDocument;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ComputedStyles {
@@ -491,10 +491,10 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
     ComputedStyles { styles: computed }
 }
 
-fn computed_style<'a>(
-    styles: &'a [(NodeId, Vec<Declaration>)],
+fn computed_style(
+    styles: &[(NodeId, Vec<Declaration>)],
     parent: html::NodeId,
-) -> Option<&'a Vec<Declaration>> {
+) -> Option<&Vec<Declaration>> {
     styles
         .iter()
         .find(|(id, _)| id.index() as usize == parent.index())
@@ -523,7 +523,7 @@ fn attribute_value<'a>(element: &'a html::ElementData, name: &str) -> Option<&'a
         .map(|attribute| attribute.value.as_str())
 }
 
-fn matches_selector(dom: &HtmlDocument, node_id: html::NodeId, selector: &str) -> bool {
+fn matches_selector(dom: &HTMLDocument, node_id: html::NodeId, selector: &str) -> bool {
     let parts = selector.split_whitespace().collect::<Vec<_>>();
     let Some(last) = parts.last() else {
         return false;
@@ -548,7 +548,7 @@ fn matches_selector(dom: &HtmlDocument, node_id: html::NodeId, selector: &str) -
     true
 }
 
-fn matches_compound(dom: &HtmlDocument, node_id: html::NodeId, selector: &str) -> bool {
+fn matches_compound(dom: &HTMLDocument, node_id: html::NodeId, selector: &str) -> bool {
     let Some(node) = dom.node(node_id) else {
         return false;
     };
@@ -597,8 +597,6 @@ fn matches_compound(dom: &HtmlDocument, node_id: html::NodeId, selector: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use html::Query;
-
     #[test]
     fn parses_comments_strings_functions_and_important_values() {
         let sheet = parse_stylesheet(
@@ -641,16 +639,18 @@ mod tests {
     #[test]
     fn cascades_matches_and_inlines() {
         let document = html::parse_raw_html(
-            "<div><p class='intro' style='color: black'>Hello</p></div>".into(),
+            "<div><p id='target' class='intro' style='color: black'>Hello</p></div>".into(),
         );
         let stylesheet =
             parse_stylesheet("p { color: green; } .intro { color: red; font-size: 20px; }");
         let styles = style_document(&document, &[stylesheet]);
-        let paragraph = document.query("p").pop().expect("paragraph");
+        let paragraph = document
+            .get_element_by_id("target")
+            .expect("paragraph node id");
         let declarations = styles
             .styles
             .iter()
-            .find(|(id, _)| id.index() == paragraph.id.index())
+            .find(|(id, _)| id.index() as usize == paragraph.index())
             .expect("computed paragraph");
         assert!(declarations.1.contains(&Declaration {
             property: "color".into(),
