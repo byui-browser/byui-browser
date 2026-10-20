@@ -1,87 +1,99 @@
-# File provider hardening plan
+# Browser `file:` provider
 
-`BrowserFileProvider` adapts the security crate's filesystem policy to
-`net::FileProvider`. Filesystem policy remains security-owned, and all access
-must remain fail-closed.
+The browser adapts security-owned file access to `net::FileProvider`. The
+security crate owns path authorization and filesystem capabilities; the browser
+owns request-context translation and explicit grants; `net` owns scheme
+dispatch, response validation, and body behavior. The security crate does not
+depend on `net`.
 
-## Completed
+## Current implementation
 
-- `FileAccessPolicy` is default-deny and produces opaque authorized paths.
-- `CapFileSystem` opens configured roots as capabilities and reads from the
-  retained handle without reopening an authorized pathname.
-- Browser composition installs `file:` access only with explicit policy and
-  filesystem configuration.
-- Security and browser tests cover allowed and denied reads, traversal and
-  sibling rejection, symlink and junction escapes, replacement races, missing
-  files, directories, malformed URLs, content length, and `GET`/`HEAD`.
-- The generic `net` provider boundary covers provider routing, metadata
-  validation, and provider/body cancellation behavior.
+### Authorization and composition
+
+- `FileAccessPolicy` is default-deny and canonicalizes configured roots.
+- `FileAccessPolicy::authorize_request` requires granted permission, the
+  configured `FileSandboxId`, a `file:` target origin, and a top-level
+  navigation request before a path is opened.
+- `FileRequestContext` carries the initiating origin, requested origin,
+  navigation/subresource kind, permission state, and sandbox identity. The
+  initiating origin is preserved for the later file-document origin policy;
+  the current policy denies subresource requests.
+- `BrowserFileProvider` translates `net::Request` into that context through an
+  explicit `FileAccessGrant`. `FileAccessConfiguration` makes policy,
+  filesystem, permission, and sandbox state explicit when composing the
+  browser request controller.
+- If no file configuration is supplied, no `file:` provider is installed and
+  requests fail with `MissingProvider` before filesystem access.
+
+### Capability-based filesystem access
+
+- `CapFileSystem` opens each configured root as a directory capability.
+- `FileAccessPolicy::open_file` authorizes a canonical path and passes an
+  `AuthorizedPath` to the filesystem backend.
+- The backend opens the file once and returns an `OpenedFile`; reads use that
+  retained handle rather than reopening the authorized pathname.
+- Root containment uses path components, so similarly named sibling roots are
+  distinct. Canonicalization rejects traversal and symlink escapes.
+- Current tests cover regular files, denied siblings, directories, replacement
+  races, Unix symlink escapes, and Windows junction escapes.
+
+### Provider response behavior
+
+After request authorization and file opening, `BrowserFileProvider` currently:
+
+- materializes the opened file with `OpenedFile::read_all`;
+- emits `Content-Length` and an optional filesystem-supplied `Content-Type`;
+- returns status `200 OK` with an opaque response origin; and
+- supplies the bytes to `net` as `SchemeBody::Bytes`.
+
+The shared `net` scheme pipeline enforces `GET`/`HEAD`, nulls the body for
+`HEAD`, validates response metadata, and maps failures to stable provider error
+categories without exposing filesystem paths or OS diagnostics. Browser tests
+cover allowed reads, default denial, missing files, directories, malformed
+URLs, content length, `GET`/`HEAD`, denied permissions, sandbox mismatches, and
+subresource rejection.
 
 ## Remaining work
 
-### Request and origin authorization
-
-Implemented: `BrowserFileProvider::open` translates `net::Request` into a
-security-owned request context covering:
-
-- initiating and requested file origins;
-- navigation versus subresource access;
-- permission state; and
-- browser sandbox or container identity.
-
-The initial policy is deliberately partial: it allows only an explicitly
-permitted, sandbox-matching top-level navigation to a `file:` URL.
-Subresource requests are denied until file-document origin semantics are
-available end-to-end. The browser adapter performs the translation without
-making the security crate depend on `net`.
-
 ### Asynchronous reads and streaming
 
-`OpenedFile::read_all` performs blocking I/O and materializes the entire file.
-Move reads to a bounded blocking executor or introduce an asynchronous
-filesystem boundary. Then stream large or unknown-size files through
-`net::SchemeBody::Stream` while retaining the opened handle.
+`OpenedFile::read_all` performs blocking I/O and materializes the complete
+file. Move reads behind a bounded blocking executor or an asynchronous
+filesystem boundary, then stream large or unknown-size files through
+`net::SchemeBody::Stream` while retaining the opened handle. Verify cleanup
+when requests or bodies are aborted, fail, dropped unread, or only partially
+consumed.
 
-Verify cleanup when requests or bodies are aborted, fail, dropped unread, or
-are only partially consumed.
+### File-document origins and request policy
 
-### Metadata, errors, and origin policy
+The current policy intentionally permits only explicitly granted top-level
+navigations. Define file-document origin semantics and then decide which
+subresource requests are allowed. Connect that decision to initiating origins,
+same-origin checks, sandbox/container identity, and navigation policy while
+preserving fail-closed behavior.
 
-Complete browser-adapter behavior for:
+### Metadata and resource limits
 
-- valid and invalid filesystem media types;
-- directories, unreadable files, and unsupported file types;
-- content length and content type generation;
-- stable provider error categories without leaking paths or OS details; and
-- the chosen `file:` response origin policy.
+Complete handling and tests for invalid media types, unreadable files,
+unsupported file types, large files, read duration, and concurrent reads.
+Decide whether the provider should reject invalid filesystem media metadata or
+omit it, rather than silently dropping invalid values during header creation.
 
-Document and test the origin decision against response validation, same-origin
-checks, and future request authorization.
+### Platform hardening and conformance
 
-### Platform and filesystem hardening
+Extend coverage for Unix mount points and hard links, Windows reparse-point
+variants, drive-letter and UNC paths, network shares, removable media, and
+capability-backend fallbacks. Any fallback must open once, revalidate that
+handle, and read from that same handle; it must never re-authorize and reopen a
+pathname.
 
-Extend validation of `CapFileSystem` for filesystem semantics not covered by
-the current tests:
-
-- Unix mount points and hard links;
-- Windows reparse-point variants, drive-letter paths, and UNC paths;
-- network shares and removable media; and
-- fallback behavior when the capability backend lacks a required primitive.
-
-Any fallback must open once, revalidate that exact handle, and read from that
-same handle. Revalidating a pathname and then reopening it is not acceptable.
-
-### Resource limits and broader coverage
-
-Add explicit file-size, stream-duration, and concurrent-read limits. Extend
-security, browser, and `net` integration coverage as these capabilities land,
-including no HTTP transport, cache, cookie, or unrelated-provider side
-effects.
+Keep security, browser, and `net` integration tests aligned with the guarantees
+that local file requests do not use HTTP transport, cookies, the HTTP cache, or
+unrelated scheme providers.
 
 ## Recommended order
 
-1. Make reads asynchronous and cancellable.
-2. Add retained-handle streaming.
-3. Finalize metadata, errors, and origin behavior, including file-document
-   origin semantics and subresource authorization.
-4. Extend platform hardening, resource limits, and conformance coverage.
+1. Move file reads to bounded asynchronous or blocking-executor-backed I/O.
+2. Add retained-handle streaming and lifecycle/limit tests.
+3. Finalize file-document origin and subresource authorization semantics.
+4. Extend platform hardening and broader conformance coverage.
