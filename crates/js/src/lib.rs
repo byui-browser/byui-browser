@@ -8,16 +8,19 @@
 #![warn(missing_docs)]
 
 pub mod ast;
+pub mod bytecode;
 pub mod lexer;
 pub mod parser;
 pub mod runtime;
 mod stack;
+pub mod vm;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
 pub use runtime::{Function, Object};
+pub use vm::Vm;
 
 /// A JavaScript value produced by evaluation or passed to host functions.
 ///
