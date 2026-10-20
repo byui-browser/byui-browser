@@ -17,6 +17,7 @@ use webapis::{
 pub mod byui_provider;
 pub mod fetch_services;
 pub mod file_provider;
+pub mod refresh;
 
 /// Browser-owned resource limits for one local-file session.
 ///

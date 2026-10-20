@@ -46,7 +46,7 @@ pub(crate) enum Control {
     Back,
     /// Forward navigation; disabled because there is no history yet.
     Forward,
-    /// Reload; re-renders the welcome page.
+    /// Reload; fetches the current URL to the terminal and repaints the loaded page.
     Reload,
     /// Address field; text entry is not implemented yet.
     Address,
