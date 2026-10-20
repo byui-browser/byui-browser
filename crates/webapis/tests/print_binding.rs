@@ -115,6 +115,12 @@ fn scripts_can_shadow_print_without_reaching_the_web_api() {
         Ok(Value::Number(1.0))
     );
     assert_eq!(console.count(), 0);
-    realm.evaluate_script("print()").unwrap();
-    assert_eq!(console.count(), 1);
+    // The shadowing binding persists in the Realm, so the Web API stays unreachable.
+    let error = realm.evaluate_script("print()").unwrap_err();
+    assert_eq!(error.message, "`print` is not a function");
+    assert_eq!(console.count(), 0);
+
+    let (fresh, fresh_console) = realm_with_print();
+    fresh.evaluate_script("print()").unwrap();
+    assert_eq!(fresh_console.count(), 1);
 }
