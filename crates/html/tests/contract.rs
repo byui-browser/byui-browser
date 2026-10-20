@@ -162,6 +162,7 @@ fn valid_fixture_has_expected_arena_shape_and_text() {
     assert!(
         document
             .text_content(body_id)
+            .expect("body text")
             .contains("Building a Small HTML Tree")
     );
     assert!(
@@ -297,7 +298,7 @@ fn parse_5_nested_children_finds_the_text_node() {
         .collect::<Vec<_>>();
 
     assert_eq!(text_nodes, vec![(html::NodeId(6), "Hello")]);
-    assert_eq!(document.text_content(text_nodes[0].0), "Hello");
+    assert_eq!(document.text_content(text_nodes[0].0), Some("Hello".into()));
 
     let mut current = text_nodes[0].0;
     for _ in 0..5 {
@@ -317,7 +318,45 @@ fn handles_empty_input_and_text_without_markup() {
     assert!(matches!(empty.nodes[empty.root.0].kind, NodeKind::Document));
 
     let text = parse_raw_html("plain text < and > signs".to_owned());
-    assert_eq!(text.text_content(text.root), "plain text < and > signs");
+    assert_eq!(text.text_content(text.root), None);
+}
+
+#[test]
+fn text_content_matches_dom_node_type_rules() {
+    let mut document = HTMLDocument::new();
+    let element = document.push_node(
+        NodeKind::Element(ElementData {
+            name: "section".into(),
+            namespace: Namespace::Html,
+            attributes: Vec::new(),
+        }),
+        None,
+    );
+    let first_text = document.push_node(NodeKind::Text("before".into()), None);
+    let comment = document.push_node(NodeKind::Comment("ignored by elements".into()), None);
+    let second_text = document.push_node(NodeKind::Text("after".into()), None);
+    let doctype = document.push_node(
+        NodeKind::Doctype {
+            name: Some("html".into()),
+            public_id: None,
+            system_id: None,
+        },
+        None,
+    );
+    document.append_child(document.root, element);
+    document.append_child(element, first_text);
+    document.append_child(element, comment);
+    document.append_child(element, second_text);
+
+    assert_eq!(document.text_content(element), Some("beforeafter".into()));
+    assert_eq!(document.text_content(first_text), Some("before".into()));
+    assert_eq!(
+        document.text_content(comment),
+        Some("ignored by elements".into())
+    );
+    assert_eq!(document.text_content(document.root), None);
+    assert_eq!(document.text_content(doctype), None);
+    assert_eq!(document.text_content(html::NodeId(999)), None);
 }
 
 #[test]
@@ -337,8 +376,8 @@ fn handles_unclosed_tags_and_mismatched_closing_tags() {
         .position(|node| node == &paragraphs[1])
         .map(html::NodeId)
         .expect("second paragraph id");
-    assert_eq!(document.text_content(first_id), "first");
-    assert_eq!(document.text_content(second_id), "second");
+    assert_eq!(document.text_content(first_id), Some("first".into()));
+    assert_eq!(document.text_content(second_id), Some("second".into()));
 }
 
 #[test]
@@ -351,7 +390,10 @@ fn preserves_void_element_siblings_and_does_not_push_void_nodes() {
         .position(|node| node == &paragraph)
         .map(html::NodeId)
         .expect("paragraph id");
-    assert_eq!(document.text_content(paragraph_id), "beforeaftertail");
+    assert_eq!(
+        document.text_content(paragraph_id),
+        Some("beforeaftertail".into())
+    );
     for tag in ["br", "img"] {
         let node_id = paragraph
             .children
@@ -371,7 +413,7 @@ fn preserves_void_element_siblings_and_does_not_push_void_nodes() {
 #[test]
 fn keeps_incomplete_tag_text_and_unterminated_attribute_values() {
     let incomplete = parse_raw_html("hello <p".to_owned());
-    assert_eq!(incomplete.text_content(incomplete.root), "hello <p");
+    assert_eq!(incomplete.text_content(incomplete.root), None);
 
     let attributes = parse_raw_html("<input value='unfinished>".to_owned());
     let input = attributes.query("input").pop().expect("input");

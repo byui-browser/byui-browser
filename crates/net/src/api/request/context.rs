@@ -69,8 +69,7 @@ pub enum CredentialsMode {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RedirectMode {
     #[default]
-    /// Requests redirect following. Redirect responses currently fail with
-    /// `RedirectFailure` until the controller-owned redirect loop exists.
+    /// Follow HTTP redirects, subject to Fetch's redirect policy.
     Follow,
     /// Fail when the response would redirect.
     Error,

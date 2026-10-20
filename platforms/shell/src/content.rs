@@ -8,12 +8,12 @@ use tiny_skia::Pixmap;
 fn render_demo(width: u32, height: u32) -> Frame {
     let page = browser::welcome_page();
     let document = html::parse_raw_html(page.html.to_owned());
-    let stylesheet = css::parse_stylesheet(page.css);
+    let stylesheet = css::parse_stylesheet(&page.css);
     assert!(
         !stylesheet.rules.is_empty(),
         "the welcome page should have a stylesheet"
     );
-    let script_result = js::eval(page.js).expect("the welcome page script should execute");
+    let script_result = js::eval(&page.js).expect("the welcome page script should execute");
     assert_eq!(
         script_result,
         js::Value::String("Welcome to BYUI Browser!".into())
@@ -33,7 +33,7 @@ fn render_demo(width: u32, height: u32) -> Frame {
 /// The current compositor rasterizes at 1x; nearest-neighbor scaling keeps its
 /// bitmap font at a consistent logical size on Retina. Returns `None` for an
 /// empty area.
-pub(super) fn render_page(width: u32, height: u32, scale_factor: f64) -> Option<Pixmap> {
+pub(crate) fn render_page(width: u32, height: u32, scale_factor: f64) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(width, height)?;
     let frame = render_demo(
         (width as f64 / scale_factor).ceil() as u32,

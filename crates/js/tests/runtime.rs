@@ -423,7 +423,15 @@ fn realm_scripts_may_shadow_host_globals() {
         .register_global_function("print", Arc::new(|_: &[Value]| Ok(Value::Null)))
         .unwrap();
     assert_eq!(realm.evaluate_script("let print = 3; print"), number(3.0));
-    assert_eq!(realm.evaluate_script("print()"), Ok(Value::Null));
+    // The shadowing binding persists in the Realm, so the host function stays hidden.
+    let error = realm.evaluate_script("print()").unwrap_err();
+    assert_eq!(error.message, "`print` is not a function");
+
+    let mut fresh = Realm::new();
+    fresh
+        .register_global_function("print", Arc::new(|_: &[Value]| Ok(Value::Null)))
+        .unwrap();
+    assert_eq!(fresh.evaluate_script("print()"), Ok(Value::Null));
 }
 
 #[test]

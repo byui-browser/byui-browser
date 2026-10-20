@@ -32,7 +32,9 @@ fn fetch_yields_body_chunks_before_response_completion() {
         let _ = stream.write_all(b" world");
     });
 
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
     let first_chunk = runtime().block_on(async {
         let mut response = controller.fetch(Request::get(url)).await.unwrap();
         response.body.next().await.unwrap().unwrap().to_vec()
@@ -53,7 +55,9 @@ fn incomplete_stream_forwards_error_and_is_not_cached() {
             b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nvalid".to_vec()
         }
     });
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
 
     let (partial, retry) = runtime().block_on(async {
         let mut response = controller.fetch(Request::get(server.url())).await.unwrap();
@@ -89,10 +93,11 @@ fn dropping_a_stream_releases_its_scheduler_permit_and_does_not_cache() {
         observed_hits.fetch_add(1, Ordering::SeqCst);
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody".to_vec()
     });
-    let controller = RequestController::new(Config {
+    let controller = RequestController::builder(Config {
         max_in_flight: 1,
         ..Config::default()
     })
+    .build()
     .unwrap();
 
     runtime().block_on(async {

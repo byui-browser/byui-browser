@@ -1,0 +1,40 @@
+[package]
+name = "browser-shell"
+description = "Window, toolbar, and page rendering shared by the native shells of BYUI Browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+browser = { path = "../../crates/browser" }
+css = { workspace = true }
+html = { workspace = true }
+js = { workspace = true }
+layout = { workspace = true }
+paint = { workspace = true }
+render = { workspace = true }
+# Anti-aliased chrome drawing and system-font text for the toolbar.
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+ab_glyph = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+softbuffer = { version = "0.4", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+softbuffer = { version = "0.4", default-features = false }
+
+# Both display servers are supported; winit picks Wayland when
+# `WAYLAND_DISPLAY` is set and falls back to X11 (or XWayland) otherwise.
+# `wayland-csd-adwaita` draws a titlebar on compositors such as GNOME's that
+# offer no server-side decorations, so the window still has native-looking
+# buttons and resize borders there.
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
+softbuffer = { version = "0.4", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+
+[lints]
+workspace = true

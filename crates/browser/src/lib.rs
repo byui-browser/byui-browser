@@ -7,57 +7,73 @@ use std::sync::Arc;
 
 use html::Query;
 use js::{JsResult, Realm, Value};
-use net::RequestController;
+use net::{Request, RequestController, SchemeProviders};
 use webapis::{ConsoleSink, register_fetch, register_print};
 
-const WELCOME_HTML: &str = include_str!("../../../browser-pages/welcome/index.html");
-const WELCOME_CSS: &str = include_str!("../../../browser-pages/welcome/style.css");
-const WELCOME_JS: &str = include_str!("../../../browser-pages/welcome/script.js");
+pub mod byui_provider;
 
 /// A browser page and the resources referenced by its HTML source.
 ///
-/// Resource text is embedded at compile time so native shells do not depend
-/// on the process working directory. The HTML references are still resolved
-/// and validated before the page is returned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Resource text is loaded through the browser-owned `byui:` provider, so
+/// native shells do not depend on the process working directory. The HTML
+/// references are resolved and validated before the page is returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page {
     /// HTML document source.
-    pub html: &'static str,
+    pub html: String,
     /// CSS source referenced by the document's stylesheet link.
-    pub css: &'static str,
+    pub css: String,
     /// JavaScript source referenced by the document's script element.
-    pub js: &'static str,
+    pub js: String,
 }
 
 /// Loads the welcome page and resolves its local stylesheet and script links.
 pub fn welcome_page() -> Page {
-    let document = html::parse_raw_html(WELCOME_HTML.to_owned());
-    let stylesheet = document
+    let controller = RequestController::builder(net::Config::default())
+        .with_scheme_providers(SchemeProviders::new().with_page(byui_provider::provider()))
+        .build()
+        .expect("network controller should initialize");
+    let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+    let html = runtime
+        .block_on(fetch_text(&controller, "byui://welcome/page"))
+        .expect("welcome HTML should be available through byui:");
+    let document = html::parse_raw_html(html.clone());
+    let stylesheet_url = document
         .query("link")
         .into_iter()
         .find_map(|node| {
             node.kind.element_attributes().and_then(|attributes| {
                 (attribute(attributes, "rel") == Some("stylesheet")
                     && attribute(attributes, "href") == Some("style.css"))
-                .then_some(WELCOME_CSS)
+                .then_some("byui://welcome/style.css")
             })
         })
         .expect("welcome HTML must link style.css as its stylesheet");
-    let script = document
+    let script_url = document
         .query("script")
         .into_iter()
         .find_map(|node| {
             node.kind.element_attributes().and_then(|attributes| {
-                (attribute(attributes, "src") == Some("script.js")).then_some(WELCOME_JS)
+                (attribute(attributes, "src") == Some("script.js"))
+                    .then_some("byui://welcome/script.js")
             })
         })
         .expect("welcome HTML must link script.js as its script");
+    let css = runtime
+        .block_on(fetch_text(&controller, stylesheet_url))
+        .expect("welcome stylesheet should be available through byui:");
+    let js = runtime
+        .block_on(fetch_text(&controller, script_url))
+        .expect("welcome script should be available through byui:");
 
-    Page {
-        html: WELCOME_HTML,
-        css: stylesheet,
-        js: script,
-    }
+    Page { html, css, js }
+}
+
+async fn fetch_text(
+    controller: &RequestController,
+    url: &str,
+) -> Result<String, net::RequestError> {
+    controller.fetch(Request::get(url)).await?.body.text().await
 }
 
 fn attribute<'a>(attributes: &'a [html::Attribute], name: &str) -> Option<&'a str> {

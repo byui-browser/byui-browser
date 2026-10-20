@@ -18,13 +18,13 @@ build:
 ## Run the native shell for the current operating system.
 run:
 ifeq ($(OS),Windows_NT)
-	$(error Windows shell is not implemented yet)
+	cargo run -p byui-browser-windows
 else ifneq (,$(filter Darwin darwin,$(shell uname -s)))
 	cargo run -p browser-macos
 else ifneq (,$(filter Linux linux,$(shell uname -s)))
-	$(error Linux shell is not implemented yet)
+	cargo run -p browser-linux
 else ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(shell uname -s)))
-	$(error Windows shell is not implemented yet)
+	cargo run -p byui-browser-windows
 else
 	$(error Unsupported operating system '$(shell uname -s)')
 endif
