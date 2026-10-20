@@ -8,16 +8,19 @@
 #![warn(missing_docs)]
 
 pub mod ast;
+pub mod bytecode;
 pub mod lexer;
 pub mod parser;
 pub mod runtime;
 mod stack;
+pub mod vm;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
 pub use runtime::{Function, Object};
+pub use vm::Vm;
 
 /// A JavaScript value produced by evaluation or passed to host functions.
 ///
@@ -130,15 +133,33 @@ pub type HostFunction = Arc<dyn Fn(&[Value]) -> JsResult<Value> + Send + Sync>;
 
 /// A JavaScript execution realm with a table of host-provided globals.
 ///
-/// Globals are installed in a scope enclosing every script, so a script can
-/// shadow them with its own declarations, and assigning to a global name
-/// changes it for that script only. Objects registered as globals are shared
-/// handles, however: property changes a script makes to them persist across
-/// [`Realm::evaluate_script`] calls and are visible to the host.
+/// A realm is a persistent global environment. Every [`Realm::evaluate_script`]
+/// call runs against the same globals, so a `var`, function, `let`, or `const`
+/// declared by one script is visible to later scripts, and host globals and
+/// script globals resolve through the same environment. Separate realms share
+/// no script state. Function bodies and blocks keep their own scopes.
+///
+/// Redeclaration rules, checked before a script runs so a failing script
+/// declares nothing:
+/// - `var` and function declarations may repeat across scripts; a repeated
+///   `var` without an initializer keeps its value.
+/// - `let` and `const` may not repeat a global `let`/`const`, `var`, or
+///   function name, nor repeat a name within one script.
+/// - `var` or a function may not redeclare a global `let`/`const`.
+/// - `let`/`const` may shadow a host global that no script has redeclared;
+///   the host global stays reachable through [`Realm::call_global`].
+/// - Assigning to a global name changes the persistent binding, and
+///   assigning to an undeclared name is still an error.
+///
+/// A script that throws keeps the effects that ran before the error, and its
+/// `let`/`const` names stay uninitialized afterwards. Use
+/// [`Realm::reset_script_state`] to start a new document. Modules, imports,
+/// workers, and sharing state between realms are not supported.
 pub struct Realm {
     functions: HashMap<String, HostFunction>,
     values: HashMap<String, Value>,
     limits: runtime::ExecutionLimits,
+    globals: runtime::GlobalState,
 }
 
 impl Default for Realm {
@@ -154,6 +175,25 @@ impl Realm {
             functions: HashMap::new(),
             values: HashMap::new(),
             limits: runtime::ExecutionLimits::default(),
+            globals: runtime::GlobalState::new(),
+        }
+    }
+
+    /// Discards every binding scripts have declared or reassigned, so the next
+    /// [`Realm::evaluate_script`] starts as a new document would.
+    ///
+    /// Host globals stay registered and are reinstalled with the values they
+    /// were registered with. Objects registered as globals are shared handles,
+    /// so properties scripts set on them are not undone; register a new
+    /// [`Object`] to start clean. Use [`Realm::new`] for a realm with no host
+    /// globals at all.
+    pub fn reset_script_state(&mut self) {
+        self.globals = runtime::GlobalState::new();
+        for (name, function) in &self.functions {
+            self.globals.install_host(name, host_value(name, function));
+        }
+        for (name, value) in &self.values {
+            self.globals.install_host(name, value.clone());
         }
     }
 
@@ -177,6 +217,8 @@ impl Realm {
         }
 
         self.values.remove(&name);
+        self.globals
+            .install_host(&name, host_value(&name, &function));
         self.functions.insert(name, function);
         Ok(())
     }
@@ -211,6 +253,7 @@ impl Realm {
         }
 
         self.functions.remove(&name);
+        self.globals.install_host(&name, value.clone());
         self.values.insert(name, value);
         Ok(())
     }
@@ -239,15 +282,20 @@ impl Realm {
     /// Parses and evaluates a script with the registered host functions in
     /// scope, returning its completion value.
     ///
-    /// Supports the same language subset as [`eval`]. Each call runs in a
-    /// fresh script scope: bindings declared by one script are not visible to
-    /// the next.
+    /// Supports the same language subset as [`eval`]. Declarations persist in
+    /// the realm's globals for later calls; see [`Realm`] for the
+    /// redeclaration rules and [`Realm::reset_script_state`] to clear them.
     pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
         let program = parse(source).map_err(|error| {
             JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
         })?;
-        runtime::evaluate_program_with_globals(&program, &self.functions, &self.values, self.limits)
+        self.globals.evaluate(&program, self.limits)
     }
+}
+
+/// Wraps a registered host function as the script-visible function value.
+fn host_value(name: &str, function: &HostFunction) -> Value {
+    Value::Function(Function::from_host(name, Arc::clone(function)))
 }
 
 /// The owned statement and expression tree produced by parsing.

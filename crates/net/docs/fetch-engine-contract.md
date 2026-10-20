@@ -92,11 +92,10 @@ work.
   own handles, tasks, and other resources when those futures or streams drop.
 - `RequestController::builder` is the construction API. Its optional
   `with_fetch_services` and `with_scheme_providers` setters compose browser
-  services and local-scheme capabilities; the former convenience constructors
-  have been removed. A controller without services is for standalone requests
-  without client context. A request carrying browser client context requires
-  browser-owned `FetchServices`; local schemes require their matching provider.
-  That interface supplies security decisions, credential
+  services and local-scheme capabilities. A controller without services is for
+  standalone requests without client context. A request carrying browser
+  client context requires browser-owned `FetchServices`; local schemes require
+  their matching provider. That interface supplies security decisions, credential
   selection and storage, a service-worker network decision, a cache partition,
   and a response-header observation hook. `Set-Cookie` reaches only that
   trusted interface. Credential mode still decides whether the engine calls

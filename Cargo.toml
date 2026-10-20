@@ -17,6 +17,7 @@ members = [
     "crates/browser",
     "platforms/shell",
     "platforms/macos",
+    "platforms/windows",
     "platforms/linux",
 ]
 default-members = ["crates/browser"]

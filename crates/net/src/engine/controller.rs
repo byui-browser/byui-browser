@@ -18,7 +18,7 @@ use crate::{
 /// connection pool held by its transport. Cloning a controller is therefore
 /// inexpensive and preserves cache and connection reuse. Use
 /// [`RequestController::builder`] to compose optional browser services and
-/// scheme providers. This builder is the only controller construction API.
+/// scheme providers.
 #[derive(Clone)]
 pub struct RequestController {
     pub(crate) inner: Arc<ControllerInner>,
