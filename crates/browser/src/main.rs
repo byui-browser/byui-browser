@@ -9,13 +9,21 @@
 use std::sync::Arc;
 
 use browser::evaluate_page_scripts;
-use webapis::ConsoleSink;
+use webapis::{AlertSink, ConsoleSink};
 
 struct StdoutConsole;
 
 impl ConsoleSink for StdoutConsole {
     fn log(&self, message: &str) {
         println!("{message}");
+    }
+}
+
+struct StdoutAlert;
+
+impl AlertSink for StdoutAlert {
+    fn alert(&self, message: &str) {
+        println!("[alert] {message}");
     }
 }
 
@@ -32,6 +40,7 @@ fn main() {
     evaluate_page_scripts(
         "<script>print()</script>",
         Arc::new(StdoutConsole),
+        Arc::new(StdoutAlert),
         controller,
     )
     .expect("page scripts should evaluate");
