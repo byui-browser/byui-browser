@@ -42,6 +42,7 @@ pub(crate) fn reqwest_transport(config: Config) -> Result<Arc<dyn Transport>, re
 }
 
 /// HTTP transport implementation that owns one reusable reqwest client.
+/// HTTP transport implementation that owns one reusable reqwest client.
 struct ReqwestTransport {
     client: Client,
 }
@@ -63,6 +64,7 @@ impl ReqwestTransport {
 }
 
 impl Transport for ReqwestTransport {
+    /// Sends the prepared request and exposes its response body as a live stream.
     fn send(
         &self,
         request: PreparedRequest,

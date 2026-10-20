@@ -93,7 +93,8 @@ pub fn fetch_image() {
     let url = "https://www.rust-lang.org/logos/rust-logo-512x512.png";
     let runtime = runtime();
     let body = runtime.block_on(async {
-        let controller = net::RequestController::new(net::Config::default())
+        let controller = net::RequestController::builder(net::Config::default())
+            .build()
             .expect("request controller should initialize");
         controller
             .fetch(net::Request::get(url))

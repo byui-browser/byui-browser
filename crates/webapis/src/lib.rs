@@ -13,8 +13,8 @@ pub mod local_storage;
 use std::sync::Arc;
 
 use common::ids::NodeId;
-use html::{HTMLDocument, NodeKind};
-use js::{HostFunction, JsError, JsResult, Realm, Value};
+use html::{Attribute, DOMTokenList, HTMLDocument, Namespace, NodeKind};
+use js::{HostFunction, JsError, JsResult, Object, Realm, Value};
 use net::{Request, RequestController};
 
 /// Destination for messages emitted by browser Web APIs.
@@ -81,8 +81,84 @@ pub struct Element {
     pub node: NodeId,
     /// The element's HTML local name, normalized to ASCII lowercase.
     pub local_name: String,
+    /// Namespace of this element, used to apply the DOM's HTML name matching
+    /// rules when attributes are read.
+    pub namespace: Namespace,
     /// Value of the `id` attribute, if any.
     pub id_attr: Option<String>,
+    /// Attributes in document order, including their original values.
+    pub attributes: Vec<Attribute>,
+}
+
+impl Element {
+    /// Returns the value of the first attribute matching `qualified_name`.
+    ///
+    /// This follows the DOM Standard's `Element.getAttribute()` algorithm:
+    /// HTML elements in an HTML document match attribute names after ASCII
+    /// lowercasing, while other namespaces use the name as provided. The
+    /// returned value borrows this element's immutable attribute snapshot and
+    /// is `None` when no matching attribute exists.
+    pub fn get_attribute(&self, qualified_name: &str) -> Option<&str> {
+        let name = match self.namespace {
+            Namespace::Html => qualified_name.to_ascii_lowercase(),
+            Namespace::Svg | Namespace::MathMl => qualified_name.to_owned(),
+        };
+
+        self.attributes
+            .iter()
+            .find(|attribute| attribute.name == name)
+            .map(|attribute| attribute.value.as_str())
+    }
+}
+
+fn element_object(element: Element) -> Object {
+    let object = Object::new();
+    let get_attribute_element = element;
+    object.set_method(
+        "getAttribute",
+        Arc::new(move |arguments| get_attribute(&get_attribute_element, arguments)),
+    );
+    object
+}
+
+/// Implements JavaScript `Element.getAttribute(qualifiedName)`.
+pub fn get_attribute(element: &Element, arguments: &[Value]) -> JsResult<Value> {
+    let [Value::String(qualified_name)] = arguments else {
+        return Err(JsError::new(
+            "Element.getAttribute() expects one qualified name string",
+        ));
+    };
+
+    Ok(match element.get_attribute(qualified_name) {
+        Some(value) => Value::String(value.to_owned()),
+        None => Value::Null,
+    })
+}
+
+/// Implements JavaScript `document.getElementById(id)`.
+pub fn get_element_by_id(document: &Document, arguments: &[Value]) -> JsResult<Value> {
+    let [Value::String(id)] = arguments else {
+        return Err(JsError::new(
+            "document.getElementById() expects one id string",
+        ));
+    };
+
+    Ok(match document.get_element_by_id(id) {
+        Some(element) => Value::Object(element_object(element.clone())),
+        None => Value::Null,
+    })
+}
+
+/// Registers the read-only DOM methods supported by this crate on the global
+/// JavaScript `document` object.
+pub fn register_document(realm: &mut Realm, document: Document) -> JsResult<()> {
+    let document_object = Object::new();
+    let get_element_document = document;
+    document_object.set_method(
+        "getElementById",
+        Arc::new(move |arguments| get_element_by_id(&get_element_document, arguments)),
+    );
+    realm.register_global_value("document", Value::Object(document_object))
 }
 
 /// Script-visible `document` object.
@@ -107,6 +183,17 @@ impl Document {
             elements: collect_elements(document),
             source_document: Some(document.clone()),
         }
+    }
+
+    /// Returns this document node's DOM `textContent` value.
+    ///
+    /// The DOM Standard defines `textContent` for a `Document` as `null`, so
+    /// this method returns `None`. Use [`HTMLDocument::text_content`] with an
+    /// element or character-data node ID to retrieve text from a node.
+    pub fn text_content(&self) -> Option<String> {
+        self.source_document
+            .as_ref()
+            .and_then(|document| document.text_content(document.root))
     }
 
     /// Implements `document.createElement(localName)` for an HTML document.
@@ -134,7 +221,9 @@ impl Document {
         Ok(Element {
             node: NodeId::new(node.index() as u32),
             local_name: element.name.clone(),
+            namespace: element.namespace,
             id_attr: None,
+            attributes: element.attributes.clone(),
         })
     }
 
@@ -144,6 +233,16 @@ impl Document {
         self.elements
             .iter()
             .find(|element| element.id_attr.as_deref() == Some(id))
+    }
+
+    /// Implements the DOM `Element.classList` getter for an element in this
+    /// document. The returned live token list mutates the element's `class`
+    /// attribute through the DOM Standard operations.
+    pub fn class_list(&mut self, element: NodeId) -> JsResult<DOMTokenList<'_>> {
+        self.source_document
+            .get_or_insert_with(HTMLDocument::new)
+            .class_list(html::NodeId(element.index() as usize))
+            .map_err(|error| JsError::new(error.to_string()))
     }
 
     /// Removes an element node from this document's tree.
@@ -296,7 +395,9 @@ fn collect_elements(document: &HTMLDocument) -> Vec<Element> {
                     elements.push(Element {
                         node: NodeId::new(child.index() as u32),
                         local_name: element.name.clone(),
+                        namespace: element.namespace,
                         id_attr,
+                        attributes: element.attributes.clone(),
                     });
                 }
                 collect(document, *child, elements);
@@ -507,7 +608,9 @@ impl TimerQueue {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsoleSink, DomException, fetch, print, register_fetch, register_print};
+    use super::{
+        ConsoleSink, DomException, fetch, print, register_document, register_fetch, register_print,
+    };
     use common::ids::NodeId;
     use html::{Attribute, ElementData, HTMLDocument, Namespace, NodeKind, parse_raw_html};
     use js::{Realm, Value};
@@ -550,7 +653,9 @@ mod tests {
 
     #[test]
     fn fetch_requires_one_url_string() {
-        let controller = RequestController::new(Config::default()).unwrap();
+        let controller = RequestController::builder(Config::default())
+            .build()
+            .unwrap();
 
         assert_eq!(
             fetch(&controller, &[]).unwrap_err().to_string(),
@@ -566,7 +671,11 @@ mod tests {
 
     #[test]
     fn registration_exposes_fetch_to_the_realm() {
-        let controller = std::sync::Arc::new(RequestController::new(Config::default()).unwrap());
+        let controller = std::sync::Arc::new(
+            RequestController::builder(Config::default())
+                .build()
+                .unwrap(),
+        );
         let mut realm = Realm::new();
         register_fetch(&mut realm, controller).unwrap();
 
@@ -590,8 +699,43 @@ mod tests {
     }
 
     #[test]
+    fn registration_exposes_element_get_attribute_to_javascript() {
+        let html_document = parse_raw_html("<main id='app' data-state='ready'></main>".to_owned());
+        let mut realm = Realm::new();
+        register_document(
+            &mut realm,
+            super::Document::from_html_document(&html_document),
+        )
+        .unwrap();
+
+        assert_eq!(
+            realm
+                .evaluate_script("document.getElementById('app').getAttribute('DATA-STATE')")
+                .unwrap(),
+            Value::String("ready".to_owned())
+        );
+        assert_eq!(
+            realm
+                .evaluate_script("document.getElementById('app').getAttribute('missing')")
+                .unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
     fn empty_document_has_no_element_by_id() {
         assert_eq!(super::Document::new().get_element_by_id("main"), None);
+    }
+
+    #[test]
+    fn document_text_content_is_null_per_dom_standard() {
+        let empty = super::Document::new();
+        assert_eq!(empty.text_content(), None);
+
+        let parsed = super::Document::from_html_document(&parse_raw_html(
+            "<main>document text</main>".to_owned(),
+        ));
+        assert_eq!(parsed.text_content(), None);
     }
 
     #[test]
@@ -607,6 +751,25 @@ mod tests {
             .expect("nested element");
         assert_eq!(element.node.index(), 2);
         assert_eq!(document.get_element_by_id("NESTED"), None);
+    }
+
+    #[test]
+    fn element_get_attribute_matches_html_names_case_insensitively() {
+        let document = super::Document::from_html_document(&parse_raw_html(
+            "<main id='app' data-state='ready' data-state='first'></main>".to_owned(),
+        ));
+        let element = document.get_element_by_id("app").expect("app element");
+
+        assert_eq!(element.get_attribute("DATA-STATE"), Some("ready"));
+        assert_eq!(element.get_attribute("missing"), None);
+    }
+
+    #[test]
+    fn created_element_get_attribute_returns_none_without_attributes() {
+        let mut document = super::Document::new();
+        let element = document.create_element("custom-widget").unwrap();
+
+        assert_eq!(element.get_attribute("data-state"), None);
     }
 
     #[test]

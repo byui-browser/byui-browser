@@ -272,7 +272,7 @@ fn objects_are_shared_references() {
         number(9.0)
     );
     assert_eq!(
-        realm.evaluate_script("let alias = object; alias === object"),
+        realm.evaluate_script("alias === object"),
         Ok(Value::Boolean(true))
     );
     // Property changes persist across scripts and are visible to the host.
@@ -577,8 +577,9 @@ fn global_value_names_cannot_be_empty() {
 fn scripts_can_shadow_global_objects() {
     let (realm, object) = realm_with_object();
     assert_eq!(realm.evaluate_script("let object = 5; object"), number(5.0));
-    // Reassigning the global name affects only that script.
+    // The shadowing `let` persists, so later scripts assign to it, not to the
+    // host object.
     realm.evaluate_script("object = 1").unwrap();
-    assert_eq!(realm.evaluate_script("object.value"), number(1.0));
+    assert_eq!(realm.evaluate_script("object"), number(1.0));
     assert_eq!(object.get("value"), Some(Value::Number(1.0)));
 }

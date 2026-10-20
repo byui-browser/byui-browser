@@ -19,10 +19,11 @@ fn zero_in_flight_limit_still_allows_a_request() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
     });
-    let controller = RequestController::new(Config {
+    let controller = RequestController::builder(Config {
         max_in_flight: 0,
         ..Config::default()
     })
+    .build()
     .unwrap();
 
     let response = runtime().block_on(controller.fetch(Request::get(server.url())));
@@ -48,10 +49,11 @@ fn scheduler_limits_active_transport_requests() {
         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
     });
 
-    let controller = RequestController::new(Config {
+    let controller = RequestController::builder(Config {
         max_in_flight: 1,
         ..Config::default()
     })
+    .build()
     .unwrap();
     runtime().block_on(async {
         let first_controller = controller.clone();

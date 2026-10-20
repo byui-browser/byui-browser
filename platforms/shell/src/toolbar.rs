@@ -133,7 +133,7 @@ pub(crate) fn hit_test(x: f64, y: f64, width: f64, inset: f32) -> Option<Control
 ///
 /// Each platform shell lists its system UI font files in order of preference.
 /// Variable fonts with an optical-size axis are set to the toolbar text size.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) fn load_ui_font<P: AsRef<std::path::Path>>(
     candidates: impl IntoIterator<Item = P>,
 ) -> Option<FontVec> {
@@ -743,6 +743,17 @@ mod tests {
         assert_eq!(hit_test(500.0, 200.0, 1000.0, 0.0), None);
         assert!(!Control::Back.is_enabled());
         assert!(Control::Reload.is_enabled());
+    }
+
+    #[test]
+    fn disabled_navigation_controls_still_occupy_hit_regions() {
+        let back = hit_test(26.0, 26.0, 1000.0, 0.0);
+        let forward = hit_test(58.0, 26.0, 1000.0, 0.0);
+
+        assert_eq!(back, Some(Control::Back));
+        assert_eq!(forward, Some(Control::Forward));
+        assert!(!back.is_some_and(Control::is_enabled));
+        assert!(!forward.is_some_and(Control::is_enabled));
     }
 
     #[test]

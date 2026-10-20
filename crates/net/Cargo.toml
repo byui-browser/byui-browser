@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64 = "0.22"
 common = { workspace = true }
 bytes = "1"
 encoding_rs = "0.8"

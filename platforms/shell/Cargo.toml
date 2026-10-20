@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 browser = { path = "../../crates/browser" }
+chrome = { workspace = true }
 css = { workspace = true }
 html = { workspace = true }
 js = { workspace = true }
@@ -20,6 +21,10 @@ tiny-skia = { version = "0.11", default-features = false, features = ["std", "si
 ab_glyph = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+softbuffer = { version = "0.4", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 softbuffer = { version = "0.4", default-features = false }
 
