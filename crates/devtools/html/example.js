@@ -18,10 +18,11 @@ function getLoadedCssAndJs() {
   return requests;
 }
 
-function displayNetworkRequests(requests) {
+function displayNetworkRequests(requests, request_log = []) {
   const tbody = document.querySelector("#network-rows");
   tbody.replaceChildren();
 
+  // Display CSS and JS resources
   for (const request of requests) {
     const row = document.createElement("tr");
 
@@ -38,12 +39,28 @@ function displayNetworkRequests(requests) {
 
     tbody.appendChild(row);
   }
+
+  // Display additional request log entries
+  for (const entry of request_log) {
+    const row = document.createElement("tr");
+
+    for (const value of [entry.name, entry.event]) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.appendChild(cell);
+    }
+
+    tbody.appendChild(row);
+  }
 }
 
-function ReloadNetworkLog() {
-  displayNetworkRequests(getLoadedCssAndJs());
+function ReloadNetworkLog(request_log) {
+  displayNetworkRequests(getLoadedCssAndJs(), request_log);
   // this needs another paramater to read from a new variable "request_log" that is an array of objects
-  // [{nmame: data, event: data}] and displays it
+  // [
+  // {name: data, event: data}
+  // {name: data2, event: data2}
+  // ] and displays it
 }
 
 document.addEventListener("keydown", (event) => {
