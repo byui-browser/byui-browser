@@ -30,9 +30,30 @@ pub struct FileResource {
 pub struct OpenedFile {
     file: fs::File,
     media_type: Option<String>,
+    length: u64,
 }
 
 impl OpenedFile {
+    /// Reads the next chunk through this opened handle.
+    ///
+    /// The returned count is zero at end of file. The operation is blocking;
+    /// callers running on an asynchronous executor must perform it on a
+    /// blocking executor. The read always uses the retained handle and never
+    /// reopens the authorized pathname.
+    pub fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize, FileAccessError> {
+        self.file.read(buffer).map_err(FileAccessError::from)
+    }
+
+    /// Returns the file length observed when the handle was opened.
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+
+    /// Returns the filesystem-provided media type, when one is available.
+    pub fn media_type(&self) -> Option<&str> {
+        self.media_type.as_deref()
+    }
+
     /// Reads the complete file through this opened handle.
     ///
     /// Consumes the handle, closing it after the read completes or fails. The
@@ -40,9 +61,13 @@ impl OpenedFile {
     /// rather than from a later pathname lookup.
     pub fn read_all(mut self) -> Result<FileResource, FileAccessError> {
         let mut bytes = Vec::new();
-        self.file
-            .read_to_end(&mut bytes)
-            .map_err(FileAccessError::from)?;
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            match self.read_chunk(&mut buffer)? {
+                0 => break,
+                count => bytes.extend_from_slice(&buffer[..count]),
+            }
+        }
         Ok(FileResource {
             bytes,
             media_type: self.media_type,
@@ -99,17 +124,14 @@ impl FileSystem for CapFileSystem {
             .ok_or(FileAccessError::Denied)?;
         let file = root.open(path.relative()).map_err(FileAccessError::from)?;
         let file = file.into_std();
-        if !file
-            .metadata()
-            .map_err(FileAccessError::from)?
-            .file_type()
-            .is_file()
-        {
+        let metadata = file.metadata().map_err(FileAccessError::from)?;
+        if !metadata.file_type().is_file() {
             return Err(FileAccessError::UnsupportedFile);
         }
         Ok(OpenedFile {
             file,
             media_type: None,
+            length: metadata.len(),
         })
     }
 }
@@ -154,6 +176,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(resource.bytes, b"authorized bytes");
+        drop(filesystem);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn opened_file_reports_length_and_reads_chunks_from_the_retained_handle() {
+        let directory = temporary_directory();
+        let path = directory.join("allowed.txt");
+        fs::write(&path, b"authorized bytes").unwrap();
+        let policy = FileAccessPolicy::new([directory.clone()]).unwrap();
+        let filesystem = CapFileSystem::new([directory.clone()]).unwrap();
+
+        let mut opened = policy.open_file(&path, &filesystem).unwrap();
+        let mut first = [0; 5];
+        let mut second = [0; 32];
+        let first_len = opened.read_chunk(&mut first).unwrap();
+        let second_len = opened.read_chunk(&mut second).unwrap();
+
+        assert_eq!(opened.length(), b"authorized bytes".len() as u64);
+        assert_eq!(&first[..first_len], b"autho");
+        assert_eq!(&second[..second_len], b"rized bytes");
+        assert_eq!(opened.read_chunk(&mut second).unwrap(), 0);
         drop(filesystem);
         fs::remove_dir_all(directory).unwrap();
     }

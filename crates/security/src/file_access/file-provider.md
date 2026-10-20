@@ -39,12 +39,16 @@ depend on `net`.
 
 ### Provider response behavior
 
-After request authorization and file opening, `BrowserFileProvider` currently:
+After request authorization and file opening, `BrowserFileProvider` now:
 
-- materializes the opened file with `OpenedFile::read_all`;
+- acquires one of four bounded file-read slots;
+- performs authorization, opening, and chunked reads on Tokio's blocking
+  executor while retaining the opened handle;
+- stops between chunks when the provider future is cancelled or dropped;
 - emits `Content-Length` and an optional filesystem-supplied `Content-Type`;
+- avoids reading file contents for `HEAD`, while still reporting metadata;
 - returns status `200 OK` with an opaque response origin; and
-- supplies the bytes to `net` as `SchemeBody::Bytes`.
+- supplies buffered bytes to `net` as `SchemeBody::Bytes`.
 
 The shared `net` scheme pipeline enforces `GET`/`HEAD`, nulls the body for
 `HEAD`, validates response metadata, and maps failures to stable provider error
@@ -57,9 +61,11 @@ subresource rejection.
 
 ### Asynchronous reads and streaming
 
-`OpenedFile::read_all` performs blocking I/O and materializes the complete
-file. Move reads behind a bounded blocking executor or an asynchronous
-filesystem boundary, then stream large or unknown-size files through
+The first asynchronous slice moves authorization, opening, and buffered reads
+behind a bounded blocking executor. The provider still materializes a complete
+file before returning because the current `FileProvider` contract returns one
+complete `SchemeResource`. The next slice should expose response metadata
+before body completion and stream large or unknown-size files through
 `net::SchemeBody::Stream` while retaining the opened handle. Verify cleanup
 when requests or bodies are aborted, fail, dropped unread, or only partially
 consumed.
