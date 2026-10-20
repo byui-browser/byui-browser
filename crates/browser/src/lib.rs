@@ -8,7 +8,7 @@ use std::sync::Arc;
 use html::Query;
 use js::{JsResult, Realm, Value};
 use net::{Request, RequestController, SchemeProviders};
-use webapis::{ConsoleSink, register_fetch, register_print};
+use webapis::{ConsoleSink, Document, register_document, register_fetch, register_print};
 
 pub mod byui_provider;
 
@@ -111,6 +111,7 @@ pub fn evaluate_page_scripts(
     let mut realm = Realm::new();
     register_print(&mut realm, console)?;
     register_fetch(&mut realm, controller)?;
+    register_document(&mut realm, Document::from_html_document(&document))?;
 
     document
         .script_sources()
