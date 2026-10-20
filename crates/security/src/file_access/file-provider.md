@@ -21,15 +21,18 @@ must remain fail-closed.
 
 ### Request and origin authorization
 
-`BrowserFileProvider::open` still ignores `Request`. Add a security-owned
-request context covering:
+Implemented: `BrowserFileProvider::open` translates `net::Request` into a
+security-owned request context covering:
 
 - initiating and requested file origins;
 - navigation versus subresource access;
 - permission state; and
 - browser sandbox or container identity.
 
-Translate `net::Request` into that context in the browser adapter without
+The initial policy is deliberately partial: it allows only an explicitly
+permitted, sandbox-matching top-level navigation to a `file:` URL.
+Subresource requests are denied until file-document origin semantics are
+available end-to-end. The browser adapter performs the translation without
 making the security crate depend on `net`.
 
 ### Asynchronous reads and streaming
@@ -77,8 +80,8 @@ effects.
 
 ## Recommended order
 
-1. Add request and origin authorization.
-2. Make reads asynchronous and cancellable.
-3. Add retained-handle streaming.
-4. Finalize metadata, errors, and origin behavior.
-5. Extend platform hardening, resource limits, and conformance coverage.
+1. Make reads asynchronous and cancellable.
+2. Add retained-handle streaming.
+3. Finalize metadata, errors, and origin behavior, including file-document
+   origin semantics and subresource authorization.
+4. Extend platform hardening, resource limits, and conformance coverage.

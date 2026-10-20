@@ -6,25 +6,57 @@ use net::{
     FileProvider, HeaderName, HeaderValue, Origin, ProviderErrorKind, ProviderFuture, Request,
     RequestError, SchemeBody, SchemeResource, Url,
 };
-use security::file_access::{FileAccessError, FileAccessPolicy, SharedFileSystem};
+use security::file_access::{
+    FileAccessError, FileAccessPermission, FileAccessPolicy, FileOrigin, FileRequestContext,
+    FileRequestKind, FileSandboxId, SharedFileSystem,
+};
+
+/// Explicit browser-owned grant used when composing a local-file capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileAccessGrant {
+    permission: FileAccessPermission,
+    sandbox: FileSandboxId,
+}
+
+impl FileAccessGrant {
+    /// Creates the permission and sandbox state for a local-file capability.
+    pub fn new(permission: FileAccessPermission, sandbox: FileSandboxId) -> Self {
+        Self {
+            permission,
+            sandbox,
+        }
+    }
+}
 
 /// Adapts security policy and filesystem access to the network provider API.
 #[derive(Clone)]
 pub struct BrowserFileProvider {
     policy: Arc<FileAccessPolicy>,
     filesystem: SharedFileSystem,
+    grant: FileAccessGrant,
 }
 
 impl BrowserFileProvider {
     /// Creates a provider using the supplied security policy and filesystem.
-    pub fn new(policy: Arc<FileAccessPolicy>, filesystem: SharedFileSystem) -> Self {
-        Self { policy, filesystem }
+    pub fn new(
+        policy: Arc<FileAccessPolicy>,
+        filesystem: SharedFileSystem,
+        grant: FileAccessGrant,
+    ) -> Self {
+        Self {
+            policy,
+            filesystem,
+            grant,
+        }
     }
 }
 
 impl FileProvider for BrowserFileProvider {
-    fn open<'a>(&'a self, _request: &'a Request, url: &'a Url) -> ProviderFuture<'a> {
+    fn open<'a>(&'a self, request: &'a Request, url: &'a Url) -> ProviderFuture<'a> {
         let result = (|| {
+            self.policy
+                .authorize_request(&request_context(request, &self.grant))
+                .map_err(provider_error)?;
             let path = url
                 .to_file_path()
                 .map_err(|_| provider_error(FileAccessError::InvalidPath))?;
@@ -62,6 +94,27 @@ impl FileProvider for BrowserFileProvider {
     }
 }
 
+/// Translates networking request state into the security crate's file-access context.
+fn request_context(request: &Request, grant: &FileAccessGrant) -> FileRequestContext {
+    let initiating_origin = match request.environment().origin.as_ref() {
+        None => FileOrigin::Absent,
+        Some(origin) if origin.is_opaque() => FileOrigin::Opaque,
+        Some(origin) => FileOrigin::Tuple(origin.as_str()),
+    };
+    let kind = if request.mode() == net::RequestMode::Navigate {
+        FileRequestKind::Navigation
+    } else {
+        FileRequestKind::Subresource
+    };
+    FileRequestContext {
+        initiating_origin,
+        requested_origin: FileOrigin::LocalFile,
+        kind,
+        permission: grant.permission,
+        sandbox: grant.sandbox.clone(),
+    }
+}
+
 fn provider_error(error: FileAccessError) -> RequestError {
     let kind = match error {
         FileAccessError::Missing => ProviderErrorKind::ResourceMissing,
@@ -80,6 +133,7 @@ fn provider_error(error: FileAccessError) -> RequestError {
 pub fn provider(
     policy: Arc<FileAccessPolicy>,
     filesystem: SharedFileSystem,
+    grant: FileAccessGrant,
 ) -> Arc<dyn FileProvider> {
-    Arc::new(BrowserFileProvider::new(policy, filesystem))
+    Arc::new(BrowserFileProvider::new(policy, filesystem, grant))
 }

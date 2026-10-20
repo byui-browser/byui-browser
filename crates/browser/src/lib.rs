@@ -14,18 +14,44 @@ use webapis::{ConsoleSink, register_fetch, register_print};
 pub mod byui_provider;
 pub mod file_provider;
 
+/// Explicit configuration for the browser's local-file capability.
+#[derive(Clone)]
+pub struct FileAccessConfiguration {
+    policy: Arc<FileAccessPolicy>,
+    filesystem: SharedFileSystem,
+    grant: file_provider::FileAccessGrant,
+}
+
+impl FileAccessConfiguration {
+    /// Creates a local-file configuration with policy, filesystem, and browser grant.
+    pub fn new(
+        policy: Arc<FileAccessPolicy>,
+        filesystem: SharedFileSystem,
+        grant: file_provider::FileAccessGrant,
+    ) -> Self {
+        Self {
+            policy,
+            filesystem,
+            grant,
+        }
+    }
+}
+
 /// Builds a browser request controller with the built-in page provider and an
 /// optional explicitly configured local-file capability.
 ///
 /// When `file_access` is `None`, no `file:` provider is installed. When it is
-/// present, callers must supply the policy and filesystem backend that enforce
-/// the allowed roots; this function does not infer roots from process state.
-pub fn request_controller(
-    file_access: Option<(Arc<FileAccessPolicy>, SharedFileSystem)>,
-) -> Arc<RequestController> {
+/// present, callers must supply the policy, filesystem backend, and explicit
+/// permission/container grant; this function does not infer them from process
+/// state.
+pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<RequestController> {
     let mut providers = SchemeProviders::new().with_page(byui_provider::provider());
-    if let Some((policy, filesystem)) = file_access {
-        providers = providers.with_file(file_provider::provider(policy, filesystem));
+    if let Some(file_access) = file_access {
+        providers = providers.with_file(file_provider::provider(
+            file_access.policy,
+            file_access.filesystem,
+            file_access.grant,
+        ));
     }
     Arc::new(
         RequestController::builder(net::Config::default())

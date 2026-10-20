@@ -5,7 +5,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{FileAccessError, FileSystem, OpenedFile};
+use super::{
+    FileAccessError, FileAccessPermission, FileOrigin, FileRequestContext, FileRequestKind,
+    FileSandboxId, FileSystem, OpenedFile,
+};
 
 /// A filesystem path that has passed the configured access policy.
 ///
@@ -38,6 +41,7 @@ impl AuthorizedPath {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FileAccessPolicy {
     allowed_roots: Vec<PathBuf>,
+    sandbox: FileSandboxId,
 }
 
 impl FileAccessPolicy {
@@ -50,7 +54,45 @@ impl FileAccessPolicy {
             .into_iter()
             .map(|root| fs::canonicalize(root).map_err(FileAccessError::from))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { allowed_roots })
+        Ok(Self {
+            allowed_roots,
+            sandbox: FileSandboxId::default(),
+        })
+    }
+
+    /// Creates a policy allowing reads below `allowed_roots` in `sandbox`.
+    ///
+    /// Browser composition must supply this same sandbox identity in each
+    /// [`FileRequestContext`] before the policy will authorize a request.
+    pub fn new_in_sandbox(
+        allowed_roots: impl IntoIterator<Item = PathBuf>,
+        sandbox: FileSandboxId,
+    ) -> Result<Self, FileAccessError> {
+        let mut policy = Self::new(allowed_roots)?;
+        policy.sandbox = sandbox;
+        Ok(policy)
+    }
+
+    /// Returns the sandbox identity that owns this policy's file capability.
+    pub fn sandbox(&self) -> &FileSandboxId {
+        &self.sandbox
+    }
+
+    /// Authorizes the browser context before any filesystem path is opened.
+    ///
+    /// Access is default-deny. The caller must provide an explicitly granted
+    /// permission, the configured sandbox identity, and a local-file target.
+    /// This initial policy supports only top-level navigations; subresource
+    /// access remains denied until file-document origin semantics are defined.
+    pub fn authorize_request(&self, context: &FileRequestContext) -> Result<(), FileAccessError> {
+        if context.permission != FileAccessPermission::Granted
+            || context.sandbox != self.sandbox
+            || context.requested_origin != FileOrigin::LocalFile
+            || context.kind != FileRequestKind::Navigation
+        {
+            return Err(FileAccessError::Denied);
+        }
+        Ok(())
     }
 
     /// Authorizes and canonicalizes one requested path.
@@ -145,6 +187,45 @@ mod tests {
             policy.authorize_path(std::env::temp_dir()),
             Err(FileAccessError::Denied)
         );
+    }
+
+    #[test]
+    fn request_authorization_requires_granted_navigation_in_matching_sandbox() {
+        let sandbox = FileSandboxId::new("profile-a");
+        let policy = FileAccessPolicy::new_in_sandbox([], sandbox.clone()).unwrap();
+        let allowed = FileRequestContext {
+            initiating_origin: FileOrigin::Tuple("https://example.test".into()),
+            requested_origin: FileOrigin::LocalFile,
+            kind: FileRequestKind::Navigation,
+            permission: FileAccessPermission::Granted,
+            sandbox: sandbox.clone(),
+        };
+
+        assert_eq!(policy.authorize_request(&allowed), Ok(()));
+
+        for context in [
+            FileRequestContext {
+                permission: FileAccessPermission::Denied,
+                ..allowed.clone()
+            },
+            FileRequestContext {
+                kind: FileRequestKind::Subresource,
+                ..allowed.clone()
+            },
+            FileRequestContext {
+                requested_origin: FileOrigin::Opaque,
+                ..allowed.clone()
+            },
+            FileRequestContext {
+                sandbox: FileSandboxId::new("profile-b"),
+                ..allowed
+            },
+        ] {
+            assert_eq!(
+                policy.authorize_request(&context),
+                Err(FileAccessError::Denied)
+            );
+        }
     }
 
     #[test]
