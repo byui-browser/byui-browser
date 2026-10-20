@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 browser = { path = "../../crates/browser" }
+chrome = { workspace = true }
 css = { workspace = true }
 html = { workspace = true }
 js = { workspace = true }
