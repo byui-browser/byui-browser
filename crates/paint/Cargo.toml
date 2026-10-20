@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 common = { workspace = true }
+css = { workspace = true }
 html = { workspace = true }
 layout = { workspace = true }
 

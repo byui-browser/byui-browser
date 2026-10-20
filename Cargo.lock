@@ -1543,6 +1543,7 @@ name = "paint"
 version = "0.1.0"
 dependencies = [
  "common",
+ "css",
  "html",
  "layout",
 ]

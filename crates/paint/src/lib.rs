@@ -12,5 +12,5 @@ mod painter;
 mod types;
 
 pub use display_list::{DisplayItem, DisplayList, build_display_list};
-pub use painter::paint_document;
+pub use painter::{paint_document, paint_document_with_stylesheet};
 pub use types::{Color, PaintBox, Rect};

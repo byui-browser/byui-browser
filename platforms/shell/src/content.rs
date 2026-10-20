@@ -25,7 +25,7 @@ fn render_demo(width: u32, height: u32) -> Frame {
             height: height as f32,
         },
     );
-    let display_list = paint::paint_document(&tree, &document);
+    let display_list = paint::paint_document_with_stylesheet(&tree, &document, &stylesheet);
     Compositor::new(width, height).compose_paint(&display_list)
 }
 
@@ -67,7 +67,7 @@ mod tests {
     fn demo_produces_layout_background_and_renderer_text() {
         let frame = render_demo(160, 120);
         assert_eq!((frame.width, frame.height), (160, 120));
-        assert_eq!(&frame.pixels[..4], &[242, 245, 250, 255]);
+        assert_eq!(&frame.pixels[..4], &[0, 128, 0, 255]);
         assert!(frame.pixels.chunks_exact(4).any(|p| p == [30, 43, 62, 255]));
         assert_eq!(&frame.pixels[160 * 110 * 4..160 * 110 * 4 + 4], &[255; 4]);
     }
@@ -79,7 +79,7 @@ mod tests {
             let page = render_page(width, height, scale).unwrap();
             assert_eq!((page.width(), page.height()), (width, height));
             let data = page.data();
-            assert_eq!(&data[..4], &[242, 245, 250, 255]);
+            assert_eq!(&data[..4], &[0, 128, 0, 255]);
             assert!(data.chunks_exact(4).any(|p| p == [30, 43, 62, 255]));
             let bottom = ((110.0 * scale) as u32 * width) as usize * 4;
             assert_eq!(&data[bottom..bottom + 4], &[255; 4]);
