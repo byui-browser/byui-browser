@@ -22,7 +22,8 @@ Add focused tests for:
 
 Extend the existing `tests/schemes/` coverage with:
 
-- concrete browser composition through `with_services_and_providers`;
+- concrete browser composition through the builder's
+  `with_fetch_services` and `with_scheme_providers` setters;
 - exact-once matching-provider selection and request-context assertions;
 - missing, revoked, denied, malformed, invalid-origin, and I/O outcomes;
 - tuple and opaque provider origins;

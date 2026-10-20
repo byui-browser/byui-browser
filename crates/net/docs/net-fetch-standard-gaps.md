@@ -239,8 +239,8 @@ The semaphore provides concurrency admission, and Fetch priority now reaches the
 
 **Evidence:** [`SchemeProviders`](../src/api/providers/mod.rs) holds optional,
 thread-safe `BlobProvider`, `FileProvider`, and `PageProvider` capabilities;
-[`RequestController::builder`](../src/engine/controller.rs)
-or the provider-only `with_providers` constructor installs them;
+[`RequestController::builder`](../src/engine/controller.rs) with its
+`with_scheme_providers` setter installs them;
 [`SchemeResource`](../src/api/providers/body.rs) carries the
 provider-neutral URL, status, headers, origin, media type, and body; and
 [`InternalResponse::from_scheme_resource`](../src/api/response/view.rs)

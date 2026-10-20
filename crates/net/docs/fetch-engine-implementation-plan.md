@@ -92,12 +92,11 @@ explicitly changes that boundary.
 ### 7. Public API and downstream migration
 
 Make controller construction a single Fetch-oriented interface rather than a
-four-constructor capability matrix. Add a `RequestController::builder(config)`
-that provides optional `FetchServices` and `SchemeProviders` setters and a
-fallible `build()` method. Preserve the existing constructors as delegating
-compatibility conveniences while callers migrate; consider eventually
-deprecating them and use names such as `with_fetch_services` and
-`with_scheme_providers` if specialized convenience constructors remain.
+four-constructor capability matrix. This is implemented by
+`RequestController::builder(config)`, which provides optional `FetchServices`
+and `SchemeProviders` setters and a fallible `build()` method. The former
+specialized constructors have been removed, so callers use the builder and its
+`with_fetch_services` and `with_scheme_providers` setters directly.
 
 The builder must preserve the current capability rules: standalone requests
 may omit services, local schemes require matching scheme providers, and

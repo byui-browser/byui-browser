@@ -90,14 +90,13 @@ work.
   byte and streaming bodies observe the same abort signal; aborting, failing,
   or discarding a body drops its provider stream. Providers must release their
   own handles, tasks, and other resources when those futures or streams drop.
-- `RequestController::builder` is the canonical construction API. Its optional
+- `RequestController::builder` is the construction API. Its optional
   `with_fetch_services` and `with_scheme_providers` setters compose browser
-  services and local-scheme capabilities. The legacy `new`, `with_providers`,
-  `with_services`, and `with_services_and_providers` constructors delegate to
-  the builder for compatibility. A controller without services is for
-  standalone requests without client context. A request carrying browser
-  client context requires browser-owned `FetchServices`; local schemes require
-  their matching provider. That interface supplies security decisions, credential
+  services and local-scheme capabilities; the former convenience constructors
+  have been removed. A controller without services is for standalone requests
+  without client context. A request carrying browser client context requires
+  browser-owned `FetchServices`; local schemes require their matching provider.
+  That interface supplies security decisions, credential
   selection and storage, a service-worker network decision, a cache partition,
   and a response-header observation hook. `Set-Cookie` reaches only that
   trusted interface. Credential mode still decides whether the engine calls

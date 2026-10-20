@@ -20,8 +20,8 @@ Complete browser-side ownership and composition without moving browser state
 into `net`:
 
 - provide a concrete browser `FetchServices` implementation and compose it
-  with `SchemeProviders` through `with_services_and_providers` when browser
-  client context is available;
+  with `SchemeProviders` through the builder's `with_scheme_providers` setter
+  when browser client context is available;
 - keep `byui:` page registration, lookup, replacement, and origin policy in
   `crates/browser`;
 - add browser/storage ownership for blob URL creation, creator origins,
@@ -52,7 +52,7 @@ routes, and origin policy.
 
 Add browser-composition and net integration tests for:
 
-- `with_services_and_providers` and request-context propagation;
+- builder-based service/provider composition and request-context propagation;
 - exact-once selection of the matching provider;
 - missing, revoked, denied, malformed, and I/O-failure outcomes;
 - provider-assigned tuple and opaque origins;
