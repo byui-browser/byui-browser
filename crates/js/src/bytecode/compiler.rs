@@ -2,7 +2,7 @@
 
 use super::{Chunk, Instruction};
 use crate::Value;
-use crate::ast::{Expr, LogicalOperator, Program, Statement};
+use crate::ast::{Expr, LogicalOperator, MemberProperty, Program, Statement};
 use std::fmt;
 
 /// A source construct that the initial bytecode compiler cannot lower yet.
@@ -114,10 +114,50 @@ impl Compiler {
                 Err(CompileError::unsupported("identifier bindings"))
             }
             Expr::Call { .. } => Err(CompileError::unsupported("function calls")),
-            Expr::Member { .. } | Expr::MemberAssign { .. } => {
-                Err(CompileError::unsupported("object properties"))
+            Expr::Member { object, property } => {
+                self.compile_expression(object)?;
+                match property {
+                    MemberProperty::Named(name) => {
+                        let index = self.name_constant(name)?;
+                        self.chunk.emit(Instruction::LoadProperty(index));
+                    }
+                    MemberProperty::Computed(key) => {
+                        self.compile_expression(key)?;
+                        self.chunk.emit(Instruction::LoadComputedProperty);
+                    }
+                }
+                Ok(())
+            }
+            Expr::MemberAssign {
+                object,
+                property,
+                value,
+            } => {
+                self.compile_expression(object)?;
+                match property {
+                    MemberProperty::Named(name) => {
+                        let index = self.name_constant(name)?;
+                        self.compile_expression(value)?;
+                        self.chunk.emit(Instruction::StoreProperty(index));
+                    }
+                    MemberProperty::Computed(key) => {
+                        self.compile_expression(key)?;
+                        self.compile_expression(value)?;
+                        self.chunk.emit(Instruction::StoreComputedProperty);
+                    }
+                }
+                Ok(())
             }
         }
+    }
+
+    /// Adds a property name to the constant pool and returns its index.
+    fn name_constant(&mut self, name: &str) -> Result<u16, CompileError> {
+        self.chunk
+            .add_constant(Value::String(name.to_owned()))
+            .map_err(|message| CompileError {
+                message: message.into(),
+            })
     }
 
     fn compile_logical(

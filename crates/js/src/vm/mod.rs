@@ -2,7 +2,8 @@
 
 use crate::ast::{BinaryOperator, UnaryOperator};
 use crate::bytecode::{Chunk, Instruction};
-use crate::{JsError, JsResult, Value};
+use crate::runtime::{non_object, to_property_key};
+use crate::{JsError, JsErrorCategory, JsResult, Value};
 
 /// Executes a [`Chunk`] using an owned operand stack.
 #[derive(Debug, Default)]
@@ -53,6 +54,30 @@ impl Vm {
                         instruction_pointer = target;
                     }
                 }
+                Instruction::LoadProperty(index) => {
+                    let key = property_name(chunk, index)?;
+                    let target = self.pop()?;
+                    self.push(load_property(&target, &key)?);
+                }
+                Instruction::LoadComputedProperty => {
+                    let key = to_property_key(&self.pop()?);
+                    let target = self.pop()?;
+                    self.push(load_property(&target, &key)?);
+                }
+                Instruction::StoreProperty(index) => {
+                    let key = property_name(chunk, index)?;
+                    let value = self.pop()?;
+                    let target = self.pop()?;
+                    store_property(&target, key, &value)?;
+                    self.push(value);
+                }
+                Instruction::StoreComputedProperty => {
+                    let value = self.pop()?;
+                    let key = to_property_key(&self.pop()?);
+                    let target = self.pop()?;
+                    store_property(&target, key, &value)?;
+                    self.push(value);
+                }
             }
         }
         Err(JsError::runtime(
@@ -71,6 +96,37 @@ impl Vm {
 
 fn stack_underflow() -> JsError {
     JsError::runtime("bytecode operand stack underflow")
+}
+
+/// Reads the string constant naming a property.
+fn property_name(chunk: &Chunk, index: u16) -> JsResult<String> {
+    match chunk.constants.get(usize::from(index)) {
+        Some(Value::String(name)) => Ok(name.clone()),
+        _ => Err(JsError::runtime(
+            "bytecode property name constant is invalid",
+        )),
+    }
+}
+
+fn load_property(target: &Value, key: &str) -> JsResult<Value> {
+    let Value::Object(object) = target else {
+        return Err(non_object(target, "read", key, "property access"));
+    };
+    object.get(key).ok_or_else(|| {
+        JsError::with_context(
+            JsErrorCategory::Runtime,
+            format!("Property `{key}` is not defined"),
+            "property access",
+        )
+    })
+}
+
+fn store_property(target: &Value, key: String, value: &Value) -> JsResult<()> {
+    let Value::Object(object) = target else {
+        return Err(non_object(target, "set", &key, "property assignment"));
+    };
+    object.set(key, value.clone());
+    Ok(())
 }
 
 fn unary(operator: UnaryOperator, value: Value) -> JsResult<Value> {

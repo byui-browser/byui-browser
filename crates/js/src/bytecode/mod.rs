@@ -2,9 +2,9 @@
 //!
 //! This module is the first compiler boundary between the parser's [`crate::ast`]
 //! and the stack-based [`crate::vm`]. The initial instruction set intentionally
-//! covers expressions only. Declarations, calls, properties, functions, and
-//! control flow are reported as compile errors until their corresponding
-//! instructions are added.
+//! covers expressions and property access (`object.name`, `object[key]`, and
+//! assignment to either). Declarations, calls, functions, and control flow are
+//! reported as compile errors until their corresponding instructions are added.
 
 mod chunk;
 mod compiler;
