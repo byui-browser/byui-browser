@@ -10,12 +10,12 @@ pub struct Node {
 
 impl Node {
     pub fn new() -> Self {
-        return Self {
+        Self {
             parent: Option::None,
             children: vec![],
             kind: NodeKind::None,
             span: Option::None,
-        };
+        }
     }
 
     pub fn append_child(node: Node) {}
