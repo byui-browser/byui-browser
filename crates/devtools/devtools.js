@@ -14,6 +14,7 @@ export class Devtools {
             elements: new Elements(),
             network: new Network(),
         };
+        this.tools.network.onReload = () => this.tools.console.resetContext();
         this.activeTool = null;
         this.bindControls();
         this.bindKeyboardShortcut();

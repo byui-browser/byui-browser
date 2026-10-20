@@ -11,6 +11,7 @@
     <h2>DevTools Console Test</h2>
 
     <p>Press Ctrl+Shift+H to open or close Devtools.</p>
+    <p>Try <code>pageExampleValue</code> in the Console to read a value loaded by this page.</p>
   </div>
 
   <!-- hidden by default -->
@@ -32,7 +33,8 @@
       </div>
     </section>
     <section id="elements-panel" data-devtools-panel="elements" hidden>
-      <p>Elements inspection is not available yet.</p>
+      <button type="button" id="hover-inspect">Inspect elements on hover</button>
+      <p id="hover-element-details" aria-live="polite">Hover inspection is off.</p>
     </section>
     <section id="network-panel" data-devtools-panel="network" hidden>
       <table>
@@ -42,6 +44,7 @@
     </section>
   </div>
 
+  <script src="page-example.js"></script>
   <script type="module" src="main.js"></script>
 </body>
 </html>

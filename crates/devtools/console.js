@@ -16,6 +16,7 @@ export class DevConsole extends DevTools {
 
         this.history = [];
         this.historyIndex = -1;
+        this.resetContext(false);
 
         this.input.addEventListener("keydown", (e) => this.onKeyDown(e));
 
@@ -92,11 +93,58 @@ export class DevConsole extends DevTools {
 
     execute(code) {
         try {
-            const result = (0, eval)(code);
+            const source = this.persistSimpleDeclarations(code);
+            const result = this.evaluateInPageContext(source);
             if (result !== undefined) this.print(result, "result");
         } catch (error) {
             this.print(error, "error");
         }
+    }
+
+    createContext() {
+        const values = { __devtoolsContext: null };
+        const context = new Proxy(values, {
+            has: (target, property) => {
+                if (property === Symbol.unscopables) return false;
+                return Reflect.has(target, property) ||
+                    (typeof property === "string" && property in window);
+            },
+            get: (target, property) => {
+                if (property === Symbol.unscopables) return undefined;
+                if (Reflect.has(target, property)) return Reflect.get(target, property);
+                return window[property];
+            },
+            set: (target, property, value) => {
+                Reflect.set(target, property, value);
+                return true;
+            },
+        });
+        values.__devtoolsContext = context;
+        return context;
+    }
+
+    persistSimpleDeclarations(code) {
+        // Store simple top-level let/const/var declarations in the console context.
+        // This keeps values available for later commands without changing page globals.
+        return code.replace(
+            /(^|[;\n]\s*)(?:let|const|var)\s+([A-Za-z_$][\w$]*)\s*(?:=\s*([^;\n]+))?(?=[;\n]|$)/g,
+            (_declaration, prefix, name, initializer) =>
+                `${prefix}__devtoolsContext[${JSON.stringify(name)}] = ${initializer ?? "undefined"}`,
+        );
+    }
+
+    evaluateInPageContext(source) {
+        const evaluate = new Function(
+            "environment",
+            "source",
+            "with (environment) { return eval(source); }",
+        );
+        return evaluate(this.context, source);
+    }
+
+    resetContext(showMessage = true) {
+        this.context = this.createContext();
+        if (showMessage && this.output) this.print("Console variables reset", "command");
     }
 
     clear() {

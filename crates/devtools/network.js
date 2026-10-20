@@ -13,7 +13,11 @@ export class Network extends DevTools {
         this.rows = this.require("#network-rows");
         this.requestLog = DEMO_REQUEST_LOG;
         this.reloadButton = this.require("#reload-network-button");
-        this.reloadButton.addEventListener("click", () => this.reload(DEMO_REQUEST_LOG));
+        this.onReload = () => {};
+        this.reloadButton.addEventListener("click", () => {
+            this.reload(DEMO_REQUEST_LOG);
+            this.onReload();
+        });
     }
 
     getLoadedResources() {
