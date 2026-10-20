@@ -5,7 +5,11 @@ use std::{
     time::Duration,
 };
 
-use browser::{FileAccessConfiguration, file_provider::FileAccessGrant, request_controller};
+use browser::{
+    FileAccessConfiguration,
+    file_provider::{FileAccessGrant, FileAccessGrantSource},
+    request_controller,
+};
 use futures_util::StreamExt;
 use net::AbortController;
 use security::file_access::{CapFileSystem, FileAccessPermission, FileAccessPolicy, FileSandboxId};
@@ -37,6 +41,15 @@ fn file_access(
 fn navigation(url: impl Into<String>) -> net::Request {
     let mut request = net::Request::get(url);
     request.set_mode(net::RequestMode::Navigate).unwrap();
+    request
+}
+
+fn navigation_with_client_origin(url: impl Into<String>) -> net::Request {
+    let mut request = navigation(url);
+    request.set_environment(
+        net::FetchEnvironment::from_url(net::Url::parse("https://client.test/page").unwrap())
+            .unwrap(),
+    );
     request
 }
 
@@ -90,6 +103,77 @@ fn configured_file_provider_reads_allowed_files_and_keeps_default_deny() {
     assert!(head.body.is_null());
 
     drop(head);
+    drop(controller);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn configured_file_provider_accepts_navigation_with_a_client_origin() {
+    let directory = temporary_directory();
+    let allowed = directory.join("allowed");
+    let file = allowed.join("page.html");
+    fs::create_dir(&allowed).unwrap();
+    fs::write(&file, b"context-aware").unwrap();
+    let policy = Arc::new(FileAccessPolicy::new([allowed.clone()]).unwrap());
+    let filesystem = Arc::new(CapFileSystem::new([allowed]).unwrap());
+    let controller = request_controller(Some(file_access(
+        policy,
+        filesystem,
+        FileAccessPermission::Granted,
+    )));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let url = net::Url::from_file_path(&file).unwrap();
+
+    let response = runtime
+        .block_on(controller.fetch(navigation_with_client_origin(url)))
+        .unwrap();
+    assert_eq!(
+        runtime.block_on(response.body.bytes()).unwrap(),
+        b"context-aware"
+    );
+
+    drop(controller);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn revoking_a_file_access_grant_denies_subsequent_opens() {
+    let directory = temporary_directory();
+    let allowed = directory.join("allowed");
+    let file = allowed.join("page.html");
+    fs::create_dir(&allowed).unwrap();
+    fs::write(&file, b"revocable").unwrap();
+    let policy = Arc::new(FileAccessPolicy::new([allowed.clone()]).unwrap());
+    let filesystem = Arc::new(CapFileSystem::new([allowed]).unwrap());
+    let grants = FileAccessGrantSource::new(FileAccessGrant::new(
+        FileAccessPermission::Granted,
+        FileSandboxId::default(),
+    ));
+    let controller = request_controller(Some(FileAccessConfiguration::with_grant_source(
+        policy,
+        filesystem,
+        grants.clone(),
+    )));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let url = net::Url::from_file_path(&file).unwrap();
+
+    let response = runtime
+        .block_on(controller.fetch(navigation(url.clone())))
+        .unwrap();
+    assert_eq!(
+        runtime.block_on(response.body.bytes()).unwrap(),
+        b"revocable"
+    );
+
+    grants.revoke();
+    assert!(matches!(
+        runtime.block_on(controller.fetch(navigation(url))),
+        Err(net::RequestError::Provider {
+            provider: "file",
+            kind: net::ProviderErrorKind::AccessDenied
+        })
+    ));
+
     drop(controller);
     fs::remove_dir_all(directory).unwrap();
 }

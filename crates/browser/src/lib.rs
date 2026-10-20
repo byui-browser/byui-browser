@@ -12,6 +12,7 @@ use security::file_access::{FileAccessPolicy, SharedFileSystem};
 use webapis::{ConsoleSink, register_fetch, register_print};
 
 pub mod byui_provider;
+pub mod fetch_services;
 pub mod file_provider;
 
 /// Explicit configuration for the browser's local-file capability.
@@ -19,7 +20,7 @@ pub mod file_provider;
 pub struct FileAccessConfiguration {
     policy: Arc<FileAccessPolicy>,
     filesystem: SharedFileSystem,
-    grant: file_provider::FileAccessGrant,
+    grants: file_provider::FileAccessGrantSource,
 }
 
 impl FileAccessConfiguration {
@@ -29,32 +30,47 @@ impl FileAccessConfiguration {
         filesystem: SharedFileSystem,
         grant: file_provider::FileAccessGrant,
     ) -> Self {
+        Self::with_grant_source(
+            policy,
+            filesystem,
+            file_provider::FileAccessGrantSource::new(grant),
+        )
+    }
+
+    /// Creates a local-file configuration backed by a shared, revocable grant source.
+    pub fn with_grant_source(
+        policy: Arc<FileAccessPolicy>,
+        filesystem: SharedFileSystem,
+        grants: file_provider::FileAccessGrantSource,
+    ) -> Self {
         Self {
             policy,
             filesystem,
-            grant,
+            grants,
         }
     }
 }
 
 /// Builds a browser request controller with the built-in page provider and an
-/// optional explicitly configured local-file capability.
+/// optional explicitly configured local-file capability and browser services.
 ///
 /// When `file_access` is `None`, no `file:` provider is installed. When it is
 /// present, callers must supply the policy, filesystem backend, and explicit
-/// permission/container grant; this function does not infer them from process
-/// state.
+/// permission/container grant source; this function does not infer them from
+/// process state. Browser services use a conservative no-cookie, no-worker
+/// default and permit requests carrying browser client context.
 pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<RequestController> {
     let mut providers = SchemeProviders::new().with_page(byui_provider::provider());
     if let Some(file_access) = file_access {
         providers = providers.with_file(file_provider::provider(
             file_access.policy,
             file_access.filesystem,
-            file_access.grant,
+            file_access.grants,
         ));
     }
     Arc::new(
         RequestController::builder(net::Config::default())
+            .with_fetch_services(Arc::new(fetch_services::BrowserFetchServices::default()))
             .with_scheme_providers(providers)
             .build()
             .expect("network controller should initialize"),

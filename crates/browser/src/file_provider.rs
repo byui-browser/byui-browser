@@ -1,7 +1,7 @@
 //! Browser adapter from security-owned file access to `net::FileProvider`.
 
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::{
@@ -43,12 +43,57 @@ impl FileAccessGrant {
     }
 }
 
+/// Mutable browser-owned source for local-file authorization state.
+///
+/// Providers snapshot this source immediately before request authorization.
+/// Revocation therefore denies subsequent opens, while an already opened file
+/// stream retains its existing handle until it completes, fails, or is dropped.
+#[derive(Clone, Debug)]
+pub struct FileAccessGrantSource {
+    grant: Arc<RwLock<FileAccessGrant>>,
+}
+
+impl FileAccessGrantSource {
+    /// Creates a shared source with `grant` as its initial authorization state.
+    pub fn new(grant: FileAccessGrant) -> Self {
+        Self {
+            grant: Arc::new(RwLock::new(grant)),
+        }
+    }
+
+    /// Replaces the authorization state used by future file opens.
+    ///
+    /// A poisoned source fails closed: this operation leaves its previous state
+    /// unchanged and future snapshots are denied.
+    pub fn replace(&self, grant: FileAccessGrant) {
+        if let Ok(mut current) = self.grant.write() {
+            *current = grant;
+        }
+    }
+
+    /// Revokes local-file access for future opens while retaining the sandbox identity.
+    pub fn revoke(&self) {
+        if let Ok(mut grant) = self.grant.write() {
+            grant.permission = FileAccessPermission::Denied;
+        }
+    }
+
+    fn snapshot(&self) -> FileAccessGrant {
+        self.grant
+            .read()
+            .map(|grant| grant.clone())
+            .unwrap_or_else(|_| {
+                FileAccessGrant::new(FileAccessPermission::Denied, FileSandboxId::default())
+            })
+    }
+}
+
 /// Adapts security policy and filesystem access to the network provider API.
 #[derive(Clone)]
 pub struct BrowserFileProvider {
     policy: Arc<FileAccessPolicy>,
     filesystem: SharedFileSystem,
-    grant: FileAccessGrant,
+    grants: FileAccessGrantSource,
     read_slots: Arc<Semaphore>,
 }
 
@@ -57,12 +102,12 @@ impl BrowserFileProvider {
     pub fn new(
         policy: Arc<FileAccessPolicy>,
         filesystem: SharedFileSystem,
-        grant: FileAccessGrant,
+        grants: FileAccessGrantSource,
     ) -> Self {
         Self {
             policy,
             filesystem,
-            grant,
+            grants,
             read_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_READS)),
         }
     }
@@ -72,7 +117,7 @@ impl FileProvider for BrowserFileProvider {
     fn open<'a>(&'a self, request: &'a Request, url: &'a Url) -> ProviderFuture<'a> {
         let policy = Arc::clone(&self.policy);
         let filesystem = Arc::clone(&self.filesystem);
-        let grant = self.grant.clone();
+        let grants = self.grants.clone();
         let read_slots = Arc::clone(&self.read_slots);
         let url = url.clone();
         let is_head = request.method() == net::Method::HEAD;
@@ -89,6 +134,7 @@ impl FileProvider for BrowserFileProvider {
             let path = url
                 .to_file_path()
                 .map_err(|_| provider_error(FileAccessError::InvalidPath))?;
+            let grant = grants.snapshot();
             let context = request_context(request, &grant);
             let task = tokio::task::spawn_blocking(move || {
                 if preparation_cancelled.load(Ordering::Acquire) {
@@ -285,7 +331,7 @@ fn provider_error(error: FileAccessError) -> RequestError {
 pub fn provider(
     policy: Arc<FileAccessPolicy>,
     filesystem: SharedFileSystem,
-    grant: FileAccessGrant,
+    grants: FileAccessGrantSource,
 ) -> Arc<dyn FileProvider> {
-    Arc::new(BrowserFileProvider::new(policy, filesystem, grant))
+    Arc::new(BrowserFileProvider::new(policy, filesystem, grants))
 }
