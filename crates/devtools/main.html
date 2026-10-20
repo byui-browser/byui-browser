@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Devtools Example</title>
+</head>
+
+<body>
+  <div id="page">
+    <h2>DevTools Console Test</h2>
+
+    <p>Press Ctrl+Shift+H to open or close Devtools.</p>
+  </div>
+
+  <!-- hidden by default -->
+  <div id="devtools" hidden>
+    <div id="dev-header">
+      <span>Devtools</span>
+      <button id="dev-close-btn" title="Close">✕</button>
+    </div>
+    <nav id="devtools-tabs" aria-label="Devtools panels">
+      <button type="button" data-devtools-tool="console" aria-pressed="true">Console</button>
+      <button type="button" data-devtools-tool="elements" aria-pressed="false">Elements</button>
+      <button type="button" data-devtools-tool="network" aria-pressed="false">Network</button>
+      <button type="button" id="reload-network-button">Reload sample requests</button>
+    </nav>
+    <section id="console-panel" data-devtools-panel="console" hidden>
+      <div id="dev-console-div">
+        <div id="dev-console-output"></div>
+        <input id="dev-console-input" placeholder="Type JavaScript and press Enter" autocomplete="off" spellcheck="false" />
+      </div>
+    </section>
+    <section id="elements-panel" data-devtools-panel="elements" hidden>
+      <p>Elements inspection is not available yet.</p>
+    </section>
+    <section id="network-panel" data-devtools-panel="network" hidden>
+      <table>
+        <thead><tr><th>Name</th><th>Status</th><th>Type</th><th>Time (ms)</th></tr></thead>
+        <tbody id="network-rows"></tbody>
+      </table>
+    </section>
+  </div>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
