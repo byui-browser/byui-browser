@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use browser::evaluate_page_scripts;
+use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use webapis::{AlertSink, ConsoleSink};
 
 struct StdoutConsole;
@@ -19,11 +20,17 @@ impl ConsoleSink for StdoutConsole {
     }
 }
 
-struct StdoutAlert;
+/// Native modal alert adapter for the standalone browser composition binary.
+struct NativeAlert;
 
-impl AlertSink for StdoutAlert {
+impl AlertSink for NativeAlert {
     fn alert(&self, message: &str) {
-        println!("[alert] {message}");
+        MessageDialog::new()
+            .set_title("BYUI Browser")
+            .set_description(message)
+            .set_level(MessageLevel::Info)
+            .set_buttons(MessageButtons::Ok)
+            .show();
     }
 }
 
@@ -40,7 +47,7 @@ fn main() {
     evaluate_page_scripts(
         "<script>print()</script>",
         Arc::new(StdoutConsole),
-        Arc::new(StdoutAlert),
+        Arc::new(NativeAlert),
         controller,
     )
     .expect("page scripts should evaluate");
