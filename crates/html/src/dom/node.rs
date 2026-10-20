@@ -9,21 +9,16 @@ pub struct Node {
 }
 
 impl Node {
-
-    pub fn new() -> Self{
+    pub fn new() -> Self {
         return Self {
             parent: Option::None,
             children: vec![],
             kind: NodeKind::None,
-            span: Option::None
+            span: Option::None,
         };
     }
 
-    pub fn append_child(node : Node){
+    pub fn append_child(node: Node) {}
 
-    }
-
-    pub fn remove() {
-        
-    }
+    pub fn remove() {}
 }
