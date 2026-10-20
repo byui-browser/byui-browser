@@ -2,9 +2,12 @@ use std::{
     fs,
     sync::Arc,
     sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
 };
 
 use browser::{FileAccessConfiguration, file_provider::FileAccessGrant, request_controller};
+use futures_util::StreamExt;
+use net::AbortController;
 use security::file_access::{CapFileSystem, FileAccessPermission, FileAccessPolicy, FileSandboxId};
 
 static NEXT_TEMP_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
@@ -89,6 +92,87 @@ fn configured_file_provider_reads_allowed_files_and_keeps_default_deny() {
     drop(head);
     drop(controller);
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn configured_file_provider_returns_a_live_chunked_body() {
+    let directory = temporary_directory();
+    let allowed = directory.join("allowed");
+    let file = allowed.join("large-page.html");
+    let expected = vec![b'x'; 192 * 1024];
+    fs::create_dir(&allowed).unwrap();
+    fs::write(&file, &expected).unwrap();
+
+    let policy = Arc::new(FileAccessPolicy::new([allowed.clone()]).unwrap());
+    let filesystem = Arc::new(CapFileSystem::new([allowed]).unwrap());
+    let controller = request_controller(Some(file_access(
+        policy,
+        filesystem,
+        FileAccessPermission::Granted,
+    )));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let url = net::Url::from_file_path(&file).unwrap();
+
+    runtime.block_on(async {
+        let response = controller.fetch(navigation(url)).await.unwrap();
+        assert_eq!(
+            response.headers.get("content-length"),
+            Some(expected.len().to_string())
+        );
+        assert!(!response.body.is_replayable());
+
+        let mut body = response.body;
+        let first = body.next().await.unwrap().unwrap();
+        assert!(!first.is_empty());
+        let mut received = first.to_vec();
+        while let Some(chunk) = body.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(received, expected);
+    });
+
+    drop(controller);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn aborting_a_live_file_body_stops_the_blocking_reader() {
+    let directory = temporary_directory();
+    let allowed = directory.join("allowed");
+    let file = allowed.join("large-page.html");
+    fs::create_dir(&allowed).unwrap();
+    fs::write(&file, vec![b'x'; 4 * 1024 * 1024]).unwrap();
+
+    let policy = Arc::new(FileAccessPolicy::new([allowed.clone()]).unwrap());
+    let filesystem = Arc::new(CapFileSystem::new([allowed]).unwrap());
+    let controller = request_controller(Some(file_access(
+        policy,
+        filesystem,
+        FileAccessPermission::Granted,
+    )));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let url = net::Url::from_file_path(&file).unwrap();
+
+    runtime.block_on(async {
+        let abort = AbortController::new();
+        let mut request = navigation(url);
+        request.set_signal(abort.signal());
+        let response = controller.fetch(request).await.unwrap();
+        abort.abort();
+
+        let error = response.body.into_future().await.0.unwrap().unwrap_err();
+        assert!(matches!(error, net::RequestError::Aborted));
+    });
+
+    drop(controller);
+    drop(runtime);
+    for _ in 0..100 {
+        if fs::remove_dir_all(&directory).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("aborted file reader should release its opened handle");
 }
 
 #[test]

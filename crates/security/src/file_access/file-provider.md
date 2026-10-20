@@ -44,31 +44,34 @@ After request authorization and file opening, `BrowserFileProvider` now:
 - acquires one of four bounded file-read slots;
 - performs authorization, opening, and chunked reads on Tokio's blocking
   executor while retaining the opened handle;
-- stops between chunks when the provider future is cancelled or dropped;
+- returns response metadata before body reads complete;
+- sends 64 KiB chunks through a bounded two-chunk channel as
+  `SchemeBody::Stream`;
+- keeps its file-read slot and opened handle until the stream reaches EOF,
+  fails, is aborted, or is dropped; and
+- stops between chunks when the provider future or body stream is cancelled or
+  dropped;
 - emits `Content-Length` and an optional filesystem-supplied `Content-Type`;
 - avoids reading file contents for `HEAD`, while still reporting metadata;
 - returns status `200 OK` with an opaque response origin; and
-- supplies buffered bytes to `net` as `SchemeBody::Bytes`.
+- supplies a live body to `net` as `SchemeBody::Stream`.
 
 The shared `net` scheme pipeline enforces `GET`/`HEAD`, nulls the body for
 `HEAD`, validates response metadata, and maps failures to stable provider error
 categories without exposing filesystem paths or OS diagnostics. Browser tests
 cover allowed reads, default denial, missing files, directories, malformed
-URLs, content length, `GET`/`HEAD`, denied permissions, sandbox mismatches, and
-subresource rejection.
+URLs, content length, live chunked bodies, `GET`/`HEAD`, aborted-reader
+cleanup, denied permissions, sandbox mismatches, and subresource rejection.
 
 ## Remaining work
 
 ### Asynchronous reads and streaming
 
-The first asynchronous slice moves authorization, opening, and buffered reads
-behind a bounded blocking executor. The provider still materializes a complete
-file before returning because the current `FileProvider` contract returns one
-complete `SchemeResource`. The next slice should expose response metadata
-before body completion and stream large or unknown-size files through
-`net::SchemeBody::Stream` while retaining the opened handle. Verify cleanup
-when requests or bodies are aborted, fail, dropped unread, or only partially
-consumed.
+Authorization and opening occur on the bounded blocking executor before the
+provider returns metadata. The opened handle then moves into a separate
+bounded blocking reader, which streams chunks through `net::SchemeBody::Stream`
+without materializing the full file. Verify cleanup when requests or bodies
+are aborted, fail, dropped unread, or only partially consumed.
 
 ### File-document origins and request policy
 
@@ -147,7 +150,6 @@ be addressed before treating the provider as a complete browser capability:
 1. Move file reads to bounded asynchronous or blocking-executor-backed I/O.
 2. Compose browser services and design revocable, trustworthy grants.
 3. Close request-policy and filesystem-backend bypasses.
-4. Add retained-handle streaming, early metadata, `HEAD` optimization, and
-   lifecycle/limit tests.
+4. Add concurrency-limit and read-failure lifecycle coverage.
 5. Finalize file-document origin and subresource authorization semantics.
 6. Extend platform hardening and broader conformance coverage.

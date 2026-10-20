@@ -4,19 +4,27 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
+use futures_util::Stream;
 use net::{
-    FileProvider, HeaderName, HeaderValue, Origin, ProviderErrorKind, ProviderFuture, Request,
-    RequestError, SchemeBody, SchemeResource, Url,
+    AbortSignal, FileProvider, HeaderName, HeaderValue, Origin, ProviderErrorKind, ProviderFuture,
+    Request, RequestError, SchemeBody, SchemeResource, Url,
 };
 use security::file_access::{
     FileAccessError, FileAccessPermission, FileAccessPolicy, FileOrigin, FileRequestContext,
     FileRequestKind, FileSandboxId, SharedFileSystem,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 
 const FILE_READ_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_CONCURRENT_FILE_READS: usize = 4;
+const FILE_READ_CHANNEL_CAPACITY: usize = 2;
+const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Explicit browser-owned grant used when composing a local-file capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,10 +77,11 @@ impl FileProvider for BrowserFileProvider {
         let url = url.clone();
         let is_head = request.method() == net::Method::HEAD;
         let cancelled = Arc::new(AtomicBool::new(false));
-        let cancellation = CancellationFlag(Arc::clone(&cancelled));
+        let mut cancellation = CancellationGuard::new(Arc::clone(&cancelled));
+        let signal = request.signal().clone();
+        let preparation_cancelled = Arc::clone(&cancelled);
 
         Box::pin(async move {
-            let _cancellation = cancellation;
             let permit = read_slots
                 .acquire_owned()
                 .await
@@ -82,34 +91,18 @@ impl FileProvider for BrowserFileProvider {
                 .map_err(|_| provider_error(FileAccessError::InvalidPath))?;
             let context = request_context(request, &grant);
             let task = tokio::task::spawn_blocking(move || {
-                if cancelled.load(Ordering::Acquire) {
+                if preparation_cancelled.load(Ordering::Acquire) {
                     return Err(RequestError::Aborted);
                 }
                 policy.authorize_request(&context).map_err(provider_error)?;
-                let mut opened = policy
+                let opened = policy
                     .open_file(path, filesystem.as_ref())
                     .map_err(provider_error)?;
                 let length = opened.length();
-                let media_type = if is_head {
-                    opened.media_type().map(str::to_owned)
-                } else {
-                    let mut bytes = Vec::new();
-                    let mut buffer = [0; FILE_READ_CHUNK_SIZE];
-                    loop {
-                        if cancelled.load(Ordering::Acquire) {
-                            return Err(RequestError::Aborted);
-                        }
-                        match opened.read_chunk(&mut buffer).map_err(provider_error)? {
-                            0 => break,
-                            count => bytes.extend_from_slice(&buffer[..count]),
-                        }
-                    }
-                    return Ok((length, opened.media_type().map(str::to_owned), bytes));
-                };
-                Ok((length, media_type, Vec::new()))
+                let media_type = opened.media_type().map(str::to_owned);
+                Ok((opened, length, media_type))
             });
-            let (length, media_type, bytes) = task.await.map_err(|_| provider_io_error())??;
-            drop(permit);
+            let (opened, length, media_type) = task.await.map_err(|_| provider_io_error())??;
 
             let length =
                 HeaderValue::from_str(&length.to_string()).map_err(|_| RequestError::Provider {
@@ -129,20 +122,120 @@ impl FileProvider for BrowserFileProvider {
                 media_type,
                 origin: Origin::opaque(),
                 body: if is_head {
+                    drop(opened);
+                    drop(permit);
                     SchemeBody::Null
                 } else {
-                    SchemeBody::Bytes(bytes)
+                    let (sender, receiver) = mpsc::channel(FILE_READ_CHANNEL_CAPACITY);
+                    let worker_cancelled = Arc::clone(&cancelled);
+                    tokio::task::spawn_blocking(move || {
+                        read_file_stream(opened, sender, permit, worker_cancelled, signal);
+                    });
+                    cancellation.disarm();
+                    SchemeBody::Stream(Box::pin(FileBodyStream {
+                        receiver,
+                        cancelled,
+                    }))
                 },
             })
         })
     }
 }
 
-struct CancellationFlag(Arc<AtomicBool>);
+/// A body stream that cancels its blocking reader when Fetch discards it.
+struct FileBodyStream {
+    receiver: mpsc::Receiver<Result<Vec<u8>, RequestError>>,
+    cancelled: Arc<AtomicBool>,
+}
 
-impl Drop for CancellationFlag {
+impl Stream for FileBodyStream {
+    type Item = Result<Vec<u8>, RequestError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(context)
+    }
+}
+
+impl Drop for FileBodyStream {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+/// Stops pending provider work if Fetch drops the resolution future.
+struct CancellationGuard {
+    cancelled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl CancellationGuard {
+    fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Reads an opened file on Tokio's blocking pool and sends bounded body chunks.
+fn read_file_stream(
+    mut opened: security::file_access::OpenedFile,
+    sender: mpsc::Sender<Result<Vec<u8>, RequestError>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    cancelled: Arc<AtomicBool>,
+    signal: AbortSignal,
+) {
+    let mut buffer = [0; FILE_READ_CHUNK_SIZE];
+    loop {
+        if cancelled.load(Ordering::Acquire) || signal.is_aborted() {
+            return;
+        }
+        match opened.read_chunk(&mut buffer).map_err(provider_error) {
+            Ok(0) => return,
+            Ok(count) => {
+                if !send_chunk(&sender, Ok(buffer[..count].to_vec()), &cancelled, &signal) {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = send_chunk(&sender, Err(error), &cancelled, &signal);
+                return;
+            }
+        }
+    }
+}
+
+/// Sends one chunk while honoring cancellation and bounded-channel backpressure.
+fn send_chunk(
+    sender: &mpsc::Sender<Result<Vec<u8>, RequestError>>,
+    mut chunk: Result<Vec<u8>, RequestError>,
+    cancelled: &AtomicBool,
+    signal: &AbortSignal,
+) -> bool {
+    loop {
+        if cancelled.load(Ordering::Acquire) || signal.is_aborted() {
+            return false;
+        }
+        match sender.try_send(chunk) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                chunk = returned;
+                std::thread::sleep(BACKPRESSURE_POLL_INTERVAL);
+            }
+        }
     }
 }
 

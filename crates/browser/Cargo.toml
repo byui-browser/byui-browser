@@ -29,6 +29,7 @@ storage = { workspace = true }
 security = { workspace = true }
 chrome = { workspace = true }
 devtools = { workspace = true }
+futures-util = "0.3"
 
 [lints]
 workspace = true
