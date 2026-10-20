@@ -237,6 +237,7 @@ impl Document {
             NodeKind::Comment(_) | NodeKind::Element(_) | NodeKind::Doctype { .. } => {}
             NodeKind::Text(_) => return Err(DomException::HierarchyRequestError),
             NodeKind::Document => return Err(DomException::HierarchyRequestError),
+            NodeKind::None => return Err(DomException::HierarchyRequestError),
         }
 
         let root_node = source
