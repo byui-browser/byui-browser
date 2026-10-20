@@ -91,9 +91,57 @@ Keep security, browser, and `net` integration tests aligned with the guarantees
 that local file requests do not use HTTP transport, cookies, the HTTP cache, or
 unrelated scheme providers.
 
+### Additional required work from implementation review
+
+The following issues are not sufficiently covered by the work above and must
+be addressed before treating the provider as a complete browser capability:
+
+1. **Compose browser services for context-bearing requests.** The browser
+   controller currently installs the file provider without `FetchServices`.
+   File requests carrying an initiating environment, destination, or other
+   browser context are rejected by `net` before reaching the provider. Add the
+   browser service composition and test navigation requests with real
+   initiating origins.
+2. **Support permission revocation.** A `FileAccessGrant` is copied into the
+   provider at controller construction and cannot be revoked or refreshed.
+   Add a browser-owned permission source, revocation path, or capability
+   generation check so an old controller cannot authorize access after a grant
+   is withdrawn.
+3. **Make grants and sandbox identity trustworthy.** `Granted` permission and
+   `FileSandboxId` values are currently constructible by callers. Define the
+   trust boundary for `FileAccessGrant` and sandbox identities, or replace
+   forgeable values with browser-owned capabilities/tokens that untrusted code
+   cannot manufacture.
+4. **Prevent request-policy bypass through lower-level APIs.**
+   `FileAccessPolicy::open_file` performs path authorization without requiring
+   a `FileRequestContext`. Either enforce request authorization in the API
+   boundary or make the lower-level path-opening API explicitly private to the
+   browser adapter and document the invariant.
+5. **Harden the `FileSystem` backend contract.** A custom `FileSystem`
+   implementation can ignore the supplied `AuthorizedPath` and open an
+   unrelated ambient path. Restrict implementations, strengthen the
+   capability type, or add validation/tests so the security boundary does not
+   rely only on an unenforced implementation contract.
+6. **Make provider work genuinely abortable.** Authorization, opening, and
+   `read_all` currently run synchronously before the provider future is
+   returned. Move them off the async executor’s worker thread and make aborts
+   interrupt or promptly stop in-progress reads.
+7. **Avoid reading file contents for `HEAD`.** The provider currently reads and
+   allocates the complete file even though `net` later exposes a null body for
+   `HEAD`. Return metadata without materializing contents and add a regression
+   test proving that `HEAD` does not perform a full read.
+8. **Expose response headers before body completion.** `Content-Length` is
+   currently computed only after `read_all` finishes, so callers cannot receive
+   file response headers before the complete file is read. Separate metadata
+   acquisition from body delivery and test response-before-body behavior for
+   files.
+
 ## Recommended order
 
 1. Move file reads to bounded asynchronous or blocking-executor-backed I/O.
-2. Add retained-handle streaming and lifecycle/limit tests.
-3. Finalize file-document origin and subresource authorization semantics.
-4. Extend platform hardening and broader conformance coverage.
+2. Compose browser services and design revocable, trustworthy grants.
+3. Close request-policy and filesystem-backend bypasses.
+4. Add retained-handle streaming, early metadata, `HEAD` optimization, and
+   lifecycle/limit tests.
+5. Finalize file-document origin and subresource authorization semantics.
+6. Extend platform hardening and broader conformance coverage.
