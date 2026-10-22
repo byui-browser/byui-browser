@@ -16,6 +16,28 @@ mod tests {
     use crate::{AbortController, Body, RequestError, RequestMode};
 
     #[test]
+    /// Verifies provider failures expose stable, non-diagnostic categories.
+    fn provider_error_categories_are_stable_and_non_diagnostic() {
+        let error = RequestError::Provider {
+            provider: "file",
+            kind: crate::ProviderErrorKind::AccessDenied,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Fetch provider file failed: AccessDenied"
+        );
+        assert!(matches!(
+            error,
+            RequestError::Provider {
+                provider: "file",
+                kind: crate::ProviderErrorKind::AccessDenied
+            }
+        ));
+    }
+
+    #[test]
+    /// Verifies an aborted response stream ends with the typed abort error.
     fn a_pending_response_stream_ends_with_aborted_error() {
         let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
         let controller = AbortController::new();
@@ -33,6 +55,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies basic response exposure removes cookie headers.
     fn basic_view_hides_cookie_headers_before_exposure() {
         let mut headers = HeaderMap::new();
         headers.insert("set-cookie", "session=secret".parse().unwrap());
@@ -61,6 +84,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies filtered and null views do not reveal transport bytes.
     fn opaque_and_null_views_cannot_yield_transport_bytes() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         for (response_type, body_is_null) in [

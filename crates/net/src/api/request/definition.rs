@@ -116,14 +116,19 @@ impl Request {
         &self.context.environment
     }
     /// Returns all URLs visited by this request, in order.
-    /// The supported single-exchange path never follows a redirect.
     pub fn url_list(&self) -> &[Url] {
         &self.url_list
     }
     /// Returns the number of redirects followed so far.
-    /// This remains zero until controller-owned redirects are implemented.
     pub fn redirect_count(&self) -> usize {
         self.redirect_count
+    }
+    /// Returns the cancellation signal associated with this request.
+    ///
+    /// Scheme providers may clone the signal when provider-owned work must
+    /// outlive the initial resolution future.
+    pub fn signal(&self) -> &AbortSignal {
+        &self.signal
     }
     /// Replaces the method after Fetch token and forbidden-method validation.
     pub fn set_method(&mut self, method: impl AsRef<str>) -> Result<(), RequestError> {
@@ -256,6 +261,7 @@ impl Request {
             }
         }
     }
+    /// Reports whether method or headers require a CORS preflight.
     pub(crate) fn requires_cors_preflight(&self) -> bool {
         !matches!(self.method, Method::GET | Method::HEAD | Method::POST)
             || self
@@ -271,11 +277,36 @@ impl Request {
             RequestPriority::High => crate::scheduling::RequestPriority::High,
         }
     }
+    /// Records the validated URL as the current and initial request URL.
     pub(crate) fn prepare_url(&mut self, url: Url) {
         if self.url_list.is_empty() {
             self.url_list.push(url.clone());
         }
         self.current_url = Some(url);
+    }
+
+    pub(crate) fn follow_url(&mut self, url: Url) {
+        self.url_list.push(url.clone());
+        self.current_url = Some(url);
+        self.redirect_count += 1;
+    }
+
+    pub(crate) fn rewrite_for_redirect(&mut self) -> Result<(), RequestError> {
+        self.set_method("GET")?;
+        self.body = None;
+        self.headers.remove_internal_header(CONTENT_TYPE);
+        self.headers
+            .remove_internal_header(HeaderName::from_static("content-length"));
+        Ok(())
+    }
+
+    pub(crate) fn strip_sensitive_redirect_headers(&mut self) {
+        for name in [
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("proxy-authorization"),
+        ] {
+            self.headers.remove_internal_header(name);
+        }
     }
     /// Builds the internal transport header channel without changing caller headers.
     pub(crate) fn fetch_headers(&self) -> Result<Headers, RequestError> {
@@ -325,6 +356,7 @@ impl Request {
             ReferrerPolicy::Empty => Some(source_origin),
         }
     }
+    /// Validates method, no-CORS, and keepalive constraints for the body.
     pub(crate) fn validate_body_state(
         &self,
         max_keepalive_body_size: u64,
