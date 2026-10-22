@@ -8,6 +8,8 @@
 
 use std::collections::HashMap;
 
+use security::{RendererSecurityContext, StorageKey};
+
 /// In-memory `localStorage` for a single origin.
 ///
 /// The real implementation must be scoped per origin and persisted to disk;
@@ -53,6 +55,83 @@ impl LocalStorage {
         self.items.is_empty()
     }
 }
+
+/// In-memory local storage partitioned by the trusted storage key in a
+/// renderer's security context.
+///
+/// Each operation checks the context's storage permission before accessing its
+/// origin's store. Callers cannot select a different origin or storage key for
+/// an operation.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OriginStorage {
+    stores: HashMap<StorageKey, LocalStorage>,
+}
+
+impl OriginStorage {
+    /// Creates an empty set of origin-scoped stores.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reads `key` from the store associated with `context`.
+    ///
+    /// Returns `Ok(None)` when the key is absent, or `Err` when the context is
+    /// not permitted to read storage.
+    pub fn get_item<'a>(
+        &'a self,
+        context: &RendererSecurityContext,
+        key: &str,
+    ) -> Result<Option<&'a str>, StorageAccessError> {
+        if !context.can_read_storage() {
+            return Err(StorageAccessError::ReadDenied);
+        }
+
+        Ok(self
+            .stores
+            .get(context.storage_key())
+            .and_then(|store| store.get_item(key)))
+    }
+
+    /// Writes `value` to `key` in the store associated with `context`.
+    ///
+    /// Returns `Err` when the context is not permitted to write storage.
+    pub fn set_item(
+        &mut self,
+        context: &RendererSecurityContext,
+        key: &str,
+        value: &str,
+    ) -> Result<(), StorageAccessError> {
+        if !context.can_write_storage() {
+            return Err(StorageAccessError::WriteDenied);
+        }
+
+        self.stores
+            .entry(context.storage_key().clone())
+            .or_default()
+            .set_item(key, value);
+        Ok(())
+    }
+}
+
+/// A storage operation rejected by the renderer's storage permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageAccessError {
+    /// The renderer is not permitted to read storage.
+    ReadDenied,
+    /// The renderer is not permitted to write storage.
+    WriteDenied,
+}
+
+impl std::fmt::Display for StorageAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadDenied => f.write_str("storage read denied"),
+            Self::WriteDenied => f.write_str("storage write denied"),
+        }
+    }
+}
+
+impl std::error::Error for StorageAccessError {}
 
 #[cfg(test)]
 mod tests {

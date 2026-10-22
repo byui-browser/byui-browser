@@ -111,10 +111,11 @@ pub enum StoragePermission {
 /// The origin, associated storage key, and permission are fixed when the
 /// context is created. Callers can inspect them but cannot change them.
 ///
-/// Directly changing the origin or permission is not part of the public API:
+/// Directly changing the origin, storage key, or permission is not part of the
+/// public API:
 ///
 /// ```compile_fail
-/// use security::{Origin, RendererSecurityContext, StoragePermission};
+/// use security::{Origin, RendererSecurityContext, StorageKey, StoragePermission};
 ///
 /// let mut context = RendererSecurityContext::new(
 ///     Origin::placeholder(),
@@ -122,6 +123,7 @@ pub enum StoragePermission {
 /// );
 /// context.origin = Origin::placeholder();
 /// context.storage_permission = StoragePermission::Allowed;
+/// context.storage_key = StorageKey::new(Origin::placeholder());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RendererSecurityContext {
