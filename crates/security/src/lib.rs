@@ -419,4 +419,24 @@ mod tests {
 
         assert!(cookies.is_empty());
     }
+
+    #[test]
+    fn secure_cookie_is_only_returned_for_https() {
+        let https_site = origin("https", "byui.edu", 443);
+        let http_site = origin("http", "byui.edu", 80);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &https_site,
+            Cookie {
+                name: "session".into(),
+                value: "abc123".into(),
+                domain: "byui.edu".into(),
+                secure: true,
+            },
+        );
+
+        assert_eq!(jar.cookies_for(&https_site).len(), 1);
+        assert!(jar.cookies_for(&http_site).is_empty());
+    }
 }
