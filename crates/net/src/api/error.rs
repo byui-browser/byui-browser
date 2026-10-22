@@ -11,6 +11,8 @@ pub enum ProviderErrorKind {
     Revoked,
     /// Browser authorization or sandbox policy denied access.
     AccessDenied,
+    /// The provider rejected work because its bounded resource budget is full.
+    ResourceExhausted,
     /// The provider failed after beginning its operation.
     Io,
     /// The provider returned metadata that violates its contract.

@@ -26,6 +26,7 @@ pub use security::file_access::FileAccessGrant;
 
 const FILE_READ_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_CONCURRENT_FILE_READS: usize = 4;
+const MAX_PENDING_FILE_READS: usize = 8;
 const FILE_READ_CHANNEL_CAPACITY: usize = 2;
 const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MAX_PENDING_FILE_NAVIGATIONS: usize = 64;
@@ -147,13 +148,54 @@ impl FileAccessGrantSource {
     }
 }
 
+/// Bounded admission for provider setup and live file readers.
+///
+/// At most four readers may hold an opened file and at most eight additional
+/// authorized requests may wait for a reader. A waiting request retains no
+/// file handle or blocking task.
+#[derive(Clone, Debug)]
+struct FileReadAdmission {
+    active: Arc<Semaphore>,
+    pending: Arc<Semaphore>,
+}
+
+impl FileReadAdmission {
+    fn new(max_active: usize, max_pending: usize) -> Self {
+        Self {
+            active: Arc::new(Semaphore::new(max_active)),
+            pending: Arc::new(Semaphore::new(max_pending)),
+        }
+    }
+
+    async fn acquire(
+        &self,
+        signal: &AbortSignal,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, RequestError> {
+        if signal.is_aborted() {
+            return Err(RequestError::Aborted);
+        }
+        let pending = self
+            .pending
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| provider_resource_exhausted_error())?;
+        let active = self.active.clone().acquire_owned();
+        let result = tokio::select! {
+            _ = signal.cancelled() => Err(RequestError::Aborted),
+            permit = active => permit.map_err(|_| provider_io_error()),
+        };
+        drop(pending);
+        result
+    }
+}
+
 /// Adapts security policy and filesystem access to the network provider API.
 #[derive(Clone)]
 pub(crate) struct BrowserFileProvider {
     capability: Arc<FileAccessCapability>,
     grants: FileAccessGrantSource,
     navigation_authorizations: Arc<FileNavigationAuthorizations>,
-    read_slots: Arc<Semaphore>,
+    read_admission: FileReadAdmission,
 }
 
 impl BrowserFileProvider {
@@ -167,7 +209,10 @@ impl BrowserFileProvider {
             capability,
             grants,
             navigation_authorizations,
-            read_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_READS)),
+            read_admission: FileReadAdmission::new(
+                MAX_CONCURRENT_FILE_READS,
+                MAX_PENDING_FILE_READS,
+            ),
         }
     }
 }
@@ -177,7 +222,7 @@ impl FileProvider for BrowserFileProvider {
         let capability = Arc::clone(&self.capability);
         let grants = self.grants.clone();
         let navigation_authorizations = Arc::clone(&self.navigation_authorizations);
-        let read_slots = Arc::clone(&self.read_slots);
+        let read_admission = self.read_admission.clone();
         let url = url.clone();
         let is_head = request.method() == net::Method::HEAD;
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -201,10 +246,7 @@ impl FileProvider for BrowserFileProvider {
             let path = url
                 .to_file_path()
                 .map_err(|_| provider_error(FileAccessError::InvalidPath))?;
-            let permit = read_slots
-                .acquire_owned()
-                .await
-                .map_err(|_| provider_io_error())?;
+            let permit = read_admission.acquire(&signal).await?;
             let task = tokio::task::spawn_blocking(move || {
                 if preparation_cancelled.load(Ordering::Acquire) {
                     return Err(RequestError::Aborted);
@@ -360,6 +402,13 @@ fn provider_io_error() -> RequestError {
     }
 }
 
+fn provider_resource_exhausted_error() -> RequestError {
+    RequestError::Provider {
+        provider: "file",
+        kind: ProviderErrorKind::ResourceExhausted,
+    }
+}
+
 /// Translates networking request state into the security crate's file-access context.
 fn request_context(request: &Request) -> FileRequestContext {
     let initiating_origin = match request.environment().origin.as_ref() {
@@ -404,4 +453,36 @@ pub(crate) fn provider(
         grants,
         navigation_authorizations,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_read_admission_rejects_excess_waiters_and_cancels_queued_work() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let admission = FileReadAdmission::new(0, 1);
+            let abort = net::AbortController::new();
+            let waiting_admission = admission.clone();
+            let waiting_signal = abort.signal();
+            let waiting =
+                tokio::spawn(async move { waiting_admission.acquire(&waiting_signal).await });
+
+            while admission.pending.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+            assert!(matches!(
+                admission.acquire(&AbortSignal::new()).await,
+                Err(RequestError::Provider {
+                    provider: "file",
+                    kind: ProviderErrorKind::ResourceExhausted,
+                })
+            ));
+
+            abort.abort();
+            assert!(matches!(waiting.await.unwrap(), Err(RequestError::Aborted)));
+        });
+    }
 }
