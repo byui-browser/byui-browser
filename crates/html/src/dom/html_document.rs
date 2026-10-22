@@ -230,6 +230,8 @@ impl HTMLDocument {
                 output.push_str(comment);
                 output.push_str("-->");
             }
+            // Placeholder nodes have no markup.
+            NodeKind::None => {}
         }
     }
 
