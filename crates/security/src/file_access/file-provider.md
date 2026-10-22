@@ -27,6 +27,11 @@ depend on `net`.
   explicit `FileAccessGrantSource`. `FileAccessConfiguration` makes policy,
   filesystem, and shared policy-bound grant state explicit when composing the
   browser request controller.
+- A `RequestMode::Navigate` value alone is not authorization. Trusted browser
+  code must create the request through
+  `FileAccessConfiguration::navigation_request`, which records a bounded,
+  single-use navigation authorization. The provider consumes that
+  authorization before it converts the URL to a filesystem path.
 - `FileAccessGrantSource` snapshots its state immediately before authorization.
   Revoking it denies future opens; already opened streams retain their existing
   capability until EOF, error, abort, or drop.
@@ -98,6 +103,10 @@ Browser tests cover allowed reads, default denial, missing files, directories,
 malformed URLs, content length, live chunked bodies, `GET`/`HEAD`,
 aborted-reader cleanup, revoked grants, foreign-policy grants, and subresource
 rejection.
+
+Requests that do not have a valid grant and browser-issued navigation
+authorization fail with `AccessDenied` before URL-to-path conversion, so an
+unauthorized caller cannot use malformed file URLs as a path-error oracle.
 
 ## Remaining work
 
@@ -177,15 +186,11 @@ capability:
    completion, failure, abort, or drop. Specify behavior for tab/document
    close, navigation, process shutdown, user-grant expiry, and audit logging;
    add tests for each lifecycle transition.
-7. **Bind navigation authorization to trusted browser state.** The provider
-   currently maps the public `RequestMode::Navigate` value directly to
-   `FileRequestKind::Navigation`. Because request construction can set that
-   value, a caller that can reach the controller may be able to turn an
-   ordinary file request into an apparently top-level navigation and bypass
-   the subresource restriction. Require a browser-issued navigation context or
-   equivalent capability rather than trusting the request mode alone, and add
-   a regression test proving that a caller-controlled mode cannot authorize
-   local-file access.
+7. **Bind navigation authorization to trusted browser state.** Completed for
+   this slice: a browser-issued, single-use authorization is now required in
+   addition to `RequestMode::Navigate`, and prepared authorizations are bounded
+   to prevent unbounded state growth. Keep this state private to browser
+   navigation code as new navigation entry points are added.
 8. **Bound pending provider work and make permit acquisition cancellable.**
    The four-reader semaphore limits active readers, but requests waiting for a
    permit are not bounded and the wait does not observe the request abort
@@ -193,12 +198,10 @@ capability:
    delay cancellation while active readers remain occupied. Add a bounded
    pending-request policy and cancellation-aware permit acquisition, with
    tests for aborts before a permit is available and for queue exhaustion.
-9. **Normalize pre-authorization path errors.** URL-to-filesystem-path
-   conversion currently occurs before grant and request-context authorization,
-   allowing unauthorized callers to distinguish malformed file URLs from
-   ordinary denied requests. Perform authorization before filesystem path
-   conversion where possible, or map all such pre-authorization failures to a
-   uniform access-denied result; add a regression test for the error behavior.
+9. **Normalize pre-authorization path errors.** Completed for this slice:
+   grant, browser-issued navigation, and request-context authorization now
+   precede URL-to-filesystem-path conversion. Unauthorized malformed and
+   ordinary file URLs both return `AccessDenied`.
 
 ## Recommended order
 

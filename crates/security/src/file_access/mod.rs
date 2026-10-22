@@ -58,6 +58,21 @@ impl FileAccessCapability {
         self.policy.issue_grant()
     }
 
+    /// Verifies the request context and policy-issued grant before any path is
+    /// normalized or opened.
+    ///
+    /// Browser adapters use this to fail closed before converting an
+    /// unauthorized URL into a filesystem path. A successful result does not
+    /// authorize a pathname; callers must still use
+    /// [`Self::open_authorized_file`] for the eventual open.
+    pub fn authorize_request(
+        &self,
+        context: &FileRequestContext,
+        grant: &FileAccessGrant,
+    ) -> Result<(), FileAccessError> {
+        self.policy.authorize_request(context, grant)
+    }
+
     /// Authorizes and opens one local file through this capability.
     ///
     /// The returned handle is retained by the caller and must be used for all

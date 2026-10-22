@@ -5,6 +5,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::{
+    collections::HashSet,
+    fmt,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -26,6 +28,77 @@ const FILE_READ_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_CONCURRENT_FILE_READS: usize = 4;
 const FILE_READ_CHANNEL_CAPACITY: usize = 2;
 const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const MAX_PENDING_FILE_NAVIGATIONS: usize = 64;
+
+/// Failure while preparing a browser-authorized local-file navigation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileNavigationError {
+    /// The browser has reached its bounded number of prepared navigations.
+    PendingLimitReached {
+        /// Maximum number of navigation authorizations that may await use.
+        limit: usize,
+    },
+    /// Browser-owned navigation state could not be read safely.
+    Unavailable,
+}
+
+impl fmt::Display for FileNavigationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PendingLimitReached { limit } => {
+                write!(
+                    formatter,
+                    "too many pending file navigations (limit: {limit})"
+                )
+            }
+            Self::Unavailable => {
+                formatter.write_str("file navigation authorization is unavailable")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FileNavigationError {}
+
+/// Browser-owned, single-use authorizations for local-file navigations.
+#[derive(Debug)]
+pub(crate) struct FileNavigationAuthorizations {
+    pending: std::sync::Mutex<HashSet<u64>>,
+}
+
+impl FileNavigationAuthorizations {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: std::sync::Mutex::new(HashSet::new()),
+        }
+    }
+
+    pub(crate) fn authorize(&self, request_id: u64) -> Result<(), FileNavigationError> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| FileNavigationError::Unavailable)?;
+        if pending.len() == MAX_PENDING_FILE_NAVIGATIONS {
+            return Err(FileNavigationError::PendingLimitReached {
+                limit: MAX_PENDING_FILE_NAVIGATIONS,
+            });
+        }
+        pending.insert(request_id);
+        Ok(())
+    }
+
+    pub(crate) fn consume(&self, request_id: u64) -> bool {
+        self.pending
+            .lock()
+            .is_ok_and(|mut pending| pending.remove(&request_id))
+    }
+
+    fn clear(&self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.clear();
+        }
+    }
+}
 
 /// Mutable browser-owned source for local-file authorization state.
 ///
@@ -35,13 +108,18 @@ const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 #[derive(Clone, Debug)]
 pub struct FileAccessGrantSource {
     grant: Arc<RwLock<Option<FileAccessGrant>>>,
+    navigation_authorizations: Arc<FileNavigationAuthorizations>,
 }
 
 impl FileAccessGrantSource {
     /// Creates a shared source with `grant` as its initial authorization state.
-    pub(crate) fn new(grant: FileAccessGrant) -> Self {
+    pub(crate) fn new(
+        grant: FileAccessGrant,
+        navigation_authorizations: Arc<FileNavigationAuthorizations>,
+    ) -> Self {
         Self {
             grant: Arc::new(RwLock::new(Some(grant))),
+            navigation_authorizations,
         }
     }
 
@@ -52,6 +130,7 @@ impl FileAccessGrantSource {
     pub fn replace(&self, grant: FileAccessGrant) {
         if let Ok(mut current) = self.grant.write() {
             *current = Some(grant);
+            self.navigation_authorizations.clear();
         }
     }
 
@@ -59,6 +138,7 @@ impl FileAccessGrantSource {
     pub fn revoke(&self) {
         if let Ok(mut grant) = self.grant.write() {
             *grant = None;
+            self.navigation_authorizations.clear();
         }
     }
 
@@ -69,18 +149,24 @@ impl FileAccessGrantSource {
 
 /// Adapts security policy and filesystem access to the network provider API.
 #[derive(Clone)]
-pub struct BrowserFileProvider {
+pub(crate) struct BrowserFileProvider {
     capability: Arc<FileAccessCapability>,
     grants: FileAccessGrantSource,
+    navigation_authorizations: Arc<FileNavigationAuthorizations>,
     read_slots: Arc<Semaphore>,
 }
 
 impl BrowserFileProvider {
     /// Creates a provider using the supplied browser-owned capability.
-    pub fn new(capability: Arc<FileAccessCapability>, grants: FileAccessGrantSource) -> Self {
+    pub(crate) fn new(
+        capability: Arc<FileAccessCapability>,
+        grants: FileAccessGrantSource,
+        navigation_authorizations: Arc<FileNavigationAuthorizations>,
+    ) -> Self {
         Self {
             capability,
             grants,
+            navigation_authorizations,
             read_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_READS)),
         }
     }
@@ -90,6 +176,7 @@ impl FileProvider for BrowserFileProvider {
     fn open<'a>(&'a self, request: &'a Request, url: &'a Url) -> ProviderFuture<'a> {
         let capability = Arc::clone(&self.capability);
         let grants = self.grants.clone();
+        let navigation_authorizations = Arc::clone(&self.navigation_authorizations);
         let read_slots = Arc::clone(&self.read_slots);
         let url = url.clone();
         let is_head = request.method() == net::Method::HEAD;
@@ -99,27 +186,31 @@ impl FileProvider for BrowserFileProvider {
         let preparation_cancelled = Arc::clone(&cancelled);
 
         Box::pin(async move {
+            let grant = grants
+                .snapshot()
+                .ok_or_else(|| provider_error(FileAccessError::Denied))?;
+            let context = request_context(request);
+            if context.kind != FileRequestKind::Navigation
+                || !navigation_authorizations.consume(request.id())
+            {
+                return Err(provider_error(FileAccessError::Denied));
+            }
+            capability
+                .authorize_request(&context, &grant)
+                .map_err(provider_error)?;
+            let path = url
+                .to_file_path()
+                .map_err(|_| provider_error(FileAccessError::InvalidPath))?;
             let permit = read_slots
                 .acquire_owned()
                 .await
                 .map_err(|_| provider_io_error())?;
-            let path = url
-                .to_file_path()
-                .map_err(|_| provider_error(FileAccessError::InvalidPath))?;
-            let grant = grants.snapshot();
-            let context = request_context(request);
             let task = tokio::task::spawn_blocking(move || {
                 if preparation_cancelled.load(Ordering::Acquire) {
                     return Err(RequestError::Aborted);
                 }
                 let opened = capability
-                    .open_authorized_file(
-                        &context,
-                        grant
-                            .as_ref()
-                            .ok_or_else(|| provider_error(FileAccessError::Denied))?,
-                        path,
-                    )
+                    .open_authorized_file(&context, &grant, path)
                     .map_err(provider_error)?;
                 let length = opened.length();
                 let media_type = opened.media_type().map(str::to_owned);
@@ -303,9 +394,14 @@ fn provider_error(error: FileAccessError) -> RequestError {
 }
 
 /// Creates a provider from one browser-owned file-access capability.
-pub fn provider(
+pub(crate) fn provider(
     capability: Arc<FileAccessCapability>,
     grants: FileAccessGrantSource,
+    navigation_authorizations: Arc<FileNavigationAuthorizations>,
 ) -> Arc<dyn FileProvider> {
-    Arc::new(BrowserFileProvider::new(capability, grants))
+    Arc::new(BrowserFileProvider::new(
+        capability,
+        grants,
+        navigation_authorizations,
+    ))
 }

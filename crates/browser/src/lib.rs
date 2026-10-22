@@ -20,6 +20,7 @@ pub mod file_provider;
 pub struct FileAccessConfiguration {
     capability: Arc<FileAccessCapability>,
     grants: file_provider::FileAccessGrantSource,
+    navigation_authorizations: Arc<file_provider::FileNavigationAuthorizations>,
 }
 
 impl FileAccessConfiguration {
@@ -35,8 +36,17 @@ impl FileAccessConfiguration {
         allowed_roots: impl IntoIterator<Item = std::path::PathBuf>,
     ) -> Result<Self, FileAccessError> {
         let capability = Arc::new(FileAccessCapability::from_trusted_roots(allowed_roots)?);
-        let grants = file_provider::FileAccessGrantSource::new(capability.issue_grant());
-        Ok(Self { capability, grants })
+        let navigation_authorizations =
+            Arc::new(file_provider::FileNavigationAuthorizations::new());
+        let grants = file_provider::FileAccessGrantSource::new(
+            capability.issue_grant(),
+            Arc::clone(&navigation_authorizations),
+        );
+        Ok(Self {
+            capability,
+            grants,
+            navigation_authorizations,
+        })
     }
 
     /// Returns the browser-owned grant source for this configuration.
@@ -48,22 +58,43 @@ impl FileAccessConfiguration {
     pub fn grant_source(&self) -> file_provider::FileAccessGrantSource {
         self.grants.clone()
     }
+
+    /// Creates a request authorized as one top-level local-file navigation.
+    ///
+    /// This browser-owned operation is required in addition to
+    /// [`net::RequestMode::Navigate`]. The returned authorization is consumed
+    /// when the file provider admits the request, cannot be replayed, and is
+    /// cleared if this configuration's grant source is replaced or revoked.
+    pub fn navigation_request(
+        &self,
+        url: impl Into<String>,
+    ) -> Result<Request, file_provider::FileNavigationError> {
+        let mut request = Request::get(url);
+        request
+            .set_mode(net::RequestMode::Navigate)
+            .expect("GET requests may always use navigation mode");
+        self.navigation_authorizations.authorize(request.id())?;
+        Ok(request)
+    }
 }
 
 /// Builds a browser request controller with the built-in page provider and an
 /// optional explicitly configured local-file capability and browser services.
 ///
 /// When `file_access` is `None`, no `file:` provider is installed. When it is
-/// present, callers must supply the policy, filesystem backend, and explicit
-/// policy-issued grant source; this function does not infer them from
-/// process state. Browser services use a conservative no-cookie, no-worker
-/// default and permit requests carrying browser client context.
+/// present, callers must supply a trusted [`FileAccessConfiguration`]; this
+/// function does not infer roots from process state. Local-file navigations
+/// must be created through [`FileAccessConfiguration::navigation_request`],
+/// not by setting [`net::RequestMode::Navigate`] on an ordinary request.
+/// Browser services use a conservative no-cookie, no-worker default and
+/// permit requests carrying browser client context.
 pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<RequestController> {
     let mut providers = SchemeProviders::new().with_page(byui_provider::provider());
     if let Some(file_access) = file_access {
         providers = providers.with_file(file_provider::provider(
             file_access.capability,
             file_access.grants,
+            file_access.navigation_authorizations,
         ));
     }
     Arc::new(
