@@ -5,10 +5,12 @@
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ab_glyph::FontVec;
 use tiny_skia::Pixmap;
+use webapis::AlertSink;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::error::EventLoopError;
@@ -61,6 +63,8 @@ struct App {
     /// Window size, scale-factor bits, and theme `frame` was painted for.
     frame_key: Option<(u32, u32, u64, bool)>,
     last_toolbar_click: Option<Instant>,
+    alert_sink: Arc<dyn AlertSink>,
+    scripts_evaluated: bool,
 }
 
 impl App {
@@ -81,6 +85,8 @@ impl App {
             frame: Vec::new(),
             frame_key: None,
             last_toolbar_click: None,
+            alert_sink: crate::content::native_alert_sink(),
+            scripts_evaluated: false,
         }
     }
 
@@ -145,6 +151,7 @@ impl App {
         match control {
             Control::Reload => {
                 self.page = None;
+                self.scripts_evaluated = false;
                 self.redraw();
             }
             // Navigation, tabs, address entry, and the menu are not
@@ -183,6 +190,8 @@ impl App {
                     card.width,
                     card.height,
                     scale,
+                    Arc::clone(&self.alert_sink),
+                    &mut self.scripts_evaluated,
                 )
                 .map(|page| ((card.width, card.height), page))
             });
@@ -405,6 +414,8 @@ mod tests {
                 width,
                 height,
                 scale,
+                Arc::clone(&app.alert_sink),
+                &mut app.scripts_evaluated,
             );
             assert_eq!(rendered.is_some(), width > 0 && height > 0);
             app.page = rendered.map(|page| ((width, height), page));
