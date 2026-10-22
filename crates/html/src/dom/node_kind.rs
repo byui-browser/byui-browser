@@ -11,4 +11,5 @@ pub enum NodeKind {
     Element(ElementData),
     Text(String),
     Comment(String),
+    None,
 }

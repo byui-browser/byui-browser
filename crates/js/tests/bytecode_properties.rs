@@ -172,6 +172,7 @@ fn compiled_order_is_object_then_key_then_value() {
     assert!(matches!(
         chunk.code.as_slice(),
         [
+            Instruction::EnterScope(0),
             Instruction::Constant(0),
             Instruction::Constant(1),
             Instruction::Constant(2),
@@ -186,6 +187,7 @@ fn compiled_order_is_object_then_key_then_value() {
     assert!(matches!(
         chunk.code.as_slice(),
         [
+            Instruction::EnterScope(0),
             Instruction::Constant(0),
             Instruction::Constant(2),
             Instruction::StoreProperty(1),
@@ -198,6 +200,7 @@ fn compiled_order_is_object_then_key_then_value() {
     assert!(matches!(
         chunk.code.as_slice(),
         [
+            Instruction::EnterScope(0),
             Instruction::Constant(0),
             Instruction::LoadProperty(1),
             Instruction::Constant(2),
