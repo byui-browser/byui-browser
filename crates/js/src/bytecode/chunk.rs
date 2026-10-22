@@ -31,6 +31,37 @@ impl Chunk {
         offset
     }
 
+    /// Returns the offset where the next instruction will be emitted.
+    pub fn current_offset(&self) -> usize {
+        self.code.len()
+    }
+
+    /// Emits a jump with a placeholder target and returns its offset.
+    pub fn emit_jump(&mut self, instruction: Instruction) -> Result<usize, &'static str> {
+        if !matches!(
+            instruction,
+            Instruction::Jump(_) | Instruction::JumpIfFalse(_) | Instruction::JumpIfTrue(_)
+        ) {
+            return Err("instruction is not patchable");
+        }
+        Ok(self.emit(instruction))
+    }
+
+    /// Replaces a placeholder jump target with a valid instruction offset.
+    pub fn patch_jump(&mut self, offset: usize, target: usize) -> Result<(), &'static str> {
+        if target > self.code.len() {
+            return Err("jump target is outside the chunk");
+        }
+        let instruction = self.code.get_mut(offset).ok_or("jump offset is invalid")?;
+        match instruction {
+            Instruction::Jump(target_slot)
+            | Instruction::JumpIfFalse(target_slot)
+            | Instruction::JumpIfTrue(target_slot) => *target_slot = target,
+            _ => return Err("instruction is not patchable"),
+        }
+        Ok(())
+    }
+
     /// Adds an owned constant and returns its pool index.
     pub fn add_constant(&mut self, value: Value) -> Result<u16, &'static str> {
         let index = u16::try_from(self.constants.len()).map_err(|_| "constant pool is full")?;
