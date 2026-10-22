@@ -1,7 +1,8 @@
 //! Tree-walk interpreter for parsed programs.
 //!
 //! Supports expressions, `var`/`let`/`const` declarations, blocks, `if`,
-//! `while`, function declarations with closures, calls, and `return`.
+//! `while`, function declarations with closures, calls, `return`, and member
+//! access (`object.name`, `object[key]`, and assignment to either).
 //!
 //! Semantics follow ECMAScript where supported: `var` and function
 //! declarations are hoisted to the enclosing function or script, `let` and
@@ -10,6 +11,10 @@
 //!
 //! Limitations:
 //! - Assigning to an undeclared name is an error, as in strict mode.
+//! - Member access works only on [`Object`] values. Reading a property of any
+//!   other value, including strings and functions, is a runtime error, and so
+//!   is reading a property the object does not have (JavaScript would return
+//!   `undefined`). Methods are called without `this`.
 //! - There is no garbage collector yet. A function stored in the scope it
 //!   closes over forms an `Arc` cycle, so its scope is never freed.
 //! - Evaluation runs on a dedicated engine thread with a large stack. Deep
@@ -20,20 +25,24 @@
 //!   endless loops fail with an error instead of running forever.
 
 mod conversions;
+mod object;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::ast::{
-    BinaryOperator, Expr, LogicalOperator, Program, Statement, UnaryOperator, VarKind,
+    BinaryOperator, Expr, LogicalOperator, MemberProperty, Program, Statement, UnaryOperator,
+    VarKind,
 };
 use crate::stack::{StackGuard, with_engine_stack};
 use crate::{HostFunction, JsError, JsResult, Value};
 pub(crate) use conversions::number_to_string;
 use conversions::{
-    is_truthy, less_than, loose_equals, strict_equals, to_int32, to_number, to_primitive, to_uint32,
+    is_truthy, less_than, loose_equals, strict_equals, to_int32, to_number, to_primitive,
+    to_property_key, to_uint32,
 };
+pub use object::Object;
 
 const STACK_OVERFLOW: &str = "Maximum call stack size exceeded";
 
@@ -91,6 +100,10 @@ struct Binding {
     mutable: bool,
     /// Whether the binding came from `let`, `const`, or a block function.
     lexical: bool,
+    /// Whether the host registered this global and no script has declared it
+    /// since. A script-level `let`/`const` may shadow a host binding but not a
+    /// script-declared one.
+    host: bool,
 }
 
 #[derive(Default)]
@@ -158,9 +171,12 @@ fn already_declared(name: &str) -> JsError {
 /// `var` binding of the same name.
 fn declare_var(scope: &ScopeRef, name: &str) -> JsResult<()> {
     let mut scope = scope.lock_scope();
-    match scope.bindings.get(name) {
+    match scope.bindings.get_mut(name) {
         Some(binding) if binding.lexical => Err(already_declared(name)),
-        Some(_) => Ok(()),
+        Some(binding) => {
+            binding.host = false;
+            Ok(())
+        }
         None => {
             scope.bindings.insert(
                 name.to_owned(),
@@ -168,6 +184,7 @@ fn declare_var(scope: &ScopeRef, name: &str) -> JsResult<()> {
                     value: Some(Value::Undefined),
                     mutable: true,
                     lexical: false,
+                    host: false,
                 },
             );
             Ok(())
@@ -192,6 +209,7 @@ fn declare_lexical(
             value,
             mutable,
             lexical: true,
+            host: false,
         },
     );
     Ok(())
@@ -338,40 +356,128 @@ pub fn evaluate_program_with_step_limit(program: &Program, step_limit: u64) -> J
     )
 }
 
-/// Evaluates a program with caller-provided resource limits.
+/// Evaluates a program with caller-provided resource limits, in a fresh
+/// global state that is discarded afterwards.
 pub fn evaluate_program_with_limits(program: &Program, limits: ExecutionLimits) -> JsResult<Value> {
-    evaluate_program_with_globals(program, &HashMap::new(), limits)
+    GlobalState::new().evaluate(program, limits)
 }
 
-/// Evaluates a program with `globals` installed as callable functions in a
-/// scope enclosing the script, so scripts may shadow them with `let`.
-pub(crate) fn evaluate_program_with_globals(
-    program: &Program,
-    globals: &HashMap<String, HostFunction>,
-    limits: ExecutionLimits,
-) -> JsResult<Value> {
-    with_engine_stack(|| {
-        let global_scope: ScopeRef = Arc::default();
-        for (name, function) in globals {
-            global_scope.lock_scope().bindings.insert(
-                name.clone(),
-                Binding {
-                    value: Some(Value::Function(Function::from_host(
-                        name,
-                        Arc::clone(function),
-                    ))),
-                    mutable: true,
-                    lexical: false,
-                },
-            );
-        }
-        let script_scope = child_scope(&global_scope);
-        let completion = Interpreter::new(limits).run_body(&script_scope, &program.body)?;
-        Ok(match completion {
-            Completion::Normal(value) => value.unwrap_or(Value::Undefined),
-            Completion::Return(value) => value,
+/// The persistent global environment of one realm.
+///
+/// Globals live in two layers so scripts can be evaluated repeatedly:
+/// `object` holds host globals plus `var` and function declarations, and
+/// `lexical` (a child of `object`) holds top-level `let` and `const`. Lookups
+/// check `lexical` first, so a `let` shadows a host global of the same name.
+pub(crate) struct GlobalState {
+    object: ScopeRef,
+    lexical: ScopeRef,
+}
+
+impl GlobalState {
+    /// Creates an empty global state with no host or script bindings.
+    pub(crate) fn new() -> Self {
+        let object: ScopeRef = Arc::default();
+        let lexical = child_scope(&object);
+        Self { object, lexical }
+    }
+
+    /// Binds a host-provided global, replacing any binding in the object
+    /// layer. A script `let`/`const` of the same name still shadows it.
+    pub(crate) fn install_host(&self, name: &str, value: Value) {
+        self.object.lock_scope().bindings.insert(
+            name.to_owned(),
+            Binding {
+                value: Some(value),
+                mutable: true,
+                lexical: false,
+                host: true,
+            },
+        );
+    }
+
+    /// Evaluates `program` against the persistent globals.
+    ///
+    /// Declarations are validated before any is applied, so a redeclaration
+    /// error leaves the globals untouched. Errors thrown while running keep
+    /// the effects that happened before them, as in JavaScript.
+    pub(crate) fn evaluate(&self, program: &Program, limits: ExecutionLimits) -> JsResult<Value> {
+        with_engine_stack(|| {
+            self.declare_globals(&program.body)?;
+            let completion =
+                Interpreter::new(limits).execute_statements(&self.lexical, &program.body)?;
+            Ok(match completion {
+                Completion::Normal(value) => value.unwrap_or(Value::Undefined),
+                Completion::Return(value) => value,
+            })
         })
-    })
+    }
+
+    /// Global declaration instantiation: checks every conflict first, then
+    /// hoists `var`s, functions, and uninitialized `let`/`const` bindings.
+    fn declare_globals(&self, statements: &[Statement]) -> JsResult<()> {
+        let probe: ScopeRef = Arc::default();
+        hoist_var_declarations(&probe, statements)?;
+        let mut var_names: Vec<String> = probe.lock_scope().bindings.keys().cloned().collect();
+        let mut lexical_names: Vec<&str> = Vec::new();
+        for statement in statements {
+            match statement {
+                Statement::FunctionDeclaration { name, .. } => var_names.push(name.clone()),
+                Statement::VariableDeclaration {
+                    kind: VarKind::Let | VarKind::Const,
+                    name,
+                    ..
+                } => lexical_names.push(name),
+                _ => {}
+            }
+        }
+
+        {
+            let lexical = self.lexical.lock_scope();
+            let object = self.object.lock_scope();
+            for (index, name) in lexical_names.iter().enumerate() {
+                let conflicts = lexical_names[..index].contains(name)
+                    || var_names.iter().any(|var| var == name)
+                    || lexical.bindings.contains_key(*name)
+                    || object
+                        .bindings
+                        .get(*name)
+                        .is_some_and(|binding| !binding.host);
+                if conflicts {
+                    return Err(already_declared(name));
+                }
+            }
+            if let Some(name) = var_names
+                .iter()
+                .find(|name| lexical.bindings.contains_key(name.as_str()))
+            {
+                return Err(already_declared(name));
+            }
+        }
+
+        for name in &var_names {
+            declare_var(&self.object, name)?;
+        }
+        for statement in statements {
+            match statement {
+                Statement::VariableDeclaration {
+                    kind: kind @ (VarKind::Let | VarKind::Const),
+                    name,
+                    ..
+                } => declare_lexical(&self.lexical, name, *kind == VarKind::Let, None)?,
+                Statement::FunctionDeclaration { name, params, body } => {
+                    let function = Value::Function(Function(Arc::new(FunctionKind::Script {
+                        name: name.clone(),
+                        params: params.clone(),
+                        body: body.clone(),
+                        closure: Arc::clone(&self.lexical),
+                    })));
+                    initialize(&self.object, name, function);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Evaluates one expression in a fresh, empty environment.
@@ -603,9 +709,9 @@ impl Interpreter {
                     .map(|argument| self.evaluate(argument, scope))
                     .collect::<JsResult<Vec<_>>>()?;
                 let Value::Function(function) = function else {
-                    let description = match callee.as_ref() {
-                        Expr::Identifier(name) => format!("`{name}`"),
-                        _ => "expression".to_owned(),
+                    let description = match describe(callee) {
+                        Some(path) => format!("`{path}`"),
+                        None => "expression".to_owned(),
                     };
                     return Err(JsError::with_context(
                         crate::JsErrorCategory::Runtime,
@@ -615,6 +721,46 @@ impl Interpreter {
                 };
                 self.call(&function, &arguments)
             }
+            Expr::Member { object, property } => {
+                let target = self.evaluate(object, scope)?;
+                let key = self.property_key(property, scope)?;
+                let Value::Object(target) = target else {
+                    return Err(non_object(&target, "read", &key, "property access"));
+                };
+                target.get(&key).ok_or_else(|| {
+                    let description = match describe(expression) {
+                        Some(path) => format!("`{path}`"),
+                        None => format!("Property `{key}`"),
+                    };
+                    JsError::with_context(
+                        crate::JsErrorCategory::Runtime,
+                        format!("{description} is not defined"),
+                        "property access",
+                    )
+                })
+            }
+            Expr::MemberAssign {
+                object,
+                property,
+                value,
+            } => {
+                let target = self.evaluate(object, scope)?;
+                let key = self.property_key(property, scope)?;
+                let value = self.evaluate(value, scope)?;
+                let Value::Object(target) = target else {
+                    return Err(non_object(&target, "set", &key, "property assignment"));
+                };
+                target.set(key, value.clone());
+                Ok(value)
+            }
+        }
+    }
+
+    /// Evaluates a member expression's property to its string key.
+    fn property_key(&mut self, property: &MemberProperty, scope: &ScopeRef) -> JsResult<String> {
+        match property {
+            MemberProperty::Named(name) => Ok(name.clone()),
+            MemberProperty::Computed(key) => Ok(to_property_key(&self.evaluate(key, scope)?)),
         }
     }
 
@@ -653,6 +799,37 @@ impl Interpreter {
             }),
         }
     }
+}
+
+/// Describes an identifier or a chain of `.name` accesses on one, such as
+/// `console.log`, for error messages. Other expressions return `None`.
+fn describe(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Identifier(name) => Some(name.clone()),
+        Expr::Member {
+            object,
+            property: MemberProperty::Named(name),
+        } => describe(object).map(|path| format!("{path}.{name}")),
+        _ => None,
+    }
+}
+
+/// The error for reading or setting property `key` of a non-object value.
+fn non_object(value: &Value, action: &str, key: &str, context: &str) -> JsError {
+    let kind = match value {
+        Value::Undefined => "undefined",
+        Value::Null => "null",
+        Value::Boolean(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Function(_) => "a function",
+        Value::Object(_) => "an object",
+    };
+    JsError::with_context(
+        crate::JsErrorCategory::Runtime,
+        format!("Cannot {action} property `{key}` of {kind}"),
+        context,
+    )
 }
 
 /// Declares every `var` in a function or script body, including those nested

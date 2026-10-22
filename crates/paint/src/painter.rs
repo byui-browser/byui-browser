@@ -6,15 +6,15 @@ use layout::{LayoutTree, Rect as LayoutRect};
 use crate::{Color, DisplayItem, DisplayList, Rect};
 
 const BACKGROUND: Color = Color {
-    r: 210,
-    g: 230,
-    b: 255,
+    r: 242,
+    g: 245,
+    b: 250,
     a: 255,
 };
 const TEXT: Color = Color {
-    r: 25,
-    g: 45,
-    b: 70,
+    r: 30,
+    g: 43,
+    b: 62,
     a: 255,
 };
 
@@ -69,4 +69,32 @@ pub fn paint_document(tree: &LayoutTree, document: &HTMLDocument) -> DisplayList
         }
     }
     DisplayList { items }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use layout::{Size, StyledDom, layout_tree};
+
+    #[test]
+    fn direct_body_text_is_painted() {
+        let document = html::parse_raw_html("<body>Hello</body>".to_owned());
+        let tree = layout_tree(
+            &StyledDom::from_html_document(&document),
+            Size {
+                width: 160.0,
+                height: 120.0,
+            },
+        );
+
+        let text = paint_document(&tree, &document)
+            .items
+            .into_iter()
+            .find_map(|item| match item {
+                DisplayItem::Text { text, .. } => Some(text),
+                DisplayItem::FillRect { .. } => None,
+            });
+
+        assert_eq!(text.as_deref(), Some("Hello"));
+    }
 }

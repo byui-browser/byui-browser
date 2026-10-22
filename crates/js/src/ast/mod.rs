@@ -55,12 +55,49 @@ pub enum Expr {
         value: Box<Expr>,
     },
     /// Function invocation; the callee may itself be a call.
+    ///
+    /// A member callee such as `object.method()` is read like any other
+    /// member and then called; the method does not receive `this`.
     Call {
         /// Owned expression resolving the callable value.
         callee: Box<Expr>,
         /// Owned arguments in evaluation order.
         arguments: Vec<Expr>,
     },
+    /// Property read such as `object.name` or `object[key]`.
+    ///
+    /// The object is evaluated first, then a computed key. Reading a missing
+    /// property, or any property of a non-object value, is a runtime error.
+    Member {
+        /// Owned expression producing the object to read from.
+        object: Box<Expr>,
+        /// Property name, fixed or computed.
+        property: MemberProperty,
+    },
+    /// Property assignment such as `object.name = value`, yielding the
+    /// assigned value.
+    ///
+    /// Evaluation order is the object, then a computed key, then the value;
+    /// only then is the object checked, so assigning to a property of a
+    /// non-object fails after the value has been evaluated.
+    MemberAssign {
+        /// Owned expression producing the object to write to.
+        object: Box<Expr>,
+        /// Property name, fixed or computed.
+        property: MemberProperty,
+        /// Owned expression supplying the assigned value.
+        value: Box<Expr>,
+    },
+}
+
+/// The property part of a member expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemberProperty {
+    /// `object.name`: an owned property name, which may be a keyword.
+    Named(String),
+    /// `object[expression]`: the key is converted to a string after
+    /// evaluation, so `object[1]` and `object['1']` name the same property.
+    Computed(Box<Expr>),
 }
 
 /// An owned statement in the supported program grammar.

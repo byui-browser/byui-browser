@@ -4,12 +4,9 @@ use std::collections::BTreeMap;
 /// A stable index into an [`HtmlDocument`] arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub usize);
+pub mod html_document;
 
-impl NodeId {
-    pub const fn index(self) -> usize {
-        self.0
-    }
-}
+pub mod node;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
@@ -27,32 +24,17 @@ pub struct Node {
     pub kind: NodeKind,
     pub span: Option<SourceSpan>,
 }
+pub mod node_id;
+pub mod node_kind;
+pub mod source_span;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NodeKind {
-    Document,
-    Doctype {
-        name: Option<String>,
-        public_id: Option<String>,
-        system_id: Option<String>,
-    },
-    Element(ElementData),
-    Text(String),
-    Comment(String),
-}
+pub mod element_data;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ElementData {
-    pub name: String,
-    pub namespace: Namespace,
-    pub attributes: Vec<Attribute>,
-}
+pub mod attribute;
+pub mod namespace;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Attribute {
-    pub name: String,
-    pub value: String,
-}
+pub mod dom_error;
+pub mod dom_token_list;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Namespace {
@@ -223,3 +205,9 @@ pub struct LegacyNode {
 pub struct Location {
     pub url: String,
 }
+pub use dom_token_list::DOMTokenList;
+pub use {
+    attribute::Attribute, dom_error::DomError, element_data::ElementData,
+    html_document::HTMLDocument, namespace::Namespace, node::Node, node_id::NodeId,
+    node_kind::NodeKind, source_span::SourceSpan,
+};

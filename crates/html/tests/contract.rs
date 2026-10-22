@@ -17,6 +17,38 @@ fn arena_document_starts_with_a_document_root() {
 }
 
 #[test]
+fn create_element_follows_html_document_rules() {
+    let mut document = HTMLDocument::new();
+
+    let element = document.create_element("DiV-Card").expect("valid name");
+    let node = document.node(element).expect("created node");
+
+    assert_eq!(node.parent, None);
+    assert_eq!(node.children, Vec::new());
+    assert!(matches!(
+        &node.kind,
+        NodeKind::Element(ElementData {
+            name,
+            namespace: Namespace::Html,
+            attributes,
+        }) if name == "div-card" && attributes.is_empty()
+    ));
+}
+
+#[test]
+fn create_element_rejects_invalid_names() {
+    let mut document = HTMLDocument::new();
+
+    for name in ["", "1div", "div name", "div/name", "div>"] {
+        assert_eq!(
+            document.create_element(name),
+            Err(html::DomError::InvalidCharacter),
+            "expected {name:?} to be rejected"
+        );
+    }
+}
+
+#[test]
 fn arena_nodes_are_connected_with_stable_ids_and_spans() {
     let mut document = HtmlDocument::new();
     let paragraph = document.push_node(
@@ -107,6 +139,7 @@ fn valid_fixture_has_expected_arena_shape_and_text() {
     assert!(
         document
             .text_content(body_id)
+            .expect("body text")
             .contains("Building a Small HTML Tree")
     );
     assert!(
@@ -160,6 +193,98 @@ fn get_element_by_id_accepts_an_empty_id() {
 }
 
 #[test]
+fn class_list_exposes_the_class_attribute_as_an_ordered_set() {
+    let mut document = parse_raw_html("<div class='  card card featured\t'></div>".to_owned());
+    let element = html::NodeId(1);
+    let mut class_list = document.class_list(element).expect("element class list");
+
+    assert_eq!(class_list.length(), 2);
+    assert_eq!(class_list.item(0), Some("card".to_owned()));
+    assert_eq!(class_list.item(2), None);
+    assert!(class_list.contains("featured"));
+    assert_eq!(class_list.value(), "  card card featured\t");
+
+    class_list.add(&["selected", "card"]).unwrap();
+    assert_eq!(class_list.value(), "card featured selected");
+    class_list.remove(&["featured"]).unwrap();
+    assert_eq!(class_list.value(), "card selected");
+}
+
+#[test]
+fn class_list_mutations_update_the_element_attribute() {
+    let mut document = parse_raw_html("<div class='card'></div>".to_owned());
+    let element = html::NodeId(1);
+
+    {
+        let mut class_list = document.class_list(element).unwrap();
+        assert_eq!(class_list.toggle("active", None), Ok(true));
+        assert_eq!(class_list.toggle("active", Some(false)), Ok(false));
+        assert_eq!(class_list.replace("card", "panel"), Ok(true));
+        class_list.set_value("panel  wide wide").unwrap();
+    }
+
+    let NodeKind::Element(element) = &document.node(html::NodeId(1)).unwrap().kind else {
+        panic!("expected element");
+    };
+    assert_eq!(
+        element
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == "class")
+            .map(|attribute| attribute.value.as_str()),
+        Some("panel  wide wide")
+    );
+}
+
+#[test]
+fn class_list_validates_all_tokens_before_mutating() {
+    let mut document = parse_raw_html("<div class='card'></div>".to_owned());
+    let mut class_list = document.class_list(html::NodeId(1)).unwrap();
+
+    assert_eq!(
+        class_list.add(&["valid", "has space"]),
+        Err(html::DomError::InvalidToken)
+    );
+    assert_eq!(class_list.value(), "card");
+    assert_eq!(class_list.remove(&[""]), Err(html::DomError::Syntax));
+    assert_eq!(class_list.supports("card"), Err(html::DomError::Type));
+}
+
+#[test]
+fn remove_detaches_a_node_but_preserves_its_subtree() {
+    let mut document =
+        parse_raw_html("<section><span id='target'>text</span></section><p></p>".to_owned());
+    let section = html::NodeId(1);
+    let span = document.get_element_by_id("target").expect("target");
+    let text = document
+        .nodes
+        .iter()
+        .position(|node| matches!(&node.kind, NodeKind::Text(value) if value == "text"))
+        .map(html::NodeId)
+        .expect("text node");
+
+    document.remove(section);
+
+    assert_eq!(document.node(section).unwrap().parent, None);
+    assert_eq!(document.node(span).unwrap().parent, Some(section));
+    assert_eq!(document.node(text).unwrap().parent, Some(span));
+    assert_eq!(document.get_element_by_id("target"), None);
+}
+
+#[test]
+fn remove_of_detached_or_root_nodes_is_a_no_op() {
+    let mut document = parse_raw_html("<div></div>".to_owned());
+    let detached = document.push_node(NodeKind::Comment("detached".into()), None);
+    let children_before = document.nodes[document.root.0].children.clone();
+
+    document.remove(detached);
+    document.remove(document.root);
+
+    assert_eq!(document.node(detached).unwrap().parent, None);
+    assert_eq!(document.nodes[document.root.0].children, children_before);
+}
+
+#[test]
 fn parses_attributes_and_boolean_attributes_as_ordered_values() {
     let document = parse_raw_html("<input disabled class='field' data-count=3>".to_owned());
     let input = document.query("input").pop().expect("input");
@@ -184,7 +309,7 @@ fn parse_5_nested_children_finds_the_text_node() {
         .collect::<Vec<_>>();
 
     assert_eq!(text_nodes, vec![(html::NodeId(6), "Hello")]);
-    assert_eq!(document.text_content(text_nodes[0].0), "Hello");
+    assert_eq!(document.text_content(text_nodes[0].0), Some("Hello".into()));
 
     let mut current = text_nodes[0].0;
     for _ in 0..5 {
@@ -204,7 +329,45 @@ fn handles_empty_input_and_text_without_markup() {
     assert!(matches!(empty.nodes[empty.root.0].kind, NodeKind::Document));
 
     let text = parse_raw_html("plain text < and > signs".to_owned());
-    assert_eq!(text.text_content(text.root), "plain text < and > signs");
+    assert_eq!(text.text_content(text.root), None);
+}
+
+#[test]
+fn text_content_matches_dom_node_type_rules() {
+    let mut document = HTMLDocument::new();
+    let element = document.push_node(
+        NodeKind::Element(ElementData {
+            name: "section".into(),
+            namespace: Namespace::Html,
+            attributes: Vec::new(),
+        }),
+        None,
+    );
+    let first_text = document.push_node(NodeKind::Text("before".into()), None);
+    let comment = document.push_node(NodeKind::Comment("ignored by elements".into()), None);
+    let second_text = document.push_node(NodeKind::Text("after".into()), None);
+    let doctype = document.push_node(
+        NodeKind::Doctype {
+            name: Some("html".into()),
+            public_id: None,
+            system_id: None,
+        },
+        None,
+    );
+    document.append_child(document.root, element);
+    document.append_child(element, first_text);
+    document.append_child(element, comment);
+    document.append_child(element, second_text);
+
+    assert_eq!(document.text_content(element), Some("beforeafter".into()));
+    assert_eq!(document.text_content(first_text), Some("before".into()));
+    assert_eq!(
+        document.text_content(comment),
+        Some("ignored by elements".into())
+    );
+    assert_eq!(document.text_content(document.root), None);
+    assert_eq!(document.text_content(doctype), None);
+    assert_eq!(document.text_content(html::NodeId(999)), None);
 }
 
 #[test]
@@ -220,6 +383,20 @@ fn handles_unclosed_tags_and_mismatched_closing_tags() {
         document.text_content(html::NodeId(paragraphs[1].id.index() as usize)),
         "second"
     );
+    let first_id = document
+        .nodes
+        .iter()
+        .position(|node| node == &paragraphs[0])
+        .map(html::NodeId)
+        .expect("first paragraph id");
+    let second_id = document
+        .nodes
+        .iter()
+        .position(|node| node == &paragraphs[1])
+        .map(html::NodeId)
+        .expect("second paragraph id");
+    assert_eq!(document.text_content(first_id), Some("first".into()));
+    assert_eq!(document.text_content(second_id), Some("second".into()));
 }
 
 #[test]
@@ -229,6 +406,15 @@ fn preserves_void_element_siblings_and_does_not_push_void_nodes() {
     assert_eq!(
         document.text_content(html::NodeId(paragraph.id.index() as usize)),
         "beforeaftertail"
+    let paragraph_id = document
+        .nodes
+        .iter()
+        .position(|node| node == &paragraph)
+        .map(html::NodeId)
+        .expect("paragraph id");
+    assert_eq!(
+        document.text_content(paragraph_id),
+        Some("beforeaftertail".into())
     );
     for tag in ["br", "img"] {
         let node_id = paragraph
@@ -249,12 +435,25 @@ fn preserves_void_element_siblings_and_does_not_push_void_nodes() {
 #[test]
 fn keeps_incomplete_tag_text_and_unterminated_attribute_values() {
     let incomplete = parse_raw_html("hello <p".to_owned());
-    assert_eq!(incomplete.text_content(incomplete.root), "hello <p");
+    assert_eq!(incomplete.text_content(incomplete.root), None);
 
     let attributes = parse_raw_html("<input value='unfinished>".to_owned());
     let input = attributes.query("input").pop().expect("input");
     assert_eq!(
         input.attributes.get("value"),
         Some(&"unfinished".to_owned())
+    );
+}
+
+#[test]
+fn extracts_inline_script_sources_in_document_order() {
+    let document = parse_raw_html(
+        "<script>print()</script><div><script>fetch('https://example.com')</script></div>"
+            .to_owned(),
+    );
+
+    assert_eq!(
+        document.script_sources(),
+        ["print()", "fetch('https://example.com')"]
     );
 }

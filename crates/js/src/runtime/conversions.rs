@@ -3,10 +3,12 @@
 use crate::Value;
 use crate::lexer::is_js_whitespace;
 
-/// `ToPrimitive`: functions convert to their string form; primitives are kept.
+/// `ToPrimitive`: functions and objects convert to their string form
+/// (`[object Object]` for objects, as there are no prototypes to supply
+/// `valueOf` or `toString`); primitives are kept.
 pub(super) fn to_primitive(value: &Value) -> Value {
     match value {
-        Value::Function(_) => Value::String(value.to_string()),
+        Value::Function(_) | Value::Object(_) => Value::String(value.to_string()),
         other => other.clone(),
     }
 }
@@ -18,7 +20,7 @@ pub(super) fn is_truthy(value: &Value) -> bool {
         Value::Boolean(value) => *value,
         Value::Number(value) => *value != 0.0 && !value.is_nan(),
         Value::String(value) => !value.is_empty(),
-        Value::Function(_) => true,
+        Value::Function(_) | Value::Object(_) => true,
     }
 }
 
@@ -28,7 +30,7 @@ pub(super) fn to_number(value: &Value) -> f64 {
         Value::Number(number) => *number,
         Value::Boolean(true) => 1.0,
         Value::Boolean(false) | Value::Null => 0.0,
-        Value::Undefined | Value::Function(_) => f64::NAN,
+        Value::Undefined | Value::Function(_) | Value::Object(_) => f64::NAN,
         Value::String(text) => string_to_number(text),
     }
 }
@@ -165,6 +167,7 @@ pub(super) fn strict_equals(left: &Value, right: &Value) -> bool {
         (Value::Number(left), Value::Number(right)) => left == right,
         (Value::String(left), Value::String(right)) => left == right,
         (Value::Function(left), Value::Function(right)) => left == right,
+        (Value::Object(left), Value::Object(right)) => left == right,
         _ => false,
     }
 }
@@ -177,13 +180,22 @@ pub(super) fn loose_equals(left: &Value, right: &Value) -> bool {
         | (Value::String(text), Value::Number(number)) => *number == string_to_number(text),
         (Value::Boolean(_), _) => loose_equals(&Value::Number(to_number(left)), right),
         (_, Value::Boolean(_)) => loose_equals(left, &Value::Number(to_number(right))),
-        (Value::Function(_), Value::Number(_) | Value::String(_)) => {
+        (Value::Function(_) | Value::Object(_), Value::Number(_) | Value::String(_)) => {
             loose_equals(&to_primitive(left), right)
         }
-        (Value::Number(_) | Value::String(_), Value::Function(_)) => {
+        (Value::Number(_) | Value::String(_), Value::Function(_) | Value::Object(_)) => {
             loose_equals(left, &to_primitive(right))
         }
         _ => strict_equals(left, right),
+    }
+}
+
+/// `ToPropertyKey`: strings are used as-is and every other value uses its
+/// JavaScript string form, so `1` and `'1'` name the same property.
+pub(super) fn to_property_key(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => to_primitive(other).to_string(),
     }
 }
 

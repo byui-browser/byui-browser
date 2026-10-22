@@ -13,13 +13,16 @@ pub(super) fn parse(parser: &mut Parser<'_>, minimum_precedence: u8) -> ParseRes
     let (mut left, mut depth) = unary::parse(parser)?;
     loop {
         if minimum_precedence == 0 && parser.peek() == Some(&Token::Assign) {
-            let Expr::Identifier(name) = left else {
-                return Err(parser.error("Assignment target must be an identifier", "assignment"));
-            };
+            if !matches!(left, Expr::Identifier(_) | Expr::Member { .. }) {
+                return Err(parser.error(
+                    "Assignment target must be an identifier or member expression",
+                    "assignment",
+                ));
+            }
             parser.advance();
             let (value, value_depth) = parser.parse_expression_with_depth(0)?;
-            depth = parser.node_depth(value_depth + 1, "assignment")?;
-            left = assignment::build(name, value);
+            depth = parser.node_depth(depth.max(value_depth) + 1, "assignment")?;
+            left = assignment::build(left, value);
         } else if let Some(operator) = parser.peek().and_then(binary_operator::from_token) {
             if operator.precedence() < minimum_precedence {
                 break;

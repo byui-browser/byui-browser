@@ -19,16 +19,20 @@ fn zero_in_flight_limit_still_allows_a_request() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
     });
-    let controller = RequestController::new(Config {
+    let controller = RequestController::builder(Config {
         max_in_flight: 0,
         ..Config::default()
     })
+    .build()
     .unwrap();
 
     let response = runtime().block_on(controller.fetch(Request::get(server.url())));
 
     server.join();
-    assert_eq!(response.unwrap().body, b"ok");
+    assert_eq!(
+        runtime().block_on(response.unwrap().body.bytes()).unwrap(),
+        b"ok"
+    );
 }
 
 #[test]
@@ -45,20 +49,29 @@ fn scheduler_limits_active_transport_requests() {
         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
     });
 
-    let controller = RequestController::new(Config {
+    let controller = RequestController::builder(Config {
         max_in_flight: 1,
         ..Config::default()
     })
+    .build()
     .unwrap();
     runtime().block_on(async {
         let first_controller = controller.clone();
         let second_controller = controller.clone();
         let first_url = server.url();
         let second_url = server.url();
-        let first =
-            tokio::spawn(async move { first_controller.fetch(Request::get(first_url)).await });
-        let second =
-            tokio::spawn(async move { second_controller.fetch(Request::get(second_url)).await });
+        // Each task reads its own body. The scheduler permit stays with a
+        // response body until it is consumed, so an unread response parked in
+        // one join handle would starve the other request, whichever task the
+        // runtime happens to admit first.
+        let first = tokio::spawn(async move {
+            let response = first_controller.fetch(Request::get(first_url)).await?;
+            response.body.bytes().await
+        });
+        let second = tokio::spawn(async move {
+            let response = second_controller.fetch(Request::get(second_url)).await?;
+            response.body.bytes().await
+        });
         first.await.unwrap().unwrap();
         second.await.unwrap().unwrap();
     });

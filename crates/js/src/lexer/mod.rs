@@ -98,6 +98,12 @@ pub enum Token {
     RightBrace,
     /// `,` separator.
     Comma,
+    /// `.` member access operator.
+    Dot,
+    /// `[` computed member access opener.
+    LeftBracket,
+    /// `]` computed member access closer.
+    RightBracket,
     /// Unrecognized source character. Kept in the stream so callers can
     /// report unsupported syntax without the lexer silently dropping it.
     Unknown(char),
@@ -254,6 +260,9 @@ pub fn tokenize_spanned(input: &str) -> Vec<SpannedToken> {
                 '{' => Token::LeftBrace,
                 '}' => Token::RightBrace,
                 ',' => Token::Comma,
+                '.' => Token::Dot,
+                '[' => Token::LeftBracket,
+                ']' => Token::RightBracket,
                 other => Token::Unknown(other),
             }
         };
