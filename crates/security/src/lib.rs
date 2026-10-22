@@ -198,8 +198,8 @@ impl CookieJar {
 
     /// Stores a cookie received from `origin`, applying domain/secure rules.
     // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
-    pub fn store(&mut self, origin: &Origin, cookie: Cookie) {
-        todo!("TODO(security): store {} for {}", cookie.name, origin.host)
+    pub fn store(&mut self, _origin: &Origin, cookie: Cookie) {
+        self.cookies.push(cookie);
     }
 
     /// Cookies that may be sent to `origin`.
@@ -207,14 +207,18 @@ impl CookieJar {
     /// Currently only handles the empty jar.
     // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
     pub fn cookies_for(&self, origin: &Origin) -> Vec<&Cookie> {
-        if self.cookies.is_empty() {
-            return Vec::new();
-        }
-        todo!(
-            "TODO(security): filter {} cookies for {}",
-            self.cookies.len(),
-            origin.host
-        )
+       let mut matching_cookies = Vec::new();
+
+       for cookie in &self.cookies {
+           let domain_matches = cookie.domain == origin.host();
+           let secure_connection = origin.scheme() == "https";
+
+           if domain_matches && (!cookie.secure || secure_connection) {
+               matching_cookies.push(cookie);
+           }
+       }
+
+       matching_cookies
     }
 }
 
@@ -371,5 +375,27 @@ mod tests {
             jar.cookies_for(&origin("https", "byui.edu", 443))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn stores_and_returns_cookie_for_matching_origin() {
+        let site = origin("https", "byui.edu", 443);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "abc123".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        let cookies = jar.cookies_for(&site);
+
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].name, "session");
+        assert_eq!(cookies[0].value, "abc123");
     }
 }
