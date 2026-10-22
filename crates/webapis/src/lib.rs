@@ -10,7 +10,7 @@
 
 pub mod local_storage;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use common::ids::NodeId;
 use html::{Attribute, DOMTokenList, HTMLDocument, Namespace, NodeKind};
@@ -137,16 +137,83 @@ impl Element {
             .find(|attribute| attribute.name == name)
             .map(|attribute| attribute.value.as_str())
     }
+
+    /// Sets an attribute on this element according to the DOM Standard.
+    ///
+    /// HTML attribute names are normalized to ASCII lowercase. Existing
+    /// attributes are replaced in place and new attributes are appended.
+    /// Invalid names return `InvalidCharacterError`.
+    pub fn set_attribute(&mut self, qualified_name: &str, value: &str) -> JsResult<()> {
+        let name = normalize_attribute_name(self.namespace, qualified_name)?;
+        if let Some(attribute) = self
+            .attributes
+            .iter_mut()
+            .find(|attribute| attribute.name == name)
+        {
+            attribute.value = value.to_owned();
+        } else {
+            self.attributes.push(Attribute {
+                name,
+                value: value.to_owned(),
+            });
+        }
+        self.id_attr = self
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == "id")
+            .map(|attribute| attribute.value.clone());
+        Ok(())
+    }
 }
 
-fn element_object(element: Element) -> Object {
+fn element_object(element: Element, document: Arc<Mutex<Document>>) -> Object {
     let object = Object::new();
-    let get_attribute_element = element;
+    let node = element.node;
+    let get_attribute_document = document.clone();
     object.set_method(
         "getAttribute",
-        Arc::new(move |arguments| get_attribute(&get_attribute_element, arguments)),
+        Arc::new(move |arguments| {
+            let document = get_attribute_document.lock().unwrap();
+            let Some(element) = document.element_by_node(node) else {
+                return Ok(Value::Null);
+            };
+            get_attribute(element, arguments)
+        }),
+    );
+    let set_attribute_document = document;
+    object.set_method(
+        "setAttribute",
+        Arc::new(move |arguments| {
+            let [Value::String(qualified_name), Value::String(value)] = arguments else {
+                return Err(JsError::new(
+                    "Element.setAttribute() expects a qualified name and value string",
+                ));
+            };
+            set_attribute_document
+                .lock()
+                .unwrap()
+                .set_attribute(node, qualified_name, value)
+        }),
     );
     object
+}
+
+fn normalize_attribute_name(namespace: Namespace, qualified_name: &str) -> JsResult<String> {
+    if qualified_name.is_empty()
+        || qualified_name.chars().any(|character| {
+            matches!(
+                character,
+                '\t' | '\n' | '\x0c' | '\r' | ' ' | '\0' | '/' | '=' | '>'
+            )
+        })
+    {
+        return Err(JsError::new("InvalidCharacterError"));
+    }
+
+    Ok(match namespace {
+        Namespace::Html => qualified_name.to_ascii_lowercase(),
+        Namespace::Svg | Namespace::MathMl => qualified_name.to_owned(),
+    })
 }
 
 /// Implements JavaScript `Element.getAttribute(qualifiedName)`.
@@ -172,19 +239,37 @@ pub fn get_element_by_id(document: &Document, arguments: &[Value]) -> JsResult<V
     };
 
     Ok(match document.get_element_by_id(id) {
-        Some(element) => Value::Object(element_object(element.clone())),
+        Some(element) => Value::Object(element_object(
+            element.clone(),
+            Arc::new(Mutex::new(document.clone())),
+        )),
         None => Value::Null,
     })
 }
 
-/// Registers the read-only DOM methods supported by this crate on the global
-/// JavaScript `document` object.
+/// Registers the DOM methods supported by this crate on the global JavaScript
+/// `document` object.
 pub fn register_document(realm: &mut Realm, document: Document) -> JsResult<()> {
     let document_object = Object::new();
-    let get_element_document = document;
+    let shared_document = Arc::new(Mutex::new(document));
+    let get_element_document = shared_document.clone();
     document_object.set_method(
         "getElementById",
-        Arc::new(move |arguments| get_element_by_id(&get_element_document, arguments)),
+        Arc::new(move |arguments| {
+            let document = get_element_document.lock().unwrap();
+            let [Value::String(id)] = arguments else {
+                return Err(JsError::new(
+                    "document.getElementById() expects one id string",
+                ));
+            };
+            Ok(match document.get_element_by_id(id) {
+                Some(element) => Value::Object(element_object(
+                    element.clone(),
+                    get_element_document.clone(),
+                )),
+                None => Value::Null,
+            })
+        }),
     );
     realm.register_global_value("document", Value::Object(document_object))
 }
@@ -275,6 +360,24 @@ impl Document {
         self.source_document
             .as_ref()
             .map_or_else(String::new, HTMLDocument::inner_html)
+    }
+
+    fn element_by_node(&self, node: NodeId) -> Option<&Element> {
+        self.elements.iter().find(|element| element.node == node)
+    }
+
+    fn set_attribute(
+        &mut self,
+        node: NodeId,
+        qualified_name: &str,
+        value: &str,
+    ) -> JsResult<Value> {
+        let document = self.source_document.get_or_insert_with(HTMLDocument::new);
+        document
+            .set_attribute(html::NodeId(node.index() as usize), qualified_name, value)
+            .map_err(|error| JsError::new(error.to_string()))?;
+        self.elements = collect_elements(document);
+        Ok(Value::Undefined)
     }
 
     /// Implements the DOM `Element.classList` getter for an element in this
@@ -812,6 +915,55 @@ mod tests {
                 .unwrap(),
             Value::Null
         );
+    }
+
+    #[test]
+    fn registration_exposes_element_set_attribute_to_javascript() {
+        let html_document = parse_raw_html("<main id='app' data-state='ready'></main>".to_owned());
+        let mut realm = Realm::new();
+        register_document(
+            &mut realm,
+            super::Document::from_html_document(&html_document),
+        )
+        .unwrap();
+
+        assert_eq!(
+            realm.evaluate_script(
+                "document.getElementById('app').setAttribute('DATA-STATE', 'updated'); document.getElementById('app').getAttribute('data-state')",
+            ),
+            Ok(Value::String("updated".to_owned()))
+        );
+        assert_eq!(
+            realm.evaluate_script(
+                "document.getElementById('app').setAttribute('data-added', 'yes')",
+            ),
+            Ok(Value::Undefined)
+        );
+        assert_eq!(
+            realm
+                .evaluate_script("document.getElementById('app').getAttribute('DATA-ADDED')")
+                .unwrap(),
+            Value::String("yes".to_owned())
+        );
+    }
+
+    #[test]
+    fn element_set_attribute_rejects_invalid_names() {
+        let mut element = super::Element {
+            node: NodeId::new(1),
+            local_name: "main".into(),
+            namespace: Namespace::Html,
+            id_attr: None,
+            attributes: Vec::new(),
+        };
+        assert_eq!(
+            element
+                .set_attribute("bad name", "value")
+                .unwrap_err()
+                .to_string(),
+            "InvalidCharacterError"
+        );
+        assert!(element.attributes.is_empty());
     }
 
     #[test]
