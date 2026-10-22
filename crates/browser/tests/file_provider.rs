@@ -5,8 +5,10 @@ use std::{
 };
 
 use browser::{FileAccessConfiguration, request_controller};
+use cap_std::{ambient_authority, fs::Dir};
 use futures_util::StreamExt;
 use net::AbortController;
+use security::file_access::TrustedFileAccessRoot;
 
 static NEXT_TEMP_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -23,7 +25,15 @@ fn temporary_directory() -> std::path::PathBuf {
 fn file_access(
     allowed_roots: impl IntoIterator<Item = std::path::PathBuf>,
 ) -> FileAccessConfiguration {
-    FileAccessConfiguration::from_trusted_roots(allowed_roots).unwrap()
+    let roots = allowed_roots
+        .into_iter()
+        .map(|path| {
+            let canonical_path = fs::canonicalize(&path).unwrap();
+            let directory = Dir::open_ambient_dir(&canonical_path, ambient_authority()).unwrap();
+            TrustedFileAccessRoot::from_open_directory(canonical_path, directory).unwrap()
+        })
+        .collect::<Vec<_>>();
+    FileAccessConfiguration::from_trusted_roots(roots).unwrap()
 }
 
 fn navigation(file_access: &FileAccessConfiguration, url: impl Into<String>) -> net::Request {

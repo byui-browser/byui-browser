@@ -8,7 +8,7 @@ use std::sync::Arc;
 use html::Query;
 use js::{JsResult, Realm, Value};
 use net::{Request, RequestController, SchemeProviders};
-use security::file_access::{FileAccessCapability, FileAccessError};
+use security::file_access::{FileAccessCapability, FileAccessError, TrustedFileAccessRoot};
 use webapis::{ConsoleSink, register_fetch, register_print};
 
 pub mod byui_provider;
@@ -28,12 +28,13 @@ impl FileAccessConfiguration {
     /// browser or platform code.
     ///
     /// This is the browser's filesystem-capability boundary. Callers must use
-    /// user-selected paths or an equivalent trusted embedder decision, never a
-    /// path supplied by web content. The resulting policy and directory
-    /// capabilities are created together and cannot be mixed with another
-    /// root set.
+    /// user-selected directory handles or an equivalent trusted embedder
+    /// capability, never a path supplied by web content. Each root retains the
+    /// directory handle selected by the platform; this API deliberately does
+    /// not reopen a pathname and therefore cannot bind the policy to one root
+    /// and I/O to a replacement root.
     pub fn from_trusted_roots(
-        allowed_roots: impl IntoIterator<Item = std::path::PathBuf>,
+        allowed_roots: impl IntoIterator<Item = TrustedFileAccessRoot>,
     ) -> Result<Self, FileAccessError> {
         let capability = Arc::new(FileAccessCapability::from_trusted_roots(allowed_roots)?);
         let navigation_authorizations =

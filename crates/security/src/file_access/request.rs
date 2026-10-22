@@ -3,7 +3,7 @@
 /// Origin information supplied by the browser when it asks to access a local file.
 ///
 /// This is deliberately a security-owned representation. Browser adapters must
-/// translate their networking origin type before calling [`FileAccessPolicy`].
+/// translate their networking origin type before calling [`FileAccessCapability`].
 /// Tuple origins are serialized in their canonical form and are retained for
 /// policy decisions and auditing; this initial policy does not grant
 /// subresource access for any origin.
@@ -28,19 +28,19 @@ pub enum FileRequestKind {
     Subresource,
 }
 
-/// Opaque authorization issued by one [`FileAccessPolicy`].
+/// Opaque authorization issued by one [`FileAccessCapability`].
 ///
 /// Only the policy that issued this value accepts it. Browser composition must
 /// retain grants exclusively in browser-owned state and never expose them to
 /// request or web-content code. Dropping a grant source denies future opens.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileAccessGrant {
-    pub(crate) policy_id: u64,
+    pub(crate) capability_id: u64,
 }
 
 impl FileAccessGrant {
-    pub(crate) fn new(policy_id: u64) -> Self {
-        Self { policy_id }
+    pub(crate) fn new(capability_id: u64) -> Self {
+        Self { capability_id }
     }
 }
 

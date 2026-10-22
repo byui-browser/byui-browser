@@ -177,6 +177,7 @@ dependencies = [
 name = "browser"
 version = "0.1.0"
 dependencies = [
+ "cap-std",
  "chrome",
  "common",
  "css",

@@ -31,5 +31,8 @@ chrome = { workspace = true }
 devtools = { workspace = true }
 futures-util = "0.3"
 
+[dev-dependencies]
+cap-std = "4"
+
 [lints]
 workspace = true

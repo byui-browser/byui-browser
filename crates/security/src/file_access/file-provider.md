@@ -13,6 +13,9 @@ for explicitly configured roots. Browser-issued, single-use navigation
 authorizations and policy-bound grants are required before URL-to-path
 conversion. Requests are opened once through retained directory and file
 handles, with path-component containment and symlink/junction escape checks.
+Root configuration accepts only a trusted canonical selection path paired with
+its already-open directory handle, eliminating the prior policy-versus-handle
+root-replacement race.
 
 Authorized `GET` requests stream 64 KiB chunks through a bounded channel;
 `HEAD` performs authorization and metadata lookup without starting a reader.
@@ -26,10 +29,13 @@ containment, streaming, cancellation, revocation, and failure behavior.
 
 ### Trusted composition and permission lifetime
 
-- Connect `FileAccessCapability::from_trusted_roots` to user-selected handles
-  or an equivalent narrow platform capability before enabling local-file UI.
-  Renderers and request-construction code must never receive source roots or
-  the capability itself.
+- Connect `TrustedFileAccessRoot::from_open_directory` to user-selected
+  directory handles or an equivalent narrow platform capability before enabling
+  local-file UI. Its canonical selection path and directory handle must be
+  captured by the same trusted platform operation; this is what prevents a
+  root-replacement race during configuration. Renderers and
+  request-construction code must never receive source roots or the capability
+  itself.
 - Define permission lifetime and revocation behavior for tab/document close,
   navigation, process shutdown, grant expiry, and audit logging. Specify which
   already-open streams survive each transition.
@@ -82,10 +88,10 @@ files, while preserving fail-closed behavior.
 - Preserve the single-open/retained-handle invariant in every backend or
   fallback. A fallback must fail closed rather than re-authorize and reopen a
   pathname.
-- Make policy and filesystem-root construction atomic or define its failure
-  behavior. They currently canonicalize and open configured roots independently,
-  so a root replacement during capability creation can leave the policy and
-  retained directory handle referring to different objects.
+- Keep every platform implementation on the already-open-handle construction
+  path. Do not add a convenience constructor that canonicalizes and reopens a
+  root pathname, because it would reintroduce the root-replacement race closed
+  by `TrustedFileAccessRoot`.
 
 ### Integration and conformance
 
