@@ -6,6 +6,9 @@ use crate::ast::{Expr, LogicalOperator, Program, Statement, VarKind};
 use std::collections::HashMap;
 use std::fmt;
 
+#[path = "control_flow.rs"]
+mod control_flow;
+
 /// A source construct that the initial bytecode compiler cannot lower yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileError {
@@ -66,9 +69,7 @@ impl Compiler {
         self.collect_root_bindings(program)?;
         let root_enter = self.chunk.emit(Instruction::EnterScope(0));
         self.emit_scope_declarations(0)?;
-        for (index, statement) in program.body.iter().enumerate() {
-            self.compile_statement(statement, index + 1 == program.body.len())?;
-        }
+        self.compile_sequence(&program.body, true)?;
         self.chunk.code[root_enter] = Instruction::EnterScope(self.scopes[0].slots);
         self.chunk.emit(Instruction::Return);
         Ok(self.chunk)
@@ -204,34 +205,61 @@ impl Compiler {
         })
     }
 
+    fn compile_sequence(
+        &mut self,
+        statements: &[Statement],
+        wants_completion: bool,
+    ) -> Result<bool, CompileError> {
+        let mut has_value = false;
+        for statement in statements {
+            let produced = self.compile_statement(statement, true)?;
+            if produced {
+                if has_value {
+                    self.chunk.emit(Instruction::Swap);
+                    self.chunk.emit(Instruction::Pop);
+                }
+                has_value = true;
+            }
+        }
+        if wants_completion {
+            if !has_value {
+                self.constant(Value::Undefined)?;
+            }
+            Ok(true)
+        } else {
+            if has_value {
+                self.chunk.emit(Instruction::Pop);
+            }
+            Ok(false)
+        }
+    }
+
     fn compile_statement(
         &mut self,
         statement: &Statement,
         is_completion: bool,
-    ) -> Result<(), CompileError> {
+    ) -> Result<bool, CompileError> {
         match statement {
             Statement::Expression(expression) => {
                 self.compile_expression(expression)?;
                 if !is_completion {
                     self.chunk.emit(Instruction::Pop);
                 }
-                Ok(())
+                Ok(is_completion)
             }
             Statement::Block(statements) => {
                 let scope = self.enter_block()?;
                 self.collect_block_bindings(scope, statements)?;
                 let enter = self.chunk.emit(Instruction::EnterScope(0));
                 self.emit_scope_declarations(scope)?;
-                for (index, statement) in statements.iter().enumerate() {
-                    self.compile_statement(
-                        statement,
-                        is_completion && index + 1 == statements.len(),
-                    )?;
-                }
+                self.compile_sequence(statements, true)?;
                 self.chunk.code[enter] = Instruction::EnterScope(self.scopes[scope].slots);
                 self.chunk.emit(Instruction::ExitScope);
                 self.scopes.pop();
-                Ok(())
+                if !is_completion {
+                    self.chunk.emit(Instruction::Pop);
+                }
+                Ok(is_completion)
             }
             Statement::VariableDeclaration { kind, name, init } => {
                 let name_index = self.name(name)?;
@@ -255,10 +283,16 @@ impl Compiler {
                     });
                 }
                 let _ = kind;
-                Ok(())
+                Ok(false)
             }
-            Statement::If { .. } => Err(CompileError::unsupported("if statements")),
-            Statement::While { .. } => Err(CompileError::unsupported("while statements")),
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => self.compile_if(condition, then_branch, else_branch, is_completion),
+            Statement::While { condition, body } => {
+                self.compile_while(condition, body, is_completion)
+            }
             Statement::FunctionDeclaration { .. } => {
                 Err(CompileError::unsupported("function declarations"))
             }
