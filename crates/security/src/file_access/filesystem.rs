@@ -81,15 +81,19 @@ impl OpenedFile {
 /// then resolved relative to that capability, so path components cannot
 /// escape through a junction or symlink race. The roots passed here must be
 /// the same configured roots used to construct the corresponding
-/// [`FileAccessPolicy`].
+/// [`FileAccessPolicy`]. A hard link stored below an allowed root is an
+/// allowed directory entry; pathname containment cannot and does not infer
+/// where else its inode may be linked.
 #[derive(Debug)]
-pub struct CapFileSystem {
+pub(crate) struct CapFileSystem {
     roots: Vec<(PathBuf, Dir)>,
 }
 
 impl CapFileSystem {
     /// Opens directory capabilities for the configured allowed roots.
-    pub fn new(allowed_roots: impl IntoIterator<Item = PathBuf>) -> Result<Self, FileAccessError> {
+    pub(crate) fn new(
+        allowed_roots: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Self, FileAccessError> {
         let roots = allowed_roots
             .into_iter()
             .map(|root| {
@@ -287,6 +291,68 @@ mod tests {
         fs::rename(&replacement, &path).unwrap();
 
         assert_eq!(opened.read_all().unwrap().bytes, b"authorized bytes");
+        drop(filesystem);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_filesystem_retains_the_original_root_after_root_replacement() {
+        let directory = temporary_directory();
+        let allowed = directory.join("allowed");
+        let replacement = directory.join("replacement");
+        let previous = directory.join("previous");
+        fs::create_dir(&allowed).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        fs::write(allowed.join("page.html"), b"original root").unwrap();
+        fs::write(replacement.join("page.html"), b"replacement root").unwrap();
+        let policy = FileAccessPolicy::new([allowed.clone()]).unwrap();
+        let filesystem = CapFileSystem::new([allowed.clone()]).unwrap();
+
+        fs::rename(&allowed, &previous).unwrap();
+        fs::rename(&replacement, &allowed).unwrap();
+
+        let resource = policy
+            .open_authorized_file(
+                &navigation_context(),
+                &policy.issue_grant(),
+                allowed.join("page.html"),
+                &filesystem,
+            )
+            .unwrap()
+            .read_all()
+            .unwrap();
+
+        assert_eq!(resource.bytes, b"original root");
+        drop(filesystem);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_filesystem_allows_hard_links_named_inside_the_root() {
+        let directory = temporary_directory();
+        let allowed = directory.join("allowed");
+        let outside = directory.join("outside.txt");
+        let linked = allowed.join("linked.txt");
+        fs::create_dir(&allowed).unwrap();
+        fs::write(&outside, b"linked bytes").unwrap();
+        fs::hard_link(&outside, &linked).unwrap();
+        let policy = FileAccessPolicy::new([allowed.clone()]).unwrap();
+        let filesystem = CapFileSystem::new([allowed]).unwrap();
+
+        let resource = policy
+            .open_authorized_file(
+                &navigation_context(),
+                &policy.issue_grant(),
+                &linked,
+                &filesystem,
+            )
+            .unwrap()
+            .read_all()
+            .unwrap();
+
+        assert_eq!(resource.bytes, b"linked bytes");
         drop(filesystem);
         fs::remove_dir_all(directory).unwrap();
     }

@@ -16,8 +16,7 @@ use net::{
     Request, RequestError, SchemeBody, SchemeResource, Url,
 };
 use security::file_access::{
-    CapFileSystem, FileAccessError, FileAccessPolicy, FileOrigin, FileRequestContext,
-    FileRequestKind,
+    FileAccessCapability, FileAccessError, FileOrigin, FileRequestContext, FileRequestKind,
 };
 use tokio::sync::{Semaphore, mpsc};
 
@@ -40,7 +39,7 @@ pub struct FileAccessGrantSource {
 
 impl FileAccessGrantSource {
     /// Creates a shared source with `grant` as its initial authorization state.
-    pub fn new(grant: FileAccessGrant) -> Self {
+    pub(crate) fn new(grant: FileAccessGrant) -> Self {
         Self {
             grant: Arc::new(RwLock::new(Some(grant))),
         }
@@ -71,22 +70,16 @@ impl FileAccessGrantSource {
 /// Adapts security policy and filesystem access to the network provider API.
 #[derive(Clone)]
 pub struct BrowserFileProvider {
-    policy: Arc<FileAccessPolicy>,
-    filesystem: Arc<CapFileSystem>,
+    capability: Arc<FileAccessCapability>,
     grants: FileAccessGrantSource,
     read_slots: Arc<Semaphore>,
 }
 
 impl BrowserFileProvider {
-    /// Creates a provider using the supplied security policy and filesystem.
-    pub fn new(
-        policy: Arc<FileAccessPolicy>,
-        filesystem: Arc<CapFileSystem>,
-        grants: FileAccessGrantSource,
-    ) -> Self {
+    /// Creates a provider using the supplied browser-owned capability.
+    pub fn new(capability: Arc<FileAccessCapability>, grants: FileAccessGrantSource) -> Self {
         Self {
-            policy,
-            filesystem,
+            capability,
             grants,
             read_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_READS)),
         }
@@ -95,8 +88,7 @@ impl BrowserFileProvider {
 
 impl FileProvider for BrowserFileProvider {
     fn open<'a>(&'a self, request: &'a Request, url: &'a Url) -> ProviderFuture<'a> {
-        let policy = Arc::clone(&self.policy);
-        let filesystem = Arc::clone(&self.filesystem);
+        let capability = Arc::clone(&self.capability);
         let grants = self.grants.clone();
         let read_slots = Arc::clone(&self.read_slots);
         let url = url.clone();
@@ -120,14 +112,13 @@ impl FileProvider for BrowserFileProvider {
                 if preparation_cancelled.load(Ordering::Acquire) {
                     return Err(RequestError::Aborted);
                 }
-                let opened = policy
+                let opened = capability
                     .open_authorized_file(
                         &context,
                         grant
                             .as_ref()
                             .ok_or_else(|| provider_error(FileAccessError::Denied))?,
                         path,
-                        filesystem.as_ref(),
                     )
                     .map_err(provider_error)?;
                 let length = opened.length();
@@ -311,11 +302,10 @@ fn provider_error(error: FileAccessError) -> RequestError {
     }
 }
 
-/// Creates a provider from a policy and filesystem backend.
+/// Creates a provider from one browser-owned file-access capability.
 pub fn provider(
-    policy: Arc<FileAccessPolicy>,
-    filesystem: Arc<CapFileSystem>,
+    capability: Arc<FileAccessCapability>,
     grants: FileAccessGrantSource,
 ) -> Arc<dyn FileProvider> {
-    Arc::new(BrowserFileProvider::new(policy, filesystem, grants))
+    Arc::new(BrowserFileProvider::new(capability, grants))
 }

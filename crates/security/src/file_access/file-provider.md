@@ -10,11 +10,15 @@ depend on `net`.
 
 ### Authorization and composition
 
-- `FileAccessPolicy` is default-deny and canonicalizes configured roots.
-- `FileAccessPolicy::open_authorized_file` requires a grant issued by that
-  policy, a `file:` target origin, and a top-level navigation request before it
-  canonicalizes or opens a path. The opaque grant binds authorization to one
-  policy and therefore to its browser sandbox/container capability.
+- `FileAccessCapability` is the security crate's trusted browser/platform
+  composition boundary. It creates the default-deny policy and directory
+  capabilities from the same approved roots, so request code cannot combine a
+  policy for one root set with filesystem handles for another.
+- `FileAccessCapability::open_authorized_file` requires a grant issued by that
+  capability, a `file:` target origin, and a top-level navigation request
+  before it canonicalizes or opens a path. The opaque grant binds
+  authorization to one capability and therefore to its browser
+  sandbox/container capability.
 - `FileRequestContext` carries the initiating origin, requested origin,
   and navigation/subresource kind. The initiating origin is preserved for the
   later file-document origin policy; the current policy denies subresource
@@ -46,14 +50,19 @@ depend on `net`.
   that retained handle rather than reopening the authorized pathname.
 - Root containment uses path components, so similarly named sibling roots are
   distinct. Canonicalization rejects traversal and symlink escapes.
+- Directory capabilities retain the root handle selected at configuration time.
+  On platforms that permit a configured root pathname to be replaced, later
+  requests continue to read from that retained root rather than a replacement
+  pathname. A hard link named inside an allowed root is an allowed entry; path
+  containment does not attempt inode-provenance checks.
 - The current backend exposes no media type, so responses include
   `Content-Length` but no `Content-Type`. The adapter will include a media type
   only when a future backend supplies a valid header value.
 - Tests cover regular files, denied siblings, directories, retained handles
-  after Unix pathname replacement, Unix symlink escapes, and Windows junction
-  escapes. A denied request for a missing path is also verified to return
-  `AccessDenied` before path canonicalization can reveal that the path is
-  missing.
+  after Unix pathname and root replacement, Unix hard links and symlink
+  escapes, and Windows junction escapes. A denied request for a missing path
+  is also verified to return `AccessDenied` before path canonicalization can
+  reveal that the path is missing.
 
 ### Provider response and body lifecycle
 
@@ -132,12 +141,12 @@ unrelated scheme providers.
 The following issues remain before treating the provider as a complete browser
 capability:
 
-1. **Keep root configuration inside trusted browser code.** `FileAccessPolicy::new`
-   and `CapFileSystem::new` accept arbitrary filesystem paths and therefore
-   represent a powerful ambient capability. Ensure renderers and other
-   untrusted callers cannot configure allowed roots; expose only a trusted
-   browser/platform composition path, preferably backed by user-selected
-   handles or an equivalent narrow capability.
+1. **Keep root configuration inside trusted browser code.** `FileAccessCapability`
+   is now the only public composition path and creates policy and filesystem
+   state together. Wire its `from_trusted_roots` call to user-selected handles
+   or an equivalent narrow platform capability before enabling local-file UI;
+   renderers and request-construction code must never receive source roots or
+   the capability itself.
 2. **Define file-document origin and subresource semantics before enabling
    subresources.** The current top-level-navigation-only rule is fail-closed,
    but the initiating origin is not yet used to decide access. Specify file
@@ -146,12 +155,13 @@ capability:
    allowing scripts, workers, stylesheets, or other subresources to read local
    files.
 3. **Complete platform containment hardening.** Authorization canonicalizes a
-   path before the capability backend opens its relative path. Preserve the
+   path before the capability backend opens its relative path. The Unix
+   root-replacement and hard-link cases are covered, as are Windows
+   drive-letter, UNC, and junction component cases. Preserve the
    single-open/retained-handle invariant and add conformance tests for Unix
-   mount changes and hard links, Windows reparse-point variants, drive-letter
-   and UNC paths, network shares, removable media, and races involving root
-   replacement. Any fallback must fail closed rather than re-authorizing and
-   reopening a pathname.
+   mount changes, Windows reparse-point variants, network shares, removable
+   media, and any remaining root-replacement races. Any fallback must fail
+   closed rather than re-authorizing and reopening a pathname.
 4. **Add file resource limits.** Define and enforce maximum file size, read
    duration, total bytes served, and aggregate blocking-reader/channel memory.
    The current four-reader semaphore and bounded channel limit concurrency and
@@ -167,6 +177,28 @@ capability:
    completion, failure, abort, or drop. Specify behavior for tab/document
    close, navigation, process shutdown, user-grant expiry, and audit logging;
    add tests for each lifecycle transition.
+7. **Bind navigation authorization to trusted browser state.** The provider
+   currently maps the public `RequestMode::Navigate` value directly to
+   `FileRequestKind::Navigation`. Because request construction can set that
+   value, a caller that can reach the controller may be able to turn an
+   ordinary file request into an apparently top-level navigation and bypass
+   the subresource restriction. Require a browser-issued navigation context or
+   equivalent capability rather than trusting the request mode alone, and add
+   a regression test proving that a caller-controlled mode cannot authorize
+   local-file access.
+8. **Bound pending provider work and make permit acquisition cancellable.**
+   The four-reader semaphore limits active readers, but requests waiting for a
+   permit are not bounded and the wait does not observe the request abort
+   signal. A caller can therefore accumulate abandoned pending requests and
+   delay cancellation while active readers remain occupied. Add a bounded
+   pending-request policy and cancellation-aware permit acquisition, with
+   tests for aborts before a permit is available and for queue exhaustion.
+9. **Normalize pre-authorization path errors.** URL-to-filesystem-path
+   conversion currently occurs before grant and request-context authorization,
+   allowing unauthorized callers to distinguish malformed file URLs from
+   ordinary denied requests. Perform authorization before filesystem path
+   conversion where possible, or map all such pre-authorization failures to a
+   uniform access-denied result; add a regression test for the error behavior.
 
 ## Recommended order
 

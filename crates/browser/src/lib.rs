@@ -8,7 +8,7 @@ use std::sync::Arc;
 use html::Query;
 use js::{JsResult, Realm, Value};
 use net::{Request, RequestController, SchemeProviders};
-use security::file_access::{CapFileSystem, FileAccessPolicy};
+use security::file_access::{FileAccessCapability, FileAccessError};
 use webapis::{ConsoleSink, register_fetch, register_print};
 
 pub mod byui_provider;
@@ -18,24 +18,35 @@ pub mod file_provider;
 /// Explicit configuration for the browser's local-file capability.
 #[derive(Clone)]
 pub struct FileAccessConfiguration {
-    policy: Arc<FileAccessPolicy>,
-    filesystem: Arc<CapFileSystem>,
+    capability: Arc<FileAccessCapability>,
     grants: file_provider::FileAccessGrantSource,
 }
 
 impl FileAccessConfiguration {
-    /// Creates a local-file configuration backed by a policy-issued,
-    /// shared, revocable grant source.
-    pub fn with_grant_source(
-        policy: Arc<FileAccessPolicy>,
-        filesystem: Arc<CapFileSystem>,
-        grants: file_provider::FileAccessGrantSource,
-    ) -> Self {
-        Self {
-            policy,
-            filesystem,
-            grants,
-        }
+    /// Creates a local-file configuration from roots approved by trusted
+    /// browser or platform code.
+    ///
+    /// This is the browser's filesystem-capability boundary. Callers must use
+    /// user-selected paths or an equivalent trusted embedder decision, never a
+    /// path supplied by web content. The resulting policy and directory
+    /// capabilities are created together and cannot be mixed with another
+    /// root set.
+    pub fn from_trusted_roots(
+        allowed_roots: impl IntoIterator<Item = std::path::PathBuf>,
+    ) -> Result<Self, FileAccessError> {
+        let capability = Arc::new(FileAccessCapability::from_trusted_roots(allowed_roots)?);
+        let grants = file_provider::FileAccessGrantSource::new(capability.issue_grant());
+        Ok(Self { capability, grants })
+    }
+
+    /// Returns the browser-owned grant source for this configuration.
+    ///
+    /// The browser or platform owner may revoke this source when its
+    /// user-approved permission expires. Revocation denies future opens while
+    /// an already-open body retains its file handle until it is finished,
+    /// aborted, or dropped.
+    pub fn grant_source(&self) -> file_provider::FileAccessGrantSource {
+        self.grants.clone()
     }
 }
 
@@ -51,8 +62,7 @@ pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<R
     let mut providers = SchemeProviders::new().with_page(byui_provider::provider());
     if let Some(file_access) = file_access {
         providers = providers.with_file(file_provider::provider(
-            file_access.policy,
-            file_access.filesystem,
+            file_access.capability,
             file_access.grants,
         ));
     }

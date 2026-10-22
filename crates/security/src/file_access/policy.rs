@@ -43,7 +43,7 @@ impl AuthorizedPath {
 
 /// Default-deny policy for browser-authorized local files.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FileAccessPolicy {
+pub(crate) struct FileAccessPolicy {
     allowed_roots: Vec<PathBuf>,
     policy_id: u64,
 }
@@ -63,7 +63,9 @@ impl FileAccessPolicy {
     ///
     /// Roots are canonicalized when the policy is created. An empty root list
     /// denies every request.
-    pub fn new(allowed_roots: impl IntoIterator<Item = PathBuf>) -> Result<Self, FileAccessError> {
+    pub(crate) fn new(
+        allowed_roots: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Self, FileAccessError> {
         let allowed_roots = allowed_roots
             .into_iter()
             .map(|root| fs::canonicalize(root).map_err(FileAccessError::from))
@@ -79,7 +81,7 @@ impl FileAccessPolicy {
     /// The caller that receives this grant is the trusted browser/embedder
     /// boundary. It must retain the grant in browser-owned state and must not
     /// expose it to web-content or request-construction code.
-    pub fn issue_grant(&self) -> FileAccessGrant {
+    pub(crate) fn issue_grant(&self) -> FileAccessGrant {
         FileAccessGrant::new(self.policy_id)
     }
 
@@ -147,7 +149,7 @@ impl FileAccessPolicy {
     /// access. The returned [`OpenedFile`] owns the handle that callers must
     /// use for subsequent reads. This prevents callers from authorizing one
     /// pathname and later reopening that pathname for its contents.
-    pub fn open_authorized_file(
+    pub(crate) fn open_authorized_file(
         &self,
         context: &FileRequestContext,
         grant: &FileAccessGrant,
