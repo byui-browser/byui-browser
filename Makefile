@@ -18,23 +18,23 @@ build:
 ## Run the native shell for the current operating system.
 run:
 ifeq ($(OS),Windows_NT)
-	$(error Windows shell is not implemented yet)
+	cargo run -p byui-browser-windows
 else ifneq (,$(filter Darwin darwin,$(shell uname -s)))
 	cargo run -p browser-macos
 else ifneq (,$(filter Linux linux,$(shell uname -s)))
-	$(error Linux shell is not implemented yet)
+	cargo run -p browser-linux
 else ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(shell uname -s)))
-	$(error Windows shell is not implemented yet)
+	cargo run -p byui-browser-windows
 else
 	$(error Unsupported operating system '$(shell uname -s)')
 endif
 
-## Run all workspace tests, or `make test <crate_name>` for one crate.
+## Run all workspace tests, or `make test <crate_name>...` for specific crates.
 test:
 ifeq ($(strip $(ARGS)),)
 	cargo test --workspace
 else
-	cargo test -p $(ARGS)
+	cargo test $(foreach crate,$(ARGS),-p $(crate))
 endif
 
 ## Release-build the browser for a platform: `make release <macos|linux|windows>`.

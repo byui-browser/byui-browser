@@ -1,0 +1,10 @@
+# Single source of truth for the toolchain, used by local dev and CI alike.
+#
+# `rust-version` in Cargo.toml (1.85) is the hard floor; this file keeps everyone
+# on the same channel and guarantees the components `make lint` needs are present.
+# Pin an exact version here (e.g. channel = "1.98.0") when the project wants
+# reproducible builds across the whole cohort.
+
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

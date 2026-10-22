@@ -8,8 +8,9 @@
 
 use std::sync::Arc;
 
-use js::Realm;
-use webapis::{ConsoleSink, register_fetch, register_print};
+use browser::evaluate_page_scripts;
+use rfd::{MessageButtons, MessageDialog, MessageLevel};
+use webapis::{AlertSink, ConsoleSink};
 
 struct StdoutConsole;
 
@@ -19,19 +20,35 @@ impl ConsoleSink for StdoutConsole {
     }
 }
 
+/// Native modal alert adapter for the standalone browser composition binary.
+struct NativeAlert;
+
+impl AlertSink for NativeAlert {
+    fn alert(&self, message: &str) {
+        MessageDialog::new()
+            .set_title("BYUI Browser")
+            .set_description(message)
+            .set_level(MessageLevel::Info)
+            .set_buttons(MessageButtons::Ok)
+            .show();
+    }
+}
+
 fn main() {
     // Keep the standalone binary useful while native platform shells are
     // brought online. `make run` selects the platform shell below.
-    let mut realm = Realm::new();
-    register_print(&mut realm, Arc::new(StdoutConsole))
-        .expect("registering built-in Web APIs should succeed");
+    let providers = net::SchemeProviders::new().with_page(browser::byui_provider::provider());
     let controller = Arc::new(
-        net::RequestController::new(net::Config::default())
+        net::RequestController::builder(net::Config::default())
+            .with_scheme_providers(providers)
+            .build()
             .expect("network client should initialize"),
     );
-    register_fetch(&mut realm, controller).expect("registering the fetch Web API should succeed");
-
-    realm
-        .evaluate_script("print()")
-        .expect("the built-in print function should be callable");
+    evaluate_page_scripts(
+        "<script>print()</script>",
+        Arc::new(StdoutConsole),
+        Arc::new(NativeAlert),
+        controller,
+    )
+    .expect("page scripts should evaluate");
 }

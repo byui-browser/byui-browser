@@ -33,6 +33,8 @@ crate ownership, and collaboration rules. Team overviews live in
 └── docs/
     ├── TECH_ARCHITECTURE.md
     ├── TEAMS.md
+    ├── CI.md
+    ├── PLATFORM_TESTING.md
     └── adr/             # Architecture Decision Records
 ```
 
@@ -62,10 +64,10 @@ The binary entry point:
 cargo run -p browser
 ```
 
-`make run` selects the platform shell automatically. The macOS shell currently
-renders the startup HTML page, parses its CSS, and executes its JavaScript
-startup script. Linux and Windows shells are not implemented yet, so the
-command reports that limitation instead of running the wrong binary.
+`make run` selects the platform shell automatically. The macOS, Linux, and
+Windows shells currently render the startup HTML page, parse its CSS, and
+execute its JavaScript startup script; see [`platforms/`](platforms/README.md)
+for what each shell needs.
 
 ## Development workflow
 
@@ -74,6 +76,7 @@ command reports that limitation instead of running the wrong binary.
 - Before merge: `make lint` and `make test` (or `make test <crate>` for changed crates)
 - Cross-crate / `common` changes need review from affected owning teams
 - Record architecture decisions in [`docs/adr/`](docs/adr/)
+- See [`docs/CI.md`](docs/CI.md) for pull-request checks and local equivalents.
 
 ## Status
 
