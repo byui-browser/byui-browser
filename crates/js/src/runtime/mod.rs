@@ -37,11 +37,10 @@ use crate::ast::{
 };
 use crate::stack::{StackGuard, with_engine_stack};
 use crate::{HostFunction, JsError, JsResult, Value};
-pub(crate) use conversions::number_to_string;
 use conversions::{
-    is_truthy, less_than, loose_equals, strict_equals, to_int32, to_number, to_primitive,
-    to_property_key, to_uint32,
+    is_truthy, less_than, loose_equals, strict_equals, to_int32, to_number, to_primitive, to_uint32,
 };
+pub(crate) use conversions::{number_to_string, to_property_key};
 pub use object::Object;
 
 const STACK_OVERFLOW: &str = "Maximum call stack size exceeded";
@@ -824,7 +823,7 @@ fn describe(expression: &Expr) -> Option<String> {
 }
 
 /// The error for reading or setting property `key` of a non-object value.
-fn non_object(value: &Value, action: &str, key: &str, context: &str) -> JsError {
+pub(crate) fn non_object(value: &Value, action: &str, key: &str, context: &str) -> JsError {
     let kind = match value {
         Value::Undefined => "undefined",
         Value::Null => "null",
