@@ -8,6 +8,12 @@ pub struct Node {
     pub span: Option<SourceSpan>,
 }
 
+impl Default for Node {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Node {
     pub fn new() -> Self {
         Self {
@@ -18,7 +24,7 @@ impl Node {
         }
     }
 
-    pub fn append_child(node: Node) {}
+    pub fn append_child(_node: Node) {}
 
     pub fn remove() {}
 }
