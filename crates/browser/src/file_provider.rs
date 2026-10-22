@@ -22,6 +22,9 @@ use security::file_access::{
 };
 use tokio::sync::{Semaphore, mpsc};
 
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+
 pub use security::file_access::FileAccessGrant;
 
 const FILE_READ_CHUNK_SIZE: usize = 64 * 1024;
@@ -196,6 +199,8 @@ pub(crate) struct BrowserFileProvider {
     grants: FileAccessGrantSource,
     navigation_authorizations: Arc<FileNavigationAuthorizations>,
     read_admission: FileReadAdmission,
+    #[cfg(test)]
+    post_setup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl BrowserFileProvider {
@@ -213,6 +218,8 @@ impl BrowserFileProvider {
                 MAX_CONCURRENT_FILE_READS,
                 MAX_PENDING_FILE_READS,
             ),
+            #[cfg(test)]
+            post_setup_hook: None,
         }
     }
 }
@@ -229,6 +236,8 @@ impl FileProvider for BrowserFileProvider {
         let mut cancellation = CancellationGuard::new(Arc::clone(&cancelled));
         let signal = request.signal().clone();
         let preparation_cancelled = Arc::clone(&cancelled);
+        #[cfg(test)]
+        let post_setup_hook = self.post_setup_hook.clone();
 
         Box::pin(async move {
             let grant = grants
@@ -259,6 +268,14 @@ impl FileProvider for BrowserFileProvider {
                 Ok((opened, length, media_type))
             });
             let (opened, length, media_type) = task.await.map_err(|_| provider_io_error())??;
+
+            #[cfg(test)]
+            if let Some(hook) = post_setup_hook {
+                hook();
+            }
+            if signal.is_aborted() {
+                return Err(RequestError::Aborted);
+            }
 
             let length =
                 HeaderValue::from_str(&length.to_string()).map_err(|_| RequestError::Provider {
@@ -458,6 +475,12 @@ pub(crate) fn provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    use cap_std::{ambient_authority, fs::Dir};
+    use security::file_access::TrustedFileAccessRoot;
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn file_read_admission_rejects_excess_waiters_and_cancels_queued_work() {
@@ -484,5 +507,80 @@ mod tests {
             abort.abort();
             assert!(matches!(waiting.await.unwrap(), Err(RequestError::Aborted)));
         });
+    }
+
+    #[test]
+    fn abort_after_file_setup_rejects_get_and_head_and_releases_admission() {
+        let directory = std::env::temp_dir().join(format!(
+            "byui-browser-post-setup-abort-{}-{}",
+            std::process::id(),
+            NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        let file = directory.join("page.html");
+        fs::write(&file, b"prepared content").unwrap();
+        let canonical_directory = fs::canonicalize(&directory).unwrap();
+        let root = TrustedFileAccessRoot::from_open_directory(
+            canonical_directory,
+            Dir::open_ambient_dir(&directory, ambient_authority()).unwrap(),
+        )
+        .unwrap();
+        let capability = Arc::new(FileAccessCapability::from_trusted_roots([root]).unwrap());
+        let navigation_authorizations = Arc::new(FileNavigationAuthorizations::new());
+        let grants = FileAccessGrantSource::new(
+            capability.issue_grant(),
+            Arc::clone(&navigation_authorizations),
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let url = Url::from_file_path(&file).unwrap();
+
+        for method in [net::Method::GET, net::Method::HEAD] {
+            let abort = net::AbortController::new();
+            let hook_abort = abort.clone();
+            let mut provider = BrowserFileProvider::new(
+                Arc::clone(&capability),
+                grants.clone(),
+                Arc::clone(&navigation_authorizations),
+            );
+            provider.post_setup_hook = Some(Arc::new(move || hook_abort.abort()));
+            let mut request = Request::get(url.clone());
+            request.set_method(method).unwrap();
+            request.set_mode(net::RequestMode::Navigate).unwrap();
+            request.set_signal(abort.signal());
+            navigation_authorizations.authorize(request.id()).unwrap();
+
+            assert!(matches!(
+                runtime.block_on(provider.open(&request, &url)),
+                Err(RequestError::Aborted)
+            ));
+            assert_eq!(
+                provider.read_admission.active.available_permits(),
+                MAX_CONCURRENT_FILE_READS
+            );
+            assert_eq!(
+                provider.read_admission.pending.available_permits(),
+                MAX_PENDING_FILE_READS
+            );
+
+            let probe = BrowserFileProvider {
+                capability: Arc::clone(&provider.capability),
+                grants: provider.grants.clone(),
+                navigation_authorizations: Arc::clone(&provider.navigation_authorizations),
+                read_admission: provider.read_admission.clone(),
+                post_setup_hook: None,
+            };
+            let mut probe_request = Request::get(url.clone());
+            probe_request.set_method(net::Method::HEAD).unwrap();
+            probe_request.set_mode(net::RequestMode::Navigate).unwrap();
+            navigation_authorizations
+                .authorize(probe_request.id())
+                .unwrap();
+            let response = runtime.block_on(probe.open(&probe_request, &url)).unwrap();
+            assert!(matches!(response.body, SchemeBody::Null));
+        }
+
+        drop(runtime);
+        drop(capability);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

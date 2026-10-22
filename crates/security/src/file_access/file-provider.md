@@ -20,7 +20,8 @@ root-replacement race.
 Authorized `GET` requests stream 64 KiB chunks through a bounded channel;
 `HEAD` performs authorization and metadata lookup without starting a reader.
 Four readers and eight pending opens are admitted, and cancellation releases
-provider resources. The provider avoids HTTP transport, cookies, service
+provider resources, including when cancellation arrives during response
+preparation. The provider avoids HTTP transport, cookies, service
 workers, and the HTTP cache, and exposes stable non-diagnostic error
 categories. Browser and security tests cover the implemented authorization,
 containment, streaming, cancellation, revocation, and failure behavior.
@@ -72,10 +73,6 @@ files, while preserving fail-closed behavior.
 - Define content consistency for mutable opened files. Retaining a handle
   prevents pathname replacement, but not in-place writes, truncation, or other
   mutations while streaming. Add detection or document the supported guarantee.
-- Handle aborts during response preparation. The blocking setup task checks
-  cancellation before opening, but not after opening and metadata lookup, so an
-  abort can still produce a successful response, especially for `HEAD`. Add
-  post-setup checks and tests for aborts during open and metadata lookup.
 - Add regression tests for unread and partially read body drops, worker-side
   read failures, full-channel backpressure, and the four-reader concurrency
   limit.
