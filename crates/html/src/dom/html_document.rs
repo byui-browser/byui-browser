@@ -136,6 +136,7 @@ impl HTMLDocument {
             }
             NodeKind::Text(text) | NodeKind::Comment(text) => Some(text.clone()),
             NodeKind::Document | NodeKind::Doctype { .. } => None,
+            NodeKind::None => None,
         }
     }
 
