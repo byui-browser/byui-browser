@@ -1,0 +1,9 @@
+Document
+  Doctype { name: Some("html"), public_id: None, system_id: None }
+  Element(ElementData { name: "html", namespace: Html, attributes: [] })
+    Element(ElementData { name: "head", namespace: Html, attributes: [] })
+      Element(ElementData { name: "title", namespace: Html, attributes: [] })
+        Text("T")
+    Element(ElementData { name: "body", namespace: Html, attributes: [] })
+      Element(ElementData { name: "h1", namespace: Html, attributes: [] })
+        Text("Hi")

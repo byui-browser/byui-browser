@@ -1,0 +1,4 @@
+NodeId(1) <html>: []
+NodeId(2) <body>: [color: navy; margin: 8px]
+NodeId(3) <div>: [color: navy]
+NodeId(4) <span>: [color: navy]

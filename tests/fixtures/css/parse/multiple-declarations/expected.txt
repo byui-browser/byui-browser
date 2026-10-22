@@ -1,0 +1,21 @@
+Stylesheet {
+    rules: [
+        Rule {
+            selector: Selector(
+                "p.note",
+            ),
+            declarations: [
+                Declaration {
+                    property: "margin",
+                    value: "0",
+                },
+                Declaration {
+                    property: "font-size",
+                    value: "14px",
+                },
+            ],
+        },
+    ],
+    at_rules: [],
+    errors: [],
+}

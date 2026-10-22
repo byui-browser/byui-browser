@@ -1,0 +1,18 @@
+[package]
+name = "fixture-runner"
+description = "Runs the shared team fixtures under tests/fixtures"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+css = { workspace = true }
+html = { workspace = true }
+js = { workspace = true }
+net = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

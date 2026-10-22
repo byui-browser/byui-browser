@@ -1,0 +1,7 @@
+status: 200 "OK"
+redirected: false
+header: content-type: text/html
+header: x-fixture: yes
+header: content-length: 9
+body: 9 bytes
+<p>ok</p>

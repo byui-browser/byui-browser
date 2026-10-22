@@ -1,7 +1,7 @@
 use html::{Attribute, ElementData, HTMLDocument, Namespace, NodeKind, Query, parse_raw_html};
 
-const SIMPLE_HTML: &str = include_str!("../../../tests/html/simple.html");
-const VALID_HTML: &str = include_str!("../../../tests/html/valid.html");
+const SIMPLE_HTML: &str = include_str!("../../../tests/fixtures/html/simple-document/input.html");
+const VALID_HTML: &str = include_str!("../../../tests/fixtures/html/valid-document/input.html");
 
 #[test]
 fn arena_document_starts_with_a_document_root() {

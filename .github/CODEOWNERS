@@ -47,3 +47,7 @@
 # Architecture docs
 /docs/TECH_ARCHITECTURE.md             @byui-browser/byui-browser-scrum-of-scrums @byui-browser/byui-browser-html @byui-browser/byui-browser-css @byui-browser/byui-browser-layout-rendering @byui-browser/byui-browser-js-engine @byui-browser/byui-browser-webapis @byui-browser/byui-browser-networking @byui-browser/byui-browser-security-storage @byui-browser/byui-browser-browser-ux @byui-browser/byui-browser-devtools
 /docs/adr/                             @byui-browser/byui-browser-scrum-of-scrums @byui-browser/byui-browser-html @byui-browser/byui-browser-css @byui-browser/byui-browser-layout-rendering @byui-browser/byui-browser-js-engine @byui-browser/byui-browser-webapis @byui-browser/byui-browser-networking @byui-browser/byui-browser-security-storage @byui-browser/byui-browser-browser-ux @byui-browser/byui-browser-devtools
+/tests/fixtures/html/                  @byui-browser/byui-browser-scrum-of-scrums @byui-browser/byui-browser-html
+/tests/fixtures/css/                   @byui-browser/byui-browser-scrum-of-scrums @byui-browser/byui-browser-css
+/tests/fixtures/js/                    @byui-browser/byui-browser-scrum-of-scrums @byui-browser/byui-browser-js-engine
+/tests/fixtures/net/                   @byui-browser/byui-browser-scrum-of-scrums @byui-browser/byui-browser-networking

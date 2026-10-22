@@ -1,0 +1,27 @@
+Stylesheet {
+    rules: [],
+    at_rules: [
+        AtRule {
+            name: "media",
+            prelude: "(max-width: 600px)",
+            rules: [
+                Rule {
+                    selector: Selector(
+                        "body",
+                    ),
+                    declarations: [
+                        Declaration {
+                            property: "color",
+                            value: "blue",
+                        },
+                    ],
+                },
+            ],
+            declarations: [],
+            block: Some(
+                "\n  body { color: blue; }\n",
+            ),
+        },
+    ],
+    errors: [],
+}

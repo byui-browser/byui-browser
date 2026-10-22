@@ -1,0 +1,15 @@
+Document
+  Doctype { name: Some("html"), public_id: None, system_id: None }
+  Element(ElementData { name: "html", namespace: Html, attributes: [Attribute { name: "lang", value: "en" }] })
+    Element(ElementData { name: "head", namespace: Html, attributes: [] })
+      Text("\n    ")
+      Element(ElementData { name: "meta", namespace: Html, attributes: [Attribute { name: "charset", value: "UTF-8" }] })
+      Text("\n    ")
+      Element(ElementData { name: "meta", namespace: Html, attributes: [Attribute { name: "name", value: "viewport" }, Attribute { name: "content", value: "width=device-width, initial-scale=1.0" }] })
+      Text("\n    ")
+      Element(ElementData { name: "title", namespace: Html, attributes: [] })
+        Text("Document")
+      Text("\n")
+    Text("\n")
+    Element(ElementData { name: "body", namespace: Html, attributes: [] })
+      Text("\n    \n\n")

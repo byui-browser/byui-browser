@@ -1,0 +1,8 @@
+Document
+  Doctype { name: Some("html"), public_id: None, system_id: None }
+  Element(ElementData { name: "html", namespace: Html, attributes: [] })
+    Element(ElementData { name: "head", namespace: Html, attributes: [] })
+    Element(ElementData { name: "body", namespace: Html, attributes: [] })
+      Comment(" note ")
+      Element(ElementData { name: "a", namespace: Html, attributes: [Attribute { name: "href", value: "/x" }, Attribute { name: "class", value: "link" }] })
+        Text("Go")

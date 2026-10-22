@@ -1,0 +1,6 @@
+Document
+  Element(ElementData { name: "html", namespace: Html, attributes: [] })
+    Element(ElementData { name: "head", namespace: Html, attributes: [] })
+    Element(ElementData { name: "body", namespace: Html, attributes: [] })
+      Element(ElementData { name: "p", namespace: Html, attributes: [] })
+        Text("Hello")

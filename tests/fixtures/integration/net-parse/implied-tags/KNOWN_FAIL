@@ -1,0 +1,1 @@
+Parser does not create the implied html/head/body elements (HTML spec 13.2.6.4).

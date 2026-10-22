@@ -1,0 +1,17 @@
+Stylesheet {
+    rules: [
+        Rule {
+            selector: Selector(
+                "h1",
+            ),
+            declarations: [
+                Declaration {
+                    property: "color",
+                    value: "red",
+                },
+            ],
+        },
+    ],
+    at_rules: [],
+    errors: [],
+}
