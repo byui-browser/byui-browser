@@ -1,11 +1,14 @@
-use html::{Attribute, ElementData, HTMLDocument, Namespace, NodeKind, Query, parse_raw_html};
+use html::{
+    Attribute, ElementData, HtmlDocument, Namespace, NodeKind, Query, Token, parse, parse_raw_html,
+    tokenize,
+};
 
 const SIMPLE_HTML: &str = include_str!("../../../tests/html/simple.html");
 const VALID_HTML: &str = include_str!("../../../tests/html/valid.html");
 
 #[test]
 fn arena_document_starts_with_a_document_root() {
-    let document = HTMLDocument::new();
+    let document = HtmlDocument::new();
     assert_eq!(document.root.0, 0);
     assert!(matches!(
         document.nodes[document.root.0].kind,
@@ -47,7 +50,7 @@ fn create_element_rejects_invalid_names() {
 
 #[test]
 fn arena_nodes_are_connected_with_stable_ids_and_spans() {
-    let mut document = HTMLDocument::new();
+    let mut document = HtmlDocument::new();
     let paragraph = document.push_node(
         NodeKind::Element(ElementData {
             name: "p".into(),
@@ -81,24 +84,12 @@ fn parses_simple_fixture_into_typed_nodes_and_queries() {
     let viewport = document
         .query("meta")
         .into_iter()
-        .find(|node| {
-            matches!(
-                &node.kind,
-                NodeKind::Element(element)
-                    if element.attributes.iter().any(|attribute| {
-                        attribute.name == "name" && attribute.value == "viewport"
-                    })
-            )
-        })
+        .find(|element| element.attributes.get("name") == Some(&"viewport".to_owned()))
         .expect("viewport");
-    assert!(matches!(
-        &viewport.kind,
-        NodeKind::Element(element)
-            if element.attributes.iter().any(|attribute| {
-                attribute.name == "content"
-                    && attribute.value == "width=device-width, initial-scale=1.0"
-            })
-    ));
+    assert_eq!(
+        viewport.attributes.get("content"),
+        Some(&"width=device-width, initial-scale=1.0".to_owned())
+    );
     assert!(document.nodes.iter().any(
         |node| matches!(&node.kind, NodeKind::Doctype { name: Some(name), .. } if name == "html")
     ));
@@ -106,53 +97,39 @@ fn parses_simple_fixture_into_typed_nodes_and_queries() {
 
 #[test]
 fn tokenizes_tags_text_doctypes_and_comments() {
-    let document = parse_raw_html("<!doctype html><!-- note --><p>hi</p>".to_owned());
-    assert!(document.nodes.iter().any(
-        |node| matches!(&node.kind, NodeKind::Doctype { name: Some(name), .. } if name == "html")
-    ));
-    assert!(
-        document
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.kind, NodeKind::Comment(comment) if comment == " note "))
+    assert_eq!(
+        tokenize("<!doctype html><!-- note --><p>hi</p>"),
+        vec![
+            Token::Doctype("html".into()),
+            Token::Comment(" note ".into()),
+            Token::StartTag("p".into()),
+            Token::Text("hi".into()),
+            Token::EndTag("p".into()),
+        ]
     );
-    assert!(
-        document
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.kind, NodeKind::Text(text) if text == "hi"))
-    );
-    assert_eq!(document.query("p").len(), 1);
 }
 
 #[test]
 fn builds_legacy_tree_without_pushing_void_elements() {
-    let document = parse_raw_html("<p>before<br>after</p><p>next</p>".to_owned());
-    let paragraphs = document
+    let dom = parse("<p>before<br>after</p><p>next</p>");
+    let paragraphs = dom
         .nodes
         .iter()
-        .filter(|node| matches!(&node.kind, NodeKind::Element(element) if element.name == "p"))
+        .filter(|node| node.name == "p")
         .collect::<Vec<_>>();
     assert_eq!(paragraphs.len(), 2);
-    assert_eq!(paragraphs[1].parent, Some(document.root));
+    assert_eq!(paragraphs[1].parent, None);
     assert_eq!(
-        document
-            .nodes
-            .iter()
-            .filter(|node| matches!(&node.kind, NodeKind::Text(_)))
-            .count(),
+        dom.nodes.iter().filter(|node| node.name == "#text").count(),
         3
     );
 }
 
 #[test]
 fn malformed_legacy_input_does_not_panic() {
-    assert!(
-        !parse_raw_html("<div><p>unclosed".to_owned())
-            .nodes
-            .is_empty()
-    );
+    assert!(!parse("<div><p>unclosed").nodes.is_empty());
 }
+
 #[test]
 fn valid_fixture_has_expected_arena_shape_and_text() {
     assert_eq!(VALID_HTML.lines().count(), 100);
@@ -311,33 +288,9 @@ fn remove_of_detached_or_root_nodes_is_a_no_op() {
 fn parses_attributes_and_boolean_attributes_as_ordered_values() {
     let document = parse_raw_html("<input disabled class='field' data-count=3>".to_owned());
     let input = document.query("input").pop().expect("input");
-    let NodeKind::Element(element) = &input.kind else {
-        panic!("expected an input element");
-    };
-    assert_eq!(
-        element
-            .attributes
-            .iter()
-            .find(|attribute| attribute.name == "disabled")
-            .map(|attribute| &attribute.value),
-        Some(&String::new())
-    );
-    assert_eq!(
-        element
-            .attributes
-            .iter()
-            .find(|attribute| attribute.name == "class")
-            .map(|attribute| &attribute.value),
-        Some(&"field".to_owned())
-    );
-    assert_eq!(
-        element
-            .attributes
-            .iter()
-            .find(|attribute| attribute.name == "data-count")
-            .map(|attribute| &attribute.value),
-        Some(&"3".to_owned())
-    );
+    assert_eq!(input.attributes.get("disabled"), Some(&String::new()));
+    assert_eq!(input.attributes.get("class"), Some(&"field".to_owned()));
+    assert_eq!(input.attributes.get("data-count"), Some(&"3".to_owned()));
 }
 
 #[test]
@@ -422,6 +375,14 @@ fn handles_unclosed_tags_and_mismatched_closing_tags() {
     let document = parse_raw_html("<div><p>first</div><p>second".to_owned());
     let paragraphs = document.query("p");
     assert_eq!(paragraphs.len(), 2);
+    assert_eq!(
+        document.text_content(html::NodeId(paragraphs[0].id.index() as usize)),
+        "first"
+    );
+    assert_eq!(
+        document.text_content(html::NodeId(paragraphs[1].id.index() as usize)),
+        "second"
+    );
     let first_id = document
         .nodes
         .iter()
@@ -442,6 +403,9 @@ fn handles_unclosed_tags_and_mismatched_closing_tags() {
 fn preserves_void_element_siblings_and_does_not_push_void_nodes() {
     let document = parse_raw_html("<p>before<br>after<img src=x>tail</p>".to_owned());
     let paragraph = document.query("p").pop().expect("paragraph");
+    assert_eq!(
+        document.text_content(html::NodeId(paragraph.id.index() as usize)),
+        "beforeaftertail"
     let paragraph_id = document
         .nodes
         .iter()
@@ -459,12 +423,12 @@ fn preserves_void_element_siblings_and_does_not_push_void_nodes() {
             .copied()
             .find(|id| {
                 matches!(
-                    &document.nodes[id.index()].kind,
+                    &document.nodes[id.index() as usize].kind,
                     NodeKind::Element(element) if element.name == tag
                 )
             })
             .expect("void element child");
-        assert!(document.nodes[node_id.index()].children.is_empty());
+        assert!(document.nodes[node_id.index() as usize].children.is_empty());
     }
 }
 
@@ -475,13 +439,10 @@ fn keeps_incomplete_tag_text_and_unterminated_attribute_values() {
 
     let attributes = parse_raw_html("<input value='unfinished>".to_owned());
     let input = attributes.query("input").pop().expect("input");
-    assert!(matches!(
-        &input.kind,
-        NodeKind::Element(element)
-            if element.attributes.iter().any(|attribute| {
-                attribute.name == "value" && attribute.value == "unfinished"
-            })
-    ));
+    assert_eq!(
+        input.attributes.get("value"),
+        Some(&"unfinished".to_owned())
+    );
 }
 
 #[test]
