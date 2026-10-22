@@ -14,7 +14,7 @@ pub(super) fn to_primitive(value: &Value) -> Value {
 }
 
 /// `ToBoolean`.
-pub(super) fn is_truthy(value: &Value) -> bool {
+pub(crate) fn is_truthy(value: &Value) -> bool {
     match value {
         Value::Undefined | Value::Null => false,
         Value::Boolean(value) => *value,

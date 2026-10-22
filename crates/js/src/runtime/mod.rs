@@ -26,23 +26,19 @@
 
 mod conversions;
 mod object;
+mod operators;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::ast::{
-    BinaryOperator, Expr, LogicalOperator, MemberProperty, Program, Statement, UnaryOperator,
-    VarKind,
-};
+use crate::ast::{Expr, LogicalOperator, MemberProperty, Program, Statement, VarKind};
 use crate::stack::{StackGuard, with_engine_stack};
 use crate::{HostFunction, JsError, JsResult, Value};
-pub(crate) use conversions::number_to_string;
-use conversions::{
-    is_truthy, less_than, loose_equals, strict_equals, to_int32, to_number, to_primitive,
-    to_property_key, to_uint32,
-};
+use conversions::to_property_key;
+pub(crate) use conversions::{is_truthy, number_to_string};
 pub use object::Object;
+pub(crate) use operators::{binary, unary};
 
 const STACK_OVERFLOW: &str = "Maximum call stack size exceeded";
 
@@ -671,11 +667,7 @@ impl Interpreter {
             Expr::Undefined => Ok(Value::Undefined),
             Expr::Unary { operator, operand } => {
                 let value = self.evaluate(operand, scope)?;
-                Ok(match operator {
-                    UnaryOperator::Negate => Value::Number(-to_number(&value)),
-                    UnaryOperator::Not => Value::Boolean(!is_truthy(&value)),
-                    UnaryOperator::BitwiseNot => Value::Number(f64::from(!to_int32(&value))),
-                })
+                Ok(unary(*operator, &value))
             }
             Expr::Binary {
                 left,
@@ -896,42 +888,4 @@ fn hoist_lexical_declarations(
         }
     }
     Ok(())
-}
-
-fn binary(operator: BinaryOperator, left: &Value, right: &Value) -> Value {
-    let number = |operation: fn(f64, f64) -> f64| {
-        Value::Number(operation(to_number(left), to_number(right)))
-    };
-    let int32 = |operation: fn(i32, i32) -> i32| {
-        Value::Number(f64::from(operation(to_int32(left), to_int32(right))))
-    };
-    let shift = to_uint32(right) & 31;
-    match operator {
-        BinaryOperator::Add => {
-            let (left, right) = (to_primitive(left), to_primitive(right));
-            if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
-                Value::String(format!("{left}{right}"))
-            } else {
-                Value::Number(to_number(&left) + to_number(&right))
-            }
-        }
-        BinaryOperator::Subtract => number(|left, right| left - right),
-        BinaryOperator::Multiply => number(|left, right| left * right),
-        BinaryOperator::Divide => number(|left, right| left / right),
-        BinaryOperator::Remainder => number(|left, right| left % right),
-        BinaryOperator::BitwiseAnd => int32(|left, right| left & right),
-        BinaryOperator::BitwiseOr => int32(|left, right| left | right),
-        BinaryOperator::BitwiseXor => int32(|left, right| left ^ right),
-        BinaryOperator::LeftShift => Value::Number(f64::from(to_int32(left).wrapping_shl(shift))),
-        BinaryOperator::SignedRightShift => Value::Number(f64::from(to_int32(left) >> shift)),
-        BinaryOperator::UnsignedRightShift => Value::Number(f64::from(to_uint32(left) >> shift)),
-        BinaryOperator::Less => Value::Boolean(less_than(left, right) == Some(true)),
-        BinaryOperator::Greater => Value::Boolean(less_than(right, left) == Some(true)),
-        BinaryOperator::LessEqual => Value::Boolean(less_than(right, left) == Some(false)),
-        BinaryOperator::GreaterEqual => Value::Boolean(less_than(left, right) == Some(false)),
-        BinaryOperator::Equal => Value::Boolean(loose_equals(left, right)),
-        BinaryOperator::NotEqual => Value::Boolean(!loose_equals(left, right)),
-        BinaryOperator::StrictEqual => Value::Boolean(strict_equals(left, right)),
-        BinaryOperator::StrictNotEqual => Value::Boolean(!strict_equals(left, right)),
-    }
 }
