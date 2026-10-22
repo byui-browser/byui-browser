@@ -398,4 +398,25 @@ mod tests {
         assert_eq!(cookies[0].name, "session");
         assert_eq!(cookies[0].value, "abc123");
     }
+
+    #[test]
+    fn does_not_return_cookie_for_different_origin() {
+        let site = origin("https", "byui.edu", 443);
+        let other_site = origin("https", "example.com", 443);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "abc123".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        let cookies = jar.cookies_for(&other_site);
+
+        assert!(cookies.is_empty());
+    }
 }
