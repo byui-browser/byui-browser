@@ -478,6 +478,7 @@ mod tests {
     use std::fs;
 
     use cap_std::{ambient_authority, fs::Dir};
+    use futures_util::StreamExt;
     use security::file_access::TrustedFileAccessRoot;
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -582,5 +583,74 @@ mod tests {
         drop(runtime);
         drop(capability);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dropping_unread_or_partially_read_body_releases_reader_admission() {
+        let directory = std::env::temp_dir().join(format!(
+            "byui-browser-body-drop-{}-{}",
+            std::process::id(),
+            NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        let file = directory.join("page.html");
+        fs::write(&file, vec![b'x'; FILE_READ_CHUNK_SIZE * 4]).unwrap();
+        let canonical_directory = fs::canonicalize(&directory).unwrap();
+        let root = TrustedFileAccessRoot::from_open_directory(
+            canonical_directory,
+            Dir::open_ambient_dir(&directory, ambient_authority()).unwrap(),
+        )
+        .unwrap();
+        let capability = Arc::new(FileAccessCapability::from_trusted_roots([root]).unwrap());
+        let navigation_authorizations = Arc::new(FileNavigationAuthorizations::new());
+        let grants = FileAccessGrantSource::new(
+            capability.issue_grant(),
+            Arc::clone(&navigation_authorizations),
+        );
+        let provider = BrowserFileProvider::new(
+            Arc::clone(&capability),
+            grants,
+            Arc::clone(&navigation_authorizations),
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let url = Url::from_file_path(&file).unwrap();
+
+        for read_first_chunk in [false, true] {
+            let mut request = Request::get(url.clone());
+            request.set_mode(net::RequestMode::Navigate).unwrap();
+            navigation_authorizations.authorize(request.id()).unwrap();
+            let resource = runtime.block_on(provider.open(&request, &url)).unwrap();
+            let SchemeBody::Stream(mut body) = resource.body else {
+                panic!("GET requests should receive a live file body");
+            };
+
+            if read_first_chunk {
+                let chunk = runtime.block_on(body.next()).unwrap().unwrap();
+                assert!(!chunk.is_empty());
+            }
+            drop(body);
+
+            runtime.block_on(wait_for_readers_to_finish(&provider.read_admission));
+            assert_eq!(
+                provider.read_admission.active.available_permits(),
+                MAX_CONCURRENT_FILE_READS
+            );
+        }
+
+        drop(runtime);
+        drop(provider);
+        drop(capability);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    async fn wait_for_readers_to_finish(admission: &FileReadAdmission) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while admission.active.available_permits() != MAX_CONCURRENT_FILE_READS {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dropped body should release its file-reader permit"
+            );
+            tokio::task::yield_now().await;
+        }
     }
 }

@@ -24,7 +24,8 @@ provider resources, including when cancellation arrives during response
 preparation. The provider avoids HTTP transport, cookies, service
 workers, and the HTTP cache, and exposes stable non-diagnostic error
 categories. Browser and security tests cover the implemented authorization,
-containment, streaming, cancellation, revocation, and failure behavior.
+containment, streaming, cancellation, unread and partially read body drops,
+revocation, and failure behavior.
 
 ## Remaining work
 
@@ -73,9 +74,8 @@ files, while preserving fail-closed behavior.
 - Define content consistency for mutable opened files. Retaining a handle
   prevents pathname replacement, but not in-place writes, truncation, or other
   mutations while streaming. Add detection or document the supported guarantee.
-- Add regression tests for unread and partially read body drops, worker-side
-  read failures, full-channel backpressure, and the four-reader concurrency
-  limit.
+- Add regression tests for worker-side read failures, full-channel
+  backpressure, and the four-reader concurrency limit.
 
 ### Platform hardening and capability construction
 
