@@ -9,12 +9,16 @@ rust-version.workspace = true
 
 [dependencies]
 browser = { path = "../../crates/browser" }
+net = { workspace = true }
+webapis = { workspace = true }
+chrome = { workspace = true }
 css = { workspace = true }
 html = { workspace = true }
 js = { workspace = true }
 layout = { workspace = true }
 paint = { workspace = true }
 render = { workspace = true }
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
 # Anti-aliased chrome drawing and system-font text for the toolbar.
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 ab_glyph = "0.2"

@@ -29,6 +29,7 @@ storage = { workspace = true }
 security = { workspace = true }
 chrome = { workspace = true }
 devtools = { workspace = true }
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
 
 [lints]
 workspace = true
