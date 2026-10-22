@@ -71,10 +71,11 @@ fn suffix(
 }
 
 /// Parses the name after `.`. Like JavaScript's `IdentifierName`, keywords
-/// are allowed, so `object.if` and `object.null` are ordinary properties.
+/// are allowed, so `object.if` and `object.null` are ordinary properties, and
+/// so are escaped keywords such as `object.\u0069f`.
 fn property_name(parser: &mut Parser<'_>) -> ParseResult<String> {
     let name = match parser.peek() {
-        Some(Token::Identifier(name)) => name.as_str(),
+        Some(Token::Identifier(name) | Token::EscapedKeyword(name)) => name.as_str(),
         Some(Token::Let) => "let",
         Some(Token::Var) => "var",
         Some(Token::Const) => "const",
