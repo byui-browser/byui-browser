@@ -196,7 +196,7 @@ fn next_capability_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        fs, io,
         path::PathBuf,
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -242,6 +242,32 @@ mod tests {
         ));
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_access_errors_have_stable_messages_and_io_mappings() {
+        for (error, message) in [
+            (FileAccessError::Missing, "file is missing"),
+            (FileAccessError::Denied, "file access was denied"),
+            (FileAccessError::InvalidPath, "file path is invalid"),
+            (FileAccessError::UnsupportedFile, "file type is unsupported"),
+            (FileAccessError::Io, "file I/O failed"),
+        ] {
+            assert_eq!(error.to_string(), message);
+        }
+
+        assert_eq!(
+            FileAccessError::from(io::Error::from(io::ErrorKind::NotFound)),
+            FileAccessError::Missing
+        );
+        assert_eq!(
+            FileAccessError::from(io::Error::from(io::ErrorKind::PermissionDenied)),
+            FileAccessError::Denied
+        );
+        assert_eq!(
+            FileAccessError::from(io::Error::from(io::ErrorKind::Other)),
+            FileAccessError::Io
+        );
     }
 
     #[test]
@@ -337,6 +363,33 @@ mod tests {
             Err(FileAccessError::UnsupportedFile)
         ));
 
+        drop(capability);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn opened_file_reports_metadata_and_reads_through_its_retained_handle() {
+        let directory = temporary_directory();
+        let file = directory.join("page.html");
+        fs::write(&file, b"authorized bytes").unwrap();
+        let capability =
+            FileAccessCapability::from_trusted_roots([trusted_root(&directory)]).unwrap();
+        let grant = capability.issue_grant();
+        let mut opened = capability
+            .open_authorized_file(&navigation_context(), &grant, &file)
+            .unwrap();
+        let mut first = [0; 5];
+        let mut remaining = [0; 32];
+
+        assert_eq!(opened.length(), b"authorized bytes".len() as u64);
+        assert_eq!(opened.media_type(), None);
+        let first_length = opened.read_chunk(&mut first).unwrap();
+        let remaining_length = opened.read_chunk(&mut remaining).unwrap();
+        assert_eq!(&first[..first_length], b"autho");
+        assert_eq!(&remaining[..remaining_length], b"rized bytes");
+        assert_eq!(opened.read_chunk(&mut remaining).unwrap(), 0);
+
+        drop(opened);
         drop(capability);
         fs::remove_dir_all(directory).unwrap();
     }
