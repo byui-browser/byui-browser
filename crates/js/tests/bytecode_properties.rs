@@ -160,9 +160,9 @@ fn non_object_targets_match_the_evaluator() {
 fn assignment_evaluates_the_value_before_checking_the_target() {
     // The value expression fails first, so the non-object target is never
     // reported.
-    for source in ["1['k'] = -'x'", "null.k = -'x'"] {
+    for source in ["1['k'] = missing", "null.k = missing"] {
         let error = Vm::new().execute(&compile_source(source)).unwrap_err();
-        assert_eq!(error.message, "cannot convert string to number", "{source}");
+        assert_eq!(error.message, "`missing` is not defined", "{source}");
     }
 }
 

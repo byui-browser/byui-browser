@@ -358,9 +358,8 @@ fn to_number(value: &Value) -> JsResult<f64> {
         Value::Boolean(value) => Ok(f64::from(*value as u8)),
         Value::Null => Ok(0.0),
         Value::Undefined => Ok(f64::NAN),
-        Value::String(value) => value
-            .parse()
-            .map_err(|_| JsError::runtime("cannot convert string to number")),
+        Value::String(value) if value.trim().is_empty() => Ok(0.0),
+        Value::String(value) => Ok(value.trim().parse().unwrap_or(f64::NAN)),
         Value::Function(_) | Value::Object(_) => {
             Err(JsError::runtime("cannot convert object to number"))
         }
