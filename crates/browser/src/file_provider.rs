@@ -358,7 +358,7 @@ impl FileProvider for BrowserFileProvider {
                     return Err(RequestError::Aborted);
                 }
                 let opened = capability
-                    .open_authorized_file_with_lease(&context, &grant, &setup_lease, path)
+                    .open_authorized_file(&context, &grant, &setup_lease, path)
                     .map_err(|error| {
                         if setup_lease.is_current() {
                             provider_error(error)

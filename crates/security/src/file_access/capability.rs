@@ -79,27 +79,11 @@ impl FileAccessCapability {
 
     /// Authorizes and opens one local file through this capability.
     ///
-    /// The returned handle is retained by the caller and must be used for all
-    /// subsequent reads; callers must not reopen the pathname.
-    pub(crate) fn open_authorized_file(
-        &self,
-        context: &FileRequestContext,
-        grant: &FileAccessGrant,
-        requested: impl AsRef<std::path::Path>,
-    ) -> Result<OpenedFile, FileAccessError> {
-        self.authorize_request(context, grant)?;
-        let (root_index, relative) = self.authorize_path(requested)?;
-        self.open_relative(root_index, &relative)
-    }
-
-    /// Authorizes and opens one file while a session lease remains current.
-    ///
-    /// Browser providers use this operation for revocable sessions. It checks
-    /// `lease` before filesystem work and once more before returning the
-    /// opened handle, so a revocation concurrent with setup cannot admit that
-    /// handle for response publication. Callers must still validate the lease
-    /// immediately before exposing metadata and each body chunk.
-    pub fn open_authorized_file_with_lease(
+    /// The lease must remain current before the caller exposes response
+    /// metadata or body data. The returned handle is retained by the caller
+    /// and must be used for all subsequent reads; callers must not reopen the
+    /// pathname.
+    pub fn open_authorized_file(
         &self,
         context: &FileRequestContext,
         grant: &FileAccessGrant,
@@ -109,7 +93,9 @@ impl FileAccessCapability {
         if !lease.is_current() {
             return Err(FileAccessError::Denied);
         }
-        let opened = self.open_authorized_file(context, grant, requested)?;
+        self.authorize_request(context, grant)?;
+        let (root_index, relative) = self.authorize_path(requested)?;
+        let opened = self.open_relative(root_index, &relative)?;
         if !lease.is_current() {
             return Err(FileAccessError::Denied);
         }

@@ -156,13 +156,14 @@ mod tests {
             FileAccessCapability::from_trusted_directory_selections([trusted_selection(&allowed)])
                 .unwrap();
         let grant = capability.issue_grant();
+        let lease = grant.lease().unwrap();
 
         let opened = capability
-            .open_authorized_file(&navigation_context(), &grant, &allowed_file)
+            .open_authorized_file(&navigation_context(), &grant, &lease, &allowed_file)
             .unwrap();
         assert_eq!(read_all(opened), b"allowed");
         assert!(matches!(
-            capability.open_authorized_file(&navigation_context(), &grant, &outside),
+            capability.open_authorized_file(&navigation_context(), &grant, &lease, &outside),
             Err(FileAccessError::Denied)
         ));
 
@@ -182,13 +183,24 @@ mod tests {
             FileAccessCapability::from_trusted_directory_selections([trusted_selection(&allowed)])
                 .unwrap();
         let grant = capability.issue_grant();
+        let lease = grant.lease().unwrap();
 
         assert!(matches!(
-            capability.open_authorized_file(&navigation_context(), &grant, &existing_outside),
+            capability.open_authorized_file(
+                &navigation_context(),
+                &grant,
+                &lease,
+                &existing_outside
+            ),
             Err(FileAccessError::Denied)
         ));
         assert!(matches!(
-            capability.open_authorized_file(&navigation_context(), &grant, &missing_outside),
+            capability.open_authorized_file(
+                &navigation_context(),
+                &grant,
+                &lease,
+                &missing_outside
+            ),
             Err(FileAccessError::Denied)
         ));
 
@@ -205,11 +217,13 @@ mod tests {
             )])
             .unwrap();
         let grant = capability.issue_grant();
+        let lease = grant.lease().unwrap();
 
         assert!(matches!(
             capability.open_authorized_file(
                 &navigation_context(),
                 &grant,
+                &lease,
                 directory.join("missing.html")
             ),
             Err(FileAccessError::Missing)
@@ -230,13 +244,14 @@ mod tests {
             FileAccessCapability::from_trusted_directory_selections([trusted_selection(&allowed)])
                 .unwrap();
         let grant = capability.issue_grant();
+        let lease = grant.lease().unwrap();
 
         for path in [
             allowed.join("..").join("outside.html"),
             allowed.join("..").join("missing.html"),
         ] {
             assert!(matches!(
-                capability.open_authorized_file(&navigation_context(), &grant, path),
+                capability.open_authorized_file(&navigation_context(), &grant, &lease, path),
                 Err(FileAccessError::Denied)
             ));
         }
@@ -253,9 +268,10 @@ mod tests {
         // resolution or be interpreted relative to a trusted root.
         let capability = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
         let grant = capability.issue_grant();
+        let lease = grant.lease().unwrap();
         for path in [Path::new(r"\\?\C:"), Path::new(r"\\?\UNC\server")] {
             assert!(matches!(
-                capability.open_authorized_file(&navigation_context(), &grant, path),
+                capability.open_authorized_file(&navigation_context(), &grant, &lease, path),
                 Err(FileAccessError::InvalidPath)
             ));
         }
@@ -310,7 +326,7 @@ mod tests {
         assert!(!lease.is_current());
         assert!(grant.lease().is_none());
         assert!(matches!(
-            capability.open_authorized_file_with_lease(
+            capability.open_authorized_file(
                 &navigation_context(),
                 &grant,
                 &lease,
@@ -348,11 +364,14 @@ mod tests {
     fn denied_requests_do_not_canonicalize_their_path() {
         let capability = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
         let another = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
+        let another_grant = another.issue_grant();
+        let another_lease = another_grant.lease().unwrap();
 
         assert!(matches!(
             capability.open_authorized_file(
                 &navigation_context(),
-                &another.issue_grant(),
+                &another_grant,
+                &another_lease,
                 "this-path-does-not-need-to-exist",
             ),
             Err(FileAccessError::Denied)
@@ -368,9 +387,10 @@ mod tests {
             )])
             .unwrap();
         let grant = capability.issue_grant();
+        let lease = grant.lease().unwrap();
 
         assert!(matches!(
-            capability.open_authorized_file(&navigation_context(), &grant, &directory),
+            capability.open_authorized_file(&navigation_context(), &grant, &lease, &directory),
             Err(FileAccessError::UnsupportedFile)
         ));
 
@@ -389,8 +409,9 @@ mod tests {
             )])
             .unwrap();
         let grant = capability.issue_grant();
+        let lease = grant.lease().unwrap();
         let mut opened = capability
-            .open_authorized_file(&navigation_context(), &grant, &file)
+            .open_authorized_file(&navigation_context(), &grant, &lease, &file)
             .unwrap();
         let mut first = [0; 5];
         let mut remaining = [0; 32];
@@ -465,11 +486,13 @@ mod tests {
             FileAccessCapability::from_trusted_directory_selections([trusted_selection(&allowed)])
                 .unwrap();
         let grant = capability.issue_grant();
+        let lease = grant.lease().unwrap();
 
         assert!(matches!(
             capability.open_authorized_file(
                 &navigation_context(),
                 &grant,
+                &lease,
                 allowed.join("escape").join("secret.txt"),
             ),
             Err(FileAccessError::Denied)
@@ -478,6 +501,7 @@ mod tests {
             capability.open_authorized_file(
                 &navigation_context(),
                 &grant,
+                &lease,
                 allowed.join("escape").join("missing.txt"),
             ),
             Err(FileAccessError::Denied)
@@ -509,13 +533,14 @@ mod tests {
             FileAccessCapability::from_trusted_directory_selections([trusted_selection(&allowed)])
                 .unwrap();
         let grant = capability.issue_grant();
+        let lease = grant.lease().unwrap();
 
         for path in [
             allowed.join("existing-link.html"),
             allowed.join("missing-link.html"),
         ] {
             assert!(matches!(
-                capability.open_authorized_file(&navigation_context(), &grant, path),
+                capability.open_authorized_file(&navigation_context(), &grant, &lease, path),
                 Err(FileAccessError::Denied)
             ));
         }
@@ -538,8 +563,9 @@ mod tests {
             )])
             .unwrap();
         let grant = capability.issue_grant();
+        let lease = grant.lease().unwrap();
         let opened = capability
-            .open_authorized_file(&navigation_context(), &grant, &path)
+            .open_authorized_file(&navigation_context(), &grant, &lease, &path)
             .unwrap();
 
         fs::rename(&replacement, &path).unwrap();
@@ -565,12 +591,18 @@ mod tests {
             FileAccessCapability::from_trusted_directory_selections([trusted_selection(&selected)])
                 .unwrap();
         let grant = capability.issue_grant();
+        let lease = grant.lease().unwrap();
 
         fs::rename(&selected, &previous).unwrap();
         fs::rename(&replacement, &selected).unwrap();
 
         let opened = capability
-            .open_authorized_file(&navigation_context(), &grant, selected.join("page.html"))
+            .open_authorized_file(
+                &navigation_context(),
+                &grant,
+                &lease,
+                selected.join("page.html"),
+            )
             .unwrap();
         assert_eq!(read_all(opened), b"selected root");
 
