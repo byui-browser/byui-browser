@@ -44,7 +44,7 @@ mod tests {
     fn trusted_selection(path: &Path) -> TrustedDirectorySelection {
         let canonical_path = fs::canonicalize(path).unwrap();
         let directory = Dir::open_ambient_dir(&canonical_path, ambient_authority()).unwrap();
-        TrustedDirectorySelection::from_open_directory(canonical_path, directory).unwrap()
+        TrustedDirectorySelection::from_verified_open_directory(canonical_path, directory).unwrap()
     }
 
     fn navigation_context() -> FileRequestContext {
@@ -61,8 +61,55 @@ mod tests {
         let handle = Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
 
         assert!(matches!(
-            TrustedDirectorySelection::from_open_directory(PathBuf::from("relative"), handle),
+            TrustedDirectorySelection::from_verified_open_directory(
+                PathBuf::from("relative"),
+                handle
+            ),
             Err(FileAccessError::InvalidPath)
+        ));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn trusted_selection_rejects_a_path_and_handle_from_different_directories() {
+        let directory = temporary_directory();
+        let selected = directory.join("selected");
+        let another = directory.join("another");
+        fs::create_dir(&selected).unwrap();
+        fs::create_dir(&another).unwrap();
+        let selected_path = fs::canonicalize(&selected).unwrap();
+        let another_handle = Dir::open_ambient_dir(&another, ambient_authority()).unwrap();
+
+        assert!(matches!(
+            TrustedDirectorySelection::from_verified_open_directory(selected_path, another_handle,),
+            Err(FileAccessError::Denied)
+        ));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_selection_rejects_root_replacement_during_configuration() {
+        let directory = temporary_directory();
+        let selected = directory.join("selected");
+        let replacement = directory.join("replacement");
+        let previous = directory.join("previous");
+        fs::create_dir(&selected).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let canonical_path = fs::canonicalize(&selected).unwrap();
+        let selected_handle = Dir::open_ambient_dir(&canonical_path, ambient_authority()).unwrap();
+
+        fs::rename(&selected, &previous).unwrap();
+        fs::rename(&replacement, &selected).unwrap();
+
+        assert!(matches!(
+            TrustedDirectorySelection::from_verified_open_directory(
+                canonical_path,
+                selected_handle,
+            ),
+            Err(FileAccessError::Denied)
         ));
 
         fs::remove_dir_all(directory).unwrap();

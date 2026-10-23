@@ -49,9 +49,11 @@ impl FileAccessConfiguration {
     ///
     /// This is the browser's filesystem-capability boundary. The platform team
     /// creates each [`TrustedDirectorySelection`] from one user-approved
-    /// selection operation; this API consumes the selection without reopening
-    /// its pathname. `limits` is browser-owned and is never derived from web
-    /// content or caller-controlled request metadata.
+    /// selection operation. Selection construction verifies that its canonical
+    /// path and retained directory handle identify the same directory; this
+    /// API then consumes the selection without reopening its pathname.
+    /// `limits` is browser-owned and is never derived from web content or
+    /// caller-controlled request metadata.
     pub fn from_trusted_directory_selections(
         selected_directories: impl IntoIterator<Item = TrustedDirectorySelection>,
         limits: FileAccessLimits,

@@ -2,28 +2,59 @@
 
 The browser adapts security-owned file access to `net::FileProvider`. The
 security crate owns path authorization and filesystem capabilities; the browser
-owns request-context translation, grants, and session lifecycle; `net` owns
-scheme dispatch, response validation, and body behavior.
+owns request-context translation, grants, limits, and session lifecycle; `net`
+owns scheme dispatch, response validation, and body behavior.
 
 ## Current status
 
 The provider is a default-deny, capability-backed implementation for trusted
-roots. It requires browser-issued single-use navigation authorization, opens
-files through retained handles with symlink following disabled, streams bounded
-64 KiB chunks, limits admission to four readers and eight pending opens, and
-supports request abort plus session revocation. Core authorization, containment,
-streaming, and lifecycle tests pass. The remaining work below is required
-before treating the provider as a complete browser capability.
+directory selections. It requires browser-issued single-use navigation
+authorization, opens files through retained handles with symlink following
+disabled, streams bounded 64 KiB chunks, limits admission to four readers and
+eight pending opens, and supports request abort plus session revocation.
 
-Browser configuration consumes opaque `TrustedDirectorySelection` values with
-explicit browser-owned resource limits. The selection's path and directory
-handle remain private to the security capability after configuration, and the
-browser never reopens the selected pathname. Platform-specific user permission
-selection remains owned by the platform team.
+The current slice also provides a configurable per-file size limit, allowlisted
+extension-based media types, exact `Content-Length` enforcement, and
+close/navigation-away cancellation. Core authorization, containment,
+streaming, admission, lifecycle, media-type, size-limit, and length-consistency
+tests pass. The remaining work below is required before treating the provider as
+a complete browser capability.
+
+Trusted directory composition now verifies that the supplied canonical path and
+the retained `Dir` identify the same directory before a selection is accepted.
+This prevents configuration from authorizing paths below one directory and then
+reading identically named files through another directory's handle. After this
+one-time verification, all opens remain relative to the retained handle, so a
+replacement of the pathname cannot redirect reads.
+
+The current crate layout has no native directory-picker adapter. Consequently,
+`TrustedDirectorySelection::from_verified_open_directory` remains public for
+platform integration and accepts the path and handle at the API boundary. The
+identity check makes mismatched pairs fail closed, but it is not the stronger
+opaque platform-selection boundary described below: a future adapter should
+capture both values inside the user-approval operation and return only an
+opaque selection or configured session. Renderer, web-content, and ordinary
+request-construction code must not be given either input, a selection, or a
+`FileAccessCapability`. The remaining platform conformance work must also cover
+the filesystem identities reported for Windows reparse points, UNC paths,
+network shares, removable media, and Unix mount changes.
 
 ## Remaining work
 
-### 1. Remove path-existence oracles
+### 1. Harden trusted composition
+
+The implemented `from_verified_open_directory` constructor rejects a path and
+handle that identify different filesystem objects. Regression tests cover that
+mismatch, replacement between handle capture and configuration, and a matched
+retained handle continuing to serve the original directory after its pathname
+is replaced.
+
+The native platform adapter remains incomplete. Replace the public
+path-and-handle constructor with a private adapter or an opaque value produced
+directly by the trusted selection operation once the platform picker exists.
+Do not introduce a fallback that reauthorizes and reopens the root pathname.
+
+### 2. Remove path-existence oracles
 
 Path authorization currently canonicalizes a requested path before checking
 whether it belongs to an allowed root. An authorized caller can therefore
@@ -39,25 +70,24 @@ Test existing and missing outside-root paths, malformed paths, traversal, and
 symlinked paths. Verify that unauthorized and authorized callers receive the
 same non-diagnostic denial for ineligible paths.
 
-### 2. Make revocation fully linearizable
+### 3. Make revocation fully linearizable
 
-Session revocation now cancels pending setup and live bodies, but authorization,
-file opening, and response construction still need one clear revocation
-linearization point. A revocation racing with the final setup check must not
-publish a `HEAD` response or a queued body chunk from the old session.
+Basic session revocation is implemented: pending admission, setup, and live
+bodies are cancelled, and close/navigation-away denies future opens. The
+remaining issue is the exact race between revocation, final setup checks, and
+response publication.
 
 Carry a session generation or revocation token into the security-owned open
 operation. Revalidate it before admitting the opened handle and before exposing
 response metadata or body data. Define whether an already-running OS read may
-finish internally, but ensure its bytes are never delivered after the session
-is revoked.
+finish internally, but ensure its bytes are never delivered after revocation.
 
-Add race-focused tests for revocation before opening, during blocking setup,
+Add deterministic tests for revocation before opening, during blocking setup,
 immediately before response construction, while a chunk is queued, and during
 `HEAD` handling. Cover close, navigation-away, grant replacement, and grant
 expiry consistently.
 
-### 3. Define file-document origins and subresource policy
+### 4. Define file-document origins and subresource policy
 
 The current policy permits only explicitly granted top-level navigations, and
 the initiating origin is carried through but not used to authorize access.
@@ -75,67 +105,71 @@ other subresources may read local files. Connect the decision to same-origin
 checks, sandbox/container identity, navigation policy, grants, and request
 context. Keep unsupported cases denied until the full policy is implemented.
 
-### 4. Add resource and content limits
+### 5. Complete resource and content limits
 
-Define product limits for maximum file size, total bytes served per session,
-read duration, active readers, pending requests, chunk size, and aggregate
-blocking-reader/channel memory. Enforce limits before opening when possible and
-while streaming when limits depend on bytes or time.
+Per-file size limits, bounded active/pending admission, bounded chunking, and
+allowlisted extension-based media types are implemented. The per-file limit
+does not yet bound the lifetime or aggregate cost of a session.
 
-Add filesystem media-type detection and specify whether invalid detected values
-are rejected or omitted. Define MIME sniffing, `nosniff`, and executable-content
-rules before local HTML, JavaScript, images, stylesheets, or other active
-content is interpreted. Decide whether directories and unsupported file types
-retain the current non-diagnostic `Io` category or receive dedicated errors.
+Define and enforce:
 
-Test each limit at its boundary, including concurrent readers, queue
-exhaustion, slow reads, and cancellation while a limit is being reached.
+- maximum read duration;
+- total bytes served per session;
+- aggregate blocking-reader and channel memory; and
+- any additional platform-specific I/O limits.
 
-### 5. Define stream consistency
+Define MIME sniffing, `nosniff`, and executable-content rules before local HTML,
+JavaScript, images, stylesheets, or other active content is interpreted. Decide
+whether directories and unsupported file types retain the current non-diagnostic
+`Io` category or receive dedicated errors.
 
-The provider captures `Content-Length` when the handle is opened but does not
-currently enforce that length while reading. Truncation or extension can make
-the streamed body differ from the advertised length.
+Test every limit at its boundary, including slow reads, concurrent readers,
+queue exhaustion, and cancellation while a limit is being reached.
+
+### 6. Define mutable-file and stream consistency semantics
+
+The provider now enforces the captured `Content-Length`: early EOF and extra
+bytes produce a provider failure. It does not yet define whether local-file
+responses are snapshot-consistent or may observe mutable file contents.
 
 Choose whether local-file responses require a stable snapshot or support live
-file contents. If the captured length is authoritative, stop after that many
-bytes and report a consistency failure when the file changes. If live contents
-are supported, define the response framing and security implications explicitly.
+file contents. Document the existing length-mismatch failure behavior and define
+how to handle in-place writes, truncation, growth, and metadata changes after
+authorization. If live contents are supported, define response framing and its
+security implications explicitly.
 
-Also define behavior for in-place writes, truncation, growth, and metadata
-changes after authorization. Add tests for each mutation during setup and
-streaming, including cleanup of the retained handle and read permit.
+Add mutation tests beyond the existing length-mismatch coverage, including
+changes during setup and streaming, and verify cleanup of the retained handle,
+channel, and read permit.
 
-### 6. Finish permission lifecycle behavior
+### 7. Finish permission lifecycle behavior
 
-Specify grant expiry, audit logging, and process-shutdown behavior. Document
-which operations are denied after expiry, whether existing bodies are aborted,
-what events are recorded, and what information must never enter logs (paths,
-contents, or sensitive OS diagnostics).
+Close and navigation-away cancellation are implemented. Remaining lifecycle
+work covers grant expiry, audit logging, and explicit process-shutdown
+sequencing.
 
-Define explicit shutdown sequencing if process teardown is not sufficient for
-future browser lifecycle code. Test tab close, navigation-away, grant expiry,
-grant replacement, controller destruction, and process shutdown for pending
-setup, active readers, queued data, and navigation authorizations.
+Document which operations are denied after expiry, whether existing bodies are
+aborted, what events are recorded, and what information must never enter logs
+(paths, contents, or sensitive OS diagnostics). Test expiry, grant replacement,
+controller destruction, process shutdown, pending setup, active readers, queued
+data, and navigation authorizations.
 
-### 7. Complete streaming regression coverage
+### 8. Complete regression and platform coverage
 
-Add browser-provider tests for:
-
-- worker-side read failures and stable error mapping;
-- full-channel backpressure and cancellation while blocked;
-- all four active readers and eight pending opens;
-- queue exhaustion and permit release after failure;
-- unread and partially read body drops;
-- request abort before admission, during setup, and during streaming;
-- session revocation at every lifecycle boundary; and
-- `GET` versus `HEAD` behavior under cancellation and revocation.
+Retain regression coverage for worker-side read failures, full-channel
+backpressure, four-reader concurrency, queue exhaustion, request aborts,
+revocation races, and `GET` versus `HEAD` behavior under cancellation.
 
 Use deterministic hooks or test doubles for races rather than relying only on
 timing. Verify that every path releases file handles, permits, channels, and
 blocking tasks.
 
-### 8. Maintain integration and conformance guarantees
+Extend platform conformance coverage for Unix mounts and links, Windows
+reparse-point variants, drive-letter and UNC paths, network shares, removable
+media, and remaining root-replacement races. Any fallback must fail closed and
+must not re-authorize and reopen a pathname.
+
+### 9. Maintain integration guarantees
 
 Keep security, browser, and `net` integration tests aligned with these
 guarantees:
@@ -147,15 +181,15 @@ guarantees:
 - provider errors remain stable and non-diagnostic; and
 - authorization occurs before path conversion for unauthorized requests.
 
-Run the relevant security, browser, and `net` tests on supported platforms and
-include platform-specific coverage for Unix mounts and links, Windows
-reparse-point variants, drive-letter and UNC paths, network shares, and
-removable media.
+Run the relevant cross-crate tests on supported platforms and include the new
+size-limit, media-type, length-consistency, and session-lifecycle behavior in
+the integration contract.
 
 ## Recommended order
 
-1. Remove the path-existence oracle.
+1. Restrict trusted selection construction and remove the path-existence oracle.
 2. Make revocation linearizable and finalize permission lifecycle behavior.
 3. Define file-document origins and subresource policy.
-4. Add resource limits, content handling, and stream consistency.
-5. Complete race-focused tests and cross-crate/platform conformance coverage.
+4. Add duration/session-wide limits and active-content policy.
+5. Define mutable-file semantics and complete race, platform, and integration
+   coverage.

@@ -1,6 +1,7 @@
 use std::{fs, io::Read, path::PathBuf};
 
-use cap_std::fs::Dir;
+use cap_fs_ext::MetadataExt;
+use cap_std::{ambient_authority, fs::Dir};
 
 use super::FileAccessError;
 
@@ -19,25 +20,64 @@ pub struct TrustedDirectorySelection {
 }
 
 impl TrustedDirectorySelection {
-    /// Creates a selection from one trusted platform approval result.
+    /// Creates a selection after verifying one trusted platform approval result.
     ///
     /// `canonical_path` must be the absolute, canonical path reported by the
-    /// same trusted platform operation that produced `directory`. Callers must
-    /// not construct this from a pathname and then reopen that pathname: that
-    /// would reintroduce a root-replacement race. This method deliberately
-    /// performs no filesystem lookup. An empty or relative path is rejected.
-    pub fn from_open_directory(
+    /// same trusted platform operation that produced `directory`. The method
+    /// verifies that the pathname and retained directory handle identify the
+    /// same filesystem object before storing either one. A mismatched pair is
+    /// denied, rather than allowing path authorization for one directory and
+    /// reads through another directory's handle.
+    ///
+    /// Platform code must capture `directory` from the user-approved selection
+    /// operation and pass it here immediately. It must not reopen a pathname
+    /// after approval: the retained handle is the authority used for later
+    /// reads. This constructor necessarily consults the supplied path once to
+    /// verify the pair; after construction, file access never reopens that
+    /// root pathname. An empty, relative, or non-canonical path is rejected.
+    pub fn from_verified_open_directory(
         canonical_path: PathBuf,
         directory: Dir,
     ) -> Result<Self, FileAccessError> {
         if !canonical_path.is_absolute() || canonical_path.as_os_str().is_empty() {
             return Err(FileAccessError::InvalidPath);
         }
+
+        let resolved_path = fs::canonicalize(&canonical_path).map_err(FileAccessError::from)?;
+        if resolved_path != canonical_path {
+            return Err(FileAccessError::InvalidPath);
+        }
+        if !same_directory(&canonical_path, &directory)? {
+            return Err(FileAccessError::Denied);
+        }
+
         Ok(Self {
             canonical_path,
             directory,
         })
     }
+}
+
+/// Compares the filesystem identities observed through the supplied pathname
+/// and the retained directory handle.
+///
+/// The pathname is used only while accepting a trusted selection. All later
+/// file opens are relative to the retained handle.
+fn same_directory(
+    canonical_path: &std::path::Path,
+    directory: &Dir,
+) -> Result<bool, FileAccessError> {
+    let path_metadata = Dir::open_ambient_dir(canonical_path, ambient_authority())
+        .and_then(|path_directory| path_directory.metadata("."))
+        .map_err(FileAccessError::from)?;
+    let directory_metadata = directory.metadata(".").map_err(FileAccessError::from)?;
+
+    if !path_metadata.is_dir() || !directory_metadata.is_dir() {
+        return Ok(false);
+    }
+
+    Ok(path_metadata.dev() == directory_metadata.dev()
+        && path_metadata.ino() == directory_metadata.ino())
 }
 
 /// An opened regular file accepted by the capability-backed filesystem.

@@ -37,7 +37,8 @@ fn file_access_with_limits(
         .map(|path| {
             let canonical_path = fs::canonicalize(&path).unwrap();
             let directory = Dir::open_ambient_dir(&canonical_path, ambient_authority()).unwrap();
-            TrustedDirectorySelection::from_open_directory(canonical_path, directory).unwrap()
+            TrustedDirectorySelection::from_verified_open_directory(canonical_path, directory)
+                .unwrap()
         })
         .collect::<Vec<_>>();
     FileAccessConfiguration::from_trusted_directory_selections(roots, limits).unwrap()
@@ -505,7 +506,8 @@ fn configured_file_provider_retains_the_selected_directory_handle() {
     let canonical_path = fs::canonicalize(&selected).unwrap();
     let selected_directory = Dir::open_ambient_dir(&canonical_path, ambient_authority()).unwrap();
     let selection =
-        TrustedDirectorySelection::from_open_directory(canonical_path, selected_directory).unwrap();
+        TrustedDirectorySelection::from_verified_open_directory(canonical_path, selected_directory)
+            .unwrap();
     let file_access = FileAccessConfiguration::from_trusted_directory_selections(
         [selection],
         FileAccessLimits::default(),

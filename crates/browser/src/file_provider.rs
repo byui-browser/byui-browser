@@ -717,7 +717,7 @@ mod tests {
         let file = directory.join("page.html");
         fs::write(&file, b"prepared content").unwrap();
         let canonical_directory = fs::canonicalize(&directory).unwrap();
-        let selection = TrustedDirectorySelection::from_open_directory(
+        let selection = TrustedDirectorySelection::from_verified_open_directory(
             canonical_directory,
             Dir::open_ambient_dir(&directory, ambient_authority()).unwrap(),
         )
@@ -794,7 +794,7 @@ mod tests {
         let file = directory.join("page.html");
         fs::write(&file, vec![b'x'; FILE_READ_CHUNK_SIZE * 4]).unwrap();
         let canonical_directory = fs::canonicalize(&directory).unwrap();
-        let selection = TrustedDirectorySelection::from_open_directory(
+        let selection = TrustedDirectorySelection::from_verified_open_directory(
             canonical_directory,
             Dir::open_ambient_dir(&directory, ambient_authority()).unwrap(),
         )
@@ -853,7 +853,7 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let file = directory.join("page.html");
         let canonical_directory = fs::canonicalize(&directory).unwrap();
-        let selection = TrustedDirectorySelection::from_open_directory(
+        let selection = TrustedDirectorySelection::from_verified_open_directory(
             canonical_directory,
             Dir::open_ambient_dir(&directory, ambient_authority()).unwrap(),
         )
