@@ -5,6 +5,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
+    time::Instant,
 };
 
 use futures_util::Stream;
@@ -21,12 +22,24 @@ pub(super) struct FileBodyStream {
     pub(super) session_cancellation: FileAccessCancellation,
     pub(super) lease: FileAccessLease,
     pub(super) reported_session_cancellation: bool,
+    pub(super) deadline: Instant,
+    pub(super) reported_timeout: bool,
 }
 
 impl Stream for FileBodyStream {
     type Item = Result<Vec<u8>, RequestError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if Instant::now() >= self.deadline {
+            if self.reported_timeout {
+                return Poll::Ready(None);
+            }
+            self.reported_timeout = true;
+            return Poll::Ready(Some(Err(RequestError::Provider {
+                provider: "file",
+                kind: net::ProviderErrorKind::ResourceExhausted,
+            })));
+        }
         if self.session_cancellation.is_cancelled() || !self.lease.is_current() {
             if self.reported_session_cancellation {
                 return Poll::Ready(None);

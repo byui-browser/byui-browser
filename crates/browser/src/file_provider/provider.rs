@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
 };
 
 use net::{
@@ -14,10 +17,11 @@ use super::{
     admission::{FileReadAdmission, MAX_CONCURRENT_FILE_READS, MAX_PENDING_FILE_READS},
     authorization::FileNavigationAuthorizations,
     policy::{
-        provider_error, provider_io_error, provider_resource_exhausted_error, request_context,
+        allows_content, is_native_executable_prefix, provider_error, provider_io_error,
+        provider_resource_exhausted_error, request_context,
     },
     reader::{FILE_READ_CHANNEL_CAPACITY, FileReadTask, read_file_stream},
-    session::FileAccessGrantSource,
+    session::{FileAccessGrantSource, FileSessionByteBudget},
     stream::{CancellationGuard, FileBodyStream},
 };
 
@@ -28,7 +32,9 @@ pub(crate) struct BrowserFileProvider {
     pub(super) grants: FileAccessGrantSource,
     pub(super) navigation_authorizations: Arc<FileNavigationAuthorizations>,
     pub(super) read_admission: FileReadAdmission,
-    pub(super) max_file_size: u64,
+    pub(super) limits: crate::FileAccessLimits,
+    pub(super) content_policy: crate::FileAccessContentPolicy,
+    pub(super) session_budget: FileSessionByteBudget,
     #[cfg(test)]
     pub(super) post_setup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -39,7 +45,8 @@ impl BrowserFileProvider {
         capability: Arc<FileAccessCapability>,
         grants: FileAccessGrantSource,
         navigation_authorizations: Arc<FileNavigationAuthorizations>,
-        max_file_size: u64,
+        limits: crate::FileAccessLimits,
+        content_policy: crate::FileAccessContentPolicy,
     ) -> Self {
         Self {
             capability,
@@ -49,7 +56,9 @@ impl BrowserFileProvider {
                 MAX_CONCURRENT_FILE_READS,
                 MAX_PENDING_FILE_READS,
             ),
-            max_file_size,
+            session_budget: FileSessionByteBudget::new(limits.max_session_bytes),
+            limits,
+            content_policy,
             #[cfg(test)]
             post_setup_hook: None,
         }
@@ -62,7 +71,9 @@ impl FileProvider for BrowserFileProvider {
         let grants = self.grants.clone();
         let navigation_authorizations = Arc::clone(&self.navigation_authorizations);
         let read_admission = self.read_admission.clone();
-        let max_file_size = self.max_file_size;
+        let limits = self.limits;
+        let content_policy = self.content_policy;
+        let session_budget = self.session_budget.clone();
         let url = url.clone();
         let is_head = request.method() == net::Method::HEAD;
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -94,6 +105,7 @@ impl FileProvider for BrowserFileProvider {
             let permit = read_admission
                 .acquire(&signal, &session_cancellation)
                 .await?;
+            let deadline = Instant::now() + limits.max_read_duration;
             let setup_cancellation = session_cancellation.clone();
             let setup_lease = lease.clone();
             let task = tokio::task::spawn_blocking(move || {
@@ -116,17 +128,34 @@ impl FileProvider for BrowserFileProvider {
                 let media_type = opened.media_type().map(str::to_owned);
                 Ok((opened, length, media_type))
             });
-            let (opened, length, media_type) = task.await.map_err(|_| provider_io_error())??;
+            let (mut opened, length, media_type) =
+                task.await.map_err(|_| provider_io_error())??;
 
             #[cfg(test)]
             if let Some(hook) = post_setup_hook {
                 hook();
             }
-            if signal.is_aborted() || session_cancellation.is_cancelled() || !lease.is_current() {
-                return Err(RequestError::Aborted);
+            if signal.is_aborted()
+                || session_cancellation.is_cancelled()
+                || !lease.is_current()
+                || Instant::now() >= deadline
+            {
+                return Err(if Instant::now() >= deadline {
+                    provider_resource_exhausted_error()
+                } else {
+                    RequestError::Aborted
+                });
             }
-            if length > max_file_size {
+            if length > limits.max_file_size {
                 return Err(provider_resource_exhausted_error());
+            }
+            if !allows_content(content_policy, media_type.as_deref()) {
+                return Err(provider_error(FileAccessError::UnsupportedFile));
+            }
+            let mut prefix = [0; 4];
+            let prefix_length = opened.read_prefix(&mut prefix).map_err(provider_error)?;
+            if is_native_executable_prefix(&prefix[..prefix_length]) {
+                return Err(provider_error(FileAccessError::UnsupportedFile));
             }
             let expected_length = length;
 
@@ -139,6 +168,10 @@ impl FileProvider for BrowserFileProvider {
             let media_type = media_type.and_then(|value| HeaderValue::from_str(&value).ok());
             if let Some(media_type) = media_type.clone() {
                 headers.push((HeaderName::from_static("content-type"), media_type));
+                headers.push((
+                    HeaderName::from_static("x-content-type-options"),
+                    HeaderValue::from_static("nosniff"),
+                ));
             }
             // This is the linearization point for metadata publication. A
             // revocation observed first aborts setup; a later revocation is
@@ -175,6 +208,8 @@ impl FileProvider for BrowserFileProvider {
                             lease: worker_lease,
                             signal,
                             expected_length,
+                            deadline,
+                            session_budget,
                         });
                     });
                     cancellation.disarm();
@@ -184,6 +219,8 @@ impl FileProvider for BrowserFileProvider {
                         session_cancellation,
                         lease,
                         reported_session_cancellation: false,
+                        deadline,
+                        reported_timeout: false,
                     }))
                 },
             })
@@ -196,12 +233,14 @@ pub(crate) fn provider(
     capability: Arc<FileAccessCapability>,
     grants: FileAccessGrantSource,
     navigation_authorizations: Arc<FileNavigationAuthorizations>,
-    max_file_size: u64,
+    limits: crate::FileAccessLimits,
+    content_policy: crate::FileAccessContentPolicy,
 ) -> Arc<dyn FileProvider> {
     Arc::new(BrowserFileProvider::new(
         capability,
         grants,
         navigation_authorizations,
-        max_file_size,
+        limits,
+        content_policy,
     ))
 }

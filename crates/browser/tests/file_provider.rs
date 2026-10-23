@@ -69,8 +69,13 @@ fn configured_file_provider_enforces_per_file_size_limits() {
         b"fiver"
     );
 
-    let allowed_access =
-        file_access_with_limits([allowed.clone()], FileAccessLimits { max_file_size: 4 });
+    let allowed_access = file_access_with_limits(
+        [allowed.clone()],
+        FileAccessLimits {
+            max_file_size: 4,
+            ..FileAccessLimits::default()
+        },
+    );
     let controller = request_controller(Some(allowed_access.clone()));
 
     let at_limit_url = net::Url::from_file_path(&at_limit).unwrap();
@@ -119,7 +124,7 @@ fn configured_file_provider_enforces_per_file_size_limits() {
 }
 
 #[test]
-fn configured_file_provider_sets_allowlisted_media_types_only() {
+fn configured_file_provider_allows_only_static_media_types_and_sets_nosniff() {
     let directory = temporary_directory();
     let allowed = directory.join("allowed");
     let html = allowed.join("page.HTML");
@@ -142,18 +147,126 @@ fn configured_file_provider_sets_allowlisted_media_types_only() {
         Some("text/html; charset=utf-8")
     );
     assert_eq!(
+        typed.headers.get("x-content-type-options").as_deref(),
+        Some("nosniff")
+    );
+    assert_eq!(
         runtime.block_on(typed.body.bytes()).unwrap(),
         b"<h1>typed</h1>"
     );
 
-    let untyped = runtime
-        .block_on(controller.fetch(navigation(
+    assert!(matches!(
+        runtime.block_on(controller.fetch(navigation(
             &file_access,
             net::Url::from_file_path(&unknown).unwrap(),
+        ))),
+        Err(net::RequestError::Provider {
+            provider: "file",
+            kind: net::ProviderErrorKind::UnsupportedResource,
+        })
+    ));
+
+    drop(controller);
+    drop(file_access);
+    drop(runtime);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn configured_file_provider_enforces_a_session_byte_budget() {
+    let directory = temporary_directory();
+    let allowed = directory.join("allowed");
+    let first = allowed.join("first.html");
+    let second = allowed.join("second.html");
+    fs::create_dir(&allowed).unwrap();
+    fs::write(&first, b"one").unwrap();
+    fs::write(&second, b"two").unwrap();
+    let file_access = file_access_with_limits(
+        [allowed],
+        FileAccessLimits {
+            max_session_bytes: 5,
+            ..FileAccessLimits::default()
+        },
+    );
+    let controller = request_controller(Some(file_access.clone()));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let first_response = runtime
+        .block_on(controller.fetch(navigation(
+            &file_access,
+            net::Url::from_file_path(&first).unwrap(),
         )))
         .unwrap();
-    assert_eq!(untyped.headers.get("content-type"), None);
-    assert_eq!(runtime.block_on(untyped.body.bytes()).unwrap(), b"bytes");
+    assert_eq!(
+        runtime.block_on(first_response.body.bytes()).unwrap(),
+        b"one"
+    );
+
+    let second_response = runtime
+        .block_on(controller.fetch(navigation(
+            &file_access,
+            net::Url::from_file_path(&second).unwrap(),
+        )))
+        .unwrap();
+    assert!(matches!(
+        runtime.block_on(second_response.body.bytes()),
+        Err(net::RequestError::Provider {
+            provider: "file",
+            kind: net::ProviderErrorKind::ResourceExhausted,
+        })
+    ));
+
+    drop(controller);
+    drop(file_access);
+    drop(runtime);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn file_access_configuration_rejects_zero_resource_limits() {
+    for limits in [
+        FileAccessLimits {
+            max_file_size: 0,
+            ..FileAccessLimits::default()
+        },
+        FileAccessLimits {
+            max_session_bytes: 0,
+            ..FileAccessLimits::default()
+        },
+        FileAccessLimits {
+            max_read_duration: Duration::ZERO,
+            ..FileAccessLimits::default()
+        },
+    ] {
+        assert!(matches!(
+            FileAccessConfiguration::from_trusted_directory_selections([], limits),
+            Err(security::file_access::FileAccessError::InvalidPath)
+        ));
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+#[test]
+fn configured_file_provider_rejects_native_executable_signatures() {
+    let directory = temporary_directory();
+    let allowed = directory.join("allowed");
+    let executable = allowed.join("disguised.html");
+    fs::create_dir(&allowed).unwrap();
+    fs::write(&executable, b"\x7fELFnot-html").unwrap();
+    let file_access = file_access([allowed]);
+    let controller = request_controller(Some(file_access.clone()));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    assert!(matches!(
+        runtime.block_on(controller.fetch(navigation(
+            &file_access,
+            net::Url::from_file_path(&executable).unwrap(),
+        ))),
+        Err(net::RequestError::Provider {
+            provider: "file",
+            kind: net::ProviderErrorKind::UnsupportedResource,
+        })
+    ));
 
     drop(controller);
     drop(file_access);

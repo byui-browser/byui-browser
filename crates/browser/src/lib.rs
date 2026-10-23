@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use html::Query;
 use js::{JsResult, Realm, Value};
@@ -24,6 +24,23 @@ pub mod file_provider;
 pub struct FileAccessLimits {
     /// Maximum number of bytes in one local file admitted for `GET` or `HEAD`.
     pub max_file_size: u64,
+    /// Maximum cumulative response-body bytes delivered by this session.
+    /// `HEAD` responses consume no bytes from this budget.
+    pub max_session_bytes: u64,
+    /// Maximum elapsed time for setup and streaming of one admitted `GET`.
+    pub max_read_duration: Duration,
+}
+
+/// Browser-owned interpretation policy for responses from a local-file session.
+///
+/// The currently supported static mode permits only extension-classified HTML,
+/// CSS, and passive raster images. It does not authorize JavaScript, SVG,
+/// unknown binary data, or local-file subresources; a future script-capable
+/// mode requires document/container identity enforcement end to end.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileAccessContentPolicy {
+    /// Render only static, top-level documents and passive response types.
+    StaticDocument,
 }
 
 impl Default for FileAccessLimits {
@@ -31,6 +48,8 @@ impl Default for FileAccessLimits {
     fn default() -> Self {
         Self {
             max_file_size: 64 * 1024 * 1024,
+            max_session_bytes: 256 * 1024 * 1024,
+            max_read_duration: Duration::from_secs(30),
         }
     }
 }
@@ -42,6 +61,7 @@ pub struct FileAccessConfiguration {
     grants: file_provider::FileAccessGrantSource,
     navigation_authorizations: Arc<file_provider::FileNavigationAuthorizations>,
     limits: FileAccessLimits,
+    content_policy: FileAccessContentPolicy,
 }
 
 impl FileAccessConfiguration {
@@ -58,6 +78,12 @@ impl FileAccessConfiguration {
         selected_directories: impl IntoIterator<Item = TrustedDirectorySelection>,
         limits: FileAccessLimits,
     ) -> Result<Self, FileAccessError> {
+        if limits.max_file_size == 0
+            || limits.max_session_bytes == 0
+            || limits.max_read_duration.is_zero()
+        {
+            return Err(FileAccessError::InvalidPath);
+        }
         let capability = Arc::new(FileAccessCapability::from_trusted_directory_selections(
             selected_directories,
         )?);
@@ -72,6 +98,7 @@ impl FileAccessConfiguration {
             grants,
             navigation_authorizations,
             limits,
+            content_policy: FileAccessContentPolicy::StaticDocument,
         })
     }
 
@@ -82,6 +109,11 @@ impl FileAccessConfiguration {
     /// cancels pending setup plus live response bodies from this session.
     pub fn grant_source(&self) -> file_provider::FileAccessGrantSource {
         self.grants.clone()
+    }
+
+    /// Returns the interpretation policy enforced for this local-file session.
+    pub fn content_policy(&self) -> FileAccessContentPolicy {
+        self.content_policy
     }
 
     /// Creates a request authorized as one top-level local-file navigation.
@@ -139,7 +171,8 @@ pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<R
             file_access.capability,
             file_access.grants,
             file_access.navigation_authorizations,
-            file_access.limits.max_file_size,
+            file_access.limits,
+            file_access.content_policy,
         ));
     }
     Arc::new(

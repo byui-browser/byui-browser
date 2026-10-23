@@ -1,4 +1,8 @@
-use std::{fs, io::Read, path::PathBuf};
+use std::{
+    fs,
+    io::{Read, Seek, SeekFrom},
+    path::PathBuf,
+};
 
 use cap_fs_ext::MetadataExt;
 use cap_std::{ambient_authority, fs::Dir};
@@ -101,6 +105,23 @@ impl OpenedFile {
     /// reopens the authorized pathname.
     pub fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize, FileAccessError> {
         self.file.read(buffer).map_err(FileAccessError::from)
+    }
+
+    /// Reads up to `buffer.len()` leading bytes without changing the next
+    /// chunk returned by [`Self::read_chunk`].
+    ///
+    /// Browser policy may use this bounded inspection to reject native
+    /// executable formats before publishing response metadata. The operation
+    /// is blocking and continues to use this retained authorized handle.
+    pub fn read_prefix(&mut self, buffer: &mut [u8]) -> Result<usize, FileAccessError> {
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(FileAccessError::from)?;
+        let count = self.file.read(buffer).map_err(FileAccessError::from)?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(FileAccessError::from)?;
+        Ok(count)
     }
 
     /// Returns the file length observed when the handle was opened.

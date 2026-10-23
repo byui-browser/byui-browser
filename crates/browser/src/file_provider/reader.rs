@@ -3,7 +3,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use net::{AbortSignal, RequestError};
@@ -11,8 +11,8 @@ use security::file_access::{FileAccessLease, OpenedFile};
 use tokio::sync::mpsc;
 
 use super::{
-    policy::{provider_error, provider_io_error},
-    session::FileAccessCancellation,
+    policy::{provider_error, provider_io_error, provider_resource_exhausted_error},
+    session::{FileAccessCancellation, FileSessionByteBudget},
 };
 
 pub(super) const FILE_READ_CHUNK_SIZE: usize = 64 * 1024;
@@ -29,6 +29,8 @@ pub(super) struct FileReadTask {
     pub(super) lease: FileAccessLease,
     pub(super) signal: AbortSignal,
     pub(super) expected_length: u64,
+    pub(super) deadline: Instant,
+    pub(super) session_budget: FileSessionByteBudget,
 }
 
 /// Reads an opened file on Tokio's blocking pool and sends bounded body chunks.
@@ -41,6 +43,18 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
             || !task.lease.is_current()
             || task.signal.is_aborted()
         {
+            return;
+        }
+        if Instant::now() >= task.deadline {
+            let _ = send_chunk(
+                &task.sender,
+                Err(provider_resource_exhausted_error()),
+                &task.cancelled,
+                &task.session_cancellation,
+                &task.lease,
+                &task.signal,
+                task.deadline,
+            );
             return;
         }
         if remaining == 0 {
@@ -58,6 +72,7 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
                         &task.session_cancellation,
                         &task.lease,
                         &task.signal,
+                        task.deadline,
                     );
                     return;
                 }
@@ -69,6 +84,7 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
                         &task.session_cancellation,
                         &task.lease,
                         &task.signal,
+                        task.deadline,
                     );
                     return;
                 }
@@ -89,11 +105,24 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
                     &task.session_cancellation,
                     &task.lease,
                     &task.signal,
+                    task.deadline,
                 );
                 return;
             }
             Ok(count) => {
                 remaining -= count as u64;
+                if !task.session_budget.try_consume(count as u64) {
+                    let _ = send_chunk(
+                        &task.sender,
+                        Err(provider_resource_exhausted_error()),
+                        &task.cancelled,
+                        &task.session_cancellation,
+                        &task.lease,
+                        &task.signal,
+                        task.deadline,
+                    );
+                    return;
+                }
                 if !send_chunk(
                     &task.sender,
                     Ok(buffer[..count].to_vec()),
@@ -101,6 +130,7 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
                     &task.session_cancellation,
                     &task.lease,
                     &task.signal,
+                    task.deadline,
                 ) {
                     return;
                 }
@@ -113,6 +143,7 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
                     &task.session_cancellation,
                     &task.lease,
                     &task.signal,
+                    task.deadline,
                 );
                 return;
             }
@@ -128,6 +159,7 @@ fn send_chunk(
     session_cancellation: &FileAccessCancellation,
     lease: &FileAccessLease,
     signal: &AbortSignal,
+    deadline: Instant,
 ) -> bool {
     loop {
         if cancelled.load(Ordering::Acquire)
@@ -135,6 +167,9 @@ fn send_chunk(
             || !lease.is_current()
             || signal.is_aborted()
         {
+            return false;
+        }
+        if Instant::now() >= deadline {
             return false;
         }
         match sender.try_send(chunk) {

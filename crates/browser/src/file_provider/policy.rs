@@ -47,3 +47,48 @@ pub(super) fn provider_error(error: FileAccessError) -> RequestError {
         kind,
     }
 }
+
+/// Accepts only formats safe for the current navigation-only static mode.
+/// Script, SVG, JSON, and untyped files remain denied until a browser-owned
+/// document/container policy can enforce their consumers end to end.
+pub(super) fn allows_content(
+    policy: crate::FileAccessContentPolicy,
+    media_type: Option<&str>,
+) -> bool {
+    match policy {
+        crate::FileAccessContentPolicy::StaticDocument => matches!(
+            media_type,
+            Some("text/html; charset=utf-8")
+                | Some("text/css; charset=utf-8")
+                | Some("image/png")
+                | Some("image/jpeg")
+                | Some("image/gif")
+                | Some("image/webp")
+        ),
+    }
+}
+
+/// Returns whether a bounded prefix identifies a native executable on this
+/// platform. This is intentionally a conservative format check, not malware
+/// detection or a claim to recognize every executable/polyglot format.
+pub(super) fn is_native_executable_prefix(prefix: &[u8]) -> bool {
+    #[cfg(windows)]
+    {
+        prefix.starts_with(b"MZ")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        matches!(
+            prefix,
+            [0xfe, 0xed, 0xfa, 0xce, ..]
+                | [0xce, 0xfa, 0xed, 0xfe, ..]
+                | [0xfe, 0xed, 0xfa, 0xcf, ..]
+                | [0xcf, 0xfa, 0xed, 0xfe, ..]
+                | [0xca, 0xfe, 0xba, 0xbe, ..]
+        );
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        prefix.starts_with(b"\x7fELF")
+    }
+}

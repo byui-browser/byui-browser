@@ -3,6 +3,28 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+/// Shared, monotonically consumed response-byte budget for one file session.
+#[derive(Clone, Debug)]
+pub(super) struct FileSessionByteBudget {
+    remaining: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl FileSessionByteBudget {
+    pub(super) fn new(limit: u64) -> Self {
+        Self {
+            remaining: Arc::new(std::sync::atomic::AtomicU64::new(limit)),
+        }
+    }
+
+    pub(super) fn try_consume(&self, bytes: u64) -> bool {
+        self.remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(bytes)
+            })
+            .is_ok()
+    }
+}
+
 use security::file_access::{FileAccessGrant, FileAccessLease};
 use tokio::sync::Notify;
 

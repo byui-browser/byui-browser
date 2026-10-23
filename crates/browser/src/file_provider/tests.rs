@@ -111,7 +111,12 @@ fn revocation_after_file_setup_rejects_get_and_head_and_releases_admission() {
             Arc::clone(&capability),
             grants.clone(),
             Arc::clone(&navigation_authorizations),
-            u64::MAX,
+            crate::FileAccessLimits {
+                max_file_size: u64::MAX,
+                max_session_bytes: u64::MAX,
+                ..crate::FileAccessLimits::default()
+            },
+            crate::FileAccessContentPolicy::StaticDocument,
         );
         provider.post_setup_hook = Some(Arc::new(move || hook_grants.revoke()));
         let mut request = Request::get(url.clone());
@@ -138,7 +143,9 @@ fn revocation_after_file_setup_rejects_get_and_head_and_releases_admission() {
             grants: provider.grants.clone(),
             navigation_authorizations: Arc::clone(&provider.navigation_authorizations),
             read_admission: provider.read_admission.clone(),
-            max_file_size: provider.max_file_size,
+            limits: provider.limits,
+            session_budget: provider.session_budget.clone(),
+            content_policy: provider.content_policy,
             post_setup_hook: None,
         };
         let mut probe_request = Request::get(url.clone());
@@ -170,12 +177,40 @@ fn revoked_session_never_delivers_an_already_queued_chunk() {
         session_cancellation: FileAccessCancellation::new(),
         lease,
         reported_session_cancellation: false,
+        deadline: std::time::Instant::now() + Duration::from_secs(1),
+        reported_timeout: false,
     };
     let runtime = tokio::runtime::Runtime::new().unwrap();
 
     assert!(matches!(
         runtime.block_on(body.next()),
         Some(Err(RequestError::Aborted))
+    ));
+}
+
+#[test]
+fn timed_out_file_body_reports_resource_exhaustion() {
+    let capability = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
+    let grant = capability.issue_grant();
+    let lease = grant.lease().unwrap();
+    let (_sender, receiver) = mpsc::channel(1);
+    let mut body = FileBodyStream {
+        receiver,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        session_cancellation: FileAccessCancellation::new(),
+        lease,
+        reported_session_cancellation: false,
+        deadline: std::time::Instant::now(),
+        reported_timeout: false,
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    assert!(matches!(
+        runtime.block_on(body.next()),
+        Some(Err(RequestError::Provider {
+            provider: "file",
+            kind: ProviderErrorKind::ResourceExhausted,
+        }))
     ));
 }
 
@@ -206,7 +241,12 @@ fn dropping_unread_or_partially_read_body_releases_reader_admission() {
         Arc::clone(&capability),
         grants,
         Arc::clone(&navigation_authorizations),
-        u64::MAX,
+        crate::FileAccessLimits {
+            max_file_size: u64::MAX,
+            max_session_bytes: u64::MAX,
+            ..crate::FileAccessLimits::default()
+        },
+        crate::FileAccessContentPolicy::StaticDocument,
     );
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let url = Url::from_file_path(&file).unwrap();
@@ -272,7 +312,12 @@ fn file_body_fails_when_opened_length_does_not_match_live_bytes() {
             Arc::clone(&capability),
             grants.clone(),
             Arc::clone(&navigation_authorizations),
-            u64::MAX,
+            crate::FileAccessLimits {
+                max_file_size: u64::MAX,
+                max_session_bytes: u64::MAX,
+                ..crate::FileAccessLimits::default()
+            },
+            crate::FileAccessContentPolicy::StaticDocument,
         );
         provider.post_setup_hook = Some(Arc::new(move || {
             fs::write(&replacement_path, &replacement).unwrap();

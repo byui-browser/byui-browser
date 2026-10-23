@@ -32,19 +32,81 @@ native directory picker is provided by this crate. Renderer, web-content, and
 ordinary request-construction code must not receive selections or
 `FileAccessCapability` values.
 
+## Active-content policy
+
+The browser uses the following conservative policy for local-file responses.
+These decisions are part of the browser contract even where enforcement is
+still listed as remaining work below.
+
+### Default permission level
+
+The default local-file mode is static top-level document rendering. A
+browser-issued navigation may return an allowlisted static HTML document, CSS,
+or passive raster image. The provider currently denies every local-file
+subresource because it has no document/container identity; consequently,
+linked stylesheets, images, fonts, and media are not yet loaded from local
+files even when their types would otherwise be passive.
+
+The default mode does not enable JavaScript, workers, service workers, nested
+browsing contexts, popups, external network requests, cookies, HTTP-cache
+state, local storage, IndexedDB, uploads, or arbitrary filesystem access.
+Forms and other user-mediated operations remain denied unless a separate
+browser policy explicitly authorizes them. Enabling script-capable local web
+applications is a distinct, opt-in mode and must not be inferred from a file
+extension.
+
+- Media types are classified from a browser-owned extension allowlist. General
+  MIME sniffing is not used initially; caller-controlled bytes must not change
+  the declared media type. Any future sniffing must be a separate,
+  security-reviewed policy component rather than ad hoc stream logic.
+- Local responses with a declared media type include
+  `X-Content-Type-Options: nosniff`. This reduces consumer-side
+  reinterpretation but is not, by itself, a substitute for provider
+  classification and active-content checks.
+- Unknown extensions are treated as inert binary data. If the consuming path
+  cannot guarantee inert handling, the provider denies the resource instead.
+  Unknown content must never receive an inferred active media type.
+- Native executable formats are denied regardless of filename extension where
+  the platform can identify them. This policy does not claim to detect every
+  possible executable or polyglot file.
+- HTML and direct static CSS/image responses are enabled by the default mode.
+  JavaScript, active SVG behavior, JSON, unknown files, and other
+  script-capable or active formats require an explicit browser-owned
+  active-content policy. The default remains deny for scripting until that
+  policy is available end to end, including scripting and subresource rules.
+- Directories and unsupported or disallowed files retain stable,
+  non-diagnostic provider error categories. Trusted browser diagnostics may
+  record a sanitized policy reason, but web-visible errors must not disclose
+  sensitive paths, contents, or detailed OS information.
+
+The policy is intentionally stricter than merely assigning an opaque origin.
+An opaque origin prevents local documents from sharing a tuple origin, but it
+does not by itself make active bytes safe to parse or execute. Enforcement must
+occur before response metadata is published and must remain consistent with
+the existing revocation and cancellation checks.
+
 ## Remaining work
 
 ### 1. Complete resource and active-content limits
 
-Define and enforce maximum read duration, total bytes served per session,
-aggregate blocking-reader/channel memory, and platform-specific I/O limits.
+The provider now enforces a 30-second default setup/stream deadline, a
+256 MiB default cumulative body-byte budget per session, four active readers,
+eight queued readers, and at most 512 KiB of queued payload (four readers,
+two 64 KiB chunks each). Browser-owned configuration may tighten or raise the
+file, session-byte, and duration limits; zero-valued limits are rejected.
 
-Define MIME sniffing, `nosniff`, and executable-content rules before local
-HTML, JavaScript, images, stylesheets, or other active content is interpreted.
-Decide whether directories and unsupported types retain the current
-non-diagnostic error categories or receive dedicated errors. Test each limit
-at its boundary, including slow reads, contention, queue exhaustion, and
-cancellation.
+Only static HTML/CSS and passive PNG, JPEG, GIF, and WebP responses are
+admitted. Unknown, JavaScript, JSON, SVG, and other unsupported types are
+denied, declared responses carry `X-Content-Type-Options: nosniff`, and a
+bounded prefix check rejects recognizable native executable headers on the
+current platform. This remains a provider policy, not a renderer capability:
+the current provider still denies all local-file subresources and does not
+authorize script interpretation.
+
+Remaining work is to expose a configurable byte-buffer cap if channel sizing
+becomes configurable, establish cancellable platform I/O deadlines rather
+than enforcing the deadline at provider observation points, and add targeted
+slow-I/O and full-channel timeout tests on each supported platform.
 
 ### 2. Define mutable-file and stream-consistency semantics
 
