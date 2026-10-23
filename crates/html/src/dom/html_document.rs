@@ -105,6 +105,48 @@ impl HTMLDocument {
         Ok(self.push_node(NodeKind::Element(element), None))
     }
 
+    /// Sets an element's attribute using the DOM `setAttribute` rules.
+    ///
+    /// HTML attribute names are normalized to ASCII lowercase. Existing
+    /// attributes are updated in place so their document order is preserved;
+    /// new attributes are appended. Names that are not valid attribute local
+    /// names return [`DomError::InvalidCharacter`].
+    pub fn set_attribute(
+        &mut self,
+        element: NodeId,
+        qualified_name: &str,
+        value: &str,
+    ) -> Result<(), DomError> {
+        if !is_valid_attribute_local_name(qualified_name) {
+            return Err(DomError::InvalidCharacter);
+        }
+
+        let node = self.node_mut(element).ok_or(DomError::NotFound)?;
+        let NodeKind::Element(element_data) = &mut node.kind else {
+            return Err(DomError::NotFound);
+        };
+
+        let name = match element_data.namespace {
+            Namespace::Html => qualified_name.to_ascii_lowercase(),
+            Namespace::Svg | Namespace::MathMl => qualified_name.to_owned(),
+        };
+
+        if let Some(attribute) = element_data
+            .attributes
+            .iter_mut()
+            .find(|attribute| attribute.name == name)
+        {
+            attribute.value = value.to_owned();
+        } else {
+            element_data.attributes.push(super::attribute::Attribute {
+                name,
+                value: value.to_owned(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Returns the DOM `textContent` value for a node.
     ///
     /// Element nodes return the concatenation of descendant text nodes in tree
@@ -230,6 +272,7 @@ impl HTMLDocument {
                 output.push_str(comment);
                 output.push_str("-->");
             }
+            NodeKind::None => {}
         }
     }
 
@@ -344,4 +387,15 @@ fn is_valid_element_local_name(name: &str) -> bool {
             || matches!(character, '-' | '.' | ':' | '_')
             || (character as u32) >= 0x80
     })
+}
+
+fn is_valid_attribute_local_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|character| {
+            !is_ascii_whitespace(character)
+                && character != '\0'
+                && character != '/'
+                && character != '='
+                && character != '>'
+        })
 }
