@@ -210,6 +210,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "browser-js"
+version = "0.1.0"
+dependencies = [
+ "js",
+]
+
+[[package]]
 name = "browser-linux"
 version = "0.1.0"
 dependencies = [
