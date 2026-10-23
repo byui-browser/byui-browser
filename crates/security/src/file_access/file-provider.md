@@ -33,6 +33,8 @@ non-diagnostic `Io` category.
 An allowlisted, case-insensitive filename extension determines the media type
 for HTML, CSS, JavaScript, JSON, and common image formats. Unknown extensions
 omit `Content-Type`; the provider does not sniff file contents.
+Directories and other non-regular files fail with the stable, non-diagnostic
+`UnsupportedResource` category rather than being reported as generic I/O.
 The provider avoids HTTP transport, cookies, service
 workers, and the HTTP cache, and exposes stable non-diagnostic error
 categories. Browser and security tests cover the implemented authorization,
@@ -91,8 +93,6 @@ files, while preserving fail-closed behavior.
   policy is needed before local HTML, script, image, or similar content is
   interpreted. The current extension allowlist omits unknown types and does
   not inspect file contents.
-- Decide whether directories and other unsupported file types should retain the
-  current non-diagnostic `Io` category or receive a dedicated category.
 
 ### Stream consistency and lifecycle coverage
 

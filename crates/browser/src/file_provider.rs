@@ -619,7 +619,7 @@ fn provider_error(error: FileAccessError) -> RequestError {
         FileAccessError::Missing => ProviderErrorKind::ResourceMissing,
         FileAccessError::Denied => ProviderErrorKind::AccessDenied,
         FileAccessError::InvalidPath => ProviderErrorKind::MalformedMetadata,
-        FileAccessError::UnsupportedFile => ProviderErrorKind::Io,
+        FileAccessError::UnsupportedFile => ProviderErrorKind::UnsupportedResource,
         FileAccessError::Io => ProviderErrorKind::Io,
     };
     RequestError::Provider {

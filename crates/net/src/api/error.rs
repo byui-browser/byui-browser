@@ -7,6 +7,8 @@ use crate::HeaderGuard;
 pub enum ProviderErrorKind {
     /// The requested resource does not exist.
     ResourceMissing,
+    /// The requested resource exists but is not a type the provider can serve.
+    UnsupportedResource,
     /// A previously valid resource is no longer available.
     Revoked,
     /// Browser authorization or sandbox policy denied access.
