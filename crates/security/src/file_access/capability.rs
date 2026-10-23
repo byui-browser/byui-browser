@@ -1,8 +1,10 @@
 use std::{
-    fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
+
+#[cfg(windows)]
+use std::fs;
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
@@ -95,41 +97,48 @@ impl FileAccessCapability {
         requested: impl AsRef<Path>,
     ) -> Result<(usize, PathBuf), FileAccessError> {
         // Establish root eligibility without touching the filesystem. This
-        // prevents a caller from learning whether an ineligible path exists
-        // based on the error returned by canonicalize.
+        // prevents a caller from learning whether an ineligible path exists.
         let lexical = normalize_absolute_path(requested.as_ref())?;
-        let lexical_root = self
+        if let Some((root_index, root)) = self
             .roots
             .iter()
             .enumerate()
-            .filter(|(_, root)| {
-                normalize_absolute_path(&root.canonical_path)
-                    .map(|root| lexical.starts_with(&root))
-                    .unwrap_or(false)
+            .filter_map(|(root_index, root)| {
+                let root_components = normalize_absolute_path(&root.canonical_path).ok()?;
+                lexical
+                    .starts_with(&root_components)
+                    .then_some((root_index, root_components))
             })
-            .max_by_key(|(_, root)| root.canonical_path.components().count());
+            .max_by_key(|(_, root_components)| root_components.len())
+        {
+            return Ok((root_index, relative_path(&lexical[root.len()..])?));
+        }
 
-        let canonical = match fs::canonicalize(requested.as_ref()) {
-            Ok(canonical) => canonical,
-            Err(error) if lexical_root.is_none() => {
-                // A Windows short-name path can be inside a root even when
-                // lexical components do not match the canonical long-name
-                // root. Resolve only to normalize that alias. Every failure
-                // in this fallback remains a denial, so it cannot disclose
-                // whether an unauthorized path exists.
-                let parent = requested.as_ref().parent().ok_or(FileAccessError::Denied)?;
-                let canonical_parent =
-                    fs::canonicalize(parent).map_err(|_| FileAccessError::Denied)?;
-                if !self
-                    .roots
-                    .iter()
-                    .any(|root| canonical_parent.starts_with(&root.canonical_path))
-                {
-                    return Err(FileAccessError::Denied);
+        self.authorize_windows_alias(requested.as_ref())
+    }
+
+    /// Resolves a Windows path spelling that cannot be compared lexically.
+    ///
+    /// Long-name, short-name, and extended-length spellings can identify a
+    /// selected directory without sharing the canonical path's components.
+    /// This fallback is unavailable on other platforms, where a lexical miss
+    /// is always denied without a filesystem lookup.
+    #[cfg(windows)]
+    fn authorize_windows_alias(
+        &self,
+        requested: &Path,
+    ) -> Result<(usize, PathBuf), FileAccessError> {
+        let mut unresolved = Vec::new();
+        let mut candidate = requested;
+        let canonical = loop {
+            match fs::canonicalize(candidate) {
+                Ok(canonical) => break canonical,
+                Err(_) => {
+                    let name = candidate.file_name().ok_or(FileAccessError::Denied)?;
+                    unresolved.push(name.to_owned());
+                    candidate = candidate.parent().ok_or(FileAccessError::Denied)?;
                 }
-                return Err(FileAccessError::from(error));
             }
-            Err(error) => return Err(FileAccessError::from(error)),
         };
         let Some((root_index, root)) = self
             .roots
@@ -140,13 +149,18 @@ impl FileAccessCapability {
         else {
             return Err(FileAccessError::Denied);
         };
-        if !canonical.starts_with(&root.canonical_path) {
-            return Err(FileAccessError::Denied);
-        }
         let relative = canonical
             .strip_prefix(&root.canonical_path)
             .map(Path::to_path_buf)
             .map_err(|_| FileAccessError::InvalidPath)?;
+        let mut relative = if relative.as_os_str().is_empty() {
+            PathBuf::new()
+        } else {
+            relative
+        };
+        for component in unresolved.iter().rev() {
+            relative.push(component);
+        }
         Ok((
             root_index,
             if relative.as_os_str().is_empty() {
@@ -155,6 +169,14 @@ impl FileAccessCapability {
                 relative
             },
         ))
+    }
+
+    #[cfg(not(windows))]
+    fn authorize_windows_alias(
+        &self,
+        _requested: &Path,
+    ) -> Result<(usize, PathBuf), FileAccessError> {
+        Err(FileAccessError::Denied)
     }
 
     fn open_relative(
@@ -182,8 +204,9 @@ impl FileAccessCapability {
 
 /// Normalizes path syntax without resolving filesystem objects.
 ///
-/// This is deliberately performed before canonicalization so paths outside a
-/// trusted root receive the same denial regardless of whether they exist.
+/// Paths matching a trusted root are opened from the retained root handle
+/// without canonicalization. Paths outside a trusted root receive the same
+/// denial regardless of whether they exist.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum LexicalComponent {
     Prefix(std::ffi::OsString),
@@ -229,6 +252,22 @@ fn normalize_absolute_path(path: &Path) -> Result<Vec<LexicalComponent>, FileAcc
     }
 }
 
+/// Builds a retained-root-relative path from normalized lexical components.
+fn relative_path(components: &[LexicalComponent]) -> Result<PathBuf, FileAccessError> {
+    let mut relative = PathBuf::new();
+    for component in components {
+        let LexicalComponent::Normal(name) = component else {
+            return Err(FileAccessError::InvalidPath);
+        };
+        relative.push(name);
+    }
+    Ok(if relative.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        relative
+    })
+}
+
 /// Returns the safe, deterministic media type associated with a file name.
 ///
 /// This intentionally relies only on an allowlisted filename extension. It
@@ -262,9 +301,9 @@ pub(super) fn media_type_for_path(path: &Path) -> Option<&'static str> {
 /// Opens a regular-file candidate one component at a time beneath `root`.
 ///
 /// Every component is opened relative to a handle retained from the trusted
-/// root selection, with symlink following disabled. This prevents a component
-/// replacement after pathname authorization from redirecting the eventual
-/// open outside the selected tree.
+/// root selection, after explicitly rejecting symlinks and with symlink
+/// following disabled. This prevents a component replacement after pathname
+/// authorization from redirecting the eventual open outside the selected tree.
 pub(super) fn open_relative_nofollow(
     root: &Dir,
     relative: &Path,
@@ -277,6 +316,14 @@ pub(super) fn open_relative_nofollow(
         let std::path::Component::Normal(name) = component else {
             return Err(FileAccessError::InvalidPath);
         };
+        if directory
+            .symlink_metadata(name)
+            .map_err(FileAccessError::from)?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(FileAccessError::Denied);
+        }
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         let opened = directory

@@ -433,6 +433,15 @@ fn file_provider_maps_missing_directories_and_malformed_urls() {
         })
     ));
 
+    let missing_allowed = net::Url::from_file_path(allowed.join("missing.html")).unwrap();
+    assert!(matches!(
+        runtime.block_on(controller.fetch(navigation(&file_access, missing_allowed))),
+        Err(net::RequestError::Provider {
+            provider: "file",
+            kind: net::ProviderErrorKind::ResourceMissing
+        })
+    ));
+
     let directory_url = net::Url::from_file_path(&allowed).unwrap();
     assert!(matches!(
         runtime.block_on(controller.fetch(navigation(&file_access, directory_url))),

@@ -57,18 +57,22 @@ Do not introduce a fallback that reauthorizes and reopens the root pathname.
 
 ### 2. Remove path-existence oracles — implemented
 
-Path authorization now performs lexical/root eligibility before canonicalizing a
-requested path. Existing and missing paths outside configured roots both return
-`AccessDenied`; missing paths that are eligible under an allowed root continue
-to return `ResourceMissing`.
+Path authorization now performs lexical/root eligibility before filesystem
+resolution. Paths matching a trusted root are opened solely from its retained
+handle; existing and missing paths outside configured roots both return
+`AccessDenied`, while missing paths that are eligible under an allowed root
+continue to return `ResourceMissing`. Symlink components are explicitly denied
+before they are opened, so existing and missing targets through an escaping
+symlink cannot reveal different results.
 
 Windows path-alias fallback is also fail-closed: when lexical components do not
 match a canonical root, filesystem normalization is used only to resolve the
 alias, and every ineligible or failed fallback remains `AccessDenied`.
 
-Regression tests cover existing and missing outside-root paths and missing
-eligible paths. Keep extending this coverage for malformed paths, traversal,
-symlinked paths, UNC paths, and other platform-specific aliases.
+Regression tests cover existing and missing outside-root paths, missing eligible
+paths, traversal, and Unix symlink escapes. Keep extending this coverage for
+malformed paths, UNC paths, Windows reparse points, and other platform-specific
+aliases.
 
 ### 3. Make revocation fully linearizable
 

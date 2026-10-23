@@ -218,6 +218,32 @@ mod tests {
     }
 
     #[test]
+    fn traversal_outside_a_root_is_denied_without_an_existence_oracle() {
+        let directory = temporary_directory();
+        let allowed = directory.join("allowed");
+        let existing_outside = directory.join("outside.html");
+        fs::create_dir(&allowed).unwrap();
+        fs::write(&existing_outside, b"outside").unwrap();
+        let capability =
+            FileAccessCapability::from_trusted_directory_selections([trusted_selection(&allowed)])
+                .unwrap();
+        let grant = capability.issue_grant();
+
+        for path in [
+            allowed.join("..").join("outside.html"),
+            allowed.join("..").join("missing.html"),
+        ] {
+            assert!(matches!(
+                capability.open_authorized_file(&navigation_context(), &grant, path),
+                Err(FileAccessError::Denied)
+            ));
+        }
+
+        drop(capability);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn capability_grants_are_bound_to_one_capability() {
         let first = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
         let second = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
@@ -379,6 +405,14 @@ mod tests {
                 &navigation_context(),
                 &grant,
                 allowed.join("escape").join("secret.txt"),
+            ),
+            Err(FileAccessError::Denied)
+        ));
+        assert!(matches!(
+            capability.open_authorized_file(
+                &navigation_context(),
+                &grant,
+                allowed.join("escape").join("missing.txt"),
             ),
             Err(FileAccessError::Denied)
         ));
