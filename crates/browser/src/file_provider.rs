@@ -650,7 +650,7 @@ mod tests {
 
     use cap_std::{ambient_authority, fs::Dir};
     use futures_util::StreamExt;
-    use security::file_access::TrustedFileAccessRoot;
+    use security::file_access::TrustedDirectorySelection;
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -717,12 +717,13 @@ mod tests {
         let file = directory.join("page.html");
         fs::write(&file, b"prepared content").unwrap();
         let canonical_directory = fs::canonicalize(&directory).unwrap();
-        let root = TrustedFileAccessRoot::from_open_directory(
+        let selection = TrustedDirectorySelection::from_open_directory(
             canonical_directory,
             Dir::open_ambient_dir(&directory, ambient_authority()).unwrap(),
         )
         .unwrap();
-        let capability = Arc::new(FileAccessCapability::from_trusted_roots([root]).unwrap());
+        let capability =
+            Arc::new(FileAccessCapability::from_trusted_directory_selections([selection]).unwrap());
         let navigation_authorizations = Arc::new(FileNavigationAuthorizations::new());
         let grants = FileAccessGrantSource::new(
             capability.issue_grant(),
@@ -793,12 +794,13 @@ mod tests {
         let file = directory.join("page.html");
         fs::write(&file, vec![b'x'; FILE_READ_CHUNK_SIZE * 4]).unwrap();
         let canonical_directory = fs::canonicalize(&directory).unwrap();
-        let root = TrustedFileAccessRoot::from_open_directory(
+        let selection = TrustedDirectorySelection::from_open_directory(
             canonical_directory,
             Dir::open_ambient_dir(&directory, ambient_authority()).unwrap(),
         )
         .unwrap();
-        let capability = Arc::new(FileAccessCapability::from_trusted_roots([root]).unwrap());
+        let capability =
+            Arc::new(FileAccessCapability::from_trusted_directory_selections([selection]).unwrap());
         let navigation_authorizations = Arc::new(FileNavigationAuthorizations::new());
         let grants = FileAccessGrantSource::new(
             capability.issue_grant(),
@@ -851,12 +853,13 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let file = directory.join("page.html");
         let canonical_directory = fs::canonicalize(&directory).unwrap();
-        let root = TrustedFileAccessRoot::from_open_directory(
+        let selection = TrustedDirectorySelection::from_open_directory(
             canonical_directory,
             Dir::open_ambient_dir(&directory, ambient_authority()).unwrap(),
         )
         .unwrap();
-        let capability = Arc::new(FileAccessCapability::from_trusted_roots([root]).unwrap());
+        let capability =
+            Arc::new(FileAccessCapability::from_trusted_directory_selections([selection]).unwrap());
         let navigation_authorizations = Arc::new(FileNavigationAuthorizations::new());
         let grants = FileAccessGrantSource::new(
             capability.issue_grant(),

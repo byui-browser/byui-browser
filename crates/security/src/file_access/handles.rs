@@ -4,29 +4,28 @@ use cap_std::fs::Dir;
 
 use super::FileAccessError;
 
-/// A directory capability and its trusted, canonical selection path.
+/// An opaque directory selection approved by trusted platform code.
 ///
-/// Platform integration creates this value immediately from a user-selected
+/// Platform integration creates this value immediately from a user-approved
 /// directory handle (or another already-authorized directory capability). The
-/// path and handle must describe that same selection. In particular, callers
-/// must not construct this from a pathname and then reopen that pathname: that
-/// reintroduces a root-replacement race. Holding a [`Dir`] is the authority;
-/// the path is used only to translate a selected `file:` URL to a relative
-/// name below that authority.
+/// path and handle must describe that same selection. Browser configuration
+/// consumes this value without accessing either part directly. Holding a
+/// [`Dir`] is the authority; the path is used only to translate a selected
+/// `file:` URL to a relative name below that authority.
 #[derive(Debug)]
-pub struct TrustedFileAccessRoot {
+pub struct TrustedDirectorySelection {
     pub(super) canonical_path: PathBuf,
     pub(super) directory: Dir,
 }
 
-impl TrustedFileAccessRoot {
-    /// Combines a trusted canonical selection path with its already-opened
-    /// directory capability.
+impl TrustedDirectorySelection {
+    /// Creates a selection from one trusted platform approval result.
     ///
     /// `canonical_path` must be the absolute, canonical path reported by the
-    /// same trusted platform operation that produced `directory`. This method
-    /// deliberately performs no filesystem lookup, so it cannot reopen a
-    /// replacement at that path. An empty or relative path is rejected.
+    /// same trusted platform operation that produced `directory`. Callers must
+    /// not construct this from a pathname and then reopen that pathname: that
+    /// would reintroduce a root-replacement race. This method deliberately
+    /// performs no filesystem lookup. An empty or relative path is rejected.
     pub fn from_open_directory(
         canonical_path: PathBuf,
         directory: Dir,

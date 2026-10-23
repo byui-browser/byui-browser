@@ -11,7 +11,7 @@ mod request;
 
 pub use capability::FileAccessCapability;
 pub use error::FileAccessError;
-pub use handles::{OpenedFile, TrustedFileAccessRoot};
+pub use handles::{OpenedFile, TrustedDirectorySelection};
 pub use request::{FileAccessGrant, FileOrigin, FileRequestContext, FileRequestKind};
 
 #[cfg(test)]
@@ -41,10 +41,10 @@ mod tests {
         directory
     }
 
-    fn trusted_root(path: &Path) -> TrustedFileAccessRoot {
+    fn trusted_selection(path: &Path) -> TrustedDirectorySelection {
         let canonical_path = fs::canonicalize(path).unwrap();
         let directory = Dir::open_ambient_dir(&canonical_path, ambient_authority()).unwrap();
-        TrustedFileAccessRoot::from_open_directory(canonical_path, directory).unwrap()
+        TrustedDirectorySelection::from_open_directory(canonical_path, directory).unwrap()
     }
 
     fn navigation_context() -> FileRequestContext {
@@ -56,12 +56,12 @@ mod tests {
     }
 
     #[test]
-    fn trusted_root_rejects_a_relative_selection_path() {
+    fn trusted_selection_rejects_a_relative_selection_path() {
         let directory = temporary_directory();
         let handle = Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
 
         assert!(matches!(
-            TrustedFileAccessRoot::from_open_directory(PathBuf::from("relative"), handle),
+            TrustedDirectorySelection::from_open_directory(PathBuf::from("relative"), handle),
             Err(FileAccessError::InvalidPath)
         ));
 
@@ -104,7 +104,8 @@ mod tests {
         fs::write(&allowed_file, b"allowed").unwrap();
         fs::write(&outside, b"denied").unwrap();
         let capability =
-            FileAccessCapability::from_trusted_roots([trusted_root(&allowed)]).unwrap();
+            FileAccessCapability::from_trusted_directory_selections([trusted_selection(&allowed)])
+                .unwrap();
         let grant = capability.issue_grant();
 
         let opened = capability
@@ -122,8 +123,8 @@ mod tests {
 
     #[test]
     fn capability_grants_are_bound_to_one_capability() {
-        let first = FileAccessCapability::from_trusted_roots([]).unwrap();
-        let second = FileAccessCapability::from_trusted_roots([]).unwrap();
+        let first = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
+        let second = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
 
         assert_eq!(
             first.authorize_request(&navigation_context(), &second.issue_grant()),
@@ -133,7 +134,7 @@ mod tests {
 
     #[test]
     fn request_authorization_requires_a_local_navigation() {
-        let capability = FileAccessCapability::from_trusted_roots([]).unwrap();
+        let capability = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
         let grant = capability.issue_grant();
 
         for context in [
@@ -157,8 +158,8 @@ mod tests {
 
     #[test]
     fn denied_requests_do_not_canonicalize_their_path() {
-        let capability = FileAccessCapability::from_trusted_roots([]).unwrap();
-        let another = FileAccessCapability::from_trusted_roots([]).unwrap();
+        let capability = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
+        let another = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
 
         assert!(matches!(
             capability.open_authorized_file(
@@ -174,7 +175,10 @@ mod tests {
     fn root_path_is_not_served_as_a_regular_file() {
         let directory = temporary_directory();
         let capability =
-            FileAccessCapability::from_trusted_roots([trusted_root(&directory)]).unwrap();
+            FileAccessCapability::from_trusted_directory_selections([trusted_selection(
+                &directory,
+            )])
+            .unwrap();
         let grant = capability.issue_grant();
 
         assert!(matches!(
@@ -192,7 +196,10 @@ mod tests {
         let file = directory.join("page.html");
         fs::write(&file, b"authorized bytes").unwrap();
         let capability =
-            FileAccessCapability::from_trusted_roots([trusted_root(&directory)]).unwrap();
+            FileAccessCapability::from_trusted_directory_selections([trusted_selection(
+                &directory,
+            )])
+            .unwrap();
         let grant = capability.issue_grant();
         let mut opened = capability
             .open_authorized_file(&navigation_context(), &grant, &file)
@@ -241,9 +248,11 @@ mod tests {
         fs::create_dir(&parent).unwrap();
         fs::create_dir(&child).unwrap();
         fs::write(&file, b"nested").unwrap();
-        let capability =
-            FileAccessCapability::from_trusted_roots([trusted_root(&parent), trusted_root(&child)])
-                .unwrap();
+        let capability = FileAccessCapability::from_trusted_directory_selections([
+            trusted_selection(&parent),
+            trusted_selection(&child),
+        ])
+        .unwrap();
 
         assert_eq!(capability.authorize_path(&file).unwrap().0, 1);
 
@@ -265,7 +274,8 @@ mod tests {
         fs::write(&secret, b"secret").unwrap();
         symlink(&outside, allowed.join("escape")).unwrap();
         let capability =
-            FileAccessCapability::from_trusted_roots([trusted_root(&allowed)]).unwrap();
+            FileAccessCapability::from_trusted_directory_selections([trusted_selection(&allowed)])
+                .unwrap();
         let grant = capability.issue_grant();
 
         assert!(matches!(
@@ -290,7 +300,10 @@ mod tests {
         fs::write(&path, b"original").unwrap();
         fs::write(&replacement, b"replacement").unwrap();
         let capability =
-            FileAccessCapability::from_trusted_roots([trusted_root(&directory)]).unwrap();
+            FileAccessCapability::from_trusted_directory_selections([trusted_selection(
+                &directory,
+            )])
+            .unwrap();
         let grant = capability.issue_grant();
         let opened = capability
             .open_authorized_file(&navigation_context(), &grant, &path)
@@ -316,7 +329,8 @@ mod tests {
         fs::write(selected.join("page.html"), b"selected root").unwrap();
         fs::write(replacement.join("page.html"), b"replacement root").unwrap();
         let capability =
-            FileAccessCapability::from_trusted_roots([trusted_root(&selected)]).unwrap();
+            FileAccessCapability::from_trusted_directory_selections([trusted_selection(&selected)])
+                .unwrap();
         let grant = capability.issue_grant();
 
         fs::rename(&selected, &previous).unwrap();
@@ -343,7 +357,7 @@ mod tests {
         fs::create_dir(&selected).unwrap();
         fs::write(&target, b"target").unwrap();
         symlink(&target, &link).unwrap();
-        let root = trusted_root(&selected);
+        let root = trusted_selection(&selected);
 
         assert!(open_relative_nofollow(&root.directory, Path::new("link.txt")).is_err());
 
@@ -364,7 +378,7 @@ mod tests {
         fs::create_dir(&target).unwrap();
         fs::write(target.join("page.txt"), b"target").unwrap();
         symlink(&target, &link).unwrap();
-        let root = trusted_root(&selected);
+        let root = trusted_selection(&selected);
 
         assert!(open_relative_nofollow(&root.directory, Path::new("link/page.txt")).is_err());
 

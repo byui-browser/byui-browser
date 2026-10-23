@@ -8,7 +8,7 @@ use browser::{FileAccessConfiguration, FileAccessLimits, request_controller};
 use cap_std::{ambient_authority, fs::Dir};
 use futures_util::StreamExt;
 use net::AbortController;
-use security::file_access::TrustedFileAccessRoot;
+use security::file_access::TrustedDirectorySelection;
 
 static NEXT_TEMP_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -37,10 +37,10 @@ fn file_access_with_limits(
         .map(|path| {
             let canonical_path = fs::canonicalize(&path).unwrap();
             let directory = Dir::open_ambient_dir(&canonical_path, ambient_authority()).unwrap();
-            TrustedFileAccessRoot::from_open_directory(canonical_path, directory).unwrap()
+            TrustedDirectorySelection::from_open_directory(canonical_path, directory).unwrap()
         })
         .collect::<Vec<_>>();
-    FileAccessConfiguration::from_trusted_roots_with_limits(roots, limits).unwrap()
+    FileAccessConfiguration::from_trusted_directory_selections(roots, limits).unwrap()
 }
 
 #[test]
@@ -488,6 +488,48 @@ fn file_provider_denies_revoked_and_subresource_requests_before_opening() {
 
     drop(subresource);
     drop(revoked);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_file_provider_retains_the_selected_directory_handle() {
+    let directory = temporary_directory();
+    let selected = directory.join("selected");
+    let replacement = directory.join("replacement");
+    let previous = directory.join("previous");
+    fs::create_dir(&selected).unwrap();
+    fs::create_dir(&replacement).unwrap();
+    fs::write(selected.join("page.html"), b"selected directory").unwrap();
+    fs::write(replacement.join("page.html"), b"replacement directory").unwrap();
+    let canonical_path = fs::canonicalize(&selected).unwrap();
+    let selected_directory = Dir::open_ambient_dir(&canonical_path, ambient_authority()).unwrap();
+    let selection =
+        TrustedDirectorySelection::from_open_directory(canonical_path, selected_directory).unwrap();
+    let file_access = FileAccessConfiguration::from_trusted_directory_selections(
+        [selection],
+        FileAccessLimits::default(),
+    )
+    .unwrap();
+    let controller = request_controller(Some(file_access.clone()));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    fs::rename(&selected, &previous).unwrap();
+    fs::rename(&replacement, &selected).unwrap();
+    let response = runtime
+        .block_on(controller.fetch(navigation(
+            &file_access,
+            net::Url::from_file_path(selected.join("page.html")).unwrap(),
+        )))
+        .unwrap();
+    assert_eq!(
+        runtime.block_on(response.body.bytes()).unwrap(),
+        b"selected directory"
+    );
+
+    drop(controller);
+    drop(file_access);
+    drop(runtime);
     fs::remove_dir_all(directory).unwrap();
 }
 

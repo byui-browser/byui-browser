@@ -9,39 +9,39 @@ use cap_std::fs::{Dir, OpenOptions};
 
 use super::{
     FileAccessError, FileAccessGrant, FileOrigin, FileRequestContext, FileRequestKind, OpenedFile,
-    TrustedFileAccessRoot,
+    TrustedDirectorySelection,
 };
 
 static NEXT_CAPABILITY_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Browser-owned capability for reading files below a fixed set of trusted roots.
+/// Browser-owned capability for reading files below trusted directory selections.
 ///
 /// Construct this value only at the browser or platform trust boundary, after a
 /// user choice or equivalent embedder authorization has produced
-/// [`TrustedFileAccessRoot`] values. Each root combines its selection path and
+/// [`TrustedDirectorySelection`] values. Each selection combines its path and
 /// already-open directory authority, so this capability never separately
 /// resolves and reopens a mutable root pathname. Web content and
 /// request-construction code should receive requests and grants, never this
 /// capability or its roots.
 #[derive(Debug)]
 pub struct FileAccessCapability {
-    roots: Vec<TrustedFileAccessRoot>,
+    roots: Vec<TrustedDirectorySelection>,
     capability_id: u64,
 }
 
 impl FileAccessCapability {
-    /// Creates a local-file capability from roots supplied by trusted browser
-    /// or platform code.
+    /// Creates a local-file capability from selections supplied by trusted
+    /// platform code.
     ///
-    /// Each root must already hold the directory capability captured by the
+    /// Each selection must already hold the directory capability captured by the
     /// platform selection operation. An empty list creates a default-deny
     /// capability. Callers must not pass paths supplied by web content or
     /// recreate directory handles from paths at this boundary.
-    pub fn from_trusted_roots(
-        allowed_roots: impl IntoIterator<Item = TrustedFileAccessRoot>,
+    pub fn from_trusted_directory_selections(
+        selected_directories: impl IntoIterator<Item = TrustedDirectorySelection>,
     ) -> Result<Self, FileAccessError> {
         Ok(Self {
-            roots: allowed_roots.into_iter().collect(),
+            roots: selected_directories.into_iter().collect(),
             capability_id: next_capability_id(),
         })
     }

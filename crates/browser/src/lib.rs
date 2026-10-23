@@ -8,7 +8,7 @@ use std::sync::Arc;
 use html::Query;
 use js::{JsResult, Realm, Value};
 use net::{Request, RequestController, SchemeProviders};
-use security::file_access::{FileAccessCapability, FileAccessError, TrustedFileAccessRoot};
+use security::file_access::{FileAccessCapability, FileAccessError, TrustedDirectorySelection};
 use webapis::{ConsoleSink, register_fetch, register_print};
 
 pub mod byui_provider;
@@ -45,30 +45,20 @@ pub struct FileAccessConfiguration {
 }
 
 impl FileAccessConfiguration {
-    /// Creates a local-file configuration from roots approved by trusted
-    /// browser or platform code.
+    /// Creates a local-file configuration from trusted platform selections.
     ///
-    /// This is the browser's filesystem-capability boundary. Callers must use
-    /// user-selected directory handles or an equivalent trusted embedder
-    /// capability, never a path supplied by web content. Each root retains the
-    /// directory handle selected by the platform; this API deliberately does
-    /// not reopen a pathname and therefore cannot bind the policy to one root
-    /// and I/O to a replacement root.
-    pub fn from_trusted_roots(
-        allowed_roots: impl IntoIterator<Item = TrustedFileAccessRoot>,
-    ) -> Result<Self, FileAccessError> {
-        Self::from_trusted_roots_with_limits(allowed_roots, FileAccessLimits::default())
-    }
-
-    /// Creates a local-file configuration with browser-owned resource limits.
-    ///
-    /// `limits` is selected by trusted browser or platform code and is never
-    /// derived from web content or caller-controlled request metadata.
-    pub fn from_trusted_roots_with_limits(
-        allowed_roots: impl IntoIterator<Item = TrustedFileAccessRoot>,
+    /// This is the browser's filesystem-capability boundary. The platform team
+    /// creates each [`TrustedDirectorySelection`] from one user-approved
+    /// selection operation; this API consumes the selection without reopening
+    /// its pathname. `limits` is browser-owned and is never derived from web
+    /// content or caller-controlled request metadata.
+    pub fn from_trusted_directory_selections(
+        selected_directories: impl IntoIterator<Item = TrustedDirectorySelection>,
         limits: FileAccessLimits,
     ) -> Result<Self, FileAccessError> {
-        let capability = Arc::new(FileAccessCapability::from_trusted_roots(allowed_roots)?);
+        let capability = Arc::new(FileAccessCapability::from_trusted_directory_selections(
+            selected_directories,
+        )?);
         let navigation_authorizations =
             Arc::new(file_provider::FileNavigationAuthorizations::new());
         let grants = file_provider::FileAccessGrantSource::new(
