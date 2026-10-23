@@ -135,9 +135,39 @@ impl FileAccessCapability {
         }
         Ok(OpenedFile {
             file,
-            media_type: None,
+            media_type: media_type_for_path(relative).map(str::to_owned),
             length: metadata.len(),
         })
+    }
+}
+
+/// Returns the safe, deterministic media type associated with a file name.
+///
+/// This intentionally relies only on an allowlisted filename extension. It
+/// does not inspect the file contents, so caller-controlled bytes cannot
+/// influence response metadata.
+pub(super) fn media_type_for_path(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm") {
+        Some("text/html; charset=utf-8")
+    } else if extension.eq_ignore_ascii_case("css") {
+        Some("text/css; charset=utf-8")
+    } else if extension.eq_ignore_ascii_case("js") || extension.eq_ignore_ascii_case("mjs") {
+        Some("text/javascript; charset=utf-8")
+    } else if extension.eq_ignore_ascii_case("json") {
+        Some("application/json")
+    } else if extension.eq_ignore_ascii_case("png") {
+        Some("image/png")
+    } else if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
+        Some("image/jpeg")
+    } else if extension.eq_ignore_ascii_case("gif") {
+        Some("image/gif")
+    } else if extension.eq_ignore_ascii_case("svg") {
+        Some("image/svg+xml")
+    } else if extension.eq_ignore_ascii_case("webp") {
+        Some("image/webp")
+    } else {
+        None
     }
 }
 

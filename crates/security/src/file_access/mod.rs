@@ -24,6 +24,7 @@ mod tests {
 
     use cap_std::{ambient_authority, fs::Dir};
 
+    use super::capability::media_type_for_path;
     #[cfg(unix)]
     use super::capability::open_relative_nofollow;
     use super::*;
@@ -200,7 +201,7 @@ mod tests {
         let mut remaining = [0; 32];
 
         assert_eq!(opened.length(), b"authorized bytes".len() as u64);
-        assert_eq!(opened.media_type(), None);
+        assert_eq!(opened.media_type(), Some("text/html; charset=utf-8"));
         let first_length = opened.read_chunk(&mut first).unwrap();
         let remaining_length = opened.read_chunk(&mut remaining).unwrap();
         assert_eq!(&first[..first_length], b"autho");
@@ -210,6 +211,25 @@ mod tests {
         drop(opened);
         drop(capability);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn media_type_detection_is_allowlisted_and_case_insensitive() {
+        for (path, media_type) in [
+            ("page.HTML", Some("text/html; charset=utf-8")),
+            ("stylesheet.css", Some("text/css; charset=utf-8")),
+            ("module.MJS", Some("text/javascript; charset=utf-8")),
+            ("document.json", Some("application/json")),
+            ("image.PNG", Some("image/png")),
+            ("image.JpEg", Some("image/jpeg")),
+            ("image.gif", Some("image/gif")),
+            ("image.SVG", Some("image/svg+xml")),
+            ("image.webp", Some("image/webp")),
+            ("archive.bin", None),
+            ("extensionless", None),
+        ] {
+            assert_eq!(media_type_for_path(Path::new(path)), media_type);
+        }
     }
 
     #[test]

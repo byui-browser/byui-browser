@@ -117,6 +117,49 @@ fn configured_file_provider_enforces_per_file_size_limits() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn configured_file_provider_sets_allowlisted_media_types_only() {
+    let directory = temporary_directory();
+    let allowed = directory.join("allowed");
+    let html = allowed.join("page.HTML");
+    let unknown = allowed.join("payload.bin");
+    fs::create_dir(&allowed).unwrap();
+    fs::write(&html, b"<h1>typed</h1>").unwrap();
+    fs::write(&unknown, b"bytes").unwrap();
+    let file_access = file_access([allowed]);
+    let controller = request_controller(Some(file_access.clone()));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let typed = runtime
+        .block_on(controller.fetch(navigation(
+            &file_access,
+            net::Url::from_file_path(&html).unwrap(),
+        )))
+        .unwrap();
+    assert_eq!(
+        typed.headers.get("content-type").as_deref(),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(
+        runtime.block_on(typed.body.bytes()).unwrap(),
+        b"<h1>typed</h1>"
+    );
+
+    let untyped = runtime
+        .block_on(controller.fetch(navigation(
+            &file_access,
+            net::Url::from_file_path(&unknown).unwrap(),
+        )))
+        .unwrap();
+    assert_eq!(untyped.headers.get("content-type"), None);
+    assert_eq!(runtime.block_on(untyped.body.bytes()).unwrap(), b"bytes");
+
+    drop(controller);
+    drop(file_access);
+    drop(runtime);
+    fs::remove_dir_all(directory).unwrap();
+}
+
 fn navigation(file_access: &FileAccessConfiguration, url: impl Into<String>) -> net::Request {
     file_access.navigation_request(url).unwrap()
 }

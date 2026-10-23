@@ -30,7 +30,10 @@ browser admits files only up to its configured per-file size limit (64 MiB by
 default). A response body must yield exactly the length captured for its
 `Content-Length` header: early EOF and trailing bytes fail the body with the
 non-diagnostic `Io` category.
-provider avoids HTTP transport, cookies, service
+An allowlisted, case-insensitive filename extension determines the media type
+for HTML, CSS, JavaScript, JSON, and common image formats. Unknown extensions
+omit `Content-Type`; the provider does not sniff file contents.
+The provider avoids HTTP transport, cookies, service
 workers, and the HTTP cache, and exposes stable non-diagnostic error
 categories. Browser and security tests cover the implemented authorization,
 containment, streaming, cancellation, unread and partially read body drops,
@@ -84,10 +87,10 @@ files, while preserving fail-closed behavior.
   blocking-reader/channel memory. The provider enforces a configurable
   per-file size limit and admission bounds concurrency and buffering, but it
   does not yet bound the duration or total cost of a permitted read.
-- Add filesystem media-type detection and decide whether invalid detected
-  metadata fails the request or is omitted. Define MIME sniffing, `nosniff`, and
-  executable-content policy before local HTML, script, image, or similar
-  content is interpreted.
+- Decide whether MIME sniffing, `nosniff`, or a stricter executable-content
+  policy is needed before local HTML, script, image, or similar content is
+  interpreted. The current extension allowlist omits unknown types and does
+  not inspect file contents.
 - Decide whether directories and other unsupported file types should retain the
   current non-diagnostic `Io` category or receive a dedicated category.
 
