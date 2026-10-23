@@ -20,6 +20,7 @@ use net::{
 use security::file_access::{
     FileAccessCapability, FileAccessError, FileOrigin, FileRequestContext, FileRequestKind,
 };
+use tokio::sync::Notify;
 use tokio::sync::{Semaphore, mpsc};
 
 #[cfg(test)]
@@ -44,6 +45,8 @@ pub enum FileNavigationError {
     },
     /// Browser-owned navigation state could not be read safely.
     Unavailable,
+    /// The local-file session has been revoked or closed.
+    SessionRevoked,
 }
 
 impl fmt::Display for FileNavigationError {
@@ -58,6 +61,7 @@ impl fmt::Display for FileNavigationError {
             Self::Unavailable => {
                 formatter.write_str("file navigation authorization is unavailable")
             }
+            Self::SessionRevoked => formatter.write_str("file access session has been revoked"),
         }
     }
 }
@@ -104,14 +108,61 @@ impl FileNavigationAuthorizations {
     }
 }
 
-/// Mutable browser-owned source for local-file authorization state.
+/// Cancellation state captured by one local-file setup operation or body stream.
+#[derive(Clone, Debug)]
+struct FileAccessCancellation {
+    state: Arc<FileAccessCancellationState>,
+}
+
+#[derive(Debug, Default)]
+struct FileAccessCancellationState {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl FileAccessCancellation {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(FileAccessCancellationState::default()),
+        }
+    }
+
+    fn cancel(&self) {
+        if !self.state.cancelled.swap(true, Ordering::AcqRel) {
+            self.state.notify.notify_waiters();
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.state.notify.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+#[derive(Debug)]
+struct FileAccessGrantState {
+    grant: Option<FileAccessGrant>,
+    cancellation: FileAccessCancellation,
+}
+
+/// Mutable browser-owned source for one local-file session's authorization state.
 ///
 /// Providers snapshot this source immediately before request authorization.
-/// Revocation therefore denies subsequent opens, while an already opened file
-/// stream retains its existing handle until it completes, fails, or is dropped.
+/// Replacing, revoking, or closing the session cancels every operation holding
+/// the prior snapshot and denies future opens until a replacement grant exists.
 #[derive(Clone, Debug)]
 pub struct FileAccessGrantSource {
-    grant: Arc<RwLock<Option<FileAccessGrant>>>,
+    state: Arc<RwLock<FileAccessGrantState>>,
     navigation_authorizations: Arc<FileNavigationAuthorizations>,
 }
 
@@ -122,32 +173,50 @@ impl FileAccessGrantSource {
         navigation_authorizations: Arc<FileNavigationAuthorizations>,
     ) -> Self {
         Self {
-            grant: Arc::new(RwLock::new(Some(grant))),
+            state: Arc::new(RwLock::new(FileAccessGrantState {
+                grant: Some(grant),
+                cancellation: FileAccessCancellation::new(),
+            })),
             navigation_authorizations,
         }
     }
 
     /// Replaces the authorization state used by future file opens.
     ///
+    /// Replacing a grant cancels setup and streams admitted by the prior grant.
     /// A poisoned source fails closed: this operation leaves its previous state
     /// unchanged and future snapshots are denied.
     pub fn replace(&self, grant: FileAccessGrant) {
-        if let Ok(mut current) = self.grant.write() {
-            *current = Some(grant);
+        if let Ok(mut current) = self.state.write() {
+            current.cancellation.cancel();
+            current.grant = Some(grant);
+            current.cancellation = FileAccessCancellation::new();
             self.navigation_authorizations.clear();
         }
     }
 
-    /// Revokes local-file access for future opens by removing its policy-issued grant.
+    /// Revokes local-file access and cancels its pending setup and live streams.
     pub fn revoke(&self) {
-        if let Ok(mut grant) = self.grant.write() {
-            *grant = None;
+        if let Ok(mut current) = self.state.write() {
+            current.cancellation.cancel();
+            current.grant = None;
             self.navigation_authorizations.clear();
         }
     }
 
-    fn snapshot(&self) -> Option<FileAccessGrant> {
-        self.grant.read().map(|grant| grant.clone()).unwrap_or(None)
+    fn snapshot(&self) -> Option<(FileAccessGrant, FileAccessCancellation)> {
+        self.state.read().ok().and_then(|state| {
+            state
+                .grant
+                .clone()
+                .map(|grant| (grant, state.cancellation.clone()))
+        })
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.state
+            .read()
+            .is_ok_and(|state| state.grant.is_some() && !state.cancellation.is_cancelled())
     }
 }
 
@@ -173,8 +242,9 @@ impl FileReadAdmission {
     async fn acquire(
         &self,
         signal: &AbortSignal,
+        session_cancellation: &FileAccessCancellation,
     ) -> Result<tokio::sync::OwnedSemaphorePermit, RequestError> {
-        if signal.is_aborted() {
+        if signal.is_aborted() || session_cancellation.is_cancelled() {
             return Err(RequestError::Aborted);
         }
         let pending = self
@@ -185,6 +255,7 @@ impl FileReadAdmission {
         let active = self.active.clone().acquire_owned();
         let result = tokio::select! {
             _ = signal.cancelled() => Err(RequestError::Aborted),
+            _ = session_cancellation.cancelled() => Err(RequestError::Aborted),
             permit = active => permit.map_err(|_| provider_io_error()),
         };
         drop(pending);
@@ -240,9 +311,12 @@ impl FileProvider for BrowserFileProvider {
         let post_setup_hook = self.post_setup_hook.clone();
 
         Box::pin(async move {
-            let grant = grants
+            let (grant, session_cancellation) = grants
                 .snapshot()
                 .ok_or_else(|| provider_error(FileAccessError::Denied))?;
+            if session_cancellation.is_cancelled() {
+                return Err(RequestError::Aborted);
+            }
             let context = request_context(request);
             if context.kind != FileRequestKind::Navigation
                 || !navigation_authorizations.consume(request.id())
@@ -255,9 +329,14 @@ impl FileProvider for BrowserFileProvider {
             let path = url
                 .to_file_path()
                 .map_err(|_| provider_error(FileAccessError::InvalidPath))?;
-            let permit = read_admission.acquire(&signal).await?;
+            let permit = read_admission
+                .acquire(&signal, &session_cancellation)
+                .await?;
+            let setup_cancellation = session_cancellation.clone();
             let task = tokio::task::spawn_blocking(move || {
-                if preparation_cancelled.load(Ordering::Acquire) {
+                if preparation_cancelled.load(Ordering::Acquire)
+                    || setup_cancellation.is_cancelled()
+                {
                     return Err(RequestError::Aborted);
                 }
                 let opened = capability
@@ -273,7 +352,7 @@ impl FileProvider for BrowserFileProvider {
             if let Some(hook) = post_setup_hook {
                 hook();
             }
-            if signal.is_aborted() {
+            if signal.is_aborted() || session_cancellation.is_cancelled() {
                 return Err(RequestError::Aborted);
             }
 
@@ -301,13 +380,23 @@ impl FileProvider for BrowserFileProvider {
                 } else {
                     let (sender, receiver) = mpsc::channel(FILE_READ_CHANNEL_CAPACITY);
                     let worker_cancelled = Arc::clone(&cancelled);
+                    let worker_session_cancellation = session_cancellation.clone();
                     tokio::task::spawn_blocking(move || {
-                        read_file_stream(opened, sender, permit, worker_cancelled, signal);
+                        read_file_stream(
+                            opened,
+                            sender,
+                            permit,
+                            worker_cancelled,
+                            worker_session_cancellation,
+                            signal,
+                        );
                     });
                     cancellation.disarm();
                     SchemeBody::Stream(Box::pin(FileBodyStream {
                         receiver,
                         cancelled,
+                        session_cancellation,
+                        reported_session_cancellation: false,
                     }))
                 },
             })
@@ -319,12 +408,21 @@ impl FileProvider for BrowserFileProvider {
 struct FileBodyStream {
     receiver: mpsc::Receiver<Result<Vec<u8>, RequestError>>,
     cancelled: Arc<AtomicBool>,
+    session_cancellation: FileAccessCancellation,
+    reported_session_cancellation: bool,
 }
 
 impl Stream for FileBodyStream {
     type Item = Result<Vec<u8>, RequestError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.session_cancellation.is_cancelled() {
+            if self.reported_session_cancellation {
+                return Poll::Ready(None);
+            }
+            self.reported_session_cancellation = true;
+            return Poll::Ready(Some(Err(RequestError::Aborted)));
+        }
         self.receiver.poll_recv(context)
     }
 }
@@ -368,22 +466,38 @@ fn read_file_stream(
     sender: mpsc::Sender<Result<Vec<u8>, RequestError>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
     cancelled: Arc<AtomicBool>,
+    session_cancellation: FileAccessCancellation,
     signal: AbortSignal,
 ) {
     let mut buffer = [0; FILE_READ_CHUNK_SIZE];
     loop {
-        if cancelled.load(Ordering::Acquire) || signal.is_aborted() {
+        if cancelled.load(Ordering::Acquire)
+            || session_cancellation.is_cancelled()
+            || signal.is_aborted()
+        {
             return;
         }
         match opened.read_chunk(&mut buffer).map_err(provider_error) {
             Ok(0) => return,
             Ok(count) => {
-                if !send_chunk(&sender, Ok(buffer[..count].to_vec()), &cancelled, &signal) {
+                if !send_chunk(
+                    &sender,
+                    Ok(buffer[..count].to_vec()),
+                    &cancelled,
+                    &session_cancellation,
+                    &signal,
+                ) {
                     return;
                 }
             }
             Err(error) => {
-                let _ = send_chunk(&sender, Err(error), &cancelled, &signal);
+                let _ = send_chunk(
+                    &sender,
+                    Err(error),
+                    &cancelled,
+                    &session_cancellation,
+                    &signal,
+                );
                 return;
             }
         }
@@ -395,10 +509,14 @@ fn send_chunk(
     sender: &mpsc::Sender<Result<Vec<u8>, RequestError>>,
     mut chunk: Result<Vec<u8>, RequestError>,
     cancelled: &AtomicBool,
+    session_cancellation: &FileAccessCancellation,
     signal: &AbortSignal,
 ) -> bool {
     loop {
-        if cancelled.load(Ordering::Acquire) || signal.is_aborted() {
+        if cancelled.load(Ordering::Acquire)
+            || session_cancellation.is_cancelled()
+            || signal.is_aborted()
+        {
             return false;
         }
         match sender.try_send(chunk) {
@@ -489,16 +607,23 @@ mod tests {
         runtime.block_on(async {
             let admission = FileReadAdmission::new(0, 1);
             let abort = net::AbortController::new();
+            let session_cancellation = FileAccessCancellation::new();
             let waiting_admission = admission.clone();
             let waiting_signal = abort.signal();
-            let waiting =
-                tokio::spawn(async move { waiting_admission.acquire(&waiting_signal).await });
+            let waiting_session_cancellation = session_cancellation.clone();
+            let waiting = tokio::spawn(async move {
+                waiting_admission
+                    .acquire(&waiting_signal, &waiting_session_cancellation)
+                    .await
+            });
 
             while admission.pending.available_permits() != 0 {
                 tokio::task::yield_now().await;
             }
             assert!(matches!(
-                admission.acquire(&AbortSignal::new()).await,
+                admission
+                    .acquire(&AbortSignal::new(), &session_cancellation)
+                    .await,
                 Err(RequestError::Provider {
                     provider: "file",
                     kind: ProviderErrorKind::ResourceExhausted,
@@ -507,11 +632,29 @@ mod tests {
 
             abort.abort();
             assert!(matches!(waiting.await.unwrap(), Err(RequestError::Aborted)));
+
+            let session_admission = FileReadAdmission::new(0, 1);
+            let session_cancellation = FileAccessCancellation::new();
+            let waiting_admission = session_admission.clone();
+            let waiting_cancellation = session_cancellation.clone();
+            let session_waiting = tokio::spawn(async move {
+                waiting_admission
+                    .acquire(&AbortSignal::new(), &waiting_cancellation)
+                    .await
+            });
+            while session_admission.pending.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+            session_cancellation.cancel();
+            assert!(matches!(
+                session_waiting.await.unwrap(),
+                Err(RequestError::Aborted)
+            ));
         });
     }
 
     #[test]
-    fn abort_after_file_setup_rejects_get_and_head_and_releases_admission() {
+    fn revocation_after_file_setup_rejects_get_and_head_and_releases_admission() {
         let directory = std::env::temp_dir().join(format!(
             "byui-browser-post-setup-abort-{}-{}",
             std::process::id(),
@@ -536,18 +679,16 @@ mod tests {
         let url = Url::from_file_path(&file).unwrap();
 
         for method in [net::Method::GET, net::Method::HEAD] {
-            let abort = net::AbortController::new();
-            let hook_abort = abort.clone();
+            let hook_grants = grants.clone();
             let mut provider = BrowserFileProvider::new(
                 Arc::clone(&capability),
                 grants.clone(),
                 Arc::clone(&navigation_authorizations),
             );
-            provider.post_setup_hook = Some(Arc::new(move || hook_abort.abort()));
+            provider.post_setup_hook = Some(Arc::new(move || hook_grants.revoke()));
             let mut request = Request::get(url.clone());
             request.set_method(method).unwrap();
             request.set_mode(net::RequestMode::Navigate).unwrap();
-            request.set_signal(abort.signal());
             navigation_authorizations.authorize(request.id()).unwrap();
 
             assert!(matches!(
@@ -563,6 +704,7 @@ mod tests {
                 MAX_PENDING_FILE_READS
             );
 
+            grants.replace(capability.issue_grant());
             let probe = BrowserFileProvider {
                 capability: Arc::clone(&provider.capability),
                 grants: provider.grants.clone(),

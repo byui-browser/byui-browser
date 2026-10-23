@@ -151,16 +151,53 @@ fn revoking_a_file_access_grant_denies_subsequent_opens() {
 
     grants.revoke();
     assert!(matches!(
-        runtime.block_on(controller.fetch(navigation(&navigation_access, url))),
-        Err(net::RequestError::Provider {
-            provider: "file",
-            kind: net::ProviderErrorKind::AccessDenied
-        })
+        navigation_access.navigation_request(url.to_string()),
+        Err(browser::file_provider::FileNavigationError::SessionRevoked)
     ));
 
     drop(controller);
     drop(navigation_access);
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn closing_a_file_access_session_cancels_live_file_bodies() {
+    let directory = temporary_directory();
+    let allowed = directory.join("allowed");
+    let file = allowed.join("large-page.html");
+    fs::create_dir(&allowed).unwrap();
+    fs::write(&file, vec![b'x'; 4 * 1024 * 1024]).unwrap();
+    let file_access = file_access([allowed]);
+    let navigation_access = file_access.clone();
+    let controller = request_controller(Some(file_access));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let url = net::Url::from_file_path(&file).unwrap();
+
+    runtime.block_on(async {
+        let response = controller
+            .fetch(navigation(&navigation_access, url.clone()))
+            .await
+            .unwrap();
+        navigation_access.navigation_away();
+
+        let error = response.body.into_future().await.0.unwrap().unwrap_err();
+        assert!(matches!(error, net::RequestError::Aborted));
+    });
+    assert!(matches!(
+        navigation_access.navigation_request(url.to_string()),
+        Err(browser::file_provider::FileNavigationError::SessionRevoked)
+    ));
+
+    drop(controller);
+    drop(navigation_access);
+    drop(runtime);
+    for _ in 0..100 {
+        if fs::remove_dir_all(&directory).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("closed file session should release its opened handle");
 }
 
 #[test]

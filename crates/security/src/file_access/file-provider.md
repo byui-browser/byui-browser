@@ -15,15 +15,18 @@ conversion. Requests are opened once through retained directory and file
 handles. Every component is opened relative to the retained root with symlink
 following disabled, so a component replacement cannot redirect the final open
 outside the selected tree.
-Root configuration accepts only a trusted canonical selection path paired with
-its already-open directory handle, eliminating the prior policy-versus-handle
-root-replacement race.
+Root configuration is intended to accept only a trusted canonical selection
+path paired with its already-open directory handle, eliminating the prior
+policy-versus-handle root-replacement race when the trusted boundary is used
+correctly.
 
 Authorized `GET` requests stream 64 KiB chunks through a bounded channel;
 `HEAD` performs authorization and metadata lookup without starting a reader.
 Four readers and eight pending opens are admitted, and cancellation releases
 provider resources, including when cancellation arrives during response
-preparation. The provider avoids HTTP transport, cookies, service
+preparation. Revocation, navigation-away, and session close deny future opens,
+clear pending navigations, and cancel setup plus live response bodies. The
+provider avoids HTTP transport, cookies, service
 workers, and the HTTP cache, and exposes stable non-diagnostic error
 categories. Browser and security tests cover the implemented authorization,
 containment, streaming, cancellation, unread and partially read body drops,
@@ -40,9 +43,26 @@ revocation, and failure behavior.
   root-replacement race during configuration. Renderers and
   request-construction code must never receive source roots or the capability
   itself.
-- Define permission lifetime and revocation behavior for tab/document close,
-  navigation, process shutdown, grant expiry, and audit logging. Specify which
-  already-open streams survive each transition.
+- Remove the public path/handle pairing footgun: make root construction
+  platform-private or expose only an opaque value produced by the trusted
+  selection operation. Add a regression test or type-level boundary showing
+  that a canonical path from one directory cannot be paired with another
+  directory handle.
+- Prevent authorized callers from using path errors as an outside-root
+  existence oracle. Establish lexical/root eligibility before filesystem
+  canonicalization where possible, or normalize missing and other lookup
+  failures for paths outside the configured roots to `AccessDenied`. Test both
+  existing and missing outside-root paths, including malformed and symlinked
+  paths, without exposing filesystem details.
+- Make revocation linearizable with authorization and open. Carry a session
+  generation or revocation token into the security-owned open operation, reject
+  it if the session changes before the handle is admitted, and ensure response
+  construction cannot publish a `HEAD` response or a queued body chunk after
+  revocation. Add race-focused tests for revocation before open, during setup,
+  immediately before response construction, and while a body chunk is queued.
+- Add grant expiry and audit logging. Process shutdown relies on process
+  teardown today; define any explicit shutdown sequencing required by future
+  browser lifecycle code.
 - Keep navigation-authorization state private to trusted browser navigation
   code as new navigation entry points are added.
 

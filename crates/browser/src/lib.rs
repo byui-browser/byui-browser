@@ -53,9 +53,8 @@ impl FileAccessConfiguration {
     /// Returns the browser-owned grant source for this configuration.
     ///
     /// The browser or platform owner may revoke this source when its
-    /// user-approved permission expires. Revocation denies future opens while
-    /// an already-open body retains its file handle until it is finished,
-    /// aborted, or dropped.
+    /// user-approved permission expires. Revocation denies future opens and
+    /// cancels pending setup plus live response bodies from this session.
     pub fn grant_source(&self) -> file_provider::FileAccessGrantSource {
         self.grants.clone()
     }
@@ -70,12 +69,31 @@ impl FileAccessConfiguration {
         &self,
         url: impl Into<String>,
     ) -> Result<Request, file_provider::FileNavigationError> {
+        if !self.grants.is_active() {
+            return Err(file_provider::FileNavigationError::SessionRevoked);
+        }
         let mut request = Request::get(url);
         request
             .set_mode(net::RequestMode::Navigate)
             .expect("GET requests may always use navigation mode");
         self.navigation_authorizations.authorize(request.id())?;
         Ok(request)
+    }
+
+    /// Ends this local-file session after a navigation-away or tab close.
+    ///
+    /// The operation revokes future file opens, clears pending navigations,
+    /// and cancels setup plus live response bodies owned by this session.
+    pub fn close(&self) {
+        self.grants.revoke();
+    }
+
+    /// Revokes this local-file session when its document navigates away.
+    ///
+    /// This is equivalent to [`Self::close`]. It is a separate browser-facing
+    /// operation so navigation code can express its lifecycle transition.
+    pub fn navigation_away(&self) {
+        self.close();
     }
 }
 
