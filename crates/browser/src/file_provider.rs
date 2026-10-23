@@ -406,6 +406,9 @@ impl FileProvider for BrowserFileProvider {
                 status_text: Some("OK".into()),
                 headers,
                 media_type,
+                // Local-file documents deliberately receive an opaque origin.
+                // The security policy denies their subresources until a
+                // file-document container identity is implemented.
                 origin: Origin::opaque(),
                 body: if is_head {
                     drop(opened);

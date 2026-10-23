@@ -7,17 +7,20 @@ use std::sync::{Arc, Mutex};
 /// This is deliberately a security-owned representation. Browser adapters must
 /// translate their networking origin type before calling [`FileAccessCapability`].
 /// Tuple origins are serialized in their canonical form and are retained for
-/// policy decisions and auditing; this initial policy does not grant
-/// subresource access for any origin.
+/// policy decisions and auditing. File documents receive opaque origins, and
+/// this policy denies local-file subresource access for every initiator until
+/// browser document/container identity is available end-to-end.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileOrigin {
     /// The request has no initiating client origin.
     Absent,
-    /// The request has an opaque initiating origin.
+    /// The request has an opaque initiating origin, including a file document
+    /// or a sandboxed document.
     Opaque,
     /// A canonical tuple origin, such as `https://example.test`.
     Tuple(String),
-    /// The requested resource is a local file.
+    /// The requested resource is a local file, or the initiating document is
+    /// represented as a local-file document by browser policy.
     LocalFile,
 }
 
@@ -146,10 +149,11 @@ impl FileAccessLease {
 
 /// Security-relevant context for one attempted local-file access.
 ///
-/// This initial vertical slice intentionally supports only top-level
-/// navigations authorized by a policy-issued [`FileAccessGrant`]. Subresource
-/// access is denied until file-document origin semantics are available
-/// end-to-end.
+/// This policy assigns every admitted file document an opaque origin. It
+/// supports only top-level navigations authorized by a policy-issued
+/// [`FileAccessGrant`]; subresources, workers, and nested contexts are denied
+/// regardless of whether their initiating origin is local-file, tuple, opaque,
+/// or absent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileRequestContext {
     /// Origin of the document or worker that initiated the request.

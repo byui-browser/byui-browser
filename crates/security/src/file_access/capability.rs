@@ -68,13 +68,30 @@ impl FileAccessCapability {
         context: &FileRequestContext,
         grant: &FileAccessGrant,
     ) -> Result<(), FileAccessError> {
-        if grant.capability_id != self.capability_id
-            || context.requested_origin != FileOrigin::LocalFile
-            || context.kind != FileRequestKind::Navigation
-        {
+        if grant.capability_id != self.capability_id {
             return Err(FileAccessError::Denied);
         }
-        Ok(())
+        match (
+            &context.initiating_origin,
+            &context.requested_origin,
+            context.kind,
+        ) {
+            // Top-level file navigation is a browser-issued capability action,
+            // rather than a same-origin privilege. Its initiator may therefore
+            // be absent, tuple, opaque, or another local-file document.
+            (
+                FileOrigin::Absent
+                | FileOrigin::Opaque
+                | FileOrigin::Tuple(_)
+                | FileOrigin::LocalFile,
+                FileOrigin::LocalFile,
+                FileRequestKind::Navigation,
+            ) => Ok(()),
+            // File documents have opaque origins and no container identity in
+            // this slice. Deny all subresources (including workers and nested
+            // contexts) until that policy can be enforced end-to-end.
+            _ => Err(FileAccessError::Denied),
+        }
     }
 
     /// Authorizes and opens one local file through this capability.

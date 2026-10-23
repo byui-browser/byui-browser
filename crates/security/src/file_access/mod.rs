@@ -361,6 +361,42 @@ mod tests {
     }
 
     #[test]
+    fn file_document_policy_allows_only_explicit_top_level_navigations() {
+        let capability = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
+        let grant = capability.issue_grant();
+
+        for initiating_origin in [
+            FileOrigin::Absent,
+            FileOrigin::Opaque,
+            FileOrigin::Tuple("https://example.test".into()),
+            FileOrigin::LocalFile,
+        ] {
+            assert_eq!(
+                capability.authorize_request(
+                    &FileRequestContext {
+                        initiating_origin: initiating_origin.clone(),
+                        requested_origin: FileOrigin::LocalFile,
+                        kind: FileRequestKind::Navigation,
+                    },
+                    &grant,
+                ),
+                Ok(())
+            );
+            assert_eq!(
+                capability.authorize_request(
+                    &FileRequestContext {
+                        initiating_origin,
+                        requested_origin: FileOrigin::LocalFile,
+                        kind: FileRequestKind::Subresource,
+                    },
+                    &grant,
+                ),
+                Err(FileAccessError::Denied)
+            );
+        }
+    }
+
+    #[test]
     fn denied_requests_do_not_canonicalize_their_path() {
         let capability = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
         let another = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
