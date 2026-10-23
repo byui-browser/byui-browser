@@ -51,20 +51,25 @@ that reauthorizes or reopens the root pathname.
 
 ### 2. Make revocation fully linearizable
 
-Basic session revocation is implemented: pending admission, setup, and live
-bodies are cancelled, and close/navigation-away denies future opens. The
-remaining issue is the exact race between revocation, final setup checks, and
-response publication.
+Session grants now own a generation-bound security lease. The browser carries
+that lease into the security-owned open operation, which validates it before
+filesystem work and before returning the opened handle. The browser validates
+it once more at response publication and before delivering every body chunk.
+Revocation and validation serialize through the session state: an open that
+observes revocation before its publication check is aborted without exposing
+metadata or a body.
 
-Carry a session generation or revocation token into the security-owned open
-operation. Revalidate it before admitting the opened handle and before exposing
-response metadata or body data. Define whether an already-running OS read may
-finish internally, but ensure its bytes are never delivered after revocation.
+An already-running OS read may finish internally after revocation, but its
+result is discarded. A chunk already queued in the bounded channel is also
+checked by the body stream before it reaches Fetch. `GET` and `HEAD` share the
+same final publication validation. Close, navigation-away, and grant
+replacement all revoke the prior grant; future expiry support must use this
+same grant-revocation path.
 
-Add deterministic tests for revocation before opening, during blocking setup,
-immediately before response construction, while a chunk is queued, and during
-`HEAD` handling. Cover close, navigation-away, grant replacement, and grant
-expiry consistently.
+Regression coverage includes post-setup revocation for `GET` and `HEAD`,
+admission release, and revocation after a chunk has been queued. Follow-up
+tests should retain deterministic hooks for blocking setup and the exact
+publication handoff when those paths gain additional asynchronous work.
 
 ### 3. Define file-document origins and subresource policy
 

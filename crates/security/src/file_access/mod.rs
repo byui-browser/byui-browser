@@ -12,7 +12,9 @@ mod request;
 pub use capability::FileAccessCapability;
 pub use error::FileAccessError;
 pub use handles::{OpenedFile, TrustedDirectorySelection};
-pub use request::{FileAccessGrant, FileOrigin, FileRequestContext, FileRequestKind};
+pub use request::{
+    FileAccessGrant, FileAccessLease, FileOrigin, FileRequestContext, FileRequestKind,
+};
 
 #[cfg(test)]
 mod tests {
@@ -295,6 +297,27 @@ mod tests {
             first.authorize_request(&navigation_context(), &second.issue_grant()),
             Err(FileAccessError::Denied)
         );
+    }
+
+    #[test]
+    fn revoking_a_grant_invalidates_its_leases_and_future_open_attempts() {
+        let capability = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
+        let grant = capability.issue_grant();
+        let lease = grant.lease().unwrap();
+
+        assert!(lease.is_current());
+        grant.revoke();
+        assert!(!lease.is_current());
+        assert!(grant.lease().is_none());
+        assert!(matches!(
+            capability.open_authorized_file_with_lease(
+                &navigation_context(),
+                &grant,
+                &lease,
+                Path::new("C:/not-opened"),
+            ),
+            Err(FileAccessError::Denied)
+        ));
     }
 
     #[test]

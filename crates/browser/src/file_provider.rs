@@ -18,7 +18,8 @@ use net::{
     Request, RequestError, SchemeBody, SchemeResource, Url,
 };
 use security::file_access::{
-    FileAccessCapability, FileAccessError, FileOrigin, FileRequestContext, FileRequestKind,
+    FileAccessCapability, FileAccessError, FileAccessLease, FileOrigin, FileRequestContext,
+    FileRequestKind,
 };
 use tokio::sync::Notify;
 use tokio::sync::{Semaphore, mpsc};
@@ -188,6 +189,9 @@ impl FileAccessGrantSource {
     /// unchanged and future snapshots are denied.
     pub fn replace(&self, grant: FileAccessGrant) {
         if let Ok(mut current) = self.state.write() {
+            if let Some(previous_grant) = current.grant.as_ref() {
+                previous_grant.revoke();
+            }
             current.cancellation.cancel();
             current.grant = Some(grant);
             current.cancellation = FileAccessCancellation::new();
@@ -198,25 +202,33 @@ impl FileAccessGrantSource {
     /// Revokes local-file access and cancels its pending setup and live streams.
     pub fn revoke(&self) {
         if let Ok(mut current) = self.state.write() {
+            if let Some(grant) = current.grant.as_ref() {
+                grant.revoke();
+            }
             current.cancellation.cancel();
             current.grant = None;
             self.navigation_authorizations.clear();
         }
     }
 
-    fn snapshot(&self) -> Option<(FileAccessGrant, FileAccessCancellation)> {
+    fn snapshot(&self) -> Option<(FileAccessGrant, FileAccessLease, FileAccessCancellation)> {
         self.state.read().ok().and_then(|state| {
-            state
-                .grant
-                .clone()
-                .map(|grant| (grant, state.cancellation.clone()))
+            state.grant.clone().and_then(|grant| {
+                grant
+                    .lease()
+                    .map(|lease| (grant, lease, state.cancellation.clone()))
+            })
         })
     }
 
     pub(crate) fn is_active(&self) -> bool {
-        self.state
-            .read()
-            .is_ok_and(|state| state.grant.is_some() && !state.cancellation.is_cancelled())
+        self.state.read().is_ok_and(|state| {
+            state
+                .grant
+                .as_ref()
+                .is_some_and(|grant| grant.lease().is_some())
+                && !state.cancellation.is_cancelled()
+        })
     }
 }
 
@@ -315,10 +327,10 @@ impl FileProvider for BrowserFileProvider {
         let post_setup_hook = self.post_setup_hook.clone();
 
         Box::pin(async move {
-            let (grant, session_cancellation) = grants
+            let (grant, lease, session_cancellation) = grants
                 .snapshot()
                 .ok_or_else(|| provider_error(FileAccessError::Denied))?;
-            if session_cancellation.is_cancelled() {
+            if session_cancellation.is_cancelled() || !lease.is_current() {
                 return Err(RequestError::Aborted);
             }
             let context = request_context(request);
@@ -337,15 +349,23 @@ impl FileProvider for BrowserFileProvider {
                 .acquire(&signal, &session_cancellation)
                 .await?;
             let setup_cancellation = session_cancellation.clone();
+            let setup_lease = lease.clone();
             let task = tokio::task::spawn_blocking(move || {
                 if preparation_cancelled.load(Ordering::Acquire)
                     || setup_cancellation.is_cancelled()
+                    || !setup_lease.is_current()
                 {
                     return Err(RequestError::Aborted);
                 }
                 let opened = capability
-                    .open_authorized_file(&context, &grant, path)
-                    .map_err(provider_error)?;
+                    .open_authorized_file_with_lease(&context, &grant, &setup_lease, path)
+                    .map_err(|error| {
+                        if setup_lease.is_current() {
+                            provider_error(error)
+                        } else {
+                            RequestError::Aborted
+                        }
+                    })?;
                 let length = opened.length();
                 let media_type = opened.media_type().map(str::to_owned);
                 Ok((opened, length, media_type))
@@ -356,7 +376,7 @@ impl FileProvider for BrowserFileProvider {
             if let Some(hook) = post_setup_hook {
                 hook();
             }
-            if signal.is_aborted() || session_cancellation.is_cancelled() {
+            if signal.is_aborted() || session_cancellation.is_cancelled() || !lease.is_current() {
                 return Err(RequestError::Aborted);
             }
             if length > max_file_size {
@@ -374,6 +394,12 @@ impl FileProvider for BrowserFileProvider {
             if let Some(media_type) = media_type.clone() {
                 headers.push((HeaderName::from_static("content-type"), media_type));
             }
+            // This is the linearization point for metadata publication. A
+            // revocation observed first aborts setup; a later revocation is
+            // enforced by the body lease checks below.
+            if !lease.is_current() {
+                return Err(RequestError::Aborted);
+            }
             Ok(SchemeResource {
                 url,
                 status: 200,
@@ -389,22 +415,25 @@ impl FileProvider for BrowserFileProvider {
                     let (sender, receiver) = mpsc::channel(FILE_READ_CHANNEL_CAPACITY);
                     let worker_cancelled = Arc::clone(&cancelled);
                     let worker_session_cancellation = session_cancellation.clone();
+                    let worker_lease = lease.clone();
                     tokio::task::spawn_blocking(move || {
-                        read_file_stream(
+                        read_file_stream(FileReadTask {
                             opened,
                             sender,
-                            permit,
-                            worker_cancelled,
-                            worker_session_cancellation,
+                            _permit: permit,
+                            cancelled: worker_cancelled,
+                            session_cancellation: worker_session_cancellation,
+                            lease: worker_lease,
                             signal,
                             expected_length,
-                        );
+                        });
                     });
                     cancellation.disarm();
                     SchemeBody::Stream(Box::pin(FileBodyStream {
                         receiver,
                         cancelled,
                         session_cancellation,
+                        lease,
                         reported_session_cancellation: false,
                     }))
                 },
@@ -418,6 +447,7 @@ struct FileBodyStream {
     receiver: mpsc::Receiver<Result<Vec<u8>, RequestError>>,
     cancelled: Arc<AtomicBool>,
     session_cancellation: FileAccessCancellation,
+    lease: FileAccessLease,
     reported_session_cancellation: bool,
 }
 
@@ -425,14 +455,24 @@ impl Stream for FileBodyStream {
     type Item = Result<Vec<u8>, RequestError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.session_cancellation.is_cancelled() {
+        if self.session_cancellation.is_cancelled() || !self.lease.is_current() {
             if self.reported_session_cancellation {
                 return Poll::Ready(None);
             }
             self.reported_session_cancellation = true;
             return Poll::Ready(Some(Err(RequestError::Aborted)));
         }
-        self.receiver.poll_recv(context)
+        match self.receiver.poll_recv(context) {
+            Poll::Ready(Some(_)) if !self.lease.is_current() => {
+                if self.reported_session_cancellation {
+                    Poll::Ready(None)
+                } else {
+                    self.reported_session_cancellation = true;
+                    Poll::Ready(Some(Err(RequestError::Aborted)))
+                }
+            }
+            result => result,
+        }
     }
 }
 
@@ -470,44 +510,55 @@ impl Drop for CancellationGuard {
 }
 
 /// Reads an opened file on Tokio's blocking pool and sends bounded body chunks.
-fn read_file_stream(
-    mut opened: security::file_access::OpenedFile,
+struct FileReadTask {
+    opened: security::file_access::OpenedFile,
     sender: mpsc::Sender<Result<Vec<u8>, RequestError>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
     cancelled: Arc<AtomicBool>,
     session_cancellation: FileAccessCancellation,
+    lease: FileAccessLease,
     signal: AbortSignal,
     expected_length: u64,
-) {
+}
+
+/// Reads an opened file on Tokio's blocking pool and sends bounded body chunks.
+fn read_file_stream(mut task: FileReadTask) {
     let mut buffer = [0; FILE_READ_CHUNK_SIZE];
-    let mut remaining = expected_length;
+    let mut remaining = task.expected_length;
     loop {
-        if cancelled.load(Ordering::Acquire)
-            || session_cancellation.is_cancelled()
-            || signal.is_aborted()
+        if task.cancelled.load(Ordering::Acquire)
+            || task.session_cancellation.is_cancelled()
+            || !task.lease.is_current()
+            || task.signal.is_aborted()
         {
             return;
         }
         if remaining == 0 {
-            match opened.read_chunk(&mut buffer[..1]).map_err(provider_error) {
+            match task
+                .opened
+                .read_chunk(&mut buffer[..1])
+                .map_err(provider_error)
+            {
                 Ok(0) => return,
                 Ok(_) => {
                     let _ = send_chunk(
-                        &sender,
+                        &task.sender,
                         Err(provider_io_error()),
-                        &cancelled,
-                        &session_cancellation,
-                        &signal,
+                        &task.cancelled,
+                        &task.session_cancellation,
+                        &task.lease,
+                        &task.signal,
                     );
                     return;
                 }
                 Err(error) => {
                     let _ = send_chunk(
-                        &sender,
+                        &task.sender,
                         Err(error),
-                        &cancelled,
-                        &session_cancellation,
-                        &signal,
+                        &task.cancelled,
+                        &task.session_cancellation,
+                        &task.lease,
+                        &task.signal,
                     );
                     return;
                 }
@@ -515,39 +566,43 @@ fn read_file_stream(
         }
         let permitted = usize::try_from(remaining.min(FILE_READ_CHUNK_SIZE as u64))
             .expect("file read chunk size fits in usize");
-        match opened
+        match task
+            .opened
             .read_chunk(&mut buffer[..permitted])
             .map_err(provider_error)
         {
             Ok(0) => {
                 let _ = send_chunk(
-                    &sender,
+                    &task.sender,
                     Err(provider_io_error()),
-                    &cancelled,
-                    &session_cancellation,
-                    &signal,
+                    &task.cancelled,
+                    &task.session_cancellation,
+                    &task.lease,
+                    &task.signal,
                 );
                 return;
             }
             Ok(count) => {
                 remaining -= count as u64;
                 if !send_chunk(
-                    &sender,
+                    &task.sender,
                     Ok(buffer[..count].to_vec()),
-                    &cancelled,
-                    &session_cancellation,
-                    &signal,
+                    &task.cancelled,
+                    &task.session_cancellation,
+                    &task.lease,
+                    &task.signal,
                 ) {
                     return;
                 }
             }
             Err(error) => {
                 let _ = send_chunk(
-                    &sender,
+                    &task.sender,
                     Err(error),
-                    &cancelled,
-                    &session_cancellation,
-                    &signal,
+                    &task.cancelled,
+                    &task.session_cancellation,
+                    &task.lease,
+                    &task.signal,
                 );
                 return;
             }
@@ -561,11 +616,13 @@ fn send_chunk(
     mut chunk: Result<Vec<u8>, RequestError>,
     cancelled: &AtomicBool,
     session_cancellation: &FileAccessCancellation,
+    lease: &FileAccessLease,
     signal: &AbortSignal,
 ) -> bool {
     loop {
         if cancelled.load(Ordering::Acquire)
             || session_cancellation.is_cancelled()
+            || !lease.is_current()
             || signal.is_aborted()
         {
             return false;
@@ -781,6 +838,29 @@ mod tests {
         drop(runtime);
         drop(capability);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn revoked_session_never_delivers_an_already_queued_chunk() {
+        let capability = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
+        let grant = capability.issue_grant();
+        let lease = grant.lease().unwrap();
+        let (sender, receiver) = mpsc::channel(1);
+        sender.try_send(Ok(vec![b'x'])).unwrap();
+        grant.revoke();
+        let mut body = FileBodyStream {
+            receiver,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            session_cancellation: FileAccessCancellation::new(),
+            lease,
+            reported_session_cancellation: false,
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        assert!(matches!(
+            runtime.block_on(body.next()),
+            Some(Err(RequestError::Aborted))
+        ));
     }
 
     #[test]
