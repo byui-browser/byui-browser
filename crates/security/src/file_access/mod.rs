@@ -169,6 +169,55 @@ mod tests {
     }
 
     #[test]
+    fn outside_paths_are_denied_without_an_existence_oracle() {
+        let directory = temporary_directory();
+        let allowed = directory.join("allowed");
+        let existing_outside = directory.join("outside.html");
+        let missing_outside = directory.join("missing.html");
+        fs::create_dir(&allowed).unwrap();
+        fs::write(&existing_outside, b"outside").unwrap();
+        let capability =
+            FileAccessCapability::from_trusted_directory_selections([trusted_selection(&allowed)])
+                .unwrap();
+        let grant = capability.issue_grant();
+
+        assert!(matches!(
+            capability.open_authorized_file(&navigation_context(), &grant, &existing_outside),
+            Err(FileAccessError::Denied)
+        ));
+        assert!(matches!(
+            capability.open_authorized_file(&navigation_context(), &grant, &missing_outside),
+            Err(FileAccessError::Denied)
+        ));
+
+        drop(capability);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn missing_paths_inside_a_root_remain_missing() {
+        let directory = temporary_directory();
+        let capability =
+            FileAccessCapability::from_trusted_directory_selections([trusted_selection(
+                &directory,
+            )])
+            .unwrap();
+        let grant = capability.issue_grant();
+
+        assert!(matches!(
+            capability.open_authorized_file(
+                &navigation_context(),
+                &grant,
+                directory.join("missing.html")
+            ),
+            Err(FileAccessError::Missing)
+        ));
+
+        drop(capability);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn capability_grants_are_bound_to_one_capability() {
         let first = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
         let second = FileAccessCapability::from_trusted_directory_selections([]).unwrap();

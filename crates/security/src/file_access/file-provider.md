@@ -17,8 +17,9 @@ The current slice also provides a configurable per-file size limit, allowlisted
 extension-based media types, exact `Content-Length` enforcement, and
 close/navigation-away cancellation. Core authorization, containment,
 streaming, admission, lifecycle, media-type, size-limit, and length-consistency
-tests pass. The remaining work below is required before treating the provider as
-a complete browser capability.
+tests pass. Path eligibility now precedes filesystem resolution, so ineligible
+existing and missing paths receive the same denial. The remaining work below is
+required before treating the provider as a complete browser capability.
 
 Trusted directory composition now verifies that the supplied canonical path and
 the retained `Dir` identify the same directory before a selection is accepted.
@@ -54,21 +55,20 @@ path-and-handle constructor with a private adapter or an opaque value produced
 directly by the trusted selection operation once the platform picker exists.
 Do not introduce a fallback that reauthorizes and reopens the root pathname.
 
-### 2. Remove path-existence oracles
+### 2. Remove path-existence oracles — implemented
 
-Path authorization currently canonicalizes a requested path before checking
-whether it belongs to an allowed root. An authorized caller can therefore
-distinguish an existing outside-root path (`AccessDenied`) from a missing
-outside-root path (`ResourceMissing`).
+Path authorization now performs lexical/root eligibility before canonicalizing a
+requested path. Existing and missing paths outside configured roots both return
+`AccessDenied`; missing paths that are eligible under an allowed root continue
+to return `ResourceMissing`.
 
-Establish lexical/root eligibility before filesystem canonicalization where
-possible. For paths that are outside the configured roots, normalize missing,
-permission, and related lookup failures to `AccessDenied`. Preserve useful
-`ResourceMissing` behavior for paths that are eligible under an allowed root.
+Windows path-alias fallback is also fail-closed: when lexical components do not
+match a canonical root, filesystem normalization is used only to resolve the
+alias, and every ineligible or failed fallback remains `AccessDenied`.
 
-Test existing and missing outside-root paths, malformed paths, traversal, and
-symlinked paths. Verify that unauthorized and authorized callers receive the
-same non-diagnostic denial for ineligible paths.
+Regression tests cover existing and missing outside-root paths and missing
+eligible paths. Keep extending this coverage for malformed paths, traversal,
+symlinked paths, UNC paths, and other platform-specific aliases.
 
 ### 3. Make revocation fully linearizable
 

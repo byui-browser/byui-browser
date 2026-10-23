@@ -94,7 +94,43 @@ impl FileAccessCapability {
         &self,
         requested: impl AsRef<Path>,
     ) -> Result<(usize, PathBuf), FileAccessError> {
-        let canonical = fs::canonicalize(requested).map_err(FileAccessError::from)?;
+        // Establish root eligibility without touching the filesystem. This
+        // prevents a caller from learning whether an ineligible path exists
+        // based on the error returned by canonicalize.
+        let lexical = normalize_absolute_path(requested.as_ref())?;
+        let lexical_root = self
+            .roots
+            .iter()
+            .enumerate()
+            .filter(|(_, root)| {
+                normalize_absolute_path(&root.canonical_path)
+                    .map(|root| lexical.starts_with(&root))
+                    .unwrap_or(false)
+            })
+            .max_by_key(|(_, root)| root.canonical_path.components().count());
+
+        let canonical = match fs::canonicalize(requested.as_ref()) {
+            Ok(canonical) => canonical,
+            Err(error) if lexical_root.is_none() => {
+                // A Windows short-name path can be inside a root even when
+                // lexical components do not match the canonical long-name
+                // root. Resolve only to normalize that alias. Every failure
+                // in this fallback remains a denial, so it cannot disclose
+                // whether an unauthorized path exists.
+                let parent = requested.as_ref().parent().ok_or(FileAccessError::Denied)?;
+                let canonical_parent =
+                    fs::canonicalize(parent).map_err(|_| FileAccessError::Denied)?;
+                if !self
+                    .roots
+                    .iter()
+                    .any(|root| canonical_parent.starts_with(&root.canonical_path))
+                {
+                    return Err(FileAccessError::Denied);
+                }
+                return Err(FileAccessError::from(error));
+            }
+            Err(error) => return Err(FileAccessError::from(error)),
+        };
         let Some((root_index, root)) = self
             .roots
             .iter()
@@ -104,6 +140,9 @@ impl FileAccessCapability {
         else {
             return Err(FileAccessError::Denied);
         };
+        if !canonical.starts_with(&root.canonical_path) {
+            return Err(FileAccessError::Denied);
+        }
         let relative = canonical
             .strip_prefix(&root.canonical_path)
             .map(Path::to_path_buf)
@@ -138,6 +177,55 @@ impl FileAccessCapability {
             media_type: media_type_for_path(relative).map(str::to_owned),
             length: metadata.len(),
         })
+    }
+}
+
+/// Normalizes path syntax without resolving filesystem objects.
+///
+/// This is deliberately performed before canonicalization so paths outside a
+/// trusted root receive the same denial regardless of whether they exist.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LexicalComponent {
+    Prefix(std::ffi::OsString),
+    Root,
+    Normal(std::ffi::OsString),
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<Vec<LexicalComponent>, FileAccessError> {
+    if !path.is_absolute() {
+        return Err(FileAccessError::InvalidPath);
+    }
+
+    let mut normalized = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => {
+                let prefix = prefix.as_os_str().to_string_lossy().into_owned();
+                let prefix = prefix.strip_prefix("\\\\?\\").unwrap_or(&prefix);
+                normalized.push(LexicalComponent::Prefix(prefix.into()))
+            }
+            std::path::Component::RootDir => normalized.push(LexicalComponent::Root),
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => {
+                normalized.push(LexicalComponent::Normal(name.to_owned()))
+            }
+            std::path::Component::ParentDir => {
+                if matches!(normalized.last(), Some(LexicalComponent::Normal(_))) {
+                    normalized.pop();
+                }
+            }
+        }
+    }
+
+    if normalized.first().is_some_and(|component| {
+        matches!(
+            component,
+            LexicalComponent::Root | LexicalComponent::Prefix(_)
+        )
+    }) {
+        Ok(normalized)
+    } else {
+        Err(FileAccessError::InvalidPath)
     }
 }
 

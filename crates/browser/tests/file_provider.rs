@@ -429,7 +429,7 @@ fn file_provider_maps_missing_directories_and_malformed_urls() {
         runtime.block_on(controller.fetch(navigation(&file_access, missing))),
         Err(net::RequestError::Provider {
             provider: "file",
-            kind: net::ProviderErrorKind::ResourceMissing
+            kind: net::ProviderErrorKind::AccessDenied
         })
     ));
 
