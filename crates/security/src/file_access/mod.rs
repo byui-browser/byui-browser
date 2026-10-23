@@ -9,7 +9,7 @@ mod filesystem;
 mod request;
 
 pub use error::FileAccessError;
-pub use filesystem::{FileResource, OpenedFile};
+pub use filesystem::OpenedFile;
 pub use request::{FileAccessGrant, FileOrigin, FileRequestContext, FileRequestKind};
 
 use std::{
@@ -18,7 +18,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use cap_std::fs::Dir;
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, OpenOptions};
 
 static NEXT_CAPABILITY_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -172,10 +173,7 @@ impl FileAccessCapability {
             return Err(FileAccessError::UnsupportedFile);
         }
         let root = self.roots.get(root_index).ok_or(FileAccessError::Denied)?;
-        let file = root
-            .directory
-            .open(relative)
-            .map_err(FileAccessError::from)?;
+        let file = open_relative_nofollow(&root.directory, relative)?;
         let file = file.into_std();
         let metadata = file.metadata().map_err(FileAccessError::from)?;
         if !metadata.file_type().is_file() {
@@ -187,6 +185,48 @@ impl FileAccessCapability {
             length: metadata.len(),
         })
     }
+}
+
+/// Opens a regular-file candidate one component at a time beneath `root`.
+///
+/// Every component is opened relative to a handle retained from the trusted
+/// root selection, with symlink following disabled. This prevents a component
+/// replacement after pathname authorization from redirecting the eventual
+/// open outside the selected tree.
+fn open_relative_nofollow(
+    root: &Dir,
+    relative: &Path,
+) -> Result<cap_std::fs::File, FileAccessError> {
+    let mut directory = root.try_clone().map_err(FileAccessError::from)?;
+    let mut components = relative.components().peekable();
+    let mut final_file = None;
+
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(FileAccessError::InvalidPath);
+        };
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let opened = directory
+            .open_with(name, &options)
+            .map_err(FileAccessError::from)?;
+
+        if components.peek().is_some() {
+            if !opened
+                .metadata()
+                .map_err(FileAccessError::from)?
+                .file_type()
+                .is_dir()
+            {
+                return Err(FileAccessError::UnsupportedFile);
+            }
+            directory = Dir::from_std_file(opened.into_std());
+        } else {
+            final_file = Some(opened);
+        }
+    }
+
+    final_file.ok_or(FileAccessError::InvalidPath)
 }
 
 fn next_capability_id() -> u64 {
@@ -283,15 +323,10 @@ mod tests {
             FileAccessCapability::from_trusted_roots([trusted_root(&allowed)]).unwrap();
         let grant = capability.issue_grant();
 
-        assert_eq!(
-            capability
-                .open_authorized_file(&navigation_context(), &grant, &allowed_file)
-                .unwrap()
-                .read_all()
-                .unwrap()
-                .bytes,
-            b"allowed"
-        );
+        let opened = capability
+            .open_authorized_file(&navigation_context(), &grant, &allowed_file)
+            .unwrap();
+        assert_eq!(read_all(opened), b"allowed");
         assert!(matches!(
             capability.open_authorized_file(&navigation_context(), &grant, &outside),
             Err(FileAccessError::Denied)
@@ -460,7 +495,7 @@ mod tests {
 
         fs::rename(&replacement, &path).unwrap();
 
-        assert_eq!(opened.read_all().unwrap().bytes, b"original");
+        assert_eq!(read_all(opened), b"original");
 
         drop(capability);
         fs::remove_dir_all(directory).unwrap();
@@ -484,17 +519,64 @@ mod tests {
         fs::rename(&selected, &previous).unwrap();
         fs::rename(&replacement, &selected).unwrap();
 
-        assert_eq!(
-            capability
-                .open_authorized_file(&navigation_context(), &grant, selected.join("page.html"))
-                .unwrap()
-                .read_all()
-                .unwrap()
-                .bytes,
-            b"selected root"
-        );
+        let opened = capability
+            .open_authorized_file(&navigation_context(), &grant, selected.join("page.html"))
+            .unwrap();
+        assert_eq!(read_all(opened), b"selected root");
 
         drop(capability);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_root_open_rejects_a_final_symlink_component() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        let selected = directory.join("selected");
+        let target = selected.join("target.txt");
+        let link = selected.join("link.txt");
+        fs::create_dir(&selected).unwrap();
+        fs::write(&target, b"target").unwrap();
+        symlink(&target, &link).unwrap();
+        let root = trusted_root(&selected);
+
+        assert!(open_relative_nofollow(&root.directory, Path::new("link.txt")).is_err());
+
+        drop(root);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_root_open_rejects_an_intermediate_symlink_component() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        let selected = directory.join("selected");
+        let target = selected.join("target");
+        let link = selected.join("link");
+        fs::create_dir(&selected).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("page.txt"), b"target").unwrap();
+        symlink(&target, &link).unwrap();
+        let root = trusted_root(&selected);
+
+        assert!(open_relative_nofollow(&root.directory, Path::new("link/page.txt")).is_err());
+
+        drop(root);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn read_all(mut opened: OpenedFile) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            match opened.read_chunk(&mut buffer).unwrap() {
+                0 => return bytes,
+                count => bytes.extend_from_slice(&buffer[..count]),
+            }
+        }
     }
 }

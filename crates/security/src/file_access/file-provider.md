@@ -12,7 +12,9 @@ The current implementation provides a default-deny, capability-backed provider
 for explicitly configured roots. Browser-issued, single-use navigation
 authorizations and policy-bound grants are required before URL-to-path
 conversion. Requests are opened once through retained directory and file
-handles, with path-component containment and symlink/junction escape checks.
+handles. Every component is opened relative to the retained root with symlink
+following disabled, so a component replacement cannot redirect the final open
+outside the selected tree.
 Root configuration accepts only a trusted canonical selection path paired with
 its already-open directory handle, eliminating the prior policy-versus-handle
 root-replacement race.

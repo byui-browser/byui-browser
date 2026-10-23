@@ -4,20 +4,11 @@ use std::{fs, io::Read};
 
 use super::FileAccessError;
 
-/// Materialized data read from an authorized file.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FileResource {
-    /// File contents in byte order.
-    pub bytes: Vec<u8>,
-    /// Optional media type determined by the filesystem owner.
-    pub media_type: Option<String>,
-}
-
 /// An opened regular file accepted by the capability-backed filesystem.
 ///
-/// The handle is intentionally private. Callers can materialize it with
-/// [`Self::read_all`] now, while a future streaming API can retain ownership of
-/// the same handle. Callers must not reopen the authorized pathname.
+/// The handle is intentionally private and supports chunked reads through the
+/// same file selected by the capability. Callers must not reopen the
+/// authorized pathname.
 #[derive(Debug)]
 pub struct OpenedFile {
     pub(crate) file: fs::File,
@@ -44,25 +35,5 @@ impl OpenedFile {
     /// Returns the filesystem-provided media type, when one is available.
     pub fn media_type(&self) -> Option<&str> {
         self.media_type.as_deref()
-    }
-
-    /// Reads the complete file through this opened handle.
-    ///
-    /// Consumes the handle, closing it after the read completes or fails. The
-    /// returned bytes are therefore from the file that the backend opened,
-    /// rather than from a later pathname lookup.
-    pub fn read_all(mut self) -> Result<FileResource, FileAccessError> {
-        let mut bytes = Vec::new();
-        let mut buffer = [0; 64 * 1024];
-        loop {
-            match self.read_chunk(&mut buffer)? {
-                0 => break,
-                count => bytes.extend_from_slice(&buffer[..count]),
-            }
-        }
-        Ok(FileResource {
-            bytes,
-            media_type: self.media_type,
-        })
     }
 }
