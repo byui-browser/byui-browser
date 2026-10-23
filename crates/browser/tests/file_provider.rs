@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use browser::{FileAccessConfiguration, request_controller};
+use browser::{FileAccessConfiguration, FileAccessLimits, request_controller};
 use cap_std::{ambient_authority, fs::Dir};
 use futures_util::StreamExt;
 use net::AbortController;
@@ -25,6 +25,13 @@ fn temporary_directory() -> std::path::PathBuf {
 fn file_access(
     allowed_roots: impl IntoIterator<Item = std::path::PathBuf>,
 ) -> FileAccessConfiguration {
+    file_access_with_limits(allowed_roots, FileAccessLimits::default())
+}
+
+fn file_access_with_limits(
+    allowed_roots: impl IntoIterator<Item = std::path::PathBuf>,
+    limits: FileAccessLimits,
+) -> FileAccessConfiguration {
     let roots = allowed_roots
         .into_iter()
         .map(|path| {
@@ -33,7 +40,81 @@ fn file_access(
             TrustedFileAccessRoot::from_open_directory(canonical_path, directory).unwrap()
         })
         .collect::<Vec<_>>();
-    FileAccessConfiguration::from_trusted_roots(roots).unwrap()
+    FileAccessConfiguration::from_trusted_roots_with_limits(roots, limits).unwrap()
+}
+
+#[test]
+fn configured_file_provider_enforces_per_file_size_limits() {
+    let directory = temporary_directory();
+    let allowed = directory.join("allowed");
+    let at_limit = allowed.join("at-limit.html");
+    let over_limit = allowed.join("over-limit.html");
+    let small = allowed.join("small.html");
+    fs::create_dir(&allowed).unwrap();
+    fs::write(&at_limit, b"four").unwrap();
+    fs::write(&over_limit, b"fiver").unwrap();
+    fs::write(&small, b"ok").unwrap();
+    let permissive_access = file_access([allowed.clone()]);
+    let permissive_controller = request_controller(Some(permissive_access.clone()));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let over_limit_url = net::Url::from_file_path(&over_limit).unwrap();
+    let permissive_response = runtime
+        .block_on(
+            permissive_controller.fetch(navigation(&permissive_access, over_limit_url.clone())),
+        )
+        .unwrap();
+    assert_eq!(
+        runtime.block_on(permissive_response.body.bytes()).unwrap(),
+        b"fiver"
+    );
+
+    let allowed_access =
+        file_access_with_limits([allowed.clone()], FileAccessLimits { max_file_size: 4 });
+    let controller = request_controller(Some(allowed_access.clone()));
+
+    let at_limit_url = net::Url::from_file_path(&at_limit).unwrap();
+    let response = runtime
+        .block_on(controller.fetch(navigation(&allowed_access, at_limit_url.clone())))
+        .unwrap();
+    assert_eq!(response.headers.get("content-length"), Some("4".into()));
+    assert_eq!(runtime.block_on(response.body.bytes()).unwrap(), b"four");
+
+    let mut head = navigation(&allowed_access, at_limit_url);
+    head.set_method(net::Method::HEAD).unwrap();
+    assert!(runtime.block_on(controller.fetch(head)).is_ok());
+
+    assert!(matches!(
+        runtime.block_on(controller.fetch(navigation(&allowed_access, over_limit_url.clone()))),
+        Err(net::RequestError::Provider {
+            provider: "file",
+            kind: net::ProviderErrorKind::ResourceExhausted
+        })
+    ));
+    let mut oversized_head = navigation(&allowed_access, over_limit_url);
+    oversized_head.set_method(net::Method::HEAD).unwrap();
+    assert!(matches!(
+        runtime.block_on(controller.fetch(oversized_head)),
+        Err(net::RequestError::Provider {
+            provider: "file",
+            kind: net::ProviderErrorKind::ResourceExhausted
+        })
+    ));
+
+    let small_url = net::Url::from_file_path(&small).unwrap();
+    let small_response = runtime
+        .block_on(controller.fetch(navigation(&allowed_access, small_url)))
+        .unwrap();
+    assert_eq!(
+        runtime.block_on(small_response.body.bytes()).unwrap(),
+        b"ok"
+    );
+
+    drop(controller);
+    drop(allowed_access);
+    drop(permissive_controller);
+    drop(permissive_access);
+    drop(runtime);
+    fs::remove_dir_all(directory).unwrap();
 }
 
 fn navigation(file_access: &FileAccessConfiguration, url: impl Into<String>) -> net::Request {

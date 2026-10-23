@@ -15,12 +15,33 @@ pub mod byui_provider;
 pub mod fetch_services;
 pub mod file_provider;
 
+/// Browser-owned resource limits for one local-file session.
+///
+/// The current limit bounds the length, in bytes, of each individual file
+/// admitted by the provider. It does not yet bound read duration, total bytes
+/// served by a session, or aggregate provider buffering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileAccessLimits {
+    /// Maximum number of bytes in one local file admitted for `GET` or `HEAD`.
+    pub max_file_size: u64,
+}
+
+impl Default for FileAccessLimits {
+    /// Uses a conservative 64 MiB maximum individual file size.
+    fn default() -> Self {
+        Self {
+            max_file_size: 64 * 1024 * 1024,
+        }
+    }
+}
+
 /// Explicit configuration for the browser's local-file capability.
 #[derive(Clone)]
 pub struct FileAccessConfiguration {
     capability: Arc<FileAccessCapability>,
     grants: file_provider::FileAccessGrantSource,
     navigation_authorizations: Arc<file_provider::FileNavigationAuthorizations>,
+    limits: FileAccessLimits,
 }
 
 impl FileAccessConfiguration {
@@ -36,6 +57,17 @@ impl FileAccessConfiguration {
     pub fn from_trusted_roots(
         allowed_roots: impl IntoIterator<Item = TrustedFileAccessRoot>,
     ) -> Result<Self, FileAccessError> {
+        Self::from_trusted_roots_with_limits(allowed_roots, FileAccessLimits::default())
+    }
+
+    /// Creates a local-file configuration with browser-owned resource limits.
+    ///
+    /// `limits` is selected by trusted browser or platform code and is never
+    /// derived from web content or caller-controlled request metadata.
+    pub fn from_trusted_roots_with_limits(
+        allowed_roots: impl IntoIterator<Item = TrustedFileAccessRoot>,
+        limits: FileAccessLimits,
+    ) -> Result<Self, FileAccessError> {
         let capability = Arc::new(FileAccessCapability::from_trusted_roots(allowed_roots)?);
         let navigation_authorizations =
             Arc::new(file_provider::FileNavigationAuthorizations::new());
@@ -47,6 +79,7 @@ impl FileAccessConfiguration {
             capability,
             grants,
             navigation_authorizations,
+            limits,
         })
     }
 
@@ -114,6 +147,7 @@ pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<R
             file_access.capability,
             file_access.grants,
             file_access.navigation_authorizations,
+            file_access.limits.max_file_size,
         ));
     }
     Arc::new(

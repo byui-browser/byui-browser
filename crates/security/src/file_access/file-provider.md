@@ -26,6 +26,10 @@ Four readers and eight pending opens are admitted, and cancellation releases
 provider resources, including when cancellation arrives during response
 preparation. Revocation, navigation-away, and session close deny future opens,
 clear pending navigations, and cancel setup plus live response bodies. The
+browser admits files only up to its configured per-file size limit (64 MiB by
+default). A response body must yield exactly the length captured for its
+`Content-Length` header: early EOF and trailing bytes fail the body with the
+non-diagnostic `Io` category.
 provider avoids HTTP transport, cookies, service
 workers, and the HTTP cache, and exposes stable non-diagnostic error
 categories. Browser and security tests cover the implemented authorization,
@@ -76,10 +80,10 @@ files, while preserving fail-closed behavior.
 
 ### Limits, metadata, and content handling
 
-- Define and enforce maximum file size, read duration, total bytes served, and
-  aggregate blocking-reader/channel memory. The current admission bounds limit
-  concurrency and buffering but do not bound the duration or total cost of a
-  permitted read.
+- Define and enforce read duration, total bytes served, and aggregate
+  blocking-reader/channel memory. The provider enforces a configurable
+  per-file size limit and admission bounds concurrency and buffering, but it
+  does not yet bound the duration or total cost of a permitted read.
 - Add filesystem media-type detection and decide whether invalid detected
   metadata fails the request or is omitted. Define MIME sniffing, `nosniff`, and
   executable-content policy before local HTML, script, image, or similar
@@ -89,13 +93,12 @@ files, while preserving fail-closed behavior.
 
 ### Stream consistency and lifecycle coverage
 
-- Keep `Content-Length` consistent with the live stream. The provider currently
-  captures length before reading but does not enforce it if the file is
-  truncated or extended during the read. Define snapshot consistency and either
-  enforce the captured length or fail when the file changes.
 - Define content consistency for mutable opened files. Retaining a handle
-  prevents pathname replacement, but not in-place writes, truncation, or other
-  mutations while streaming. Add detection or document the supported guarantee.
+  prevents pathname replacement, but not in-place writes or other mutations
+  while streaming. The provider detects truncation and extension that would
+  violate `Content-Length`, but does not provide a byte-for-byte snapshot when
+  content changes without changing its length. Add detection or document the
+  supported guarantee.
 - Add regression tests for worker-side read failures, full-channel
   backpressure, and the four-reader concurrency limit.
 

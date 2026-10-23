@@ -270,6 +270,7 @@ pub(crate) struct BrowserFileProvider {
     grants: FileAccessGrantSource,
     navigation_authorizations: Arc<FileNavigationAuthorizations>,
     read_admission: FileReadAdmission,
+    max_file_size: u64,
     #[cfg(test)]
     post_setup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -280,6 +281,7 @@ impl BrowserFileProvider {
         capability: Arc<FileAccessCapability>,
         grants: FileAccessGrantSource,
         navigation_authorizations: Arc<FileNavigationAuthorizations>,
+        max_file_size: u64,
     ) -> Self {
         Self {
             capability,
@@ -289,6 +291,7 @@ impl BrowserFileProvider {
                 MAX_CONCURRENT_FILE_READS,
                 MAX_PENDING_FILE_READS,
             ),
+            max_file_size,
             #[cfg(test)]
             post_setup_hook: None,
         }
@@ -301,6 +304,7 @@ impl FileProvider for BrowserFileProvider {
         let grants = self.grants.clone();
         let navigation_authorizations = Arc::clone(&self.navigation_authorizations);
         let read_admission = self.read_admission.clone();
+        let max_file_size = self.max_file_size;
         let url = url.clone();
         let is_head = request.method() == net::Method::HEAD;
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -355,6 +359,10 @@ impl FileProvider for BrowserFileProvider {
             if signal.is_aborted() || session_cancellation.is_cancelled() {
                 return Err(RequestError::Aborted);
             }
+            if length > max_file_size {
+                return Err(provider_resource_exhausted_error());
+            }
+            let expected_length = length;
 
             let length =
                 HeaderValue::from_str(&length.to_string()).map_err(|_| RequestError::Provider {
@@ -389,6 +397,7 @@ impl FileProvider for BrowserFileProvider {
                             worker_cancelled,
                             worker_session_cancellation,
                             signal,
+                            expected_length,
                         );
                     });
                     cancellation.disarm();
@@ -468,8 +477,10 @@ fn read_file_stream(
     cancelled: Arc<AtomicBool>,
     session_cancellation: FileAccessCancellation,
     signal: AbortSignal,
+    expected_length: u64,
 ) {
     let mut buffer = [0; FILE_READ_CHUNK_SIZE];
+    let mut remaining = expected_length;
     loop {
         if cancelled.load(Ordering::Acquire)
             || session_cancellation.is_cancelled()
@@ -477,9 +488,49 @@ fn read_file_stream(
         {
             return;
         }
-        match opened.read_chunk(&mut buffer).map_err(provider_error) {
-            Ok(0) => return,
+        if remaining == 0 {
+            match opened.read_chunk(&mut buffer[..1]).map_err(provider_error) {
+                Ok(0) => return,
+                Ok(_) => {
+                    let _ = send_chunk(
+                        &sender,
+                        Err(provider_io_error()),
+                        &cancelled,
+                        &session_cancellation,
+                        &signal,
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let _ = send_chunk(
+                        &sender,
+                        Err(error),
+                        &cancelled,
+                        &session_cancellation,
+                        &signal,
+                    );
+                    return;
+                }
+            }
+        }
+        let permitted = usize::try_from(remaining.min(FILE_READ_CHUNK_SIZE as u64))
+            .expect("file read chunk size fits in usize");
+        match opened
+            .read_chunk(&mut buffer[..permitted])
+            .map_err(provider_error)
+        {
+            Ok(0) => {
+                let _ = send_chunk(
+                    &sender,
+                    Err(provider_io_error()),
+                    &cancelled,
+                    &session_cancellation,
+                    &signal,
+                );
+                return;
+            }
             Ok(count) => {
+                remaining -= count as u64;
                 if !send_chunk(
                     &sender,
                     Ok(buffer[..count].to_vec()),
@@ -582,11 +633,13 @@ pub(crate) fn provider(
     capability: Arc<FileAccessCapability>,
     grants: FileAccessGrantSource,
     navigation_authorizations: Arc<FileNavigationAuthorizations>,
+    max_file_size: u64,
 ) -> Arc<dyn FileProvider> {
     Arc::new(BrowserFileProvider::new(
         capability,
         grants,
         navigation_authorizations,
+        max_file_size,
     ))
 }
 
@@ -684,6 +737,7 @@ mod tests {
                 Arc::clone(&capability),
                 grants.clone(),
                 Arc::clone(&navigation_authorizations),
+                u64::MAX,
             );
             provider.post_setup_hook = Some(Arc::new(move || hook_grants.revoke()));
             let mut request = Request::get(url.clone());
@@ -710,6 +764,7 @@ mod tests {
                 grants: provider.grants.clone(),
                 navigation_authorizations: Arc::clone(&provider.navigation_authorizations),
                 read_admission: provider.read_admission.clone(),
+                max_file_size: provider.max_file_size,
                 post_setup_hook: None,
             };
             let mut probe_request = Request::get(url.clone());
@@ -753,6 +808,7 @@ mod tests {
             Arc::clone(&capability),
             grants,
             Arc::clone(&navigation_authorizations),
+            u64::MAX,
         );
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let url = Url::from_file_path(&file).unwrap();
@@ -781,6 +837,82 @@ mod tests {
 
         drop(runtime);
         drop(provider);
+        drop(capability);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_body_fails_when_opened_length_does_not_match_live_bytes() {
+        let directory = std::env::temp_dir().join(format!(
+            "byui-browser-content-length-{}-{}",
+            std::process::id(),
+            NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        let file = directory.join("page.html");
+        let canonical_directory = fs::canonicalize(&directory).unwrap();
+        let root = TrustedFileAccessRoot::from_open_directory(
+            canonical_directory,
+            Dir::open_ambient_dir(&directory, ambient_authority()).unwrap(),
+        )
+        .unwrap();
+        let capability = Arc::new(FileAccessCapability::from_trusted_roots([root]).unwrap());
+        let navigation_authorizations = Arc::new(FileNavigationAuthorizations::new());
+        let grants = FileAccessGrantSource::new(
+            capability.issue_grant(),
+            Arc::clone(&navigation_authorizations),
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let url = Url::from_file_path(&file).unwrap();
+
+        for actual in [b"a".as_slice(), b"abc".as_slice()] {
+            fs::write(&file, b"ab").unwrap();
+            let replacement = actual.to_vec();
+            let replacement_path = file.clone();
+            let mut provider = BrowserFileProvider::new(
+                Arc::clone(&capability),
+                grants.clone(),
+                Arc::clone(&navigation_authorizations),
+                u64::MAX,
+            );
+            provider.post_setup_hook = Some(Arc::new(move || {
+                fs::write(&replacement_path, &replacement).unwrap();
+            }));
+            let mut request = Request::get(url.clone());
+            request.set_mode(net::RequestMode::Navigate).unwrap();
+            navigation_authorizations.authorize(request.id()).unwrap();
+            let resource = runtime.block_on(provider.open(&request, &url)).unwrap();
+            assert_eq!(
+                resource
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name == "content-length")
+                    .unwrap()
+                    .1,
+                HeaderValue::from_static("2")
+            );
+            let SchemeBody::Stream(mut body) = resource.body else {
+                panic!("GET requests should receive a live file body");
+            };
+
+            let mut received = Vec::new();
+            let error = loop {
+                match runtime.block_on(body.next()).unwrap() {
+                    Ok(chunk) => received.extend_from_slice(&chunk),
+                    Err(error) => break error,
+                }
+            };
+            assert!(matches!(
+                error,
+                RequestError::Provider {
+                    provider: "file",
+                    kind: ProviderErrorKind::Io
+                }
+            ));
+            assert_eq!(received, actual[..actual.len().min(2)]);
+        }
+
+        drop(runtime);
         drop(capability);
         fs::remove_dir_all(directory).unwrap();
     }
