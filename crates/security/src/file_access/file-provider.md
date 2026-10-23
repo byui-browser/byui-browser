@@ -19,7 +19,7 @@ close/navigation-away cancellation. Core authorization, containment,
 streaming, admission, lifecycle, media-type, size-limit, and length-consistency
 tests pass. Path eligibility now precedes filesystem resolution, so ineligible
 existing and missing paths receive the same denial. The remaining work below is
-required before treating the provider as a complete browser capability.
+limited to provider behavior, policy, lifecycle, and regression coverage.
 
 Trusted directory composition now verifies that the supplied canonical path and
 the retained `Dir` identify the same directory before a selection is accepted.
@@ -28,21 +28,14 @@ reading identically named files through another directory's handle. After this
 one-time verification, all opens remain relative to the retained handle, so a
 replacement of the pathname cannot redirect reads.
 
-The current crate layout has no native directory-picker adapter. Consequently,
-`TrustedDirectorySelection::from_verified_open_directory` remains public for
-platform integration and accepts the path and handle at the API boundary. The
-identity check makes mismatched pairs fail closed, but it is not the stronger
-opaque platform-selection boundary described below: a future adapter should
-capture both values inside the user-approval operation and return only an
-opaque selection or configured session. Renderer, web-content, and ordinary
-request-construction code must not be given either input, a selection, or a
-`FileAccessCapability`. The remaining platform conformance work must also cover
-the filesystem identities reported for Windows reparse points, UNC paths,
-network shares, removable media, and Unix mount changes.
+The current crate does not provide a native directory picker. The public
+selection constructor is therefore treated as a trusted integration boundary;
+renderer, web-content, and ordinary request-construction code must not receive
+its inputs, a selection, or a `FileAccessCapability`.
 
 ## Remaining work
 
-### 1. Harden trusted composition
+### 1. Finish trusted-composition regression coverage
 
 The implemented `from_verified_open_directory` constructor rejects a path and
 handle that identify different filesystem objects. Regression tests cover that
@@ -50,31 +43,13 @@ mismatch, replacement between handle capture and configuration, and a matched
 retained handle continuing to serve the original directory after its pathname
 is replaced.
 
-The native platform adapter remains incomplete. Replace the public
-path-and-handle constructor with a private adapter or an opaque value produced
-directly by the trusted selection operation once the platform picker exists.
-Do not introduce a fallback that reauthorizes and reopens the root pathname.
+Keep the path/handle identity check, retained-handle behavior, and root
+replacement tests as part of the provider contract. Add current-scope tests for
+malformed absolute paths, traversal, existing and missing symlink escapes, and
+the stable denial behavior of the Windows alias fallback. Do not add a fallback
+that reauthorizes or reopens the root pathname.
 
-### 2. Remove path-existence oracles — implemented
-
-Path authorization now performs lexical/root eligibility before filesystem
-resolution. Paths matching a trusted root are opened solely from its retained
-handle; existing and missing paths outside configured roots both return
-`AccessDenied`, while missing paths that are eligible under an allowed root
-continue to return `ResourceMissing`. Symlink components are explicitly denied
-before they are opened, so existing and missing targets through an escaping
-symlink cannot reveal different results.
-
-Windows path-alias fallback is also fail-closed: when lexical components do not
-match a canonical root, filesystem normalization is used only to resolve the
-alias, and every ineligible or failed fallback remains `AccessDenied`.
-
-Regression tests cover existing and missing outside-root paths, missing eligible
-paths, traversal, and Unix symlink escapes. Keep extending this coverage for
-malformed paths, UNC paths, Windows reparse points, and other platform-specific
-aliases.
-
-### 3. Make revocation fully linearizable
+### 2. Make revocation fully linearizable
 
 Basic session revocation is implemented: pending admission, setup, and live
 bodies are cancelled, and close/navigation-away denies future opens. The
@@ -91,7 +66,7 @@ immediately before response construction, while a chunk is queued, and during
 `HEAD` handling. Cover close, navigation-away, grant replacement, and grant
 expiry consistently.
 
-### 4. Define file-document origins and subresource policy
+### 3. Define file-document origins and subresource policy
 
 The current policy permits only explicitly granted top-level navigations, and
 the initiating origin is carried through but not used to authorize access.
@@ -109,7 +84,7 @@ other subresources may read local files. Connect the decision to same-origin
 checks, sandbox/container identity, navigation policy, grants, and request
 context. Keep unsupported cases denied until the full policy is implemented.
 
-### 5. Complete resource and content limits
+### 4. Complete resource and content limits
 
 Per-file size limits, bounded active/pending admission, bounded chunking, and
 allowlisted extension-based media types are implemented. The per-file limit
@@ -130,7 +105,7 @@ whether directories and unsupported file types retain the current non-diagnostic
 Test every limit at its boundary, including slow reads, concurrent readers,
 queue exhaustion, and cancellation while a limit is being reached.
 
-### 6. Define mutable-file and stream consistency semantics
+### 5. Define mutable-file and stream consistency semantics
 
 The provider now enforces the captured `Content-Length`: early EOF and extra
 bytes produce a provider failure. It does not yet define whether local-file
@@ -146,7 +121,7 @@ Add mutation tests beyond the existing length-mismatch coverage, including
 changes during setup and streaming, and verify cleanup of the retained handle,
 channel, and read permit.
 
-### 7. Finish permission lifecycle behavior
+### 6. Finish permission lifecycle behavior
 
 Close and navigation-away cancellation are implemented. Remaining lifecycle
 work covers grant expiry, audit logging, and explicit process-shutdown
@@ -158,7 +133,7 @@ aborted, what events are recorded, and what information must never enter logs
 controller destruction, process shutdown, pending setup, active readers, queued
 data, and navigation authorizations.
 
-### 8. Complete regression and platform coverage
+### 7. Complete provider regression coverage
 
 Retain regression coverage for worker-side read failures, full-channel
 backpressure, four-reader concurrency, queue exhaustion, request aborts,
@@ -168,12 +143,7 @@ Use deterministic hooks or test doubles for races rather than relying only on
 timing. Verify that every path releases file handles, permits, channels, and
 blocking tasks.
 
-Extend platform conformance coverage for Unix mounts and links, Windows
-reparse-point variants, drive-letter and UNC paths, network shares, removable
-media, and remaining root-replacement races. Any fallback must fail closed and
-must not re-authorize and reopen a pathname.
-
-### 9. Maintain integration guarantees
+### 8. Maintain integration guarantees
 
 Keep security, browser, and `net` integration tests aligned with these
 guarantees:
@@ -191,9 +161,8 @@ the integration contract.
 
 ## Recommended order
 
-1. Restrict trusted selection construction and remove the path-existence oracle.
+1. Finish trusted-composition and path-authorization regression coverage.
 2. Make revocation linearizable and finalize permission lifecycle behavior.
 3. Define file-document origins and subresource policy.
 4. Add duration/session-wide limits and active-content policy.
-5. Define mutable-file semantics and complete race, platform, and integration
-   coverage.
+5. Define mutable-file semantics and complete provider/integration coverage.
