@@ -118,7 +118,7 @@ fn revocation_after_file_setup_rejects_get_and_head_and_releases_admission() {
             },
             crate::FileAccessContentPolicy::StaticDocument,
         );
-        provider.post_setup_hook = Some(Arc::new(move || hook_grants.revoke()));
+        provider.after_open_hook = Some(Arc::new(move || hook_grants.revoke()));
         let mut request = Request::get(url.clone());
         request.set_method(method).unwrap();
         request.set_mode(net::RequestMode::Navigate).unwrap();
@@ -146,7 +146,7 @@ fn revocation_after_file_setup_rejects_get_and_head_and_releases_admission() {
             limits: provider.limits,
             session_budget: provider.session_budget.clone(),
             content_policy: provider.content_policy,
-            post_setup_hook: None,
+            after_open_hook: None,
         };
         let mut probe_request = Request::get(url.clone());
         probe_request.set_method(net::Method::HEAD).unwrap();
@@ -280,7 +280,7 @@ fn dropping_unread_or_partially_read_body_releases_reader_admission() {
 }
 
 #[test]
-fn file_body_fails_when_opened_length_does_not_match_live_bytes() {
+fn file_body_uses_captured_framing_for_live_file_mutations() {
     let directory = std::env::temp_dir().join(format!(
         "byui-browser-content-length-{}-{}",
         std::process::id(),
@@ -304,7 +304,11 @@ fn file_body_fails_when_opened_length_does_not_match_live_bytes() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let url = Url::from_file_path(&file).unwrap();
 
-    for actual in [b"a".as_slice(), b"abc".as_slice()] {
+    for (actual, expect_error) in [
+        (b"cd".as_slice(), false),
+        (b"a".as_slice(), true),
+        (b"abc".as_slice(), true),
+    ] {
         fs::write(&file, b"ab").unwrap();
         let replacement = actual.to_vec();
         let replacement_path = file.clone();
@@ -319,7 +323,7 @@ fn file_body_fails_when_opened_length_does_not_match_live_bytes() {
             },
             crate::FileAccessContentPolicy::StaticDocument,
         );
-        provider.post_setup_hook = Some(Arc::new(move || {
+        provider.after_open_hook = Some(Arc::new(move || {
             fs::write(&replacement_path, &replacement).unwrap();
         }));
         let mut request = Request::get(url.clone());
@@ -340,19 +344,26 @@ fn file_body_fails_when_opened_length_does_not_match_live_bytes() {
         };
 
         let mut received = Vec::new();
-        let error = loop {
-            match runtime.block_on(body.next()).unwrap() {
-                Ok(chunk) => received.extend_from_slice(&chunk),
-                Err(error) => break error,
+        let result = loop {
+            match runtime.block_on(body.next()) {
+                Some(Ok(chunk)) => received.extend_from_slice(&chunk),
+                Some(Err(error)) => break Err(error),
+                // A clean end is permitted only when the in-place write kept
+                // the captured length unchanged.
+                None => break Ok(()),
             }
         };
-        assert!(matches!(
-            error,
-            RequestError::Provider {
-                provider: "file",
-                kind: ProviderErrorKind::Io
-            }
-        ));
+        if expect_error {
+            assert!(matches!(
+                result,
+                Err(RequestError::Provider {
+                    provider: "file",
+                    kind: ProviderErrorKind::Io
+                })
+            ));
+        } else {
+            assert!(result.is_ok());
+        }
         assert_eq!(received, actual[..actual.len().min(2)]);
     }
 

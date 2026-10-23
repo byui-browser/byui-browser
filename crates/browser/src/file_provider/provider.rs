@@ -36,7 +36,9 @@ pub(crate) struct BrowserFileProvider {
     pub(super) content_policy: crate::FileAccessContentPolicy,
     pub(super) session_budget: FileSessionByteBudget,
     #[cfg(test)]
-    pub(super) post_setup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Deterministically mutates the already-open handle's file before this
+    /// provider publishes response metadata.
+    pub(super) after_open_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl BrowserFileProvider {
@@ -60,7 +62,7 @@ impl BrowserFileProvider {
             limits,
             content_policy,
             #[cfg(test)]
-            post_setup_hook: None,
+            after_open_hook: None,
         }
     }
 }
@@ -81,7 +83,7 @@ impl FileProvider for BrowserFileProvider {
         let signal = request.signal().clone();
         let preparation_cancelled = Arc::clone(&cancelled);
         #[cfg(test)]
-        let post_setup_hook = self.post_setup_hook.clone();
+        let after_open_hook = self.after_open_hook.clone();
 
         Box::pin(async move {
             let (grant, lease, session_cancellation) = grants
@@ -132,7 +134,7 @@ impl FileProvider for BrowserFileProvider {
                 task.await.map_err(|_| provider_io_error())??;
 
             #[cfg(test)]
-            if let Some(hook) = post_setup_hook {
+            if let Some(hook) = after_open_hook {
                 hook();
             }
             if signal.is_aborted()

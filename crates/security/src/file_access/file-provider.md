@@ -110,10 +110,20 @@ slow-I/O and full-channel timeout tests on each supported platform.
 
 ### 2. Define mutable-file and stream-consistency semantics
 
-Choose whether responses require a stable snapshot or may observe live file
-contents. Document and test the behavior for in-place writes, truncation,
-growth, and metadata changes during setup and streaming, including response
-framing and cleanup of retained handles, channels, and permits.
+Responses use a retained open handle, not a filesystem snapshot. The selected
+handle and its metadata are captured during setup, so replacing the pathname,
+selected root, or a path component after open cannot redirect the response.
+The `Content-Length` header is the length captured from that handle and is
+never recomputed.
+
+In-place writes may be observed by later reads. A same-length overwrite may
+therefore yield old bytes, new bytes, or a mixture, but succeeds only if the
+stream yields exactly the captured length. Truncation can yield a prefix then
+fails with the stable `Io` provider category. Growth yields no bytes beyond
+the captured length and likewise fails with `Io` after the bounded extra-byte
+probe. Media type and other response metadata remain those captured during
+setup. All success, mismatch, cancellation, and body-drop paths release the
+opened handle, channel, and reader permit.
 
 ### 3. Complete permission lifecycle behavior
 

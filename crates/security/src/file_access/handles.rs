@@ -87,8 +87,10 @@ fn same_directory(
 /// An opened regular file accepted by the capability-backed filesystem.
 ///
 /// The handle is intentionally private and supports chunked reads through the
-/// same file selected by the capability. Callers must not reopen the
-/// authorized pathname.
+/// same file selected by the capability. Its length and media type are
+/// captured when it opens, but its bytes are not a snapshot: an in-place
+/// writer may change later reads. Callers must not reopen the authorized
+/// pathname.
 #[derive(Debug)]
 pub struct OpenedFile {
     pub(crate) file: fs::File,
@@ -102,7 +104,8 @@ impl OpenedFile {
     /// The returned count is zero at end of file. The operation is blocking;
     /// callers running on an asynchronous executor must perform it on a
     /// blocking executor. The read always uses the retained handle and never
-    /// reopens the authorized pathname.
+    /// reopens the authorized pathname. It may observe an in-place write made
+    /// after the handle was opened.
     pub fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize, FileAccessError> {
         self.file.read(buffer).map_err(FileAccessError::from)
     }
@@ -125,6 +128,9 @@ impl OpenedFile {
     }
 
     /// Returns the file length observed when the handle was opened.
+    ///
+    /// This is not refreshed after in-place writes. Consumers publishing it as
+    /// response framing must reject an early end of file or later extra bytes.
     pub fn length(&self) -> u64 {
         self.length
     }
