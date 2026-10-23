@@ -243,6 +243,49 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn malformed_absolute_windows_paths_are_rejected() {
+        // These look like extended-length paths but omit the root directory
+        // component required after the prefix. They must not enter alias
+        // resolution or be interpreted relative to a trusted root.
+        let capability = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
+        let grant = capability.issue_grant();
+        for path in [Path::new(r"\\?\C:"), Path::new(r"\\?\UNC\server")] {
+            assert!(matches!(
+                capability.open_authorized_file(&navigation_context(), &grant, path),
+                Err(FileAccessError::InvalidPath)
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_alias_fallback_denies_existing_and_missing_paths_outside_a_root() {
+        let directory = temporary_directory();
+        let allowed = directory.join("allowed");
+        let existing_outside = directory.join("outside.html");
+        let missing_outside = directory.join("missing.html");
+        fs::create_dir(&allowed).unwrap();
+        fs::write(&existing_outside, b"outside").unwrap();
+        let capability =
+            FileAccessCapability::from_trusted_directory_selections([trusted_selection(&allowed)])
+                .unwrap();
+
+        // Exercise the filesystem-assisted spelling fallback directly. It
+        // must retain the lexical path policy's non-diagnostic denial for
+        // both an existing path and a missing one.
+        for path in [&existing_outside, &missing_outside] {
+            assert_eq!(
+                capability.authorize_path(path),
+                Err(FileAccessError::Denied)
+            );
+        }
+
+        drop(capability);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn capability_grants_are_bound_to_one_capability() {
         let first = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
@@ -416,6 +459,43 @@ mod tests {
             ),
             Err(FileAccessError::Denied)
         ));
+
+        drop(capability);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlink_escapes_are_denied_for_existing_and_missing_targets() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        let allowed = directory.join("allowed");
+        let outside = directory.join("outside");
+        let existing_target = outside.join("existing.html");
+        fs::create_dir(&allowed).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(&existing_target, b"secret").unwrap();
+        symlink(&existing_target, allowed.join("existing-link.html")).unwrap();
+        symlink(
+            outside.join("missing.html"),
+            allowed.join("missing-link.html"),
+        )
+        .unwrap();
+        let capability =
+            FileAccessCapability::from_trusted_directory_selections([trusted_selection(&allowed)])
+                .unwrap();
+        let grant = capability.issue_grant();
+
+        for path in [
+            allowed.join("existing-link.html"),
+            allowed.join("missing-link.html"),
+        ] {
+            assert!(matches!(
+                capability.open_authorized_file(&navigation_context(), &grant, path),
+                Err(FileAccessError::Denied)
+            ));
+        }
 
         drop(capability);
         fs::remove_dir_all(directory).unwrap();

@@ -240,12 +240,10 @@ fn normalize_absolute_path(path: &Path) -> Result<Vec<LexicalComponent>, FileAcc
         }
     }
 
-    if normalized.first().is_some_and(|component| {
-        matches!(
-            component,
-            LexicalComponent::Root | LexicalComponent::Prefix(_)
-        )
-    }) {
+    if normalized
+        .iter()
+        .any(|component| matches!(component, LexicalComponent::Root))
+    {
         Ok(normalized)
     } else {
         Err(FileAccessError::InvalidPath)
