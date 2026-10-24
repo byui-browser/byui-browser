@@ -2,12 +2,20 @@
 
 use crate::ast::{BinaryOperator, UnaryOperator};
 use crate::bytecode::{Chunk, Instruction};
-use crate::{JsError, JsResult, Value};
+use crate::runtime::{non_object, to_property_key};
+use crate::{JsError, JsErrorCategory, JsResult, Value};
 
 /// Executes a [`Chunk`] using an owned operand stack.
 #[derive(Debug, Default)]
 pub struct Vm {
     stack: Vec<Value>,
+    scopes: Vec<Vec<Slot>>,
+}
+
+#[derive(Debug, Clone)]
+struct Slot {
+    value: Option<Value>,
+    kind: Option<crate::ast::VarKind>,
 }
 
 impl Vm {
@@ -19,6 +27,7 @@ impl Vm {
     /// Executes `chunk` and returns its completion value.
     pub fn execute(&mut self, chunk: &Chunk) -> JsResult<Value> {
         self.stack.clear();
+        self.scopes.clear();
         let mut instruction_pointer = 0;
         while let Some(instruction) = chunk.code.get(instruction_pointer).copied() {
             instruction_pointer += 1;
@@ -53,6 +62,82 @@ impl Vm {
                         instruction_pointer = target;
                     }
                 }
+                Instruction::LoadProperty(index) => {
+                    let key = property_name(chunk, index)?;
+                    let target = self.pop()?;
+                    self.push(load_property(&target, &key)?);
+                }
+                Instruction::LoadComputedProperty => {
+                    let key = to_property_key(&self.pop()?);
+                    let target = self.pop()?;
+                    self.push(load_property(&target, &key)?);
+                }
+                Instruction::StoreProperty(index) => {
+                    let key = property_name(chunk, index)?;
+                    let value = self.pop()?;
+                    let target = self.pop()?;
+                    store_property(&target, key, &value)?;
+                    self.push(value);
+                }
+                Instruction::StoreComputedProperty => {
+                    let value = self.pop()?;
+                    let key = to_property_key(&self.pop()?);
+                    let target = self.pop()?;
+                    store_property(&target, key, &value)?;
+                    self.push(value);
+                }
+                Instruction::EnterScope(slot_count) => {
+                    self.scopes.push(vec![
+                        Slot {
+                            value: None,
+                            kind: None
+                        };
+                        usize::from(slot_count)
+                    ]);
+                }
+                Instruction::ExitScope => {
+                    self.scopes
+                        .pop()
+                        .ok_or_else(|| JsError::runtime("bytecode scope underflow"))?;
+                }
+                Instruction::DeclareGlobal { slot, kind, name } => {
+                    self.declare(0, slot, kind, name, chunk)?;
+                }
+                Instruction::DeclareLocal { slot, kind, name } => {
+                    self.declare(0, slot, kind, name, chunk)?;
+                }
+                Instruction::LoadGlobal { slot, name } => {
+                    let value = self.load(0, slot, name, chunk)?;
+                    self.push(value);
+                }
+                Instruction::LoadLocal { depth, slot, name } => {
+                    let value = self.load(depth, slot, name, chunk)?;
+                    self.push(value);
+                }
+                Instruction::InitializeGlobal { slot, name } => {
+                    let value = self.pop()?;
+                    self.initialize(0, slot, value, name, chunk)?;
+                }
+                Instruction::InitializeLocal { slot, name } => {
+                    let value = self.pop()?;
+                    self.initialize(0, slot, value, name, chunk)?;
+                }
+                Instruction::StoreGlobal { slot, name } => {
+                    let value = self.peek()?.clone();
+                    self.store(0, slot, value, name, chunk)?;
+                }
+                Instruction::StoreLocal { depth, slot, name } => {
+                    let value = self.peek()?.clone();
+                    self.store(depth, slot, value, name, chunk)?;
+                }
+                Instruction::LoadUnresolved { name } => {
+                    let name = self.binding_name(name, chunk)?;
+                    return Err(JsError::new(format!("`{name}` is not defined")));
+                }
+                Instruction::StoreUnresolved { name } => {
+                    let name = self.binding_name(name, chunk)?;
+                    return Err(JsError::new(format!("`{name}` is not defined")));
+                }
             }
         }
         Err(JsError::runtime(
@@ -67,10 +152,142 @@ impl Vm {
     fn pop(&mut self) -> JsResult<Value> {
         self.stack.pop().ok_or_else(stack_underflow)
     }
+
+    fn peek(&self) -> JsResult<&Value> {
+        self.stack.last().ok_or_else(stack_underflow)
+    }
+
+    fn slot_mut(&mut self, depth: u16, slot: u16) -> JsResult<&mut Slot> {
+        let index = self
+            .scopes
+            .len()
+            .checked_sub(1 + usize::from(depth))
+            .ok_or_else(|| JsError::runtime("bytecode scope depth is invalid"))?;
+        self.scopes
+            .get_mut(index)
+            .and_then(|scope| scope.get_mut(usize::from(slot)))
+            .ok_or_else(|| JsError::runtime("bytecode binding slot is invalid"))
+    }
+
+    fn slot(&self, depth: u16, slot: u16) -> JsResult<&Slot> {
+        let index = self
+            .scopes
+            .len()
+            .checked_sub(1 + usize::from(depth))
+            .ok_or_else(|| JsError::runtime("bytecode scope depth is invalid"))?;
+        self.scopes
+            .get(index)
+            .and_then(|scope| scope.get(usize::from(slot)))
+            .ok_or_else(|| JsError::runtime("bytecode binding slot is invalid"))
+    }
+
+    fn binding_name<'a>(&self, name: u16, chunk: &'a Chunk) -> JsResult<&'a str> {
+        chunk
+            .names
+            .get(usize::from(name))
+            .map(String::as_str)
+            .ok_or_else(|| JsError::runtime("bytecode binding name is invalid"))
+    }
+
+    fn declare(
+        &mut self,
+        depth: u16,
+        slot: u16,
+        kind: crate::ast::VarKind,
+        name: u16,
+        chunk: &Chunk,
+    ) -> JsResult<()> {
+        let name = self.binding_name(name, chunk)?.to_owned();
+        let entry = self.slot_mut(depth, slot)?;
+        entry.kind = Some(kind);
+        if kind == crate::ast::VarKind::Var {
+            entry.value = Some(Value::Undefined);
+        }
+        let _ = name;
+        Ok(())
+    }
+
+    fn load(&self, depth: u16, slot: u16, name: u16, chunk: &Chunk) -> JsResult<Value> {
+        let name = self.binding_name(name, chunk)?;
+        self.slot(depth, slot)?
+            .value
+            .clone()
+            .ok_or_else(|| JsError::new(format!("Cannot access `{name}` before initialization")))
+    }
+
+    fn initialize(
+        &mut self,
+        depth: u16,
+        slot: u16,
+        value: Value,
+        name: u16,
+        chunk: &Chunk,
+    ) -> JsResult<()> {
+        let name = self.binding_name(name, chunk)?.to_owned();
+        let entry = self.slot_mut(depth, slot)?;
+        if entry.value.is_some() && entry.kind == Some(crate::ast::VarKind::Const) {
+            return Err(JsError::new(format!("Assignment to constant `{name}`")));
+        }
+        entry.value = Some(value);
+        Ok(())
+    }
+
+    fn store(
+        &mut self,
+        depth: u16,
+        slot: u16,
+        value: Value,
+        name: u16,
+        chunk: &Chunk,
+    ) -> JsResult<()> {
+        let name = self.binding_name(name, chunk)?.to_owned();
+        let entry = self.slot_mut(depth, slot)?;
+        if entry.value.is_none() {
+            return Err(JsError::new(format!(
+                "Cannot access `{name}` before initialization"
+            )));
+        }
+        if entry.kind == Some(crate::ast::VarKind::Const) {
+            return Err(JsError::new(format!("Assignment to constant `{name}`")));
+        }
+        entry.value = Some(value);
+        Ok(())
+    }
 }
 
 fn stack_underflow() -> JsError {
     JsError::runtime("bytecode operand stack underflow")
+}
+
+/// Reads the string constant naming a property.
+fn property_name(chunk: &Chunk, index: u16) -> JsResult<String> {
+    match chunk.constants.get(usize::from(index)) {
+        Some(Value::String(name)) => Ok(name.clone()),
+        _ => Err(JsError::runtime(
+            "bytecode property name constant is invalid",
+        )),
+    }
+}
+
+fn load_property(target: &Value, key: &str) -> JsResult<Value> {
+    let Value::Object(object) = target else {
+        return Err(non_object(target, "read", key, "property access"));
+    };
+    object.get(key).ok_or_else(|| {
+        JsError::with_context(
+            JsErrorCategory::Runtime,
+            format!("Property `{key}` is not defined"),
+            "property access",
+        )
+    })
+}
+
+fn store_property(target: &Value, key: String, value: &Value) -> JsResult<()> {
+    let Value::Object(object) = target else {
+        return Err(non_object(target, "set", &key, "property assignment"));
+    };
+    object.set(key, value.clone());
+    Ok(())
 }
 
 fn unary(operator: UnaryOperator, value: Value) -> JsResult<Value> {
@@ -141,9 +358,8 @@ fn to_number(value: &Value) -> JsResult<f64> {
         Value::Boolean(value) => Ok(f64::from(*value as u8)),
         Value::Null => Ok(0.0),
         Value::Undefined => Ok(f64::NAN),
-        Value::String(value) => value
-            .parse()
-            .map_err(|_| JsError::runtime("cannot convert string to number")),
+        Value::String(value) if value.trim().is_empty() => Ok(0.0),
+        Value::String(value) => Ok(value.trim().parse().unwrap_or(f64::NAN)),
         Value::Function(_) | Value::Object(_) => {
             Err(JsError::runtime("cannot convert object to number"))
         }

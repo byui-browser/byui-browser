@@ -96,6 +96,77 @@ impl StorageKey {
     }
 }
 
+/// The renderer's permission to access browser storage.
+///
+/// This initial policy is all-or-nothing: allowing storage permits both reads
+/// and writes. More granular permissions can be added when the storage policy
+/// is expanded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoragePermission {
+    /// The renderer may read and write storage.
+    Allowed,
+    /// The renderer may neither read nor write storage.
+    Denied,
+}
+
+/// Security identity and storage policy for a renderer.
+///
+/// The origin, associated storage key, and permission are fixed when the
+/// context is created. Callers can inspect them but cannot change them.
+///
+/// Directly changing the origin or permission is not part of the public API:
+///
+/// ```compile_fail
+/// use security::{Origin, RendererSecurityContext, StoragePermission};
+///
+/// let mut context = RendererSecurityContext::new(
+///     Origin::placeholder(),
+///     StoragePermission::Denied,
+/// );
+/// context.origin = Origin::placeholder();
+/// context.storage_permission = StoragePermission::Allowed;
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RendererSecurityContext {
+    origin: Origin,
+    storage_key: StorageKey,
+    storage_permission: StoragePermission,
+}
+
+impl RendererSecurityContext {
+    /// Creates a renderer context for `origin` with the specified storage
+    /// permission.
+    ///
+    /// The storage key is derived from the same origin stored by this context.
+    pub fn new(origin: Origin, storage_permission: StoragePermission) -> Self {
+        Self {
+            storage_key: StorageKey::new(origin.clone()),
+            origin,
+            storage_permission,
+        }
+    }
+
+    /// Returns the renderer's origin.
+    pub fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
+    /// Returns the storage key associated with the renderer's origin.
+    pub fn storage_key(&self) -> &StorageKey {
+        &self.storage_key
+    }
+
+    /// Whether the renderer is allowed to read storage.
+    pub fn can_read_storage(&self) -> bool {
+        self.storage_permission == StoragePermission::Allowed
+    }
+
+    /// Whether the renderer is allowed to write storage.
+    pub fn can_write_storage(&self) -> bool {
+        self.storage_permission == StoragePermission::Allowed
+    }
+}
+
 /// Same-origin policy check.
 // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
 pub fn same_origin(a: &Origin, b: &Origin) -> bool {
@@ -236,6 +307,62 @@ mod tests {
 
         assert_eq!(key.get(), &origin);
         assert_eq!(key, StorageKey::new(origin));
+    }
+
+    #[test]
+    fn renderer_context_stores_origin_and_matching_storage_key() {
+        let origin = origin("https", "byui.edu", 443);
+        let context = RendererSecurityContext::new(origin.clone(), StoragePermission::Allowed);
+
+        assert_eq!(context.origin(), &origin);
+        assert_eq!(context.storage_key().get(), &origin);
+    }
+
+    #[test]
+    fn different_origins_have_different_storage_keys() {
+        let first = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+        let second = RendererSecurityContext::new(
+            origin("https", "example.com", 443),
+            StoragePermission::Allowed,
+        );
+
+        assert_ne!(first.storage_key(), second.storage_key());
+    }
+
+    #[test]
+    fn allowed_renderer_can_read_and_write_storage() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+
+        assert!(context.can_read_storage());
+        assert!(context.can_write_storage());
+    }
+
+    #[test]
+    fn denied_renderer_cannot_read_or_write_storage() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Denied,
+        );
+
+        assert!(!context.can_read_storage());
+        assert!(!context.can_write_storage());
+    }
+
+    #[test]
+    fn renderer_context_exposes_only_immutable_identity_and_policy() {
+        let origin = origin("https", "byui.edu", 443);
+        let context = RendererSecurityContext::new(origin.clone(), StoragePermission::Denied);
+
+        assert_eq!(context.origin(), &origin);
+        assert_eq!(context.storage_key().get(), &origin);
+        assert!(!context.can_read_storage());
+        assert!(!context.can_write_storage());
     }
 
     #[test]

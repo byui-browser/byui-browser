@@ -199,3 +199,24 @@ fn spans_use_utf8_byte_offsets_and_exclude_whitespace() {
     );
     assert_eq!(&source[entries[0].start..entries[0].end], "'é'");
 }
+
+#[test]
+fn lexes_mixed_ascii_unicode_and_escaped_identifiers() {
+    assert_eq!(
+        tokenize(r"let total_€ = caf\u00e9 + 名前.\u{78} + \u0069f;"),
+        vec![
+            Token::Let,
+            Token::Identifier("total_".into()),
+            Token::Unknown('€'),
+            Token::Assign,
+            Token::Identifier("café".into()),
+            Token::Plus,
+            Token::Identifier("名前".into()),
+            Token::Dot,
+            Token::Identifier("x".into()),
+            Token::Plus,
+            Token::EscapedKeyword("if".into()),
+            Token::Semicolon,
+        ]
+    );
+}

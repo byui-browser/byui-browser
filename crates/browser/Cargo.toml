@@ -30,6 +30,7 @@ security = { workspace = true }
 chrome = { workspace = true }
 devtools = { workspace = true }
 futures-util = "0.3"
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
 
 [dev-dependencies]
 cap-std = "4"

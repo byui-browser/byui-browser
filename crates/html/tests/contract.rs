@@ -14,6 +14,30 @@ fn arena_document_starts_with_a_document_root() {
 }
 
 #[test]
+fn inner_html_serializes_markup_and_escapes_text_and_attributes() {
+    let mut document = HTMLDocument::new();
+    let paragraph = document.push_node(
+        NodeKind::Element(html::ElementData {
+            name: "p".into(),
+            namespace: Namespace::Html,
+            attributes: vec![Attribute {
+                name: "title".into(),
+                value: "A & \"B\"".into(),
+            }],
+        }),
+        None,
+    );
+    let text = document.push_node(NodeKind::Text("<hello & goodbye>".into()), None);
+    document.append_child(document.root, paragraph);
+    document.append_child(paragraph, text);
+
+    assert_eq!(
+        document.inner_html(),
+        "<p title=\"A &amp; &quot;B&quot;\">&lt;hello &amp; goodbye></p>"
+    );
+}
+
+#[test]
 fn create_element_follows_html_document_rules() {
     let mut document = HTMLDocument::new();
 
@@ -213,6 +237,64 @@ fn get_element_by_id_accepts_an_empty_id() {
     let document = parse_raw_html("<div id=''></div>".to_owned());
 
     assert_eq!(document.get_element_by_id(""), Some(html::NodeId(1)));
+}
+
+#[test]
+fn class_list_exposes_the_class_attribute_as_an_ordered_set() {
+    let mut document = parse_raw_html("<div class='  card card featured\t'></div>".to_owned());
+    let element = html::NodeId(1);
+    let mut class_list = document.class_list(element).expect("element class list");
+
+    assert_eq!(class_list.length(), 2);
+    assert_eq!(class_list.item(0), Some("card".to_owned()));
+    assert_eq!(class_list.item(2), None);
+    assert!(class_list.contains("featured"));
+    assert_eq!(class_list.value(), "  card card featured\t");
+
+    class_list.add(&["selected", "card"]).unwrap();
+    assert_eq!(class_list.value(), "card featured selected");
+    class_list.remove(&["featured"]).unwrap();
+    assert_eq!(class_list.value(), "card selected");
+}
+
+#[test]
+fn class_list_mutations_update_the_element_attribute() {
+    let mut document = parse_raw_html("<div class='card'></div>".to_owned());
+    let element = html::NodeId(1);
+
+    {
+        let mut class_list = document.class_list(element).unwrap();
+        assert_eq!(class_list.toggle("active", None), Ok(true));
+        assert_eq!(class_list.toggle("active", Some(false)), Ok(false));
+        assert_eq!(class_list.replace("card", "panel"), Ok(true));
+        class_list.set_value("panel  wide wide").unwrap();
+    }
+
+    let NodeKind::Element(element) = &document.node(html::NodeId(1)).unwrap().kind else {
+        panic!("expected element");
+    };
+    assert_eq!(
+        element
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == "class")
+            .map(|attribute| attribute.value.as_str()),
+        Some("panel  wide wide")
+    );
+}
+
+#[test]
+fn class_list_validates_all_tokens_before_mutating() {
+    let mut document = parse_raw_html("<div class='card'></div>".to_owned());
+    let mut class_list = document.class_list(html::NodeId(1)).unwrap();
+
+    assert_eq!(
+        class_list.add(&["valid", "has space"]),
+        Err(html::DomError::InvalidToken)
+    );
+    assert_eq!(class_list.value(), "card");
+    assert_eq!(class_list.remove(&[""]), Err(html::DomError::Syntax));
+    assert_eq!(class_list.supports("card"), Err(html::DomError::Type));
 }
 
 #[test]
