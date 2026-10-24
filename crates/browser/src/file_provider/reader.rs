@@ -36,11 +36,21 @@ impl FileBufferBudget {
     }
 
     pub(super) fn try_reserve(&self, bytes: u64) -> bool {
-        self.available
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
-                available.checked_sub(bytes)
-            })
-            .is_ok()
+        let mut available = self.available.load(Ordering::Acquire);
+        loop {
+            let Some(next) = available.checked_sub(bytes) else {
+                return false;
+            };
+            match self.available.compare_exchange_weak(
+                available,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => available = current,
+            }
+        }
     }
 
     fn release(&self, bytes: u64) {

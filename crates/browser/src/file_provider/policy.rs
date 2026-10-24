@@ -85,7 +85,7 @@ pub(super) fn is_native_executable_prefix(prefix: &[u8]) -> bool {
                 | [0xfe, 0xed, 0xfa, 0xcf, ..]
                 | [0xcf, 0xfa, 0xed, 0xfe, ..]
                 | [0xca, 0xfe, 0xba, 0xbe, ..]
-        );
+        )
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {

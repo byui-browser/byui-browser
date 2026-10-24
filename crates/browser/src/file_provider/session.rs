@@ -21,11 +21,21 @@ impl FileSessionByteBudget {
     }
 
     pub(super) fn try_consume(&self, bytes: u64) -> bool {
-        self.remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                remaining.checked_sub(bytes)
-            })
-            .is_ok()
+        let mut remaining = self.remaining.load(Ordering::Acquire);
+        loop {
+            let Some(next) = remaining.checked_sub(bytes) else {
+                return false;
+            };
+            match self.remaining.compare_exchange_weak(
+                remaining,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => remaining = current,
+            }
+        }
     }
 }
 
