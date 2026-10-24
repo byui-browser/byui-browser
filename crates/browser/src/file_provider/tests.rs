@@ -137,11 +137,11 @@ fn revocation_after_file_setup_rejects_get_and_head_and_releases_admission() {
         NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir(&directory).unwrap();
+    let directory = fs::canonicalize(directory).unwrap();
     let file = directory.join("page.html");
     fs::write(&file, b"prepared content").unwrap();
-    let canonical_directory = fs::canonicalize(&directory).unwrap();
     let selection = TrustedDirectorySelection::from_verified_open_directory(
-        canonical_directory,
+        directory.clone(),
         Dir::open_ambient_dir(&directory, ambient_authority()).unwrap(),
     )
     .unwrap();
@@ -451,11 +451,11 @@ fn dropping_unread_or_partially_read_body_releases_reader_admission() {
         NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir(&directory).unwrap();
+    let directory = fs::canonicalize(directory).unwrap();
     let file = directory.join("page.html");
     fs::write(&file, vec![b'x'; FILE_READ_CHUNK_SIZE * 4]).unwrap();
-    let canonical_directory = fs::canonicalize(&directory).unwrap();
     let selection = TrustedDirectorySelection::from_verified_open_directory(
-        canonical_directory,
+        directory.clone(),
         Dir::open_ambient_dir(&directory, ambient_authority()).unwrap(),
     )
     .unwrap();
@@ -517,10 +517,10 @@ fn file_body_uses_captured_framing_for_live_file_mutations() {
         NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir(&directory).unwrap();
+    let directory = fs::canonicalize(directory).unwrap();
     let file = directory.join("page.html");
-    let canonical_directory = fs::canonicalize(&directory).unwrap();
     let selection = TrustedDirectorySelection::from_verified_open_directory(
-        canonical_directory,
+        directory.clone(),
         Dir::open_ambient_dir(&directory, ambient_authority()).unwrap(),
     )
     .unwrap();

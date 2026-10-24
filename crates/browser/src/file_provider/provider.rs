@@ -113,6 +113,9 @@ impl FileProvider for BrowserFileProvider {
             let path = url
                 .to_file_path()
                 .map_err(|_| provider_error(FileAccessError::InvalidPath))?;
+            if path.as_os_str().to_string_lossy().contains('\0') {
+                return Err(provider_error(FileAccessError::InvalidPath));
+            }
             let permit = read_admission
                 .acquire(&signal, &session_cancellation)
                 .await?;
