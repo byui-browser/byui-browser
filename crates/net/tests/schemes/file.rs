@@ -205,6 +205,7 @@ fn file_fetches_resolve_once_and_use_shared_response_finalization() {
     );
     assert_eq!(services.cookie_lookups.load(Ordering::SeqCst), 0);
     assert_eq!(services.cache_partitions.load(Ordering::SeqCst), 0);
+    assert_eq!(services.worker_checks.load(Ordering::SeqCst), 0);
 }
 
 #[test]

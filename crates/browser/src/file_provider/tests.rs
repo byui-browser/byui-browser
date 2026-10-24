@@ -28,7 +28,7 @@ use super::{
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 #[test]
-fn file_read_admission_rejects_excess_waiters_and_cancels_queued_work() {
+fn file_read_admission_enforces_reader_and_queue_limits_and_cancels_queued_work() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let admission = FileReadAdmission::new(0, 1);
@@ -76,6 +76,56 @@ fn file_read_admission_rejects_excess_waiters_and_cancels_queued_work() {
             session_waiting.await.unwrap(),
             Err(RequestError::Aborted)
         ));
+
+        let admission = FileReadAdmission::new(MAX_CONCURRENT_FILE_READS, MAX_PENDING_FILE_READS);
+        let session_cancellation = FileAccessCancellation::new();
+        let signals = (0..MAX_CONCURRENT_FILE_READS)
+            .map(|_| AbortSignal::new())
+            .collect::<Vec<_>>();
+        let active = futures_util::future::join_all(
+            signals
+                .iter()
+                .map(|signal| admission.acquire(signal, &session_cancellation)),
+        )
+        .await;
+        let active = active
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("active reader permits should be available");
+        let queued = (0..MAX_PENDING_FILE_READS)
+            .map(|_| {
+                let admission = admission.clone();
+                let cancellation = session_cancellation.clone();
+                tokio::spawn(
+                    async move { admission.acquire(&AbortSignal::new(), &cancellation).await },
+                )
+            })
+            .collect::<Vec<_>>();
+        while admission.pending.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            admission
+                .acquire(&AbortSignal::new(), &session_cancellation)
+                .await,
+            Err(RequestError::Provider {
+                provider: "file",
+                kind: ProviderErrorKind::ResourceExhausted,
+            })
+        ));
+        session_cancellation.cancel();
+        for queued in queued {
+            assert!(matches!(queued.await.unwrap(), Err(RequestError::Aborted)));
+        }
+        drop(active);
+        assert_eq!(
+            admission.active.available_permits(),
+            MAX_CONCURRENT_FILE_READS
+        );
+        assert_eq!(
+            admission.pending.available_permits(),
+            MAX_PENDING_FILE_READS
+        );
     });
 }
 

@@ -17,9 +17,9 @@ pub mod file_provider;
 
 /// Browser-owned resource limits for one local-file session.
 ///
-/// The current limit bounds the length, in bytes, of each individual file
-/// admitted by the provider. It does not yet bound read duration, total bytes
-/// served by a session, or aggregate provider buffering.
+/// The limits bound the length of each individual file, the total response
+/// bytes served by a session, the duration of each read, and aggregate
+/// buffering between blocking readers and response consumers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileAccessLimits {
     /// Maximum number of bytes in one local file admitted for `GET` or `HEAD`.

@@ -111,28 +111,55 @@ does not by itself make active bytes safe to parse or execute. Enforcement must
 occur before response metadata is published and must remain consistent with
 the existing revocation and cancellation checks.
 
-## Remaining work
+## Regression and integration guarantees
 
-### 1. Maintain regression and integration guarantees
-
-Keep deterministic regression coverage for blocking setup, response
+Deterministic regression coverage exercises blocking setup, response
 publication, queued chunks, worker-side failures, full-channel backpressure,
 four-reader concurrency, queue exhaustion, request aborts, and `GET`/`HEAD`
-revocation behavior. Verify every path releases handles, permits, channels,
-and blocking tasks.
+revocation behavior. Each completion, failure, cancellation, and body-drop
+path releases its handles, permits, channels, and blocking tasks.
 
-Keep cross-crate tests aligned with these guarantees:
-
-- Local-file requests never use HTTP transport, cookies, service workers, or
-  the HTTP cache.
-- Unrelated scheme providers cannot satisfy a `file:` request.
-- Provider errors stay stable and non-diagnostic.
-- Authorization occurs before path conversion for unauthorized requests.
+Cross-crate tests verify that local-file requests bypass HTTP transport,
+cookies, service workers, and the HTTP cache; unrelated providers cannot
+satisfy a `file:` request; provider errors remain stable and non-diagnostic;
+and unauthorized requests are rejected before path conversion.
 
 There is no automatic `Drop`-based session shutdown. Browser lifecycle code
 must explicitly call `close`, `navigation_away`, `shutdown`, or revoke the
 grant, unless a grant lifetime is configured. The audit stream contains only
 the path-free events `Replaced`, `Revoked`, `Expired`, and `Shutdown`.
+
+## Potential future security work
+
+The following risks are known and intentionally remain for now. They must not
+be treated as guarantees supplied by the file provider alone.
+
+- **Active HTML content:** `text/html` is currently admitted as a static
+  document type, but the provider does not itself install a CSP, sandbox
+  policy, or HTML/script filtering. A future renderer integration must ensure
+  that scripts, inline event handlers, active navigation, and other HTML
+  capabilities cannot execute or escape the intended local-file policy. The
+  existing opaque origin and `nosniff` header are not sufficient by themselves.
+- **Outbound network policy:** the file provider blocks local-file
+  subresources, but it does not by itself prevent a future document or renderer
+  from issuing HTTP(S) requests. A browser-owned request policy must enforce the
+  documented no-external-network default for file documents, including markup,
+  script, form, popup, and navigation paths.
+- **Content integrity after open:** retained handles prevent pathname
+  replacement and symlink redirection, but they do not snapshot file bytes.
+  Another process may modify the file in place after metadata and the bounded
+  executable-prefix check have completed. Future policy should decide whether
+  local documents require immutable snapshots, stronger file identity checks, or
+  an explicit acceptance of this mutation behavior.
+- **Lifecycle resource bounds:** audit events are retained in memory without a
+  configured cap, and each timed grant generation currently uses a sleeping
+  background thread. Future work should bound audit retention and replace
+  per-generation sleeping threads with a cancellable, bounded scheduler.
+- **Windows alias timing:** the Windows long-name, short-name, and
+  extended-length spelling fallback may consult the filesystem through
+  `canonicalize`. It preserves stable denial categories, but future work should
+  assess and, if necessary, remove filesystem-dependent timing differences when
+  proving the no-existence-oracle property for alias spellings.
 
 The security layer also fails closed for malformed or unauthorized paths before
 filesystem conversion, avoids existence oracles for paths outside selected
