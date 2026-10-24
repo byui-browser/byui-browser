@@ -621,7 +621,7 @@ fn test_directory(label: &str) -> std::path::PathBuf {
         NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir(&directory).unwrap();
-    directory
+    fs::canonicalize(directory).unwrap()
 }
 
 fn provider_authority(
