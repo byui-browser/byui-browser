@@ -29,6 +29,9 @@ pub struct FileAccessLimits {
     pub max_session_bytes: u64,
     /// Maximum elapsed time for setup and streaming of one admitted `GET`.
     pub max_read_duration: Duration,
+    /// Maximum aggregate bytes queued between blocking local-file readers and
+    /// response-body consumers for this session.
+    pub max_buffered_bytes: u64,
 }
 
 /// Browser-owned interpretation policy for responses from a local-file session.
@@ -50,6 +53,7 @@ impl Default for FileAccessLimits {
             max_file_size: 64 * 1024 * 1024,
             max_session_bytes: 256 * 1024 * 1024,
             max_read_duration: Duration::from_secs(30),
+            max_buffered_bytes: 512 * 1024,
         }
     }
 }
@@ -81,6 +85,7 @@ impl FileAccessConfiguration {
         if limits.max_file_size == 0
             || limits.max_session_bytes == 0
             || limits.max_read_duration.is_zero()
+            || limits.max_buffered_bytes == 0
         {
             return Err(FileAccessError::InvalidPath);
         }

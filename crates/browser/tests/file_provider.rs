@@ -237,6 +237,10 @@ fn file_access_configuration_rejects_zero_resource_limits() {
             max_read_duration: Duration::ZERO,
             ..FileAccessLimits::default()
         },
+        FileAccessLimits {
+            max_buffered_bytes: 0,
+            ..FileAccessLimits::default()
+        },
     ] {
         assert!(matches!(
             FileAccessConfiguration::from_trusted_directory_selections([], limits),

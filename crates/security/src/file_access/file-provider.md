@@ -15,6 +15,12 @@ captured `Content-Length` enforcement, request cancellation, and revocable
 generation-bound grants are implemented. Revocation prevents future opens and
 body delivery, including already queued chunks.
 
+The provider also bounds aggregate queued response bytes per session and wakes
+body consumers at their read deadline, cancelling further delivery. A regular
+filesystem read already executing in the safe blocking API cannot be forcibly
+interrupted; its result is discarded and all provider resources are released
+as soon as that operation returns.
+
 Each admitted `file:` document receives an opaque origin. Local-file access is
 limited to browser-issued top-level navigations; all subresources, workers, and
 nested browsing contexts remain denied until document/container identity is
@@ -87,45 +93,7 @@ the existing revocation and cancellation checks.
 
 ## Remaining work
 
-### 1. Complete resource and active-content limits
-
-The provider now enforces a 30-second default setup/stream deadline, a
-256 MiB default cumulative body-byte budget per session, four active readers,
-eight queued readers, and at most 512 KiB of queued payload (four readers,
-two 64 KiB chunks each). Browser-owned configuration may tighten or raise the
-file, session-byte, and duration limits; zero-valued limits are rejected.
-
-Only static HTML/CSS and passive PNG, JPEG, GIF, and WebP responses are
-admitted. Unknown, JavaScript, JSON, SVG, and other unsupported types are
-denied, declared responses carry `X-Content-Type-Options: nosniff`, and a
-bounded prefix check rejects recognizable native executable headers on the
-current platform. This remains a provider policy, not a renderer capability:
-the current provider still denies all local-file subresources and does not
-authorize script interpretation.
-
-Remaining work is to expose a configurable byte-buffer cap if channel sizing
-becomes configurable, establish cancellable platform I/O deadlines rather
-than enforcing the deadline at provider observation points, and add targeted
-slow-I/O and full-channel timeout tests on each supported platform.
-
-### 2. Define mutable-file and stream-consistency semantics
-
-Responses use a retained open handle, not a filesystem snapshot. The selected
-handle and its metadata are captured during setup, so replacing the pathname,
-selected root, or a path component after open cannot redirect the response.
-The `Content-Length` header is the length captured from that handle and is
-never recomputed.
-
-In-place writes may be observed by later reads. A same-length overwrite may
-therefore yield old bytes, new bytes, or a mixture, but succeeds only if the
-stream yields exactly the captured length. Truncation can yield a prefix then
-fails with the stable `Io` provider category. Growth yields no bytes beyond
-the captured length and likewise fails with `Io` after the bounded extra-byte
-probe. Media type and other response metadata remain those captured during
-setup. All success, mismatch, cancellation, and body-drop paths release the
-opened handle, channel, and reader permit.
-
-### 3. Complete permission lifecycle behavior
+### 1. Complete permission lifecycle behavior
 
 Add grant expiry, audit logging, and explicit process-shutdown sequencing. Use
 the existing grant-revocation path for expiry so pending setup, live readers,
@@ -138,7 +106,7 @@ and OS diagnostics from logs. Test expiry, replacement,
 controller destruction, shutdown, pending setup, active readers, queued data,
 and navigation authorizations.
 
-### 4. Maintain regression and integration guarantees
+### 2. Maintain regression and integration guarantees
 
 Keep deterministic regression coverage for blocking setup, response
 publication, queued chunks, worker-side failures, full-channel backpressure,

@@ -20,7 +20,7 @@ use super::{
         allows_content, is_native_executable_prefix, provider_error, provider_io_error,
         provider_resource_exhausted_error, request_context,
     },
-    reader::{FILE_READ_CHANNEL_CAPACITY, FileReadTask, read_file_stream},
+    reader::{FILE_READ_CHANNEL_CAPACITY, FileBufferBudget, FileReadTask, read_file_stream},
     session::{FileAccessGrantSource, FileSessionByteBudget},
     stream::{CancellationGuard, FileBodyStream},
 };
@@ -35,10 +35,13 @@ pub(crate) struct BrowserFileProvider {
     pub(super) limits: crate::FileAccessLimits,
     pub(super) content_policy: crate::FileAccessContentPolicy,
     pub(super) session_budget: FileSessionByteBudget,
+    pub(super) buffer_budget: FileBufferBudget,
     #[cfg(test)]
     /// Deterministically mutates the already-open handle's file before this
     /// provider publishes response metadata.
     pub(super) after_open_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    pub(super) before_read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl BrowserFileProvider {
@@ -59,10 +62,13 @@ impl BrowserFileProvider {
                 MAX_PENDING_FILE_READS,
             ),
             session_budget: FileSessionByteBudget::new(limits.max_session_bytes),
+            buffer_budget: FileBufferBudget::new(limits.max_buffered_bytes),
             limits,
             content_policy,
             #[cfg(test)]
             after_open_hook: None,
+            #[cfg(test)]
+            before_read_hook: None,
         }
     }
 }
@@ -76,6 +82,7 @@ impl FileProvider for BrowserFileProvider {
         let limits = self.limits;
         let content_policy = self.content_policy;
         let session_budget = self.session_budget.clone();
+        let buffer_budget = self.buffer_budget.clone();
         let url = url.clone();
         let is_head = request.method() == net::Method::HEAD;
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -84,6 +91,8 @@ impl FileProvider for BrowserFileProvider {
         let preparation_cancelled = Arc::clone(&cancelled);
         #[cfg(test)]
         let after_open_hook = self.after_open_hook.clone();
+        #[cfg(test)]
+        let before_read_hook = self.before_read_hook.clone();
 
         Box::pin(async move {
             let (grant, lease, session_cancellation) = grants
@@ -212,6 +221,9 @@ impl FileProvider for BrowserFileProvider {
                             expected_length,
                             deadline,
                             session_budget,
+                            buffer_budget,
+                            #[cfg(test)]
+                            before_read_hook,
                         });
                     });
                     cancellation.disarm();
@@ -222,6 +234,9 @@ impl FileProvider for BrowserFileProvider {
                         lease,
                         reported_session_cancellation: false,
                         deadline,
+                        deadline_timer: Box::pin(tokio::time::sleep_until(
+                            tokio::time::Instant::from_std(deadline),
+                        )),
                         reported_timeout: false,
                     }))
                 },

@@ -20,7 +20,7 @@ use super::{
     FileAccessGrantSource, FileNavigationAuthorizations,
     admission::{FileReadAdmission, MAX_CONCURRENT_FILE_READS, MAX_PENDING_FILE_READS},
     provider::BrowserFileProvider,
-    reader::FILE_READ_CHUNK_SIZE,
+    reader::{BufferedChunk, FILE_READ_CHUNK_SIZE, FileBufferBudget},
     session::FileAccessCancellation,
     stream::FileBodyStream,
 };
@@ -145,8 +145,10 @@ fn revocation_after_file_setup_rejects_get_and_head_and_releases_admission() {
             read_admission: provider.read_admission.clone(),
             limits: provider.limits,
             session_budget: provider.session_budget.clone(),
+            buffer_budget: provider.buffer_budget.clone(),
             content_policy: provider.content_policy,
             after_open_hook: None,
+            before_read_hook: None,
         };
         let mut probe_request = Request::get(url.clone());
         probe_request.set_method(net::Method::HEAD).unwrap();
@@ -169,8 +171,14 @@ fn revoked_session_never_delivers_an_already_queued_chunk() {
     let grant = capability.issue_grant();
     let lease = grant.lease().unwrap();
     let (sender, receiver) = mpsc::channel(1);
-    sender.try_send(Ok(vec![b'x'])).unwrap();
+    let buffer_budget = FileBufferBudget::new(1);
+    assert!(buffer_budget.try_reserve(1));
+    sender
+        .try_send(Ok(BufferedChunk::new(vec![b'x'], 1, buffer_budget)))
+        .unwrap();
     grant.revoke();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let runtime_guard = runtime.enter();
     let mut body = FileBodyStream {
         receiver,
         cancelled: Arc::new(AtomicBool::new(false)),
@@ -178,9 +186,10 @@ fn revoked_session_never_delivers_an_already_queued_chunk() {
         lease,
         reported_session_cancellation: false,
         deadline: std::time::Instant::now() + Duration::from_secs(1),
+        deadline_timer: Box::pin(tokio::time::sleep(Duration::from_secs(1))),
         reported_timeout: false,
     };
-    let runtime = tokio::runtime::Runtime::new().unwrap();
+    drop(runtime_guard);
 
     assert!(matches!(
         runtime.block_on(body.next()),
@@ -194,6 +203,8 @@ fn timed_out_file_body_reports_resource_exhaustion() {
     let grant = capability.issue_grant();
     let lease = grant.lease().unwrap();
     let (_sender, receiver) = mpsc::channel(1);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let runtime_guard = runtime.enter();
     let mut body = FileBodyStream {
         receiver,
         cancelled: Arc::new(AtomicBool::new(false)),
@@ -201,9 +212,10 @@ fn timed_out_file_body_reports_resource_exhaustion() {
         lease,
         reported_session_cancellation: false,
         deadline: std::time::Instant::now(),
+        deadline_timer: Box::pin(tokio::time::sleep(Duration::ZERO)),
         reported_timeout: false,
     };
-    let runtime = tokio::runtime::Runtime::new().unwrap();
+    drop(runtime_guard);
 
     assert!(matches!(
         runtime.block_on(body.next()),
@@ -212,6 +224,105 @@ fn timed_out_file_body_reports_resource_exhaustion() {
             kind: ProviderErrorKind::ResourceExhausted,
         }))
     ));
+}
+
+#[test]
+fn buffered_chunks_return_capacity_when_consumed_or_dropped() {
+    let budget = FileBufferBudget::new(3);
+    assert!(budget.try_reserve(3));
+    let chunk = BufferedChunk::new(vec![b'x'; 3], 3, budget.clone());
+    assert_eq!(budget.available(), 0);
+    assert_eq!(chunk.into_bytes(), b"xxx");
+    assert_eq!(budget.available(), 3);
+
+    assert!(budget.try_reserve(3));
+    drop(BufferedChunk::new(vec![b'x'; 3], 3, budget.clone()));
+    assert_eq!(budget.available(), 3);
+}
+
+#[test]
+fn slow_read_deadline_aborts_the_body_and_releases_its_reader() {
+    let directory = test_directory("slow-read-deadline");
+    let file = directory.join("page.html");
+    fs::write(&file, b"slow").unwrap();
+    let (capability, grants, navigation_authorizations) = provider_authority(&directory);
+    let mut provider = BrowserFileProvider::new(
+        capability,
+        grants,
+        Arc::clone(&navigation_authorizations),
+        crate::FileAccessLimits {
+            max_file_size: u64::MAX,
+            max_session_bytes: u64::MAX,
+            max_read_duration: Duration::from_millis(200),
+            max_buffered_bytes: FILE_READ_CHUNK_SIZE as u64,
+        },
+        crate::FileAccessContentPolicy::StaticDocument,
+    );
+    provider.before_read_hook = Some(Arc::new(|| std::thread::sleep(Duration::from_millis(300))));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let url = Url::from_file_path(&file).unwrap();
+    let mut request = Request::get(url.clone());
+    request.set_mode(net::RequestMode::Navigate).unwrap();
+    navigation_authorizations.authorize(request.id()).unwrap();
+
+    let resource = runtime.block_on(provider.open(&request, &url)).unwrap();
+    let SchemeBody::Stream(mut body) = resource.body else {
+        panic!("GET requests should receive a live file body");
+    };
+    assert!(matches!(
+        runtime.block_on(body.next()),
+        Some(Err(RequestError::Provider {
+            provider: "file",
+            kind: ProviderErrorKind::ResourceExhausted,
+        }))
+    ));
+    runtime.block_on(wait_for_readers_to_finish(&provider.read_admission));
+
+    drop(runtime);
+    drop(provider);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn full_channel_deadline_releases_the_blocking_reader() {
+    let directory = test_directory("full-channel-deadline");
+    let file = directory.join("page.html");
+    fs::write(&file, vec![b'x'; FILE_READ_CHUNK_SIZE * 3]).unwrap();
+    let (capability, grants, navigation_authorizations) = provider_authority(&directory);
+    let provider = BrowserFileProvider::new(
+        capability,
+        grants,
+        Arc::clone(&navigation_authorizations),
+        crate::FileAccessLimits {
+            max_file_size: u64::MAX,
+            max_session_bytes: u64::MAX,
+            max_read_duration: Duration::from_millis(200),
+            max_buffered_bytes: (FILE_READ_CHUNK_SIZE * 3) as u64,
+        },
+        crate::FileAccessContentPolicy::StaticDocument,
+    );
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let url = Url::from_file_path(&file).unwrap();
+    let mut request = Request::get(url.clone());
+    request.set_mode(net::RequestMode::Navigate).unwrap();
+    navigation_authorizations.authorize(request.id()).unwrap();
+
+    let resource = runtime.block_on(provider.open(&request, &url)).unwrap();
+    let SchemeBody::Stream(mut body) = resource.body else {
+        panic!("GET requests should receive a live file body");
+    };
+    runtime.block_on(wait_for_readers_to_finish(&provider.read_admission));
+    assert!(matches!(
+        runtime.block_on(body.next()),
+        Some(Err(RequestError::Provider {
+            provider: "file",
+            kind: ProviderErrorKind::ResourceExhausted,
+        }))
+    ));
+
+    drop(runtime);
+    drop(provider);
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -381,4 +492,37 @@ async fn wait_for_readers_to_finish(admission: &FileReadAdmission) {
         );
         tokio::task::yield_now().await;
     }
+}
+
+fn test_directory(label: &str) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(format!(
+        "byui-browser-{label}-{}-{}",
+        std::process::id(),
+        NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&directory).unwrap();
+    directory
+}
+
+fn provider_authority(
+    directory: &std::path::Path,
+) -> (
+    Arc<FileAccessCapability>,
+    FileAccessGrantSource,
+    Arc<FileNavigationAuthorizations>,
+) {
+    let canonical_directory = fs::canonicalize(directory).unwrap();
+    let selection = TrustedDirectorySelection::from_verified_open_directory(
+        canonical_directory,
+        Dir::open_ambient_dir(directory, ambient_authority()).unwrap(),
+    )
+    .unwrap();
+    let capability =
+        Arc::new(FileAccessCapability::from_trusted_directory_selections([selection]).unwrap());
+    let navigation_authorizations = Arc::new(FileNavigationAuthorizations::new());
+    let grants = FileAccessGrantSource::new(
+        capability.issue_grant(),
+        Arc::clone(&navigation_authorizations),
+    );
+    (capability, grants, navigation_authorizations)
 }

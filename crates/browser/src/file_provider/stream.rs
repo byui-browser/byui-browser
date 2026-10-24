@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     pin::Pin,
     sync::{
         Arc,
@@ -12,17 +13,19 @@ use futures_util::Stream;
 use net::RequestError;
 use security::file_access::FileAccessLease;
 use tokio::sync::mpsc;
+use tokio::time::Sleep;
 
-use super::session::FileAccessCancellation;
+use super::{reader::BufferedChunk, session::FileAccessCancellation};
 
 /// A body stream that cancels its blocking reader when Fetch discards it.
 pub(super) struct FileBodyStream {
-    pub(super) receiver: mpsc::Receiver<Result<Vec<u8>, RequestError>>,
+    pub(super) receiver: mpsc::Receiver<Result<BufferedChunk, RequestError>>,
     pub(super) cancelled: Arc<AtomicBool>,
     pub(super) session_cancellation: FileAccessCancellation,
     pub(super) lease: FileAccessLease,
     pub(super) reported_session_cancellation: bool,
     pub(super) deadline: Instant,
+    pub(super) deadline_timer: Pin<Box<Sleep>>,
     pub(super) reported_timeout: bool,
 }
 
@@ -30,11 +33,13 @@ impl Stream for FileBodyStream {
     type Item = Result<Vec<u8>, RequestError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if Instant::now() >= self.deadline {
+        if Instant::now() >= self.deadline || self.deadline_timer.as_mut().poll(context).is_ready()
+        {
             if self.reported_timeout {
                 return Poll::Ready(None);
             }
             self.reported_timeout = true;
+            self.cancelled.store(true, Ordering::Release);
             return Poll::Ready(Some(Err(RequestError::Provider {
                 provider: "file",
                 kind: net::ProviderErrorKind::ResourceExhausted,
@@ -56,7 +61,10 @@ impl Stream for FileBodyStream {
                     Poll::Ready(Some(Err(RequestError::Aborted)))
                 }
             }
-            result => result,
+            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(chunk.into_bytes()))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
