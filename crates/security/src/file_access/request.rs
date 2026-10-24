@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 /// Origin information supplied by the browser when it asks to access a local file.
 ///
 /// This is deliberately a security-owned representation. Browser adapters must
-/// translate their networking origin type before calling [`FileAccessCapability`].
+/// translate their networking origin type before calling
+/// [`crate::file_access::FileAccessCapability`].
 /// Tuple origins are serialized in their canonical form and are retained for
 /// policy decisions and auditing. File documents receive opaque origins, and
 /// this policy denies local-file subresource access for every initiator until
@@ -33,7 +34,7 @@ pub enum FileRequestKind {
     Subresource,
 }
 
-/// Opaque authorization issued by one [`FileAccessCapability`].
+/// Opaque authorization issued by one [`crate::file_access::FileAccessCapability`].
 ///
 /// Only the policy that issued this value accepts it. Browser composition must
 /// retain grants exclusively in browser-owned state and never expose them to
