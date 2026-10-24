@@ -37,6 +37,7 @@ impl From<io::Error> for FileAccessError {
         match error.kind() {
             io::ErrorKind::NotFound => Self::Missing,
             io::ErrorKind::PermissionDenied => Self::Denied,
+            io::ErrorKind::InvalidInput => Self::InvalidPath,
             _ => Self::Io,
         }
     }

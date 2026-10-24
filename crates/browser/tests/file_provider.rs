@@ -19,7 +19,7 @@ fn temporary_directory() -> std::path::PathBuf {
         NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir(&directory).unwrap();
-    directory
+    fs::canonicalize(directory).unwrap()
 }
 
 fn file_access(

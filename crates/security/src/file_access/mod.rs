@@ -40,7 +40,7 @@ mod tests {
             NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&directory).unwrap();
-        directory
+        fs::canonicalize(directory).unwrap()
     }
 
     fn trusted_selection(path: &Path) -> TrustedDirectorySelection {
@@ -136,6 +136,10 @@ mod tests {
         assert_eq!(
             FileAccessError::from(io::Error::from(io::ErrorKind::PermissionDenied)),
             FileAccessError::Denied
+        );
+        assert_eq!(
+            FileAccessError::from(io::Error::from(io::ErrorKind::InvalidInput)),
+            FileAccessError::InvalidPath
         );
         assert_eq!(
             FileAccessError::from(io::Error::from(io::ErrorKind::Other)),
