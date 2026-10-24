@@ -15,16 +15,36 @@ captured `Content-Length` enforcement, request cancellation, and revocable
 generation-bound grants are implemented. Revocation prevents future opens and
 body delivery, including already queued chunks.
 
+Grants may have a browser-configured lifetime. Expiry, replacement, explicit
+revocation, and shutdown all cancel pending setup and live or queued body
+delivery through the same revocation path, clear unused navigation
+authorizations, and record path-free lifecycle audit events. After expiry,
+future navigations are denied and existing bodies report cancellation.
+
 The provider also bounds aggregate queued response bytes per session and wakes
 body consumers at their read deadline, cancelling further delivery. A regular
 filesystem read already executing in the safe blocking API cannot be forcibly
 interrupted; its result is discarded and all provider resources are released
 as soon as that operation returns.
 
+The default limits are a 64 MiB maximum file size, 256 MiB of response bytes
+per session, a 30-second setup-and-read deadline, and 512 KiB of aggregate
+queued body data. At most four file readers are active and eight additional
+authorized requests may wait for admission. These browser-owned limits can be
+made stricter through configuration; zero-valued limits are rejected.
+
 Each admitted `file:` document receives an opaque origin. Local-file access is
 limited to browser-issued top-level navigations; all subresources, workers, and
 nested browsing contexts remain denied until document/container identity is
 available end-to-end.
+
+Callers must create navigations with
+`FileAccessConfiguration::navigation_request`. Setting
+`RequestMode::Navigate` on an ordinary request does not issue the required
+single-use authorization. At most 64 unused navigation authorizations may be
+held at once. `GET` and `HEAD` are supported; `HEAD` performs the same
+authorization and content checks but returns no body and consumes no session
+response-byte budget.
 
 Potential future work is a scoped `file:` origin in `net`, bound to the
 security-owned capability and browser document/container rather than a global
@@ -41,8 +61,8 @@ ordinary request-construction code must not receive selections or
 ## Active-content policy
 
 The browser uses the following conservative policy for local-file responses.
-These decisions are part of the browser contract even where enforcement is
-still listed as remaining work below.
+These decisions are part of the browser contract and are enforced before
+response metadata or body data is exposed.
 
 ### Default permission level
 
@@ -69,9 +89,9 @@ extension.
   `X-Content-Type-Options: nosniff`. This reduces consumer-side
   reinterpretation but is not, by itself, a substitute for provider
   classification and active-content checks.
-- Unknown extensions are treated as inert binary data. If the consuming path
-  cannot guarantee inert handling, the provider denies the resource instead.
-  Unknown content must never receive an inferred active media type.
+- Unknown extensions are not admitted by the current static policy. They must
+  never receive an inferred active media type; serving inert binary data would
+  require a separate consumer path with an explicit policy.
 - Native executable formats are denied regardless of filename extension where
   the platform can identify them. This policy does not claim to detect every
   possible executable or polyglot file.
@@ -93,20 +113,7 @@ the existing revocation and cancellation checks.
 
 ## Remaining work
 
-### 1. Complete permission lifecycle behavior
-
-Add grant expiry, audit logging, and explicit process-shutdown sequencing. Use
-the existing grant-revocation path for expiry so pending setup, live readers,
-and queued chunks behave consistently with close, navigation-away, and grant
-replacement.
-
-Document denied operations after expiry, whether existing bodies are aborted,
-which lifecycle events are recorded, and exclude sensitive paths, contents,
-and OS diagnostics from logs. Test expiry, replacement,
-controller destruction, shutdown, pending setup, active readers, queued data,
-and navigation authorizations.
-
-### 2. Maintain regression and integration guarantees
+### 1. Maintain regression and integration guarantees
 
 Keep deterministic regression coverage for blocking setup, response
 publication, queued chunks, worker-side failures, full-channel backpressure,
@@ -121,3 +128,14 @@ Keep cross-crate tests aligned with these guarantees:
 - Unrelated scheme providers cannot satisfy a `file:` request.
 - Provider errors stay stable and non-diagnostic.
 - Authorization occurs before path conversion for unauthorized requests.
+
+There is no automatic `Drop`-based session shutdown. Browser lifecycle code
+must explicitly call `close`, `navigation_away`, `shutdown`, or revoke the
+grant, unless a grant lifetime is configured. The audit stream contains only
+the path-free events `Replaced`, `Revoked`, `Expired`, and `Shutdown`.
+
+The security layer also fails closed for malformed or unauthorized paths before
+filesystem conversion, avoids existence oracles for paths outside selected
+roots, rejects symlink components, and reads through retained handles rather
+than reopening a pathname. A file opened for a response remains bound to that
+handle even if its directory entry is replaced.

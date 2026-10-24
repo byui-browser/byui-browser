@@ -32,6 +32,9 @@ pub struct FileAccessLimits {
     /// Maximum aggregate bytes queued between blocking local-file readers and
     /// response-body consumers for this session.
     pub max_buffered_bytes: u64,
+    /// Optional lifetime for each issued local-file grant. Expiry cancels
+    /// pending and live work through the normal revocation path.
+    pub grant_lifetime: Option<Duration>,
 }
 
 /// Browser-owned interpretation policy for responses from a local-file session.
@@ -54,6 +57,7 @@ impl Default for FileAccessLimits {
             max_session_bytes: 256 * 1024 * 1024,
             max_read_duration: Duration::from_secs(30),
             max_buffered_bytes: 512 * 1024,
+            grant_lifetime: None,
         }
     }
 }
@@ -86,6 +90,9 @@ impl FileAccessConfiguration {
             || limits.max_session_bytes == 0
             || limits.max_read_duration.is_zero()
             || limits.max_buffered_bytes == 0
+            || limits
+                .grant_lifetime
+                .is_some_and(|lifetime| lifetime.is_zero())
         {
             return Err(FileAccessError::InvalidPath);
         }
@@ -97,6 +104,7 @@ impl FileAccessConfiguration {
         let grants = file_provider::FileAccessGrantSource::new(
             capability.issue_grant(),
             Arc::clone(&navigation_authorizations),
+            limits.grant_lifetime,
         );
         Ok(Self {
             capability,
@@ -156,6 +164,14 @@ impl FileAccessConfiguration {
     /// operation so navigation code can express its lifecycle transition.
     pub fn navigation_away(&self) {
         self.close();
+    }
+
+    /// Ends the local-file session during explicit browser shutdown.
+    ///
+    /// This cancels pending and live work, clears unused navigation
+    /// authorizations, and records a path-free shutdown audit event.
+    pub fn shutdown(&self) {
+        self.grants.shutdown();
     }
 }
 

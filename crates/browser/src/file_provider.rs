@@ -12,7 +12,7 @@ pub(crate) use authorization::FileNavigationAuthorizations;
 pub use authorization::FileNavigationError;
 pub(crate) use provider::provider;
 pub use security::file_access::FileAccessGrant;
-pub use session::FileAccessGrantSource;
+pub use session::{FileAccessAuditEvent, FileAccessGrantSource};
 
 #[cfg(test)]
 mod tests;

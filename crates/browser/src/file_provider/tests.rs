@@ -17,7 +17,7 @@ use security::file_access::{FileAccessCapability, TrustedDirectorySelection};
 use tokio::sync::mpsc;
 
 use super::{
-    FileAccessGrantSource, FileNavigationAuthorizations,
+    FileAccessAuditEvent, FileAccessGrantSource, FileNavigationAuthorizations,
     admission::{FileReadAdmission, MAX_CONCURRENT_FILE_READS, MAX_PENDING_FILE_READS},
     provider::BrowserFileProvider,
     reader::{BufferedChunk, FILE_READ_CHUNK_SIZE, FileBufferBudget},
@@ -101,6 +101,7 @@ fn revocation_after_file_setup_rejects_get_and_head_and_releases_admission() {
     let grants = FileAccessGrantSource::new(
         capability.issue_grant(),
         Arc::clone(&navigation_authorizations),
+        None,
     );
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let url = Url::from_file_path(&file).unwrap();
@@ -241,6 +242,71 @@ fn buffered_chunks_return_capacity_when_consumed_or_dropped() {
 }
 
 #[test]
+fn expiry_cancels_queued_delivery_and_audits_the_lifecycle() {
+    let capability = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
+    let navigation_authorizations = Arc::new(FileNavigationAuthorizations::new());
+    let source = FileAccessGrantSource::new(
+        capability.issue_grant(),
+        navigation_authorizations,
+        Some(Duration::from_millis(20)),
+    );
+    let (_, lease, cancellation) = source.snapshot().unwrap();
+    let (sender, receiver) = mpsc::channel(1);
+    let buffer_budget = FileBufferBudget::new(1);
+    assert!(buffer_budget.try_reserve(1));
+    sender
+        .try_send(Ok(BufferedChunk::new(vec![b'x'], 1, buffer_budget)))
+        .unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let runtime_guard = runtime.enter();
+    let mut body = FileBodyStream {
+        receiver,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        session_cancellation: cancellation,
+        lease,
+        reported_session_cancellation: false,
+        deadline: std::time::Instant::now() + Duration::from_secs(1),
+        deadline_timer: Box::pin(tokio::time::sleep(Duration::from_secs(1))),
+        reported_timeout: false,
+    };
+    drop(runtime_guard);
+
+    let wait_deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while source.is_active() {
+        assert!(
+            std::time::Instant::now() < wait_deadline,
+            "grant did not expire"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(matches!(
+        runtime.block_on(body.next()),
+        Some(Err(RequestError::Aborted))
+    ));
+    assert_eq!(source.audit_events(), vec![FileAccessAuditEvent::Expired]);
+}
+
+#[test]
+fn replacement_and_shutdown_are_audited_and_fail_closed() {
+    let capability = FileAccessCapability::from_trusted_directory_selections([]).unwrap();
+    let navigation_authorizations = Arc::new(FileNavigationAuthorizations::new());
+    let source =
+        FileAccessGrantSource::new(capability.issue_grant(), navigation_authorizations, None);
+
+    source.replace(capability.issue_grant());
+    assert!(source.is_active());
+    source.shutdown();
+    assert!(!source.is_active());
+    assert_eq!(
+        source.audit_events(),
+        vec![
+            FileAccessAuditEvent::Replaced,
+            FileAccessAuditEvent::Shutdown
+        ]
+    );
+}
+
+#[test]
 fn slow_read_deadline_aborts_the_body_and_releases_its_reader() {
     let directory = test_directory("slow-read-deadline");
     let file = directory.join("page.html");
@@ -255,6 +321,7 @@ fn slow_read_deadline_aborts_the_body_and_releases_its_reader() {
             max_session_bytes: u64::MAX,
             max_read_duration: Duration::from_millis(200),
             max_buffered_bytes: FILE_READ_CHUNK_SIZE as u64,
+            grant_lifetime: None,
         },
         crate::FileAccessContentPolicy::StaticDocument,
     );
@@ -298,6 +365,7 @@ fn full_channel_deadline_releases_the_blocking_reader() {
             max_session_bytes: u64::MAX,
             max_read_duration: Duration::from_millis(200),
             max_buffered_bytes: (FILE_READ_CHUNK_SIZE * 3) as u64,
+            grant_lifetime: None,
         },
         crate::FileAccessContentPolicy::StaticDocument,
     );
@@ -347,6 +415,7 @@ fn dropping_unread_or_partially_read_body_releases_reader_admission() {
     let grants = FileAccessGrantSource::new(
         capability.issue_grant(),
         Arc::clone(&navigation_authorizations),
+        None,
     );
     let provider = BrowserFileProvider::new(
         Arc::clone(&capability),
@@ -411,6 +480,7 @@ fn file_body_uses_captured_framing_for_live_file_mutations() {
     let grants = FileAccessGrantSource::new(
         capability.issue_grant(),
         Arc::clone(&navigation_authorizations),
+        None,
     );
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let url = Url::from_file_path(&file).unwrap();
@@ -523,6 +593,7 @@ fn provider_authority(
     let grants = FileAccessGrantSource::new(
         capability.issue_grant(),
         Arc::clone(&navigation_authorizations),
+        None,
     );
     (capability, grants, navigation_authorizations)
 }
