@@ -82,22 +82,74 @@ offline mode, and future HTTP/3 support.
 
 ### 6. Complete scheme-provider/browser integration
 
-Finish the Feature 4.4 work in
-[`fetch-engine-feature-4-4-plan.md`](fetch-engine-feature-4-4-plan.md):
-browser-owned `FetchServices`, blob/file ownership, `byui-provider` body-copy
-and route hardening, origin policy, and browser-composition tests. Keep local
-schemes out of HTTP transport, cookies, and cache unless a later contract
-explicitly changes that boundary.
+#### Browser-owned composition
+
+Complete browser-side ownership and composition without moving browser state
+into `net`:
+
+- provide a concrete browser `FetchServices` implementation and compose it
+  with `SchemeProviders` through the builder's `with_scheme_providers` setter
+  when browser client context is available;
+- keep `byui:` page registration, lookup, replacement, and origin policy in
+  `crates/browser`;
+- add browser/storage ownership for blob URL creation, creator origins,
+  revocation, and lifetime; and
+- add the designated filesystem/security owner for authorized `file:` access,
+  sandboxing, path resolution, and origin policy.
+
+Browser-owned providers must never fall back to HTTP or direct filesystem
+access when lookup fails.
+
+#### `byui-provider` hardening
+
+Finish the provider-local implementation by avoiding a fresh `Vec` copy of
+embedded resource bytes for every request. Retain the engine-enforced
+`GET`/`HEAD` boundary and explicit `HEAD` body semantics. Keep route lookup
+exact and declarative, including declared resource aliases and unknown-host or
+path rejection, and document and enforce the chosen opaque or stable
+browser-UI origin policy.
+
+Add focused browser tests for method rejection, `GET`/`HEAD` bodies, query and
+fragment handling, aliases, repeated loads, shared-body ownership, unknown
+routes, and origin policy.
+
+#### Provider conformance and isolation
+
+Add browser-composition and `net` integration tests for:
+
+- builder-based service/provider composition and request-context propagation;
+- exact-once selection of the matching provider;
+- missing, revoked, denied, malformed, and I/O-failure outcomes;
+- provider-assigned tuple and opaque origins;
+- response headers, status, URL, media type, empty/readable/null bodies;
+- cancellation while resolving and streaming, including resource cleanup;
+- no HTTP transport, cookie, cache, or unrelated-provider calls; and
+- repeated resolution of the same resource without accidental HTTP caching.
+
+Keep `data:` parsing engine-owned and retain the exact `about:blank`
+allowlist. Unsupported schemes must fail before service, provider, cache, or
+transport side effects. Any new local scheme must define its provider owner,
+origin policy, method policy, body/null-body behavior, response filtering, and
+cache/cookie behavior before implementation. Keep local schemes out of HTTP
+transport, cookies, and cache unless a later contract explicitly changes that
+boundary.
+
+#### Verification and documentation
+
+Keep the Feature 4.4 contract, test plan, and standard-gap audit synchronized
+with the implementation. Before considering browser-level scheme-provider
+integration complete, run the focused `net` and browser tests, relevant
+workspace tests, `cargo fmt --all`, and
+`cargo clippy --all-targets -- -D warnings`.
 
 ### 7. Public API and downstream migration
 
 Make controller construction a single Fetch-oriented interface rather than a
-four-constructor capability matrix. Add a `RequestController::builder(config)`
-that provides optional `FetchServices` and `SchemeProviders` setters and a
-fallible `build()` method. Preserve the existing constructors as delegating
-compatibility conveniences while callers migrate; consider eventually
-deprecating them and use names such as `with_fetch_services` and
-`with_scheme_providers` if specialized convenience constructors remain.
+four-constructor capability matrix. This is implemented by
+`RequestController::builder(config)`, which provides optional `FetchServices`
+and `SchemeProviders` setters and a fallible `build()` method. The former
+specialized constructors have been removed, so callers use the builder and its
+`with_fetch_services` and `with_scheme_providers` setters directly.
 
 The builder must preserve the current capability rules: standalone requests
 may omit services, local schemes require matching scheme providers, and

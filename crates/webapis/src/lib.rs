@@ -138,27 +138,77 @@ impl Element {
             .find(|attribute| attribute.name == name)
             .map(|attribute| attribute.value.as_str())
     }
+
+    /// Sets an attribute according to the DOM Standard's name validation and
+    /// namespace normalization rules.
+    pub fn set_attribute(&mut self, qualified_name: &str, value: &str) -> JsResult<()> {
+        let name = normalize_attribute_name(self.namespace, qualified_name)?;
+        if let Some(attribute) = self
+            .attributes
+            .iter_mut()
+            .find(|attribute| attribute.name == name)
+        {
+            attribute.value = value.to_owned();
+        } else {
+            self.attributes.push(Attribute {
+                name,
+                value: value.to_owned(),
+            });
+        }
+        self.id_attr = self
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == "id")
+            .map(|attribute| attribute.value.clone());
+        Ok(())
+    }
 }
 
-fn element_object(element: Element, document: Document) -> Object {
+fn element_object(element: Element, document: Arc<Mutex<Document>>) -> Object {
     let object = Object::new();
-    let get_attribute_element = element.clone();
+    let node = element.node;
+    let get_attribute_document = document.clone();
     object.set_method(
         "getAttribute",
-        Arc::new(move |arguments| get_attribute(&get_attribute_element, arguments)),
+        Arc::new(move |arguments| {
+            let document = get_attribute_document.lock().unwrap();
+            let Some(element) = document.element_by_node(node) else {
+                return Ok(Value::Null);
+            };
+            get_attribute(element, arguments)
+        }),
+    );
+    let set_attribute_document = document.clone();
+    object.set_method(
+        "setAttribute",
+        Arc::new(move |arguments| {
+            let [Value::String(qualified_name), Value::String(value)] = arguments else {
+                return Err(JsError::new(
+                    "Element.setAttribute() expects a qualified name and value string",
+                ));
+            };
+            set_attribute_document
+                .lock()
+                .unwrap()
+                .set_attribute(node, qualified_name, value)
+        }),
     );
     let add_document = document.clone();
     let add_node = element.node;
     object.set_method(
         "addEventListener",
-        Arc::new(move |arguments| add_event_listener_at(&add_document, Some(add_node), arguments)),
+        Arc::new(move |arguments| {
+            let document = add_document.lock().unwrap();
+            add_event_listener_at(&document, Some(add_node), arguments)
+        }),
     );
     let remove_document = document.clone();
     let remove_node = element.node;
     object.set_method(
         "removeEventListener",
         Arc::new(move |arguments| {
-            remove_event_listener_at(&remove_document, Some(remove_node), arguments)
+            let document = remove_document.lock().unwrap();
+            remove_event_listener_at(&document, Some(remove_node), arguments)
         }),
     );
     let dispatch_document = document.clone();
@@ -167,15 +217,29 @@ fn element_object(element: Element, document: Document) -> Object {
     object.set_method(
         "dispatchEvent",
         Arc::new(move |arguments| {
-            dispatch_event_at(
-                &dispatch_document,
-                Some(dispatch_node),
-                &dispatch_target,
-                arguments,
-            )
+            let document = dispatch_document.lock().unwrap();
+            dispatch_event_at(&document, Some(dispatch_node), &dispatch_target, arguments)
         }),
     );
     object
+}
+
+fn normalize_attribute_name(namespace: Namespace, qualified_name: &str) -> JsResult<String> {
+    if qualified_name.is_empty()
+        || qualified_name.chars().any(|character| {
+            matches!(
+                character,
+                '\t' | '\n' | '\x0c' | '\r' | ' ' | '\0' | '/' | '=' | '>'
+            )
+        })
+    {
+        return Err(JsError::new("InvalidCharacterError"));
+    }
+
+    Ok(match namespace {
+        Namespace::Html => qualified_name.to_ascii_lowercase(),
+        Namespace::Svg | Namespace::MathMl => qualified_name.to_owned(),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -604,7 +668,7 @@ fn dispatch_event_at(
             }
             if let Some(element) = element_for_node(document, *ancestor) {
                 let target = event_target_for(document, Some(*ancestor));
-                let object = element_object(element, document.clone());
+                let object = element_object(element, Arc::new(Mutex::new(document.clone())));
                 invoke_listeners(&target, event, &event_type, &object, true, 1.0);
             }
         }
@@ -627,7 +691,7 @@ fn dispatch_event_at(
                 }
                 if let Some(element) = element_for_node(document, *ancestor) {
                     let target = event_target_for(document, Some(*ancestor));
-                    let object = element_object(element, document.clone());
+                    let object = element_object(element, Arc::new(Mutex::new(document.clone())));
                     invoke_listeners(&target, event, &event_type, &object, false, 3.0);
                 }
             }
@@ -700,7 +764,10 @@ pub fn get_element_by_id(document: &Document, arguments: &[Value]) -> JsResult<V
     };
 
     Ok(match document.get_element_by_id(id) {
-        Some(element) => Value::Object(element_object(element.clone(), document.clone())),
+        Some(element) => Value::Object(element_object(
+            element.clone(),
+            Arc::new(Mutex::new(document.clone())),
+        )),
         None => Value::Null,
     })
 }
@@ -709,27 +776,48 @@ pub fn get_element_by_id(document: &Document, arguments: &[Value]) -> JsResult<V
 /// on the global JavaScript environment.
 pub fn register_document(realm: &mut Realm, document: Document) -> JsResult<()> {
     let document_object = Object::new();
-    let get_element_document = document.clone();
+    let shared_document = Arc::new(Mutex::new(document));
+    let get_element_document = shared_document.clone();
     document_object.set_method(
         "getElementById",
-        Arc::new(move |arguments| get_element_by_id(&get_element_document, arguments)),
+        Arc::new(move |arguments| {
+            let document = get_element_document.lock().unwrap();
+            let [Value::String(id)] = arguments else {
+                return Err(JsError::new(
+                    "document.getElementById() expects one id string",
+                ));
+            };
+            Ok(match document.get_element_by_id(id).cloned() {
+                Some(element) => {
+                    Value::Object(element_object(element, get_element_document.clone()))
+                }
+                None => Value::Null,
+            })
+        }),
     );
-    let event_listener_document = document.clone();
+    let event_listener_document = shared_document.clone();
     document_object.set_method(
         "addEventListener",
-        Arc::new(move |arguments| add_event_listener(&event_listener_document, arguments)),
+        Arc::new(move |arguments| {
+            let document = event_listener_document.lock().unwrap();
+            add_event_listener(&document, arguments)
+        }),
     );
-    let remove_event_document = document.clone();
+    let remove_event_document = shared_document.clone();
     document_object.set_method(
         "removeEventListener",
-        Arc::new(move |arguments| remove_event_listener(&remove_event_document, arguments)),
+        Arc::new(move |arguments| {
+            let document = remove_event_document.lock().unwrap();
+            remove_event_listener(&document, arguments)
+        }),
     );
-    let dispatch_event_document = document;
+    let dispatch_event_document = shared_document;
     let dispatch_target = document_object.clone();
     document_object.set_method(
         "dispatchEvent",
         Arc::new(move |arguments| {
-            dispatch_event_with_target(&dispatch_event_document, &dispatch_target, arguments)
+            let document = dispatch_event_document.lock().unwrap();
+            dispatch_event_with_target(&document, &dispatch_target, arguments)
         }),
     );
     realm.register_global_function("Event", Arc::new(event_constructor))?;
@@ -829,6 +917,24 @@ impl Document {
         self.elements
             .iter()
             .find(|element| element.id_attr.as_deref() == Some(id))
+    }
+
+    fn element_by_node(&self, node: NodeId) -> Option<&Element> {
+        self.elements.iter().find(|element| element.node == node)
+    }
+
+    fn set_attribute(
+        &mut self,
+        node: NodeId,
+        qualified_name: &str,
+        value: &str,
+    ) -> JsResult<Value> {
+        let document = self.source_document.get_or_insert_with(HTMLDocument::new);
+        document
+            .set_attribute(html::NodeId(node.index() as usize), qualified_name, value)
+            .map_err(|error| JsError::new(error.to_string()))?;
+        self.elements = collect_elements(document);
+        Ok(Value::Undefined)
     }
 
     /// Returns this document's child nodes serialized as an HTML fragment.
@@ -1634,6 +1740,25 @@ mod tests {
 
         assert_eq!(element.get_attribute("DATA-STATE"), Some("ready"));
         assert_eq!(element.get_attribute("missing"), None);
+    }
+
+    #[test]
+    fn element_set_attribute_rejects_invalid_names() {
+        let mut element = super::Element {
+            node: NodeId::new(1),
+            local_name: "main".into(),
+            namespace: Namespace::Html,
+            id_attr: None,
+            attributes: Vec::new(),
+        };
+        assert_eq!(
+            element
+                .set_attribute("bad name", "value")
+                .unwrap_err()
+                .to_string(),
+            "InvalidCharacterError"
+        );
+        assert!(element.attributes.is_empty());
     }
 
     #[test]
