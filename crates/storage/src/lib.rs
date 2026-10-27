@@ -111,6 +111,27 @@ impl OriginStorage {
             .set_item(key, value);
         Ok(())
     }
+
+    /// Returns the number of items stored for `storage_key`.
+    ///
+    /// A key without an initialized store has a length of zero.
+    pub fn len(&self, storage_key: &StorageKey) -> usize {
+        self.stores.get(storage_key).map_or(0, LocalStorage::len)
+    }
+
+    /// Whether `storage_key` has no stored items.
+    ///
+    /// A key without an initialized store is empty.
+    pub fn is_empty(&self, storage_key: &StorageKey) -> bool {
+        self.len(storage_key) == 0
+    }
+
+    /// Removes all items associated with `storage_key`.
+    ///
+    /// Other origin stores are left unchanged.
+    pub fn clear(&mut self, storage_key: &StorageKey) {
+        self.stores.remove(storage_key);
+    }
 }
 
 /// A storage operation rejected by the renderer's storage permission.

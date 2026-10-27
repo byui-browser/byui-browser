@@ -105,3 +105,50 @@ fn different_storage_keys_select_isolated_stores() {
         None
     );
 }
+
+#[test]
+fn length_and_empty_status_are_scoped_to_storage_key() {
+    let origin_a = context("a.example.test", StoragePermission::Allowed);
+    let origin_b = context("b.example.test", StoragePermission::Allowed);
+    let mut storage = OriginStorage::new();
+
+    assert_eq!(storage.len(origin_a.storage_key()), 0);
+    assert!(storage.is_empty(origin_a.storage_key()));
+
+    storage
+        .set_item(&origin_a, "first", "one")
+        .expect("origin A can write");
+    storage
+        .set_item(&origin_a, "second", "two")
+        .expect("origin A can write");
+
+    assert_eq!(storage.len(origin_a.storage_key()), 2);
+    assert!(!storage.is_empty(origin_a.storage_key()));
+    assert_eq!(storage.len(origin_b.storage_key()), 0);
+    assert!(storage.is_empty(origin_b.storage_key()));
+}
+
+#[test]
+fn clear_removes_only_the_selected_origin_store() {
+    let origin_a = context("a.example.test", StoragePermission::Allowed);
+    let origin_b = context("b.example.test", StoragePermission::Allowed);
+    let mut storage = OriginStorage::new();
+
+    storage
+        .set_item(&origin_a, "key", "origin-a-value")
+        .expect("origin A can write");
+    storage
+        .set_item(&origin_b, "key", "origin-b-value")
+        .expect("origin B can write");
+
+    storage.clear(origin_a.storage_key());
+
+    assert!(storage.is_empty(origin_a.storage_key()));
+    assert_eq!(storage.len(origin_b.storage_key()), 1);
+    assert_eq!(
+        storage
+            .get_item(&origin_b, "key")
+            .expect("origin B can read its own storage"),
+        Some("origin-b-value")
+    );
+}
