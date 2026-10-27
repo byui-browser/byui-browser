@@ -199,6 +199,10 @@ impl CookieJar {
     /// Stores a cookie received from `origin`, applying domain/secure rules.
     // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
     pub fn store(&mut self, _origin: &Origin, cookie: Cookie) {
+        self.cookies.retain(|existing| {
+            existing.name != cookie.name || existing.domain != cookie.domain
+        });
+
         self.cookies.push(cookie);
     }
 
@@ -438,5 +442,36 @@ mod tests {
 
         assert_eq!(jar.cookies_for(&https_site).len(), 1);
         assert!(jar.cookies_for(&http_site).is_empty());
+    }
+
+    #[test]
+    fn newer_cookie_replaces_old_cookie() {
+        let site = origin("https", "byui.edu", 443);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "old-value".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "new-value".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        let cookies = jar.cookies_for(&site);
+
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].value, "new-value");
     }
 }
