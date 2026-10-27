@@ -283,6 +283,7 @@ enum FunctionKind {
         name: String,
         function: HostFunction,
     },
+    Bytecode(crate::vm::VmClosure),
 }
 
 impl Function {
@@ -298,6 +299,25 @@ impl Function {
     pub fn name(&self) -> &str {
         match &*self.0 {
             FunctionKind::Script { name, .. } | FunctionKind::Host { name, .. } => name,
+            FunctionKind::Bytecode(function) => &function.prototype.name,
+        }
+    }
+
+    pub(crate) fn from_bytecode(function: crate::vm::VmClosure) -> Self {
+        Self(Arc::new(FunctionKind::Bytecode(function)))
+    }
+
+    pub(crate) fn bytecode(&self) -> Option<crate::vm::VmClosure> {
+        match &*self.0 {
+            FunctionKind::Bytecode(function) => Some(function.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn call_host(&self, arguments: &[Value]) -> Option<JsResult<Value>> {
+        match &*self.0 {
+            FunctionKind::Host { function, .. } => Some(function(arguments)),
+            _ => None,
         }
     }
 }
@@ -329,6 +349,12 @@ impl fmt::Display for Function {
             FunctionKind::Host { name, .. } => {
                 write!(formatter, "function {name}() {{ [native code] }}")
             }
+            FunctionKind::Bytecode(function) => write!(
+                formatter,
+                "function {}({}) {{ [code] }}",
+                function.prototype.name,
+                function.prototype.params.join(", ")
+            ),
         }
     }
 }
@@ -766,6 +792,9 @@ impl Interpreter {
     fn call(&mut self, function: &Function, arguments: &[Value]) -> JsResult<Value> {
         match &*function.0 {
             FunctionKind::Host { function, .. } => function(arguments),
+            FunctionKind::Bytecode(_) => Err(JsError::runtime(
+                "bytecode function cannot run in the tree-walk interpreter",
+            )),
             FunctionKind::Script {
                 params,
                 body,

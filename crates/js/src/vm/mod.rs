@@ -1,21 +1,40 @@
 //! Stack-based virtual machine for executing compiled JavaScript bytecode.
 
 use crate::ast::{BinaryOperator, UnaryOperator};
-use crate::bytecode::{Chunk, Instruction};
+use crate::bytecode::{Chunk, FunctionPrototype, Instruction};
 use crate::runtime::{ExecutionLimits, non_object, to_property_key};
-use crate::{JsError, JsErrorCategory, JsResult, Value};
+use crate::{Function, JsError, JsErrorCategory, JsResult, Value};
+use std::sync::{Arc, Mutex, PoisonError};
+
+type SharedScope = Arc<Mutex<Vec<Slot>>>;
+
+/// A compiled function and the lexical scopes it closes over.
+#[derive(Clone, Debug)]
+pub(crate) struct VmClosure {
+    pub(crate) prototype: FunctionPrototype,
+    scopes: Vec<SharedScope>,
+}
+
+#[derive(Debug)]
+struct CallFrame {
+    chunk: Arc<Chunk>,
+    instruction_pointer: usize,
+    stack_base: usize,
+    scope_base: usize,
+    root_scope: usize,
+}
 
 /// Executes a [`Chunk`] using an owned operand stack.
 #[derive(Debug, Default)]
 pub struct Vm {
     stack: Vec<Value>,
-    scopes: Vec<Vec<Slot>>,
+    scopes: Vec<SharedScope>,
     steps_remaining: u64,
     loop_iterations_remaining: u64,
 }
 
 #[derive(Debug, Clone)]
-struct Slot {
+pub(crate) struct Slot {
     value: Option<Value>,
     kind: Option<crate::ast::VarKind>,
 }
@@ -45,8 +64,20 @@ impl Vm {
         self.scopes.clear();
         self.steps_remaining = limits.step_limit;
         self.loop_iterations_remaining = limits.loop_iteration_limit;
-        let mut instruction_pointer = 0;
-        while let Some(instruction) = chunk.code.get(instruction_pointer).copied() {
+        let mut frames = vec![CallFrame {
+            chunk: Arc::new(chunk.clone()),
+            instruction_pointer: 0,
+            stack_base: 0,
+            scope_base: 0,
+            root_scope: 0,
+        }];
+        loop {
+            let frame_index = frames.len() - 1;
+            let current_chunk = Arc::clone(&frames[frame_index].chunk);
+            let instruction_pointer = frames[frame_index].instruction_pointer;
+            let Some(instruction) = current_chunk.code.get(instruction_pointer).copied() else {
+                break;
+            };
             if self.steps_remaining == 0 {
                 return Err(JsError::with_context(
                     crate::JsErrorCategory::Limit,
@@ -55,10 +86,10 @@ impl Vm {
                 ));
             }
             self.steps_remaining -= 1;
-            instruction_pointer += 1;
+            frames[frame_index].instruction_pointer += 1;
             match instruction {
                 Instruction::Constant(index) => self.push(
-                    chunk
+                    current_chunk
                         .constants
                         .get(usize::from(index))
                         .cloned()
@@ -74,13 +105,94 @@ impl Vm {
                     self.push(left);
                 }
                 Instruction::Jump(target) => {
-                    validate_jump(target, chunk)?;
-                    if target < instruction_pointer {
+                    validate_jump(target, &current_chunk)?;
+                    if target < frames[frame_index].instruction_pointer {
                         self.next_loop_iteration()?;
                     }
-                    instruction_pointer = target;
+                    frames[frame_index].instruction_pointer = target;
                 }
-                Instruction::Return => return Ok(self.stack.pop().unwrap_or(Value::Undefined)),
+                Instruction::Return => {
+                    let value = if self.stack.len() > frames[frame_index].stack_base {
+                        self.pop()?
+                    } else {
+                        Value::Undefined
+                    };
+                    let frame = frames.pop().expect("active VM frame");
+                    self.scopes.truncate(frame.scope_base);
+                    self.stack.truncate(frame.stack_base);
+                    if frames.is_empty() {
+                        return Ok(value);
+                    }
+                    self.push(value);
+                }
+                Instruction::MakeFunction(index) => {
+                    let prototype = current_chunk
+                        .functions
+                        .get(usize::from(index))
+                        .cloned()
+                        .ok_or_else(|| JsError::runtime("bytecode function index is invalid"))?;
+                    let captured = self.scopes[frames[frame_index].scope_base..].to_vec();
+                    self.push(Value::Function(Function::from_bytecode(VmClosure {
+                        prototype,
+                        scopes: captured,
+                    })));
+                }
+                Instruction::Call(argument_count) => {
+                    let mut arguments = Vec::with_capacity(usize::from(argument_count));
+                    for _ in 0..argument_count {
+                        arguments.push(self.pop()?);
+                    }
+                    arguments.reverse();
+                    let callee = self.pop()?;
+                    let Value::Function(function) = callee else {
+                        return Err(JsError::with_context(
+                            JsErrorCategory::Runtime,
+                            "expression is not a function",
+                            "function call",
+                        ));
+                    };
+                    if let Some(result) = function.call_host(&arguments) {
+                        self.push(result?);
+                    } else if let Some(closure) = function.bytecode() {
+                        if frames.len() as u64 > limits.call_depth_limit {
+                            return Err(JsError::with_context(
+                                JsErrorCategory::Limit,
+                                "Maximum call stack size exceeded",
+                                "script function call depth",
+                            ));
+                        }
+                        let scope_base = self.scopes.len();
+                        self.scopes.extend(closure.scopes);
+                        let root_scope = self.scopes.len();
+                        let mut slots = vec![
+                            Slot {
+                                value: None,
+                                kind: None,
+                            };
+                            usize::from(closure.prototype.slot_count)
+                        ];
+                        for (index, slot) in closure.prototype.parameter_slots.iter().enumerate() {
+                            let entry = &mut slots[usize::from(*slot)];
+                            entry.kind = Some(crate::ast::VarKind::Var);
+                            entry.value =
+                                Some(arguments.get(index).cloned().unwrap_or(Value::Undefined));
+                        }
+                        self.scopes.push(Arc::new(Mutex::new(slots)));
+                        frames.push(CallFrame {
+                            chunk: closure.prototype.chunk.clone(),
+                            instruction_pointer: 0,
+                            stack_base: self.stack.len(),
+                            scope_base,
+                            root_scope,
+                        });
+                    } else {
+                        return Err(JsError::with_context(
+                            JsErrorCategory::Runtime,
+                            "function cannot be called by bytecode VM",
+                            "function call",
+                        ));
+                    }
+                }
                 Instruction::Unary(operator) => {
                     let value = self.pop()?;
                     self.push(unary(operator, value)?);
@@ -91,19 +203,19 @@ impl Vm {
                     self.push(binary(operator, left, right)?);
                 }
                 Instruction::JumpIfFalse(target) => {
-                    validate_jump(target, chunk)?;
+                    validate_jump(target, &current_chunk)?;
                     if !is_truthy(self.stack.last().ok_or_else(stack_underflow)?) {
-                        instruction_pointer = target;
+                        frames[frame_index].instruction_pointer = target;
                     }
                 }
                 Instruction::JumpIfTrue(target) => {
-                    validate_jump(target, chunk)?;
+                    validate_jump(target, &current_chunk)?;
                     if is_truthy(self.stack.last().ok_or_else(stack_underflow)?) {
-                        instruction_pointer = target;
+                        frames[frame_index].instruction_pointer = target;
                     }
                 }
                 Instruction::LoadProperty(index) => {
-                    let key = property_name(chunk, index)?;
+                    let key = property_name(&current_chunk, index)?;
                     let target = self.pop()?;
                     self.push(load_property(&target, &key)?);
                 }
@@ -113,7 +225,7 @@ impl Vm {
                     self.push(load_property(&target, &key)?);
                 }
                 Instruction::StoreProperty(index) => {
-                    let key = property_name(chunk, index)?;
+                    let key = property_name(&current_chunk, index)?;
                     let value = self.pop()?;
                     let target = self.pop()?;
                     store_property(&target, key, &value)?;
@@ -127,13 +239,13 @@ impl Vm {
                     self.push(value);
                 }
                 Instruction::EnterScope(slot_count) => {
-                    self.scopes.push(vec![
+                    self.scopes.push(Arc::new(Mutex::new(vec![
                         Slot {
                             value: None,
                             kind: None
                         };
                         usize::from(slot_count)
-                    ]);
+                    ])));
                 }
                 Instruction::ExitScope => {
                     self.scopes
@@ -141,41 +253,64 @@ impl Vm {
                         .ok_or_else(|| JsError::runtime("bytecode scope underflow"))?;
                 }
                 Instruction::DeclareGlobal { slot, kind, name } => {
-                    self.declare(self.global_depth()?, slot, kind, name, chunk)?;
+                    self.declare(
+                        self.global_depth(frames[frame_index].root_scope)?,
+                        slot,
+                        kind,
+                        name,
+                        &current_chunk,
+                    )?;
                 }
                 Instruction::DeclareLocal { slot, kind, name } => {
-                    self.declare(0, slot, kind, name, chunk)?;
+                    self.declare(0, slot, kind, name, &current_chunk)?;
                 }
                 Instruction::LoadGlobal { slot, name } => {
-                    let value = self.load(self.global_depth()?, slot, name, chunk)?;
+                    let value = self.load(
+                        self.global_depth(frames[frame_index].root_scope)?,
+                        slot,
+                        name,
+                        &current_chunk,
+                    )?;
                     self.push(value);
                 }
                 Instruction::LoadLocal { depth, slot, name } => {
-                    let value = self.load(depth, slot, name, chunk)?;
+                    let value = self.load(depth, slot, name, &current_chunk)?;
                     self.push(value);
                 }
                 Instruction::InitializeGlobal { slot, name } => {
                     let value = self.pop()?;
-                    self.initialize(self.global_depth()?, slot, value, name, chunk)?;
+                    self.initialize(
+                        self.global_depth(frames[frame_index].root_scope)?,
+                        slot,
+                        value,
+                        name,
+                        &current_chunk,
+                    )?;
                 }
                 Instruction::InitializeLocal { slot, name } => {
                     let value = self.pop()?;
-                    self.initialize(0, slot, value, name, chunk)?;
+                    self.initialize(0, slot, value, name, &current_chunk)?;
                 }
                 Instruction::StoreGlobal { slot, name } => {
                     let value = self.peek()?.clone();
-                    self.store(self.global_depth()?, slot, value, name, chunk)?;
+                    self.store(
+                        self.global_depth(frames[frame_index].root_scope)?,
+                        slot,
+                        value,
+                        name,
+                        &current_chunk,
+                    )?;
                 }
                 Instruction::StoreLocal { depth, slot, name } => {
                     let value = self.peek()?.clone();
-                    self.store(depth, slot, value, name, chunk)?;
+                    self.store(depth, slot, value, name, &current_chunk)?;
                 }
                 Instruction::LoadUnresolved { name } => {
-                    let name = self.binding_name(name, chunk)?;
+                    let name = self.binding_name(name, &current_chunk)?;
                     return Err(JsError::new(format!("`{name}` is not defined")));
                 }
                 Instruction::StoreUnresolved { name } => {
-                    let name = self.binding_name(name, chunk)?;
+                    let name = self.binding_name(name, &current_chunk)?;
                     return Err(JsError::new(format!("`{name}` is not defined")));
                 }
             }
@@ -201,11 +336,11 @@ impl Vm {
         Ok(())
     }
 
-    fn global_depth(&self) -> JsResult<u16> {
+    fn global_depth(&self, root_scope: usize) -> JsResult<u16> {
         let depth = self
             .scopes
             .len()
-            .checked_sub(1)
+            .checked_sub(root_scope + 1)
             .ok_or_else(|| JsError::runtime("bytecode global scope is unavailable"))?;
         u16::try_from(depth).map_err(|_| JsError::runtime("bytecode scope depth is invalid"))
     }
@@ -218,28 +353,30 @@ impl Vm {
         self.stack.last().ok_or_else(stack_underflow)
     }
 
-    fn slot_mut(&mut self, depth: u16, slot: u16) -> JsResult<&mut Slot> {
+    fn scope_mut(&mut self, depth: u16) -> JsResult<std::sync::MutexGuard<'_, Vec<Slot>>> {
         let index = self
             .scopes
             .len()
             .checked_sub(1 + usize::from(depth))
             .ok_or_else(|| JsError::runtime("bytecode scope depth is invalid"))?;
-        self.scopes
+        let scope = self
+            .scopes
             .get_mut(index)
-            .and_then(|scope| scope.get_mut(usize::from(slot)))
-            .ok_or_else(|| JsError::runtime("bytecode binding slot is invalid"))
+            .ok_or_else(|| JsError::runtime("bytecode scope depth is invalid"))?;
+        Ok(scope.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
-    fn slot(&self, depth: u16, slot: u16) -> JsResult<&Slot> {
+    fn scope(&self, depth: u16) -> JsResult<std::sync::MutexGuard<'_, Vec<Slot>>> {
         let index = self
             .scopes
             .len()
             .checked_sub(1 + usize::from(depth))
             .ok_or_else(|| JsError::runtime("bytecode scope depth is invalid"))?;
-        self.scopes
+        let scope = self
+            .scopes
             .get(index)
-            .and_then(|scope| scope.get(usize::from(slot)))
-            .ok_or_else(|| JsError::runtime("bytecode binding slot is invalid"))
+            .ok_or_else(|| JsError::runtime("bytecode scope depth is invalid"))?;
+        Ok(scope.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     fn binding_name<'a>(&self, name: u16, chunk: &'a Chunk) -> JsResult<&'a str> {
@@ -259,9 +396,12 @@ impl Vm {
         chunk: &Chunk,
     ) -> JsResult<()> {
         let name = self.binding_name(name, chunk)?.to_owned();
-        let entry = self.slot_mut(depth, slot)?;
+        let mut scope = self.scope_mut(depth)?;
+        let entry = scope
+            .get_mut(usize::from(slot))
+            .ok_or_else(|| JsError::runtime("bytecode binding slot is invalid"))?;
         entry.kind = Some(kind);
-        if kind == crate::ast::VarKind::Var {
+        if kind == crate::ast::VarKind::Var && entry.value.is_none() {
             entry.value = Some(Value::Undefined);
         }
         let _ = name;
@@ -270,7 +410,9 @@ impl Vm {
 
     fn load(&self, depth: u16, slot: u16, name: u16, chunk: &Chunk) -> JsResult<Value> {
         let name = self.binding_name(name, chunk)?;
-        self.slot(depth, slot)?
+        self.scope(depth)?
+            .get(usize::from(slot))
+            .ok_or_else(|| JsError::runtime("bytecode binding slot is invalid"))?
             .value
             .clone()
             .ok_or_else(|| JsError::new(format!("Cannot access `{name}` before initialization")))
@@ -285,7 +427,10 @@ impl Vm {
         chunk: &Chunk,
     ) -> JsResult<()> {
         let name = self.binding_name(name, chunk)?.to_owned();
-        let entry = self.slot_mut(depth, slot)?;
+        let mut scope = self.scope_mut(depth)?;
+        let entry = scope
+            .get_mut(usize::from(slot))
+            .ok_or_else(|| JsError::runtime("bytecode binding slot is invalid"))?;
         if entry.value.is_some() && entry.kind == Some(crate::ast::VarKind::Const) {
             return Err(JsError::new(format!("Assignment to constant `{name}`")));
         }
@@ -302,7 +447,10 @@ impl Vm {
         chunk: &Chunk,
     ) -> JsResult<()> {
         let name = self.binding_name(name, chunk)?.to_owned();
-        let entry = self.slot_mut(depth, slot)?;
+        let mut scope = self.scope_mut(depth)?;
+        let entry = scope
+            .get_mut(usize::from(slot))
+            .ok_or_else(|| JsError::runtime("bytecode binding slot is invalid"))?;
         if entry.value.is_none() {
             return Err(JsError::new(format!(
                 "Cannot access `{name}` before initialization"

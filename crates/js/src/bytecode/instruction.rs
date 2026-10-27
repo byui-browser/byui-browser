@@ -15,6 +15,10 @@ pub enum Instruction {
     Jump(usize),
     /// Returns the top value, or `undefined` when the stack is empty.
     Return,
+    /// Creates a closure from the function prototype at this chunk index.
+    MakeFunction(u16),
+    /// Calls a function with the top `argument_count` values and callee.
+    Call(u16),
     /// Applies a unary operator to the top stack value.
     Unary(UnaryOperator),
     /// Applies a binary operator to the two top stack values.

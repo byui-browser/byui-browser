@@ -11,7 +11,7 @@ mod chunk;
 mod compiler;
 mod instruction;
 
-pub use chunk::Chunk;
+pub use chunk::{Chunk, FunctionPrototype};
 pub use compiler::{CompileError, Compiler};
 pub use instruction::Instruction;
 

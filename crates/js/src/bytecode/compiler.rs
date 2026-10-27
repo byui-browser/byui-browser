@@ -1,10 +1,11 @@
 //! AST-to-bytecode compiler.
 
-use super::{Chunk, Instruction};
+use super::{Chunk, FunctionPrototype, Instruction};
 use crate::Value;
 use crate::ast::{Expr, LogicalOperator, MemberProperty, Program, Statement, VarKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 #[path = "control_flow.rs"]
 mod control_flow;
@@ -45,9 +46,11 @@ impl std::error::Error for CompileError {}
 pub struct Compiler {
     chunk: Chunk,
     scopes: Vec<Scope>,
+    root_scope: usize,
+    hoisted_functions: HashSet<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Scope {
     bindings: HashMap<String, Binding>,
     slots: u16,
@@ -69,6 +72,8 @@ impl Compiler {
                 bindings: HashMap::new(),
                 slots: 0,
             }],
+            root_scope: 0,
+            hoisted_functions: HashSet::new(),
         }
     }
 
@@ -77,6 +82,7 @@ impl Compiler {
         self.collect_root_bindings(program)?;
         let root_enter = self.chunk.emit(Instruction::EnterScope(0));
         self.emit_scope_declarations(0)?;
+        self.emit_functions(&program.body)?;
         self.compile_sequence(&program.body, true)?;
         self.chunk.code[root_enter] = Instruction::EnterScope(self.scopes[0].slots);
         self.chunk.emit(Instruction::Return);
@@ -89,6 +95,9 @@ impl Compiler {
                 if *kind != VarKind::Var {
                     self.add_binding(0, name, *kind)?;
                 }
+            }
+            if let Statement::FunctionDeclaration { name, .. } = statement {
+                self.add_binding(0, name, VarKind::Var)?;
             }
             self.collect_vars(statement)?;
         }
@@ -106,7 +115,9 @@ impl Compiler {
             }
             Statement::Block(statements) => {
                 for statement in statements {
-                    self.collect_vars(statement)?;
+                    if !matches!(statement, Statement::FunctionDeclaration { .. }) {
+                        self.collect_vars(statement)?;
+                    }
                 }
             }
             Statement::If {
@@ -120,8 +131,10 @@ impl Compiler {
                 }
             }
             Statement::While { body, .. } => self.collect_vars(body)?,
-            Statement::FunctionDeclaration { .. }
-            | Statement::Expression(_)
+            Statement::FunctionDeclaration { name, .. } => {
+                self.add_binding(0, name, VarKind::Var)?;
+            }
+            Statement::Expression(_)
             | Statement::Return(_)
             | Statement::VariableDeclaration { .. } => {}
         }
@@ -161,7 +174,7 @@ impl Compiler {
             .collect();
         for (name, binding) in bindings {
             let name = self.name(&name)?;
-            if scope == 0 {
+            if scope == self.root_scope {
                 self.chunk.emit(Instruction::DeclareGlobal {
                     slot: binding.slot,
                     kind: binding.kind,
@@ -197,6 +210,9 @@ impl Compiler {
                 if *kind != VarKind::Var {
                     self.add_binding(scope, name, *kind)?;
                 }
+            }
+            if let Statement::FunctionDeclaration { name, .. } = statement {
+                self.add_binding(scope, name, VarKind::Let)?;
             }
         }
         Ok(())
@@ -263,6 +279,7 @@ impl Compiler {
                 self.collect_block_bindings(scope, statements)?;
                 let enter = self.chunk.emit(Instruction::EnterScope(0));
                 self.emit_scope_declarations(scope)?;
+                self.emit_functions(statements)?;
                 self.compile_sequence(statements, true)?;
                 self.chunk.code[enter] = Instruction::EnterScope(self.scopes[scope].slots);
                 self.chunk.emit(Instruction::ExitScope);
@@ -283,7 +300,7 @@ impl Compiler {
                     message: format!("unresolved declaration `{name}`"),
                     unsupported: false,
                 })?;
-                if binding.scope == 0 {
+                if binding.scope == self.root_scope {
                     self.chunk.emit(Instruction::InitializeGlobal {
                         slot: binding.slot,
                         name: name_index,
@@ -305,11 +322,107 @@ impl Compiler {
             Statement::While { condition, body } => {
                 self.compile_while(condition, body, is_completion)
             }
-            Statement::FunctionDeclaration { .. } => {
-                Err(CompileError::unsupported("function declarations"))
+            Statement::FunctionDeclaration { name, .. } => {
+                if self.hoisted_functions.contains(name) {
+                    Ok(false)
+                } else {
+                    Err(CompileError::unsupported(
+                        "function declarations in conditional statements",
+                    ))
+                }
             }
-            Statement::Return(_) => Err(CompileError::unsupported("return statements")),
+            Statement::Return(value) => {
+                if let Some(value) = value {
+                    self.compile_expression(value)?;
+                } else {
+                    self.constant(Value::Undefined)?;
+                }
+                self.chunk.emit(Instruction::Return);
+                Ok(false)
+            }
         }
+    }
+
+    fn emit_functions(&mut self, statements: &[Statement]) -> Result<(), CompileError> {
+        for statement in statements {
+            if let Statement::FunctionDeclaration { name, params, body } = statement {
+                let prototype = self.compile_function(name, params, body)?;
+                let index =
+                    u16::try_from(self.chunk.functions.len()).map_err(|_| CompileError {
+                        message: "function pool is full".into(),
+                        unsupported: false,
+                    })?;
+                self.chunk.functions.push(prototype);
+                self.chunk.emit(Instruction::MakeFunction(index));
+                let binding = self.binding(name).ok_or_else(|| CompileError {
+                    message: format!("unresolved function declaration `{name}`"),
+                    unsupported: false,
+                })?;
+                let name_index = self.name(name)?;
+                if binding.scope == self.root_scope {
+                    self.chunk.emit(Instruction::InitializeGlobal {
+                        slot: binding.slot,
+                        name: name_index,
+                    });
+                } else {
+                    self.chunk.emit(Instruction::InitializeLocal {
+                        slot: binding.slot,
+                        name: name_index,
+                    });
+                }
+                self.hoisted_functions.insert(name.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_function(
+        &self,
+        name: &str,
+        params: &[String],
+        body: &[Statement],
+    ) -> Result<FunctionPrototype, CompileError> {
+        let root_scope = self.scopes.len();
+        let mut compiler = Self {
+            chunk: Chunk::new(),
+            scopes: self.scopes.clone(),
+            root_scope,
+            hoisted_functions: HashSet::new(),
+        };
+        compiler.scopes.push(Scope {
+            bindings: HashMap::new(),
+            slots: 0,
+        });
+        for param in params {
+            compiler.add_binding(root_scope, param, VarKind::Var)?;
+        }
+        for statement in body {
+            if let Statement::VariableDeclaration { kind, name, .. } = statement {
+                if *kind != VarKind::Var {
+                    compiler.add_binding(root_scope, name, *kind)?;
+                }
+            }
+            compiler.collect_vars(statement)?;
+        }
+        for statement in body {
+            if let Statement::FunctionDeclaration { name, .. } = statement {
+                compiler.add_binding(root_scope, name, VarKind::Var)?;
+            }
+        }
+        compiler.emit_scope_declarations(root_scope)?;
+        compiler.emit_functions(body)?;
+        compiler.compile_sequence(body, true)?;
+        compiler.chunk.emit(Instruction::Return);
+        Ok(FunctionPrototype {
+            name: name.to_owned(),
+            params: params.to_vec(),
+            parameter_slots: params
+                .iter()
+                .map(|param| compiler.scopes[root_scope].bindings[param].slot)
+                .collect(),
+            slot_count: compiler.scopes[root_scope].slots,
+            chunk: Arc::new(compiler.chunk),
+        })
     }
 
     fn compile_expression(&mut self, expression: &Expr) -> Result<(), CompileError> {
@@ -344,7 +457,18 @@ impl Compiler {
                 self.compile_expression(value)?;
                 self.compile_store(name)
             }
-            Expr::Call { .. } => Err(CompileError::unsupported("function calls")),
+            Expr::Call { callee, arguments } => {
+                self.compile_expression(callee)?;
+                for argument in arguments {
+                    self.compile_expression(argument)?;
+                }
+                let count = u16::try_from(arguments.len()).map_err(|_| CompileError {
+                    message: "function call has too many arguments".into(),
+                    unsupported: false,
+                })?;
+                self.chunk.emit(Instruction::Call(count));
+                Ok(())
+            }
             Expr::Member { object, property } => {
                 self.compile_expression(object)?;
                 match property {
@@ -399,7 +523,7 @@ impl Compiler {
                 .emit(Instruction::LoadUnresolved { name: name_index });
             return Ok(());
         };
-        if binding.scope == 0 {
+        if binding.scope == self.root_scope {
             self.chunk.emit(Instruction::LoadGlobal {
                 slot: binding.slot,
                 name: name_index,
@@ -426,7 +550,7 @@ impl Compiler {
                 .emit(Instruction::StoreUnresolved { name: name_index });
             return Ok(());
         };
-        if binding.scope == 0 {
+        if binding.scope == self.root_scope {
             self.chunk.emit(Instruction::StoreGlobal {
                 slot: binding.slot,
                 name: name_index,

@@ -216,6 +216,9 @@ fn host_methods_load_as_the_registered_function() {
     let method = object.get("method").unwrap();
     assert!(matches!(method, Value::Function(_)));
     assert_eq!(run_vm("$.method", &object), Ok(method));
+    let vm = run_vm("$.method()", &object);
+    let evaluator = run_evaluator("$.method()", &object);
+    assert_eq!(vm, evaluator);
 }
 
 #[test]
