@@ -2,16 +2,38 @@
 
 Status: the current engine boundary, headers, shared body consumption,
 controller-owned HTTP redirects, local-scheme dispatch, provider contracts,
-response filtering, basic cancellation, and the builder-based construction API
-are implemented for the supported Rust slice. The browser crate now composes
-`BrowserFetchServices`, the embedded `byui:` provider, and the authorized
-`file:` provider. This document focuses on the work remaining to make that
-slice more complete and browser-ready.
+response filtering, cancellation, caching, and the builder-based construction
+API are implemented for the supported Rust slice. The browser crate now
+composes `BrowserFetchServices`, the embedded `byui:` provider, and the
+authorized `file:` provider. The file path is capability-based, bounded,
+revocable, and cancellation-aware; it is not a general filesystem fallback.
+The browser also exercises Fetch through page resource loading and JavaScript
+integration. This document focuses on the remaining standards, browser-policy,
+and lifecycle work rather than the provider plumbing that is now in place.
 
 `net` owns reusable Fetch algorithms and transport-independent state.
 `webapis` owns JavaScript bindings; browser, storage, and security crates own
 durable state and browser policy. Those owners integrate through typed service
 and provider interfaces rather than importing JavaScript types into `net`.
+
+## Next implementation order
+
+With the current browser/provider slice complete, the next work should be
+sequenced as follows:
+
+1. Finish body ownership and cloning semantics, including tee/backpressure and
+   cache capture, so every consumer can safely share or discard a response.
+2. Implement the missing CORS preflight/cache and complete per-hop redirect
+   policy before expanding browser credentials.
+3. Replace the browser's no-op `FetchServices` defaults with origin-aware
+   cookies, service-worker decisions, and security-policy checks.
+4. Expand the process-local cache into a standards-aware, partitioned cache
+   with freshness, validators, revalidation, and 304 handling.
+5. Add transport limits and diagnostics, then broaden conformance coverage.
+
+The `byui:` and `file:` providers should receive maintenance fixes and
+regression tests during these slices, but they are no longer the critical path.
+Browser-owned `blob:` lifecycle work remains deferred.
 
 ## Remaining work
 
@@ -43,7 +65,11 @@ and provider interfaces rather than importing JavaScript types into `net`.
 
 ### 3. Implement browser credentials and policy integrations
 
-Provide browser-owned implementations for the existing hooks:
+The current browser composition installs explicit no-op policy hooks: it sends
+no cookies, stores no `Set-Cookie` values, always selects the network for
+service workers, and uses a process-local cache partition. These defaults are
+intentional for the current slice, but they are not browser-complete. Replace
+them with browser-owned implementations for:
 
 - partitioned cookie storage and `Set-Cookie` processing;
 - TLS client certificates and HTTP authentication;
@@ -82,25 +108,30 @@ decompression ratios, malformed compressed bodies, range requests,
 `Accept-Encoding`, connection failures, connection timing, per-origin limits,
 offline mode, and future HTTP/3 support.
 
-### 6. Complete scheme-provider/browser integration
+### 6. Scheme-provider/browser integration
 
-#### Next slice: harden currently composed local schemes
+#### Completed in the current slice
 
-The next implementation slice is limited to the engine-owned `data:` and
-`about:blank` paths plus the browser-composed `byui:` and authorized `file:`
-providers. Complete their edge-case, response, cancellation, and isolation
-coverage before moving on to CORS or cache work. Do not add browser blob URL
-creation, registry, revocation, or lifetime behavior in this slice.
+The engine-owned `data:` and exact `about:blank` paths, plus the browser-owned
+`byui:` and authorized `file:` providers, now have end-to-end composition and
+focused tests. The current coverage includes provider selection, method
+boundaries, response metadata validation, readable/null bodies, streaming,
+abort and drop cleanup, missing/revoked capabilities, file size and session
+budgets, media-type policy, and fail-closed behavior. Browser page loading now
+resolves its HTML, CSS, and JavaScript resources through the `byui:` provider.
 
-#### Browser-owned composition
+Do not add browser blob URL creation, registry, revocation, or lifetime
+behavior until the browser-owned blob lifecycle is designed.
 
-Complete browser-side ownership and composition without moving browser state
-into `net`:
+#### Browser-owned composition and follow-up
+
+Keep browser-side ownership and composition out of `net`:
 
 - keep `byui:` page registration, lookup, replacement, and origin policy in
   `crates/browser`;
-- add the designated filesystem/security owner for authorized `file:` access,
-  sandboxing, path resolution, and origin policy.
+- retain the security-owned capability and the browser adapter for authorized
+  `file:` access, sandboxing, path resolution, and origin policy; extend them
+  only when navigation/subresource policy or origin parsing is ready.
 
 Browser-owned providers must never fall back to HTTP or direct filesystem
 access when lookup fails.
@@ -126,8 +157,9 @@ routes, and origin policy.
 
 #### Provider conformance and isolation
 
-Add browser-composition and `net` integration tests for the currently
-implemented `data:`, `byui:`, `file:`, and `about:blank` paths:
+Keep the existing browser-composition and `net` integration tests for the
+implemented `data:`, `byui:`, `file:`, and `about:blank` paths, and extend them
+only for newly discovered regressions:
 
 - builder-based service/provider composition and request-context propagation;
 - exact-once selection of the matching provider;
@@ -171,10 +203,11 @@ The current builder preserves these capability rules: standalone requests
 may omit services, local schemes require matching scheme providers, and
 requests carrying browser client context require `FetchServices`. It should
 also make the ownership distinction explicit without exposing controller
-internals. Add constructor/builder tests for all capability combinations and
-for failures before transport or provider side effects.
+internals. The existing constructor/builder tests cover all capability
+combinations and verify failures before transport or provider side effects.
 
-Remaining work is to add or finish documented Rust APIs for response cloning,
+The builder migration and capability-combination tests are complete. Remaining
+work is to add or finish documented Rust APIs for response cloning,
 body state where it is intentionally public, response helpers, and request
 initialization. Add a Rust-consumer guide and document IPC-safe versus
 process-local types. Update the browser architecture documentation and record
