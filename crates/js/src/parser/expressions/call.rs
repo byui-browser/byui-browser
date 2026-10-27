@@ -20,6 +20,7 @@ fn primary(parser: &mut Parser<'_>) -> ParseResult<(Expr, usize)> {
         Some(Token::This) => Expr::This,
         Some(Token::New) => return parse_new(parser),
         Some(Token::Super) => return parse_super(parser),
+        Some(Token::LeftBrace) => return super::object::parse(parser),
         Some(Token::LeftParen) => {
             parser.advance();
             let (expression, depth) = parser.parse_expression_with_depth(0)?;
@@ -67,7 +68,7 @@ fn parse_super(parser: &mut Parser<'_>) -> ParseResult<(Expr, usize)> {
         let depth = parser.node_depth(depth + 1, "super call")?;
         Ok((Expr::SuperCall { arguments }, depth))
     } else if parser.consume(&Token::Dot) {
-        let name = property_name(parser)?;
+        let name = property_name(parser, "super")?;
         Ok((Expr::SuperMember { name }, 1))
     } else {
         Err(parser.error("Expected `(` or `.` after `super`", "super"))
@@ -109,7 +110,7 @@ fn suffix(
                 arguments,
             };
         } else if parser.consume(&Token::Dot) {
-            let name = property_name(parser)?;
+            let name = property_name(parser, "member access")?;
             depth = parser.node_depth(depth + 1, "member access")?;
             callee = Expr::Member {
                 object: Box::new(callee),
@@ -129,10 +130,14 @@ fn suffix(
     }
 }
 
-/// Parses the name after `.`. Like JavaScript's `IdentifierName`, keywords
-/// are allowed, so `object.if` and `object.null` are ordinary properties, and
-/// so are escaped keywords such as `object.\u0069f`.
-pub(in crate::parser) fn property_name(parser: &mut Parser<'_>) -> ParseResult<String> {
+/// Parses the name after `.`, `super.`, a class method, or an object literal
+/// key. Like JavaScript's `IdentifierName`, keywords are allowed, so
+/// `object.if` and `object.null` are ordinary properties, and so are escaped
+/// keywords such as `object.\u0069f`.
+pub(in crate::parser) fn property_name(
+    parser: &mut Parser<'_>,
+    context: &'static str,
+) -> ParseResult<String> {
     let name = match parser.peek() {
         Some(Token::Identifier(name) | Token::EscapedKeyword(name)) => name.as_str(),
         Some(Token::Let) => "let",
@@ -152,7 +157,7 @@ pub(in crate::parser) fn property_name(parser: &mut Parser<'_>) -> ParseResult<S
         Some(Token::False) => "false",
         Some(Token::Null) => "null",
         Some(Token::Undefined) => "undefined",
-        _ => return Err(parser.error("Expected a property name", "member access")),
+        _ => return Err(parser.error("Expected a property name", context)),
     }
     .to_owned();
     parser.advance();

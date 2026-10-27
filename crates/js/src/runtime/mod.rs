@@ -1,8 +1,9 @@
 //! Tree-walk interpreter for parsed programs.
 //!
 //! Supports expressions, `var`/`let`/`const` declarations, blocks, `if`,
-//! `while`, function declarations with closures, calls, `return`, and member
-//! access (`object.name`, `object[key]`, and assignment to either).
+//! `while`, function declarations with closures, calls, `return`, object
+//! literals, and member access (`object.name`, `object[key]`, and assignment
+//! to either).
 //!
 //! Semantics follow ECMAScript where supported: `var` and function
 //! declarations are hoisted to the enclosing function or script, `let` and
@@ -12,9 +13,9 @@
 //! Limitations:
 //! - Assigning to an undeclared name is an error, as in strict mode.
 //! - Member access works only on [`Object`] values. Reading a property of any
-//!   other value, including strings and functions, is a runtime error, and so
-//!   is reading a property the object does not have (JavaScript would return
-//!   `undefined`). Methods are called without `this`.
+//!   other value, including strings and functions, is a runtime error.
+//!   Reading a property an object does not have returns `undefined`, as in
+//!   JavaScript. Methods are called without `this`.
 //! - Classes, `new`, and `super` parse but are not evaluated here; they run
 //!   only through the bytecode compiler and [`crate::vm::Vm`].
 //! - There is no garbage collector yet. A function stored in the scope it
@@ -34,8 +35,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::ast::{
-    BinaryOperator, Expr, LogicalOperator, MemberProperty, Program, Statement, UnaryOperator,
-    VarKind,
+    BinaryOperator, Expr, LogicalOperator, MemberProperty, Program, PropertyKey, Statement,
+    UnaryOperator, VarKind,
 };
 use crate::bytecode::FunctionTemplate;
 use crate::stack::{StackGuard, with_engine_stack};
@@ -399,6 +400,16 @@ impl Function {
             FunctionKind::Host { function, .. } => Some(function(arguments)),
             _ => None,
         }
+    }
+
+    /// Invokes this function with `arguments`.
+    ///
+    /// Script functions execute with their captured lexical environment, and
+    /// host functions receive the supplied values directly. This is used by
+    /// host APIs that need to call a JavaScript callback, such as DOM events.
+    /// Bytecode functions are not run here; the VM executes those.
+    pub fn call(&self, arguments: &[Value]) -> JsResult<Value> {
+        with_engine_stack(|| Interpreter::new(ExecutionLimits::default()).call(self, arguments))
     }
 }
 
@@ -849,17 +860,7 @@ impl Interpreter {
                 let Value::Object(target) = target else {
                     return Err(non_object(&target, "read", &key, "property access"));
                 };
-                target.get(&key).ok_or_else(|| {
-                    let description = match describe(expression) {
-                        Some(path) => format!("`{path}`"),
-                        None => format!("Property `{key}`"),
-                    };
-                    JsError::with_context(
-                        crate::JsErrorCategory::Runtime,
-                        format!("{description} is not defined"),
-                        "property access",
-                    )
-                })
+                Ok(target.get(&key).unwrap_or(Value::Undefined))
             }
             Expr::MemberAssign {
                 object,
@@ -874,6 +875,18 @@ impl Interpreter {
                 };
                 target.set(key, value.clone());
                 Ok(value)
+            }
+            Expr::Object(properties) => {
+                let object = Object::new();
+                for property in properties {
+                    let key = match &property.key {
+                        PropertyKey::Named(name) => name.clone(),
+                        PropertyKey::Computed(key) => to_property_key(&self.evaluate(key, scope)?),
+                    };
+                    let value = self.evaluate(&property.value, scope)?;
+                    object.set(key, value);
+                }
+                Ok(Value::Object(object))
             }
         }
     }

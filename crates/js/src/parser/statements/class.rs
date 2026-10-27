@@ -46,7 +46,7 @@ pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Statement> {
 }
 
 fn parse_method(parser: &mut Parser<'_>) -> ParseResult<MethodDefinition> {
-    let name = property_name(parser)?;
+    let name = property_name(parser, "class body")?;
     if parser.peek() != Some(&Token::LeftParen) {
         return Err(parser.error(
             "Expected a method; static members, accessors, and fields are unsupported",

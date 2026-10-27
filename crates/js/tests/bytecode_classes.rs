@@ -270,11 +270,8 @@ fn prototype_changes_are_visible_to_existing_instances() {
 }
 
 #[test]
-fn reading_a_missing_property_is_an_error_like_other_objects() {
-    assert_eq!(
-        error("class A {} new A().nope").message,
-        "Property `nope` is not defined"
-    );
+fn reading_a_missing_property_is_undefined_like_other_objects() {
+    assert_eq!(value("class A {} new A().nope"), Value::Undefined);
 }
 
 #[test]

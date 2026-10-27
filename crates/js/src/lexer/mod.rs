@@ -117,6 +117,8 @@ pub enum Token {
     RightBrace,
     /// `,` separator.
     Comma,
+    /// `:` separator between an object literal's key and value.
+    Colon,
     /// `.` member access operator.
     Dot,
     /// `[` computed member access opener.
@@ -271,6 +273,7 @@ pub fn tokenize_spanned(input: &str) -> Vec<SpannedToken> {
                 '{' => Token::LeftBrace,
                 '}' => Token::RightBrace,
                 ',' => Token::Comma,
+                ':' => Token::Colon,
                 '.' => Token::Dot,
                 '[' => Token::LeftBracket,
                 ']' => Token::RightBracket,

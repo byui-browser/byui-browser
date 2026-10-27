@@ -1,7 +1,6 @@
 //! The layout-facing projection of the document tree.
 
-use common::ids::NodeId;
-use html::{HTMLDocument, NodeKind};
+use html::{HTMLDocument, NodeID, NodeKind};
 
 /// The layout-facing projection of an HTML document.
 ///
@@ -13,7 +12,7 @@ use html::{HTMLDocument, NodeKind};
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StyledDom {
     /// HTML arena indices represented as layout nodes.
-    pub nodes: Vec<NodeId>,
+    pub nodes: Vec<NodeID>,
 }
 
 impl StyledDom {
@@ -47,20 +46,11 @@ impl StyledDom {
                 {
                     return None;
                 }
-                Some(NodeId::new(index as u32))
+                Some(NodeID::new(index))
             })
             .collect();
         Self { nodes }
     }
-}
-
-/// Converts a layout node ID back to the corresponding HTML arena ID.
-///
-/// This is valid because [`StyledDom::from_html_document`] preserves the HTML
-/// document's arena indices. Callers must not use it with IDs from another
-/// arena.
-pub fn html_node_id(node_id: NodeId) -> html::NodeId {
-    html::NodeId(node_id.index() as usize)
 }
 
 #[cfg(test)]
@@ -78,7 +68,7 @@ mod tests {
 
         assert_eq!(styled.nodes.len(), 1);
         assert!(matches!(
-            document.node(html::NodeId(styled.nodes[0].index() as usize)),
+            document.node(styled.nodes[0]),
             Some(html::Node {
                 kind: html::NodeKind::Element(element),
                 ..
@@ -94,7 +84,7 @@ mod tests {
 
         assert_eq!(styled.nodes.len(), 1);
         assert!(matches!(
-            document.node(html::NodeId(styled.nodes[0].index() as usize)),
+            document.node(styled.nodes[0]),
             Some(html::Node {
                 kind: html::NodeKind::Element(element),
                 ..

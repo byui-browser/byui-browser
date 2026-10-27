@@ -3,9 +3,10 @@
 
 use std::sync::Arc;
 
-use browser::Page;
+use browser::{BrowserRuntime, Page};
 use layout::{Size, StyledDom, layout_tree};
 use render::{Compositor, Frame};
+use security::{Origin, RendererSecurityContext, StoragePermission};
 use tiny_skia::Pixmap;
 use webapis::{AlertSink, ConsoleSink};
 
@@ -15,11 +16,19 @@ impl ConsoleSink for NoopConsole {
     fn log(&self, _message: &str) {}
 }
 
+fn welcome_security_context() -> RendererSecurityContext {
+    RendererSecurityContext::new(
+        Origin::new("byui", "welcome", None),
+        StoragePermission::Allowed,
+    )
+}
+
 fn render_demo(
     page: &browser::Page,
     width: u32,
     height: u32,
     alert_sink: Arc<dyn AlertSink>,
+    runtime: &BrowserRuntime,
     scripts_evaluated: &mut bool,
 ) -> Frame {
     let stylesheet = css::parse_stylesheet(&page.css);
@@ -31,10 +40,10 @@ fn render_demo(
         // The completion value is not part of painting. `alert` returns
         // `undefined`, so requiring the welcome string aborts the first draw
         // and the window never opens.
-        evaluate_page_script(page, Arc::clone(&alert_sink));
+        evaluate_page_script(page, Arc::clone(&alert_sink), runtime.clone());
         *scripts_evaluated = true;
     }
-    render_document(page, width, height, alert_sink, scripts_evaluated)
+    render_document(page, width, height, alert_sink, runtime, scripts_evaluated)
 }
 
 fn render_document(
@@ -42,11 +51,12 @@ fn render_document(
     width: u32,
     height: u32,
     alert_sink: Arc<dyn AlertSink>,
+    runtime: &BrowserRuntime,
     scripts_evaluated: &mut bool,
 ) -> Frame {
     let document = html::parse_raw_html(page.html.to_owned());
     if !*scripts_evaluated {
-        evaluate_page_script(page, alert_sink);
+        evaluate_page_script(page, alert_sink, runtime.clone());
         *scripts_evaluated = true;
     }
     let tree = layout_tree(
@@ -65,17 +75,21 @@ fn render_document(
 /// Call this after the window has presented a frame. Running it inside the
 /// draw callback joins the JS engine thread while the UI thread cannot
 /// service a dialog.
-pub(crate) fn evaluate_page_script(page: &Page, alert_sink: Arc<dyn AlertSink>) -> Vec<js::Value> {
-    let controller = Arc::new(
-        net::RequestController::builder(net::Config::default())
-            .with_scheme_providers(
-                net::SchemeProviders::new().with_page(browser::byui_provider::provider()),
-            )
-            .build()
-            .expect("network controller should initialize"),
-    );
+pub(crate) fn evaluate_page_script(
+    page: &Page,
+    alert_sink: Arc<dyn AlertSink>,
+    runtime: BrowserRuntime,
+) -> Vec<js::Value> {
+    let controller = browser::request_controller(None);
     let source = format!("<script>{}</script>", page.js);
-    browser::evaluate_page_scripts(&source, Arc::new(NoopConsole), alert_sink, controller)
+    runtime
+        .evaluate_page_scripts(
+            &source,
+            Arc::new(NoopConsole),
+            alert_sink,
+            controller,
+            welcome_security_context(),
+        )
         .expect("the page script should execute")
 }
 
@@ -89,6 +103,7 @@ pub(crate) fn render_page(
     height: u32,
     scale_factor: f64,
     alert_sink: Arc<dyn AlertSink>,
+    runtime: &BrowserRuntime,
     scripts_evaluated: &mut bool,
 ) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(width, height)?;
@@ -97,6 +112,7 @@ pub(crate) fn render_page(
         (width as f64 / scale_factor).ceil() as u32,
         (height as f64 / scale_factor).ceil() as u32,
         alert_sink,
+        runtime,
         scripts_evaluated,
     );
     for (y, row) in pixmap
@@ -133,11 +149,23 @@ mod tests {
         Arc::new(SilentAlert)
     }
 
+    fn test_runtime() -> BrowserRuntime {
+        BrowserRuntime::in_memory()
+    }
+
     #[test]
     fn demo_produces_layout_background_and_renderer_text() {
         let page = browser::welcome_page();
+        let runtime = test_runtime();
         let mut scripts_evaluated = false;
-        let frame = render_demo(&page, 160, 120, test_alert_sink(), &mut scripts_evaluated);
+        let frame = render_demo(
+            &page,
+            160,
+            120,
+            test_alert_sink(),
+            &runtime,
+            &mut scripts_evaluated,
+        );
         assert_eq!((frame.width, frame.height), (160, 120));
         assert_eq!(&frame.pixels[..4], &[242, 245, 250, 255]);
         assert!(frame.pixels.chunks_exact(4).any(|p| p == [30, 43, 62, 255]));
@@ -147,6 +175,7 @@ mod tests {
     #[test]
     fn page_is_scaled_to_device_pixels() {
         let page_source = browser::welcome_page();
+        let runtime = test_runtime();
         let mut scripts_evaluated = false;
         for scale in [1.0, 1.5, 2.0] {
             let (width, height) = ((160.0 * scale) as u32, (120.0 * scale) as u32);
@@ -156,6 +185,7 @@ mod tests {
                 height,
                 scale,
                 test_alert_sink(),
+                &runtime,
                 &mut scripts_evaluated,
             )
             .unwrap();
@@ -171,9 +201,19 @@ mod tests {
     #[test]
     fn tiny_and_empty_pages_are_safe() {
         let page = browser::welcome_page();
+        let runtime = test_runtime();
         let mut scripts_evaluated = false;
         assert!(
-            render_page(&page, 0, 10, 1.0, test_alert_sink(), &mut scripts_evaluated,).is_none()
+            render_page(
+                &page,
+                0,
+                10,
+                1.0,
+                test_alert_sink(),
+                &runtime,
+                &mut scripts_evaluated,
+            )
+            .is_none()
         );
         for (width, height) in [(1, 1), (3, 48), (17, 70)] {
             assert!(
@@ -183,6 +223,7 @@ mod tests {
                     height,
                     2.0,
                     test_alert_sink(),
+                    &runtime,
                     &mut scripts_evaluated,
                 )
                 .is_some()
@@ -208,8 +249,16 @@ mod tests {
             js: "alert('rendered page')".into(),
         };
 
+        let runtime = test_runtime();
         let mut scripts_evaluated = false;
-        render_document(&page, 160, 120, alert.clone(), &mut scripts_evaluated);
+        render_document(
+            &page,
+            160,
+            120,
+            alert.clone(),
+            &runtime,
+            &mut scripts_evaluated,
+        );
 
         assert_eq!(alert.0.lock().unwrap().as_slice(), ["rendered page"]);
     }
@@ -232,8 +281,16 @@ mod tests {
             js: "alert('Hello from script.js')".into(),
         };
         let alert = Arc::new(Recording::default());
+        let runtime = test_runtime();
         let mut scripts_evaluated = false;
-        let frame = render_demo(&page, 160, 120, alert.clone(), &mut scripts_evaluated);
+        let frame = render_demo(
+            &page,
+            160,
+            120,
+            alert.clone(),
+            &runtime,
+            &mut scripts_evaluated,
+        );
 
         assert!(scripts_evaluated);
         assert_eq!(alert.0.lock().unwrap().as_slice(), ["Hello from script.js"]);

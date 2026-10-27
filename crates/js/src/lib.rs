@@ -86,6 +86,8 @@ pub struct JsError {
     pub message: String,
     /// The interpreter operation that failed, when known.
     pub context: Option<String>,
+    /// Bytecode source location where the failure occurred, when available.
+    pub location: Option<bytecode::SourceLocation>,
 }
 
 impl JsError {
@@ -100,6 +102,7 @@ impl JsError {
             category: JsErrorCategory::Runtime,
             message: message.into(),
             context: None,
+            location: None,
         }
     }
 
@@ -113,7 +116,14 @@ impl JsError {
             category,
             message: message.into(),
             context: Some(context.into()),
+            location: None,
         }
+    }
+
+    /// Associates this error with a bytecode source location.
+    pub fn with_location(mut self, location: bytecode::SourceLocation) -> Self {
+        self.location = Some(location);
+        self
     }
 }
 
@@ -338,12 +348,10 @@ pub fn parse(source: &str) -> Result<Program, parser::ParseError> {
 /// Parses and evaluates source text, returning the completion value.
 ///
 /// Runs the tree-walk interpreter described in [`runtime`]: expressions,
-/// member access, declarations, blocks, `if`, `while`, functions, calls, and
-/// `return`. Scripts cannot create objects themselves yet (there are no
-/// object literals), so member access needs objects from a [`Realm`]. Classes,
-/// `new`, `this`, and `super` parse but are not evaluated here; they run only
-/// through [`bytecode::compile`] and [`Vm`]. Syntax errors and runtime errors
-/// are both returned as [`JsError`].
+/// object literals, member access, declarations, blocks, `if`, `while`,
+/// functions, calls, and `return`. Classes, `new`, `this`, and `super` parse
+/// but are not evaluated here; they run only through [`bytecode::compile`] and
+/// [`Vm`]. Syntax errors and runtime errors are both returned as [`JsError`].
 pub fn eval(source: &str) -> JsResult<Value> {
     let program = parse(source).map_err(|error| {
         JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")

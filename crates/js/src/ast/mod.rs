@@ -66,8 +66,9 @@ pub enum Expr {
     },
     /// Property read such as `object.name` or `object[key]`.
     ///
-    /// The object is evaluated first, then a computed key. Reading a missing
-    /// property, or any property of a non-object value, is a runtime error.
+    /// The object is evaluated first, then a computed key. A missing property
+    /// reads as `undefined`; reading any property of a non-object value is a
+    /// runtime error.
     Member {
         /// Owned expression producing the object to read from.
         object: Box<Expr>,
@@ -111,6 +112,34 @@ pub enum Expr {
         /// Owned expression supplying the assigned value.
         value: Box<Expr>,
     },
+    /// Object literal such as `{ a: 1, 'b': 2, [key]: 3 }`, creating a new
+    /// object each time it is evaluated.
+    ///
+    /// Properties are evaluated in source order, each key before its value.
+    /// A repeated key keeps its first position and its last value. Shorthand
+    /// `{ a }` is parsed as `{ a: a }`. Methods, getters, setters, and spread
+    /// (`...`) are unsupported.
+    Object(Vec<ObjectProperty>),
+}
+
+/// One `key: value` entry of an object literal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectProperty {
+    /// Property name, fixed or computed.
+    pub key: PropertyKey,
+    /// Owned expression supplying the property's value.
+    pub value: Expr,
+}
+
+/// The key part of an object literal property.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropertyKey {
+    /// A fixed name written as an identifier (keywords allowed), a string,
+    /// or a number. Numbers are stored in their JavaScript string form, so
+    /// `{ 1.50: x }` has the key `"1.5"`.
+    Named(String),
+    /// `[expression]`: the key is converted to a string after evaluation.
+    Computed(Box<Expr>),
 }
 
 /// The property part of a member expression.

@@ -131,7 +131,13 @@ impl Vm {
                         .constants
                         .get(usize::from(index))
                         .cloned()
-                        .ok_or_else(|| JsError::runtime("bytecode constant index is invalid"))?,
+                        .ok_or_else(|| {
+                            bytecode_error(
+                                &chunk,
+                                instruction_pointer - 1,
+                                "bytecode constant index is invalid",
+                            )
+                        })?,
                 ),
                 Instruction::Pop => {
                     self.pop()?;
@@ -147,7 +153,7 @@ impl Vm {
                     self.push(value);
                 }
                 Instruction::Jump(target) => {
-                    validate_jump(target, &chunk)?;
+                    validate_jump(target, &chunk, instruction_pointer - 1)?;
                     if target < instruction_pointer {
                         self.next_loop_iteration()?;
                     }
@@ -170,13 +176,13 @@ impl Vm {
                     self.push(binary(operator, left, right)?);
                 }
                 Instruction::JumpIfFalse(target) => {
-                    validate_jump(target, &chunk)?;
+                    validate_jump(target, &chunk, instruction_pointer - 1)?;
                     if !is_truthy(self.stack.last().ok_or_else(stack_underflow)?) {
                         instruction_pointer = target;
                     }
                 }
                 Instruction::JumpIfTrue(target) => {
-                    validate_jump(target, &chunk)?;
+                    validate_jump(target, &chunk, instruction_pointer - 1)?;
                     if is_truthy(self.stack.last().ok_or_else(stack_underflow)?) {
                         instruction_pointer = target;
                     }
@@ -283,8 +289,10 @@ impl Vm {
                         .and_then(Function::home_object)
                         .ok_or_else(|| JsError::runtime("`super` has no home object"))?
                         .prototype();
-                    let value = prototype.and_then(|prototype| prototype.get(&key));
-                    self.push(value.ok_or_else(|| property_missing(&key))?);
+                    let value = prototype
+                        .and_then(|prototype| prototype.get(&key))
+                        .unwrap_or(Value::Undefined);
+                    self.push(value);
                 }
                 Instruction::DefineClass {
                     function,
@@ -317,6 +325,17 @@ impl Vm {
                     let method =
                         Function::from_template(template, Some(prototype.clone()), None, None);
                     prototype.set(key, Value::Function(method));
+                }
+                Instruction::NewObject => self.push(Value::Object(Object::new())),
+                Instruction::DefineProperty(index) => {
+                    let key = property_name(&chunk, index)?;
+                    let value = self.pop()?;
+                    store_property(self.peek()?, key, &value)?;
+                }
+                Instruction::DefineComputedProperty => {
+                    let value = self.pop()?;
+                    let key = to_property_key(&self.pop()?);
+                    store_property(self.peek()?, key, &value)?;
                 }
                 Instruction::EnterScope(slot_count) => {
                     self.frame.scopes.push(vec![
@@ -755,15 +774,26 @@ fn constructed_value(frame: &Frame, returned: Value) -> JsResult<Value> {
     })
 }
 
-fn validate_jump(target: usize, chunk: &Chunk) -> JsResult<()> {
+fn validate_jump(target: usize, chunk: &Chunk, offset: usize) -> JsResult<()> {
     if target > chunk.code.len() {
-        return Err(JsError::runtime("bytecode jump target is invalid"));
+        return Err(bytecode_error(
+            chunk,
+            offset,
+            "bytecode jump target is invalid",
+        ));
     }
     Ok(())
 }
 
 fn stack_underflow() -> JsError {
     JsError::runtime("bytecode operand stack underflow")
+}
+
+fn bytecode_error(chunk: &Chunk, offset: usize, message: &'static str) -> JsError {
+    let error = JsError::runtime(message);
+    chunk
+        .location(offset)
+        .map_or(error.clone(), |location| error.with_location(location))
 }
 
 /// Reads the string constant naming a property.
@@ -776,23 +806,19 @@ fn property_name(chunk: &Chunk, index: u16) -> JsResult<String> {
     }
 }
 
-fn property_missing(key: &str) -> JsError {
-    JsError::with_context(
-        JsErrorCategory::Runtime,
-        format!("Property `{key}` is not defined"),
-        "property access",
-    )
-}
-
 /// Reads a property of an object, following its prototype chain, or an own
 /// property of a bytecode function such as a class's `prototype`.
+///
+/// A missing property reads as `undefined`. Reading a property of any other
+/// value is an error.
 fn load_property(target: &Value, key: &str) -> JsResult<Value> {
     match target {
-        Value::Object(object) => object.get(key),
-        Value::Function(function) if function.template().is_some() => function.get_own(key),
-        _ => return Err(non_object(target, "read", key, "property access")),
+        Value::Object(object) => Ok(object.get(key).unwrap_or(Value::Undefined)),
+        Value::Function(function) if function.template().is_some() => {
+            Ok(function.get_own(key).unwrap_or(Value::Undefined))
+        }
+        _ => Err(non_object(target, "read", key, "property access")),
     }
-    .ok_or_else(|| property_missing(key))
 }
 
 fn store_property(target: &Value, key: String, value: &Value) -> JsResult<()> {
