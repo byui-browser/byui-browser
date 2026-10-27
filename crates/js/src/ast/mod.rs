@@ -75,6 +75,29 @@ pub enum Expr {
         /// Property name, fixed or computed.
         property: MemberProperty,
     },
+    /// The `this` keyword: the receiver of the running method or constructor.
+    This,
+    /// Construction such as `new Callee(arguments)`.
+    ///
+    /// The callee is evaluated first, then the arguments in order.
+    New {
+        /// Owned expression producing the constructor.
+        callee: Box<Expr>,
+        /// Owned arguments in evaluation order; empty for `new Callee`.
+        arguments: Vec<Expr>,
+    },
+    /// `super(arguments)` inside a derived class constructor: runs the parent
+    /// constructor and binds `this` to the instance it produces.
+    SuperCall {
+        /// Owned arguments in evaluation order.
+        arguments: Vec<Expr>,
+    },
+    /// `super.name` inside a class method: reads `name` starting from the
+    /// parent class's prototype. Calling it passes the current `this`.
+    SuperMember {
+        /// Owned property name.
+        name: String,
+    },
     /// Property assignment such as `object.name = value`, yielding the
     /// assigned value.
     ///
@@ -172,6 +195,36 @@ pub enum Statement {
     },
     /// Function return with an optional value; absence means undefined.
     Return(Option<Expr>),
+    /// Class declaration with an optional superclass.
+    ClassDeclaration(Box<ClassDefinition>),
+}
+
+/// The parsed body of a class declaration.
+///
+/// Limitations: only plain methods and one constructor are represented.
+/// Static members, accessors, fields, computed member names, and class
+/// expressions are not supported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassDefinition {
+    /// Owned class name, which also names the binding the class is stored in.
+    pub name: String,
+    /// Expression after `extends`, evaluated once when the class is defined.
+    pub superclass: Option<Expr>,
+    /// The explicit `constructor`, or `None` for the implicit one.
+    pub constructor: Option<MethodDefinition>,
+    /// Prototype methods in source order.
+    pub methods: Vec<MethodDefinition>,
+}
+
+/// A method or constructor inside a class body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MethodDefinition {
+    /// Owned method name.
+    pub name: String,
+    /// Owned parameter names in argument order.
+    pub params: Vec<String>,
+    /// Owned body statements in source order.
+    pub body: Vec<Statement>,
 }
 
 /// Keyword used to declare a binding.

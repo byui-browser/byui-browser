@@ -117,6 +117,8 @@ struct Parser<'tokens> {
     position: usize,
     depth: usize,
     function_depth: usize,
+    /// Nonzero while parsing a class method body, where `super` is valid.
+    method_depth: usize,
     line_terminators_before: &'tokens [bool],
 }
 
@@ -127,6 +129,7 @@ impl<'tokens> Parser<'tokens> {
             position: 0,
             depth: 0,
             function_depth: 0,
+            method_depth: 0,
             line_terminators_before,
         }
     }

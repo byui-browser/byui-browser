@@ -53,6 +53,64 @@ pub enum Instruction {
     /// key, stores the value under the stringified key on the object now at
     /// the top of the stack, and leaves the object on the stack.
     DefineComputedProperty,
+    /// Duplicates the value at the top of the stack.
+    Dup,
+    /// Pushes the running function's `this` receiver.
+    ///
+    /// At the top level this is `undefined`. In a derived constructor it is
+    /// an error until `super(...)` has returned.
+    LoadThis,
+    /// Pushes the call argument at this position, or `undefined` when the
+    /// caller passed fewer arguments.
+    LoadArgument(u16),
+    /// Pushes a new function value made from the template at this index of
+    /// [`Chunk::functions`](super::Chunk::functions).
+    MakeFunction(u16),
+    /// Calls a function with `this` set to `undefined`: pops the arguments,
+    /// then the callee, and pushes the result. The operand is the argument
+    /// count.
+    ///
+    /// Class constructors cannot be called this way.
+    Call(u16),
+    /// Calls a method: pops the arguments, then the callee, then the receiver
+    /// that becomes `this`, and pushes the result.
+    CallMethod(u16),
+    /// Constructs an instance: pops the arguments, then the constructor, and
+    /// pushes the new object, or the object the constructor returned.
+    ///
+    /// A constructor that returns a non-object value yields the new instance
+    /// instead. The instance's prototype is the constructor's `prototype`
+    /// property.
+    New(u16),
+    /// Runs the parent constructor from a derived constructor: pops the
+    /// arguments, binds `this` to the constructed instance, and pushes it.
+    ///
+    /// Calling it twice in one constructor is an error.
+    SuperCall(u16),
+    /// Reads a method through `super`: pushes the property named by the
+    /// string constant at this pool index, looked up starting from the parent
+    /// of the running method's home prototype. A missing property reads as
+    /// `undefined`.
+    LoadSuperProperty(u16),
+    /// Defines a class: pops the superclass when `has_superclass` is set, and
+    /// pushes the class constructor made from the template at `function`.
+    ///
+    /// The class gets a `prototype` object whose own prototype is the
+    /// superclass's `prototype`, so instances inherit the parent's methods.
+    DefineClass {
+        /// Index of the constructor template in the function pool.
+        function: u16,
+        /// Whether a superclass value is on the stack.
+        has_superclass: bool,
+    },
+    /// Adds a method to the class on top of the stack, leaving the class
+    /// there. The method becomes a property of the class's `prototype`.
+    DefineMethod {
+        /// Index of the method template in the function pool.
+        function: u16,
+        /// Constant-pool index of the method name string.
+        name: u16,
+    },
     /// Enters a lexical environment with `slot_count` slots.
     EnterScope(u16),
     /// Leaves the current lexical environment.
@@ -91,16 +149,20 @@ pub enum Instruction {
         /// Index into [`Chunk::names`](super::Chunk::names).
         name: u16,
     },
-    /// Initializes a global binding, leaving its value on the stack.
+    /// Initializes a global binding, popping its value from the stack.
     InitializeGlobal {
         /// Slot index in the global environment.
         slot: u16,
         /// Index into [`Chunk::names`](super::Chunk::names).
         name: u16,
     },
-    /// Initializes a local binding, leaving its value on the stack.
+    /// Initializes a local binding, popping its value from the stack.
     InitializeLocal {
-        /// Slot index in the current lexical environment.
+        /// Number of lexical environments between the current and target scope.
+        /// It is nonzero for a `var` declared in a block, which belongs to
+        /// the enclosing function's scope.
+        depth: u16,
+        /// Slot index in the target environment.
         slot: u16,
         /// Index into [`Chunk::names`](super::Chunk::names).
         name: u16,

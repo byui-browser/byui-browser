@@ -49,6 +49,16 @@ pub enum Token {
     Function,
     /// `return` keyword.
     Return,
+    /// `class` keyword.
+    Class,
+    /// `extends` keyword.
+    Extends,
+    /// `new` keyword.
+    New,
+    /// `this` keyword.
+    This,
+    /// `super` keyword.
+    Super,
     /// `true` literal.
     True,
     /// `false` literal.
@@ -539,6 +549,11 @@ fn keyword(name: &str) -> Option<Token> {
         "while" => Token::While,
         "function" => Token::Function,
         "return" => Token::Return,
+        "class" => Token::Class,
+        "extends" => Token::Extends,
+        "new" => Token::New,
+        "this" => Token::This,
+        "super" => Token::Super,
         "true" => Token::True,
         "false" => Token::False,
         "null" => Token::Null,

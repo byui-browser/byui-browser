@@ -349,8 +349,9 @@ pub fn parse(source: &str) -> Result<Program, parser::ParseError> {
 ///
 /// Runs the tree-walk interpreter described in [`runtime`]: expressions,
 /// object literals, member access, declarations, blocks, `if`, `while`,
-/// functions, calls, and `return`. Syntax errors and runtime errors are both
-/// returned as [`JsError`].
+/// functions, calls, and `return`. Classes, `new`, `this`, and `super` parse
+/// but are not evaluated here; they run only through [`bytecode::compile`] and
+/// [`Vm`]. Syntax errors and runtime errors are both returned as [`JsError`].
 pub fn eval(source: &str) -> JsResult<Value> {
     let program = parse(source).map_err(|error| {
         JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
