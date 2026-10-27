@@ -496,7 +496,7 @@ fn computed_style(
 ) -> Option<&Vec<Declaration>> {
     styles
         .iter()
-        .find(|(id, _)| id.get() as usize == parent.get())
+        .find(|(id, _)| id.get() == parent.get())
         .map(|(_, declarations)| declarations)
 }
 
@@ -649,7 +649,7 @@ mod tests {
         let declarations = styles
             .styles
             .iter()
-            .find(|(id, _)| id.get() as usize == paragraph.get())
+            .find(|(id, _)| id.get() == paragraph.get())
             .expect("computed paragraph");
         assert!(declarations.1.contains(&Declaration {
             property: "color".into(),

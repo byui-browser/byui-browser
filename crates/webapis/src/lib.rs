@@ -464,7 +464,7 @@ fn event_target_for(document: &Document, node: Option<NodeID>) -> EventTargetRef
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             targets
-                .entry(node.get() as usize)
+                .entry(node.get())
                 .or_insert_with(|| Arc::new(Mutex::new(EventTarget::default())))
                 .clone()
         }
@@ -690,8 +690,7 @@ fn dispatch_event_at(
         current = document
             .source_document
             .as_ref()
-            .and_then(|source| source.node(current_node).and_then(|n| n.parent))
-            .map(|parent| parent);
+            .and_then(|source| source.node(current_node).and_then(|n| n.parent));
     }
     let document_target = document.event_target.clone();
     if node.is_some() {
