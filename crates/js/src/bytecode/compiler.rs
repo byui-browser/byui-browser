@@ -11,19 +11,36 @@ use std::fmt;
 pub struct CompileError {
     /// Human-readable description of the unsupported construct.
     pub message: String,
+    /// Source location of the unsupported construct, when the compiler has one.
+    pub location: Option<super::SourceLocation>,
 }
 
 impl CompileError {
     fn unsupported(construct: &str) -> Self {
         Self {
             message: format!("bytecode compiler does not support {construct} yet"),
+            location: None,
         }
+    }
+
+    /// Attaches a source location to this compilation failure.
+    pub fn with_location(mut self, location: super::SourceLocation) -> Self {
+        self.location = Some(location);
+        self
     }
 }
 
 impl fmt::Display for CompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
+        formatter.write_str(&self.message)?;
+        if let Some(location) = self.location {
+            write!(
+                formatter,
+                " at line {}, column {}",
+                location.line, location.column
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -131,11 +148,13 @@ impl Compiler {
             }
             return Err(CompileError {
                 message: format!("redeclaration of `{name}`"),
+                location: None,
             });
         }
         let slot = self.scopes[scope].slots;
         self.scopes[scope].slots = slot.checked_add(1).ok_or_else(|| CompileError {
             message: "scope has too many bindings".into(),
+            location: None,
         })?;
         let binding = Binding { scope, slot, kind };
         self.scopes[scope].bindings.insert(name.to_owned(), binding);
@@ -201,6 +220,7 @@ impl Compiler {
     fn name(&mut self, name: &str) -> Result<u16, CompileError> {
         self.chunk.add_name(name).map_err(|message| CompileError {
             message: message.into(),
+            location: None,
         })
     }
 
@@ -242,6 +262,7 @@ impl Compiler {
                 }
                 let binding = self.binding(name).ok_or_else(|| CompileError {
                     message: format!("unresolved declaration `{name}`"),
+                    location: None,
                 })?;
                 if binding.scope == 0 {
                     self.chunk.emit(Instruction::InitializeGlobal {
@@ -321,6 +342,7 @@ impl Compiler {
             let depth =
                 u16::try_from(self.scopes.len() - 1 - binding.scope).map_err(|_| CompileError {
                     message: "scope nesting is too deep".into(),
+                    location: None,
                 })?;
             self.chunk.emit(Instruction::LoadLocal {
                 depth,
@@ -347,6 +369,7 @@ impl Compiler {
             let depth =
                 u16::try_from(self.scopes.len() - 1 - binding.scope).map_err(|_| CompileError {
                     message: "scope nesting is too deep".into(),
+                    location: None,
                 })?;
             self.chunk.emit(Instruction::StoreLocal {
                 depth,
@@ -383,6 +406,7 @@ impl Compiler {
             .add_constant(value)
             .map_err(|message| CompileError {
                 message: message.into(),
+                location: None,
             })?;
         self.chunk.emit(Instruction::Constant(index));
         Ok(())

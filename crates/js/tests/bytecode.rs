@@ -1,4 +1,4 @@
-use js::bytecode::{Instruction, compile};
+use js::bytecode::{Chunk, Instruction, SourceLocation, compile};
 use js::{Value, Vm, parse};
 
 fn execute(source: &str) -> Value {
@@ -79,4 +79,42 @@ fn chunk_keeps_constants_separate_from_instructions() {
             .any(|instruction| matches!(instruction, Instruction::Constant(0)))
     );
     assert_eq!(chunk.constants, vec![Value::String("hello".into())]);
+}
+
+#[test]
+fn disassembly_is_stable_and_includes_constants_jumps_and_locations() {
+    let mut chunk = Chunk::new();
+    let constant = chunk.add_constant(Value::String("hello".into())).unwrap();
+    chunk.emit_at(
+        Instruction::Constant(constant),
+        Some(SourceLocation {
+            offset: 0,
+            line: 1,
+            column: 1,
+        }),
+    );
+    let jump = chunk.emit(Instruction::JumpIfFalse(usize::MAX));
+    chunk.emit(Instruction::Return);
+    chunk.code[jump] = Instruction::JumpIfFalse(2);
+
+    assert_eq!(
+        chunk.disassemble(),
+        "== script ==\n0000 1:1 CONSTANT 0 (String(\"hello\"))\n0001 JUMP_IF_FALSE -> 0002\n0002 Return\n"
+    );
+}
+
+#[test]
+fn invalid_jump_reports_its_instruction_location() {
+    let mut chunk = Chunk::new();
+    chunk.emit_at(
+        Instruction::JumpIfTrue(99),
+        Some(SourceLocation {
+            offset: 4,
+            line: 2,
+            column: 3,
+        }),
+    );
+    let error = Vm::new().execute(&chunk).unwrap_err();
+    assert_eq!(error.message, "bytecode jump target is invalid");
+    assert_eq!(error.location.unwrap().line, 2);
 }
