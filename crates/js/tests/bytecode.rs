@@ -133,3 +133,41 @@ fn vm_limits_bound_bytecode_execution() {
         .expect_err("infinite loop should hit its step limit");
     assert_eq!(error.message, "Script exceeded the evaluation step limit");
 }
+
+#[test]
+fn disassembly_is_stable_and_includes_constants_jumps_and_locations() {
+    let mut chunk = js::bytecode::Chunk::new();
+    let constant = chunk.add_constant(Value::String("hello".into())).unwrap();
+    chunk.emit_at(
+        Instruction::Constant(constant),
+        Some(js::bytecode::SourceLocation {
+            offset: 0,
+            line: 1,
+            column: 1,
+        }),
+    );
+    let jump = chunk.emit(Instruction::JumpIfFalse(usize::MAX));
+    chunk.emit(Instruction::Return);
+    chunk.code[jump] = Instruction::JumpIfFalse(2);
+
+    assert_eq!(
+        chunk.disassemble(),
+        "== script ==\n0000 1:1 CONSTANT 0 (String(\"hello\"))\n0001 JUMP_IF_FALSE -> 0002\n0002 Return\n"
+    );
+}
+
+#[test]
+fn invalid_jump_reports_its_instruction_location() {
+    let mut chunk = js::bytecode::Chunk::new();
+    chunk.emit_at(
+        Instruction::JumpIfTrue(99),
+        Some(js::bytecode::SourceLocation {
+            offset: 4,
+            line: 2,
+            column: 3,
+        }),
+    );
+    let error = Vm::new().execute(&chunk).unwrap_err();
+    assert_eq!(error.message, "bytecode jump target is invalid");
+    assert_eq!(error.location.unwrap().line, 2);
+}

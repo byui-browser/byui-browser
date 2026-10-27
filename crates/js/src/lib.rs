@@ -86,6 +86,8 @@ pub struct JsError {
     pub message: String,
     /// The interpreter operation that failed, when known.
     pub context: Option<String>,
+    /// Bytecode source location where the failure occurred, when available.
+    pub location: Option<bytecode::SourceLocation>,
 }
 
 impl JsError {
@@ -100,6 +102,7 @@ impl JsError {
             category: JsErrorCategory::Runtime,
             message: message.into(),
             context: None,
+            location: None,
         }
     }
 
@@ -113,7 +116,14 @@ impl JsError {
             category,
             message: message.into(),
             context: Some(context.into()),
+            location: None,
         }
+    }
+
+    /// Associates this error with a bytecode source location.
+    pub fn with_location(mut self, location: bytecode::SourceLocation) -> Self {
+        self.location = Some(location);
+        self
     }
 }
 

@@ -3,6 +3,17 @@
 use super::Instruction;
 use crate::Value;
 
+/// A source position associated with a bytecode instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceLocation {
+    /// Zero-based UTF-8 byte offset in the source text.
+    pub offset: usize,
+    /// One-based source line.
+    pub line: usize,
+    /// One-based character column.
+    pub column: usize,
+}
+
 /// An owned sequence of instructions and the values referenced by them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
@@ -12,6 +23,8 @@ pub struct Chunk {
     pub constants: Vec<Value>,
     /// Binding names used to produce useful VM errors.
     pub names: Vec<String>,
+    /// Optional source location for each instruction, indexed like [`Self::code`].
+    pub locations: Vec<Option<SourceLocation>>,
 }
 
 impl Chunk {
@@ -21,14 +34,85 @@ impl Chunk {
             code: Vec::new(),
             constants: Vec::new(),
             names: Vec::new(),
+            locations: Vec::new(),
         }
     }
 
     /// Appends an instruction and returns its instruction offset.
     pub fn emit(&mut self, instruction: Instruction) -> usize {
+        self.emit_at(instruction, None)
+    }
+
+    /// Appends an instruction with an optional source location.
+    pub fn emit_at(&mut self, instruction: Instruction, location: Option<SourceLocation>) -> usize {
         let offset = self.code.len();
         self.code.push(instruction);
+        self.locations.push(location);
         offset
+    }
+
+    /// Returns the source location for an instruction, if one was recorded.
+    pub fn location(&self, offset: usize) -> Option<SourceLocation> {
+        self.locations.get(offset).copied().flatten()
+    }
+
+    /// Renders this chunk in a deterministic, human-readable format.
+    pub fn disassemble(&self) -> String {
+        self.disassemble_named("script")
+    }
+
+    /// Renders this chunk with a caller-provided function/chunk name.
+    pub fn disassemble_named(&self, name: &str) -> String {
+        use std::fmt::Write;
+        let mut output = format!("== {name} ==\n");
+        for (offset, instruction) in self.code.iter().enumerate() {
+            let location = self
+                .location(offset)
+                .map(|position| format!("{}:{} ", position.line, position.column))
+                .unwrap_or_default();
+            let _ = writeln!(
+                output,
+                "{offset:04} {location}{}",
+                self.format_instruction(instruction)
+            );
+        }
+        output
+    }
+
+    fn format_instruction(&self, instruction: &Instruction) -> String {
+        match instruction {
+            Instruction::Constant(index) => match self.constants.get(usize::from(*index)) {
+                Some(value) => format!("CONSTANT {index} ({value:?})"),
+                None => format!("CONSTANT {index} (<invalid>)"),
+            },
+            Instruction::Jump(target) => format!("JUMP -> {target:04}"),
+            Instruction::JumpIfFalse(target) => format!("JUMP_IF_FALSE -> {target:04}"),
+            Instruction::JumpIfTrue(target) => format!("JUMP_IF_TRUE -> {target:04}"),
+            Instruction::DeclareGlobal { slot, name, .. }
+            | Instruction::DeclareLocal { slot, name, .. }
+            | Instruction::InitializeGlobal { slot, name }
+            | Instruction::InitializeLocal { slot, name }
+            | Instruction::StoreGlobal { slot, name }
+            | Instruction::StoreLocal { slot, name, .. }
+            | Instruction::LoadGlobal { slot, name }
+            | Instruction::LoadLocal { slot, name, .. } => {
+                let binding = self
+                    .names
+                    .get(usize::from(*name))
+                    .map(String::as_str)
+                    .unwrap_or("<invalid>");
+                format!("{instruction:?} ({binding:?}, slot {slot})")
+            }
+            Instruction::LoadUnresolved { name } | Instruction::StoreUnresolved { name } => {
+                let binding = self
+                    .names
+                    .get(usize::from(*name))
+                    .map(String::as_str)
+                    .unwrap_or("<invalid>");
+                format!("{instruction:?} ({binding:?})")
+            }
+            other => format!("{other:?}"),
+        }
     }
 
     /// Returns the offset where the next instruction will be emitted.
