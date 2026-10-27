@@ -5,7 +5,6 @@
 
 use common::error::BrowserError;
 
-
 #[test]
 fn browser_error_is_a_std_error() {
     let err: Box<dyn std::error::Error> = Box::new(BrowserError::Unimplemented("ipc"));

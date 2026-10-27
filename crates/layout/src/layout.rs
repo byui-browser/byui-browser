@@ -43,7 +43,7 @@ pub fn layout_tree(styled_dom: &StyledDom, viewport: Size) -> LayoutTree {
 mod tests {
     use html::NodeID;
 
-use super::*;
+    use super::*;
 
     #[test]
     fn empty_document_root_fills_viewport() {

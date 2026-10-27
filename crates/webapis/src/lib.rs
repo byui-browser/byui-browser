@@ -12,7 +12,7 @@ pub mod local_storage;
 
 use std::sync::Arc;
 
-use html::{Attribute, DOMTokenList, HTMLDocument, Namespace, NodeKind, NodeID};
+use html::{Attribute, DOMTokenList, HTMLDocument, Namespace, NodeID, NodeKind};
 use js::{HostFunction, JsError, JsResult, Object, Realm, Value};
 use net::{Request, RequestController};
 
@@ -246,7 +246,7 @@ impl Document {
         };
 
         Ok(Element {
-            node: node,
+            node,
             local_name: element.name.clone(),
             namespace: element.namespace,
             id_attr: None,
@@ -640,7 +640,7 @@ mod tests {
         AlertSink, ConsoleSink, DomException, alert, fetch, print, register_alert,
         register_document, register_fetch, register_print,
     };
-    use html::{Attribute, ElementData, HTMLDocument, Namespace, NodeKind, parse_raw_html, NodeID};
+    use html::{Attribute, ElementData, HTMLDocument, Namespace, NodeID, NodeKind, parse_raw_html};
     use js::{Realm, Value};
     use net::{Config, RequestController};
     use std::sync::{Arc, Mutex};

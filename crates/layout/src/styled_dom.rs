@@ -1,6 +1,6 @@
 //! The layout-facing projection of the document tree.
 
-use html::{HTMLDocument, NodeKind, NodeID};
+use html::{HTMLDocument, NodeID, NodeKind};
 
 /// The layout-facing projection of an HTML document.
 ///
