@@ -9,6 +9,10 @@ pub enum Instruction {
     Constant(u16),
     /// Discards the value at the top of the stack.
     Pop,
+    /// Swaps the two values at the top of the stack.
+    Swap,
+    /// Jumps unconditionally to an instruction offset.
+    Jump(usize),
     /// Returns the top value, or `undefined` when the stack is empty.
     Return,
     /// Applies a unary operator to the top stack value.

@@ -2,7 +2,7 @@
 
 use crate::ast::{BinaryOperator, UnaryOperator};
 use crate::bytecode::{Chunk, Instruction};
-use crate::runtime::{non_object, to_property_key};
+use crate::runtime::{ExecutionLimits, non_object, to_property_key};
 use crate::{JsError, JsErrorCategory, JsResult, Value};
 
 /// Executes a [`Chunk`] using an owned operand stack.
@@ -10,6 +10,8 @@ use crate::{JsError, JsErrorCategory, JsResult, Value};
 pub struct Vm {
     stack: Vec<Value>,
     scopes: Vec<Vec<Slot>>,
+    steps_remaining: u64,
+    loop_iterations_remaining: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -26,10 +28,33 @@ impl Vm {
 
     /// Executes `chunk` and returns its completion value.
     pub fn execute(&mut self, chunk: &Chunk) -> JsResult<Value> {
+        self.execute_with_limits(chunk, ExecutionLimits::default())
+    }
+
+    /// Executes `chunk` with caller-provided instruction and loop limits.
+    ///
+    /// One step is charged for every instruction. A loop iteration is charged
+    /// when execution takes a backward jump, which keeps an infinite loop
+    /// bounded even when its condition and body are otherwise inexpensive.
+    pub fn execute_with_limits(
+        &mut self,
+        chunk: &Chunk,
+        limits: ExecutionLimits,
+    ) -> JsResult<Value> {
         self.stack.clear();
         self.scopes.clear();
+        self.steps_remaining = limits.step_limit;
+        self.loop_iterations_remaining = limits.loop_iteration_limit;
         let mut instruction_pointer = 0;
         while let Some(instruction) = chunk.code.get(instruction_pointer).copied() {
+            if self.steps_remaining == 0 {
+                return Err(JsError::with_context(
+                    crate::JsErrorCategory::Limit,
+                    "Script exceeded the evaluation step limit",
+                    "bytecode instruction budget",
+                ));
+            }
+            self.steps_remaining -= 1;
             instruction_pointer += 1;
             match instruction {
                 Instruction::Constant(index) => self.push(
@@ -42,6 +67,19 @@ impl Vm {
                 Instruction::Pop => {
                     self.pop()?;
                 }
+                Instruction::Swap => {
+                    let right = self.pop()?;
+                    let left = self.pop()?;
+                    self.push(right);
+                    self.push(left);
+                }
+                Instruction::Jump(target) => {
+                    validate_jump(target, chunk)?;
+                    if target < instruction_pointer {
+                        self.next_loop_iteration()?;
+                    }
+                    instruction_pointer = target;
+                }
                 Instruction::Return => return Ok(self.stack.pop().unwrap_or(Value::Undefined)),
                 Instruction::Unary(operator) => {
                     let value = self.pop()?;
@@ -53,11 +91,13 @@ impl Vm {
                     self.push(binary(operator, left, right)?);
                 }
                 Instruction::JumpIfFalse(target) => {
+                    validate_jump(target, chunk)?;
                     if !is_truthy(self.stack.last().ok_or_else(stack_underflow)?) {
                         instruction_pointer = target;
                     }
                 }
                 Instruction::JumpIfTrue(target) => {
+                    validate_jump(target, chunk)?;
                     if is_truthy(self.stack.last().ok_or_else(stack_underflow)?) {
                         instruction_pointer = target;
                     }
@@ -101,13 +141,13 @@ impl Vm {
                         .ok_or_else(|| JsError::runtime("bytecode scope underflow"))?;
                 }
                 Instruction::DeclareGlobal { slot, kind, name } => {
-                    self.declare(0, slot, kind, name, chunk)?;
+                    self.declare(self.global_depth()?, slot, kind, name, chunk)?;
                 }
                 Instruction::DeclareLocal { slot, kind, name } => {
                     self.declare(0, slot, kind, name, chunk)?;
                 }
                 Instruction::LoadGlobal { slot, name } => {
-                    let value = self.load(0, slot, name, chunk)?;
+                    let value = self.load(self.global_depth()?, slot, name, chunk)?;
                     self.push(value);
                 }
                 Instruction::LoadLocal { depth, slot, name } => {
@@ -116,7 +156,7 @@ impl Vm {
                 }
                 Instruction::InitializeGlobal { slot, name } => {
                     let value = self.pop()?;
-                    self.initialize(0, slot, value, name, chunk)?;
+                    self.initialize(self.global_depth()?, slot, value, name, chunk)?;
                 }
                 Instruction::InitializeLocal { slot, name } => {
                     let value = self.pop()?;
@@ -124,7 +164,7 @@ impl Vm {
                 }
                 Instruction::StoreGlobal { slot, name } => {
                     let value = self.peek()?.clone();
-                    self.store(0, slot, value, name, chunk)?;
+                    self.store(self.global_depth()?, slot, value, name, chunk)?;
                 }
                 Instruction::StoreLocal { depth, slot, name } => {
                     let value = self.peek()?.clone();
@@ -147,6 +187,27 @@ impl Vm {
 
     fn push(&mut self, value: Value) {
         self.stack.push(value);
+    }
+
+    fn next_loop_iteration(&mut self) -> JsResult<()> {
+        if self.loop_iterations_remaining == 0 {
+            return Err(JsError::with_context(
+                crate::JsErrorCategory::Limit,
+                "Script exceeded the loop iteration limit",
+                "bytecode loop iteration",
+            ));
+        }
+        self.loop_iterations_remaining -= 1;
+        Ok(())
+    }
+
+    fn global_depth(&self) -> JsResult<u16> {
+        let depth = self
+            .scopes
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| JsError::runtime("bytecode global scope is unavailable"))?;
+        u16::try_from(depth).map_err(|_| JsError::runtime("bytecode scope depth is invalid"))
     }
 
     fn pop(&mut self) -> JsResult<Value> {
@@ -253,6 +314,13 @@ impl Vm {
         entry.value = Some(value);
         Ok(())
     }
+}
+
+fn validate_jump(target: usize, chunk: &Chunk) -> JsResult<()> {
+    if target > chunk.code.len() {
+        return Err(JsError::runtime("bytecode jump target is invalid"));
+    }
+    Ok(())
 }
 
 fn stack_underflow() -> JsError {
