@@ -128,6 +128,20 @@ impl std::error::Error for JsError {}
 /// Result type used throughout the engine, failing with [`JsError`].
 pub type JsResult<T> = Result<T, JsError>;
 
+/// Selects the execution engine used by [`eval_with_mode`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// Use bytecode when compilation supports the program, otherwise evaluate
+    /// it with the tree-walk interpreter.
+    #[default]
+    Automatic,
+    /// Always use the tree-walk interpreter.
+    Interpreter,
+    /// Require bytecode compilation; unsupported syntax is returned as an
+    /// ordinary runtime error instead of falling back.
+    Bytecode,
+}
+
 /// A Rust function that can be exposed as a JavaScript global.
 pub type HostFunction = Arc<dyn Fn(&[Value]) -> JsResult<Value> + Send + Sync>;
 
@@ -355,4 +369,39 @@ pub fn eval_with_limits(source: &str, limits: runtime::ExecutionLimits) -> JsRes
         JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
     })?;
     runtime::evaluate_program_with_limits(&program, limits)
+}
+
+/// Parses and evaluates a script using the selected execution engine.
+///
+/// `Automatic` compiles once per call and falls back only when the compiler
+/// explicitly reports unsupported syntax. VM runtime and limit errors are
+/// returned directly. `Realm` continues to use the interpreter because its
+/// persistent host and script globals are not yet represented in VM frames.
+pub fn eval_with_mode(source: &str, mode: ExecutionMode) -> JsResult<Value> {
+    eval_with_mode_and_limits(source, mode, runtime::ExecutionLimits::default())
+}
+
+/// Evaluates with an execution mode and caller-provided limits.
+pub fn eval_with_mode_and_limits(
+    source: &str,
+    mode: ExecutionMode,
+    limits: runtime::ExecutionLimits,
+) -> JsResult<Value> {
+    let program = parse(source).map_err(|error| {
+        JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+    })?;
+    if mode == ExecutionMode::Interpreter {
+        return runtime::evaluate_program_with_limits(&program, limits);
+    }
+    match bytecode::compile(&program) {
+        Ok(chunk) => Vm::new().execute_with_limits(&chunk, limits),
+        Err(error) if mode == ExecutionMode::Automatic && error.is_unsupported() => {
+            runtime::evaluate_program_with_limits(&program, limits)
+        }
+        Err(error) => Err(JsError::with_context(
+            JsErrorCategory::Runtime,
+            error.to_string(),
+            "compiling script for bytecode execution",
+        )),
+    }
 }
