@@ -248,18 +248,48 @@ fn follows_documented_semicolon_policy() {
         vec![S::FunctionDeclaration {
             name: "f".into(),
             params: vec![],
-            body: vec![S::Return(Some(Expr::Number(1.0)))]
+            body: vec![S::Return(None), S::Expression(Expr::Number(1.0))]
         }]
     );
-    for source in [
-        "a\nb",
-        "let a = 1\nlet b = 2",
-        "if (x) x() else y()",
-        ";",
-        "a;;",
-    ] {
+    for source in ["a\nb", "let a = 1\nlet b = 2"] {
+        assert!(parse(source).is_ok(), "{source}");
+    }
+    for source in ["if (x) x() else y()", ";", "a;;"] {
         assert!(parse(source).is_err(), "{source}");
     }
+}
+
+#[test]
+fn inserts_terminators_across_nested_blocks_and_keeps_explicit_semicolons() {
+    let source = "function f() { let x = 1\n{ x = x + 1; }\nreturn x\n}\nf();";
+    assert_eq!(
+        parse(source).unwrap().body.len(),
+        2,
+        "the function and its explicit call remain separate statements"
+    );
+    assert!(parse("let a = 1;\nlet b = 2;").is_ok());
+}
+
+#[test]
+fn return_line_terminator_produces_undefined() {
+    assert_eq!(
+        parse("function f() { return\n1; }").unwrap().body,
+        vec![S::FunctionDeclaration {
+            name: "f".into(),
+            params: vec![],
+            body: vec![S::Return(None), S::Expression(Expr::Number(1.0))]
+        }]
+    );
+    assert_eq!(
+        parse("function f() { return /* comment\n */ 1; }")
+            .unwrap()
+            .body[0],
+        S::FunctionDeclaration {
+            name: "f".into(),
+            params: vec![],
+            body: vec![S::Return(None), S::Expression(Expr::Number(1.0))]
+        }
+    );
 }
 
 #[test]
@@ -406,4 +436,18 @@ fn every_prefix_of_a_program_can_be_parsed_without_panicking() {
     for end in 0..=source.len() {
         let _ = parse(&source[..end]);
     }
+}
+
+#[test]
+fn parses_mixed_ascii_unicode_and_escaped_identifiers() {
+    assert_eq!(
+        expression(r"total + caf\u00e9 * 名\u{524D}"),
+        binary(
+            id("total"),
+            B::Add,
+            binary(id("café"), B::Multiply, id("名前"))
+        )
+    );
+    assert!(parse(r"let \u0069f = 1;").is_err());
+    assert!(parse(r"let a\u0020b = 1;").is_err());
 }

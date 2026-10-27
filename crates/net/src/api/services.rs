@@ -33,7 +33,7 @@ pub struct ResponseInfo {
     pub request_mode: RequestMode,
     /// Visibility class selected by the engine before public exposure.
     pub response_type: ResponseType,
-    /// Number of redirects followed; always zero in this single-exchange slice.
+    /// Number of redirects followed before this response was approved.
     pub redirect_count: usize,
     /// Whether this response came from the process-local cache.
     pub from_cache: bool,

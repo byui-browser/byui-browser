@@ -51,10 +51,10 @@ type ParseResult<T> = Result<T, ParseError>;
 
 /// Parses a complete token stream into an owned program AST.
 ///
-/// Simple statements require `;`, except immediately before `}` or end of
-/// input. Newlines are whitespace, not automatic semicolon insertion; in
-/// particular `return` followed by a newline may still have a value. Empty
-/// statements, comma declarations, and trailing commas are unsupported.
+/// Simple statements accept an explicit `;`, or an automatic semicolon at a
+/// line terminator, before `}`, or at end of input. A line terminator directly
+/// after `return` produces an empty return. Empty statements, comma
+/// declarations, and trailing commas are unsupported.
 /// Returns outside functions, constants without initializers, duplicate
 /// parameter names, and `let`/`const`/`function` declarations used directly as
 /// an `if`, `else`, or `while` body are rejected.
@@ -63,8 +63,19 @@ type ParseResult<T> = Result<T, ParseError>;
 /// expression tree deeper than 512 nodes (including long left-associative
 /// chains such as `1 + 1 + ...`) return an error.
 pub fn parse_program(tokens: &[Token]) -> ParseResult<Program> {
+    parse_program_with_line_terminators(tokens, &[])
+}
+
+/// Parses a token stream while applying line-terminator-sensitive grammar
+/// rules. `line_terminators_before` contains one flag per token and is
+/// intended for the source-level parser, which obtains the flags from token
+/// spans. The token-level API remains whitespace-agnostic for compatibility.
+pub(crate) fn parse_program_with_line_terminators(
+    tokens: &[Token],
+    line_terminators_before: &[bool],
+) -> ParseResult<Program> {
     with_engine_stack(|| {
-        let mut parser = Parser::new(tokens);
+        let mut parser = Parser::new(tokens, line_terminators_before);
         let mut body = Vec::new();
         while parser.peek().is_some() {
             body.push(parser.parse_statement()?);
@@ -80,7 +91,7 @@ pub fn parse_program(tokens: &[Token]) -> ParseResult<Program> {
 /// index; source positions are supplied by the program-level [`crate::parse`].
 pub fn parse(tokens: &[Token]) -> ParseResult<Expr> {
     with_engine_stack(|| {
-        let mut parser = Parser::new(tokens);
+        let mut parser = Parser::new(tokens, &[]);
         let expression = parser.parse_expression(0)?;
         if parser.peek().is_some() {
             return Err(parser.error("Unexpected token after expression", "expression"));
@@ -103,15 +114,17 @@ struct Parser<'tokens> {
     position: usize,
     depth: usize,
     function_depth: usize,
+    line_terminators_before: &'tokens [bool],
 }
 
 impl<'tokens> Parser<'tokens> {
-    fn new(tokens: &'tokens [Token]) -> Self {
+    fn new(tokens: &'tokens [Token], line_terminators_before: &'tokens [bool]) -> Self {
         Self {
             tokens,
             position: 0,
             depth: 0,
             function_depth: 0,
+            line_terminators_before,
         }
     }
 
@@ -208,11 +221,20 @@ impl<'tokens> Parser<'tokens> {
     }
 
     fn terminator(&mut self, context: &'static str) -> ParseResult<()> {
-        if self.consume(&Token::Semicolon) || matches!(self.peek(), None | Some(Token::RightBrace))
+        if self.consume(&Token::Semicolon)
+            || self.line_terminator_before_current()
+            || matches!(self.peek(), None | Some(Token::RightBrace))
         {
             Ok(())
         } else {
             Err(self.error("Expected a semicolon", context))
         }
+    }
+
+    fn line_terminator_before_current(&self) -> bool {
+        self.line_terminators_before
+            .get(self.position)
+            .copied()
+            .unwrap_or(false)
     }
 }

@@ -192,7 +192,7 @@ pub(super) fn loose_equals(left: &Value, right: &Value) -> bool {
 
 /// `ToPropertyKey`: strings are used as-is and every other value uses its
 /// JavaScript string form, so `1` and `'1'` name the same property.
-pub(super) fn to_property_key(value: &Value) -> String {
+pub(crate) fn to_property_key(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         other => to_primitive(other).to_string(),

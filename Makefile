@@ -1,10 +1,10 @@
 .PHONY: all build run test release lint
 
-# Secondary goals after `test` / `release` (crate name or platform).
+# Secondary goals after `run`, `test`, or `release` (crate name or platform).
 CMD  := $(firstword $(MAKECMDGOALS))
 ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
 
-ifneq (,$(filter $(CMD),test release))
+ifneq (,$(filter $(CMD),run test release))
 $(ARGS):
 	@:
 endif
@@ -15,16 +15,21 @@ all: build
 build:
 	cargo build --workspace
 
-## Run the native shell for the current operating system.
+## Run a platform shell: `make run shell` for the browser, or `make run js`
+## for the interactive JavaScript engine shell.
 run:
-ifeq ($(OS),Windows_NT)
-	$(error Windows shell is not implemented yet)
+ifeq ($(ARGS),js)
+	cargo run -p browser-js
+else ifeq ($(ARGS),shell)
+	cargo run -p browser
+else ifeq ($(OS),Windows_NT)
+	cargo run -p byui-browser-windows
 else ifneq (,$(filter Darwin darwin,$(shell uname -s)))
 	cargo run -p browser-macos
 else ifneq (,$(filter Linux linux,$(shell uname -s)))
-	$(error Linux shell is not implemented yet)
+	cargo run -p browser-linux
 else ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(shell uname -s)))
-	$(error Windows shell is not implemented yet)
+	cargo run -p byui-browser-windows
 else
 	$(error Unsupported operating system '$(shell uname -s)')
 endif

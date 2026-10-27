@@ -150,6 +150,7 @@ mod tests {
     use super::*;
 
     #[test]
+    /// Verifies max-age is parsed alongside other cache directives.
     fn cache_control_parses_max_age_with_other_directives() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -161,6 +162,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies non-cacheable directives prevent insertion.
     fn cache_control_rejects_non_cacheable_directives() {
         for value in ["no-store", "public, no-cache, max-age=60"] {
             let mut headers = HeaderMap::new();
@@ -170,6 +172,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies directive names and quoted max-age values are accepted.
     fn cache_control_accepts_case_insensitive_and_quoted_max_age() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -181,6 +184,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies only successful responses enter the cache.
     fn cache_does_not_store_non_success_responses() {
         let cache = ResponseCache::default();
         let request = Request::get("https://example.test/missing");
@@ -201,6 +205,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies cache keys distinguish request methods.
     fn cache_key_distinguishes_http_methods() {
         let get = Request::get("https://example.test/resource");
         let mut head = get.clone();
@@ -211,6 +216,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies browser cache partitions remain isolated.
     fn browser_cache_partitions_do_not_share_entries() {
         let url = Url::parse("https://example.test/resource").unwrap();
         let mut first = Request::get(url.as_str());
@@ -225,6 +231,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies URL fragments do not affect cache identity.
     fn cache_key_ignores_url_fragments() {
         let with_fragment = Request::get("https://example.test/resource#section");
         let without_fragment = Request::get("https://example.test/resource");
@@ -238,6 +245,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies equivalent normalized URLs share a cache key.
     fn cache_key_uses_normalized_url_strings() {
         let uppercase = Request::get("HTTP://EXAMPLE.TEST/resource");
         let normalized = Request::get("http://example.test/resource");
@@ -251,11 +259,37 @@ mod tests {
     }
 
     #[test]
+    /// Verifies expired entries are treated as cache misses.
     fn expired_entries_are_not_returned() {
         let cache = ResponseCache::default();
         let request = Request::get("https://example.test/expired");
         let response = StoredResponse {
             status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            url: request.url.clone(),
+            body: b"stale".to_vec(),
+            cookie_headers_processed: false,
+        };
+        let cached = CachedResponse::from_response(&response, Duration::ZERO);
+
+        cache.entries.write().unwrap().insert(
+            cache_key(&request, &Url::parse(&request.url).unwrap()),
+            cached,
+        );
+
+        assert!(
+            cache
+                .get(&request, &Url::parse(&request.url).unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn expired_entries_are_not_returned2() {
+        let cache = ResponseCache::default();
+        let request = Request::get("https://example.test/expired2");
+        let response = StoredResponse {
+            status: StatusCode::FOUND,
             headers: HeaderMap::new(),
             url: request.url.clone(),
             body: b"stale".to_vec(),

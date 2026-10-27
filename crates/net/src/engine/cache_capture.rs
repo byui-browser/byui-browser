@@ -7,6 +7,7 @@ use crate::{
     cache::{ResponseCache, StoredResponse},
 };
 
+/// State retained while a successful response body is copied into the cache.
 struct CacheCapture {
     /// Cache receiving the body after successful end-of-stream.
     cache: ResponseCache,

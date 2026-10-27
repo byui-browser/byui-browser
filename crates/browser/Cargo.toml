@@ -24,10 +24,16 @@ render = { workspace = true }
 js = { workspace = true }
 webapis = { workspace = true }
 net = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 storage = { workspace = true }
 security = { workspace = true }
 chrome = { workspace = true }
 devtools = { workspace = true }
+futures-util = "0.3"
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
+
+[dev-dependencies]
+cap-std = "4"
 
 [lints]
 workspace = true
