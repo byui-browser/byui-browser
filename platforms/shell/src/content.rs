@@ -6,28 +6,8 @@ use std::sync::Arc;
 use browser::Page;
 use layout::{Size, StyledDom, layout_tree};
 use render::{Compositor, Frame};
-use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use tiny_skia::Pixmap;
 use webapis::{AlertSink, ConsoleSink};
-
-/// Native modal alert adapter used by the rendered page path.
-struct NativeAlert;
-
-impl AlertSink for NativeAlert {
-    fn alert(&self, message: &str) {
-        MessageDialog::new()
-            .set_title("BYUI Browser")
-            .set_description(message)
-            .set_level(MessageLevel::Info)
-            .set_buttons(MessageButtons::Ok)
-            .show();
-    }
-}
-
-/// Returns the browser shell's native alert destination.
-pub(crate) fn native_alert_sink() -> Arc<dyn AlertSink> {
-    Arc::new(NativeAlert)
-}
 
 struct NoopConsole;
 
@@ -48,11 +28,10 @@ fn render_demo(
         "the welcome page should have a stylesheet"
     );
     if !*scripts_evaluated {
-        let script_result = evaluate_page_script(page, Arc::clone(&alert_sink));
-        assert_eq!(
-            script_result.as_slice(),
-            [js::Value::String("Welcome to BYUI Browser!".into())]
-        );
+        // The completion value is not part of painting. `alert` returns
+        // `undefined`, so requiring the welcome string aborts the first draw
+        // and the window never opens.
+        evaluate_page_script(page, Arc::clone(&alert_sink));
         *scripts_evaluated = true;
     }
     render_document(page, width, height, alert_sink, scripts_evaluated)
@@ -81,7 +60,12 @@ fn render_document(
     Compositor::new(width, height).compose_paint(&display_list)
 }
 
-fn evaluate_page_script(page: &Page, alert_sink: Arc<dyn AlertSink>) -> Vec<js::Value> {
+/// Evaluates the page's script for its side effects, including `alert`.
+///
+/// Call this after the window has presented a frame. Running it inside the
+/// draw callback joins the JS engine thread while the UI thread cannot
+/// service a dialog.
+pub(crate) fn evaluate_page_script(page: &Page, alert_sink: Arc<dyn AlertSink>) -> Vec<js::Value> {
     let controller = Arc::new(
         net::RequestController::builder(net::Config::default())
             .with_scheme_providers(
@@ -139,8 +123,14 @@ pub(crate) fn render_page(
 mod tests {
     use super::*;
 
+    struct SilentAlert;
+
+    impl AlertSink for SilentAlert {
+        fn alert(&self, _message: &str) {}
+    }
+
     fn test_alert_sink() -> Arc<dyn AlertSink> {
-        Arc::new(NativeAlert)
+        Arc::new(SilentAlert)
     }
 
     #[test]
@@ -222,5 +212,32 @@ mod tests {
         render_document(&page, 160, 120, alert.clone(), &mut scripts_evaluated);
 
         assert_eq!(alert.0.lock().unwrap().as_slice(), ["rendered page"]);
+    }
+
+    #[test]
+    fn welcome_page_alert_still_paints() {
+        #[derive(Default)]
+        struct Recording(std::sync::Mutex<Vec<String>>);
+
+        impl AlertSink for Recording {
+            fn alert(&self, message: &str) {
+                self.0.lock().unwrap().push(message.to_owned());
+            }
+        }
+
+        let welcome = browser::welcome_page();
+        let page = Page {
+            html: welcome.html,
+            css: welcome.css,
+            js: "alert('Hello from script.js')".into(),
+        };
+        let alert = Arc::new(Recording::default());
+        let mut scripts_evaluated = false;
+        let frame = render_demo(&page, 160, 120, alert.clone(), &mut scripts_evaluated);
+
+        assert!(scripts_evaluated);
+        assert_eq!(alert.0.lock().unwrap().as_slice(), ["Hello from script.js"]);
+        assert_eq!((frame.width, frame.height), (160, 120));
+        assert_eq!(&frame.pixels[..4], &[242, 245, 250, 255]);
     }
 }
