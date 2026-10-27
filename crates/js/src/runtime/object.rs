@@ -18,37 +18,100 @@ use crate::{HostFunction, Value};
 /// data properties. Because the table is shared, methods take `&self` and
 /// lock it internally; the lock is never held while script code runs.
 ///
-/// Limitations: there are no prototypes, so objects have no inherited
-/// properties such as `toString`. There are no accessors, attributes, or
-/// symbol keys. As with functions, there is no garbage collector, so an
-/// object that refers to itself (directly or through other objects) is never
-/// freed.
+/// An object may have a prototype object. [`Object::get`] falls back to the
+/// prototype chain when an object has no such own property, while
+/// [`Object::set`] always writes an own property, so a write through an
+/// instance shadows the prototype instead of changing it. Only the bytecode
+/// VM creates prototypes (for `class` and `new`); [`Object::new`] makes an
+/// object with none.
+///
+/// Limitations: there is no built-in `Object.prototype`, so objects have no
+/// inherited properties such as `toString`. There are no accessors,
+/// attributes, or symbol keys. As with functions, there is no garbage
+/// collector, so an object that refers to itself (directly or through other
+/// objects) is never freed.
 #[derive(Clone, Default)]
-pub struct Object(Arc<Mutex<Vec<(String, Value)>>>);
+pub struct Object(Arc<ObjectData>);
+
+#[derive(Default)]
+struct ObjectData {
+    properties: Mutex<Vec<(String, Value)>>,
+    prototype: Mutex<Option<Object>>,
+}
 
 impl Object {
-    /// Creates an empty object with a new identity.
+    /// Creates an empty object with a new identity and no prototype.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates an empty object whose prototype is `prototype`.
+    pub fn with_prototype(prototype: Option<Object>) -> Self {
+        let object = Self::new();
+        *object.prototype_slot() = prototype;
+        object
     }
 
     fn properties(&self) -> MutexGuard<'_, Vec<(String, Value)>> {
         // Nothing panics while holding the lock, so a poisoned table is
         // still consistent.
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.0
+            .properties
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Returns a clone of the value stored under `key`, or `None` if the
-    /// object has no such property.
+    fn prototype_slot(&self) -> MutexGuard<'_, Option<Object>> {
+        self.0
+            .prototype
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Returns the object's prototype, or `None` if it has none.
+    pub fn prototype(&self) -> Option<Object> {
+        self.prototype_slot().clone()
+    }
+
+    /// Replaces the object's prototype, returning `false` and changing
+    /// nothing if that would make the prototype chain a cycle.
+    pub fn set_prototype(&self, prototype: Option<Object>) -> bool {
+        let mut link = prototype.clone();
+        while let Some(object) = link {
+            if object == *self {
+                return false;
+            }
+            link = object.prototype();
+        }
+        *self.prototype_slot() = prototype;
+        true
+    }
+
+    /// Returns a clone of the value stored under `key`, looking first at the
+    /// object's own properties and then along its prototype chain, or `None`
+    /// if no object on the chain has the property.
     pub fn get(&self, key: &str) -> Option<Value> {
+        let mut current = self.clone();
+        loop {
+            if let Some(value) = current.get_own(key) {
+                return Some(value);
+            }
+            current = current.prototype()?;
+        }
+    }
+
+    /// Returns a clone of the value stored under `key` on this object
+    /// itself, ignoring the prototype chain.
+    pub fn get_own(&self, key: &str) -> Option<Value> {
         self.properties()
             .iter()
             .find(|(name, _)| name == key)
             .map(|(_, value)| value.clone())
     }
 
-    /// Stores `value` under `key`, replacing any existing value in place or
-    /// appending a new property at the end of the insertion order.
+    /// Stores `value` under `key` as an own property, replacing any existing
+    /// own value in place or appending a new property at the end of the
+    /// insertion order. The prototype chain is never modified.
     pub fn set(&self, key: impl Into<String>, value: Value) {
         let key = key.into();
         let mut properties = self.properties();
@@ -67,12 +130,13 @@ impl Object {
         self.set(name, Value::Function(function));
     }
 
-    /// Returns whether the object has a property named `key`.
+    /// Returns whether the object itself, not its prototype chain, has a
+    /// property named `key`.
     pub fn contains_key(&self, key: &str) -> bool {
         self.properties().iter().any(|(name, _)| name == key)
     }
 
-    /// Returns the property names in insertion order.
+    /// Returns the own property names in insertion order.
     pub fn keys(&self) -> Vec<String> {
         self.properties()
             .iter()
@@ -80,12 +144,12 @@ impl Object {
             .collect()
     }
 
-    /// Returns the number of properties.
+    /// Returns the number of own properties.
     pub fn len(&self) -> usize {
         self.properties().len()
     }
 
-    /// Returns whether the object has no properties.
+    /// Returns whether the object has no own properties.
     pub fn is_empty(&self) -> bool {
         self.properties().is_empty()
     }

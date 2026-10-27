@@ -15,6 +15,8 @@
 //!   other value, including strings and functions, is a runtime error, and so
 //!   is reading a property the object does not have (JavaScript would return
 //!   `undefined`). Methods are called without `this`.
+//! - Classes, `new`, and `super` parse but are not evaluated here; they run
+//!   only through the bytecode compiler and [`crate::vm::Vm`].
 //! - There is no garbage collector yet. A function stored in the scope it
 //!   closes over forms an `Arc` cycle, so its scope is never freed.
 //! - Evaluation runs on a dedicated engine thread with a large stack. Deep
@@ -35,6 +37,7 @@ use crate::ast::{
     BinaryOperator, Expr, LogicalOperator, MemberProperty, Program, Statement, UnaryOperator,
     VarKind,
 };
+use crate::bytecode::FunctionTemplate;
 use crate::stack::{StackGuard, with_engine_stack};
 use crate::{HostFunction, JsError, JsResult, Value};
 use conversions::{
@@ -283,6 +286,16 @@ enum FunctionKind {
         name: String,
         function: HostFunction,
     },
+    /// A function compiled to bytecode; only the VM can run it.
+    Bytecode {
+        template: Arc<FunctionTemplate>,
+        /// Own properties, such as a constructor's `prototype`.
+        properties: Object,
+        /// The prototype object that `super.name` is looked up from.
+        home_object: Option<Object>,
+        /// The parent class constructor of a derived class.
+        parent: Option<Function>,
+    },
 }
 
 impl Function {
@@ -298,6 +311,84 @@ impl Function {
     pub fn name(&self) -> &str {
         match &*self.0 {
             FunctionKind::Script { name, .. } | FunctionKind::Host { name, .. } => name,
+            FunctionKind::Bytecode { template, .. } => &template.name,
+        }
+    }
+
+    /// Creates a bytecode function. Constructors (plain functions and
+    /// classes) get a `prototype` object, `prototype` itself when given and a
+    /// fresh one otherwise, whose `constructor` property refers back to the
+    /// function.
+    pub(crate) fn from_template(
+        template: Arc<FunctionTemplate>,
+        home_object: Option<Object>,
+        parent: Option<Function>,
+        prototype: Option<Object>,
+    ) -> Self {
+        let constructible = template.kind.is_constructor();
+        let function = Self(Arc::new(FunctionKind::Bytecode {
+            template,
+            properties: Object::new(),
+            home_object,
+            parent,
+        }));
+        if constructible {
+            let prototype = prototype.unwrap_or_default();
+            prototype.set("constructor", Value::Function(function.clone()));
+            function.set_own("prototype", Value::Object(prototype));
+        }
+        function
+    }
+
+    /// The compiled template, for bytecode functions.
+    pub(crate) fn template(&self) -> Option<&Arc<FunctionTemplate>> {
+        match &*self.0 {
+            FunctionKind::Bytecode { template, .. } => Some(template),
+            _ => None,
+        }
+    }
+
+    /// The prototype object `super.name` reads from, for bytecode methods.
+    pub(crate) fn home_object(&self) -> Option<&Object> {
+        match &*self.0 {
+            FunctionKind::Bytecode { home_object, .. } => home_object.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The parent class constructor, for derived bytecode classes.
+    pub(crate) fn parent(&self) -> Option<&Function> {
+        match &*self.0 {
+            FunctionKind::Bytecode { parent, .. } => parent.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Reads an own property; only bytecode functions have any.
+    pub(crate) fn get_own(&self, key: &str) -> Option<Value> {
+        match &*self.0 {
+            FunctionKind::Bytecode { properties, .. } => properties.get_own(key),
+            _ => None,
+        }
+    }
+
+    /// Writes an own property, returning `false` for functions that cannot
+    /// hold properties (script and host functions).
+    pub(crate) fn set_own(&self, key: &str, value: Value) -> bool {
+        match &*self.0 {
+            FunctionKind::Bytecode { properties, .. } => {
+                properties.set(key, value);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Calls a host function directly. Returns `None` for any other kind.
+    pub(crate) fn call_host(&self, arguments: &[Value]) -> Option<JsResult<Value>> {
+        match &*self.0 {
+            FunctionKind::Host { function, .. } => Some(function(arguments)),
+            _ => None,
         }
     }
 }
@@ -328,6 +419,12 @@ impl fmt::Display for Function {
             }
             FunctionKind::Host { name, .. } => {
                 write!(formatter, "function {name}() {{ [native code] }}")
+            }
+            FunctionKind::Bytecode { template, .. } if template.kind.is_class() => {
+                write!(formatter, "class {} {{ [code] }}", template.name)
+            }
+            FunctionKind::Bytecode { template, .. } => {
+                write!(formatter, "function {}() {{ [code] }}", template.name)
             }
         }
     }
@@ -644,6 +741,7 @@ impl Interpreter {
             }
             // Bound when the enclosing body or block was entered.
             Statement::FunctionDeclaration { .. } => Ok(Completion::Normal(None)),
+            Statement::ClassDeclaration(_) => Err(unsupported_here("class declarations")),
             Statement::Return(expression) => Ok(Completion::Return(match expression {
                 Some(expression) => self.evaluate(expression, scope)?,
                 None => Value::Undefined,
@@ -657,6 +755,11 @@ impl Interpreter {
 
     fn evaluate_unguarded(&mut self, expression: &Expr, scope: &ScopeRef) -> JsResult<Value> {
         match expression {
+            // Methods never receive `this` in this evaluator, so it reads like
+            // any other undeclared name.
+            Expr::This => Err(JsError::new("`this` is not defined")),
+            Expr::New { .. } => Err(unsupported_here("`new`")),
+            Expr::SuperCall { .. } | Expr::SuperMember { .. } => Err(unsupported_here("`super`")),
             Expr::Identifier(name) => read(scope, name),
             Expr::Assign { name, value } => {
                 let value = self.evaluate(value, scope)?;
@@ -766,6 +869,9 @@ impl Interpreter {
     fn call(&mut self, function: &Function, arguments: &[Value]) -> JsResult<Value> {
         match &*function.0 {
             FunctionKind::Host { function, .. } => function(arguments),
+            FunctionKind::Bytecode { .. } => Err(JsError::runtime(
+                "bytecode functions can only be called by the bytecode VM",
+            )),
             FunctionKind::Script {
                 params,
                 body,
@@ -798,6 +904,15 @@ impl Interpreter {
             }),
         }
     }
+}
+
+/// The error for class syntax, which only the bytecode VM can run.
+fn unsupported_here(construct: &str) -> JsError {
+    JsError::with_context(
+        crate::JsErrorCategory::Runtime,
+        format!("{construct} is only supported by the bytecode compiler"),
+        "tree-walk evaluator",
+    )
 }
 
 /// Describes an identifier or a chain of `.name` accesses on one, such as

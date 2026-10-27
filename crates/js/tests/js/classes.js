@@ -1,4 +1,4 @@
-// TODO(js): Classes and `new` are not implemented yet.
+// Classes and `new` run only through the bytecode VM (see tests/bytecode_classes.rs).
 class Counter {
     constructor() {
         this.value = 0;
