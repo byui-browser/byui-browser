@@ -24,6 +24,7 @@ enum Outcome {
     Stream,
     Null,
     Missing,
+    Unsupported,
     Denied,
     Io,
     Malformed,
@@ -114,6 +115,10 @@ impl FileProvider for Provider {
                     provider: "file",
                     kind: ProviderErrorKind::ResourceMissing,
                 }),
+                Outcome::Unsupported => Err(RequestError::Provider {
+                    provider: "file",
+                    kind: ProviderErrorKind::UnsupportedResource,
+                }),
                 Outcome::Denied => Err(RequestError::Provider {
                     provider: "file",
                     kind: ProviderErrorKind::AccessDenied,
@@ -200,6 +205,7 @@ fn file_fetches_resolve_once_and_use_shared_response_finalization() {
     );
     assert_eq!(services.cookie_lookups.load(Ordering::SeqCst), 0);
     assert_eq!(services.cache_partitions.load(Ordering::SeqCst), 0);
+    assert_eq!(services.worker_checks.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -329,6 +335,7 @@ fn dropping_unread_or_partially_read_file_bodies_releases_the_provider_stream() 
 fn file_provider_failures_retain_stable_categories() {
     for (outcome, kind) in [
         (Outcome::Missing, ProviderErrorKind::ResourceMissing),
+        (Outcome::Unsupported, ProviderErrorKind::UnsupportedResource),
         (Outcome::Denied, ProviderErrorKind::AccessDenied),
         (Outcome::Io, ProviderErrorKind::Io),
     ] {

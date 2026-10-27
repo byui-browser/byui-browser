@@ -11,5 +11,6 @@ pub enum NodeKind {
     Element(ElementData),
     Text(String),
     Comment(String),
+    /// Placeholder node kind for an uninitialized arena slot.
     None,
 }

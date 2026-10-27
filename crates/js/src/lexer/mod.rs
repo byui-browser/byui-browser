@@ -12,8 +12,17 @@ pub enum Token {
     Number(f64),
     /// String literal after supported escapes have been decoded.
     String(String),
-    /// Identifier spelling that is not a reserved keyword.
+    /// Identifier that is not a reserved keyword, with any `\u` escapes
+    /// decoded, so `caf\u{E9}` and `café` are both `Identifier("café")`.
     Identifier(String),
+    /// Keyword spelled with at least one `\u` escape, such as `\u0069f`,
+    /// holding the decoded keyword text (`"if"`).
+    ///
+    /// ECMAScript forbids escaped keywords everywhere except where any
+    /// `IdentifierName` is allowed, so the parser accepts this token only as a
+    /// property name after `.` and reports a syntax error anywhere else. This
+    /// keeps `var \u0069f = 1` from declaring a variable named `if`.
+    EscapedKeyword(String),
     /// `+` operator.
     Plus,
     /// `-` operator.
@@ -140,6 +149,24 @@ pub struct SpannedToken {
 /// [`Token::Invalid`]. Other unsupported characters produce
 /// [`Token::Unknown`]. This lexer intentionally returns tokens rather than
 /// failing fast, so callers can inspect all input.
+///
+/// Identifiers follow ECMAScript `IdentifierName`: they start with a Unicode
+/// `ID_Start` character, `$`, or `_`, and continue with `ID_Continue`
+/// characters, `$`, U+200C (ZWNJ), or U+200D (ZWJ). Any of these characters
+/// may be written as a `\uHHHH` or `\u{H...}` escape, which is decoded, so an
+/// escaped and an unescaped spelling name the same binding. A malformed
+/// escape, a non-`\u` escape, or an escape whose character is not allowed at
+/// its position makes the whole identifier one [`Token::Invalid`]. Keywords
+/// written with escapes produce [`Token::EscapedKeyword`]. A raw character
+/// that cannot start an identifier still produces [`Token::Unknown`].
+///
+/// Limitations: identifiers are not Unicode-normalized, so precomposed `é`
+/// and `e` followed by a combining acute accent are different names, and no
+/// confusable-character policy is applied. Character classes come from
+/// Unicode `XID_Start`/`XID_Continue`, which omit a few dozen compatibility
+/// characters that `ID_Start`/`ID_Continue` include (such as U+309B and
+/// U+FF9E), so those are rejected. Escapes cannot encode surrogates, matching
+/// ECMAScript, which never allows surrogates in identifiers.
 pub fn tokenize(input: &str) -> Vec<Token> {
     tokenize_spanned(input)
         .into_iter()
@@ -190,34 +217,8 @@ pub fn tokenize_spanned(input: &str) -> Vec<SpannedToken> {
             scan_number(input, &mut chars)
         } else if ch == '\'' || ch == '"' {
             scan_string(&mut chars, ch)
-        } else if is_identifier_start(ch) {
-            let mut end = start;
-
-            while let Some((index, next)) = chars.peek().copied() {
-                if is_identifier_continue(next) {
-                    end = index + next.len_utf8();
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-
-            let identifier = &input[start..end];
-            match identifier {
-                "let" => Token::Let,
-                "var" => Token::Var,
-                "const" => Token::Const,
-                "if" => Token::If,
-                "else" => Token::Else,
-                "while" => Token::While,
-                "function" => Token::Function,
-                "return" => Token::Return,
-                "true" => Token::True,
-                "false" => Token::False,
-                "null" => Token::Null,
-                "undefined" => Token::Undefined,
-                _ => Token::Identifier(identifier.to_owned()),
-            }
+        } else if is_identifier_start(ch) || ch == '\\' {
+            scan_identifier(&mut chars)
         } else {
             chars.next();
             match ch {
@@ -428,7 +429,9 @@ fn read_unicode_escape(chars: &mut Chars<'_>) -> Result<char, &'static str> {
     Err(UNSUPPORTED_ESCAPE)
 }
 
-/// Reads `HHHH` or `{H...}` after `\u`, returning the code point value.
+/// Reads `HHHH` or `{H...}` after `\u`, returning the code point value. A
+/// braced escape is consumed through its `}` even when its value is out of
+/// range, so the brace is not left behind as a separate token.
 fn read_unicode_code_point(chars: &mut Chars<'_>) -> Option<u32> {
     if !take_if(chars, '{') {
         return read_hex_digits(chars, 4);
@@ -437,10 +440,11 @@ fn read_unicode_code_point(chars: &mut Chars<'_>) -> Option<u32> {
     let mut digits = 0;
     while let Some(digit) = chars.peek().and_then(|(_, ch)| ch.to_digit(16)) {
         chars.next();
-        value = value.checked_mul(16)?.checked_add(digit)?;
+        value = value.saturating_mul(16).saturating_add(digit);
         digits += 1;
     }
-    (digits > 0 && value <= 0x10FFFF && take_if(chars, '}')).then_some(value)
+    let closed = take_if(chars, '}');
+    (digits > 0 && closed && value <= 0x10FFFF).then_some(value)
 }
 
 /// Reads exactly `count` hexadecimal digits, leaving a non-hex character
@@ -459,10 +463,95 @@ fn take_if(chars: &mut Chars<'_>, expected: char) -> bool {
     chars.next_if(|(_, ch)| *ch == expected).is_some()
 }
 
-fn is_identifier_start(ch: char) -> bool {
-    ch == '_' || ch == '$' || ch.is_ascii_alphabetic()
+/// Scans an identifier or keyword starting at an `ID_Start` character or `\`,
+/// decoding `\u` escapes. After an error, scanning continues to the end of
+/// the identifier so it becomes a single [`Token::Invalid`].
+fn scan_identifier(chars: &mut Chars<'_>) -> Token {
+    let mut name = String::new();
+    let mut escaped = false;
+    let mut error: Option<String> = None;
+
+    while let Some((_, ch)) = chars.peek().copied() {
+        let first = name.is_empty() && !escaped;
+        if ch != '\\' {
+            let allowed = if first {
+                is_identifier_start(ch)
+            } else {
+                is_identifier_continue(ch)
+            };
+            if !allowed {
+                break;
+            }
+            chars.next();
+            name.push(ch);
+            continue;
+        }
+
+        chars.next(); // '\'
+        escaped = true;
+        if !take_if(chars, 'u') {
+            error.get_or_insert_with(|| "identifier contains an escape other than \\u".into());
+            continue;
+        }
+        let Some(code_point) = read_unicode_code_point(chars) else {
+            error.get_or_insert_with(|| "identifier contains a malformed \\u escape".into());
+            continue;
+        };
+        let decoded = char::from_u32(code_point).filter(|&decoded| {
+            if first {
+                is_identifier_start(decoded)
+            } else {
+                is_identifier_continue(decoded)
+            }
+        });
+        match decoded {
+            Some(decoded) => name.push(decoded),
+            None => {
+                let position = if first { "start" } else { "continue" };
+                error.get_or_insert_with(|| {
+                    format!("escaped character U+{code_point:04X} cannot {position} an identifier")
+                });
+            }
+        }
+    }
+
+    if let Some(message) = error {
+        return Token::Invalid(message);
+    }
+    match keyword(&name) {
+        Some(_) if escaped => Token::EscapedKeyword(name),
+        Some(keyword) => keyword,
+        None => Token::Identifier(name),
+    }
 }
 
+/// Returns the keyword token spelled by `name`, if any.
+fn keyword(name: &str) -> Option<Token> {
+    Some(match name {
+        "let" => Token::Let,
+        "var" => Token::Var,
+        "const" => Token::Const,
+        "if" => Token::If,
+        "else" => Token::Else,
+        "while" => Token::While,
+        "function" => Token::Function,
+        "return" => Token::Return,
+        "true" => Token::True,
+        "false" => Token::False,
+        "null" => Token::Null,
+        "undefined" => Token::Undefined,
+        _ => return None,
+    })
+}
+
+/// ECMAScript `IdentifierStartChar`: `ID_Start`, `$`, or `_`. Uses
+/// `XID_Start`, which differs only in a few compatibility characters.
+fn is_identifier_start(ch: char) -> bool {
+    ch == '$' || ch == '_' || unicode_ident::is_xid_start(ch)
+}
+
+/// ECMAScript `IdentifierPartChar`: `ID_Continue`, `$`, ZWNJ, or ZWJ. Uses
+/// `XID_Continue`, which differs only in a few compatibility characters.
 fn is_identifier_continue(ch: char) -> bool {
-    is_identifier_start(ch) || ch.is_ascii_digit()
+    ch == '$' || ch == '\u{200C}' || ch == '\u{200D}' || unicode_ident::is_xid_continue(ch)
 }

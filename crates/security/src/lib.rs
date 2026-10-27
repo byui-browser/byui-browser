@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod file_access;
 pub mod permissions;
 
 use std::fmt;
