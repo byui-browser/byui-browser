@@ -246,7 +246,7 @@ impl Document {
         };
 
         Ok(Element {
-            node: node.clone(),
+            node: node,
             local_name: element.name.clone(),
             namespace: element.namespace,
             id_attr: None,
@@ -268,7 +268,7 @@ impl Document {
     pub fn class_list(&mut self, element: NodeID) -> JsResult<DOMTokenList<'_>> {
         self.source_document
             .get_or_insert_with(HTMLDocument::new)
-            .class_list(element.clone())
+            .class_list(element)
             .map_err(|error| JsError::new(error.to_string()))
     }
 
@@ -282,7 +282,7 @@ impl Document {
             return;
         };
 
-        document.remove(node.clone());
+        document.remove(node);
         self.elements = collect_elements(document);
     }
 
@@ -316,7 +316,7 @@ impl Document {
                 };
                 if let NodeKind::Element(element) = &node.kind {
                     if selectors.iter().any(|selector| selector.matches(element)) {
-                        matches.push(child.clone());
+                        matches.push(child);
                     }
                     collect(document, *child, selectors, matches);
                 }
@@ -341,7 +341,7 @@ impl Document {
         }
         let source = self.source_document.as_ref().unwrap();
         let root = source.root;
-        let child_id = child.clone();
+        let child_id = child;
         let child_node = source.node(child_id).ok_or(DomException::NotFoundError)?;
 
         if child_id == root || matches!(child_node.kind, NodeKind::Document) {
@@ -421,7 +421,7 @@ fn collect_elements(document: &HTMLDocument) -> Vec<Element> {
                         .find(|attribute| attribute.name == "id")
                         .map(|attribute| attribute.value.clone());
                     elements.push(Element {
-                        node: child.clone(),
+                        node: child,
                         local_name: element.name.clone(),
                         namespace: element.namespace,
                         id_attr,
@@ -970,7 +970,7 @@ mod tests {
             None,
         );
         let mut document = super::Document::from_html_document(&html_document);
-        let child = html_child.clone();
+        let child = html_child;
 
         assert_eq!(document.append_child(child), Ok(child));
         let source = document.source_document.as_ref().unwrap();
@@ -993,7 +993,7 @@ mod tests {
         html_document.append_child(html_document.root, element);
         html_document.append_child(element, comment);
         let mut document = super::Document::from_html_document(&html_document);
-        let comment_id = comment.clone();
+        let comment_id = comment;
 
         assert_eq!(document.append_child(comment_id), Ok(comment_id));
         let source = document.source_document.as_ref().unwrap();
@@ -1029,7 +1029,7 @@ mod tests {
         let before = document.source_document.clone();
 
         assert_eq!(
-            document.append_child(second_element.clone()),
+            document.append_child(second_element),
             Err(DomException::HierarchyRequestError)
         );
         assert_eq!(document.source_document, before);

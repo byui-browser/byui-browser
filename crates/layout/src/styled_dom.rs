@@ -68,7 +68,7 @@ mod tests {
 
         assert_eq!(styled.nodes.len(), 1);
         assert!(matches!(
-            document.node(styled.nodes[0].clone()),
+            document.node(styled.nodes[0]),
             Some(html::Node {
                 kind: html::NodeKind::Element(element),
                 ..
@@ -84,7 +84,7 @@ mod tests {
 
         assert_eq!(styled.nodes.len(), 1);
         assert!(matches!(
-            document.node(styled.nodes[0].clone()),
+            document.node(styled.nodes[0]),
             Some(html::Node {
                 kind: html::NodeKind::Element(element),
                 ..
