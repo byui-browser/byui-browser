@@ -2,6 +2,7 @@ use http::{
     Method,
     header::{CONTENT_TYPE, HeaderName, HeaderValue},
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use url::Url;
 
 use crate::api::{
@@ -17,6 +18,7 @@ use crate::api::headers::is_cors_safelisted_header;
 /// A browser request before conversion to a transport request.
 #[derive(Clone, Debug)]
 pub struct Request {
+    pub(crate) id: u64,
     pub(crate) url: String,
     pub(crate) method: Method,
     pub(crate) headers: Headers,
@@ -39,6 +41,8 @@ pub struct Request {
     pub(crate) cache_partition: Option<String>,
 }
 
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Relative importance assigned to a request by the network scheduler.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub enum RequestPriority {
@@ -55,6 +59,7 @@ impl Request {
     /// Creates a GET request with Fetch's default request state.
     pub fn get(url: impl Into<String>) -> Self {
         Self {
+            id: NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             url: url.into(),
             method: Method::GET,
             headers: Headers::new(),
@@ -86,6 +91,14 @@ impl Request {
     /// Returns the original URL string supplied for this request.
     pub fn url(&self) -> &str {
         &self.url
+    }
+    /// Returns this request's process-local identity.
+    ///
+    /// The identifier is stable across clones and is intended for
+    /// browser-owned request bookkeeping. It does not itself authorize any
+    /// operation.
+    pub fn id(&self) -> u64 {
+        self.id
     }
     /// Returns the normalized HTTP method.
     pub fn method(&self) -> &Method {
