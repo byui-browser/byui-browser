@@ -117,7 +117,7 @@ impl HTMLDocument {
     /// names return [`DomError::InvalidCharacter`].
     pub fn set_attribute(
         &mut self,
-        element: NodeId,
+        element: NodeID,
         qualified_name: &str,
         value: &str,
     ) -> Result<(), DomError> {
@@ -204,7 +204,7 @@ impl HTMLDocument {
         output
     }
 
-    fn serialize_node(&self, id: NodeId, output: &mut String, raw_text: bool) {
+    fn serialize_node(&self, id: NodeID, output: &mut String, raw_text: bool) {
         let Some(node) = self.node(id) else {
             return;
         };

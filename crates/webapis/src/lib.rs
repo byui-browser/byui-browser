@@ -455,7 +455,7 @@ pub fn add_event_listener(document: &Document, arguments: &[Value]) -> JsResult<
     add_event_listener_at(document, None, arguments)
 }
 
-fn event_target_for(document: &Document, node: Option<NodeId>) -> EventTargetRef {
+fn event_target_for(document: &Document, node: Option<NodeID>) -> EventTargetRef {
     match node {
         None => document.event_target.clone(),
         Some(node) => {
@@ -464,7 +464,7 @@ fn event_target_for(document: &Document, node: Option<NodeId>) -> EventTargetRef
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             targets
-                .entry(node.index() as usize)
+                .entry(node.get() as usize)
                 .or_insert_with(|| Arc::new(Mutex::new(EventTarget::default())))
                 .clone()
         }
@@ -473,7 +473,7 @@ fn event_target_for(document: &Document, node: Option<NodeId>) -> EventTargetRef
 
 fn add_event_listener_at(
     document: &Document,
-    node: Option<NodeId>,
+    node: Option<NodeID>,
     arguments: &[Value],
 ) -> JsResult<Value> {
     let [event_type, callback, options @ ..] = arguments else {
@@ -552,7 +552,7 @@ pub fn remove_event_listener(document: &Document, arguments: &[Value]) -> JsResu
 
 fn remove_event_listener_at(
     document: &Document,
-    node: Option<NodeId>,
+    node: Option<NodeID>,
     arguments: &[Value],
 ) -> JsResult<Value> {
     let [event_type, callback, options @ ..] = arguments else {
@@ -652,7 +652,7 @@ fn invoke_listeners(
     }
 }
 
-fn element_for_node(document: &Document, node: NodeId) -> Option<Element> {
+fn element_for_node(document: &Document, node: NodeID) -> Option<Element> {
     document
         .elements
         .iter()
@@ -662,7 +662,7 @@ fn element_for_node(document: &Document, node: NodeId) -> Option<Element> {
 
 fn dispatch_event_at(
     document: &Document,
-    node: Option<NodeId>,
+    node: Option<NodeID>,
     target_object: &Object,
     arguments: &[Value],
 ) -> JsResult<Value> {
@@ -690,12 +690,8 @@ fn dispatch_event_at(
         current = document
             .source_document
             .as_ref()
-            .and_then(|source| {
-                source
-                    .node(html::NodeId(current_node.index() as usize))
-                    .and_then(|n| n.parent)
-            })
-            .map(|parent| NodeId::new(parent.index() as u32));
+            .and_then(|source| source.node(current_node).and_then(|n| n.parent))
+            .map(|parent| parent);
     }
     let document_target = document.event_target.clone();
     if node.is_some() {
@@ -964,19 +960,19 @@ impl Document {
             .find(|element| element.id_attr.as_deref() == Some(id))
     }
 
-    fn element_by_node(&self, node: NodeId) -> Option<&Element> {
+    fn element_by_node(&self, node: NodeID) -> Option<&Element> {
         self.elements.iter().find(|element| element.node == node)
     }
 
     fn set_attribute(
         &mut self,
-        node: NodeId,
+        node: NodeID,
         qualified_name: &str,
         value: &str,
     ) -> JsResult<Value> {
         let document = self.source_document.get_or_insert_with(HTMLDocument::new);
         document
-            .set_attribute(html::NodeId(node.index() as usize), qualified_name, value)
+            .set_attribute(node, qualified_name, value)
             .map_err(|error| JsError::new(error.to_string()))?;
         self.elements = collect_elements(document);
         Ok(Value::Undefined)
@@ -1050,7 +1046,7 @@ impl Document {
                 };
                 if let NodeKind::Element(element) = &node.kind {
                     if selectors.iter().any(|selector| selector.matches(element)) {
-                        matches.push(child);
+                        matches.push(*child);
                     }
                     collect(document, *child, selectors, matches);
                 }
@@ -1155,7 +1151,7 @@ fn collect_elements(document: &HTMLDocument) -> Vec<Element> {
                         .find(|attribute| attribute.name == "id")
                         .map(|attribute| attribute.value.clone());
                     elements.push(Element {
-                        node: child,
+                        node: *child,
                         local_name: element.name.clone(),
                         namespace: element.namespace,
                         id_attr,
@@ -1852,7 +1848,7 @@ mod tests {
     #[test]
     fn element_set_attribute_rejects_invalid_names() {
         let mut element = super::Element {
-            node: NodeId::new(1),
+            node: NodeID::new(1),
             local_name: "main".into(),
             namespace: Namespace::Html,
             id_attr: None,
