@@ -2,6 +2,7 @@ mod assignment;
 mod binary_operator;
 mod call;
 mod logical;
+mod object;
 mod unary;
 
 use super::{ParseResult, Parser};

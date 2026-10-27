@@ -2,8 +2,8 @@
 //!
 //! This module is the first compiler boundary between the parser's [`crate::ast`]
 //! and the stack-based [`crate::vm`]. The instruction set currently covers
-//! expressions, lexical bindings, and property access (`object.name`,
-//! `object[key]`, and assignment to either). Calls, functions, and control
+//! expressions, lexical bindings, object literals, and property access
+//! (`object.name`, `object[key]`, and assignment to either). Calls, functions, and control
 //! flow are reported as compile errors until their corresponding instructions
 //! are added.
 

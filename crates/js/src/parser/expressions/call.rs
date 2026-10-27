@@ -11,6 +11,10 @@ pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<(Expr, usize)> {
         Some(Token::False) => Expr::Boolean(false),
         Some(Token::Null) => Expr::Null,
         Some(Token::Undefined) => Expr::Undefined,
+        Some(Token::LeftBrace) => {
+            let (object, depth) = super::object::parse(parser)?;
+            return suffix(parser, object, depth);
+        }
         Some(Token::LeftParen) => {
             parser.advance();
             let (expression, depth) = parser.parse_expression_with_depth(0)?;
@@ -50,7 +54,7 @@ fn suffix(
                 arguments,
             };
         } else if parser.consume(&Token::Dot) {
-            let name = property_name(parser)?;
+            let name = property_name(parser, "member access")?;
             depth = parser.node_depth(depth + 1, "member access")?;
             callee = Expr::Member {
                 object: Box::new(callee),
@@ -70,10 +74,11 @@ fn suffix(
     }
 }
 
-/// Parses the name after `.`. Like JavaScript's `IdentifierName`, keywords
-/// are allowed, so `object.if` and `object.null` are ordinary properties, and
-/// so are escaped keywords such as `object.\u0069f`.
-fn property_name(parser: &mut Parser<'_>) -> ParseResult<String> {
+/// Parses the name after `.` or an object literal key. Like JavaScript's
+/// `IdentifierName`, keywords are allowed, so `object.if` and `object.null`
+/// are ordinary properties, and so are escaped keywords such as
+/// `object.\u0069f`.
+pub(super) fn property_name(parser: &mut Parser<'_>, context: &'static str) -> ParseResult<String> {
     let name = match parser.peek() {
         Some(Token::Identifier(name) | Token::EscapedKeyword(name)) => name.as_str(),
         Some(Token::Let) => "let",
@@ -88,7 +93,7 @@ fn property_name(parser: &mut Parser<'_>) -> ParseResult<String> {
         Some(Token::False) => "false",
         Some(Token::Null) => "null",
         Some(Token::Undefined) => "undefined",
-        _ => return Err(parser.error("Expected a property name", "member access")),
+        _ => return Err(parser.error("Expected a property name", context)),
     }
     .to_owned();
     parser.advance();
