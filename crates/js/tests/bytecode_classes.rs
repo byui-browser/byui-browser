@@ -6,7 +6,8 @@
 
 use js::bytecode::{Chunk, Instruction, compile};
 use js::runtime::ExecutionLimits;
-use js::{JsError, JsErrorCategory, Value, Vm, eval, parse};
+use js::{Function, JsError, JsErrorCategory, Value, Vm, eval, parse};
+use std::sync::Arc;
 
 fn run(source: &str) -> Result<Value, JsError> {
     let program = parse(source).expect("source should parse");
@@ -668,4 +669,70 @@ fn the_vm_can_run_many_programs_in_a_row_after_a_failure() {
     assert!(vm.execute(&failing).is_err());
     let fine = compile(&parse("class A { v() { return 2; } } new A().v()").unwrap()).unwrap();
     assert_eq!(vm.execute(&fine).unwrap(), Value::Number(2.0));
+}
+
+// Reference cycles ----------------------------------------------------------------------------
+
+#[test]
+fn a_class_and_its_prototype_do_not_keep_each_other_alive() {
+    // The prototype escapes as the program's result. Once the VM has dropped
+    // the class, the prototype must not still own it through `constructor`.
+    let Value::Object(prototype) = value("class A { m() { return 1; } } A.prototype") else {
+        panic!("the prototype should be an object");
+    };
+    assert!(prototype.contains_key("m"), "methods stay on the prototype");
+    assert_eq!(prototype.get("constructor"), None);
+}
+
+#[test]
+fn constructor_is_not_an_enumerable_own_property() {
+    let Value::Object(prototype) = value("class A { m() { return 1; } } A.prototype") else {
+        panic!("the prototype should be an object");
+    };
+    assert_eq!(prototype.keys(), ["m"]);
+}
+
+// Host functions ------------------------------------------------------------------------------
+
+fn run_host_call(emit: impl FnOnce(&mut Chunk, u16)) -> Result<Value, JsError> {
+    let double = Function::from_host(
+        "double",
+        Arc::new(|arguments: &[Value]| match arguments {
+            [Value::Number(number)] => Ok(Value::Number(number * 2.0)),
+            _ => Err(JsError::new("double expects one number")),
+        }),
+    );
+    let mut chunk = Chunk::new();
+    let function = chunk.add_constant(Value::Function(double)).unwrap();
+    emit(&mut chunk, function);
+    chunk.emit(Instruction::Return);
+    Vm::new().execute(&chunk)
+}
+
+#[test]
+fn bytecode_can_call_host_functions() {
+    let result = run_host_call(|chunk, function| {
+        let argument = chunk.add_constant(Value::Number(21.0)).unwrap();
+        chunk.emit(Instruction::Constant(function));
+        chunk.emit(Instruction::Constant(argument));
+        chunk.emit(Instruction::Call(1));
+    });
+    assert_eq!(result, Ok(Value::Number(42.0)));
+}
+
+#[test]
+fn host_function_errors_propagate_and_hosts_are_not_constructors() {
+    let error = run_host_call(|chunk, function| {
+        chunk.emit(Instruction::Constant(function));
+        chunk.emit(Instruction::Call(0));
+    })
+    .unwrap_err();
+    assert_eq!(error.message, "double expects one number");
+
+    let error = run_host_call(|chunk, function| {
+        chunk.emit(Instruction::Constant(function));
+        chunk.emit(Instruction::New(0));
+    })
+    .unwrap_err();
+    assert!(error.message.contains("is not a constructor"), "{error:?}");
 }

@@ -45,6 +45,7 @@ use conversions::{
 };
 pub(crate) use conversions::{number_to_string, to_property_key};
 pub use object::Object;
+use object::WeakObject;
 
 const STACK_OVERFLOW: &str = "Maximum call stack size exceeded";
 
@@ -291,8 +292,9 @@ enum FunctionKind {
         template: Arc<FunctionTemplate>,
         /// Own properties, such as a constructor's `prototype`.
         properties: Object,
-        /// The prototype object that `super.name` is looked up from.
-        home_object: Option<Object>,
+        /// The prototype object that `super.name` is looked up from. It owns
+        /// its methods, so the link back is weak.
+        home_object: Option<WeakObject>,
         /// The parent class constructor of a derived class.
         parent: Option<Function>,
     },
@@ -317,8 +319,8 @@ impl Function {
 
     /// Creates a bytecode function. Constructors (plain functions and
     /// classes) get a `prototype` object, `prototype` itself when given and a
-    /// fresh one otherwise, whose `constructor` property refers back to the
-    /// function.
+    /// fresh one otherwise, whose `constructor` refers back to the function
+    /// without keeping it alive.
     pub(crate) fn from_template(
         template: Arc<FunctionTemplate>,
         home_object: Option<Object>,
@@ -329,12 +331,12 @@ impl Function {
         let function = Self(Arc::new(FunctionKind::Bytecode {
             template,
             properties: Object::new(),
-            home_object,
+            home_object: home_object.as_ref().map(Object::downgrade),
             parent,
         }));
         if constructible {
             let prototype = prototype.unwrap_or_default();
-            prototype.set("constructor", Value::Function(function.clone()));
+            prototype.set_constructor(&function);
             function.set_own("prototype", Value::Object(prototype));
         }
         function
@@ -349,11 +351,18 @@ impl Function {
     }
 
     /// The prototype object `super.name` reads from, for bytecode methods.
-    pub(crate) fn home_object(&self) -> Option<&Object> {
+    pub(crate) fn home_object(&self) -> Option<Object> {
         match &*self.0 {
-            FunctionKind::Bytecode { home_object, .. } => home_object.as_ref(),
+            FunctionKind::Bytecode { home_object, .. } => {
+                home_object.as_ref().and_then(WeakObject::upgrade)
+            }
             _ => None,
         }
+    }
+
+    /// Returns a non-owning reference to this function.
+    pub(crate) fn downgrade(&self) -> WeakFunction {
+        WeakFunction(Arc::downgrade(&self.0))
     }
 
     /// The parent class constructor, for derived bytecode classes.
@@ -390,6 +399,17 @@ impl Function {
             FunctionKind::Host { function, .. } => Some(function(arguments)),
             _ => None,
         }
+    }
+}
+
+/// A non-owning reference to a [`Function`], used to break reference cycles.
+#[derive(Clone)]
+pub(crate) struct WeakFunction(std::sync::Weak<FunctionKind>);
+
+impl WeakFunction {
+    /// Returns the function if something else still keeps it alive.
+    pub(crate) fn upgrade(&self) -> Option<Function> {
+        self.0.upgrade().map(Function)
     }
 }
 

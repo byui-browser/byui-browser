@@ -1,9 +1,9 @@
 //! Plain JavaScript objects: string-keyed property tables shared by reference.
 
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-use super::Function;
+use super::{Function, WeakFunction};
 use crate::{HostFunction, Value};
 
 /// A JavaScript object value: a table of owned string keys to owned values.
@@ -25,6 +25,11 @@ use crate::{HostFunction, Value};
 /// VM creates prototypes (for `class` and `new`); [`Object::new`] makes an
 /// object with none.
 ///
+/// A class prototype reaches its class through `constructor` without owning
+/// it, so a class and its prototype do not keep each other alive. The link is
+/// not an own property: it is not listed by [`Object::keys`], and it reads as
+/// missing once the class has been dropped.
+///
 /// Limitations: there is no built-in `Object.prototype`, so objects have no
 /// inherited properties such as `toString`. There are no accessors,
 /// attributes, or symbol keys. As with functions, there is no garbage
@@ -37,6 +42,18 @@ pub struct Object(Arc<ObjectData>);
 struct ObjectData {
     properties: Mutex<Vec<(String, Value)>>,
     prototype: Mutex<Option<Object>>,
+    constructor: Mutex<Option<WeakFunction>>,
+}
+
+/// A non-owning reference to an [`Object`], used to break reference cycles.
+#[derive(Clone)]
+pub(crate) struct WeakObject(Weak<ObjectData>);
+
+impl WeakObject {
+    /// Returns the object if something else still keeps it alive.
+    pub(crate) fn upgrade(&self) -> Option<Object> {
+        self.0.upgrade().map(Object)
+    }
 }
 
 impl Object {
@@ -59,6 +76,20 @@ impl Object {
             .properties
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Returns a non-owning reference to this object.
+    pub(crate) fn downgrade(&self) -> WeakObject {
+        WeakObject(Arc::downgrade(&self.0))
+    }
+
+    /// Records the class this object is the prototype of, without owning it.
+    pub(crate) fn set_constructor(&self, constructor: &Function) {
+        *self
+            .0
+            .constructor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(constructor.downgrade());
     }
 
     fn prototype_slot(&self) -> MutexGuard<'_, Option<Object>> {
@@ -103,10 +134,21 @@ impl Object {
     /// Returns a clone of the value stored under `key` on this object
     /// itself, ignoring the prototype chain.
     pub fn get_own(&self, key: &str) -> Option<Value> {
-        self.properties()
+        let own = self
+            .properties()
             .iter()
             .find(|(name, _)| name == key)
-            .map(|(_, value)| value.clone())
+            .map(|(_, value)| value.clone());
+        if own.is_none() && key == "constructor" {
+            let link = self
+                .0
+                .constructor
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            return link.and_then(|link| link.upgrade()).map(Value::Function);
+        }
+        own
     }
 
     /// Stores `value` under `key` as an own property, replacing any existing
