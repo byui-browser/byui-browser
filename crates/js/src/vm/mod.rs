@@ -3,7 +3,7 @@
 use crate::ast::{BinaryOperator, UnaryOperator};
 use crate::bytecode::{Chunk, Instruction};
 use crate::runtime::{ExecutionLimits, non_object, to_property_key};
-use crate::{JsError, JsErrorCategory, JsResult, Value};
+use crate::{JsError, JsResult, Object, Value};
 
 /// Executes a [`Chunk`] using an owned operand stack.
 #[derive(Debug, Default)]
@@ -131,6 +131,17 @@ impl Vm {
                     let target = self.pop()?;
                     store_property(&target, key, &value)?;
                     self.push(value);
+                }
+                Instruction::NewObject => self.push(Value::Object(Object::new())),
+                Instruction::DefineProperty(index) => {
+                    let key = property_name(chunk, index)?;
+                    let value = self.pop()?;
+                    store_property(self.peek()?, key, &value)?;
+                }
+                Instruction::DefineComputedProperty => {
+                    let value = self.pop()?;
+                    let key = to_property_key(&self.pop()?);
+                    store_property(self.peek()?, key, &value)?;
                 }
                 Instruction::EnterScope(slot_count) => {
                     self.scopes.push(vec![
@@ -358,13 +369,7 @@ fn load_property(target: &Value, key: &str) -> JsResult<Value> {
     let Value::Object(object) = target else {
         return Err(non_object(target, "read", key, "property access"));
     };
-    object.get(key).ok_or_else(|| {
-        JsError::with_context(
-            JsErrorCategory::Runtime,
-            format!("Property `{key}` is not defined"),
-            "property access",
-        )
-    })
+    Ok(object.get(key).unwrap_or(Value::Undefined))
 }
 
 fn store_property(target: &Value, key: String, value: &Value) -> JsResult<()> {

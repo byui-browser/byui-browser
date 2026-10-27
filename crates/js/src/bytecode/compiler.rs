@@ -2,7 +2,7 @@
 
 use super::{Chunk, Instruction};
 use crate::Value;
-use crate::ast::{Expr, LogicalOperator, MemberProperty, Program, Statement, VarKind};
+use crate::ast::{Expr, LogicalOperator, MemberProperty, Program, PropertyKey, Statement, VarKind};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -384,6 +384,24 @@ impl Compiler {
                         self.compile_expression(key)?;
                         self.compile_expression(value)?;
                         self.chunk.emit(Instruction::StoreComputedProperty);
+                    }
+                }
+                Ok(())
+            }
+            Expr::Object(properties) => {
+                self.chunk.emit(Instruction::NewObject);
+                for property in properties {
+                    match &property.key {
+                        PropertyKey::Named(name) => {
+                            let index = self.name_constant(name)?;
+                            self.compile_expression(&property.value)?;
+                            self.chunk.emit(Instruction::DefineProperty(index));
+                        }
+                        PropertyKey::Computed(key) => {
+                            self.compile_expression(key)?;
+                            self.compile_expression(&property.value)?;
+                            self.chunk.emit(Instruction::DefineComputedProperty);
+                        }
                     }
                 }
                 Ok(())
