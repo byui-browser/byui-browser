@@ -16,5 +16,5 @@ mod tree;
 pub use geometry::{Rect, Size};
 pub use layout::layout_tree;
 pub use rectangle::create_rectangle;
-pub use styled_dom::{StyledDom, html_node_id};
+pub use styled_dom::{StyledDom};
 pub use tree::{LayoutBox, LayoutTree};

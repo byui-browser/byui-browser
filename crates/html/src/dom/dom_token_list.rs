@@ -1,4 +1,4 @@
-use super::{Attribute, DomError, HTMLDocument, NodeId, NodeKind};
+use super::{Attribute, DomError, HTMLDocument, NodeID, NodeKind};
 
 /// A live view of an element's whitespace-separated `class` attribute tokens.
 ///
@@ -7,11 +7,11 @@ use super::{Attribute, DomError, HTMLDocument, NodeId, NodeKind};
 /// `class` attribute while the handle is borrowed.
 pub struct DOMTokenList<'document> {
     document: &'document mut HTMLDocument,
-    element: NodeId,
+    element: NodeID,
 }
 
 impl<'document> DOMTokenList<'document> {
-    pub(crate) fn new(document: &'document mut HTMLDocument, element: NodeId) -> Self {
+    pub(crate) fn new(document: &'document mut HTMLDocument, element: NodeID) -> Self {
         Self { document, element }
     }
 

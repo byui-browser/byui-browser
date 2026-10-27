@@ -1,13 +1,13 @@
 use super::{
     dom_error::DomError, dom_token_list::DOMTokenList, element_data::ElementData,
-    namespace::Namespace, node::Node, node_id::NodeId, node_kind::NodeKind,
+    namespace::Namespace, node::Node, node_id::NodeID, node_kind::NodeKind,
     source_span::SourceSpan,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HTMLDocument {
     pub nodes: Vec<Node>,
-    pub root: NodeId,
+    pub root: NodeID,
 }
 
 impl Default for HTMLDocument {
@@ -20,15 +20,15 @@ impl HTMLDocument {
     pub fn new() -> Self {
         let mut document = Self {
             nodes: Vec::new(),
-            root: NodeId(0),
+            root: NodeID::new(0),
         };
         let root = document.push_node(NodeKind::Document, None);
         document.root = root;
         document
     }
 
-    pub fn push_node(&mut self, kind: NodeKind, span: Option<SourceSpan>) -> NodeId {
-        let id = NodeId(self.nodes.len());
+    pub fn push_node(&mut self, kind: NodeKind, span: Option<SourceSpan>) -> NodeID {
+        let id = NodeID::new(self.nodes.len());
         self.nodes.push(Node {
             parent: None,
             children: Vec::new(),
@@ -38,9 +38,9 @@ impl HTMLDocument {
         id
     }
 
-    pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
-        self.nodes[child.0].parent = Some(parent);
-        self.nodes[parent.0].children.push(child);
+    pub fn append_child(&mut self, parent: NodeID, child: NodeID) {
+        self.nodes[child.get()].parent = Some(parent);
+        self.nodes[parent.get()].children.push(child);
     }
 
     /// Removes `node` from its parent, if it has one.
@@ -48,21 +48,25 @@ impl HTMLDocument {
     /// The removed node and its descendants remain in the document arena with
     /// their existing stable IDs. Removing a detached node, the document root,
     /// or an invalid node ID has no effect.
-    pub fn remove(&mut self, node: NodeId) {
+    pub fn remove(&mut self, node: NodeID) {
         let Some(parent) = self.node(node).and_then(|node| node.parent) else {
             return;
         };
 
-        if let Some(children) = self.nodes.get_mut(parent.0).map(|node| &mut node.children) {
+        if let Some(children) = self
+            .nodes
+            .get_mut(parent.get())
+            .map(|node| &mut node.children)
+        {
             children.retain(|child| *child != node);
         }
-        if let Some(removed) = self.nodes.get_mut(node.0) {
+        if let Some(removed) = self.nodes.get_mut(node.get()) {
             removed.parent = None;
         }
     }
 
-    pub fn node(&self, id: NodeId) -> Option<&Node> {
-        self.nodes.get(id.0)
+    pub fn node(&self, id: NodeID) -> Option<&Node> {
+        self.nodes.get(id.get())
     }
 
     /// Returns a live `DOMTokenList` for an element's `class` attribute.
@@ -71,7 +75,7 @@ impl HTMLDocument {
     /// `toggle`, `replace`, and `value` operations. The document is borrowed
     /// mutably for the lifetime of the handle, matching the exclusive access
     /// required for DOM mutations in this Rust model.
-    pub fn class_list(&mut self, element: NodeId) -> Result<DOMTokenList<'_>, DomError> {
+    pub fn class_list(&mut self, element: NodeID) -> Result<DOMTokenList<'_>, DomError> {
         if !matches!(
             self.node(element).map(|node| &node.kind),
             Some(NodeKind::Element(_))
@@ -81,8 +85,8 @@ impl HTMLDocument {
         Ok(DOMTokenList::new(self, element))
     }
 
-    pub(crate) fn node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
-        self.nodes.get_mut(id.0)
+    pub(crate) fn node_mut(&mut self, id: NodeID) -> Option<&mut Node> {
+        self.nodes.get_mut(id.get())
     }
 
     /// Creates a detached HTML element using the DOM `createElement` rules.
@@ -92,7 +96,7 @@ impl HTMLDocument {
     /// the HTML namespace. Invalid names return [`DomError::InvalidCharacter`].
     /// The node is owned by this arena; use the returned index with [`Self::node`].
     /// XML documents and custom-element creation options are not supported.
-    pub fn create_element(&mut self, local_name: &str) -> Result<NodeId, DomError> {
+    pub fn create_element(&mut self, local_name: &str) -> Result<NodeID, DomError> {
         if !is_valid_element_local_name(local_name) {
             return Err(DomError::InvalidCharacter);
         }
@@ -112,8 +116,8 @@ impl HTMLDocument {
     /// doctype nodes return `None`, matching the DOM Standard; invalid node IDs
     /// also return `None`. This is a read-only snapshot and does not mutate the
     /// document.
-    pub fn text_content(&self, id: NodeId) -> Option<String> {
-        fn descendant_text(document: &HTMLDocument, id: NodeId, output: &mut String) {
+    pub fn text_content(&self, id: NodeID) -> Option<String> {
+        fn descendant_text(document: &HTMLDocument, id: NodeID, output: &mut String) {
             let Some(node) = document.node(id) else {
                 return;
             };
@@ -154,13 +158,13 @@ impl HTMLDocument {
                     return None;
                 };
                 (element.name == "script")
-                    .then(|| self.text_content(NodeId(index)).unwrap_or_default())
+                    .then(|| self.text_content(NodeID::new(index)).unwrap_or_default())
             })
             .collect()
     }
 
-    pub fn get_element_by_id(&self, value: &str) -> Option<NodeId> {
-        fn find_in_tree(document: &HTMLDocument, parent: NodeId, value: &str) -> Option<NodeId> {
+    pub fn get_element_by_id(&self, value: &str) -> Option<NodeID> {
+        fn find_in_tree(document: &HTMLDocument, parent: NodeID, value: &str) -> Option<NodeID> {
             let children = document.node(parent)?.children.clone();
 
             for child in children {

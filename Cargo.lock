@@ -471,6 +471,7 @@ name = "css"
 version = "0.1.0"
 dependencies = [
  "common",
+ "html",
 ]
 
 [[package]]
@@ -3006,7 +3007,6 @@ dependencies = [
 name = "webapis"
 version = "0.1.0"
 dependencies = [
- "common",
  "html",
  "js",
  "net",

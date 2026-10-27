@@ -15,7 +15,7 @@ pub use selector::{
     parse_selector_list,
 };
 
-use common::ids::NodeId;
+use html::NodeID;
 
 /// A selector as written in the stylesheet, e.g. `div.card#main`.
 // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
@@ -58,14 +58,14 @@ pub struct Stylesheet {
 // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Dom {
-    pub nodes: Vec<NodeId>,
+    pub nodes: Vec<NodeID>,
 }
 
 /// Computed style for every node, keyed by node.
 // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ComputedStyles {
-    pub styles: Vec<(NodeId, Vec<Declaration>)>,
+    pub styles: Vec<(NodeID, Vec<Declaration>)>,
 }
 
 /// Parses stylesheet text into rules.
