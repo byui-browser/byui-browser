@@ -2,6 +2,7 @@
 
 use super::Instruction;
 use crate::Value;
+use std::sync::Arc;
 
 /// An owned sequence of instructions and the values referenced by them.
 #[derive(Debug, Clone, PartialEq)]
@@ -12,6 +13,23 @@ pub struct Chunk {
     pub constants: Vec<Value>,
     /// Binding names used to produce useful VM errors.
     pub names: Vec<String>,
+    /// Nested function bodies available to [`Instruction::MakeFunction`].
+    pub functions: Vec<FunctionPrototype>,
+}
+
+/// Compiled function body and parameter names stored in an enclosing chunk.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionPrototype {
+    /// Function's declared name.
+    pub name: String,
+    /// Parameter names in source order.
+    pub params: Vec<String>,
+    /// VM local-slot indexes receiving arguments, in parameter order.
+    pub parameter_slots: Vec<u16>,
+    /// Number of slots allocated for each invocation.
+    pub slot_count: u16,
+    /// Owned bytecode for one invocation.
+    pub chunk: Arc<Chunk>,
 }
 
 impl Chunk {
@@ -21,6 +39,7 @@ impl Chunk {
             code: Vec::new(),
             constants: Vec::new(),
             names: Vec::new(),
+            functions: Vec::new(),
         }
     }
 
