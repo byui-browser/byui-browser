@@ -2,9 +2,11 @@
 
 Status: the current engine boundary, headers, shared body consumption,
 controller-owned HTTP redirects, local-scheme dispatch, provider contracts,
-response filtering, and basic cancellation are implemented for the supported
-Rust slice. This document now focuses on the work remaining to make that slice
-more complete and browser-ready.
+response filtering, basic cancellation, and the builder-based construction API
+are implemented for the supported Rust slice. The browser crate now composes
+`BrowserFetchServices`, the embedded `byui:` provider, and the authorized
+`file:` provider. This document focuses on the work remaining to make that
+slice more complete and browser-ready.
 
 `net` owns reusable Fetch algorithms and transport-independent state.
 `webapis` owns JavaScript bindings; browser, storage, and security crates own
@@ -82,32 +84,41 @@ offline mode, and future HTTP/3 support.
 
 ### 6. Complete scheme-provider/browser integration
 
+#### Next slice: harden currently composed local schemes
+
+The next implementation slice is limited to the engine-owned `data:` and
+`about:blank` paths plus the browser-composed `byui:` and authorized `file:`
+providers. Complete their edge-case, response, cancellation, and isolation
+coverage before moving on to CORS or cache work. Do not add browser blob URL
+creation, registry, revocation, or lifetime behavior in this slice.
+
 #### Browser-owned composition
 
 Complete browser-side ownership and composition without moving browser state
 into `net`:
 
-- provide a concrete browser `FetchServices` implementation and compose it
-  with `SchemeProviders` through the builder's `with_scheme_providers` setter
-  when browser client context is available;
 - keep `byui:` page registration, lookup, replacement, and origin policy in
   `crates/browser`;
-- add browser/storage ownership for blob URL creation, creator origins,
-  revocation, and lifetime; and
 - add the designated filesystem/security owner for authorized `file:` access,
   sandboxing, path resolution, and origin policy.
 
 Browser-owned providers must never fall back to HTTP or direct filesystem
 access when lookup fails.
 
-#### `byui-provider` hardening
+#### Deferred `blob:` provider
 
-Finish the provider-local implementation by avoiding a fresh `Vec` copy of
-embedded resource bytes for every request. Retain the engine-enforced
-`GET`/`HEAD` boundary and explicit `HEAD` body semantics. Keep route lookup
-exact and declarative, including declared resource aliases and unknown-host or
-path rejection, and document and enforce the chosen opaque or stable
-browser-UI origin policy.
+Browser-owned blob URL storage, creator-origin association, revocation, and
+lifetime management are deferred. The `net::BlobProvider` contract and generic
+engine tests remain in place, but browser composition must not claim to provide
+`blob:` URLs until a browser-owned registry and lifecycle tests exist.
+
+#### `byui-provider` follow-up
+
+The current provider has exact declarative route lookup, compile-time embedded
+assets, aliases, unknown-route rejection, opaque origins, and the engine's
+`GET`/`HEAD` boundary. The remaining optimization is to avoid a fresh `Vec`
+copy of embedded resource bytes for every request while retaining those
+semantics.
 
 Add focused browser tests for method rejection, `GET`/`HEAD` bodies, query and
 fragment handling, aliases, repeated loads, shared-body ownership, unknown
@@ -115,7 +126,8 @@ routes, and origin policy.
 
 #### Provider conformance and isolation
 
-Add browser-composition and `net` integration tests for:
+Add browser-composition and `net` integration tests for the currently
+implemented `data:`, `byui:`, `file:`, and `about:blank` paths:
 
 - builder-based service/provider composition and request-context propagation;
 - exact-once selection of the matching provider;
@@ -125,6 +137,10 @@ Add browser-composition and `net` integration tests for:
 - cancellation while resolving and streaming, including resource cleanup;
 - no HTTP transport, cookie, cache, or unrelated-provider calls; and
 - repeated resolution of the same resource without accidental HTTP caching.
+
+Keep the existing generic `blob:` provider contract tests as regression
+coverage, but defer browser registry, creation, revocation, and lifetime tests
+until the `blob:` provider slice is resumed.
 
 Keep `data:` parsing engine-owned and retain the exact `about:blank`
 allowlist. Unsupported schemes must fail before service, provider, cache, or
@@ -144,25 +160,25 @@ workspace tests, `cargo fmt --all`, and
 
 ### 7. Public API and downstream migration
 
-Make controller construction a single Fetch-oriented interface rather than a
-four-constructor capability matrix. This is implemented by
+Controller construction is now a single Fetch-oriented interface rather than
+a four-constructor capability matrix. It is implemented by
 `RequestController::builder(config)`, which provides optional `FetchServices`
 and `SchemeProviders` setters and a fallible `build()` method. The former
 specialized constructors have been removed, so callers use the builder and its
 `with_fetch_services` and `with_scheme_providers` setters directly.
 
-The builder must preserve the current capability rules: standalone requests
+The current builder preserves these capability rules: standalone requests
 may omit services, local schemes require matching scheme providers, and
 requests carrying browser client context require `FetchServices`. It should
 also make the ownership distinction explicit without exposing controller
 internals. Add constructor/builder tests for all capability combinations and
 for failures before transport or provider side effects.
 
-Then add or finish documented Rust APIs for response cloning, body state where
-it is intentionally public, response helpers, and request initialization. Add
-a Rust-consumer guide and document IPC-safe versus process-local types. Update
-the browser architecture documentation and record the ownership decision in an
-ADR. Keep raw Reqwest types private and migrate callers incrementally.
+Remaining work is to add or finish documented Rust APIs for response cloning,
+body state where it is intentionally public, response helpers, and request
+initialization. Add a Rust-consumer guide and document IPC-safe versus
+process-local types. Update the browser architecture documentation and record
+the ownership decision in an ADR. Keep raw Reqwest types private.
 
 ### 8. Conformance and verification
 

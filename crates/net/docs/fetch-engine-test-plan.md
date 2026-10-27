@@ -3,11 +3,11 @@
 Status: the current request, header, response, cache, redirect, streaming,
 scheduler, and scheme-handler regression suites pass. The remaining work is
 conformance and integration coverage for behavior that is still partial or
-owned by browser services. The 2026-10-21 `cargo llvm-cov -p net` baseline is
-87.74% line coverage (3,164/3,552 executable lines); the gaps below are the
-coverage-derived inventory that must remain represented by the work items in
-this plan. Generated/debug-only formatting paths are included where they
-exercise public behavior or stable error reporting.
+owned by browser services. The last recorded `cargo llvm-cov -p net` baseline
+is from 2026-10-21 (87.74% line coverage, 3,164/3,552 executable lines); it
+must be refreshed when coverage is used to reprioritize this inventory.
+Generated/debug-only formatting paths are included where they exercise public
+behavior or stable error reporting.
 
 ## Coverage-derived gap inventory
 
@@ -57,21 +57,29 @@ Add focused tests for:
 
 ### 2. Scheme-provider and browser composition
 
-Extend the existing `tests/schemes/` coverage with:
+The net crate already covers the generic provider contract and lifecycle paths
+in `tests/schemes/`. Extend that coverage for the currently composed providers,
+and add browser-owned tests, with:
 
-- concrete browser composition through the builder's
-  `with_fetch_services` and `with_scheme_providers` setters;
+- browser composition through `browser::request_controller`, including the
+  current `byui:` and authorized `file:` providers;
 - exact-once matching-provider selection and request-context assertions;
 - missing, revoked, denied, malformed, invalid-origin, and I/O outcomes;
 - tuple and opaque provider origins;
 - response metadata, filtering, media types, empty/readable/null bodies;
 - cancellation during resolution and streaming, including provider cleanup;
 - no HTTP transport, cookie/cache, or unrelated-provider side effects; and
-- repeated `blob:`, `file:`, and `byui:` resolution without HTTP-cache reuse.
+- repeated `file:` and `byui:` resolution without HTTP-cache reuse;
+- `data:` decoding, `about:blank`, and unsupported-scheme side-effect checks.
 
-Add browser-owned tests for the embedded `byui:` provider covering route
-aliases, unknown hosts/paths, query and fragment handling, `GET`/`HEAD`
-semantics, repeated loads, body ownership, and origin policy.
+The browser-owned provider tests cover the embedded `byui:` routes and the
+authorized file provider; keep expanding route aliases, unknown hosts/paths,
+query and fragment handling, `GET`/`HEAD` semantics, repeated loads, body
+ownership, revocation, limits, and origin policy as those integrations evolve.
+
+Browser blob registry, creation, revocation, and lifetime tests are deferred.
+Keep `net/tests/schemes/blob.rs` as generic provider-contract regression
+coverage, without adding browser composition requirements to this slice.
 
 ### 3. CORS and response filtering
 
