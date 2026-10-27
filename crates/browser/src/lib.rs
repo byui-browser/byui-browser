@@ -288,6 +288,7 @@ pub fn application_data_directory() -> io::Result<PathBuf> {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn home_directory() -> io::Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
