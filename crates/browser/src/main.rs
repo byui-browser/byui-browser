@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use browser::{BrowserRuntime, application_data_directory};
+use browser::{BrowserRuntime, application_data_directory, request_controller};
 use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use security::{Origin, RendererSecurityContext, StoragePermission};
 use webapis::{AlertSink, ConsoleSink};
@@ -38,13 +38,7 @@ impl AlertSink for NativeAlert {
 fn main() {
     // Keep the standalone binary useful while native platform shells are
     // brought online. `make run` selects the platform shell below.
-    let providers = net::SchemeProviders::new().with_page(browser::byui_provider::provider());
-    let controller = Arc::new(
-        net::RequestController::builder(net::Config::default())
-            .with_scheme_providers(providers)
-            .build()
-            .expect("network client should initialize"),
-    );
+    let controller = request_controller(None);
     let runtime = BrowserRuntime::open(
         application_data_directory().expect("application data directory should be available"),
     )

@@ -105,6 +105,48 @@ impl HTMLDocument {
         Ok(self.push_node(NodeKind::Element(element), None))
     }
 
+    /// Sets an element's attribute using the DOM `setAttribute` rules.
+    ///
+    /// HTML attribute names are normalized to ASCII lowercase. Existing
+    /// attributes are updated in place so their document order is preserved;
+    /// new attributes are appended. Names that are not valid attribute local
+    /// names return [`DomError::InvalidCharacter`].
+    pub fn set_attribute(
+        &mut self,
+        element: NodeId,
+        qualified_name: &str,
+        value: &str,
+    ) -> Result<(), DomError> {
+        if !is_valid_attribute_local_name(qualified_name) {
+            return Err(DomError::InvalidCharacter);
+        }
+
+        let node = self.node_mut(element).ok_or(DomError::NotFound)?;
+        let NodeKind::Element(element_data) = &mut node.kind else {
+            return Err(DomError::NotFound);
+        };
+
+        let name = match element_data.namespace {
+            Namespace::Html => qualified_name.to_ascii_lowercase(),
+            Namespace::Svg | Namespace::MathMl => qualified_name.to_owned(),
+        };
+
+        if let Some(attribute) = element_data
+            .attributes
+            .iter_mut()
+            .find(|attribute| attribute.name == name)
+        {
+            attribute.value = value.to_owned();
+        } else {
+            element_data.attributes.push(super::attribute::Attribute {
+                name,
+                value: value.to_owned(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Returns the DOM `textContent` value for a node.
     ///
     /// Element nodes return the concatenation of descendant text nodes in tree
@@ -137,6 +179,100 @@ impl HTMLDocument {
             NodeKind::Text(text) | NodeKind::Comment(text) => Some(text.clone()),
             NodeKind::Document | NodeKind::Doctype { .. } => None,
             NodeKind::None => None,
+        }
+    }
+
+    /// Serializes the document's child nodes as an HTML fragment.
+    ///
+    /// This follows the HTML fragment serialization rules for the node kinds
+    /// represented by this arena. It escapes text and attribute data, emits
+    /// comments and doctypes, and omits end tags for HTML void elements. The
+    /// arena does not model template contents, shadow roots, or all namespace-
+    /// specific serialization details, so those parts of the HTML Standard
+    /// are not implemented.
+    pub fn inner_html(&self) -> String {
+        let mut output = String::new();
+        if let Some(root) = self.node(self.root) {
+            for child in &root.children {
+                self.serialize_node(*child, &mut output, false);
+            }
+        }
+        output
+    }
+
+    fn serialize_node(&self, id: NodeId, output: &mut String, raw_text: bool) {
+        let Some(node) = self.node(id) else {
+            return;
+        };
+        match &node.kind {
+            NodeKind::Document => {
+                for child in &node.children {
+                    self.serialize_node(*child, output, false);
+                }
+            }
+            NodeKind::Doctype {
+                name,
+                public_id,
+                system_id,
+            } => {
+                output.push_str("<!DOCTYPE");
+                if let Some(name) = name {
+                    output.push(' ');
+                    output.push_str(name);
+                }
+                if let Some(public_id) = public_id {
+                    output.push_str(" PUBLIC \"");
+                    output.push_str(&escape_attribute(public_id));
+                    output.push('"');
+                    if let Some(system_id) = system_id {
+                        output.push_str(" \"");
+                        output.push_str(&escape_attribute(system_id));
+                        output.push('"');
+                    }
+                } else if let Some(system_id) = system_id {
+                    output.push_str(" SYSTEM \"");
+                    output.push_str(&escape_attribute(system_id));
+                    output.push('"');
+                }
+                output.push('>');
+            }
+            NodeKind::Element(element) => {
+                output.push('<');
+                output.push_str(&element.name);
+                for attribute in &element.attributes {
+                    output.push(' ');
+                    output.push_str(&attribute.name);
+                    output.push_str("=\"");
+                    output.push_str(&escape_attribute(&attribute.value));
+                    output.push('"');
+                }
+                output.push('>');
+                let is_void =
+                    element.namespace == Namespace::Html && is_void_html_element(&element.name);
+                if !is_void {
+                    let child_raw_text = element.namespace == Namespace::Html
+                        && matches!(element.name.as_str(), "script" | "style");
+                    for child in &node.children {
+                        self.serialize_node(*child, output, child_raw_text);
+                    }
+                    output.push_str("</");
+                    output.push_str(&element.name);
+                    output.push('>');
+                }
+            }
+            NodeKind::Text(text) => {
+                if raw_text {
+                    output.push_str(text);
+                } else {
+                    output.push_str(&escape_text(text));
+                }
+            }
+            NodeKind::Comment(comment) => {
+                output.push_str("<!--");
+                output.push_str(comment);
+                output.push_str("-->");
+            }
+            NodeKind::None => {}
         }
     }
 
@@ -188,6 +324,37 @@ impl HTMLDocument {
     }
 }
 
+fn escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('\u{00a0}', "&nbsp;")
+        .replace('<', "&lt;")
+}
+
+fn escape_attribute(value: &str) -> String {
+    escape_text(value).replace('"', "&quot;")
+}
+
+fn is_void_html_element(name: &str) -> bool {
+    matches!(
+        name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
 fn is_ascii_whitespace(character: char) -> bool {
     matches!(character, '\t' | '\n' | '\x0c' | '\r' | ' ')
 }
@@ -220,4 +387,15 @@ fn is_valid_element_local_name(name: &str) -> bool {
             || matches!(character, '-' | '.' | ':' | '_')
             || (character as u32) >= 0x80
     })
+}
+
+fn is_valid_attribute_local_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|character| {
+            !is_ascii_whitespace(character)
+                && character != '\0'
+                && character != '/'
+                && character != '='
+                && character != '>'
+        })
 }
