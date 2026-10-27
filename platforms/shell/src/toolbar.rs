@@ -505,7 +505,7 @@ fn draw_address_field(
 /// Draws `text` with its baseline at `baseline` (device pixels), clipping
 /// glyph pixels at `clip_x`. Returns the pen position after the last glyph.
 #[allow(clippy::too_many_arguments)]
-fn draw_text(
+pub(crate) fn draw_text(
     pixmap: &mut Pixmap,
     font: &FontVec,
     size: f32,
