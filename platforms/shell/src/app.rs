@@ -51,6 +51,7 @@ struct App {
     chrome: ChromeState,
     /// Session history shared by all desktop platforms.
     browser_state: chrome::BrowserState,
+    refresh: Option<browser::refresh::RefreshClient>,
     /// Loaded document, retained independently of the size-dependent pixmap.
     loaded_page: Option<browser::Page>,
     /// Pointer position in logical pixels while it is over the window.
@@ -69,7 +70,13 @@ struct App {
 
 impl App {
     fn new(platform: Platform) -> Self {
+        let refresh = browser::refresh::RefreshClient::new()
+            .map_err(|error| {
+                eprintln!("Refresh initialization failed: {error}");
+            })
+            .ok();
         Self {
+            refresh,
             platform,
             window: None,
             surface: None,
@@ -150,6 +157,12 @@ impl App {
     fn activate(&mut self, control: Control) {
         match control {
             Control::Reload => {
+                if let Some(refresh) = &self.refresh {
+                    // Dropping the handle detaches the task; fetching stays off the UI thread.
+                    drop(refresh.refresh(&self.browser_state));
+                } else {
+                    eprintln!("Refresh unavailable: initialization failed.");
+                }
                 self.page = None;
                 self.scripts_evaluated = false;
                 self.redraw();
@@ -419,7 +432,9 @@ mod tests {
             );
             assert_eq!(rendered.is_some(), width > 0 && height > 0);
             app.page = rendered.map(|page| ((width, height), page));
+            app.scripts_evaluated = true;
             app.activate(Control::Reload);
+            assert!(!app.scripts_evaluated);
             assert!(app.page.is_none());
             app.ensure_welcome_loaded();
         }

@@ -78,9 +78,6 @@ impl RequestPolicy {
         if request.keepalive {
             return Err(RequestError::UnsupportedFeature("keepalive lifetime"));
         }
-        if request.context.mode == crate::RequestMode::Navigate {
-            return Err(RequestError::UnsupportedFeature("navigation fetch"));
-        }
         if request.context.mode == crate::RequestMode::SameOrigin
             && request.context.environment.origin.is_none()
         {
@@ -111,6 +108,9 @@ impl RequestPolicy {
         };
         self.validate_target(request, &url)?;
         let scheme = FetchScheme::from_url(&url)?;
+        if request.context.mode == crate::RequestMode::Navigate && scheme != FetchScheme::File {
+            return Err(RequestError::UnsupportedFeature("navigation fetch"));
+        }
         Ok(ValidatedUrl { url, scheme })
     }
 
@@ -236,6 +236,24 @@ mod tests {
                 .unwrap();
             assert_eq!(validated.scheme, expected);
         }
+    }
+
+    #[test]
+    fn navigation_mode_is_available_only_to_file_providers() {
+        let policy = RequestPolicy;
+        let mut file = Request::get("file:///tmp/page.html");
+        file.set_mode(crate::RequestMode::Navigate).unwrap();
+        assert_eq!(
+            policy.validate_request(&file, 65_536).unwrap().scheme,
+            FetchScheme::File
+        );
+
+        let mut http = Request::get("https://example.test/page.html");
+        http.set_mode(crate::RequestMode::Navigate).unwrap();
+        assert!(matches!(
+            policy.validate_request(&http, 65_536),
+            Err(RequestError::UnsupportedFeature("navigation fetch"))
+        ));
     }
 
     #[test]

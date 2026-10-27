@@ -2,9 +2,10 @@
 //!
 //! This module is the first compiler boundary between the parser's [`crate::ast`]
 //! and the stack-based [`crate::vm`]. The instruction set covers expressions,
-//! lexical bindings, conditional branches, and `while` loops. Calls,
-//! properties, functions, and returns remain compile errors until their
-//! corresponding instructions are added.
+//! lexical bindings, property access (`object.name`, `object[key]`, and
+//! assignment to either), conditional branches, and `while` loops. Calls,
+//! functions, and returns remain compile errors until their corresponding
+//! instructions are added.
 
 mod chunk;
 mod compiler;

@@ -3,7 +3,44 @@
 Status: the current request, header, response, cache, redirect, streaming,
 scheduler, and scheme-handler regression suites pass. The remaining work is
 conformance and integration coverage for behavior that is still partial or
-owned by browser services.
+owned by browser services. The 2026-10-21 `cargo llvm-cov -p net` baseline is
+87.74% line coverage (3,164/3,552 executable lines); the gaps below are the
+coverage-derived inventory that must remain represented by the work items in
+this plan. Generated/debug-only formatting paths are included where they
+exercise public behavior or stable error reporting.
+
+## Coverage-derived gap inventory
+
+The following concrete gaps are not optional cleanup; each must be covered by
+the applicable section below or by a focused regression test when the behavior
+is implemented:
+
+- Body construction and lifecycle: `array_buffer`, URL-encoded construction,
+  null/replayable/one-shot request-body conversion, `is_replayable`, known
+  `length`, body equality/debug state, and the remaining multipart text/file
+  serialization and malformed-part errors.
+- Body and cancellation errors: cancellation defaults and state accessors,
+  every stable `RequestError` display variant, transport/body conversion
+  failures, and the distinction between body-already-used and
+  body-already-consumed errors.
+- Request/header API edges: request getters and setters, forbidden methods and
+  headers, no-CORS method/content-type checks, body-not-allowed checks,
+  keepalive size limits, redirect rewriting and sensitive-header stripping,
+  all referrer-policy branches, header guard immutability/internal removal,
+  default/invalid header parsing, and CORS-safelisted content types/ranges.
+- Origin and response validation: unsupported/invalid origins, opaque origins,
+  non-default ports, provider-origin mismatch/invalid-origin outcomes, and the
+  response-type decisions for navigation and credentialed requests.
+- HTTP execution: cache-mode branches, missing client-origin/cache
+  revalidation/priority failures, URL joining and invalid joined URLs,
+  pre-send and in-flight aborts, redirect limits and failures, non-replayable
+  redirect bodies, method rewriting, and sensitive-header removal.
+- Transport and scheduling: scheduler abort while waiting or immediately
+  before transport, transport/client initialization failures, and transport
+  body conversion failures.
+- Data and response boundaries: malformed percent escapes, response policy
+  failures, and controller/debug paths that must remain typed and side-effect
+  free.
 
 ## Remaining test work
 
@@ -22,7 +59,8 @@ Add focused tests for:
 
 Extend the existing `tests/schemes/` coverage with:
 
-- concrete browser composition through `with_services_and_providers`;
+- concrete browser composition through the builder's
+  `with_fetch_services` and `with_scheme_providers` setters;
 - exact-once matching-provider selection and request-context assertions;
 - missing, revoked, denied, malformed, invalid-origin, and I/O outcomes;
 - tuple and opaque provider origins;
