@@ -14,13 +14,21 @@ mod control_flow;
 pub struct CompileError {
     /// Human-readable description of the unsupported construct.
     pub message: String,
+    /// Whether the error means the compiler does not lower this syntax yet.
+    pub unsupported: bool,
 }
 
 impl CompileError {
     fn unsupported(construct: &str) -> Self {
         Self {
             message: format!("bytecode compiler does not support {construct} yet"),
+            unsupported: true,
         }
+    }
+
+    /// Returns whether compilation rejected syntax that has not been lowered.
+    pub fn is_unsupported(&self) -> bool {
+        self.unsupported
     }
 }
 
@@ -132,11 +140,13 @@ impl Compiler {
             }
             return Err(CompileError {
                 message: format!("redeclaration of `{name}`"),
+                unsupported: false,
             });
         }
         let slot = self.scopes[scope].slots;
         self.scopes[scope].slots = slot.checked_add(1).ok_or_else(|| CompileError {
             message: "scope has too many bindings".into(),
+            unsupported: false,
         })?;
         let binding = Binding { scope, slot, kind };
         self.scopes[scope].bindings.insert(name.to_owned(), binding);
@@ -202,6 +212,7 @@ impl Compiler {
     fn name(&mut self, name: &str) -> Result<u16, CompileError> {
         self.chunk.add_name(name).map_err(|message| CompileError {
             message: message.into(),
+            unsupported: false,
         })
     }
 
@@ -270,6 +281,7 @@ impl Compiler {
                 }
                 let binding = self.binding(name).ok_or_else(|| CompileError {
                     message: format!("unresolved declaration `{name}`"),
+                    unsupported: false,
                 })?;
                 if binding.scope == 0 {
                     self.chunk.emit(Instruction::InitializeGlobal {
@@ -376,6 +388,7 @@ impl Compiler {
             .add_constant(Value::String(name.to_owned()))
             .map_err(|message| CompileError {
                 message: message.into(),
+                unsupported: false,
             })
     }
 
@@ -395,6 +408,7 @@ impl Compiler {
             let depth =
                 u16::try_from(self.scopes.len() - 1 - binding.scope).map_err(|_| CompileError {
                     message: "scope nesting is too deep".into(),
+                    unsupported: false,
                 })?;
             self.chunk.emit(Instruction::LoadLocal {
                 depth,
@@ -421,6 +435,7 @@ impl Compiler {
             let depth =
                 u16::try_from(self.scopes.len() - 1 - binding.scope).map_err(|_| CompileError {
                     message: "scope nesting is too deep".into(),
+                    unsupported: false,
                 })?;
             self.chunk.emit(Instruction::StoreLocal {
                 depth,
@@ -457,6 +472,7 @@ impl Compiler {
             .add_constant(value)
             .map_err(|message| CompileError {
                 message: message.into(),
+                unsupported: false,
             })?;
         self.chunk.emit(Instruction::Constant(index));
         Ok(())

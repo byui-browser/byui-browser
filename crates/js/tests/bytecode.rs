@@ -1,6 +1,33 @@
 use js::bytecode::{Instruction, compile};
 use js::{Value, Vm, parse};
 
+#[test]
+fn execution_modes_select_vm_and_fall_back_only_for_unsupported_syntax() {
+    assert_eq!(
+        js::eval_with_mode("let n = 2; n * 3", js::ExecutionMode::Bytecode).unwrap(),
+        Value::Number(6.0)
+    );
+    assert_eq!(
+        js::eval_with_mode(
+            "function f() { return 4; } f()",
+            js::ExecutionMode::Automatic
+        )
+        .unwrap(),
+        Value::Number(4.0)
+    );
+    let error = js::eval_with_mode("missing", js::ExecutionMode::Automatic).unwrap_err();
+    assert_eq!(error.category, js::JsErrorCategory::Runtime);
+    assert_eq!(error.message, "`missing` is not defined");
+}
+
+#[test]
+fn vm_runtime_errors_are_not_retried_in_the_interpreter() {
+    let error = js::eval_with_mode("const n = 1; n = 2", js::ExecutionMode::Automatic)
+        .expect_err("VM const assignment must fail");
+    assert_eq!(error.category, js::JsErrorCategory::Runtime);
+    assert_eq!(error.message, "Assignment to constant `n`");
+}
+
 fn execute(source: &str) -> Value {
     let program = parse(source).expect("source should parse");
     let chunk = compile(&program).expect("source should compile");
