@@ -8,8 +8,9 @@
 
 use std::sync::Arc;
 
-use browser::evaluate_page_scripts;
+use browser::{BrowserRuntime, application_data_directory};
 use rfd::{MessageButtons, MessageDialog, MessageLevel};
+use security::{Origin, RendererSecurityContext, StoragePermission};
 use webapis::{AlertSink, ConsoleSink};
 
 struct StdoutConsole;
@@ -44,11 +45,22 @@ fn main() {
             .build()
             .expect("network client should initialize"),
     );
-    evaluate_page_scripts(
-        "<script>print()</script>",
-        Arc::new(StdoutConsole),
-        Arc::new(NativeAlert),
-        controller,
+    let runtime = BrowserRuntime::open(
+        application_data_directory().expect("application data directory should be available"),
     )
-    .expect("page scripts should evaluate");
+    .expect("browser storage should initialize");
+    // The built-in page uses a fixed origin until navigation supplies a URL.
+    let security_context = RendererSecurityContext::new(
+        Origin::new("byui", "welcome", None),
+        StoragePermission::Allowed,
+    );
+    runtime
+        .evaluate_page_scripts(
+            "<script>print()</script>",
+            Arc::new(StdoutConsole),
+            Arc::new(NativeAlert),
+            controller,
+            security_context,
+        )
+        .expect("page scripts should evaluate");
 }

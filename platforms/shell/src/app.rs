@@ -63,12 +63,22 @@ struct App {
     /// Window size, scale-factor bits, and theme `frame` was painted for.
     frame_key: Option<(u32, u32, u64, bool)>,
     last_toolbar_click: Option<Instant>,
+    /// Shared browser runtime and persistent storage backend.
+    runtime: browser::BrowserRuntime,
     alert_sink: Arc<dyn AlertSink>,
     scripts_evaluated: bool,
 }
 
 impl App {
     fn new(platform: Platform) -> Self {
+        let root = browser::application_data_directory()
+            .expect("application data directory should be available");
+        let runtime =
+            browser::BrowserRuntime::open(root).expect("browser storage should initialize");
+        Self::with_runtime(platform, runtime)
+    }
+
+    fn with_runtime(platform: Platform, runtime: browser::BrowserRuntime) -> Self {
         Self {
             platform,
             window: None,
@@ -85,6 +95,7 @@ impl App {
             frame: Vec::new(),
             frame_key: None,
             last_toolbar_click: None,
+            runtime,
             alert_sink: crate::content::native_alert_sink(),
             scripts_evaluated: false,
         }
@@ -191,6 +202,7 @@ impl App {
                     card.height,
                     scale,
                     Arc::clone(&self.alert_sink),
+                    &self.runtime,
                     &mut self.scripts_evaluated,
                 )
                 .map(|page| ((card.width, card.height), page))
@@ -379,11 +391,14 @@ mod tests {
     use super::*;
 
     fn app() -> App {
-        App::new(Platform {
-            configure_window: |attributes| attributes,
-            ui_font_files: Vec::new,
-            window_controls_inset: 0.0,
-        })
+        App::with_runtime(
+            Platform {
+                configure_window: |attributes| attributes,
+                ui_font_files: Vec::new,
+                window_controls_inset: 0.0,
+            },
+            browser::BrowserRuntime::in_memory(),
+        )
     }
 
     #[test]
@@ -415,6 +430,7 @@ mod tests {
                 height,
                 scale,
                 Arc::clone(&app.alert_sink),
+                &app.runtime,
                 &mut app.scripts_evaluated,
             );
             assert_eq!(rendered.is_some(), width > 0 && height > 0);
