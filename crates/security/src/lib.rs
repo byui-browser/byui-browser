@@ -172,57 +172,69 @@ pub fn same_origin(a: &Origin, b: &Origin) -> bool {
     a == b
 }
 
-/// A cookie as stored in the jar.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+/// A cookie stored in a [`CookieJar`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cookie {
+    /// The cookie name.
     pub name: String,
+    /// The value sent with the cookie name.
     pub value: String,
+    /// The host for which the cookie is visible.
+    ///
+    /// The current implementation compares this value literally with the
+    /// requesting origin's host. It does not yet implement subdomain,
+    /// leading-dot, or other full cookie-domain matching rules.
     pub domain: String,
+    /// Whether the cookie may be returned only for HTTPS origins.
     pub secure: bool,
 }
 
-/// Cookie storage with per-origin visibility rules. A Canvas session is a
-/// cookie, so this is on the critical path to the course goal.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+/// In-memory cookie storage with basic host and secure-transport filtering.
+///
+/// Cookies are replaced when a new cookie has the same name and domain. The
+/// jar does not yet persist cookies or implement expiration, paths, or the
+/// complete browser cookie-domain model.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CookieJar {
     cookies: Vec<Cookie>,
 }
 
 impl CookieJar {
-    /// An empty jar.
+    /// Creates an empty, in-memory cookie jar.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Stores a cookie received from `origin`, applying domain/secure rules.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+    /// Stores `cookie`, replacing an existing cookie with the same name and domain.
+    ///
+    /// The `origin` argument is reserved for future validation. It is not
+    /// currently used when storing a cookie; callers are responsible for
+    /// providing a cookie with the intended domain and secure attributes.
     pub fn store(&mut self, _origin: &Origin, cookie: Cookie) {
-        self.cookies.retain(|existing| {
-            existing.name != cookie.name || existing.domain != cookie.domain
-        });
+        self.cookies
+            .retain(|existing| existing.name != cookie.name || existing.domain != cookie.domain);
 
         self.cookies.push(cookie);
     }
 
-    /// Cookies that may be sent to `origin`.
+    /// Returns cookies that may be sent to `origin`.
     ///
-    /// Currently only handles the empty jar.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+    /// A cookie is returned when its domain exactly matches the origin host.
+    /// Secure cookies are returned only for HTTPS origins. The returned
+    /// references point into the jar and are ordered by insertion order.
     pub fn cookies_for(&self, origin: &Origin) -> Vec<&Cookie> {
-       let mut matching_cookies = Vec::new();
+        let mut matching_cookies = Vec::new();
 
-       for cookie in &self.cookies {
-           let domain_matches = cookie.domain == origin.host();
-           let secure_connection = origin.scheme() == "https";
+        for cookie in &self.cookies {
+            let domain_matches = cookie.domain == origin.host();
+            let secure_connection = origin.scheme() == "https";
 
-           if domain_matches && (!cookie.secure || secure_connection) {
-               matching_cookies.push(cookie);
-           }
-       }
+            if domain_matches && (!cookie.secure || secure_connection) {
+                matching_cookies.push(cookie);
+            }
+        }
 
-       matching_cookies
+        matching_cookies
     }
 }
 
