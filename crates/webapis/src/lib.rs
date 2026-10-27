@@ -166,9 +166,21 @@ impl Element {
     }
 }
 
+/// Builds the script-facing element object. Its `style` data object reflects
+/// declarations present when the element object is created; it does not yet
+/// support CSSOM setters or stay synchronized with later attribute changes.
 fn element_object(element: Element, document: Arc<Mutex<Document>>) -> Object {
     let object = Object::new();
     let node = element.node;
+    let style_value = element
+        .get_attribute("style")
+        .map_or_else(String::new, str::to_owned);
+    let style = Object::new();
+    style.set("cssText", Value::String(style_value.clone()));
+    for (name, value) in parse_inline_style(&style_value) {
+        style.set(css_property_to_js(&name), Value::String(value));
+    }
+    object.set("style", Value::Object(style));
     let get_attribute_document = document.clone();
     object.set_method(
         "getAttribute",
@@ -196,6 +208,47 @@ fn element_object(element: Element, document: Arc<Mutex<Document>>) -> Object {
         }),
     );
     object
+}
+
+/// Reads declarations from an HTML `style` attribute.
+///
+/// This initial CSS2.1 slice accepts ordinary `property: value` pairs and
+/// ignores malformed or empty declarations. It does not tokenize quoted
+/// strings or nested functions containing semicolons.
+fn parse_inline_style(style: &str) -> Vec<(String, String)> {
+    let mut declarations = Vec::new();
+    for declaration in style.split(';') {
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        let property = property.trim().to_ascii_lowercase();
+        let value = value.trim();
+        if property.is_empty() || value.is_empty() {
+            continue;
+        }
+        if let Some(existing) = declarations.iter_mut().find(|(name, _)| name == &property) {
+            existing.1 = value.to_owned();
+        } else {
+            declarations.push((property, value.to_owned()));
+        }
+    }
+    declarations
+}
+
+fn css_property_to_js(property: &str) -> String {
+    let mut result = String::with_capacity(property.len());
+    let mut uppercase_next = false;
+    for character in property.chars() {
+        if character == '-' {
+            uppercase_next = true;
+        } else if uppercase_next {
+            result.extend(character.to_uppercase());
+            uppercase_next = false;
+        } else {
+            result.push(character);
+        }
+    }
+    result
 }
 
 fn normalize_attribute_name(namespace: Namespace, qualified_name: &str) -> JsResult<String> {
@@ -914,6 +967,39 @@ mod tests {
                 .evaluate_script("document.getElementById('app').getAttribute('missing')")
                 .unwrap(),
             Value::Null
+        );
+    }
+
+    #[test]
+    fn element_style_exposes_inline_css2_declarations_as_camel_case_properties() {
+        let html_document = parse_raw_html(
+            "<main id='app' style='color: red; background-color: blue; color: green; broken'></main>"
+                .to_owned(),
+        );
+        let mut realm = Realm::new();
+        register_document(
+            &mut realm,
+            super::Document::from_html_document(&html_document),
+        )
+        .unwrap();
+
+        assert_eq!(
+            realm
+                .evaluate_script("document.getElementById('app').style.color")
+                .unwrap(),
+            Value::String("green".to_owned())
+        );
+        assert_eq!(
+            realm
+                .evaluate_script("document.getElementById('app').style.backgroundColor")
+                .unwrap(),
+            Value::String("blue".to_owned())
+        );
+        assert_eq!(
+            realm
+                .evaluate_script("document.getElementById('app').style.cssText")
+                .unwrap(),
+            Value::String("color: red; background-color: blue; color: green; broken".to_owned())
         );
     }
 
