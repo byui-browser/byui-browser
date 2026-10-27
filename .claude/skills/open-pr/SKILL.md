@@ -1,6 +1,6 @@
 ---
 name: open-pr
-description: Prepare, validate, and open a draft GitHub pull request for the current changes following byui-browser conventions (team branch naming, CODEOWNERS reviewers, fmt/clippy/test gates). Use when the user asks to open, create, submit, or update a PR.
+description: Prepare, validate, and open a draft GitHub pull request for the current changes following byui-browser conventions (team branch naming, CODEOWNERS reviewers, fmt/clippy/test gates). Use when the user asks to open, create, submit, or update a PR, or asks to run the pre-PR checks (lint/tests) on their behalf.
 ---
 
 Read and follow `.agents/skills/open-pr/SKILL.md` from the repository root. That

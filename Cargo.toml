@@ -15,7 +15,11 @@ members = [
     "crates/chrome",
     "crates/devtools",
     "crates/browser",
+    "platforms/shell",
     "platforms/macos",
+    "platforms/windows",
+    "platforms/linux",
+    "platforms/js",
 ]
 default-members = ["crates/browser"]
 
@@ -43,3 +47,27 @@ devtools = { path = "crates/devtools" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
+
+# The native shells paint every frame on the UI thread, so keep their drawing
+# code optimized in dev builds; unoptimized software rasterizing makes window
+# drags and hover feedback lag.
+[profile.dev.package.browser-shell]
+opt-level = 3
+
+[profile.dev.package.tiny-skia]
+opt-level = 3
+
+[profile.dev.package.tiny-skia-path]
+opt-level = 3
+
+[profile.dev.package.ab_glyph]
+opt-level = 3
+
+[profile.dev.package.ab_glyph_rasterizer]
+opt-level = 3
+
+[profile.dev.package.owned_ttf_parser]
+opt-level = 3
+
+[profile.dev.package.ttf-parser]
+opt-level = 3
