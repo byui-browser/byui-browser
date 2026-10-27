@@ -5,17 +5,20 @@
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use ab_glyph::FontVec;
+use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use tiny_skia::Pixmap;
 use webapis::AlertSink;
+
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::error::EventLoopError;
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
 use crate::toolbar::{self, ChromeState, Control};
@@ -64,8 +67,64 @@ struct App {
     /// Window size, scale-factor bits, and theme `frame` was painted for.
     frame_key: Option<(u32, u32, u64, bool)>,
     last_toolbar_click: Option<Instant>,
-    alert_sink: Arc<dyn AlertSink>,
+    alerts: Arc<PageAlerts>,
     scripts_evaluated: bool,
+}
+
+/// Delivers `alert` on the UI thread, attached to the browser window.
+///
+/// Page scripts run on the JS engine thread. Showing the dialog from that
+/// thread deadlocks: the UI thread is waiting for the script, and the dialog
+/// waits for the UI thread. A dialog with no parent window also ends the
+/// process event loop, so the browser quits as the alert closes.
+struct PageAlerts {
+    proxy: Mutex<Option<EventLoopProxy<()>>>,
+    pending: Mutex<Vec<(String, mpsc::Sender<()>)>>,
+}
+
+impl PageAlerts {
+    fn new() -> Self {
+        Self {
+            proxy: Mutex::new(None),
+            pending: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn set_proxy(&self, proxy: EventLoopProxy<()>) {
+        *self.proxy.lock().expect("alert proxy lock") = Some(proxy);
+    }
+
+    /// Shows every queued alert on `parent` and releases the waiting script.
+    fn present(&self, parent: &Window) {
+        let pending = std::mem::take(&mut *self.pending.lock().expect("alert queue lock"));
+        for (message, done) in pending {
+            MessageDialog::new()
+                .set_title("BYUI Browser")
+                .set_description(message)
+                .set_level(MessageLevel::Info)
+                .set_buttons(MessageButtons::Ok)
+                .set_parent(parent)
+                .show();
+            let _ = done.send(());
+        }
+    }
+}
+
+impl AlertSink for PageAlerts {
+    fn alert(&self, message: &str) {
+        let proxy = self.proxy.lock().expect("alert proxy lock").clone();
+        let Some(proxy) = proxy else {
+            return;
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        self.pending
+            .lock()
+            .expect("alert queue lock")
+            .push((message.to_owned(), done_tx));
+        if proxy.send_event(()).is_ok() {
+            let _ = done_rx.recv();
+        }
+    }
 }
 
 impl App {
@@ -92,7 +151,7 @@ impl App {
             frame: Vec::new(),
             frame_key: None,
             last_toolbar_click: None,
-            alert_sink: crate::content::native_alert_sink(),
+            alerts: Arc::new(PageAlerts::new()),
             scripts_evaluated: false,
         }
     }
@@ -197,14 +256,18 @@ impl App {
         let card_size = card.map(|card| (card.width, card.height));
         let mut full = self.page.is_none();
         if self.page.as_ref().map(|(size, _)| *size) != card_size {
+            // Paint this frame before the page script runs. Evaluation joins
+            // the JS engine thread; doing that inside this draw leaves `alert`
+            // unable to finish and the window never appears.
+            let mut scripts_already_ran = true;
             self.page = card.and_then(|card| {
                 crate::content::render_page(
                     self.loaded_page.as_ref().expect("page was loaded"),
                     card.width,
                     card.height,
                     scale,
-                    Arc::clone(&self.alert_sink),
-                    &mut self.scripts_evaluated,
+                    Arc::clone(&self.alerts) as Arc<dyn AlertSink>,
+                    &mut scripts_already_ran,
                 )
                 .map(|page| ((card.width, card.height), page))
             });
@@ -377,6 +440,31 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        if let Some(window) = &self.window {
+            let window = Rc::clone(window);
+            self.alerts.present(&window);
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // `frame_key` is set only after a frame has been presented, so the
+        // window is on screen before the page script can request an alert.
+        if self.scripts_evaluated || self.frame_key.is_none() {
+            return;
+        }
+        let Some(page) = self.loaded_page.clone() else {
+            return;
+        };
+        self.scripts_evaluated = true;
+        // Leave this thread in the event loop. The script runs elsewhere and
+        // asks the loop to present an alert; joining it here would deadlock.
+        let alerts = Arc::clone(&self.alerts) as Arc<dyn AlertSink>;
+        thread::spawn(move || {
+            crate::content::evaluate_page_script(&page, alerts);
+        });
+    }
 }
 
 /// Opens the browser window described by `platform` and runs it until the
@@ -384,12 +472,20 @@ impl ApplicationHandler for App {
 pub fn run(platform: Platform) -> Result<(), EventLoopError> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    event_loop.run_app(&mut App::new(platform))
+    let mut app = App::new(platform);
+    app.alerts.set_proxy(event_loop.create_proxy());
+    event_loop.run_app(&mut app)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SilentAlert;
+
+    impl AlertSink for SilentAlert {
+        fn alert(&self, _message: &str) {}
+    }
 
     fn app() -> App {
         App::new(Platform {
@@ -420,6 +516,9 @@ mod tests {
 
         // Exercise the same load guard and renderer used by paint, including
         // an empty content area, changed dimensions, and a changed scale.
+        // A silent sink stays off the native dialog if the page script calls
+        // `alert`.
+        let alert_sink: Arc<dyn AlertSink> = Arc::new(SilentAlert);
         for (width, height, scale) in [(0, 0, 1.0), (160, 120, 1.0), (320, 240, 2.0)] {
             app.ensure_welcome_loaded();
             let rendered = crate::content::render_page(
@@ -427,7 +526,7 @@ mod tests {
                 width,
                 height,
                 scale,
-                Arc::clone(&app.alert_sink),
+                Arc::clone(&alert_sink),
                 &mut app.scripts_evaluated,
             );
             assert_eq!(rendered.is_some(), width > 0 && height > 0);
