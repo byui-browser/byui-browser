@@ -255,6 +255,7 @@ dependencies = [
  "paint",
  "render",
  "rfd",
+ "security",
  "softbuffer",
  "tiny-skia",
  "webapis",

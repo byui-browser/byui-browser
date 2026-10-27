@@ -301,6 +301,15 @@ impl Function {
             FunctionKind::Script { name, .. } | FunctionKind::Host { name, .. } => name,
         }
     }
+
+    /// Invokes this function with `arguments`.
+    ///
+    /// Script functions execute with their captured lexical environment, and
+    /// host functions receive the supplied values directly. This is used by
+    /// host APIs that need to call a JavaScript callback, such as DOM events.
+    pub fn call(&self, arguments: &[Value]) -> JsResult<Value> {
+        with_engine_stack(|| Interpreter::new(ExecutionLimits::default()).call(self, arguments))
+    }
 }
 
 impl PartialEq for Function {
