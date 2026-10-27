@@ -49,6 +49,16 @@ pub enum Token {
     Function,
     /// `return` keyword.
     Return,
+    /// `class` keyword.
+    Class,
+    /// `extends` keyword.
+    Extends,
+    /// `new` keyword.
+    New,
+    /// `this` keyword.
+    This,
+    /// `super` keyword.
+    Super,
     /// `true` literal.
     True,
     /// `false` literal.
@@ -107,6 +117,8 @@ pub enum Token {
     RightBrace,
     /// `,` separator.
     Comma,
+    /// `:` separator between an object literal's key and value.
+    Colon,
     /// `.` member access operator.
     Dot,
     /// `[` computed member access opener.
@@ -261,6 +273,7 @@ pub fn tokenize_spanned(input: &str) -> Vec<SpannedToken> {
                 '{' => Token::LeftBrace,
                 '}' => Token::RightBrace,
                 ',' => Token::Comma,
+                ':' => Token::Colon,
                 '.' => Token::Dot,
                 '[' => Token::LeftBracket,
                 ']' => Token::RightBracket,
@@ -536,6 +549,11 @@ fn keyword(name: &str) -> Option<Token> {
         "while" => Token::While,
         "function" => Token::Function,
         "return" => Token::Return,
+        "class" => Token::Class,
+        "extends" => Token::Extends,
+        "new" => Token::New,
+        "this" => Token::This,
+        "super" => Token::Super,
         "true" => Token::True,
         "false" => Token::False,
         "null" => Token::Null,

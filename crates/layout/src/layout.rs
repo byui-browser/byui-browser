@@ -41,6 +41,8 @@ pub fn layout_tree(styled_dom: &StyledDom, viewport: Size) -> LayoutTree {
 
 #[cfg(test)]
 mod tests {
+    use html::NodeID;
+
     use super::*;
 
     #[test]
@@ -59,7 +61,7 @@ mod tests {
     fn block_children_have_expected_positions_and_dimensions() {
         let tree = layout_tree(
             &StyledDom {
-                nodes: vec![common::ids::NodeId::new(0), common::ids::NodeId::new(1)],
+                nodes: vec![NodeID::new(0), NodeID::new(1)],
             },
             Size {
                 width: 320.0,
