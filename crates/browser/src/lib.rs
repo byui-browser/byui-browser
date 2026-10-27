@@ -351,6 +351,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn embedded_page_head_preserves_metadata_without_a_body() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let mut request = Request::get("byui://welcome/page?lang=en#top");
+        request
+            .set_method(net::Method::HEAD)
+            .expect("GET can become HEAD");
+
+        let response = runtime
+            .block_on(controller.fetch(request))
+            .expect("embedded page HEAD should resolve");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.headers.get("content-length"), Some("204".into()));
+        assert!(response.body.is_null());
+        assert!(runtime.block_on(response.body.bytes()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_embedded_page_routes_fail_without_a_fallback() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let error = runtime
+            .block_on(controller.fetch(Request::get("byui://missing/page")))
+            .expect_err("unknown embedded routes must fail");
+
+        assert!(matches!(
+            error,
+            net::RequestError::Provider {
+                provider: "byui page",
+                kind: net::ProviderErrorKind::ResourceMissing
+            }
+        ));
+    }
+
     async fn fetch_text_response(
         controller: &RequestController,
         url: &str,
