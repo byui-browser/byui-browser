@@ -36,10 +36,16 @@ impl RequestController {
             url,
             status: allowed_url.status,
             status_text: Some(allowed_url.status_text.into()),
-            headers: vec![(
-                HeaderName::from_static("content-type"),
-                HeaderValue::from_static(allowed_url.content_type),
-            )],
+            headers: vec![
+                (
+                    HeaderName::from_static("content-type"),
+                    HeaderValue::from_static(allowed_url.content_type),
+                ),
+                (
+                    HeaderName::from_static("content-length"),
+                    HeaderValue::from_static("0"),
+                ),
+            ],
             media_type: None,
             origin: Origin::opaque(),
             body: allowed_url.body(request.method()),

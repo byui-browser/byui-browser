@@ -45,7 +45,14 @@ fn resource(url: Url, definition: &super::registry::ResourceDefinition) -> Schem
         url,
         status: 200,
         status_text: Some("OK".into()),
-        headers: vec![(HeaderName::from_static("content-type"), media_type.clone())],
+        headers: vec![
+            (HeaderName::from_static("content-type"), media_type.clone()),
+            (
+                HeaderName::from_static("content-length"),
+                HeaderValue::from_str(&definition.body.len().to_string())
+                    .expect("an embedded resource length is a valid header value"),
+            ),
+        ],
         media_type: Some(media_type),
         origin: Origin::opaque(),
         body: SchemeBody::Bytes(definition.body.to_vec()),

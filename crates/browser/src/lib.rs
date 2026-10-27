@@ -329,4 +329,32 @@ mod tests {
         assert!(page.css.contains("background-color"));
         assert!(page.js.contains("const message"));
     }
+
+    #[test]
+    fn embedded_page_aliases_ignore_query_and_fragment_for_lookup() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let response = runtime
+            .block_on(fetch_text_response(
+                &controller,
+                "byui://welcome/index.html?lang=en#top",
+            ))
+            .expect("embedded page alias should resolve");
+
+        assert_eq!(response.url, "byui://welcome/index.html?lang=en#top");
+        assert_eq!(response.headers.get("content-length"), Some("204".into()));
+        assert!(
+            runtime
+                .block_on(response.body.bytes())
+                .unwrap()
+                .starts_with(b"<!doctype")
+        );
+    }
+
+    async fn fetch_text_response(
+        controller: &RequestController,
+        url: &str,
+    ) -> Result<net::Response, net::RequestError> {
+        controller.fetch(Request::get(url)).await
+    }
 }
