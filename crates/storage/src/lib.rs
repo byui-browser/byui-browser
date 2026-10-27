@@ -244,9 +244,7 @@ mod tests {
         let context = context("https", "example.com", 443);
         {
             let mut storage = OriginStorage::new();
-            storage
-                .set_item(&context, "session", "temporary")
-                .unwrap();
+            storage.set_item(&context, "session", "temporary").unwrap();
         }
 
         let storage = OriginStorage::new();

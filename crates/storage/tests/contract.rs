@@ -29,7 +29,9 @@ fn public_api_is_origin_scoped() {
         .expect("first context can write");
 
     assert_eq!(
-        storage.get_item(&first, "theme").expect("first context can read"),
+        storage
+            .get_item(&first, "theme")
+            .expect("first context can read"),
         Some("dark")
     );
     assert_eq!(
