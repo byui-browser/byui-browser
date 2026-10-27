@@ -4,10 +4,6 @@ use super::Instruction;
 use crate::Value;
 
 /// A source position associated with a bytecode instruction.
-///
-/// Offsets are UTF-8 byte offsets. Lines and columns are one-based. Locations
-/// are optional because hand-built chunks and the current AST do not always
-/// have source mapping information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceLocation {
     /// Zero-based UTF-8 byte offset in the source text.
@@ -89,6 +85,7 @@ impl Chunk {
                 Some(value) => format!("CONSTANT {index} ({value:?})"),
                 None => format!("CONSTANT {index} (<invalid>)"),
             },
+            Instruction::Jump(target) => format!("JUMP -> {target:04}"),
             Instruction::JumpIfFalse(target) => format!("JUMP_IF_FALSE -> {target:04}"),
             Instruction::JumpIfTrue(target) => format!("JUMP_IF_TRUE -> {target:04}"),
             Instruction::DeclareGlobal { slot, name, .. }
@@ -116,6 +113,37 @@ impl Chunk {
             }
             other => format!("{other:?}"),
         }
+    }
+
+    /// Returns the offset where the next instruction will be emitted.
+    pub fn current_offset(&self) -> usize {
+        self.code.len()
+    }
+
+    /// Emits a jump with a placeholder target and returns its offset.
+    pub fn emit_jump(&mut self, instruction: Instruction) -> Result<usize, &'static str> {
+        if !matches!(
+            instruction,
+            Instruction::Jump(_) | Instruction::JumpIfFalse(_) | Instruction::JumpIfTrue(_)
+        ) {
+            return Err("instruction is not patchable");
+        }
+        Ok(self.emit(instruction))
+    }
+
+    /// Replaces a placeholder jump target with a valid instruction offset.
+    pub fn patch_jump(&mut self, offset: usize, target: usize) -> Result<(), &'static str> {
+        if target > self.code.len() {
+            return Err("jump target is outside the chunk");
+        }
+        let instruction = self.code.get_mut(offset).ok_or("jump offset is invalid")?;
+        match instruction {
+            Instruction::Jump(target_slot)
+            | Instruction::JumpIfFalse(target_slot)
+            | Instruction::JumpIfTrue(target_slot) => *target_slot = target,
+            _ => return Err("instruction is not patchable"),
+        }
+        Ok(())
     }
 
     /// Adds an owned constant and returns its pool index.

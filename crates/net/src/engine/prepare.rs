@@ -30,7 +30,8 @@ impl RequestController {
 
         if let Some(services) = &self.inner.services {
             services.check_request(&request)?;
-            if request.service_workers == ServiceWorkersMode::All
+            if validated_url.scheme != crate::policy::FetchScheme::File
+                && request.service_workers == ServiceWorkersMode::All
                 && services.service_worker(&request)? == ServiceWorkerDecision::Intercept
             {
                 return Err(RequestError::UnsupportedFeature(

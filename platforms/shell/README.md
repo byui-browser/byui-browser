@@ -22,8 +22,15 @@ there is no history UI or persistence yet.
 
 Future successful navigation should pass its loaded document and URL through
 `App::page_loaded`. Navigation itself is not implemented, and the current
-renderer still supports only the welcome demo. Reload remains a repaint of
-the loaded page, not a fresh network fetch.
+renderer still supports only the welcome demo. Reload fetches the saved current URL on a background task and prints its URL,
+status, and response body (or an error) to the launching terminal. It bypasses
+the HTTP response cache and leaves the displayed document and history unchanged.
+Internal `byui://welcome` uses the embedded page provider, not HTTP or disk.
+HTTP and HTTPS use the Networking team's transport; address editing and navigation
+remain unimplemented, so the current UI refreshes the welcome page.
+
+Run `cargo test -p browser refresh::tests` to verify fresh HTTP requests,
+internal pages, saved URLs, error reporting, and unchanged history.
 
 Run `cargo test -p browser-shell app::tests` to verify visit recording and
 that redraw/resize/Reload work does not append history. Run

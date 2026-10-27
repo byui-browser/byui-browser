@@ -1,4 +1,4 @@
-use js::bytecode::{Chunk, Instruction, SourceLocation, compile};
+use js::bytecode::{Instruction, compile};
 use js::{Value, Vm, parse};
 
 fn execute(source: &str) -> Value {
@@ -82,12 +82,65 @@ fn chunk_keeps_constants_separate_from_instructions() {
 }
 
 #[test]
+fn control_flow_preserves_truthiness_and_completion_values() {
+    assert_eq!(execute("if ('yes') { 1 } else { 2 }"), Value::Number(1.0));
+    assert_eq!(execute("if (0) 1; else 2"), Value::Number(2.0));
+    assert_eq!(execute("if (false) 1"), Value::Undefined);
+    assert_eq!(execute("while (false) 1"), Value::Undefined);
+    assert_eq!(
+        execute("let i = 0; while (i < 3) { i = i + 1; } i"),
+        Value::Number(3.0)
+    );
+    assert_eq!(
+        execute("if (true) { if (false) 1; else 2 } else 3"),
+        Value::Number(2.0)
+    );
+}
+
+#[test]
+fn control_flow_keeps_short_circuit_evaluation_order() {
+    assert_eq!(
+        execute("let i = 0; false && (i = 1); true || (i = 2); i"),
+        Value::Number(0.0)
+    );
+    assert_eq!(
+        execute("let i = 0; while (i < 2) { i = i + 1; if (i == 1) 10; else 20 }"),
+        Value::Number(20.0)
+    );
+}
+
+#[test]
+fn vm_limits_bound_bytecode_execution() {
+    let program = parse("while (true) { }").expect("source should parse");
+    let chunk = compile(&program).expect("source should compile");
+    let limits = js::runtime::ExecutionLimits {
+        step_limit: 10_000,
+        call_depth_limit: 0,
+        loop_iteration_limit: 3,
+    };
+    let error = Vm::new()
+        .execute_with_limits(&chunk, limits)
+        .expect_err("infinite loop should hit its loop limit");
+    assert_eq!(error.category, js::JsErrorCategory::Limit);
+    assert_eq!(error.message, "Script exceeded the loop iteration limit");
+
+    let limits = js::runtime::ExecutionLimits {
+        step_limit: 2,
+        ..js::runtime::ExecutionLimits::default()
+    };
+    let error = Vm::new()
+        .execute_with_limits(&chunk, limits)
+        .expect_err("infinite loop should hit its step limit");
+    assert_eq!(error.message, "Script exceeded the evaluation step limit");
+}
+
+#[test]
 fn disassembly_is_stable_and_includes_constants_jumps_and_locations() {
-    let mut chunk = Chunk::new();
+    let mut chunk = js::bytecode::Chunk::new();
     let constant = chunk.add_constant(Value::String("hello".into())).unwrap();
     chunk.emit_at(
         Instruction::Constant(constant),
-        Some(SourceLocation {
+        Some(js::bytecode::SourceLocation {
             offset: 0,
             line: 1,
             column: 1,
@@ -105,10 +158,10 @@ fn disassembly_is_stable_and_includes_constants_jumps_and_locations() {
 
 #[test]
 fn invalid_jump_reports_its_instruction_location() {
-    let mut chunk = Chunk::new();
+    let mut chunk = js::bytecode::Chunk::new();
     chunk.emit_at(
         Instruction::JumpIfTrue(99),
-        Some(SourceLocation {
+        Some(js::bytecode::SourceLocation {
             offset: 4,
             line: 2,
             column: 3,

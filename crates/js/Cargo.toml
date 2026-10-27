@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 common = { workspace = true }
+unicode-ident = "1"
 
 [lints]
 workspace = true
