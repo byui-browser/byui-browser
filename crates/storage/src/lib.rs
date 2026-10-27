@@ -157,7 +157,7 @@ impl std::error::Error for StorageAccessError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use security::{Origin, StorageKey};
+    use security::{Origin, StoragePermission};
 
     #[test]
     fn missing_key_is_none() {
@@ -190,58 +190,66 @@ mod tests {
         assert_eq!(store.remove_item("k"), None);
     }
 
-    fn storage_key(scheme: &str, host: &str, port: u16) -> StorageKey {
-        StorageKey::new(Origin::with_port(scheme, host, port))
+    fn context(scheme: &str, host: &str, port: u16) -> RendererSecurityContext {
+        RendererSecurityContext::new(
+            Origin::with_port(scheme, host, port),
+            StoragePermission::Allowed,
+        )
     }
 
     #[test]
     fn origin_areas_do_not_share_values() {
-        let first = storage_key("https", "example.com", 443);
-        let second = storage_key("https", "other.example", 443);
+        let first = context("https", "example.com", 443);
+        let second = context("https", "other.example", 443);
         let mut storage = OriginStorage::new();
 
-        storage.set_item(&first, "token", "first");
-        storage.set_item(&second, "token", "second");
+        storage.set_item(&first, "token", "first").unwrap();
+        storage.set_item(&second, "token", "second").unwrap();
 
-        assert_eq!(storage.get_item(&first, "token"), Some("first"));
-        assert_eq!(storage.get_item(&second, "token"), Some("second"));
+        assert_eq!(storage.get_item(&first, "token").unwrap(), Some("first"));
+        assert_eq!(storage.get_item(&second, "token").unwrap(), Some("second"));
     }
 
     #[test]
     fn same_origin_keys_share_an_area() {
-        let first = storage_key("https", "example.com", 443);
-        let equivalent = storage_key("HTTPS", "EXAMPLE.COM", 443);
+        let first = context("https", "example.com", 443);
+        let equivalent = context("HTTPS", "EXAMPLE.COM", 443);
         let mut storage = OriginStorage::new();
 
-        storage.set_item(&first, "theme", "dark");
+        storage.set_item(&first, "theme", "dark").unwrap();
 
-        assert_eq!(storage.get_item(&equivalent, "theme"), Some("dark"));
-        assert_eq!(storage.len(&equivalent), 1);
+        assert_eq!(
+            storage.get_item(&equivalent, "theme").unwrap(),
+            Some("dark")
+        );
+        assert_eq!(storage.len(equivalent.storage_key()), 1);
     }
 
     #[test]
     fn clear_only_removes_the_selected_origin() {
-        let first = storage_key("https", "example.com", 443);
-        let second = storage_key("http", "example.com", 80);
+        let first = context("https", "example.com", 443);
+        let second = context("http", "example.com", 80);
         let mut storage = OriginStorage::new();
 
-        storage.set_item(&first, "name", "first");
-        storage.set_item(&second, "name", "second");
-        storage.clear(&first);
+        storage.set_item(&first, "name", "first").unwrap();
+        storage.set_item(&second, "name", "second").unwrap();
+        storage.clear(first.storage_key());
 
-        assert!(storage.is_empty(&first));
-        assert_eq!(storage.get_item(&second, "name"), Some("second"));
+        assert!(storage.is_empty(first.storage_key()));
+        assert_eq!(storage.get_item(&second, "name").unwrap(), Some("second"));
     }
 
     #[test]
     fn dropping_storage_discards_all_values() {
-        let key = storage_key("https", "example.com", 443);
+        let context = context("https", "example.com", 443);
         {
             let mut storage = OriginStorage::new();
-            storage.set_item(&key, "session", "temporary");
+            storage
+                .set_item(&context, "session", "temporary")
+                .unwrap();
         }
 
         let storage = OriginStorage::new();
-        assert!(storage.is_empty(&key));
+        assert!(storage.is_empty(context.storage_key()));
     }
 }
