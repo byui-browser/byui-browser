@@ -400,3 +400,77 @@ impl Request {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_mode_respects_tuple_and_opaque_origins() {
+        let mut request = Request::get("https://client.test/resource");
+        request.context.environment.origin = Some(Origin::parse("https://client.test").unwrap());
+
+        request.context.credentials = CredentialsMode::Omit;
+        assert!(!request.credentials_allowed(&Url::parse("https://client.test/other").unwrap()));
+
+        request.context.credentials = CredentialsMode::SameOrigin;
+        assert!(request.credentials_allowed(&Url::parse("https://client.test/other").unwrap()));
+        assert!(
+            !request.credentials_allowed(&Url::parse("https://client.test:8443/other").unwrap())
+        );
+        assert!(!request.credentials_allowed(&Url::parse("https://remote.test/other").unwrap()));
+
+        request.context.environment.origin = Some(Origin::opaque());
+        assert!(!request.credentials_allowed(&Url::parse("https://client.test/other").unwrap()));
+
+        request.context.credentials = CredentialsMode::Include;
+        assert!(request.credentials_allowed(&Url::parse("https://remote.test/other").unwrap()));
+    }
+
+    #[test]
+    fn referrer_policies_reduce_same_origin_cross_origin_and_downgrade_targets() {
+        let source = Url::parse("https://client.test/path?query=one").unwrap();
+        let same_origin = Url::parse("https://client.test/next").unwrap();
+        let cross_origin = Url::parse("https://remote.test/next").unwrap();
+        let downgrade = Url::parse("http://remote.test/next").unwrap();
+        let mut request = Request::get("https://client.test/resource");
+        request.context.environment.referrer = Some(source.clone());
+        request.set_referrer(Referrer::Client, ReferrerPolicy::Empty);
+
+        assert_eq!(
+            request.referrer_value(&same_origin).as_deref(),
+            Some(source.as_str())
+        );
+        assert_eq!(
+            request.referrer_value(&cross_origin).as_deref(),
+            Some("https://client.test")
+        );
+        assert_eq!(request.referrer_value(&downgrade), None);
+
+        request.set_referrer(Referrer::Client, ReferrerPolicy::NoReferrer);
+        assert_eq!(request.referrer_value(&same_origin), None);
+
+        request.set_referrer(Referrer::Client, ReferrerPolicy::OriginWhenCrossOrigin);
+        assert_eq!(
+            request.referrer_value(&same_origin).as_deref(),
+            Some(source.as_str())
+        );
+        assert_eq!(
+            request.referrer_value(&cross_origin).as_deref(),
+            Some("https://client.test")
+        );
+
+        request.set_referrer(Referrer::Client, ReferrerPolicy::SameOrigin);
+        assert_eq!(
+            request.referrer_value(&same_origin).as_deref(),
+            Some(source.as_str())
+        );
+        assert_eq!(request.referrer_value(&cross_origin), None);
+
+        request.set_referrer(Referrer::Client, ReferrerPolicy::UnsafeUrl);
+        assert_eq!(
+            request.referrer_value(&downgrade).as_deref(),
+            Some(source.as_str())
+        );
+    }
+}

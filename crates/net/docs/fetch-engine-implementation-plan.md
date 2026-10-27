@@ -40,9 +40,11 @@ Browser-owned `blob:` lifecycle work remains deferred.
 ### 1. Complete body semantics
 
 - Replace compatibility body/null flags with one authoritative body model.
-- Define and test every body state transition for helper reads, direct stream
-  reads, transport handoff, cache capture, failure, abort, cancellation, and
-  drop.
+- Define and test every remaining body state transition for helper reads,
+  direct stream reads, transport handoff, cache capture, failure, abort,
+  cancellation, and drop. Constructor metadata, URL-encoded/ArrayBuffer
+  reads, body equality/debug state, one-shot transport handoff, failed streams,
+  aborted streams, and malformed form-data errors now have focused tests.
 - Preserve response `Content-Length` metadata through live, cached, and
   provider-backed bodies.
 - Implement fallible response/body cloning and a bounded stream tee with

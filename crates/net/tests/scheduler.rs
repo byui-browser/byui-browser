@@ -12,7 +12,7 @@ use std::{
 };
 
 use common::{TestServer, runtime};
-use net::{Config, Request, RequestController};
+use net::{AbortController, Config, Request, RequestController, RequestError};
 
 #[test]
 fn zero_in_flight_limit_still_allows_a_request() {
@@ -78,4 +78,40 @@ fn scheduler_limits_active_transport_requests() {
 
     server.join();
     assert_eq!(maximum.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn aborting_a_queued_request_releases_admission_for_the_next_request() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let observed_hits = Arc::clone(&hits);
+    let server = TestServer::start(2, move |_| {
+        observed_hits.fetch_add(1, Ordering::SeqCst);
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+    });
+    let controller = RequestController::builder(Config {
+        max_in_flight: 1,
+        ..Config::default()
+    })
+    .build()
+    .unwrap();
+
+    runtime().block_on(async {
+        let first = controller.fetch(Request::get(server.url())).await.unwrap();
+        let abort = AbortController::new();
+        let mut queued_request = Request::get(server.url());
+        queued_request.set_signal(abort.signal());
+        let queued_controller = controller.clone();
+        let queued = tokio::spawn(async move { queued_controller.fetch(queued_request).await });
+
+        tokio::task::yield_now().await;
+        abort.abort();
+        assert!(matches!(queued.await.unwrap(), Err(RequestError::Aborted)));
+
+        drop(first);
+        let response = controller.fetch(Request::get(server.url())).await.unwrap();
+        assert_eq!(response.body.bytes().await.unwrap(), b"ok");
+    });
+
+    server.join();
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
