@@ -391,3 +391,74 @@ fn service_worker_interception_fails_before_cache_cookie_or_transport_work() {
     assert_eq!(services.cookie_writes.load(Ordering::SeqCst), 0);
     assert_eq!(services.cache_partitions.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn relative_urls_resolve_against_the_client_environment_and_invalid_joins_fail() {
+    let server = TestServer::start(1, |request| {
+        assert!(request.starts_with("GET /base/image.png HTTP"));
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+    });
+    let services = Arc::new(RecordingServices::new(false));
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(services)
+        .build()
+        .unwrap();
+    let environment = FetchEnvironment::from_url(
+        reqwest::Url::parse(&format!("{}/base/page.html", server.url())).unwrap(),
+    )
+    .unwrap();
+    let mut relative = Request::get("image.png");
+    relative.set_environment(environment.clone());
+
+    let response = runtime().block_on(controller.fetch(relative)).unwrap();
+    assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
+    server.join();
+
+    let mut invalid = Request::get("http://[::1");
+    invalid.set_environment(environment);
+    assert!(matches!(
+        runtime().block_on(controller.fetch(invalid)),
+        Err(RequestError::InvalidUrl(url)) if url == "http://[::1"
+    ));
+}
+
+#[test]
+fn connection_refusal_is_a_typed_transport_error() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+
+    assert!(matches!(
+        runtime().block_on(controller.fetch(Request::get(url))),
+        Err(RequestError::Transport(_))
+    ));
+}
+
+#[test]
+fn same_origin_mode_rejects_a_cross_origin_http_response_before_exposure() {
+    let server = TestServer::start(1, |_| {
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+    });
+    let services = Arc::new(RecordingServices::new(false));
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(services)
+        .build()
+        .unwrap();
+    let port = reqwest::Url::parse(&server.url()).unwrap().port().unwrap();
+    let mut request = Request::get(server.url());
+    request.set_mode(net::RequestMode::SameOrigin).unwrap();
+    request.set_environment(
+        FetchEnvironment::from_url(
+            reqwest::Url::parse(&format!("http://localhost:{port}/")).unwrap(),
+        )
+        .unwrap(),
+    );
+
+    let error = runtime().block_on(controller.fetch(request)).unwrap_err();
+    server.join();
+
+    assert!(matches!(error, RequestError::SameOriginViolation));
+}

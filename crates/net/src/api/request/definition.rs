@@ -473,4 +473,58 @@ mod tests {
             Some(source.as_str())
         );
     }
+
+    #[test]
+    fn request_mutators_enforce_method_body_and_no_cors_boundaries() {
+        for method in ["CONNECT", "TRACE", "TRACK"] {
+            assert!(matches!(
+                Request::new("https://example.test/", method),
+                Err(RequestError::ForbiddenMethod(actual)) if actual == method
+            ));
+        }
+
+        let mut get = Request::get("https://example.test/");
+        assert!(matches!(
+            get.set_body(Some(Body::from_text("payload"))),
+            Err(RequestError::BodyNotAllowed(method)) if method == "GET"
+        ));
+
+        let mut no_cors = Request::get("https://example.test/");
+        no_cors.set_mode(RequestMode::NoCors).unwrap();
+        assert!(matches!(
+            no_cors.set_method("PUT"),
+            Err(RequestError::NoCorsMethod(method)) if method == "PUT"
+        ));
+        no_cors.set_method("POST").unwrap();
+        no_cors
+            .set_body(Some(Body::from_bytes_with_content_type(
+                b"{}".to_vec(),
+                Some(HeaderValue::from_static("application/json")),
+            )))
+            .unwrap();
+        assert!(matches!(
+            no_cors.validate_body_state(64),
+            Err(RequestError::ForbiddenHeader(name)) if name == "content-type"
+        ));
+    }
+
+    #[test]
+    fn keepalive_body_limit_accepts_the_boundary_and_rejects_larger_bodies() {
+        let mut at_limit = Request::new("https://example.test/", "POST").unwrap();
+        at_limit.set_keepalive(true);
+        at_limit
+            .set_body(Some(Body::from_bytes(vec![0; 4])))
+            .unwrap();
+        assert!(at_limit.validate_body_state(4).is_ok());
+
+        let mut over_limit = Request::new("https://example.test/", "POST").unwrap();
+        over_limit.set_keepalive(true);
+        over_limit
+            .set_body(Some(Body::from_bytes(vec![0; 5])))
+            .unwrap();
+        assert!(matches!(
+            over_limit.validate_body_state(4),
+            Err(RequestError::KeepaliveBodyTooLarge { limit: 4 })
+        ));
+    }
 }

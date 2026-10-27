@@ -9,6 +9,10 @@ current redirect, scheduler, request-context, and unsupported-feature tests
 also cover POST rewriting, sensitive-header stripping, non-replayable 307
 requests, redirect limits, queued-request cancellation, credential/referrer
 decisions, and service-side-effect boundaries. The
+request-policy/transport hardening slice additionally covers forbidden
+methods and headers, no-CORS body rules, keepalive size boundaries, origin
+parsing and opaque-origin comparisons, relative URL resolution, connection
+refusal, same-origin response rejection, and post-header abort cleanup. The
 remaining work is conformance and integration coverage for behavior that is
 still partial or owned by browser services. The last recorded `cargo llvm-cov -p net` baseline
 is from 2026-10-21 (87.74% line coverage, 3,164/3,552 executable lines); it
@@ -31,20 +35,18 @@ is implemented:
   conversion failures. One-shot transport consumption and the distinction
   between body-already-used and body-already-consumed are now covered.
 - Request/header API edges: request getters and setters, forbidden methods and
-  headers, no-CORS method/content-type checks, body-not-allowed checks,
-  keepalive size limits, remaining redirect rewriting cases, remaining
-  referrer-policy branches, header guard immutability/internal removal,
+  headers, remaining no-CORS method/content-type combinations, remaining
+  request getter/setter coverage, header guard immutability/internal removal,
   default/invalid header parsing, and CORS-safelisted content types/ranges.
-- Origin and response validation: unsupported/invalid origins, opaque origins,
-  non-default ports, provider-origin mismatch/invalid-origin outcomes, and the
-  response-type decisions for navigation and credentialed requests.
+- Origin and response validation: provider-origin mismatch/invalid-origin
+  outcomes, and the response-type decisions for navigation and credentialed
+  requests.
 - HTTP execution: cache-mode branches, missing client-origin/cache
   revalidation/priority failures, URL joining and invalid joined URLs,
-  pre-send and in-flight aborts, remaining redirect failure paths, and
-  redirect URL-list accuracy.
+  remaining pre-send/in-flight abort timing, remaining redirect failure paths,
+  and redirect URL-list accuracy.
 - Transport and scheduling: abort immediately before transport,
-  transport/client initialization failures, and transport body-conversion
-  failures.
+  client initialization failures, and transport body-conversion failures.
 - Data and response boundaries: malformed percent escapes, response policy
   failures, and controller/debug paths that must remain typed and side-effect
   free.
@@ -127,6 +129,14 @@ navigation, and preflight requests fail before browser-service or network
 side effects. They also prove service-worker interception fails before cache,
 cookie, response, or transport work, and that canceling a scheduler-queued
 request releases admission for the next request.
+
+The hardening slice also covers forbidden request methods/headers, no-CORS
+content-type and range safelisting, known keepalive body-size boundaries,
+origin parsing, relative URL resolution, connection refusal, same-origin
+response rejection, and aborting a delivered HTTP response before its body is
+read. Failed, dropped, and aborted HTTP bodies now each have a regression
+proving that their scheduler permit is released and their response is not
+cached.
 
 Add tests for keepalive quotas, service-worker decisions beyond interception,
 CSP/mixed-content/CORP/MIME policy, offline behavior, timing hooks,
