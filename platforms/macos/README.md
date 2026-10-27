@@ -30,10 +30,10 @@ Dragging empty toolbar space moves the window, and double-clicking it toggles
 the zoomed size.
 
 From left to right the toolbar shows Back, Forward, Reload, a centered address
-field labelled `byui://welcome`, New Tab, and a menu button. Navigation is not
-implemented yet: Back and Forward are drawn disabled, Reload re-renders the
-welcome page, and the address field, New Tab, and menu only show hover and
-press feedback.
+field labelled `byui://welcome`, New Tab, and a menu button. Back and Forward
+are drawn disabled, Reload re-renders the welcome page, and the address field
+supports staged editing through click/`Ctrl+L`, Enter, Escape, and Backspace.
+New Tab and the menu remain visual placeholders.
 
 The chrome is drawn with `tiny-skia` (anti-aliased shapes) and `ab_glyph`
 (text in the macOS system font, loaded from `/System/Library/Fonts`), then

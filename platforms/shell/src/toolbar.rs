@@ -438,7 +438,21 @@ fn draw_address_field(
     };
     fill(pixmap, &shape, field, transform);
     // A device-pixel hairline stays crisp at every scale factor.
-    stroke(pixmap, &shape, palette.field_border, 1.0 / scale, transform);
+    stroke(
+        pixmap,
+        &shape,
+        if state.address_focused {
+            palette.accent
+        } else {
+            palette.field_border
+        },
+        if state.address_focused {
+            1.25 / scale
+        } else {
+            1.0 / scale
+        },
+        transform,
+    );
 
     let cy = CENTER_Y;
     let lock_x = rect.x() + 16.0;
@@ -860,5 +874,33 @@ mod tests {
         let dark = compose(400, 200, 1.0, &dark_state, "byui://welcome", None, None).unwrap();
         assert!(pixel(&light, 200, 4)[0] > 200);
         assert!(pixel(&dark, 200, 4)[0] < 60);
+    }
+
+    #[test]
+    fn focused_address_field_has_distinct_chrome() {
+        let normal = compose(
+            400,
+            200,
+            1.0,
+            &ChromeState::default(),
+            "byui://welcome",
+            None,
+            None,
+        )
+        .unwrap();
+        let focused = compose(
+            400,
+            200,
+            1.0,
+            &ChromeState {
+                address_focused: true,
+                ..ChromeState::default()
+            },
+            "byui://welcome",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_ne!(normal.data(), focused.data());
     }
 }
