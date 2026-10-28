@@ -1,6 +1,7 @@
 use std::io;
 
-use futures_util::stream;
+use bytes::Bytes;
+use futures_util::{StreamExt, stream};
 use http::header::HeaderValue;
 
 use super::*;

@@ -4,9 +4,22 @@ use encoding_rs::Encoding;
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 
-use super::{Blob, Body, FormData, RequestError, form_data, metadata};
+use super::{Blob, Body, BodyPhase, FormData, RequestError, form_data, metadata};
 
 impl Body {
+    /// Claims this body for one of the consuming helper methods.
+    pub(super) fn claim_for_helper(&self) -> Result<(), RequestError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| RequestError::BodyAlreadyUsed)?;
+        if state.phase != BodyPhase::Unused {
+            return Err(RequestError::BodyAlreadyUsed);
+        }
+        state.phase = BodyPhase::Locked;
+        Ok(())
+    }
+
     /// Consumes this body into owned bytes.
     pub async fn bytes(mut self) -> Result<Vec<u8>, RequestError> {
         self.claim_for_helper()?;
