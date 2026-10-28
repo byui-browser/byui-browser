@@ -452,7 +452,13 @@ mod tests {
             .expect("embedded page alias should resolve");
 
         assert_eq!(response.url, "byui://welcome/index.html?lang=en#top");
-        assert_eq!(response.headers.get("content-length"), Some("204".into()));
+        let expected_length = include_bytes!("../../../browser-pages/welcome/index.html")
+            .len()
+            .to_string();
+        assert_eq!(
+            response.headers.get("content-length"),
+            Some(expected_length)
+        );
         assert!(
             runtime
                 .block_on(response.body.bytes())
@@ -475,7 +481,13 @@ mod tests {
             .expect("embedded page HEAD should resolve");
 
         assert_eq!(response.status, 200);
-        assert_eq!(response.headers.get("content-length"), Some("204".into()));
+        let expected_length = include_bytes!("../../../browser-pages/welcome/index.html")
+            .len()
+            .to_string();
+        assert_eq!(
+            response.headers.get("content-length"),
+            Some(expected_length)
+        );
         assert!(response.body.is_null());
         assert!(runtime.block_on(response.body.bytes()).unwrap().is_empty());
     }
