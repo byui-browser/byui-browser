@@ -36,16 +36,10 @@ impl RequestController {
             url,
             status: allowed_url.status,
             status_text: Some(allowed_url.status_text.into()),
-            headers: vec![
-                (
-                    HeaderName::from_static("content-type"),
-                    HeaderValue::from_static(allowed_url.content_type),
-                ),
-                (
-                    HeaderName::from_static("content-length"),
-                    HeaderValue::from_static("0"),
-                ),
-            ],
+            headers: vec![(
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static(allowed_url.content_type),
+            )],
             media_type: None,
             origin: Origin::opaque(),
             body: allowed_url.body(request.method()),
@@ -83,11 +77,19 @@ enum AboutBody {
 impl AboutAllowlistEntry {
     fn body(&self, method: &Method) -> SchemeBody {
         if method == Method::HEAD {
-            SchemeBody::Null
-        } else {
-            match self.body {
-                AboutBody::Empty => SchemeBody::Bytes(Vec::new()),
-            }
+            return SchemeBody::NullWithLength(self.body.len());
+        }
+        match self.body {
+            AboutBody::Empty => SchemeBody::Bytes(Vec::new()),
+        }
+    }
+}
+
+impl AboutBody {
+    /// Returns the length of the selected representation without materializing it.
+    const fn len(self) -> usize {
+        match self {
+            Self::Empty => 0,
         }
     }
 }

@@ -424,15 +424,12 @@ fn relative_urls_resolve_against_the_client_environment_and_invalid_joins_fail()
 
 #[test]
 fn connection_refusal_is_a_typed_transport_error() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
     let controller = RequestController::builder(Config::default())
         .build()
         .unwrap();
 
     assert!(matches!(
-        runtime().block_on(controller.fetch(Request::get(url))),
+        runtime().block_on(controller.fetch(Request::get("http://127.0.0.1:9/"))),
         Err(RequestError::Transport(_))
     ));
 }

@@ -241,11 +241,9 @@ impl Body {
     }
 
     /// Creates a single buffered response body that observes cancellation.
-    pub(crate) fn once_with_signal(body: Vec<u8>, signal: AbortSignal) -> Self {
-        Self::from_stream_with_signal(
-            futures_util::stream::once(async move { Ok(Bytes::from(body)) }),
-            signal,
-        )
+    pub(crate) fn once_with_signal(body: impl Into<Bytes>, signal: AbortSignal) -> Self {
+        let body = body.into();
+        Self::from_stream_with_signal(futures_util::stream::once(async move { Ok(body) }), signal)
     }
 
     #[cfg(test)]

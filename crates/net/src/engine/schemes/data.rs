@@ -26,18 +26,11 @@ impl RequestController {
             url,
             status: 200,
             status_text: Some("OK".into()),
-            headers: vec![
-                (HeaderName::from_static("content-type"), media_type),
-                (
-                    HeaderName::from_static("content-length"),
-                    HeaderValue::from_str(&bytes.len().to_string())
-                        .expect("a byte length is a valid header value"),
-                ),
-            ],
+            headers: vec![(HeaderName::from_static("content-type"), media_type)],
             media_type: None,
             origin: Origin::opaque(),
             body: if request.method() == Method::HEAD {
-                SchemeBody::Null
+                SchemeBody::NullWithLength(bytes.len())
             } else {
                 SchemeBody::Bytes(bytes)
             },

@@ -17,6 +17,8 @@ use common::{TestServer, read_request, runtime};
 use futures_util::StreamExt;
 use net::{AbortController, Config, Request, RequestController, RequestError};
 
+const SCHEDULER_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
+
 #[test]
 fn fetch_yields_body_chunks_before_response_completion() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -75,7 +77,13 @@ fn incomplete_stream_forwards_error_and_is_not_cached() {
                 }
             }
         }
-        let retry = controller.fetch(Request::get(server.url())).await.unwrap();
+        let retry = tokio::time::timeout(
+            SCHEDULER_RELEASE_TIMEOUT,
+            controller.fetch(Request::get(server.url())),
+        )
+        .await
+        .expect("errored stream should release its scheduler permit")
+        .unwrap();
         (partial, (error, retry))
     });
 
@@ -110,7 +118,13 @@ fn dropping_a_stream_releases_its_scheduler_permit_and_does_not_cache() {
             b"body"
         );
         drop(response);
-        let retry = controller.fetch(Request::get(server.url())).await.unwrap();
+        let retry = tokio::time::timeout(
+            SCHEDULER_RELEASE_TIMEOUT,
+            controller.fetch(Request::get(server.url())),
+        )
+        .await
+        .expect("dropped stream should release its scheduler permit")
+        .unwrap();
         assert!(!retry.from_cache);
         assert_eq!(retry.body.bytes().await.unwrap(), b"body");
     });
@@ -145,7 +159,13 @@ fn aborting_after_headers_releases_the_permit_and_does_not_cache() {
             Err(RequestError::Aborted)
         ));
 
-        let retry = controller.fetch(Request::get(server.url())).await.unwrap();
+        let retry = tokio::time::timeout(
+            SCHEDULER_RELEASE_TIMEOUT,
+            controller.fetch(Request::get(server.url())),
+        )
+        .await
+        .expect("aborted stream should release its scheduler permit")
+        .unwrap();
         assert!(!retry.from_cache);
         assert_eq!(retry.body.bytes().await.unwrap(), b"body");
     });

@@ -445,32 +445,29 @@ mod tests {
         let controller = request_controller(None);
         let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
         let response = runtime
-            .block_on(fetch_text_response(
-                &controller,
-                "byui://welcome/index.html?lang=en#top",
-            ))
+            .block_on(controller.fetch(Request::get("byui://welcome/index.html?lang=en#top")))
             .expect("embedded page alias should resolve");
 
         assert_eq!(response.url, "byui://welcome/index.html?lang=en#top");
-        let expected_length = include_bytes!("../../../browser-pages/welcome/index.html")
-            .len()
-            .to_string();
+        let body = runtime.block_on(response.body.bytes()).unwrap();
         assert_eq!(
             response.headers.get("content-length"),
-            Some(expected_length)
+            Some(body.len().to_string())
         );
-        assert!(
-            runtime
-                .block_on(response.body.bytes())
-                .unwrap()
-                .starts_with(b"<!doctype")
-        );
+        assert!(body.starts_with(b"<!doctype"));
     }
 
     #[test]
     fn embedded_page_head_preserves_metadata_without_a_body() {
         let controller = request_controller(None);
         let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let get_response = runtime
+            .block_on(controller.fetch(Request::get("byui://welcome/page?lang=en#top")))
+            .expect("embedded page GET should resolve");
+        let expected_length = get_response
+            .headers
+            .get("content-length")
+            .expect("embedded page GET should expose content length");
         let mut request = Request::get("byui://welcome/page?lang=en#top");
         request
             .set_method(net::Method::HEAD)
@@ -481,9 +478,6 @@ mod tests {
             .expect("embedded page HEAD should resolve");
 
         assert_eq!(response.status, 200);
-        let expected_length = include_bytes!("../../../browser-pages/welcome/index.html")
-            .len()
-            .to_string();
         assert_eq!(
             response.headers.get("content-length"),
             Some(expected_length)
@@ -507,13 +501,6 @@ mod tests {
                 kind: net::ProviderErrorKind::ResourceMissing
             }
         ));
-    }
-
-    async fn fetch_text_response(
-        controller: &RequestController,
-        url: &str,
-    ) -> Result<net::Response, net::RequestError> {
-        controller.fetch(Request::get(url)).await
     }
 
     #[test]

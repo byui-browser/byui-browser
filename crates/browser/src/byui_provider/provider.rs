@@ -26,9 +26,9 @@ impl BrowserPageProvider {
 
 impl PageProvider for BrowserPageProvider {
     /// Resolves a supported `byui:` page or static subresource.
-    fn resolve<'a>(&'a self, _request: &'a Request, url: &'a Url) -> ProviderFuture<'a> {
+    fn resolve<'a>(&'a self, request: &'a Request, url: &'a Url) -> ProviderFuture<'a> {
         let resource = find_resource(url)
-            .map(|definition| resource(url.clone(), definition))
+            .map(|definition| resource(request, url.clone(), definition))
             .ok_or(RequestError::Provider {
                 provider: "byui page",
                 kind: ProviderErrorKind::ResourceMissing,
@@ -39,23 +39,24 @@ impl PageProvider for BrowserPageProvider {
 }
 
 /// Builds provider-neutral metadata for one embedded resource.
-fn resource(url: Url, definition: &super::registry::ResourceDefinition) -> SchemeResource {
+fn resource(
+    request: &Request,
+    url: Url,
+    definition: &super::registry::ResourceDefinition,
+) -> SchemeResource {
     let media_type = HeaderValue::from_static(definition.media_type);
     SchemeResource {
         url,
         status: 200,
         status_text: Some("OK".into()),
-        headers: vec![
-            (HeaderName::from_static("content-type"), media_type.clone()),
-            (
-                HeaderName::from_static("content-length"),
-                HeaderValue::from_str(&definition.body.len().to_string())
-                    .expect("an embedded resource length is a valid header value"),
-            ),
-        ],
+        headers: vec![(HeaderName::from_static("content-type"), media_type.clone())],
         media_type: Some(media_type),
         origin: Origin::opaque(),
-        body: SchemeBody::Bytes(definition.body.to_vec()),
+        body: if request.method() == net::Method::HEAD {
+            SchemeBody::NullWithLength(definition.body.len())
+        } else {
+            SchemeBody::StaticBytes(definition.body)
+        },
     }
 }
 

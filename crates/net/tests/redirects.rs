@@ -10,6 +10,19 @@ use std::sync::{
 use common::{TestServer, collect_body, runtime};
 use net::{Body, Config, RedirectMode, Request, RequestController, RequestError};
 
+fn request_has_header(request: &str, name: &str) -> bool {
+    request
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .any(|(header, _)| header.eq_ignore_ascii_case(name))
+}
+
+fn request_body(request: &str) -> &str {
+    request.split_once("\r\n\r\n").map_or("", |(_, body)| body)
+}
+
 #[test]
 fn follow_mode_follows_redirect_and_exposes_final_response() {
     let server = TestServer::start(2, |request| {
@@ -95,11 +108,12 @@ fn post_redirect_rewrites_to_get_and_removes_body_headers() {
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(requests[0].starts_with("POST /start HTTP"));
-    assert!(requests[0].contains("content-type: text/plain;charset=UTF-8"));
+    assert!(request_has_header(&requests[0], "content-type"));
+    assert_eq!(request_body(&requests[0]), "payload");
     assert!(requests[1].starts_with("GET /next HTTP"));
-    assert!(!requests[1].contains("content-type:"));
-    assert!(!requests[1].contains("content-length:"));
-    assert!(!requests[1].ends_with("payload"));
+    assert!(!request_has_header(&requests[1], "content-type"));
+    assert!(!request_has_header(&requests[1], "content-length"));
+    assert!(request_body(&requests[1]).is_empty());
 }
 
 #[test]
@@ -138,7 +152,35 @@ fn cross_origin_redirect_strips_sensitive_headers() {
 
     let requests = destination_requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
-    assert!(!requests[0].contains("authorization:"));
+    assert!(!request_has_header(&requests[0], "authorization"));
+}
+
+#[test]
+fn replayable_body_follows_a_307_redirect_unchanged() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&requests);
+    let server = TestServer::start(2, move |request| {
+        observed.lock().unwrap().push(request.to_owned());
+        if request.starts_with("POST /start HTTP") {
+            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        } else {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+        }
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+    let mut request = Request::new(format!("{}/start", server.url()), "POST").unwrap();
+    request.set_body(Some(Body::from_text("payload"))).unwrap();
+
+    let response = runtime().block_on(controller.fetch(request)).unwrap();
+    assert_eq!(runtime().block_on(collect_body(response)).unwrap(), b"ok");
+    server.join();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].starts_with("POST /next HTTP"));
+    assert_eq!(request_body(&requests[1]), "payload");
 }
 
 #[test]
