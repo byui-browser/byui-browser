@@ -602,8 +602,7 @@ fn realm_script_bindings_persist_between_scripts() {
 #[test]
 fn unsupported_syntax_is_rejected_at_parse_time() {
     for source in [
-        // Object and array literals.
-        "let o = {};",
+        // Array literals.
         "let a = [1, 2];",
         // Update and compound assignment.
         "let i = 0; i++;",

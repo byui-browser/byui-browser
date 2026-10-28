@@ -2,7 +2,10 @@ mod assignment;
 mod binary_operator;
 mod call;
 mod logical;
+mod object;
 mod unary;
+
+pub(in crate::parser) use call::property_name;
 
 use super::{ParseResult, Parser};
 use crate::ast::Expr;

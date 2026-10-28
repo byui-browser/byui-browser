@@ -13,8 +13,7 @@ pub mod local_storage;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use common::ids::NodeId;
-use html::{Attribute, DOMTokenList, HTMLDocument, Namespace, NodeKind};
+use html::{Attribute, DOMTokenList, HTMLDocument, Namespace, NodeID, NodeKind};
 use js::{HostFunction, JsError, JsResult, Object, Realm, Value};
 use net::{Request, RequestController};
 
@@ -107,7 +106,7 @@ pub fn register_fetch(realm: &mut Realm, controller: Arc<RequestController>) -> 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Element {
     /// Index of this element in its document's DOM arena.
-    pub node: NodeId,
+    pub node: NodeID,
     /// The element's HTML local name, normalized to ASCII lowercase.
     pub local_name: String,
     /// Namespace of this element, used to apply the DOM's HTML name matching
@@ -456,7 +455,7 @@ pub fn add_event_listener(document: &Document, arguments: &[Value]) -> JsResult<
     add_event_listener_at(document, None, arguments)
 }
 
-fn event_target_for(document: &Document, node: Option<NodeId>) -> EventTargetRef {
+fn event_target_for(document: &Document, node: Option<NodeID>) -> EventTargetRef {
     match node {
         None => document.event_target.clone(),
         Some(node) => {
@@ -465,7 +464,7 @@ fn event_target_for(document: &Document, node: Option<NodeId>) -> EventTargetRef
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             targets
-                .entry(node.index() as usize)
+                .entry(node.get())
                 .or_insert_with(|| Arc::new(Mutex::new(EventTarget::default())))
                 .clone()
         }
@@ -474,7 +473,7 @@ fn event_target_for(document: &Document, node: Option<NodeId>) -> EventTargetRef
 
 fn add_event_listener_at(
     document: &Document,
-    node: Option<NodeId>,
+    node: Option<NodeID>,
     arguments: &[Value],
 ) -> JsResult<Value> {
     let [event_type, callback, options @ ..] = arguments else {
@@ -553,7 +552,7 @@ pub fn remove_event_listener(document: &Document, arguments: &[Value]) -> JsResu
 
 fn remove_event_listener_at(
     document: &Document,
-    node: Option<NodeId>,
+    node: Option<NodeID>,
     arguments: &[Value],
 ) -> JsResult<Value> {
     let [event_type, callback, options @ ..] = arguments else {
@@ -653,7 +652,7 @@ fn invoke_listeners(
     }
 }
 
-fn element_for_node(document: &Document, node: NodeId) -> Option<Element> {
+fn element_for_node(document: &Document, node: NodeID) -> Option<Element> {
     document
         .elements
         .iter()
@@ -663,7 +662,7 @@ fn element_for_node(document: &Document, node: NodeId) -> Option<Element> {
 
 fn dispatch_event_at(
     document: &Document,
-    node: Option<NodeId>,
+    node: Option<NodeID>,
     target_object: &Object,
     arguments: &[Value],
 ) -> JsResult<Value> {
@@ -691,12 +690,7 @@ fn dispatch_event_at(
         current = document
             .source_document
             .as_ref()
-            .and_then(|source| {
-                source
-                    .node(html::NodeId(current_node.index() as usize))
-                    .and_then(|n| n.parent)
-            })
-            .map(|parent| NodeId::new(parent.index() as u32));
+            .and_then(|source| source.node(current_node).and_then(|n| n.parent));
     }
     let document_target = document.event_target.clone();
     if node.is_some() {
@@ -949,7 +943,7 @@ impl Document {
         };
 
         Ok(Element {
-            node: NodeId::new(node.index() as u32),
+            node,
             local_name: element.name.clone(),
             namespace: element.namespace,
             id_attr: None,
@@ -965,19 +959,19 @@ impl Document {
             .find(|element| element.id_attr.as_deref() == Some(id))
     }
 
-    fn element_by_node(&self, node: NodeId) -> Option<&Element> {
+    fn element_by_node(&self, node: NodeID) -> Option<&Element> {
         self.elements.iter().find(|element| element.node == node)
     }
 
     fn set_attribute(
         &mut self,
-        node: NodeId,
+        node: NodeID,
         qualified_name: &str,
         value: &str,
     ) -> JsResult<Value> {
         let document = self.source_document.get_or_insert_with(HTMLDocument::new);
         document
-            .set_attribute(html::NodeId(node.index() as usize), qualified_name, value)
+            .set_attribute(node, qualified_name, value)
             .map_err(|error| JsError::new(error.to_string()))?;
         self.elements = collect_elements(document);
         Ok(Value::Undefined)
@@ -1000,10 +994,10 @@ impl Document {
     /// Implements the DOM `Element.classList` getter for an element in this
     /// document. The returned live token list mutates the element's `class`
     /// attribute through the DOM Standard operations.
-    pub fn class_list(&mut self, element: NodeId) -> JsResult<DOMTokenList<'_>> {
+    pub fn class_list(&mut self, element: NodeID) -> JsResult<DOMTokenList<'_>> {
         self.source_document
             .get_or_insert_with(HTMLDocument::new)
-            .class_list(html::NodeId(element.index() as usize))
+            .class_list(element)
             .map_err(|error| JsError::new(error.to_string()))
     }
 
@@ -1012,12 +1006,12 @@ impl Document {
     /// The node and its descendants remain allocated and retain their stable
     /// IDs, but they are no longer reachable from the document root. Removing
     /// a detached node, the document root, or an invalid node ID is a no-op.
-    pub fn remove(&mut self, node: NodeId) {
+    pub fn remove(&mut self, node: NodeID) {
         let Some(document) = self.source_document.as_mut() else {
             return;
         };
 
-        document.remove(html::NodeId(node.index() as usize));
+        document.remove(node);
         self.elements = collect_elements(document);
     }
 
@@ -1029,7 +1023,7 @@ impl Document {
     /// [`SelectorError`], corresponding to the DOM `SyntaxError` exception.
     /// Supported selectors are element names, `*`, IDs, classes, compound
     /// combinations of those forms, and comma-separated selector lists.
-    pub fn query_selector_all(&self, selector: &str) -> Result<Vec<NodeId>, SelectorError> {
+    pub fn query_selector_all(&self, selector: &str) -> Result<Vec<NodeID>, SelectorError> {
         let selectors = parse_selector_list(selector)?;
         let mut matches = Vec::new();
         let Some(document) = &self.source_document else {
@@ -1038,9 +1032,9 @@ impl Document {
 
         fn collect(
             document: &HTMLDocument,
-            parent: html::NodeId,
+            parent: html::NodeID,
             selectors: &[SimpleSelector],
-            matches: &mut Vec<NodeId>,
+            matches: &mut Vec<NodeID>,
         ) {
             let Some(parent_node) = document.node(parent) else {
                 return;
@@ -1051,7 +1045,7 @@ impl Document {
                 };
                 if let NodeKind::Element(element) = &node.kind {
                     if selectors.iter().any(|selector| selector.matches(element)) {
-                        matches.push(NodeId::new(child.index() as u32));
+                        matches.push(*child);
                     }
                     collect(document, *child, selectors, matches);
                 }
@@ -1070,13 +1064,13 @@ impl Document {
     /// rules are checked before changing the tree; invalid insertions return a
     /// [`DomException`]. The current DOM model supports existing node IDs only;
     /// it does not yet provide `DocumentFragment` or JavaScript `Node` values.
-    pub fn append_child(&mut self, child: NodeId) -> Result<NodeId, DomException> {
+    pub fn append_child(&mut self, child: NodeID) -> Result<NodeID, DomException> {
         if self.source_document.is_none() {
             self.source_document = Some(HTMLDocument::new());
         }
         let source = self.source_document.as_ref().unwrap();
         let root = source.root;
-        let child_id = html::NodeId(child.index() as usize);
+        let child_id = child;
         let child_node = source.node(child_id).ok_or(DomException::NotFoundError)?;
 
         if child_id == root || matches!(child_node.kind, NodeKind::Document) {
@@ -1126,15 +1120,15 @@ impl Document {
         }
 
         let document = self.source_document.as_mut().unwrap();
-        if let Some(parent) = document.nodes[child_id.0].parent {
-            let siblings = &mut document.nodes[parent.0].children;
+        if let Some(parent) = document.nodes[child_id.get()].parent {
+            let siblings = &mut document.nodes[parent.get()].children;
             let Some(position) = siblings.iter().position(|sibling| *sibling == child_id) else {
                 return Err(DomException::NotFoundError);
             };
             siblings.remove(position);
         }
-        document.nodes[child_id.0].parent = Some(root);
-        document.nodes[root.0].children.push(child_id);
+        document.nodes[child_id.get()].parent = Some(root);
+        document.nodes[root.get()].children.push(child_id);
         self.elements = collect_elements(document);
 
         Ok(child)
@@ -1142,7 +1136,7 @@ impl Document {
 }
 
 fn collect_elements(document: &HTMLDocument) -> Vec<Element> {
-    fn collect(document: &HTMLDocument, parent: html::NodeId, elements: &mut Vec<Element>) {
+    fn collect(document: &HTMLDocument, parent: NodeID, elements: &mut Vec<Element>) {
         let Some(node) = document.node(parent) else {
             return;
         };
@@ -1156,7 +1150,7 @@ fn collect_elements(document: &HTMLDocument) -> Vec<Element> {
                         .find(|attribute| attribute.name == "id")
                         .map(|attribute| attribute.value.clone());
                     elements.push(Element {
-                        node: NodeId::new(child.index() as u32),
+                        node: *child,
                         local_name: element.name.clone(),
                         namespace: element.namespace,
                         id_attr,
@@ -1376,8 +1370,7 @@ mod tests {
         event_constructor, fetch, lock_event_target, print, register_alert, register_document,
         register_fetch, register_print, remove_event_listener,
     };
-    use common::ids::NodeId;
-    use html::{Attribute, ElementData, HTMLDocument, Namespace, NodeKind, parse_raw_html};
+    use html::{Attribute, ElementData, HTMLDocument, Namespace, NodeID, NodeKind, parse_raw_html};
     use js::{JsError, Realm, Value};
     use net::{Config, RequestController};
     use std::sync::{Arc, Mutex};
@@ -1836,7 +1829,7 @@ mod tests {
         let element = document
             .get_element_by_id("nested")
             .expect("nested element");
-        assert_eq!(element.node.index(), 2);
+        assert_eq!(element.node.get(), 2);
         assert_eq!(document.get_element_by_id("NESTED"), None);
     }
 
@@ -1854,7 +1847,7 @@ mod tests {
     #[test]
     fn element_set_attribute_rejects_invalid_names() {
         let mut element = super::Element {
-            node: NodeId::new(1),
+            node: NodeID::new(1),
             local_name: "main".into(),
             namespace: Namespace::Html,
             id_attr: None,
@@ -1885,7 +1878,7 @@ mod tests {
         let element = document.create_element("CuStOm-Widget").unwrap();
 
         assert_eq!(element.local_name, "custom-widget");
-        assert_eq!(element.node.index(), 1);
+        assert_eq!(element.node.get(), 1);
         assert_eq!(element.id_attr, None);
     }
 
@@ -1909,19 +1902,19 @@ mod tests {
         ));
         let first = document.create_element("DIV").unwrap();
         let second = document.create_element("span").unwrap();
-        assert_eq!(first.node, NodeId::new(2));
-        assert_eq!(second.node, NodeId::new(3));
+        assert_eq!(first.node, NodeID::new(2));
+        assert_eq!(second.node, NodeID::new(3));
         assert_eq!(
             document.query_selector_all("*").unwrap(),
-            vec![NodeId::new(1)]
+            vec![NodeID::new(1)]
         );
         assert_eq!(
             document.get_element_by_id("existing").unwrap().node,
-            NodeId::new(1)
+            NodeID::new(1)
         );
         let source = document.source_document.as_ref().unwrap();
-        assert_eq!(source.node(html::NodeId(2)).unwrap().parent, None);
-        assert_eq!(source.node(html::NodeId(3)).unwrap().parent, None);
+        assert_eq!(source.node(NodeID::new(2)).unwrap().parent, None);
+        assert_eq!(source.node(NodeID::new(3)).unwrap().parent, None);
     }
 
     #[test]
@@ -1930,14 +1923,14 @@ mod tests {
             "<section><span id='target'></span></section><p id='other'></p>".to_owned(),
         );
         let mut document = super::Document::from_html_document(&html_document);
-        let section = NodeId::new(1);
+        let section = NodeID::new(1);
 
         document.remove(section);
 
         assert_eq!(document.get_element_by_id("target"), None);
         assert_eq!(
             document.get_element_by_id("other").unwrap().node,
-            NodeId::new(3)
+            NodeID::new(3)
         );
         assert_eq!(document.query_selector_all("span").unwrap(), Vec::new());
     }
@@ -1947,8 +1940,8 @@ mod tests {
         let html_document = parse_raw_html("<div id='target'></div>".to_owned());
         let mut document = super::Document::from_html_document(&html_document);
 
-        document.remove(NodeId::new(99));
-        document.remove(NodeId::new(0));
+        document.remove(NodeID::new(99));
+        document.remove(NodeID::new(0));
 
         assert!(document.get_element_by_id("target").is_some());
     }
@@ -1963,15 +1956,15 @@ mod tests {
 
         assert_eq!(
             document.query_selector_all(".target, article").unwrap(),
-            vec![NodeId::new(2), NodeId::new(3), NodeId::new(4)]
+            vec![NodeID::new(2), NodeID::new(3), NodeID::new(4)]
         );
         assert_eq!(
             document.query_selector_all("*").unwrap(),
             vec![
-                NodeId::new(1),
-                NodeId::new(2),
-                NodeId::new(3),
-                NodeId::new(4)
+                NodeID::new(1),
+                NodeID::new(2),
+                NodeID::new(3),
+                NodeID::new(4)
             ]
         );
     }
@@ -2000,7 +1993,7 @@ mod tests {
             None,
         );
         let mut document = super::Document::from_html_document(&html_document);
-        let child = NodeId::new(html_child.index() as u32);
+        let child = html_child;
 
         assert_eq!(document.append_child(child), Ok(child));
         let source = document.source_document.as_ref().unwrap();
@@ -2023,7 +2016,7 @@ mod tests {
         html_document.append_child(html_document.root, element);
         html_document.append_child(element, comment);
         let mut document = super::Document::from_html_document(&html_document);
-        let comment_id = NodeId::new(comment.index() as u32);
+        let comment_id = comment;
 
         assert_eq!(document.append_child(comment_id), Ok(comment_id));
         let source = document.source_document.as_ref().unwrap();
@@ -2059,7 +2052,7 @@ mod tests {
         let before = document.source_document.clone();
 
         assert_eq!(
-            document.append_child(NodeId::new(second_element.index() as u32)),
+            document.append_child(second_element),
             Err(DomException::HierarchyRequestError)
         );
         assert_eq!(document.source_document, before);
@@ -2070,7 +2063,7 @@ mod tests {
         let mut document = super::Document::new();
 
         assert_eq!(
-            document.append_child(NodeId::new(99)),
+            document.append_child(NodeID::new(99)),
             Err(DomException::NotFoundError)
         );
     }

@@ -1,52 +1,56 @@
-//! JavaScript `localStorage` bindings backed by in-memory origin storage.
+//! JavaScript `localStorage` bindings.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use js::{HostFunction, JsError, JsResult, Realm, Value};
-use security::StorageKey;
-use storage::OriginStorage;
+use security::RendererSecurityContext;
+use storage::SharedStorage;
 
-/// JavaScript-facing storage for one trusted origin.
-///
-/// The storage manager is shared so multiple realms can observe the same
-/// origin area. The caller must provide a `StorageKey` from the browser's
-/// security context; JavaScript cannot choose or change it.
+/// JavaScript-facing storage for one renderer context.
 #[derive(Debug, Clone)]
 pub struct LocalStorage {
-    storage: Arc<Mutex<OriginStorage>>,
-    storage_key: StorageKey,
+    storage: SharedStorage,
+    security_context: RendererSecurityContext,
 }
 
 impl LocalStorage {
-    /// Creates a binding for one trusted origin.
+    /// Creates a binding for one trusted renderer context.
     #[must_use]
-    pub fn new(storage: Arc<Mutex<OriginStorage>>, storage_key: StorageKey) -> Self {
+    pub fn new(storage: SharedStorage, security_context: RendererSecurityContext) -> Self {
         Self {
             storage,
-            storage_key,
+            security_context,
         }
     }
 
     /// Stores a value in this binding's origin area.
     pub fn set_item(&self, key: &str, value: &str) -> JsResult<()> {
+        if !self.security_context.can_write_storage() {
+            return Err(JsError::new("localStorage write access denied"));
+        }
+
         self.storage
             .lock()
             .map_err(|_| JsError::new("localStorage is unavailable"))?
-            .set_item(&self.storage_key, key, value);
-        Ok(())
+            .write_item(self.security_context.storage_key(), key, value)
+            .map_err(|error| JsError::new(error.to_string()))
     }
 
     /// Reads a value from this binding's origin area.
     pub fn get_item(&self, key: &str) -> JsResult<Option<String>> {
-        let storage = self
-            .storage
+        if !self.security_context.can_read_storage() {
+            return Err(JsError::new("localStorage read access denied"));
+        }
+
+        self.storage
             .lock()
-            .map_err(|_| JsError::new("localStorage is unavailable"))?;
-        Ok(storage.get_item(&self.storage_key, key).map(str::to_owned))
+            .map_err(|_| JsError::new("localStorage is unavailable"))?
+            .read_item(self.security_context.storage_key(), key)
+            .map_err(|error| JsError::new(error.to_string()))
     }
 }
 
-/// Implements JavaScript `localStorage.setItem(key, value)` for one binding.
+/// Implements JavaScript `localStorage.setItem(key, value)`.
 pub fn set_item(storage: &LocalStorage, arguments: &[Value]) -> JsResult<Value> {
     let [Value::String(key), Value::String(value)] = arguments else {
         return Err(JsError::new(
@@ -58,7 +62,7 @@ pub fn set_item(storage: &LocalStorage, arguments: &[Value]) -> JsResult<Value> 
     Ok(Value::Undefined)
 }
 
-/// Implements JavaScript `localStorage.getItem(key)` for one binding.
+/// Implements JavaScript `localStorage.getItem(key)`.
 pub fn get_item(storage: &LocalStorage, arguments: &[Value]) -> JsResult<Value> {
     let [Value::String(key)] = arguments else {
         return Err(JsError::new(
@@ -73,15 +77,12 @@ pub fn get_item(storage: &LocalStorage, arguments: &[Value]) -> JsResult<Value> 
 }
 
 /// Registers origin-scoped `localStorage` functions in a JavaScript realm.
-///
-/// This connects JavaScript to in-memory storage only. Persistence, IPC, and
-/// renderer authentication are intentionally outside this partial binding.
 pub fn register_local_storage(
     realm: &mut Realm,
-    storage: Arc<Mutex<OriginStorage>>,
-    storage_key: StorageKey,
+    storage: SharedStorage,
+    security_context: RendererSecurityContext,
 ) -> JsResult<()> {
-    let local_storage = LocalStorage::new(storage, storage_key);
+    let local_storage = LocalStorage::new(storage, security_context);
     let set_item_storage = local_storage.clone();
     let get_item_storage = local_storage;
     let set_item_function: HostFunction =
@@ -95,26 +96,37 @@ pub fn register_local_storage(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use js::{Realm, Value};
-    use security::{Origin, StorageKey};
-    use storage::OriginStorage;
+    use security::{Origin, RendererSecurityContext, StoragePermission};
+    use storage::{OriginStorage, PersistentOriginStorage, SharedStorage, shared_storage};
 
     use super::{LocalStorage, get_item, register_local_storage, set_item};
 
-    fn storage_key(host: &str) -> StorageKey {
-        StorageKey::new(Origin::with_port("https", host, 443))
+    fn shared_memory_storage() -> SharedStorage {
+        shared_storage(OriginStorage::new())
     }
 
-    fn shared_storage() -> Arc<Mutex<OriginStorage>> {
-        Arc::new(Mutex::new(OriginStorage::new()))
+    fn context(host: &str, permission: StoragePermission) -> RendererSecurityContext {
+        RendererSecurityContext::new(Origin::with_port("https", host, 443), permission)
+    }
+
+    fn test_directory() -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("byui-webapis-storage-{suffix}"))
     }
 
     #[test]
     fn set_then_get_round_trips_through_binding() {
-        let storage = shared_storage();
-        let binding = LocalStorage::new(storage, storage_key("example.com"));
+        let binding = LocalStorage::new(
+            shared_memory_storage(),
+            context("example.com", StoragePermission::Allowed),
+        );
 
         binding.set_item("name", "Nestor").unwrap();
 
@@ -123,14 +135,20 @@ mod tests {
 
     #[test]
     fn missing_items_return_none() {
-        let binding = LocalStorage::new(shared_storage(), storage_key("example.com"));
+        let binding = LocalStorage::new(
+            shared_memory_storage(),
+            context("example.com", StoragePermission::Allowed),
+        );
 
         assert_eq!(binding.get_item("missing").unwrap(), None);
     }
 
     #[test]
     fn javascript_set_item_writes_to_storage() {
-        let binding = LocalStorage::new(shared_storage(), storage_key("example.com"));
+        let binding = LocalStorage::new(
+            shared_memory_storage(),
+            context("example.com", StoragePermission::Allowed),
+        );
 
         let result = set_item(
             &binding,
@@ -146,7 +164,10 @@ mod tests {
 
     #[test]
     fn javascript_get_item_returns_null_for_missing_items() {
-        let binding = LocalStorage::new(shared_storage(), storage_key("example.com"));
+        let binding = LocalStorage::new(
+            shared_memory_storage(),
+            context("example.com", StoragePermission::Allowed),
+        );
 
         assert_eq!(
             get_item(&binding, &[Value::String("name".to_owned())]),
@@ -156,9 +177,13 @@ mod tests {
 
     #[test]
     fn registered_functions_use_real_storage() {
-        let storage = shared_storage();
         let mut realm = Realm::new();
-        register_local_storage(&mut realm, storage, storage_key("example.com")).unwrap();
+        register_local_storage(
+            &mut realm,
+            shared_memory_storage(),
+            context("example.com", StoragePermission::Allowed),
+        )
+        .unwrap();
 
         assert_eq!(
             realm.call_global(
@@ -178,16 +203,21 @@ mod tests {
 
     #[test]
     fn registered_functions_keep_origins_isolated() {
-        let storage = shared_storage();
+        let storage = shared_memory_storage();
         let mut first_realm = Realm::new();
         let mut second_realm = Realm::new();
         register_local_storage(
             &mut first_realm,
-            Arc::clone(&storage),
-            storage_key("first.example"),
+            storage.clone(),
+            context("first.example", StoragePermission::Allowed),
         )
         .unwrap();
-        register_local_storage(&mut second_realm, storage, storage_key("second.example")).unwrap();
+        register_local_storage(
+            &mut second_realm,
+            storage,
+            context("second.example", StoragePermission::Allowed),
+        )
+        .unwrap();
 
         first_realm
             .call_global(
@@ -207,9 +237,63 @@ mod tests {
 
     #[test]
     fn javascript_arguments_are_validated() {
-        let binding = LocalStorage::new(shared_storage(), storage_key("example.com"));
+        let binding = LocalStorage::new(
+            shared_memory_storage(),
+            context("example.com", StoragePermission::Allowed),
+        );
 
         assert!(set_item(&binding, &[Value::String("only-key".to_owned())]).is_err());
         assert!(get_item(&binding, &[]).is_err());
+    }
+
+    #[test]
+    fn denied_context_cannot_read_or_write_storage() {
+        let binding = LocalStorage::new(
+            shared_memory_storage(),
+            context("example.com", StoragePermission::Denied),
+        );
+
+        assert!(binding.set_item("name", "Nestor").is_err());
+        assert!(binding.get_item("name").is_err());
+    }
+
+    #[test]
+    fn javascript_binding_survives_backend_reopen() {
+        let path = test_directory();
+        let renderer_context = context("example.com", StoragePermission::Allowed);
+
+        {
+            let mut realm = Realm::new();
+            register_local_storage(
+                &mut realm,
+                shared_storage(PersistentOriginStorage::open(&path).unwrap()),
+                renderer_context.clone(),
+            )
+            .unwrap();
+            realm
+                .call_global(
+                    "localStorage.setItem",
+                    &[
+                        Value::String("theme".to_owned()),
+                        Value::String("dark".to_owned()),
+                    ],
+                )
+                .unwrap();
+        }
+
+        let mut reopened_realm = Realm::new();
+        register_local_storage(
+            &mut reopened_realm,
+            shared_storage(PersistentOriginStorage::open(&path).unwrap()),
+            renderer_context,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened_realm
+                .call_global("localStorage.getItem", &[Value::String("theme".to_owned())],),
+            Ok(Value::String("dark".to_owned()))
+        );
+
+        let _ = std::fs::remove_dir_all(path);
     }
 }
