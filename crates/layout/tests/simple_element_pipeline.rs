@@ -4,9 +4,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use html::parse_raw_html;
-use layout::{Size, StyledDom, layout_tree};
+use layout::{Size, layout_document};
 use paint::paint_document;
-use render::Compositor;
+use render::{BitmapFont, Compositor};
 
 fn write_png(path: &std::path::Path, frame: &render::Frame) {
     let file = fs::File::create(path).expect("create rendered image");
@@ -34,19 +34,20 @@ fn parses_lays_out_paints_and_writes_a_simple_element_image() {
         width: 160.0,
         height: 120.0,
     };
-    let layout = layout_tree(&StyledDom::from_html_document(&document), viewport);
+    let styles = css::style_document(&document, &[]);
+    let layout = layout_document(&document, &styles, viewport, &BitmapFont);
     assert_eq!(layout.root.children.len(), 1);
     assert_eq!(layout.root.children[0].rect.width, viewport.width);
 
-    let display_list = paint_document(&layout, &document);
+    let display_list = paint_document(&layout);
     let frame =
         Compositor::new(viewport.width as u32, viewport.height as u32).compose_paint(&display_list);
-    assert_eq!(&frame.pixels[0..4], &[242, 245, 250, 255]);
+    assert_eq!(&frame.pixels[0..4], &[255, 255, 255, 255]);
     assert!(
         frame
             .pixels
             .chunks_exact(4)
-            .any(|pixel| pixel == [30, 43, 62, 255])
+            .any(|pixel| pixel == [0, 0, 0, 255])
     );
 
     let output_dir = option_env!("CARGO_TARGET_DIR")
@@ -64,15 +65,18 @@ fn parses_lays_out_paints_and_writes_a_simple_element_image() {
 #[test]
 fn nested_element_text_is_painted_once() {
     let document = parse_raw_html("<div><p>Hi</p></div>".to_owned());
-    let layout = layout_tree(
-        &StyledDom::from_html_document(&document),
+    let styles = css::style_document(&document, &[]);
+    let layout = layout_document(
+        &document,
+        &styles,
         Size {
             width: 160.0,
             height: 120.0,
         },
+        &BitmapFont,
     );
 
-    let text_items = paint_document(&layout, &document)
+    let text_items = paint_document(&layout)
         .items
         .into_iter()
         .filter_map(|item| match item {

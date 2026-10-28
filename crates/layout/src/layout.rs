@@ -1,82 +1,103 @@
-//! Block layout orchestration.
+//! The layout entry point.
 
-use crate::{LayoutBox, LayoutTree, Rect, Size, StyledDom};
+use html::{HTMLDocument, NodeID, NodeKind};
 
-/// Builds a layout tree for a CSS-pixel viewport.
+use crate::box_tree::{StyleMap, build_initial_containing_block, root_element};
+use crate::{FontMetrics, LayoutBox, LayoutTree, Size};
+
+/// State shared by the layout algorithms.
+pub(crate) struct Context<'a> {
+    pub fonts: &'a dyn FontMetrics,
+}
+
+/// Lays out `document` for a viewport of `viewport` CSS pixels.
 ///
-/// The first slice treats every element as a block and gives it a fixed
-/// 100 CSS-pixel height. Nesting and computed styles are not interpreted yet;
-/// every element is represented as a direct child of the root.
-pub fn layout_tree(styled_dom: &StyledDom, viewport: Size) -> LayoutTree {
-    let block_height = 100.0;
-    let children = styled_dom
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(index, node)| LayoutBox {
-            node: Some(*node),
-            rect: Rect {
-                x: 0.0,
-                y: index as f32 * block_height,
-                width: viewport.width,
-                height: block_height,
-            },
-            children: Vec::new(),
-        })
-        .collect();
+/// `styles` comes from [`css::style_document`] for the same document, and
+/// `fonts` must measure text the way the renderer will draw it.
+///
+/// Implemented (CSS 2.2 visual formatting model, with CSS Display 3 box
+/// generation):
+/// - Box generation from computed `display`: `none`, `contents`, `block`,
+///   `inline`, `inline-block`, and `flow-root`. The root element is
+///   blockified; inline runs beside blocks get anonymous block boxes; a block
+///   inside an inline splits the inline.
+/// - Block layout: `width`/`height`, `auto` margins and over-constraint
+///   (§10.3.3), percentages, padding, and vertical margin collapsing between
+///   siblings, parents and children, and through empty boxes (§8.3.1).
+/// - Inline layout: white-space collapsing, wrapping at spaces, `<br>`, line
+///   boxes sized by baseline alignment, and inline-blocks with shrink-to-fit
+///   widths.
+/// - Canvas background propagation from the root element or `body`
+///   (CSS Backgrounds 3 §2.11.2).
+///
+/// Only `display`, margins, padding, `width`, `height`, `font-size`, `color`,
+/// and `background-color` are read; all other properties take their initial
+/// values. Floats, positioning, borders, min/max sizes, and table, flex, and
+/// grid layout (laid out as `flow-root`) are not implemented. Content may
+/// overflow the viewport; the root box's rect stays viewport-sized.
+pub fn layout_document(
+    document: &HTMLDocument,
+    styles: &css::ComputedStyles,
+    viewport: Size,
+    fonts: &dyn FontMetrics,
+) -> LayoutTree {
+    let root = root_element(document);
+    let style_map = StyleMap::new(document, styles, root, viewport);
+    let icb = build_initial_containing_block(document, &style_map);
+    let context = Context { fonts };
+    let mut tree = LayoutTree {
+        root: context.layout_initial_containing_block(&icb, viewport),
+    };
+    propagate_canvas_background(&mut tree, document, &style_map, root);
+    tree
+}
 
-    LayoutTree {
-        root: LayoutBox {
-            node: None,
-            rect: Rect {
-                x: 0.0,
-                y: 0.0,
-                width: viewport.width,
-                height: viewport.height,
-            },
-            children,
-        },
+/// Moves the root element's background to the canvas, or for HTML documents
+/// `body`'s background when the root's is transparent. The element whose
+/// background propagates no longer paints it itself.
+fn propagate_canvas_background(
+    tree: &mut LayoutTree,
+    document: &HTMLDocument,
+    styles: &StyleMap,
+    root: Option<NodeID>,
+) {
+    let Some(root) = root else {
+        return;
+    };
+    let background = |node: NodeID| styles.get(node).and_then(|style| style.background_color);
+    let is_element = |node: NodeID, name: &str| {
+        matches!(
+            document.node(node).map(|node| &node.kind),
+            Some(NodeKind::Element(element)) if element.name == name
+        )
+    };
+    let source = if background(root).is_some() {
+        Some(root)
+    } else if is_element(root, "html") {
+        document
+            .node(root)
+            .into_iter()
+            .flat_map(|node| node.children.iter().copied())
+            .find(|child| is_element(*child, "body"))
+            .filter(|body| background(*body).is_some())
+    } else {
+        None
+    };
+    let Some(source) = source else {
+        return;
+    };
+    tree.root.style.background_color = background(source);
+    if let Some(layout_box) = find_box_mut(&mut tree.root, source) {
+        layout_box.style.background_color = None;
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use html::NodeID;
-
-    use super::*;
-
-    #[test]
-    fn empty_document_root_fills_viewport() {
-        let viewport = Size {
-            width: 800.0,
-            height: 600.0,
-        };
-        let tree = layout_tree(&StyledDom::default(), viewport);
-        assert_eq!(tree.root.rect.width, 800.0);
-        assert_eq!(tree.root.rect.height, 600.0);
-        assert!(tree.root.children.is_empty());
+fn find_box_mut(layout_box: &mut LayoutBox, node: NodeID) -> Option<&mut LayoutBox> {
+    if layout_box.node == Some(node) {
+        return Some(layout_box);
     }
-
-    #[test]
-    fn block_children_have_expected_positions_and_dimensions() {
-        let tree = layout_tree(
-            &StyledDom {
-                nodes: vec![NodeID::new(0), NodeID::new(1)],
-            },
-            Size {
-                width: 320.0,
-                height: 240.0,
-            },
-        );
-
-        assert_eq!(tree.root.children.len(), 2);
-        assert_eq!(tree.root.children[0].rect.x, 0.0);
-        assert_eq!(tree.root.children[0].rect.y, 0.0);
-        assert_eq!(tree.root.children[0].rect.width, 320.0);
-        assert_eq!(tree.root.children[0].rect.height, 100.0);
-        assert_eq!(tree.root.children[1].rect.x, 0.0);
-        assert_eq!(tree.root.children[1].rect.y, 100.0);
-        assert_eq!(tree.root.children[1].rect.width, 320.0);
-        assert_eq!(tree.root.children[1].rect.height, 100.0);
-    }
+    layout_box
+        .children
+        .iter_mut()
+        .find_map(|child| find_box_mut(child, node))
 }
