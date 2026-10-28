@@ -16,11 +16,13 @@ use webapis::AlertSink;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::error::EventLoopError;
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
+use crate::context_menu::{ContextMenu, MenuAction};
+use crate::page_source::PageSource;
 use crate::toolbar::{self, ChromeState, Control};
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -82,6 +84,11 @@ struct App {
     /// The pointer went down on the page and has not been released yet.
     page_press: bool,
     scripts_evaluated: bool,
+    context_menu: Option<ContextMenu>,
+    menu_pressed: Option<MenuAction>,
+    page_source: Option<PageSource>,
+    source_font: Option<FontVec>,
+    source_close_pressed: bool,
 }
 
 /// Delivers `alert` on the UI thread, attached to the browser window.
@@ -181,6 +188,11 @@ impl App {
             page_events: crate::content::PageEvents::new(),
             page_press: false,
             scripts_evaluated: false,
+            context_menu: None,
+            menu_pressed: None,
+            page_source: None,
+            source_font: None,
+            source_close_pressed: false,
         }
     }
 
@@ -324,6 +336,165 @@ impl App {
         ));
     }
 
+    fn dismiss_context_menu(&mut self) {
+        if self.context_menu.take().is_some() {
+            // Restore the page underneath the popup, without re-evaluating scripts.
+            self.frame_key = None;
+            self.redraw();
+        }
+        self.menu_pressed = None;
+    }
+
+    fn close_page_source(&mut self) {
+        self.source_close_pressed = false;
+        if self.page_source.take().is_some() {
+            self.frame_key = None;
+            self.redraw();
+        }
+    }
+
+    fn show_page_source(&mut self) {
+        if let Some(page) = &self.loaded_page {
+            self.page_source = Some(PageSource::new(&page.html));
+            self.frame_key = None;
+            self.redraw();
+        }
+    }
+
+    fn scroll_page_source(&mut self, lines: isize) {
+        if let (Some(source), Some(window)) = (&mut self.page_source, &self.window) {
+            let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+            source.scroll(lines, size.width, size.height);
+            self.redraw();
+        }
+    }
+
+    fn scroll_page_source_page(&mut self, direction: isize) {
+        if let (Some(source), Some(window)) = (&mut self.page_source, &self.window) {
+            let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+            source.scroll_page(direction, size.width, size.height);
+            self.redraw();
+        }
+    }
+
+    fn key_pressed(&mut self, key: &Key) {
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.dismiss_context_menu();
+                self.close_page_source();
+            }
+            Key::Named(NamedKey::ArrowDown) => self.scroll_page_source(1),
+            Key::Named(NamedKey::ArrowUp) => self.scroll_page_source(-1),
+            Key::Named(NamedKey::PageDown) => self.scroll_page_source_page(1),
+            Key::Named(NamedKey::PageUp) => self.scroll_page_source_page(-1),
+            Key::Named(NamedKey::Home) => self.scroll_page_source(isize::MIN),
+            Key::Named(NamedKey::End) => self.scroll_page_source(isize::MAX),
+            _ => {}
+        }
+    }
+
+    fn open_context_menu(&mut self, width: u32, height: u32, scale: f64) {
+        self.dismiss_context_menu();
+        if self.page_source.is_some() {
+            return;
+        }
+        self.chrome.pressed = None;
+        self.last_toolbar_click = None;
+        let Some((x, y)) = self.cursor else {
+            return;
+        };
+        let Some(card) = toolbar::page_rect(width, height, scale) else {
+            return;
+        };
+        if x < f64::from(card.x) / scale
+            || x >= f64::from(card.x + card.width) / scale
+            || y < f64::from(card.y) / scale
+            || y >= f64::from(card.y + card.height) / scale
+        {
+            return;
+        }
+        self.context_menu = Some(ContextMenu::new(
+            x,
+            y,
+            f64::from(width) / scale,
+            f64::from(height) / scale,
+        ));
+        self.set_hovered(None);
+        self.frame_key = None;
+        self.redraw();
+    }
+
+    fn left_mouse_input(&mut self, state: ElementState) {
+        if let Some(menu) = self.context_menu {
+            match state {
+                ElementState::Pressed => {
+                    self.menu_pressed = menu.action_at(self.cursor);
+                    if !menu.contains(self.cursor) {
+                        self.dismiss_context_menu();
+                    }
+                }
+                ElementState::Released => {
+                    // Disabled rows and padding have no press action and leave
+                    // the popup open. They never fall through to browser controls.
+                    if self.menu_pressed.is_none() {
+                        return;
+                    }
+                    let action = self
+                        .menu_pressed
+                        .filter(|action| Some(*action) == menu.action_at(self.cursor));
+                    self.dismiss_context_menu();
+                    match action {
+                        Some(MenuAction::Reload) => self.activate(Control::Reload),
+                        Some(MenuAction::PageSource) => self.show_page_source(),
+                        None => {}
+                    }
+                }
+            }
+            return;
+        }
+        if self.page_source.is_some() {
+            let close = self
+                .page_source
+                .as_ref()
+                .is_some_and(|source| source.close_at(self.cursor));
+            match state {
+                ElementState::Pressed => {
+                    self.source_close_pressed = close;
+                    // Preserve toolbar dismissal, consuming the click.
+                    if self.cursor.is_some_and(|(_, y)| y < 60.0) {
+                        self.close_page_source();
+                    }
+                }
+                ElementState::Released => {
+                    if self.source_close_pressed && close {
+                        self.close_page_source();
+                    }
+                    self.source_close_pressed = false;
+                }
+            }
+            return;
+        }
+        match state {
+            ElementState::Pressed => self.pressed(),
+            ElementState::Released => {
+                let page_press = self.page_press;
+                self.page_press = false;
+                if let Some(control) = self.chrome.pressed.take() {
+                    self.redraw();
+                    if self.chrome.hovered == Some(control) {
+                        self.activate(control);
+                    }
+                } else if page_press
+                    && let Some((x, y)) = self.cursor
+                    && self.pointer_is_on_page(x, y)
+                {
+                    let target = self.page_node_at(x, y);
+                    self.page_events.click(target);
+                }
+            }
+        }
+    }
+
     fn activate(&mut self, control: Control) {
         match control {
             Control::Reload => {
@@ -363,7 +534,8 @@ impl App {
         self.chrome.dark = window.theme() == Some(Theme::Dark);
         let card = toolbar::page_rect(size.width, size.height, scale);
         let card_size = card.map(|card| (card.width, card.height));
-        let mut full = self.page.is_none();
+        let mut full =
+            self.page.is_none() || self.context_menu.is_some() || self.page_source.is_some();
         if self.page.as_ref().map(|(size, _)| *size) != card_size {
             // Paint this frame before the page script runs. Evaluation joins
             // the JS engine thread; doing that inside this draw leaves `alert`
@@ -409,9 +581,25 @@ impl App {
                 self.font.as_ref(),
             )
         };
-        let Some(composed) = composed else {
+        let Some(mut composed) = composed else {
             return;
         };
+        if let Some(source) = &mut self.page_source {
+            source.draw(
+                &mut composed,
+                scale,
+                self.source_font.as_ref().or(self.font.as_ref()),
+            );
+        }
+        if let Some(menu) = self.context_menu {
+            menu.draw(
+                &mut composed,
+                scale,
+                self.chrome.dark,
+                menu.action_at(self.cursor),
+                self.font.as_ref(),
+            );
+        }
         if full {
             self.frame
                 .resize(size.width as usize * size.height as usize, 0);
@@ -438,6 +626,11 @@ impl App {
         let scale = window.scale_factor();
         let width = window.inner_size().to_logical::<f64>(scale).width;
         self.cursor = Some((x, y));
+        if self.context_menu.is_some() || self.page_source.is_some() {
+            self.set_hovered(None);
+            self.redraw();
+            return;
+        }
         let inset = self.platform.window_controls_inset;
         self.set_hovered(toolbar::hit_test(x, y, width, inset));
     }
@@ -544,6 +737,7 @@ impl ApplicationHandler for App {
                     .expect("failed to create window surface"),
             );
             self.font = toolbar::load_ui_font((self.platform.ui_font_files)());
+            self.source_font = crate::page_source::load_font();
             window.request_redraw();
             self.window = Some(window);
         }
@@ -564,10 +758,17 @@ impl ApplicationHandler for App {
                 event,
                 is_synthetic: false,
                 ..
-            } => self.key_input(event),
+            } => {
+                // Address editing and the context menu share one key event.
+                if event.state == ElementState::Pressed {
+                    self.key_pressed(&event.logical_key);
+                }
+                self.key_input(event);
+            }
             WindowEvent::Resized(_)
             | WindowEvent::ScaleFactorChanged { .. }
             | WindowEvent::ThemeChanged(_) => {
+                self.dismiss_context_menu();
                 self.refresh_hover();
                 self.redraw();
             }
@@ -582,30 +783,43 @@ impl ApplicationHandler for App {
                 self.cursor = None;
                 self.page_press = false;
                 self.set_hovered(None);
+                if self.context_menu.is_some() {
+                    self.redraw();
+                }
             }
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
                 ..
-            } => match state {
-                ElementState::Pressed => self.pressed(),
-                ElementState::Released => {
-                    let page_press = self.page_press;
-                    self.page_press = false;
-                    if let Some(control) = self.chrome.pressed.take() {
-                        self.redraw();
-                        if self.chrome.hovered == Some(control) {
-                            self.activate(control);
-                        }
-                    } else if page_press
-                        && let Some((x, y)) = self.cursor
-                        && self.pointer_is_on_page(x, y)
-                    {
-                        let target = self.page_node_at(x, y);
-                        self.page_events.click(target);
-                    }
+            } => self.left_mouse_input(state),
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                if let Some(window) = &self.window {
+                    let size = window.inner_size();
+                    self.open_context_menu(size.width, size.height, window.scale_factor());
                 }
-            },
+            }
+            WindowEvent::Focused(false) => self.dismiss_context_menu(),
+            WindowEvent::MouseWheel { delta, .. } => {
+                let rows = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => -f64::from(y) * 3.0,
+                    MouseScrollDelta::PixelDelta(position) => {
+                        let scale = self
+                            .window
+                            .as_ref()
+                            .map_or(1.0, |window| window.scale_factor());
+                        -position.y / (18.0 * scale)
+                    }
+                };
+                if let (Some(source), Some(window)) = (&mut self.page_source, &self.window) {
+                    let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+                    source.wheel(rows, size.width, size.height);
+                    self.redraw();
+                }
+            }
             WindowEvent::RedrawRequested => self.paint(),
             _ => {}
         }
@@ -666,6 +880,182 @@ mod tests {
             },
             browser::BrowserRuntime::in_memory(),
         )
+    }
+
+    #[test]
+    fn inspect_shows_loaded_source_without_fetching_executing_or_changing_history() {
+        let mut app = app();
+        let page = browser::Page {
+            html: "<h1>Already loaded</h1>\n<script>not executed</script>".into(),
+            css: String::new(),
+            js: String::new(),
+        };
+        app.page_loaded("byui://source-fixture", page.clone());
+        let before = app.browser_state.clone();
+        // Inspect must work even with the Refresh/network client unavailable.
+        app.refresh = None;
+        app.scripts_evaluated = true;
+        app.cursor = Some((100.0, 100.0));
+        app.open_context_menu(800, 600, 1.0);
+        app.cursor = Some((120.0, 216.0));
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        assert!(app.context_menu.is_none());
+        assert_eq!(app.page_source.as_ref().unwrap().html, page.html);
+        assert!(app.scripts_evaluated);
+        assert_eq!(app.browser_state, before);
+        assert_eq!(app.loaded_page, Some(page));
+        app.frame_key = Some((800, 600, 1.0_f64.to_bits(), false));
+        app.key_pressed(&Key::Named(NamedKey::Escape));
+        assert!(app.page_source.is_none());
+        assert!(app.frame_key.is_none());
+        assert!(app.scripts_evaluated);
+        assert_eq!(app.browser_state, before);
+    }
+
+    #[test]
+    fn source_close_button_requires_matching_press_and_release_and_preserves_state() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let before = app.browser_state.clone();
+        app.show_page_source();
+        app.page_source.as_mut().unwrap().resize(800.0, 600.0);
+        app.scripts_evaluated = true;
+        app.frame_key = Some((800, 600, 1.0_f64.to_bits(), false));
+        app.cursor = Some((730.0, 80.0));
+        app.left_mouse_input(ElementState::Pressed);
+        app.cursor = Some((400.0, 200.0));
+        app.left_mouse_input(ElementState::Released);
+        assert!(app.page_source.is_some());
+        app.cursor = Some((730.0, 80.0));
+        app.left_mouse_input(ElementState::Pressed);
+        assert!(app.page_source.is_some());
+        app.left_mouse_input(ElementState::Released);
+        assert!(app.page_source.is_none());
+        assert!(app.frame_key.is_none());
+        assert!(app.scripts_evaluated);
+        assert_eq!(app.browser_state, before);
+    }
+
+    #[test]
+    fn source_viewer_handles_missing_document_and_toolbar_dismissal() {
+        let mut app = app();
+        app.show_page_source();
+        assert!(app.page_source.is_none());
+        app.ensure_welcome_loaded();
+        app.show_page_source();
+        app.scripts_evaluated = true;
+        app.cursor = Some((162.0, 26.0));
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        assert!(app.page_source.is_none());
+        assert!(app.scripts_evaluated);
+    }
+
+    #[test]
+    fn disabled_back_forward_do_nothing_even_after_multiple_recorded_visits() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.browser_state.record_visit("https://a.example/");
+        app.browser_state.record_visit("https://b.example/");
+        let before = app.browser_state.clone();
+        let page = app.loaded_page.clone();
+        app.scripts_evaluated = true;
+        app.cursor = Some((100.0, 100.0));
+        app.open_context_menu(800, 600, 1.0);
+        for y in [120.0, 152.0] {
+            app.cursor = Some((120.0, y));
+            app.left_mouse_input(ElementState::Pressed);
+            app.left_mouse_input(ElementState::Released);
+            assert!(app.context_menu.is_some());
+            assert_eq!(app.browser_state, before);
+            assert_eq!(app.loaded_page, page);
+            assert!(app.scripts_evaluated);
+            assert!(app.page_source.is_none());
+        }
+        app.key_pressed(&Key::Named(NamedKey::Escape));
+        assert!(app.context_menu.is_none());
+        assert_eq!(app.browser_state, before);
+    }
+
+    #[test]
+    fn context_menu_opens_only_over_page_content_at_each_scale() {
+        let mut app = app();
+        for scale in [1.0, 2.0] {
+            for (point, opens) in [
+                ((100.0, 100.0), true),
+                ((20.0, 20.0), false),
+                ((1.0, 100.0), false),
+            ] {
+                app.cursor = Some(point);
+                app.open_context_menu((800.0 * scale) as u32, (600.0 * scale) as u32, scale);
+                assert_eq!(app.context_menu.is_some(), opens);
+                assert!(app.browser_state.visited_urls().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn context_reload_uses_existing_action_and_preserves_history() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let before = app.browser_state.clone();
+        let document = app.loaded_page.clone();
+        app.cursor = Some((100.0, 100.0));
+        app.open_context_menu(800, 600, 1.0);
+        app.cursor = Some((120.0, 184.0));
+        app.scripts_evaluated = true;
+        app.left_mouse_input(ElementState::Pressed);
+        assert!(app.context_menu.is_some());
+        assert!(app.scripts_evaluated);
+        app.left_mouse_input(ElementState::Released);
+        assert!(app.context_menu.is_none());
+        assert!(!app.scripts_evaluated);
+        assert!(app.page.is_none());
+        assert_eq!(app.loaded_page, document);
+        assert_eq!(app.browser_state, before);
+    }
+
+    #[test]
+    fn outside_click_and_escape_clear_popup_without_reloading_or_recording_visits() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let before = app.browser_state.clone();
+        for escape in [false, true] {
+            app.cursor = Some((100.0, 100.0));
+            app.open_context_menu(800, 600, 1.0);
+            // Simulate a frame presented with the menu on it.
+            app.frame_key = Some((800, 600, 1.0_f64.to_bits(), false));
+            app.scripts_evaluated = true;
+            if escape {
+                app.key_pressed(&Key::Named(NamedKey::Escape));
+            } else {
+                app.cursor = Some((50.0, 26.0));
+                app.left_mouse_input(ElementState::Pressed);
+                app.left_mouse_input(ElementState::Released);
+            }
+            assert!(app.context_menu.is_none());
+            assert!(
+                app.frame_key.is_none(),
+                "dismissal must restore the whole frame"
+            );
+            assert!(app.scripts_evaluated, "dismissal must not run Reload");
+            assert_eq!(app.browser_state, before);
+        }
+    }
+
+    #[test]
+    fn releasing_outside_a_pressed_menu_item_cancels_reload() {
+        let mut app = app();
+        app.cursor = Some((100.0, 100.0));
+        app.open_context_menu(800, 600, 1.0);
+        app.cursor = Some((120.0, 184.0));
+        app.left_mouse_input(ElementState::Pressed);
+        app.cursor = Some((300.0, 300.0));
+        app.scripts_evaluated = true;
+        app.left_mouse_input(ElementState::Released);
+        assert!(app.context_menu.is_none());
+        assert!(app.scripts_evaluated);
     }
 
     #[test]
