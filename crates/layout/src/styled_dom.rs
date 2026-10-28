@@ -30,12 +30,12 @@ impl StyledDom {
                     return None;
                 };
                 if matches!(
-                    element.name.as_str(),
+                    element.get_name().as_str(),
                     "head" | "html" | "link" | "meta" | "script" | "style" | "title"
                 ) {
                     return None;
                 }
-                if element.name == "body"
+                if element.get_name() == "body"
                     && !node.children.iter().any(|child| {
                         document
                             .node(*child)
@@ -72,7 +72,7 @@ mod tests {
             Some(html::Node {
                 kind: html::NodeKind::Element(element),
                 ..
-            }) if element.name == "main"
+            }) if element.get_name() == "main"
         ));
     }
 
@@ -88,7 +88,7 @@ mod tests {
             Some(html::Node {
                 kind: html::NodeKind::Element(element),
                 ..
-            }) if element.name == "body"
+            }) if element.get_name() == "body"
         ));
     }
 }

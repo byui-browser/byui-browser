@@ -2,12 +2,20 @@ use super::{attribute::Attribute, namespace::Namespace};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElementData {
-    pub name: String,
-    pub namespace: Namespace,
-    pub attributes: Vec<Attribute>,
+    name: String,
+    namespace: Namespace,
+    attributes: Vec<Attribute>,
 }
 
 impl ElementData {
+    pub fn new(name: String, namespace: Namespace, attributes: Vec<Attribute>) -> Self {
+        Self {
+            name,
+            namespace,
+            attributes,
+        }
+    }
+
     pub const fn get_name(&self) -> &String {
         &self.name
     }

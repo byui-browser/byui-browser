@@ -516,7 +516,7 @@ fn is_inherited_property(property: &str) -> bool {
 
 fn attribute_value<'a>(element: &'a html::ElementData, name: &str) -> Option<&'a str> {
     element
-        .attributes
+        .get_attributes()
         .iter()
         .find(|attribute| attribute.get_name() == name)
         .map(|attribute| attribute.get_value().as_str())
@@ -563,7 +563,7 @@ fn matches_compound(dom: &HTMLDocument, node_id: NodeID, selector: &str) -> bool
         let end = selector
             .find(['#', '.', ':', '['])
             .unwrap_or(selector.len());
-        if element.name != selector[..end].to_ascii_lowercase() {
+        if element.get_name() != &selector[..end].to_ascii_lowercase() {
             return false;
         }
         index = end;

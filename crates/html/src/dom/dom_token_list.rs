@@ -33,7 +33,7 @@ impl<'document> DOMTokenList<'document> {
             return Vec::new();
         };
         element
-            .attributes
+            .get_attributes()
             .iter()
             .find(|attribute| attribute.get_name() == "class")
             .map(|attribute| parse_tokens(attribute.get_value()))
@@ -127,7 +127,7 @@ impl<'document> DOMTokenList<'document> {
             return None;
         };
         element
-            .attributes
+            .get_attributes()
             .iter()
             .find(|attribute| attribute.get_name() == "class")
             .map(|attribute| attribute.get_value().clone())
@@ -141,17 +141,7 @@ impl<'document> DOMTokenList<'document> {
         else {
             return Err(DomError::NotFound);
         };
-        if let Some(attribute) = element
-            .attributes
-            .iter_mut()
-            .find(|attribute| attribute.get_name() == "class")
-        {
-            attribute.set_value(value.to_owned());
-        } else {
-            element
-                .attributes
-                .push(Attribute::new("class".to_owned(), value.to_owned()));
-        }
+        element.set_attribute(Attribute::new("class".to_owned(), value.to_owned()));
         Ok(())
     }
 }

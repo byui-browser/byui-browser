@@ -101,11 +101,8 @@ impl HTMLDocument {
             return Err(DomError::InvalidCharacter);
         }
 
-        let element = ElementData {
-            name: local_name.to_ascii_lowercase(),
-            namespace: Namespace::Html,
-            attributes: Vec::new(),
-        };
+        let element =
+            ElementData::new(local_name.to_ascii_lowercase(), Namespace::Html, Vec::new());
         Ok(self.push_node(NodeKind::Element(element), None))
     }
 
@@ -130,22 +127,12 @@ impl HTMLDocument {
             return Err(DomError::NotFound);
         };
 
-        let name = match element_data.namespace {
+        let name = match element_data.get_namespace() {
             Namespace::Html => qualified_name.to_ascii_lowercase(),
             Namespace::Svg | Namespace::MathMl => qualified_name.to_owned(),
         };
 
-        if let Some(attribute) = element_data
-            .attributes
-            .iter_mut()
-            .find(|attribute| attribute.get_name() == name.as_str())
-        {
-            attribute.set_value(value.to_owned());
-        } else {
-            element_data
-                .attributes
-                .push(super::attribute::Attribute::new(name, value.to_owned()));
-        }
+        element_data.set_attribute(super::attribute::Attribute::new(name, value.to_owned()));
 
         Ok(())
     }
@@ -241,8 +228,8 @@ impl HTMLDocument {
             }
             NodeKind::Element(element) => {
                 output.push('<');
-                output.push_str(&element.name);
-                for attribute in &element.attributes {
+                output.push_str(element.get_name());
+                for attribute in element.get_attributes() {
                     output.push(' ');
                     output.push_str(attribute.get_name());
                     output.push_str("=\"");
@@ -250,16 +237,16 @@ impl HTMLDocument {
                     output.push('"');
                 }
                 output.push('>');
-                let is_void =
-                    element.namespace == Namespace::Html && is_void_html_element(&element.name);
+                let is_void = *element.get_namespace() == Namespace::Html
+                    && is_void_html_element(element.get_name());
                 if !is_void {
-                    let child_raw_text = element.namespace == Namespace::Html
-                        && matches!(element.name.as_str(), "script" | "style");
+                    let child_raw_text = *element.get_namespace() == Namespace::Html
+                        && matches!(element.get_name().as_str(), "script" | "style");
                     for child in &node.children {
                         self.serialize_node(*child, output, child_raw_text);
                     }
                     output.push_str("</");
-                    output.push_str(&element.name);
+                    output.push_str(element.get_name());
                     output.push('>');
                 }
             }
@@ -292,7 +279,7 @@ impl HTMLDocument {
                 let NodeKind::Element(element) = &node.kind else {
                     return None;
                 };
-                (element.name == "script")
+                (element.get_name() == "script")
                     .then(|| self.text_content(NodeID::new(index)).unwrap_or_default())
             })
             .collect()
@@ -305,7 +292,7 @@ impl HTMLDocument {
             for child in children {
                 let node = document.node(child)?;
                 if let NodeKind::Element(element) = &node.kind
-                    && element.attributes.iter().any(|attribute| {
+                    && element.get_attributes().iter().any(|attribute| {
                         attribute.get_name() == "id" && attribute.get_value() == value
                     })
                 {

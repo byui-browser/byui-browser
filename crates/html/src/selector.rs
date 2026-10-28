@@ -47,18 +47,18 @@ impl Query for HTMLDocument {
 fn matches_selector(element: &ElementData, selector: &str) -> bool {
     match selector.strip_prefix('#') {
         Some(id) => element
-            .attributes
+            .get_attributes()
             .iter()
             .any(|attribute| attribute.get_name() == "id" && attribute.get_value() == id),
         None => match selector.strip_prefix('.') {
-            Some(class) => element.attributes.iter().any(|attribute| {
+            Some(class) => element.get_attributes().iter().any(|attribute| {
                 attribute.get_name() == "class"
                     && attribute
                         .get_value()
                         .split_whitespace()
                         .any(|value| value == class)
             }),
-            None => element.name == selector.to_ascii_lowercase(),
+            None => element.get_name().as_str() == selector.to_ascii_lowercase(),
         },
     }
 }

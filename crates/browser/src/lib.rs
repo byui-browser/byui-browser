@@ -412,7 +412,7 @@ trait ElementAttributes {
 impl ElementAttributes for html::NodeKind {
     fn element_attributes(&self) -> Option<&[html::Attribute]> {
         match self {
-            html::NodeKind::Element(element) => Some(&element.attributes),
+            html::NodeKind::Element(element) => Some(element.get_attributes()),
             _ => None,
         }
     }
