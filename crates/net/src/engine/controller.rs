@@ -42,6 +42,8 @@ pub struct RequestControllerBuilder {
 pub(crate) struct ControllerInner {
     /// Maximum accepted body size for keepalive requests.
     pub(crate) max_keepalive_body_size: u64,
+    /// Maximum bytes retained while capturing one response for the cache.
+    pub(crate) max_cache_body_size: usize,
     /// Process-local response cache shared by controller clones.
     pub(crate) cache: ResponseCache,
     /// Browser-owned policy, credential, cache-partition, and worker decisions.
@@ -103,11 +105,13 @@ impl RequestControllerBuilder {
         } = self;
         let max_in_flight = config.max_in_flight;
         let max_keepalive_body_size = config.max_keepalive_body_size;
+        let max_cache_body_size = config.max_cache_body_size;
         let transport = reqwest_transport(config.clone())
             .map_err(|error| RequestError::Initialization(error.to_string()))?;
         Ok(RequestController {
             inner: Arc::new(ControllerInner {
                 max_keepalive_body_size,
+                max_cache_body_size,
                 cache: ResponseCache::default(),
                 services,
                 providers,

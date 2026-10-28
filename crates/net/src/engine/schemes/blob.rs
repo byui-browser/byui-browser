@@ -26,7 +26,11 @@ impl RequestController {
             .providers
             .blob()
             .ok_or(RequestError::MissingProvider("blob"))?;
-        let resource = super::await_provider(&request, provider.resolve(&request, &url)).await?;
-        self.finalize_scheme_resource(&request, resource, FetchScheme::Blob)
+        self.finish_provider_request(
+            &request,
+            FetchScheme::Blob,
+            provider.resolve(&request, &url),
+        )
+        .await
     }
 }

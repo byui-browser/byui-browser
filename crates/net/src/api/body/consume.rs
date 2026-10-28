@@ -9,16 +9,7 @@ use super::{Blob, Body, FormData, RequestError, form_data, metadata};
 impl Body {
     /// Consumes this body into owned bytes.
     pub async fn bytes(mut self) -> Result<Vec<u8>, RequestError> {
-        {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| RequestError::BodyAlreadyUsed)?;
-            if state.used || state.locked {
-                return Err(RequestError::BodyAlreadyUsed);
-            }
-            state.locked = true;
-        }
+        self.claim_for_helper()?;
         let mut bytes = Vec::new();
         while let Some(chunk) = self.next().await {
             bytes.extend_from_slice(&chunk?);
@@ -55,7 +46,10 @@ impl Body {
 
     /// Consumes this body and deserializes JSON into the requested Rust type.
     pub async fn json<T: DeserializeOwned>(self) -> Result<T, RequestError> {
-        let text = self.text().await?;
+        // Fetch JSON decoding always uses UTF-8 and ignores a conflicting
+        // charset parameter in Content-Type.
+        let bytes = self.bytes().await?;
+        let (text, _, _) = encoding_rs::UTF_8.decode(&bytes);
         serde_json::from_str(&text).map_err(|error| RequestError::BodyJson(error.to_string()))
     }
 

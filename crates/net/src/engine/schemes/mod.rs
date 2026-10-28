@@ -53,6 +53,19 @@ async fn await_provider(
 }
 
 impl RequestController {
+    /// Applies cancellation and the shared finalization path to one provider operation.
+    pub(super) async fn finish_provider_request(
+        &self,
+        request: &Request,
+        scheme: FetchScheme,
+        operation: ProviderFuture<'_>,
+    ) -> Result<Response, RequestError> {
+        let resource = await_provider(request, operation).await?;
+        self.finalize_scheme_resource(request, resource, scheme)
+    }
+}
+
+impl RequestController {
     /// Dispatches a prepared request to its scheme-specific implementation.
     pub(crate) async fn fetch_scheme(
         &self,

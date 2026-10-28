@@ -7,6 +7,7 @@ use reqwest::Url;
 use crate::{
     api::{
         error::RequestError,
+        media_type::is_valid_media_type,
         providers::{SchemeBody, SchemeResource},
         request::{Origin, Request},
         response::Response,
@@ -65,9 +66,12 @@ fn parse_data_url(url: &Url) -> Result<(HeaderValue, Vec<u8>), RequestError> {
         HeaderValue::from_static("text/plain;charset=US-ASCII")
     } else {
         let media_type = percent_decode_text(&media_parts.join(";"))?;
-        validate_media_type(&media_type)?;
-        HeaderValue::from_str(&media_type)
-            .map_err(|_| invalid_data("invalid Content-Type header value"))?
+        let media_type = HeaderValue::from_str(&media_type)
+            .map_err(|_| invalid_data("invalid Content-Type header value"))?;
+        if !is_valid_media_type(&media_type) {
+            return Err(invalid_data("invalid media type"));
+        }
+        media_type
     };
 
     let decoded_payload = percent_decode(payload.as_bytes())?;
@@ -81,27 +85,6 @@ fn parse_data_url(url: &Url) -> Result<(HeaderValue, Vec<u8>), RequestError> {
         decoded_payload
     };
     Ok((media_type, bytes))
-}
-
-/// Validates the media type embedded in a data URL.
-fn validate_media_type(value: &str) -> Result<(), RequestError> {
-    let mut parts = value.split(';');
-    let essence = parts.next().unwrap_or_default().trim();
-    let Some((kind, subtype)) = essence.split_once('/') else {
-        return Err(invalid_data("media type must contain a type and subtype"));
-    };
-    if kind.is_empty() || subtype.is_empty() || kind.contains(char::is_whitespace) {
-        return Err(invalid_data("invalid media type"));
-    }
-    for parameter in parts {
-        let Some((name, value)) = parameter.split_once('=') else {
-            return Err(invalid_data("media type parameter is missing '='"));
-        };
-        if name.trim().is_empty() || value.trim().is_empty() {
-            return Err(invalid_data("invalid media type parameter"));
-        }
-    }
-    Ok(())
 }
 
 /// Percent-decodes data URL metadata and requires valid UTF-8 text.

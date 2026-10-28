@@ -26,14 +26,14 @@ implemented while other `about:` URLs remain unsupported.
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
 | URL and scheme fetch        | HTTP(S), relative URLs, `data:`, `blob:`, `file:`, `byui:`, and `about:blank` fetch work; other `about:` URLs are rejected                                    | High         |
 | Request headers and methods | Method validation, request/no-CORS guards, internal generated-header channels, and response filtering exist; later redirect/header rules remain               | Medium       |
-| Request and response bodies | Shared buffered/streaming `Body`, text/blob/form-data/JSON/array-buffer helpers, and null-body handling exist; cloning/teeing and full Fetch semantics remain | Medium       |
+| Request and response bodies | Authoritative buffered/streaming `Body`, helpers, metadata, fallible cloning, bounded teeing, and null-body handling exist; JavaScript conversion and keepalive lifetime remain | Medium       |
 | Credentials and cookies     | `FetchServices` can supply and store cookies; matching, persistence, and policy belong to its provider                                                        | Critical     |
 | CORS and response tainting  | Simple CORS checks and basic/opaque views exist; preflight and redirect checks are absent                                                                     | Critical     |
 | Redirects                   | Controller follows validated HTTP(S) redirects with `follow`, `error`, and `manual` modes; full browser policy remains incomplete                             | High         |
 | HTTP cache                  | TTL-only in-memory cache with provider-supplied partition keys; full matching/revalidation is absent                                                          | High         |
 | Fetch policy integrations   | Browser-context requests require `FetchServices`; CSP, mixed content, CORP, SRI, and worker interception remain provider/later-step work                      | Critical     |
 | Cancellation and lifecycle  | Basic abort signal works, but Fetch controller state/reasons/timing are absent                                                                                | Medium       |
-| Fetch API surface           | Rust `Request`, filtered `Response`, guarded `Headers`, shared `Body`, and body helpers exist; JavaScript bindings, response constructors, and cloning remain | High         |
+| Fetch API surface           | Rust `Request`, filtered `Response`, guarded `Headers`, shared `Body`, response cloning, and body helpers exist; complete JavaScript bindings remain | High         |
 | Scheduling and transport    | HTTP/2, compression, pooling, and priority mapping are available; scheduler ordering and HTTP/3 are absent                                                    | Low/Medium   |
 
 ## Detailed gaps
@@ -94,17 +94,17 @@ body-used errors, `bytes`, `array_buffer`, `text`, `blob`, `json`, and
 `form_data` helpers, rejection of bodies on `GET`/`HEAD`, and null-body
 handling for `HEAD` plus supported null-body status codes.
 
-It still lacks Fetch-compatible stream teeing/cloning, a public response clone
-operation, typed-array/JavaScript conversion (which belongs in `webapis`),
-`duplex`, keepalive aggregate quotas, and the Fetch rule that a successful
-`CONNECT` response has no body. The provider stream variant is defined, and the
+The Rust boundary now has fallible body/response cloning, bounded stream teeing,
+typed-array byte constructors, explicit half-duplex validation, and a public
+body lifecycle status. Typed-array/JavaScript conversion still belongs in
+`webapis`, and keepalive aggregate quotas remain browser lifecycle work.
+`CONNECT` is forbidden during request construction, so no successful CONNECT
+response enters the current engine. The provider stream variant is defined, and the
 blob, file, and page handlers exercise it; stream cancellation, failure, and
 unread/partial body-drop cleanup are covered for that provider boundary.
 
-**Required work:** finish body cloning/teeing and the remaining general
-lifecycle semantics, define
-the Rust-to-JavaScript body conversion boundary, add aggregate keepalive
-quotas, and apply the body rules consistently to every scheme handler.
+**Required work:** define the Rust-to-JavaScript body conversion boundary and
+add aggregate keepalive quotas when keepalive lifetime support is integrated.
 
 ### 4. Credentials, cookies, and authentication
 
@@ -219,9 +219,10 @@ algorithm state transition.
 
 **Evidence:** [`Response`](../src/api/response/types.rs) exposes filtered status, URL, headers, response type, and body. The private internal representation retains full transport metadata. The crate still exports Rust structs and a stream, not JavaScript Fetch interfaces.
 
-Remaining response work includes full redirect URL-list accuracy, response
-constructors, a public response clone operation, Fetch-compatible stream
-teeing, and complete network-error construction. `Body::array_buffer`,
+Remaining response work includes full redirect URL-list accuracy and the
+JavaScript response constructor/binding surface. Rust responses have fallible
+cloning, bounded stream teeing, `ok`/body-presence helpers, and a filtered
+network-error constructor. `Body::array_buffer`,
 `Body::form_data`, and `Body::json` exist for the supported Rust subset, but
 their JavaScript-facing conversion belongs to `webapis`. Local scheme response
 construction, provider metadata validation, and shared finalization are
@@ -270,7 +271,7 @@ the recording-provider conformance matrix across every provider-backed scheme.
 3. Implement credentials/cookie policy and strict same-origin/CORS/no-CORS response filtering across HTTP and local schemes.
 4. Complete per-hop redirect CORS/security and credential policy.
 5. Replace the TTL map with a partitioned HTTP cache or integrate an existing standards-aware cache.
-6. Complete shared Body cloning/teeing and JavaScript conversion semantics.
+6. Complete JavaScript Body, Request, Response, promise, and stream conversion semantics.
 7. Add integrity, keepalive, service-worker, CSP/mixed-content, MIME/CORP, and timing hooks as the surrounding browser subsystems become available.
 
 ## Suggested regression-test matrix

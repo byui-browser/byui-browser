@@ -33,6 +33,7 @@ pub struct Request {
     pub(crate) integrity: Option<String>,
     pub(crate) keepalive: bool,
     pub(crate) priority: RequestPriority,
+    pub(crate) duplex: Option<RequestDuplex>,
     pub(crate) context: FetchContext,
     pub(crate) signal: AbortSignal,
     pub(crate) url_list: Vec<Url>,
@@ -55,6 +56,13 @@ pub enum RequestPriority {
     High,
 }
 
+/// Fetch request streaming mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestDuplex {
+    /// The response is not exposed until the request body has begun sending.
+    Half,
+}
+
 impl Request {
     /// Creates a GET request with Fetch's default request state.
     pub fn get(url: impl Into<String>) -> Self {
@@ -74,6 +82,7 @@ impl Request {
             integrity: None,
             keepalive: false,
             priority: RequestPriority::Auto,
+            duplex: None,
             context: FetchContext::default(),
             signal: AbortSignal::new(),
             url_list: Vec::new(),
@@ -245,6 +254,10 @@ impl Request {
     pub fn set_priority(&mut self, priority: RequestPriority) {
         self.priority = priority;
     }
+    /// Selects the request streaming mode required for a streaming body.
+    pub fn set_duplex(&mut self, duplex: Option<RequestDuplex>) {
+        self.duplex = duplex;
+    }
     /// Sets the cancellation signal.
     pub fn set_signal(&mut self, signal: AbortSignal) {
         self.signal = signal;
@@ -376,6 +389,11 @@ impl Request {
     ) -> Result<(), RequestError> {
         if self.body.is_some() && matches!(self.method, Method::GET | Method::HEAD) {
             return Err(RequestError::BodyNotAllowed(self.method.to_string()));
+        }
+        if self.body.as_ref().is_some_and(Body::is_streaming_source)
+            && self.duplex != Some(RequestDuplex::Half)
+        {
+            return Err(RequestError::StreamingBodyRequiresDuplex);
         }
         if self.context.mode == RequestMode::NoCors
             && let Some(body) = &self.body

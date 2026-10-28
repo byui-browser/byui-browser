@@ -11,22 +11,45 @@ more complete and browser-ready.
 durable state and browser policy. Those owners integrate through typed service
 and provider interfaces rather than importing JavaScript types into `net`.
 
+## Architecture and maintainability follow-up
+
+Treat the following as internal refactors: preserve the documented Rust API and
+Fetch behavior, and add focused regression coverage before changing each area.
+
+| Priority | Issue | Potential solution |
+| --- | --- | --- |
+| High | `Body` combines source ownership, lifecycle state, cloning, polling, cancellation, tee buffering, and permit retention. `Clone` has different semantics for replayable and one-shot bodies. | Separate ownership from lifecycle observation. Define one explicit cloning model, make source transfer fallible, and retain the bounded tee only if its backpressure contract is required. |
+| High | `Body::into_parts` can turn a previously transferred source into an empty stream, concealing repeated-consumption mistakes. | Check lifecycle state and return a typed error for consumed or transferred sources, matching the transport handoff behavior. |
+| High | The HTTP fetch path combines cache lookup, transport exchange, redirects, CORS finalization, cookie handling, and streamed cache capture. | Split it into cache lookup, one exchange, redirect control, response finalization, and cache capture; preserve ordering with integration tests. |
+| Medium | `Headers` mixes ordered storage, public mutations, guards, forbidden-header policy, CORS safelisting, exposure parsing, and transport conversion. Its public iteration repeatedly scans and allocates. | Split storage/API from guard and CORS policy; implement combined iteration in one pass and avoid temporary allocations in ordinary `get` calls. |
+| Medium | `Request` and `InternalResponse` expose broadly mutable internal field bags. Request configuration, redirect state, cache partitioning, and transport state are intermixed. | Introduce caller-facing request initialization plus prepared/redirect execution state, and use narrow constructors and transition methods for internal responses. |
+| Medium | Request rules are checked in more than one place, including GET/HEAD body rejection and no-CORS method restrictions. | Keep preparation-time validation for defense in depth, but share predicates with mutation methods so rules cannot drift. |
+| Low | `CachedResponse` mirrors `StoredResponse` and copies every field in both directions. | Store a `StoredResponse` with expiration metadata inside `CachedResponse`. |
+| Low | Crate-wide `allow(dead_code)` and production lock `expect` calls hide stale code and can panic the network boundary. | Replace the allowance with narrow tracked exceptions; map poisoned locks to typed errors or explicitly document the intended failure policy. |
+
+Do not reintroduce per-scheme response-finalization duplication that the shared
+provider helper already removed.
+
 ## Remaining work
 
 ### 1. Complete body semantics
 
-- Replace compatibility body/null flags with one authoritative body model.
-- Define and test every body state transition for helper reads, direct stream
-  reads, transport handoff, cache capture, failure, abort, cancellation, and
-  drop.
-- Preserve response `Content-Length` metadata through live, cached, and
-  provider-backed bodies.
-- Implement fallible response/body cloning and a bounded stream tee with
-  backpressure, branch cancellation, drop behavior, cache capture, and permit
-  ownership rules.
-- Finish binary-safe multipart parsing/serialization, RFC 5987 filenames,
-  typed-array inputs, duplex semantics, JSON decoding edge cases, and the
-  supported `CONNECT`/network-error body rules.
+The Rust engine slice is implemented. `Body` has one authoritative lifecycle,
+nullness is represented by the body itself, and helper reads, direct stream
+reads, transport handoff, cache capture, failure, abort, cancellation, and drop
+have focused transition tests. Declared lengths survive live HTTP, cache, and
+provider paths. `Body::try_clone`, `Body::tee`, and `Response::try_clone`
+provide fallible cloning with a bounded one-chunk tee, branch cancellation,
+and shared scheduler-permit ownership. Cache capture has a configured size
+bound and stores only cleanly completed bodies.
+
+Multipart handling is binary-safe and supports RFC 5987 filenames. Rust
+ArrayBuffer/typed-array constructors, half-duplex stream validation, UTF-8 JSON
+decoding, response helpers, and a null-body network-error constructor are
+implemented. `CONNECT` remains forbidden at request construction. The
+JavaScript typed-array, `Request`, `Response`, promise, and stream conversion
+surface remains in `webapis`; aggregate keepalive lifetime accounting remains
+with the browser-lifecycle work in step 3.
 
 ### 2. Finish CORS, response, and request algorithms
 

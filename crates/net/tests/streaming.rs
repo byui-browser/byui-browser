@@ -15,7 +15,7 @@ use std::{
 
 use common::{TestServer, read_request, runtime};
 use futures_util::StreamExt;
-use net::{Config, Request, RequestController, RequestError};
+use net::{CacheMode, Config, Request, RequestController, RequestError};
 
 #[test]
 fn fetch_yields_body_chunks_before_response_completion() {
@@ -35,12 +35,15 @@ fn fetch_yields_body_chunks_before_response_completion() {
     let controller = RequestController::builder(Config::default())
         .build()
         .unwrap();
-    let first_chunk = runtime().block_on(async {
+    let (declared_length, first_chunk) = runtime().block_on(async {
         let mut response = controller.fetch(Request::get(url)).await.unwrap();
-        response.body.next().await.unwrap().unwrap().to_vec()
+        let length = response.body.length();
+        let chunk = response.body.next().await.unwrap().unwrap().to_vec();
+        (length, chunk)
     });
 
     server.join().unwrap();
+    assert_eq!(declared_length, Some(11));
     assert_eq!(first_chunk, b"hello");
 }
 
@@ -114,4 +117,42 @@ fn dropping_a_stream_releases_its_scheduler_permit_and_does_not_cache() {
 
     server.join();
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn cloned_response_holds_one_permit_until_both_branches_are_dropped() {
+    let server = TestServer::start(2, |_| {
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody".to_vec()
+    });
+    let controller = RequestController::builder(Config {
+        max_in_flight: 1,
+        ..Config::default()
+    })
+    .build()
+    .unwrap();
+
+    runtime().block_on(async {
+        let mut request = Request::get(server.url());
+        request.set_cache_mode(CacheMode::NoStore);
+        let mut first = controller.fetch(request.clone()).await.unwrap();
+        let clone = first.try_clone().unwrap();
+        drop(first);
+
+        let second = controller.fetch(request);
+        tokio::pin!(second);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err()
+        );
+
+        drop(clone);
+        let response = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("dropping both branches should release the permit")
+            .unwrap();
+        assert_eq!(response.body.bytes().await.unwrap(), b"body");
+    });
+
+    server.join();
 }

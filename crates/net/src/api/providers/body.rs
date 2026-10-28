@@ -47,16 +47,16 @@ pub struct SchemeResource {
 
 impl SchemeBody {
     /// Converts provider body data into the shared abort-aware engine body model.
-    pub(crate) fn into_body(self, signal: AbortSignal, force_null: bool) -> (Body, bool) {
+    pub(crate) fn into_body(self, signal: AbortSignal, force_null: bool) -> Body {
         if force_null {
-            return (Body::null(), true);
+            return Body::null();
         }
         match self {
-            Self::Null => (Body::null(), true),
-            Self::Bytes(bytes) => (Body::once_with_signal(bytes, signal), false),
+            Self::Null => Body::null(),
+            Self::Bytes(bytes) => Body::once_with_signal(bytes, signal),
             Self::Stream(stream) => {
                 let stream = stream.map(|chunk| chunk.map(Bytes::from));
-                (Body::from_stream_with_signal(stream, signal), false)
+                Body::from_stream_with_signal(stream, signal)
             }
         }
     }

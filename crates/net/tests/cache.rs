@@ -48,14 +48,43 @@ fn fully_consumed_stream_is_cached() {
 
     runtime().block_on(async {
         let response = controller.fetch(Request::get(server.url())).await.unwrap();
+        assert_eq!(response.body.length(), Some(6));
         assert_eq!(collect_body(response).await.unwrap(), b"cached");
         let cached = controller.fetch(Request::get(server.url())).await.unwrap();
         assert!(cached.from_cache);
+        assert_eq!(cached.body.length(), Some(6));
         assert_eq!(cached.body.bytes().await.unwrap(), b"cached");
     });
 
     server.join();
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn bodies_larger_than_the_capture_limit_are_not_cached() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let observed_hits = Arc::clone(&hits);
+    let server = TestServer::start(2, move |_| {
+        observed_hits.fetch_add(1, Ordering::SeqCst);
+        b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nlarge".to_vec()
+    });
+    let controller = RequestController::builder(Config {
+        max_cache_body_size: 4,
+        ..Config::default()
+    })
+    .build()
+    .unwrap();
+
+    runtime().block_on(async {
+        for _ in 0..2 {
+            let response = controller.fetch(Request::get(server.url())).await.unwrap();
+            assert!(!response.from_cache);
+            assert_eq!(response.body.bytes().await.unwrap(), b"large");
+        }
+    });
+
+    server.join();
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
 #[test]

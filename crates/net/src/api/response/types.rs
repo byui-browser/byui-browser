@@ -42,3 +42,50 @@ pub struct Response {
     /// Filtered opaque responses always report `false` to avoid metadata leaks.
     pub from_cache: bool,
 }
+
+impl Response {
+    /// Constructs the filtered null-body response used to represent a Fetch network error.
+    ///
+    /// Controller fetch failures continue to return [`crate::RequestError`];
+    /// this value is available to bindings that require a response-shaped error.
+    pub fn network_error() -> Self {
+        Self {
+            response_type: ResponseType::Error,
+            status: 0,
+            status_text: String::new(),
+            headers: Headers::with_guard(crate::HeaderGuard::Immutable),
+            url: String::new(),
+            redirected: false,
+            body: Body::null(),
+            from_cache: false,
+        }
+    }
+
+    /// Clones response metadata and tees an unused body into bounded branches.
+    ///
+    /// Cloning fails after body consumption has started. Live streams use a
+    /// one-chunk-per-branch buffer so a slow clone applies backpressure.
+    pub fn try_clone(&mut self) -> Result<Self, crate::RequestError> {
+        let cloned = self.body.tee()?;
+        Ok(Self {
+            response_type: self.response_type,
+            status: self.status,
+            status_text: self.status_text.clone(),
+            headers: self.headers.clone(),
+            url: self.url.clone(),
+            redirected: self.redirected,
+            body: cloned,
+            from_cache: self.from_cache,
+        })
+    }
+
+    /// Returns whether the exposed status is in the successful 200-299 range.
+    pub fn ok(&self) -> bool {
+        (200..=299).contains(&self.status)
+    }
+
+    /// Returns whether this response has a readable non-null body.
+    pub fn has_body(&self) -> bool {
+        !self.body.is_null()
+    }
+}

@@ -49,7 +49,7 @@ mod transport;
 mod tests;
 
 pub use api::{
-    body::{Blob, Body, FormData, FormDataEntry},
+    body::{Blob, Body, BodyStatus, FormData, FormDataEntry},
     cancellation::{AbortController, AbortSignal},
     config::Config,
     error::{ProviderErrorKind, RequestError},
@@ -61,7 +61,7 @@ pub use api::{
     request::{
         CacheMode, CredentialsMode, FetchContext, FetchEnvironment, InitiatorType,
         NetworkPartitionKey, Origin, RedirectMode, Referrer, ReferrerPolicy, Request,
-        RequestDestination, RequestMode, RequestPriority, ServiceWorkersMode,
+        RequestDestination, RequestDuplex, RequestMode, RequestPriority, ServiceWorkersMode,
     },
     response::{Response, ResponseType},
     services::{FetchServices, ResponseInfo, ServiceWorkerDecision},

@@ -5,7 +5,7 @@ use crate::{
         body::Body,
         error::RequestError,
         request::{CacheMode, PreparedRequest, Request},
-        response::{InternalResponse, Response, ResponseType},
+        response::{InternalResponse, Response, ResponseType, has_null_body},
     },
     cache::StoredResponse,
     engine::{RequestController, cache_capture::with_cache_capture},
@@ -31,34 +31,22 @@ impl RequestController {
                         .cache
                         .get_with_staleness(&request, &url, allow_stale)
                 {
-                    let origin = reqwest::Url::parse(&response.url)
-                        .ok()
-                        .and_then(|url| crate::Origin::from_url(&url).ok());
                     // Return information about the devtools and other observers, but do not allow the body to be consumed until the caller polls it.
-                    let content_type = response.headers.get(http::header::CONTENT_TYPE).cloned();
-                    let mut body = Body::once_with_signal(response.body, request.signal.clone());
-                    body.set_content_type(content_type);
-                    let mut internal = InternalResponse {
-                        status: response.status,
-                        status_text: response
-                            .status
-                            .canonical_reason()
-                            .unwrap_or_default()
-                            .to_owned(),
-                        headers: response.headers,
-                        url_list: vec![response.url],
-                        redirect_count: 0,
-                        origin,
-                        request_origin: request.context.environment.origin.clone(),
-                        request_mode: request.context.mode,
-                        credentials_mode: request.context.credentials,
-                        response_type: ResponseType::Basic,
-                        body,
-                        body_is_null: request.method() == reqwest::Method::HEAD
-                            || matches!(response.status.as_u16(), 101 | 204 | 205 | 304),
-                        from_cache: true,
-                        cookie_headers_processed: response.cookie_headers_processed,
+                    let mut body = if has_null_body(request.method(), response.status) {
+                        Body::null()
+                    } else {
+                        Body::once_with_signal(response.body, request.signal.clone())
                     };
+                    body.set_response_metadata(&response.headers, None);
+                    let mut internal = InternalResponse::from_http_parts(
+                        response.status,
+                        response.headers,
+                        response.url,
+                        &request.context,
+                        body,
+                        true,
+                        response.cookie_headers_processed,
+                    );
                     self.finalize_response(&request, &mut internal)?;
                     return Ok(internal.expose());
                 }
@@ -131,7 +119,7 @@ impl RequestController {
                     candidate.url_list = request.url_list.iter().map(ToString::to_string).collect();
                     candidate.redirect_count = request.redirect_count + 1;
                     candidate.response_type = ResponseType::OpaqueRedirect;
-                    candidate.body_is_null = true;
+                    candidate.body = Body::null();
                     return Ok(candidate.expose());
                 }
                 crate::RedirectMode::Follow => {}
@@ -184,7 +172,7 @@ impl RequestController {
         }
 
         if cacheable && request.cache_mode != CacheMode::NoStore {
-            if response.body_is_null {
+            if response.body.is_null() {
                 self.inner.cache.insert(
                     &request,
                     &url,
@@ -198,7 +186,13 @@ impl RequestController {
                 );
                 return Ok(response.expose());
             }
-            response = with_cache_capture(response, self.inner.cache.clone(), request.clone(), url);
+            response = with_cache_capture(
+                response,
+                self.inner.cache.clone(),
+                request.clone(),
+                url,
+                self.inner.max_cache_body_size,
+            );
         }
         Ok(response.expose())
     }

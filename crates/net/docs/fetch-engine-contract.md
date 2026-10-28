@@ -11,6 +11,16 @@ headers pass Fetch filtering. Its abort-aware `Body` holds the scheduler permit
 until it is consumed or dropped. Body errors may occur after headers. Callers
 cannot obtain the transport response.
 
+`Body` uses one lifecycle state for helper locking, direct streaming, transport
+handoff, completion, failure, and abort. Nullness is part of that model rather
+than a parallel response flag. Declared length and media type survive live,
+cached, and provider-backed responses. `Response::try_clone` tees an unused
+live body through bounded one-chunk branches; a slow active branch applies
+backpressure, dropping a branch cancels it, and the shared scheduler permit is
+released only after the source completes or both branches are dropped. Cache
+capture is bounded by `Config::max_cache_body_size` and commits only at a clean
+end-of-stream.
+
 Error timing and retry behavior are part of this boundary:
 
 | Error category                                                                  | Timing                  | Body effect and recovery                                                                                          |
@@ -25,7 +35,8 @@ Error timing and retry behavior are part of this boundary:
 The private `InternalResponse` retains the transport status and canonical
 reason phrase, every header (including `Set-Cookie` and obsolete `Set-Cookie2`), complete URL-list and
 redirect state for the supported exchange/redirect slice, origin and tainting state,
-null-body state, cache provenance, cookie-processing state, and the live body.
+cache provenance, cookie-processing state, and the live body, whose own state
+authoritatively represents nullness.
 Policy and cookie processing run on that representation. Exposure constructs
 an immutable header list and removes forbidden response headers, including the
 obsolete `Set-Cookie2` compatibility case. CORS views
