@@ -175,49 +175,69 @@ pub fn same_origin(a: &Origin, b: &Origin) -> bool {
     a == b
 }
 
-/// A cookie as stored in the jar.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+/// A cookie stored in a [`CookieJar`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cookie {
+    /// The cookie name.
     pub name: String,
+    /// The value sent with the cookie name.
     pub value: String,
+    /// The host for which the cookie is visible.
+    ///
+    /// The current implementation compares this value literally with the
+    /// requesting origin's host. It does not yet implement subdomain,
+    /// leading-dot, or other full cookie-domain matching rules.
     pub domain: String,
+    /// Whether the cookie may be returned only for HTTPS origins.
     pub secure: bool,
 }
 
-/// Cookie storage with per-origin visibility rules. A Canvas session is a
-/// cookie, so this is on the critical path to the course goal.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+/// In-memory cookie storage with basic host and secure-transport filtering.
+///
+/// Cookies are replaced when a new cookie has the same name and domain. The
+/// jar does not yet persist cookies or implement expiration, paths, or the
+/// complete browser cookie-domain model.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CookieJar {
     cookies: Vec<Cookie>,
 }
 
 impl CookieJar {
-    /// An empty jar.
+    /// Creates an empty, in-memory cookie jar.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Stores a cookie received from `origin`, applying domain/secure rules.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
-    pub fn store(&mut self, origin: &Origin, cookie: Cookie) {
-        todo!("TODO(security): store {} for {}", cookie.name, origin.host)
+    /// Stores `cookie`, replacing an existing cookie with the same name and domain.
+    ///
+    /// The `origin` argument is reserved for future validation. It is not
+    /// currently used when storing a cookie; callers are responsible for
+    /// providing a cookie with the intended domain and secure attributes.
+    pub fn store(&mut self, _origin: &Origin, cookie: Cookie) {
+        self.cookies
+            .retain(|existing| existing.name != cookie.name || existing.domain != cookie.domain);
+
+        self.cookies.push(cookie);
     }
 
-    /// Cookies that may be sent to `origin`.
+    /// Returns cookies that may be sent to `origin`.
     ///
-    /// Currently only handles the empty jar.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+    /// A cookie is returned when its domain exactly matches the origin host.
+    /// Secure cookies are returned only for HTTPS origins. The returned
+    /// references point into the jar and are ordered by insertion order.
     pub fn cookies_for(&self, origin: &Origin) -> Vec<&Cookie> {
-        if self.cookies.is_empty() {
-            return Vec::new();
+        let mut matching_cookies = Vec::new();
+
+        for cookie in &self.cookies {
+            let domain_matches = cookie.domain == origin.host();
+            let secure_connection = origin.scheme() == "https";
+
+            if domain_matches && (!cookie.secure || secure_connection) {
+                matching_cookies.push(cookie);
+            }
         }
-        todo!(
-            "TODO(security): filter {} cookies for {}",
-            self.cookies.len(),
-            origin.host
-        )
+
+        matching_cookies
     }
 }
 
@@ -374,5 +394,99 @@ mod tests {
             jar.cookies_for(&origin("https", "byui.edu", 443))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn stores_and_returns_cookie_for_matching_origin() {
+        let site = origin("https", "byui.edu", 443);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "abc123".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        let cookies = jar.cookies_for(&site);
+
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].name, "session");
+        assert_eq!(cookies[0].value, "abc123");
+    }
+
+    #[test]
+    fn does_not_return_cookie_for_different_origin() {
+        let site = origin("https", "byui.edu", 443);
+        let other_site = origin("https", "example.com", 443);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "abc123".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        let cookies = jar.cookies_for(&other_site);
+
+        assert!(cookies.is_empty());
+    }
+
+    #[test]
+    fn secure_cookie_is_only_returned_for_https() {
+        let https_site = origin("https", "byui.edu", 443);
+        let http_site = origin("http", "byui.edu", 80);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &https_site,
+            Cookie {
+                name: "session".into(),
+                value: "abc123".into(),
+                domain: "byui.edu".into(),
+                secure: true,
+            },
+        );
+
+        assert_eq!(jar.cookies_for(&https_site).len(), 1);
+        assert!(jar.cookies_for(&http_site).is_empty());
+    }
+
+    #[test]
+    fn newer_cookie_replaces_old_cookie() {
+        let site = origin("https", "byui.edu", 443);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "old-value".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "new-value".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        let cookies = jar.cookies_for(&site);
+
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].value, "new-value");
     }
 }

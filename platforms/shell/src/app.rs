@@ -67,6 +67,8 @@ struct App {
     /// Window size, scale-factor bits, and theme `frame` was painted for.
     frame_key: Option<(u32, u32, u64, bool)>,
     last_toolbar_click: Option<Instant>,
+    /// Shared browser runtime and persistent storage backend.
+    runtime: browser::BrowserRuntime,
     alerts: Arc<PageAlerts>,
     scripts_evaluated: bool,
 }
@@ -129,6 +131,14 @@ impl AlertSink for PageAlerts {
 
 impl App {
     fn new(platform: Platform) -> Self {
+        let root = browser::application_data_directory()
+            .expect("application data directory should be available");
+        let runtime =
+            browser::BrowserRuntime::open(root).expect("browser storage should initialize");
+        Self::with_runtime(platform, runtime)
+    }
+
+    fn with_runtime(platform: Platform, runtime: browser::BrowserRuntime) -> Self {
         let refresh = browser::refresh::RefreshClient::new()
             .map_err(|error| {
                 eprintln!("Refresh initialization failed: {error}");
@@ -151,6 +161,7 @@ impl App {
             frame: Vec::new(),
             frame_key: None,
             last_toolbar_click: None,
+            runtime,
             alerts: Arc::new(PageAlerts::new()),
             scripts_evaluated: false,
         }
@@ -267,6 +278,7 @@ impl App {
                     card.height,
                     scale,
                     Arc::clone(&self.alerts) as Arc<dyn AlertSink>,
+                    &self.runtime,
                     &mut scripts_already_ran,
                 )
                 .map(|page| ((card.width, card.height), page))
@@ -461,8 +473,9 @@ impl ApplicationHandler for App {
         // Leave this thread in the event loop. The script runs elsewhere and
         // asks the loop to present an alert; joining it here would deadlock.
         let alerts = Arc::clone(&self.alerts) as Arc<dyn AlertSink>;
+        let runtime = self.runtime.clone();
         thread::spawn(move || {
-            crate::content::evaluate_page_script(&page, alerts);
+            crate::content::evaluate_page_script(&page, alerts, runtime);
         });
     }
 }
@@ -488,11 +501,14 @@ mod tests {
     }
 
     fn app() -> App {
-        App::new(Platform {
-            configure_window: |attributes| attributes,
-            ui_font_files: Vec::new,
-            window_controls_inset: 0.0,
-        })
+        App::with_runtime(
+            Platform {
+                configure_window: |attributes| attributes,
+                ui_font_files: Vec::new,
+                window_controls_inset: 0.0,
+            },
+            browser::BrowserRuntime::in_memory(),
+        )
     }
 
     #[test]
@@ -527,6 +543,7 @@ mod tests {
                 height,
                 scale,
                 Arc::clone(&alert_sink),
+                &app.runtime,
                 &mut app.scripts_evaluated,
             );
             assert_eq!(rendered.is_some(), width > 0 && height > 0);

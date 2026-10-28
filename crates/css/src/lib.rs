@@ -14,8 +14,7 @@ pub use selector::{
     parse_selector_list,
 };
 
-use common::ids::NodeId;
-use html::{HTMLDocument, NodeKind};
+use html::{HTMLDocument, NodeID, NodeKind};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +63,7 @@ pub type Dom = HTMLDocument;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ComputedStyles {
-    pub styles: Vec<(NodeId, Vec<Declaration>)>,
+    pub styles: Vec<(NodeID, Vec<Declaration>)>,
 }
 
 /// Parse CSS and retain all valid rules while collecting recoverable errors.
@@ -447,7 +446,7 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
         }
         for (sheet_index, sheet) in stylesheets.iter().enumerate() {
             for (rule_index, rule) in sheet.rules.iter().enumerate() {
-                if !matches_selector(dom, html::NodeId(index), &rule.selector.0) {
+                if !matches_selector(dom, NodeID::new(index), &rule.selector.0) {
                     continue;
                 }
                 let rank = sheet_index
@@ -481,7 +480,7 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
             }
         }
         computed.push((
-            NodeId::new(index as u32),
+            NodeID::new(index),
             values
                 .into_iter()
                 .map(|(property, (_, _, value))| Declaration { property, value })
@@ -492,12 +491,12 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
 }
 
 fn computed_style(
-    styles: &[(NodeId, Vec<Declaration>)],
-    parent: html::NodeId,
+    styles: &[(NodeID, Vec<Declaration>)],
+    parent: NodeID,
 ) -> Option<&Vec<Declaration>> {
     styles
         .iter()
-        .find(|(id, _)| id.index() as usize == parent.index())
+        .find(|(id, _)| id.get() == parent.get())
         .map(|(_, declarations)| declarations)
 }
 
@@ -523,7 +522,7 @@ fn attribute_value<'a>(element: &'a html::ElementData, name: &str) -> Option<&'a
         .map(|attribute| attribute.value.as_str())
 }
 
-fn matches_selector(dom: &HTMLDocument, node_id: html::NodeId, selector: &str) -> bool {
+fn matches_selector(dom: &HTMLDocument, node_id: NodeID, selector: &str) -> bool {
     let parts = selector.split_whitespace().collect::<Vec<_>>();
     let Some(last) = parts.last() else {
         return false;
@@ -533,14 +532,14 @@ fn matches_selector(dom: &HTMLDocument, node_id: html::NodeId, selector: &str) -
     }
     let mut current = node_id;
     for part in parts.iter().rev().skip(1) {
-        let mut ancestor = dom.nodes[current.index()].parent;
+        let mut ancestor = dom.nodes[current.get()].parent;
         let mut found = None;
         while let Some(candidate) = ancestor {
             if matches_compound(dom, candidate, part) {
                 found = Some(candidate);
                 break;
             }
-            ancestor = dom.nodes[candidate.index()].parent;
+            ancestor = dom.nodes[candidate.get()].parent;
         }
         let Some(found) = found else { return false };
         current = found;
@@ -548,7 +547,7 @@ fn matches_selector(dom: &HTMLDocument, node_id: html::NodeId, selector: &str) -
     true
 }
 
-fn matches_compound(dom: &HTMLDocument, node_id: html::NodeId, selector: &str) -> bool {
+fn matches_compound(dom: &HTMLDocument, node_id: NodeID, selector: &str) -> bool {
     let Some(node) = dom.node(node_id) else {
         return false;
     };
@@ -650,7 +649,7 @@ mod tests {
         let declarations = styles
             .styles
             .iter()
-            .find(|(id, _)| id.index() as usize == paragraph.index())
+            .find(|(id, _)| id.get() == paragraph.get())
             .expect("computed paragraph");
         assert!(declarations.1.contains(&Declaration {
             property: "color".into(),

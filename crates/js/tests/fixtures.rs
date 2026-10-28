@@ -84,7 +84,7 @@ fn arrow_functions_fixture_will_evaluate_when_arrows_are_supported() {
 }
 
 #[test]
-#[ignore = "Classes and new are not implemented yet"]
+#[ignore = "Classes run only on the bytecode VM; see tests/bytecode_classes.rs"]
 fn classes_fixture_will_evaluate_when_classes_are_supported() {
     assert!(eval(fixture("classes.js")).is_ok());
 }

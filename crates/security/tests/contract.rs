@@ -22,10 +22,9 @@ fn path_does_not_affect_origin() {
 }
 
 #[test]
-#[ignore = "TODO(security): cookie jar not implemented"]
 fn secure_cookie_is_not_sent_over_http() {
-    let https = Origin::parse("https://example.test/").expect("origin");
-    let http = Origin::parse("http://example.test/").expect("origin");
+    let https = Origin::with_port("https", "example.test", 443);
+    let http = Origin::with_port("http", "example.test", 80);
     let mut jar = CookieJar::new();
     jar.store(
         &https,

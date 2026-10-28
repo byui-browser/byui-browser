@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
-use browser::evaluate_page_scripts;
+use browser::BrowserRuntime;
+use security::{Origin, RendererSecurityContext, StoragePermission};
 use webapis::{AlertSink, ConsoleSink};
 
 #[derive(Default)]
@@ -25,6 +26,13 @@ impl AlertSink for TestAlert {
     }
 }
 
+fn security_context() -> RendererSecurityContext {
+    RendererSecurityContext::new(
+        Origin::new("https", "example.com", None),
+        StoragePermission::Allowed,
+    )
+}
+
 #[test]
 fn html_script_reaches_registered_web_api() {
     let console = Arc::new(TestConsole::default());
@@ -34,14 +42,17 @@ fn html_script_reaches_registered_web_api() {
             .build()
             .expect("network client"),
     );
+    let runtime = BrowserRuntime::in_memory();
 
-    let results = evaluate_page_scripts(
-        "<main><script>print()</script></main>",
-        console.clone(),
-        alert.clone(),
-        controller,
-    )
-    .expect("page script should evaluate");
+    let results = runtime
+        .evaluate_page_scripts(
+            "<main><script>print()</script></main>",
+            console.clone(),
+            alert.clone(),
+            controller,
+            security_context(),
+        )
+        .expect("page script should evaluate");
 
     assert_eq!(results, vec![js::Value::Undefined]);
     assert_eq!(
@@ -60,14 +71,17 @@ fn html_script_reaches_registered_alert_api() {
             .build()
             .expect("network client"),
     );
+    let runtime = BrowserRuntime::in_memory();
 
-    let results = evaluate_page_scripts(
-        "<main><script>alert('team handshake')</script></main>",
-        console,
-        alert.clone(),
-        controller,
-    )
-    .expect("page script should evaluate");
+    let results = runtime
+        .evaluate_page_scripts(
+            "<main><script>alert('team handshake')</script></main>",
+            console,
+            alert.clone(),
+            controller,
+            security_context(),
+        )
+        .expect("page script should evaluate");
 
     assert_eq!(results, vec![js::Value::Undefined]);
     assert_eq!(
@@ -85,12 +99,15 @@ fn html_script_reads_dom_attributes_through_document() {
             .build()
             .expect("network client"),
     );
+    let runtime = BrowserRuntime::in_memory();
 
-    let results = evaluate_page_scripts(
+    let results = runtime
+        .evaluate_page_scripts(
         "<main id='app' data-state='ready'><script>document.getElementById('app').getAttribute('DATA-STATE')</script></main>",
         console,
         alert,
         controller,
+        security_context(),
     )
     .expect("page script should evaluate");
 
