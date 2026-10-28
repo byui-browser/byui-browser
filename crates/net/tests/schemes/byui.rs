@@ -151,10 +151,16 @@ fn resource(url: net::Url, body: SchemeBody) -> SchemeResource {
         url,
         status: 200,
         status_text: Some("OK".into()),
-        headers: vec![(
-            net::HeaderName::from_static("x-page"),
-            net::HeaderValue::from_static("welcome"),
-        )],
+        headers: vec![
+            (
+                net::HeaderName::from_static("x-page"),
+                net::HeaderValue::from_static("welcome"),
+            ),
+            (
+                net::HeaderName::from_static("set-cookie"),
+                net::HeaderValue::from_static("session=must-not-leak"),
+            ),
+        ],
         media_type: Some(net::HeaderValue::from_static("text/html")),
         origin: Origin::opaque(),
         body,
@@ -190,6 +196,7 @@ fn byui_pages_resolve_once_and_preserve_page_metadata() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(response.url, "byui://welcome/page?lang=en");
     assert_eq!(response.headers.get("x-page").as_deref(), Some("welcome"));
+    assert!(!response.headers.has("set-cookie"));
     assert_eq!(
         response.headers.get("content-type").as_deref(),
         Some("text/html")
@@ -203,6 +210,29 @@ fn byui_pages_resolve_once_and_preserve_page_metadata() {
         &[Some(Origin::opaque())]
     );
     assert_eq!(services.cookie_lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(services.cache_partitions.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn repeated_byui_fetches_resolve_again_and_do_not_use_the_http_cache() {
+    let provider = Arc::new(Provider {
+        calls: AtomicUsize::new(0),
+        outcome: Outcome::Bytes,
+    });
+    let (controller, services) = controller(provider.clone());
+
+    for _ in 0..2 {
+        let response = runtime()
+            .block_on(controller.fetch(Request::get("byui://welcome/page?lang=en")))
+            .unwrap();
+        assert!(!response.from_cache);
+        assert_eq!(
+            runtime().block_on(response.body.bytes()).unwrap(),
+            b"<h1>Welcome</h1>"
+        );
+    }
+
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     assert_eq!(services.cache_partitions.load(Ordering::SeqCst), 0);
 }
 

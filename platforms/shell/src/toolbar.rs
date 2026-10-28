@@ -4,10 +4,9 @@
 //! Window controls come from the operating system: each shell keeps its native
 //! decorations, and where those overlap the toolbar (macOS's traffic lights on
 //! a transparent titlebar) the controls shift right by
-//! [`ChromeState::window_controls_inset`]. Navigation is not implemented yet:
-//! Back and Forward are drawn disabled, and Reload, the address field, New
-//! Tab, and the menu only show hover and press feedback. The address text is a
-//! fixed label for the welcome page.
+//! [`ChromeState::window_controls_inset`]. Navigation and tabs remain staged;
+//! the address field supports focus and editing, while only the built-in
+//! `byui://welcome` page can currently be submitted.
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform};
@@ -36,8 +35,6 @@ const ADDRESS_LEADING: f32 = 116.0;
 /// field usable.
 const TRAILING_MIN_WIDTH: f32 = 360.0;
 const TEXT_SIZE: f32 = 13.0;
-const ADDRESS_SCHEME: &str = "byui://";
-const ADDRESS_PAGE: &str = "welcome";
 
 /// A clickable region of the chrome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,7 +45,7 @@ pub(crate) enum Control {
     Forward,
     /// Reload; fetches the current URL to the terminal and repaints the loaded page.
     Reload,
-    /// Address field; text entry is not implemented yet.
+    /// Address field; supports staged text editing.
     Address,
     /// New tab placeholder; tabs are not implemented yet.
     NewTab,
@@ -86,6 +83,8 @@ pub(crate) struct ChromeState {
     /// traffic lights do on a transparent titlebar. Zero when the system draws
     /// its buttons in a separate titlebar above the toolbar.
     pub window_controls_inset: f32,
+    /// Whether the address field owns keyboard input.
+    pub address_focused: bool,
 }
 
 /// A rectangle in device pixels.
@@ -158,6 +157,7 @@ pub(crate) fn compose(
     height: u32,
     scale_factor: f64,
     state: &ChromeState,
+    address: &str,
     page: Option<&Pixmap>,
     font: Option<&FontVec>,
 ) -> Option<Pixmap> {
@@ -175,6 +175,7 @@ pub(crate) fn compose(
         state,
         palette,
         font,
+        address,
     );
     Some(pixmap)
 }
@@ -190,6 +191,7 @@ pub(crate) fn compose_controls(
     height: u32,
     scale_factor: f64,
     state: &ChromeState,
+    address: &str,
     font: Option<&FontVec>,
 ) -> Option<Pixmap> {
     let strip = controls_height_in_pixels(scale_factor).min(height);
@@ -204,6 +206,7 @@ pub(crate) fn compose_controls(
         state,
         palette,
         font,
+        address,
     );
     Some(pixmap)
 }
@@ -311,6 +314,7 @@ fn draw_toolbar(
     state: &ChromeState,
     palette: &Palette,
     font: Option<&FontVec>,
+    address: &str,
 ) {
     let transform = Transform::from_scale(scale, scale);
     let inset = state.window_controls_inset;
@@ -341,7 +345,7 @@ fn draw_toolbar(
         draw_icon(pixmap, control, cx, cy, color, transform);
     }
     if let Some(rect) = control_rect(Control::Address, width, inset) {
-        draw_address_field(pixmap, rect, scale, state, palette, font);
+        draw_address_field(pixmap, rect, scale, state, palette, font, address);
     }
 }
 
@@ -420,6 +424,7 @@ fn draw_address_field(
     state: &ChromeState,
     palette: &Palette,
     font: Option<&FontVec>,
+    address: &str,
 ) {
     let transform = Transform::from_scale(scale, scale);
     let hovered = state.hovered == Some(Control::Address);
@@ -433,7 +438,21 @@ fn draw_address_field(
     };
     fill(pixmap, &shape, field, transform);
     // A device-pixel hairline stays crisp at every scale factor.
-    stroke(pixmap, &shape, palette.field_border, 1.0 / scale, transform);
+    stroke(
+        pixmap,
+        &shape,
+        if state.address_focused {
+            palette.accent
+        } else {
+            palette.field_border
+        },
+        if state.address_focused {
+            1.25 / scale
+        } else {
+            1.0 / scale
+        },
+        transform,
+    );
 
     let cy = CENTER_Y;
     let lock_x = rect.x() + 16.0;
@@ -479,25 +498,19 @@ fn draw_address_field(
         let scaled = font.as_scaled(PxScale::from(size));
         let baseline = cy * scale + (scaled.ascent() + scaled.descent()) / 2.0;
         let clip = (star_x - 12.0) * scale;
-        let x = draw_text(
+        draw_text(
             pixmap,
             font,
             size,
             (rect.x() + 30.0) * scale,
             baseline,
             clip,
-            palette.text_muted,
-            ADDRESS_SCHEME,
-        );
-        draw_text(
-            pixmap,
-            font,
-            size,
-            x,
-            baseline,
-            clip,
-            palette.text,
-            ADDRESS_PAGE,
+            if state.address_focused {
+                palette.text
+            } else {
+                palette.text_muted
+            },
+            address,
         );
     }
 }
@@ -721,7 +734,16 @@ mod tests {
             let mut page = Pixmap::new(card.width, card.height).unwrap();
             page.fill(Color::from_rgba8(255, 0, 0, 255));
             let state = ChromeState::default();
-            let out = compose(width, height, scale, &state, Some(&page), None).unwrap();
+            let out = compose(
+                width,
+                height,
+                scale,
+                &state,
+                "byui://welcome",
+                Some(&page),
+                None,
+            )
+            .unwrap();
             let middle = pixel(&out, card.x + card.width / 2, card.y + card.height / 2);
             assert_eq!(middle, [255, 0, 0, 255]);
             // The rounded corner leaves the frame showing at the card's corner.
@@ -783,7 +805,18 @@ mod tests {
 
     #[test]
     fn every_state_and_size_composes_safely() {
-        assert!(compose(0, 0, 1.0, &ChromeState::default(), None, None).is_none());
+        assert!(
+            compose(
+                0,
+                0,
+                1.0,
+                &ChromeState::default(),
+                "byui://welcome",
+                None,
+                None
+            )
+            .is_none()
+        );
         for (width, height) in [(1, 1), (20, 60), (300, 120), (1200, 800)] {
             for dark in [false, true] {
                 for hovered in [None, Some(Control::Reload), Some(Control::Address)] {
@@ -791,9 +824,11 @@ mod tests {
                         hovered,
                         pressed: hovered,
                         dark,
+                        address_focused: false,
                         window_controls_inset: if dark { 72.0 } else { 0.0 },
                     };
-                    let out = compose(width, height, 1.5, &state, None, None).unwrap();
+                    let out =
+                        compose(width, height, 1.5, &state, "byui://welcome", None, None).unwrap();
                     assert_eq!(out.width(), width);
                 }
             }
@@ -809,8 +844,9 @@ mod tests {
                 dark,
                 ..ChromeState::default()
             };
-            let full = compose(width, height, scale, &state, None, None).unwrap();
-            let strip = compose_controls(width, height, scale, &state, None).unwrap();
+            let full = compose(width, height, scale, &state, "byui://welcome", None, None).unwrap();
+            let strip =
+                compose_controls(width, height, scale, &state, "byui://welcome", None).unwrap();
             assert_eq!(strip.height(), controls_height_in_pixels(scale));
             assert_eq!(strip.data(), &full.data()[..strip.data().len()]);
             // The strip ends above the card shadow.
@@ -821,13 +857,50 @@ mod tests {
 
     #[test]
     fn dark_and_light_frames_differ() {
-        let light = compose(400, 200, 1.0, &ChromeState::default(), None, None).unwrap();
+        let light = compose(
+            400,
+            200,
+            1.0,
+            &ChromeState::default(),
+            "byui://welcome",
+            None,
+            None,
+        )
+        .unwrap();
         let dark_state = ChromeState {
             dark: true,
             ..ChromeState::default()
         };
-        let dark = compose(400, 200, 1.0, &dark_state, None, None).unwrap();
+        let dark = compose(400, 200, 1.0, &dark_state, "byui://welcome", None, None).unwrap();
         assert!(pixel(&light, 200, 4)[0] > 200);
         assert!(pixel(&dark, 200, 4)[0] < 60);
+    }
+
+    #[test]
+    fn focused_address_field_has_distinct_chrome() {
+        let normal = compose(
+            400,
+            200,
+            1.0,
+            &ChromeState::default(),
+            "byui://welcome",
+            None,
+            None,
+        )
+        .unwrap();
+        let focused = compose(
+            400,
+            200,
+            1.0,
+            &ChromeState {
+                address_focused: true,
+                ..ChromeState::default()
+            },
+            "byui://welcome",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_ne!(normal.data(), focused.data());
     }
 }

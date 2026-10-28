@@ -77,11 +77,19 @@ enum AboutBody {
 impl AboutAllowlistEntry {
     fn body(&self, method: &Method) -> SchemeBody {
         if method == Method::HEAD {
-            SchemeBody::Null
-        } else {
-            match self.body {
-                AboutBody::Empty => SchemeBody::Bytes(Vec::new()),
-            }
+            return SchemeBody::NullWithLength(self.body.len());
+        }
+        match self.body {
+            AboutBody::Empty => SchemeBody::Bytes(Vec::new()),
+        }
+    }
+}
+
+impl AboutBody {
+    /// Returns the length of the selected representation without materializing it.
+    const fn len(self) -> usize {
+        match self {
+            Self::Empty => 0,
         }
     }
 }
