@@ -52,6 +52,11 @@ fn data_urls_decode_standard_payload_forms_and_metadata() {
             response.headers.get("content-type").as_deref(),
             Some(content_type)
         );
+        let expected_length = expected_body.len().to_string();
+        assert_eq!(
+            response.headers.get("content-length").as_deref(),
+            Some(expected_length.as_str())
+        );
         assert_eq!(
             runtime().block_on(response.body.bytes()).unwrap(),
             expected_body

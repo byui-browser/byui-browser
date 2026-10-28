@@ -441,6 +441,69 @@ mod tests {
     }
 
     #[test]
+    fn embedded_page_aliases_ignore_query_and_fragment_for_lookup() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let response = runtime
+            .block_on(controller.fetch(Request::get("byui://welcome/index.html?lang=en#top")))
+            .expect("embedded page alias should resolve");
+
+        assert_eq!(response.url, "byui://welcome/index.html?lang=en#top");
+        let body = runtime.block_on(response.body.bytes()).unwrap();
+        assert_eq!(
+            response.headers.get("content-length"),
+            Some(body.len().to_string())
+        );
+        assert!(body.starts_with(b"<!doctype"));
+    }
+
+    #[test]
+    fn embedded_page_head_preserves_metadata_without_a_body() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let get_response = runtime
+            .block_on(controller.fetch(Request::get("byui://welcome/page?lang=en#top")))
+            .expect("embedded page GET should resolve");
+        let expected_length = get_response
+            .headers
+            .get("content-length")
+            .expect("embedded page GET should expose content length");
+        let mut request = Request::get("byui://welcome/page?lang=en#top");
+        request
+            .set_method(net::Method::HEAD)
+            .expect("GET can become HEAD");
+
+        let response = runtime
+            .block_on(controller.fetch(request))
+            .expect("embedded page HEAD should resolve");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.headers.get("content-length"),
+            Some(expected_length)
+        );
+        assert!(response.body.is_null());
+        assert!(runtime.block_on(response.body.bytes()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_embedded_page_routes_fail_without_a_fallback() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let error = runtime
+            .block_on(controller.fetch(Request::get("byui://missing/page")))
+            .expect_err("unknown embedded routes must fail");
+
+        assert!(matches!(
+            error,
+            net::RequestError::Provider {
+                provider: "byui page",
+                kind: net::ProviderErrorKind::ResourceMissing
+            }
+        ));
+    }
+
+    #[test]
     fn runtime_connects_persistent_storage_to_the_local_storage_binding() {
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
