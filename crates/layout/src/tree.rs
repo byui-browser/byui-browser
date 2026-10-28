@@ -1,6 +1,6 @@
 //! Layout tree data structures.
 
-use common::ids::NodeId;
+use html::NodeID;
 
 use crate::Rect;
 
@@ -8,7 +8,7 @@ use crate::Rect;
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayoutBox {
     /// The HTML node represented by this box, or `None` for the viewport root.
-    pub node: Option<NodeId>,
+    pub node: Option<NodeID>,
     /// The box's CSS-pixel bounds.
     pub rect: Rect,
     /// Nested boxes. The first slice leaves this empty and flattens elements.
