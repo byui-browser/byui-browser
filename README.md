@@ -12,12 +12,12 @@ crate ownership, and collaboration rules. Team overviews live in
 Pushing a version tag (`v0.1.0`, or any `v*.*.*` tag) runs the
 [release workflow](.github/workflows/release.yml). It builds the native shell
 for macOS, Linux, and Windows, then attaches one archive to the
-[GitHub Release](https://github.com/byui-cse/byui-browser/releases) for that
+[GitHub Release](https://github.com/byui-browser/byui-browser/releases) for that
 tag. These links always download the latest release:
 
-- [macOS (Apple Silicon)](https://github.com/byui-cse/byui-browser/releases/latest/download/byui-browser-macos-aarch64.tar.gz)
-- [Linux (x86_64)](https://github.com/byui-cse/byui-browser/releases/latest/download/byui-browser-linux-x86_64.tar.gz)
-- [Windows (x86_64)](https://github.com/byui-cse/byui-browser/releases/latest/download/byui-browser-windows-x86_64.zip)
+- [macOS (Apple Silicon)](https://github.com/byui-browser/byui-browser/releases/latest/download/byui-browser-macos-aarch64.tar.gz)
+- [Linux (x86_64)](https://github.com/byui-browser/byui-browser/releases/latest/download/byui-browser-linux-x86_64.tar.gz)
+- [Windows (x86_64)](https://github.com/byui-browser/byui-browser/releases/latest/download/byui-browser-windows-x86_64.zip)
 
 Each archive contains a `byui-browser` program (`byui-browser.exe` on
 Windows). The Linux build uses the system GTK 3 libraries, so install
