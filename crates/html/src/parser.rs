@@ -1,5 +1,5 @@
 use crate::{
-    Attribute, ElementData, HTMLDocument, Namespace, NodeId, NodeKind, SourceSpan,
+    Attribute, ElementData, HTMLDocument, Namespace, NodeID, NodeKind, SourceSpan,
     escape_characters::decode_html_entities,
 };
 
@@ -7,7 +7,7 @@ use crate::{
 pub fn parse_raw_html(raw: String) -> HTMLDocument {
     let mut document = HTMLDocument::new();
     let root = document.root;
-    let mut stack = Vec::<NodeId>::new();
+    let mut stack = Vec::<NodeID>::new();
     let mut cursor = 0;
 
     while let Some(relative_open) = raw[cursor..].find('<') {
@@ -141,11 +141,11 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
     document
 }
 
-fn current_parent(stack: &[NodeId], root: NodeId) -> NodeId {
+fn current_parent(stack: &[NodeID], root: NodeID) -> NodeID {
     stack.last().copied().unwrap_or(root)
 }
 
-fn append_text(document: &mut HTMLDocument, parent: NodeId, text: &str, start: usize, end: usize) {
+fn append_text(document: &mut HTMLDocument, parent: NodeID, text: &str, start: usize, end: usize) {
     if text.is_empty() {
         return;
     }
@@ -158,7 +158,7 @@ fn append_text(document: &mut HTMLDocument, parent: NodeId, text: &str, start: u
     document.append_child(parent, id);
 }
 
-fn element_name(document: &HTMLDocument, id: NodeId) -> Option<&str> {
+fn element_name(document: &HTMLDocument, id: NodeID) -> Option<&str> {
     match &document.node(id)?.kind {
         NodeKind::Element(element) => Some(&element.name),
         _ => None,

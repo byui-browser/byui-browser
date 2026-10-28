@@ -54,7 +54,10 @@ type ParseResult<T> = Result<T, ParseError>;
 /// Simple statements accept an explicit `;`, or an automatic semicolon at a
 /// line terminator, before `}`, or at end of input. A line terminator directly
 /// after `return` produces an empty return. Empty statements, comma
-/// declarations, and trailing commas are unsupported.
+/// declarations, and trailing commas in calls are unsupported; object
+/// literals allow a trailing comma. A `{` at the start of a statement opens a
+/// block, as in JavaScript, so wrap an object literal statement in
+/// parentheses: `({ a: 1 })`.
 /// Returns outside functions, constants without initializers, duplicate
 /// parameter names, and `let`/`const`/`function` declarations used directly as
 /// an `if`, `else`, or `while` body are rejected.

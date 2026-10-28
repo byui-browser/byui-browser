@@ -47,9 +47,8 @@ pub fn paint_document(tree: &LayoutTree, document: &HTMLDocument) -> DisplayList
     for layout_box in &tree.root.children {
         items.push(background_item(layout_box));
         if let Some(node) = layout_box.node {
-            let html_node = layout::html_node_id(node);
             let text = document
-                .node(html_node)
+                .node(node)
                 .into_iter()
                 .flat_map(|node| node.children.iter())
                 .filter_map(|child| document.node(*child))

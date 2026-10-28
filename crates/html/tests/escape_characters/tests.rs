@@ -1,4 +1,4 @@
-use html::{HTMLDocument, NodeId, NodeKind, Query, parse_raw_html};
+use html::{HTMLDocument, NodeID, NodeKind, Query, parse_raw_html};
 #[path = "../../src/html5_entities.rs"]
 mod entity_table;
 
@@ -7,12 +7,12 @@ mod entity_table;
 ///
 /// The lookup scans the document's arena order. It panics when no matching
 /// element exists; callers that need optional lookup should use `query`.
-fn element_id(document: &HTMLDocument, name: &str) -> NodeId {
+fn element_id(document: &HTMLDocument, name: &str) -> NodeID {
     document
         .nodes
         .iter()
         .position(|node| matches!(&node.kind, NodeKind::Element(element) if element.name == name))
-        .map(NodeId)
+        .map(NodeID::new)
         .unwrap_or_else(|| panic!("missing <{name}> element"))
 }
 
@@ -26,7 +26,7 @@ fn attribute_value<'a>(
     name: &str,
 ) -> Option<&'a str> {
     let id = element_id(document, element_name);
-    let NodeKind::Element(element) = &document.nodes[id.index()].kind else {
+    let NodeKind::Element(element) = &document.nodes[id.get()].kind else {
         unreachable!("element lookup returns an element")
     };
     element

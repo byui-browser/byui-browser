@@ -26,8 +26,8 @@ pub enum Instruction {
     /// Reads a named property: pops the object and pushes the value stored
     /// under the string constant at this pool index.
     ///
-    /// Reading a missing property, or any property of a non-object, is a
-    /// runtime error, matching the tree-walk evaluator.
+    /// A missing property reads as `undefined`. Reading any property of a
+    /// non-object is a runtime error, matching the tree-walk evaluator.
     LoadProperty(u16),
     /// Reads a computed property: pops the key, then the object, and pushes
     /// the value. The key is converted to a string, so `1` and `'1'` name the
@@ -43,6 +43,16 @@ pub enum Instruction {
     /// Writes a computed property: pops the value, the key, then the object,
     /// stores the value under the stringified key, and pushes the value back.
     StoreComputedProperty,
+    /// Pushes a new empty object, the start of an object literal.
+    NewObject,
+    /// Adds an object literal property: pops the value, stores it on the
+    /// object now at the top of the stack under the string constant at this
+    /// pool index, and leaves the object on the stack.
+    DefineProperty(u16),
+    /// Adds a computed object literal property: pops the value, then the
+    /// key, stores the value under the stringified key on the object now at
+    /// the top of the stack, and leaves the object on the stack.
+    DefineComputedProperty,
     /// Duplicates the value at the top of the stack.
     Dup,
     /// Pushes the running function's `this` receiver.
@@ -79,7 +89,8 @@ pub enum Instruction {
     SuperCall(u16),
     /// Reads a method through `super`: pushes the property named by the
     /// string constant at this pool index, looked up starting from the parent
-    /// of the running method's home prototype.
+    /// of the running method's home prototype. A missing property reads as
+    /// `undefined`.
     LoadSuperProperty(u16),
     /// Defines a class: pops the superclass when `has_superclass` is set, and
     /// pushes the class constructor made from the template at `function`.

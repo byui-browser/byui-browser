@@ -289,8 +289,10 @@ impl Vm {
                         .and_then(Function::home_object)
                         .ok_or_else(|| JsError::runtime("`super` has no home object"))?
                         .prototype();
-                    let value = prototype.and_then(|prototype| prototype.get(&key));
-                    self.push(value.ok_or_else(|| property_missing(&key))?);
+                    let value = prototype
+                        .and_then(|prototype| prototype.get(&key))
+                        .unwrap_or(Value::Undefined);
+                    self.push(value);
                 }
                 Instruction::DefineClass {
                     function,
@@ -323,6 +325,17 @@ impl Vm {
                     let method =
                         Function::from_template(template, Some(prototype.clone()), None, None);
                     prototype.set(key, Value::Function(method));
+                }
+                Instruction::NewObject => self.push(Value::Object(Object::new())),
+                Instruction::DefineProperty(index) => {
+                    let key = property_name(&chunk, index)?;
+                    let value = self.pop()?;
+                    store_property(self.peek()?, key, &value)?;
+                }
+                Instruction::DefineComputedProperty => {
+                    let value = self.pop()?;
+                    let key = to_property_key(&self.pop()?);
+                    store_property(self.peek()?, key, &value)?;
                 }
                 Instruction::EnterScope(slot_count) => {
                     self.frame.scopes.push(vec![
@@ -793,23 +806,19 @@ fn property_name(chunk: &Chunk, index: u16) -> JsResult<String> {
     }
 }
 
-fn property_missing(key: &str) -> JsError {
-    JsError::with_context(
-        JsErrorCategory::Runtime,
-        format!("Property `{key}` is not defined"),
-        "property access",
-    )
-}
-
 /// Reads a property of an object, following its prototype chain, or an own
 /// property of a bytecode function such as a class's `prototype`.
+///
+/// A missing property reads as `undefined`. Reading a property of any other
+/// value is an error.
 fn load_property(target: &Value, key: &str) -> JsResult<Value> {
     match target {
-        Value::Object(object) => object.get(key),
-        Value::Function(function) if function.template().is_some() => function.get_own(key),
-        _ => return Err(non_object(target, "read", key, "property access")),
+        Value::Object(object) => Ok(object.get(key).unwrap_or(Value::Undefined)),
+        Value::Function(function) if function.template().is_some() => {
+            Ok(function.get_own(key).unwrap_or(Value::Undefined))
+        }
+        _ => Err(non_object(target, "read", key, "property access")),
     }
-    .ok_or_else(|| property_missing(key))
 }
 
 fn store_property(target: &Value, key: String, value: &Value) -> JsResult<()> {

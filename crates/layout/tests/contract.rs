@@ -2,14 +2,14 @@
 //!
 //! Run ignored tests with `cargo test -p layout -- --ignored` to see the backlog.
 
-use common::ids::NodeId;
+use html::NodeID;
 use layout::{Size, StyledDom, layout_tree};
 
 #[test]
 #[ignore = "TODO(layout): block layout not implemented"]
 fn block_children_stack_vertically() {
     let dom = StyledDom {
-        nodes: vec![NodeId::new(0), NodeId::new(1)],
+        nodes: vec![NodeID::new(0), NodeID::new(1)],
     };
     let tree = layout_tree(
         &dom,

@@ -255,6 +255,7 @@ dependencies = [
  "paint",
  "render",
  "rfd",
+ "security",
  "softbuffer",
  "tiny-skia",
  "webapis",
@@ -3116,7 +3117,6 @@ dependencies = [
 name = "webapis"
 version = "0.1.0"
 dependencies = [
- "common",
  "html",
  "js",
  "net",
