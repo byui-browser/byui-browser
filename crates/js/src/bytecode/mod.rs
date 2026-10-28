@@ -15,7 +15,7 @@ mod chunk;
 mod compiler;
 mod instruction;
 
-pub use chunk::{CallableKind, Chunk, FunctionTemplate};
+pub use chunk::{CallableKind, Chunk, FunctionTemplate, SourceLocation};
 pub use compiler::{CompileError, Compiler};
 pub use instruction::Instruction;
 

@@ -131,7 +131,13 @@ impl Vm {
                         .constants
                         .get(usize::from(index))
                         .cloned()
-                        .ok_or_else(|| JsError::runtime("bytecode constant index is invalid"))?,
+                        .ok_or_else(|| {
+                            bytecode_error(
+                                &chunk,
+                                instruction_pointer - 1,
+                                "bytecode constant index is invalid",
+                            )
+                        })?,
                 ),
                 Instruction::Pop => {
                     self.pop()?;
@@ -147,7 +153,7 @@ impl Vm {
                     self.push(value);
                 }
                 Instruction::Jump(target) => {
-                    validate_jump(target, &chunk)?;
+                    validate_jump(target, &chunk, instruction_pointer - 1)?;
                     if target < instruction_pointer {
                         self.next_loop_iteration()?;
                     }
@@ -170,13 +176,13 @@ impl Vm {
                     self.push(binary(operator, left, right)?);
                 }
                 Instruction::JumpIfFalse(target) => {
-                    validate_jump(target, &chunk)?;
+                    validate_jump(target, &chunk, instruction_pointer - 1)?;
                     if !is_truthy(self.stack.last().ok_or_else(stack_underflow)?) {
                         instruction_pointer = target;
                     }
                 }
                 Instruction::JumpIfTrue(target) => {
-                    validate_jump(target, &chunk)?;
+                    validate_jump(target, &chunk, instruction_pointer - 1)?;
                     if is_truthy(self.stack.last().ok_or_else(stack_underflow)?) {
                         instruction_pointer = target;
                     }
@@ -755,15 +761,26 @@ fn constructed_value(frame: &Frame, returned: Value) -> JsResult<Value> {
     })
 }
 
-fn validate_jump(target: usize, chunk: &Chunk) -> JsResult<()> {
+fn validate_jump(target: usize, chunk: &Chunk, offset: usize) -> JsResult<()> {
     if target > chunk.code.len() {
-        return Err(JsError::runtime("bytecode jump target is invalid"));
+        return Err(bytecode_error(
+            chunk,
+            offset,
+            "bytecode jump target is invalid",
+        ));
     }
     Ok(())
 }
 
 fn stack_underflow() -> JsError {
     JsError::runtime("bytecode operand stack underflow")
+}
+
+fn bytecode_error(chunk: &Chunk, offset: usize, message: &'static str) -> JsError {
+    let error = JsError::runtime(message);
+    chunk
+        .location(offset)
+        .map_or(error.clone(), |location| error.with_location(location))
 }
 
 /// Reads the string constant naming a property.

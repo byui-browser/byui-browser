@@ -393,6 +393,17 @@ impl Function {
         }
     }
 
+    /// Invokes this function with `arguments`.
+    ///
+    /// Script functions execute with their captured lexical environment, and
+    /// host functions receive the supplied values directly. This is used by
+    /// host APIs that need to call a JavaScript callback, such as DOM events.
+    /// Bytecode functions run only inside [`crate::vm::Vm`], so calling one
+    /// here is an error.
+    pub fn call(&self, arguments: &[Value]) -> JsResult<Value> {
+        with_engine_stack(|| Interpreter::new(ExecutionLimits::default()).call(self, arguments))
+    }
+
     /// Calls a host function directly. Returns `None` for any other kind.
     pub(crate) fn call_host(&self, arguments: &[Value]) -> Option<JsResult<Value>> {
         match &*self.0 {
