@@ -138,14 +138,13 @@ impl HTMLDocument {
         if let Some(attribute) = element_data
             .attributes
             .iter_mut()
-            .find(|attribute| attribute.name == name)
+            .find(|attribute| attribute.get_name() == name.as_str())
         {
-            attribute.value = value.to_owned();
+            attribute.set_value(value.to_owned());
         } else {
-            element_data.attributes.push(super::attribute::Attribute {
-                name,
-                value: value.to_owned(),
-            });
+            element_data
+                .attributes
+                .push(super::attribute::Attribute::new(name, value.to_owned()));
         }
 
         Ok(())
@@ -245,9 +244,9 @@ impl HTMLDocument {
                 output.push_str(&element.name);
                 for attribute in &element.attributes {
                     output.push(' ');
-                    output.push_str(&attribute.name);
+                    output.push_str(attribute.get_name());
                     output.push_str("=\"");
-                    output.push_str(&escape_attribute(&attribute.value));
+                    output.push_str(&escape_attribute(attribute.get_value()));
                     output.push('"');
                 }
                 output.push('>');
@@ -306,10 +305,9 @@ impl HTMLDocument {
             for child in children {
                 let node = document.node(child)?;
                 if let NodeKind::Element(element) = &node.kind
-                    && element
-                        .attributes
-                        .iter()
-                        .any(|attribute| attribute.name == "id" && attribute.value == value)
+                    && element.attributes.iter().any(|attribute| {
+                        attribute.get_name() == "id" && attribute.get_value() == value
+                    })
                 {
                     return Some(child);
                 }

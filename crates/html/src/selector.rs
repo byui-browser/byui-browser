@@ -49,12 +49,12 @@ fn matches_selector(element: &ElementData, selector: &str) -> bool {
         Some(id) => element
             .attributes
             .iter()
-            .any(|attribute| attribute.name == "id" && attribute.value == id),
+            .any(|attribute| attribute.get_name() == "id" && attribute.get_value() == id),
         None => match selector.strip_prefix('.') {
             Some(class) => element.attributes.iter().any(|attribute| {
-                attribute.name == "class"
+                attribute.get_name() == "class"
                     && attribute
-                        .value
+                        .get_value()
                         .split_whitespace()
                         .any(|value| value == class)
             }),

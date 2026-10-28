@@ -202,10 +202,7 @@ fn parse_start_tag(tag: &str) -> (String, Vec<Attribute>) {
             }
         }
         if !attribute_name.is_empty() {
-            attributes.push(Attribute {
-                name: attribute_name,
-                value,
-            });
+            attributes.push(Attribute::new(attribute_name, value));
         }
     }
     (name, attributes)

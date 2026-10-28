@@ -20,10 +20,7 @@ fn inner_html_serializes_markup_and_escapes_text_and_attributes() {
         NodeKind::Element(html::ElementData {
             name: "p".into(),
             namespace: Namespace::Html,
-            attributes: vec![Attribute {
-                name: "title".into(),
-                value: "A & \"B\"".into(),
-            }],
+            attributes: vec![Attribute::new("title".into(), "A & \"B\"".into())],
         }),
         None,
     );
@@ -76,10 +73,7 @@ fn arena_nodes_are_connected_with_stable_ids_and_spans() {
         NodeKind::Element(ElementData {
             name: "p".into(),
             namespace: Namespace::Html,
-            attributes: vec![Attribute {
-                name: "class".into(),
-                value: "intro".into(),
-            }],
+            attributes: vec![Attribute::new("class".into(), "intro".into())],
         }),
         None,
     );
@@ -110,7 +104,7 @@ fn parses_simple_fixture_into_typed_nodes_and_queries() {
                 &node.kind,
                 NodeKind::Element(element)
                     if element.attributes.iter().any(|attribute| {
-                        attribute.name == "name" && attribute.value == "viewport"
+                        attribute.get_name() == "name" && attribute.get_value() == "viewport"
                     })
             )
         })
@@ -119,8 +113,8 @@ fn parses_simple_fixture_into_typed_nodes_and_queries() {
         &viewport.kind,
         NodeKind::Element(element)
             if element.attributes.iter().any(|attribute| {
-                attribute.name == "content"
-                    && attribute.value == "width=device-width, initial-scale=1.0"
+                attribute.get_name() == "content"
+                    && attribute.get_value() == "width=device-width, initial-scale=1.0"
             })
     ));
     assert!(document.nodes.iter().any(
@@ -221,10 +215,7 @@ fn get_element_by_id_matches_exactly_and_ignores_detached_nodes() {
         NodeKind::Element(ElementData {
             name: "span".into(),
             namespace: Namespace::Html,
-            attributes: vec![Attribute {
-                name: "id".into(),
-                value: "detached".into(),
-            }],
+            attributes: vec![Attribute::new("id".into(), "detached".into())],
         }),
         None,
     );
@@ -283,8 +274,8 @@ fn class_list_mutations_update_the_element_attribute() {
         element
             .attributes
             .iter()
-            .find(|attribute| attribute.name == "class")
-            .map(|attribute| attribute.value.as_str()),
+            .find(|attribute| attribute.get_name() == "class")
+            .map(|attribute| attribute.get_value().as_str()),
         Some("panel  wide wide")
     );
 }
@@ -351,24 +342,24 @@ fn parses_attributes_and_boolean_attributes_as_ordered_values() {
         element
             .attributes
             .iter()
-            .find(|attribute| attribute.name == "disabled")
-            .map(|attribute| &attribute.value),
+            .find(|attribute| attribute.get_name() == "disabled")
+            .map(|attribute| attribute.get_value()),
         Some(&String::new())
     );
     assert_eq!(
         element
             .attributes
             .iter()
-            .find(|attribute| attribute.name == "class")
-            .map(|attribute| &attribute.value),
+            .find(|attribute| attribute.get_name() == "class")
+            .map(|attribute| attribute.get_value()),
         Some(&"field".to_owned())
     );
     assert_eq!(
         element
             .attributes
             .iter()
-            .find(|attribute| attribute.name == "data-count")
-            .map(|attribute| &attribute.value),
+            .find(|attribute| attribute.get_name() == "data-count")
+            .map(|attribute| attribute.get_value()),
         Some(&"3".to_owned())
     );
 }
@@ -515,7 +506,7 @@ fn keeps_incomplete_tag_text_and_unterminated_attribute_values() {
         &input.kind,
         NodeKind::Element(element)
             if element.attributes.iter().any(|attribute| {
-                attribute.name == "value" && attribute.value == "unfinished"
+                attribute.get_name() == "value" && attribute.get_value() == "unfinished"
             })
     ));
 }
