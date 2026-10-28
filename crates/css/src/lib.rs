@@ -518,8 +518,8 @@ fn attribute_value<'a>(element: &'a html::ElementData, name: &str) -> Option<&'a
     element
         .attributes
         .iter()
-        .find(|attribute| attribute.name == name)
-        .map(|attribute| attribute.value.as_str())
+        .find(|attribute| attribute.get_name() == name)
+        .map(|attribute| attribute.get_value().as_str())
 }
 
 fn matches_selector(dom: &HTMLDocument, node_id: NodeID, selector: &str) -> bool {

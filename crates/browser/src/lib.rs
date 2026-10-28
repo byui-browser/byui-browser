@@ -401,8 +401,8 @@ async fn fetch_text(
 fn attribute<'a>(attributes: &'a [html::Attribute], name: &str) -> Option<&'a str> {
     attributes
         .iter()
-        .find(|attribute| attribute.name == name)
-        .map(|attribute| attribute.value.as_str())
+        .find(|attribute| attribute.get_name() == name)
+        .map(|attribute| attribute.get_value().as_str())
 }
 
 trait ElementAttributes {

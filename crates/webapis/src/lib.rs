@@ -134,8 +134,8 @@ impl Element {
 
         self.attributes
             .iter()
-            .find(|attribute| attribute.name == name)
-            .map(|attribute| attribute.value.as_str())
+            .find(|attribute| attribute.get_name() == &name)
+            .map(|attribute| attribute.get_value().as_str())
     }
 
     /// Sets an attribute according to the DOM Standard's name validation and
@@ -145,20 +145,17 @@ impl Element {
         if let Some(attribute) = self
             .attributes
             .iter_mut()
-            .find(|attribute| attribute.name == name)
+            .find(|attribute| attribute.get_name() == &name)
         {
-            attribute.value = value.to_owned();
+            attribute.set_value(value.to_owned());
         } else {
-            self.attributes.push(Attribute {
-                name,
-                value: value.to_owned(),
-            });
+            self.attributes.push(Attribute::new(name, value.to_owned()));
         }
         self.id_attr = self
             .attributes
             .iter()
-            .find(|attribute| attribute.name == "id")
-            .map(|attribute| attribute.value.clone());
+            .find(|attribute| attribute.get_name() == "id")
+            .map(|attribute| attribute.get_value().clone());
         Ok(())
     }
 }
@@ -1147,8 +1144,8 @@ fn collect_elements(document: &HTMLDocument) -> Vec<Element> {
                     let id_attr = element
                         .attributes
                         .iter()
-                        .find(|attribute| attribute.name == "id")
-                        .map(|attribute| attribute.value.clone());
+                        .find(|attribute| attribute.get_name() == "id")
+                        .map(|attribute| attribute.get_value().clone());
                     elements.push(Element {
                         node: *child,
                         local_name: element.name.clone(),
@@ -1229,15 +1226,15 @@ impl SimpleSelector {
             && !element
                 .attributes
                 .iter()
-                .any(|attribute| attribute.name == "id" && attribute.value == *id)
+                .any(|attribute| attribute.get_name() == "id" && *attribute.get_value() == *id)
         {
             return false;
         }
         self.classes.iter().all(|class| {
             element.attributes.iter().any(|attribute| {
-                attribute.name == "class"
+                attribute.get_name() == "class"
                     && attribute
-                        .value
+                        .get_value()
                         .split_whitespace()
                         .any(|value| value == class)
             })
@@ -1985,10 +1982,7 @@ mod tests {
             NodeKind::Element(ElementData {
                 name: "main".into(),
                 namespace: Namespace::Html,
-                attributes: vec![Attribute {
-                    name: "id".into(),
-                    value: "appended".into(),
-                }],
+                attributes: vec![Attribute::new("id".into(), "appended".into())],
             }),
             None,
         );
