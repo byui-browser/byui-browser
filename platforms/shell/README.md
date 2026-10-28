@@ -27,7 +27,14 @@ status, and response body (or an error) to the launching terminal. It bypasses
 the HTTP response cache and leaves the displayed document and history unchanged.
 Internal `byui://welcome` uses the embedded page provider, not HTTP or disk.
 HTTP and HTTPS use the Networking team's transport; address editing and navigation
-remain unimplemented, so the current UI refreshes the welcome page.
+remain staged, so the current UI refreshes the welcome page.
+
+The address field is an editable shell surface: click it or press `Ctrl+L`,
+use normal text editing plus Backspace, press Enter to submit, or Escape to
+restore the previous value. `Ctrl+R` triggers the existing repaint-only Reload
+action. Submitted HTTP and HTTPS URLs stay visible but do not claim a
+successful navigation until the renderer can load them. Tabs, Back, Forward,
+and the menu remain staged until the corresponding browser services exist.
 
 Run `cargo test -p browser refresh::tests` to verify fresh HTTP requests,
 internal pages, saved URLs, error reporting, and unchanged history.

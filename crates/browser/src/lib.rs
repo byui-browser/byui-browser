@@ -3,12 +3,24 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use html::Query;
 use js::{JsResult, Realm, Value};
 use net::{Request, RequestController, SchemeProviders};
-use security::file_access::{FileAccessCapability, FileAccessError, TrustedDirectorySelection};
+use security::{
+    RendererSecurityContext,
+    file_access::{FileAccessCapability, FileAccessError, TrustedDirectorySelection},
+};
+use storage::{
+    OriginStorage, PersistentOriginStorage, SharedStorage, StorageError, shared_storage,
+};
+use webapis::local_storage::register_local_storage;
 use webapis::{
     AlertSink, ConsoleSink, Document, register_alert, register_document, register_fetch,
     register_print,
@@ -224,6 +236,266 @@ pub struct Page {
     pub js: String,
 }
 
+/// Returns the browser-owned application-data directory for the current OS.
+///
+/// The renderer and webpage must never provide this path. Tests should inject
+/// a temporary directory instead of using this process-wide location.
+pub fn application_data_directory() -> io::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        home_directory().map(|home| {
+            home.join("Library")
+                .join("Application Support")
+                .join("BYUI Browser")
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let root = std::env::var_os("APPDATA")
+            .or_else(|| std::env::var_os("LOCALAPPDATA"))
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "application data directory is unavailable",
+                )
+            })?;
+        Ok(root.join("BYUI Browser"))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let root = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                home_directory()
+                    .ok()
+                    .map(|home| home.join(".local").join("share"))
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "application data directory is unavailable",
+                )
+            })?;
+        Ok(root.join("byui-browser"))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        home_directory().map(|home| home.join(".byui-browser"))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn home_directory() -> io::Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory is unavailable"))
+}
+
+/// Browser-owned state shared by renderer realms during one browser session.
+#[derive(Debug, Clone)]
+pub struct BrowserRuntime {
+    storage: SharedStorage,
+}
+
+impl BrowserRuntime {
+    /// Opens persistent storage below the browser application-data directory.
+    ///
+    /// The backend creates an additional `storage` directory below `root`.
+    /// Callers must provide a browser-owned path, never a renderer-supplied
+    /// path.
+    pub fn open(root: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let storage = PersistentOriginStorage::open(root.as_ref().join("storage"))?;
+        Ok(Self {
+            storage: shared_storage(storage),
+        })
+    }
+
+    /// Creates a runtime with application-lifetime storage for tests.
+    #[must_use]
+    pub fn in_memory() -> Self {
+        Self {
+            storage: shared_storage(OriginStorage::new()),
+        }
+    }
+
+    /// Parses a page, installs its Web APIs, and evaluates its scripts.
+    ///
+    /// The caller supplies the trusted renderer context created by browser
+    /// navigation. JavaScript cannot choose the origin or storage key. The
+    /// JavaScript engine's standard `localStorage` object syntax remains a
+    /// follow-up; the registered host-function path is available now.
+    ///
+    /// The returned values are the script completion values. Listeners
+    /// registered by those scripts are dropped with the temporary realm. Use
+    /// [`BrowserRuntime::open_page_session`] when a later click must reach
+    /// `document.addEventListener`.
+    pub fn evaluate_page_scripts(
+        &self,
+        html_source: &str,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+    ) -> JsResult<Vec<Value>> {
+        self.boot_page(
+            html_source,
+            None,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+        )
+        .map(|booted| booted.results)
+    }
+
+    /// Parses a page, evaluates its scripts, and keeps the document alive.
+    ///
+    /// The session shares listener storage with the script-visible `document`,
+    /// so [`PageSession::dispatch_click`] runs listeners the scripts
+    /// registered. The caller supplies the trusted renderer context created
+    /// by browser navigation.
+    pub fn open_page_session(
+        &self,
+        html_source: &str,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+    ) -> JsResult<PageSession> {
+        self.boot_page(
+            html_source,
+            None,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+        )
+        .map(|booted| booted.session)
+    }
+
+    /// Opens a session for a loaded [`Page`], running its linked script
+    /// against the page's own document.
+    ///
+    /// Scripts run in tree order. Inline scripts run their own text; a
+    /// `<script src>` element runs [`Page::js`], because a page currently
+    /// carries one resolved external script. A page with several external
+    /// scripts would run that one body for each of them. Element IDs in the
+    /// session match a layout of `page.html`, so a layout hit test can be
+    /// passed to [`PageSession::dispatch_click_at`].
+    pub fn open_page(
+        &self,
+        page: &Page,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+    ) -> JsResult<PageSession> {
+        self.boot_page(
+            &page.html,
+            Some(&page.js),
+            console,
+            alert_sink,
+            controller,
+            security_context,
+        )
+        .map(|booted| booted.session)
+    }
+
+    fn boot_page(
+        &self,
+        html_source: &str,
+        external_script: Option<&str>,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+    ) -> JsResult<BootedPage> {
+        let html_document = html::parse_raw_html(html_source.to_owned());
+        let document = Document::from_html_document(&html_document);
+        let retained = document.clone();
+        let mut realm = Realm::new();
+        register_print(&mut realm, console)?;
+        register_alert(&mut realm, alert_sink)?;
+        register_fetch(&mut realm, controller)?;
+        register_document(&mut realm, document)?;
+        register_local_storage(&mut realm, Arc::clone(&self.storage), security_context)?;
+
+        let results = script_sources(&html_document, external_script)
+            .iter()
+            .map(|source| realm.evaluate_script(source))
+            .collect::<JsResult<Vec<_>>>()?;
+        Ok(BootedPage {
+            session: PageSession {
+                realm,
+                document: retained,
+            },
+            results,
+        })
+    }
+}
+
+/// A loaded document whose scripts stay alive after evaluation.
+///
+/// `document.addEventListener` stores listeners here. Input that happens
+/// after the page has loaded, such as a click on the page, is delivered with
+/// [`PageSession::dispatch_click`].
+pub struct PageSession {
+    /// Realm that evaluated the page. Listeners close over its globals.
+    #[allow(dead_code)]
+    realm: Realm,
+    document: Document,
+}
+
+impl PageSession {
+    /// Fires a `click` event at this session's document.
+    ///
+    /// Runs listeners registered with `document.addEventListener('click', ...)`.
+    /// Element hit testing is not performed.
+    pub fn dispatch_click(&self) -> JsResult<Value> {
+        webapis::dispatch_click(&self.document)
+    }
+
+    /// Fires a user `click` at the element containing `node`.
+    ///
+    /// `node` is usually a layout hit test of this session's page. The event
+    /// bubbles from that element to the document, so both element and
+    /// `document` listeners run.
+    pub fn dispatch_click_at(&self, node: html::NodeID) -> JsResult<Value> {
+        webapis::dispatch_click_at(&self.document, node)
+    }
+}
+
+struct BootedPage {
+    session: PageSession,
+    results: Vec<Value>,
+}
+
+/// Returns script sources in tree order, substituting `external_script` for
+/// `<script src>` elements when the caller has already fetched it.
+fn script_sources(document: &html::HTMLDocument, external_script: Option<&str>) -> Vec<String> {
+    let Some(external_script) = external_script else {
+        return document.script_sources();
+    };
+    (0..)
+        .map(html::NodeID::new)
+        .map_while(|id| document.node(id).map(|node| (id, node)))
+        .filter_map(|(id, node)| match &node.kind {
+            html::NodeKind::Element(element) if element.get_name() == "script" => {
+                Some(if attribute(element.get_attributes(), "src").is_some() {
+                    external_script.to_owned()
+                } else {
+                    document.text_content(id).unwrap_or_default()
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Loads the welcome page and resolves its local stylesheet and script links.
 pub fn welcome_page() -> Page {
     let controller = request_controller(None);
@@ -273,8 +545,8 @@ async fn fetch_text(
 fn attribute<'a>(attributes: &'a [html::Attribute], name: &str) -> Option<&'a str> {
     attributes
         .iter()
-        .find(|attribute| attribute.name == name)
-        .map(|attribute| attribute.value.as_str())
+        .find(|attribute| attribute.get_name() == name)
+        .map(|attribute| attribute.get_value().as_str())
 }
 
 trait ElementAttributes {
@@ -284,41 +556,23 @@ trait ElementAttributes {
 impl ElementAttributes for html::NodeKind {
     fn element_attributes(&self) -> Option<&[html::Attribute]> {
         match self {
-            html::NodeKind::Element(element) => Some(&element.attributes),
+            html::NodeKind::Element(element) => Some(element.get_attributes()),
             _ => None,
         }
     }
 }
 
-/// Parses `html_source`, installs the browser's Web APIs, and evaluates each
-/// inline page script in document order.
-///
-/// The scripts are evaluated by one [`Realm`], so every script uses the same
-/// registered host-function path. DOM mutation and scheduling remain outside
-/// this entry point until those APIs are supported by the engine.
-pub fn evaluate_page_scripts(
-    html_source: &str,
-    console: Arc<dyn ConsoleSink>,
-    alert_sink: Arc<dyn AlertSink>,
-    controller: Arc<RequestController>,
-) -> JsResult<Vec<Value>> {
-    let document = html::parse_raw_html(html_source.to_owned());
-    let mut realm = Realm::new();
-    register_print(&mut realm, console)?;
-    register_alert(&mut realm, alert_sink)?;
-    register_fetch(&mut realm, controller)?;
-    register_document(&mut realm, Document::from_html_document(&document))?;
-
-    document
-        .script_sources()
-        .iter()
-        .map(|source| realm.evaluate_script(source))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use security::{Origin, RendererSecurityContext, StoragePermission};
+
+    fn storage_context() -> RendererSecurityContext {
+        RendererSecurityContext::new(
+            Origin::new("https", "example.com", None),
+            StoragePermission::Allowed,
+        )
+    }
 
     #[test]
     fn welcome_page_resolves_resources_from_html_links() {
@@ -327,6 +581,110 @@ mod tests {
         assert!(page.html.contains("href=\"style.css\""));
         assert!(page.html.contains("src=\"script.js\""));
         assert!(page.css.contains("background-color"));
-        assert!(page.js.contains("const message"));
+        assert!(page.js.contains("btn.addEventListener('click', callback)"));
+    }
+
+    #[test]
+    fn embedded_page_aliases_ignore_query_and_fragment_for_lookup() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let response = runtime
+            .block_on(controller.fetch(Request::get("byui://welcome/index.html?lang=en#top")))
+            .expect("embedded page alias should resolve");
+
+        assert_eq!(response.url, "byui://welcome/index.html?lang=en#top");
+        let body = runtime.block_on(response.body.bytes()).unwrap();
+        assert_eq!(
+            response.headers.get("content-length"),
+            Some(body.len().to_string())
+        );
+        assert!(body.starts_with(b"<!doctype"));
+    }
+
+    #[test]
+    fn embedded_page_head_preserves_metadata_without_a_body() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let get_response = runtime
+            .block_on(controller.fetch(Request::get("byui://welcome/page?lang=en#top")))
+            .expect("embedded page GET should resolve");
+        let expected_length = get_response
+            .headers
+            .get("content-length")
+            .expect("embedded page GET should expose content length");
+        let mut request = Request::get("byui://welcome/page?lang=en#top");
+        request
+            .set_method(net::Method::HEAD)
+            .expect("GET can become HEAD");
+
+        let response = runtime
+            .block_on(controller.fetch(request))
+            .expect("embedded page HEAD should resolve");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.headers.get("content-length"),
+            Some(expected_length)
+        );
+        assert!(response.body.is_null());
+        assert!(runtime.block_on(response.body.bytes()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_embedded_page_routes_fail_without_a_fallback() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let error = runtime
+            .block_on(controller.fetch(Request::get("byui://missing/page")))
+            .expect_err("unknown embedded routes must fail");
+
+        assert!(matches!(
+            error,
+            net::RequestError::Provider {
+                provider: "byui page",
+                kind: net::ProviderErrorKind::ResourceMissing
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_connects_persistent_storage_to_the_local_storage_binding() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("byui-browser-runtime-{suffix}"));
+
+        let first_runtime = BrowserRuntime::open(&root).expect("storage should open");
+        let mut first_realm = Realm::new();
+        register_local_storage(
+            &mut first_realm,
+            Arc::clone(&first_runtime.storage),
+            storage_context(),
+        )
+        .expect("localStorage should register");
+        assert_eq!(
+            first_realm.call_global(
+                "localStorage.setItem",
+                &[Value::String("name".into()), Value::String("Nestor".into()),],
+            ),
+            Ok(Value::Undefined)
+        );
+        drop(first_runtime);
+
+        let second_runtime = BrowserRuntime::open(&root).expect("storage should reopen");
+        let mut second_realm = Realm::new();
+        register_local_storage(
+            &mut second_realm,
+            Arc::clone(&second_runtime.storage),
+            storage_context(),
+        )
+        .expect("localStorage should register after restart");
+        assert_eq!(
+            second_realm.call_global("localStorage.getItem", &[Value::String("name".into())],),
+            Ok(Value::String("Nestor".into()))
+        );
+
+        std::fs::remove_dir_all(root).expect("test storage directory should be removable");
     }
 }

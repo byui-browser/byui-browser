@@ -255,6 +255,7 @@ dependencies = [
  "paint",
  "render",
  "rfd",
+ "security",
  "softbuffer",
  "tiny-skia",
  "webapis",
@@ -1292,6 +1293,7 @@ name = "layout"
 version = "0.1.0"
 dependencies = [
  "common",
+ "css",
  "html",
  "paint",
  "png",
@@ -1789,6 +1791,7 @@ name = "paint"
 version = "0.1.0"
 dependencies = [
  "common",
+ "css",
  "html",
  "layout",
 ]
@@ -2053,6 +2056,7 @@ name = "render"
 version = "0.1.0"
 dependencies = [
  "common",
+ "layout",
  "paint",
 ]
 
@@ -3116,7 +3120,6 @@ dependencies = [
 name = "webapis"
 version = "0.1.0"
 dependencies = [
- "common",
  "html",
  "js",
  "net",

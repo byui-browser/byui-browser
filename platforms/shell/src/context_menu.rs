@@ -186,7 +186,7 @@ mod tests {
     fn overlay_can_be_cleared_by_restoring_the_cached_page() {
         for scale in [1.0, 2.0] {
             let base =
-                crate::toolbar::compose(400, 300, scale, &Default::default(), None, None).unwrap();
+                crate::toolbar::compose(400, 300, scale, &Default::default(), "", None, None).unwrap();
             let mut frame = base.clone();
             ContextMenu::new(100.0, 80.0, 400.0 / scale, 300.0 / scale).draw(
                 &mut frame,
@@ -197,7 +197,7 @@ mod tests {
             );
             assert_ne!(frame.data(), base.data());
             let restored =
-                crate::toolbar::compose(400, 300, scale, &Default::default(), None, None).unwrap();
+                crate::toolbar::compose(400, 300, scale, &Default::default(), "", None, None).unwrap();
             assert_eq!(restored.data(), base.data());
         }
     }
