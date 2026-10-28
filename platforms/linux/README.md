@@ -36,10 +36,10 @@ Adwaita-style titlebar instead. Dragging empty toolbar space also moves the
 window, and double-clicking it toggles maximized, like Safari's toolbar.
 
 From left to right the toolbar shows Back, Forward, Reload, a centered address
-field labelled `byui://welcome`, New Tab, and a menu button. Navigation is not
-implemented yet: Back and Forward are drawn disabled, Reload re-renders the
-welcome page, and the address field, New Tab, and menu only show hover and
-press feedback.
+field labelled `byui://welcome`, New Tab, and a menu button. Back and Forward
+are drawn disabled, Reload re-renders the welcome page, and the address field
+supports staged editing through click/`Ctrl+L`, Enter, Escape, and Backspace.
+New Tab and the menu remain visual placeholders.
 
 Toolbar text uses the desktop's default sans-serif font, found through
 `fc-match`, falling back to Noto Sans, DejaVu Sans, or Liberation Sans at their
