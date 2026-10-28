@@ -270,7 +270,7 @@ impl Builder<'_> {
                         outside: DisplayOutside::Inline,
                         inside: DisplayInside::Flow,
                     } => {
-                        if element.name == "br" {
+                        if element.get_name() == "br" {
                             levels.push(Level::Inline(InlineItem::ForcedBreak));
                             return;
                         }

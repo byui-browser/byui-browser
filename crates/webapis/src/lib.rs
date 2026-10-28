@@ -134,8 +134,8 @@ impl Element {
 
         self.attributes
             .iter()
-            .find(|attribute| attribute.name == name)
-            .map(|attribute| attribute.value.as_str())
+            .find(|attribute| attribute.get_name() == &name)
+            .map(|attribute| attribute.get_value().as_str())
     }
 
     /// Sets an attribute according to the DOM Standard's name validation and
@@ -145,20 +145,17 @@ impl Element {
         if let Some(attribute) = self
             .attributes
             .iter_mut()
-            .find(|attribute| attribute.name == name)
+            .find(|attribute| attribute.get_name() == &name)
         {
-            attribute.value = value.to_owned();
+            attribute.set_value(value.to_owned());
         } else {
-            self.attributes.push(Attribute {
-                name,
-                value: value.to_owned(),
-            });
+            self.attributes.push(Attribute::new(name, value.to_owned()));
         }
         self.id_attr = self
             .attributes
             .iter()
-            .find(|attribute| attribute.name == "id")
-            .map(|attribute| attribute.value.clone());
+            .find(|attribute| attribute.get_name() == "id")
+            .map(|attribute| attribute.get_value().clone());
         Ok(())
     }
 }
@@ -1001,10 +998,10 @@ impl Document {
 
         Ok(Element {
             node,
-            local_name: element.name.clone(),
-            namespace: element.namespace,
+            local_name: element.get_name().clone(),
+            namespace: *element.get_namespace(),
             id_attr: None,
-            attributes: element.attributes.clone(),
+            attributes: element.get_attributes().clone(),
         })
     }
 
@@ -1202,16 +1199,16 @@ fn collect_elements(document: &HTMLDocument) -> Vec<Element> {
             if let Some(node) = document.node(*child) {
                 if let NodeKind::Element(element) = &node.kind {
                     let id_attr = element
-                        .attributes
+                        .get_attributes()
                         .iter()
-                        .find(|attribute| attribute.name == "id")
-                        .map(|attribute| attribute.value.clone());
+                        .find(|attribute| attribute.get_name() == "id")
+                        .map(|attribute| attribute.get_value().clone());
                     elements.push(Element {
                         node: *child,
-                        local_name: element.name.clone(),
-                        namespace: element.namespace,
+                        local_name: element.get_name().clone(),
+                        namespace: *element.get_namespace(),
                         id_attr,
-                        attributes: element.attributes.clone(),
+                        attributes: element.get_attributes().clone(),
                     });
                 }
                 collect(document, *child, elements);
@@ -1278,23 +1275,23 @@ struct SimpleSelector {
 impl SimpleSelector {
     fn matches(&self, element: &html::ElementData) -> bool {
         if let Some(name) = &self.element_name
-            && element.name != *name
+            && element.get_name() != name
         {
             return false;
         }
         if let Some(id) = &self.id
             && !element
-                .attributes
+                .get_attributes()
                 .iter()
-                .any(|attribute| attribute.name == "id" && attribute.value == *id)
+                .any(|attribute| attribute.get_name() == "id" && *attribute.get_value() == *id)
         {
             return false;
         }
         self.classes.iter().all(|class| {
-            element.attributes.iter().any(|attribute| {
-                attribute.name == "class"
+            element.get_attributes().iter().any(|attribute| {
+                attribute.get_name() == "class"
                     && attribute
-                        .value
+                        .get_value()
                         .split_whitespace()
                         .any(|value| value == class)
             })
@@ -2088,14 +2085,11 @@ mod tests {
     fn document_append_child_adds_a_detached_element_and_returns_its_id() {
         let mut html_document = HTMLDocument::new();
         let html_child = html_document.push_node(
-            NodeKind::Element(ElementData {
-                name: "main".into(),
-                namespace: Namespace::Html,
-                attributes: vec![Attribute {
-                    name: "id".into(),
-                    value: "appended".into(),
-                }],
-            }),
+            NodeKind::Element(ElementData::new(
+                "main".into(),
+                Namespace::Html,
+                vec![Attribute::new("id".into(), "appended".into())],
+            )),
             None,
         );
         let mut document = super::Document::from_html_document(&html_document);
@@ -2111,11 +2105,7 @@ mod tests {
     fn document_append_child_moves_a_child_from_its_old_parent() {
         let mut html_document = HTMLDocument::new();
         let element = html_document.push_node(
-            NodeKind::Element(ElementData {
-                name: "main".into(),
-                namespace: Namespace::Html,
-                attributes: Vec::new(),
-            }),
+            NodeKind::Element(ElementData::new("main".into(), Namespace::Html, Vec::new())),
             None,
         );
         let comment = html_document.push_node(NodeKind::Comment("move me".into()), None);
@@ -2138,19 +2128,15 @@ mod tests {
     fn document_append_child_rejects_invalid_hierarchy_without_mutating_the_tree() {
         let mut html_document = HTMLDocument::new();
         let existing_element = html_document.push_node(
-            NodeKind::Element(ElementData {
-                name: "main".into(),
-                namespace: Namespace::Html,
-                attributes: Vec::new(),
-            }),
+            NodeKind::Element(ElementData::new("main".into(), Namespace::Html, Vec::new())),
             None,
         );
         let second_element = html_document.push_node(
-            NodeKind::Element(ElementData {
-                name: "aside".into(),
-                namespace: Namespace::Html,
-                attributes: Vec::new(),
-            }),
+            NodeKind::Element(ElementData::new(
+                "aside".into(),
+                Namespace::Html,
+                Vec::new(),
+            )),
             None,
         );
         html_document.append_child(html_document.root, existing_element);

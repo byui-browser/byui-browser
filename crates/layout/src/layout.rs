@@ -68,7 +68,7 @@ fn propagate_canvas_background(
     let is_element = |node: NodeID, name: &str| {
         matches!(
             document.node(node).map(|node| &node.kind),
-            Some(NodeKind::Element(element)) if element.name == name
+            Some(NodeKind::Element(element)) if element.get_name() == name
         )
     };
     let source = if background(root).is_some() {

@@ -484,8 +484,8 @@ fn script_sources(document: &html::HTMLDocument, external_script: Option<&str>) 
         .map(html::NodeID::new)
         .map_while(|id| document.node(id).map(|node| (id, node)))
         .filter_map(|(id, node)| match &node.kind {
-            html::NodeKind::Element(element) if element.name == "script" => {
-                Some(if attribute(&element.attributes, "src").is_some() {
+            html::NodeKind::Element(element) if element.get_name() == "script" => {
+                Some(if attribute(element.get_attributes(), "src").is_some() {
                     external_script.to_owned()
                 } else {
                     document.text_content(id).unwrap_or_default()
@@ -545,8 +545,8 @@ async fn fetch_text(
 fn attribute<'a>(attributes: &'a [html::Attribute], name: &str) -> Option<&'a str> {
     attributes
         .iter()
-        .find(|attribute| attribute.name == name)
-        .map(|attribute| attribute.value.as_str())
+        .find(|attribute| attribute.get_name() == name)
+        .map(|attribute| attribute.get_value().as_str())
 }
 
 trait ElementAttributes {
@@ -556,7 +556,7 @@ trait ElementAttributes {
 impl ElementAttributes for html::NodeKind {
     fn element_attributes(&self) -> Option<&[html::Attribute]> {
         match self {
-            html::NodeKind::Element(element) => Some(&element.attributes),
+            html::NodeKind::Element(element) => Some(element.get_attributes()),
             _ => None,
         }
     }
@@ -582,6 +582,69 @@ mod tests {
         assert!(page.html.contains("src=\"script.js\""));
         assert!(page.css.contains("background-color"));
         assert!(page.js.contains("btn.addEventListener('click', callback)"));
+    }
+
+    #[test]
+    fn embedded_page_aliases_ignore_query_and_fragment_for_lookup() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let response = runtime
+            .block_on(controller.fetch(Request::get("byui://welcome/index.html?lang=en#top")))
+            .expect("embedded page alias should resolve");
+
+        assert_eq!(response.url, "byui://welcome/index.html?lang=en#top");
+        let body = runtime.block_on(response.body.bytes()).unwrap();
+        assert_eq!(
+            response.headers.get("content-length"),
+            Some(body.len().to_string())
+        );
+        assert!(body.starts_with(b"<!doctype"));
+    }
+
+    #[test]
+    fn embedded_page_head_preserves_metadata_without_a_body() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let get_response = runtime
+            .block_on(controller.fetch(Request::get("byui://welcome/page?lang=en#top")))
+            .expect("embedded page GET should resolve");
+        let expected_length = get_response
+            .headers
+            .get("content-length")
+            .expect("embedded page GET should expose content length");
+        let mut request = Request::get("byui://welcome/page?lang=en#top");
+        request
+            .set_method(net::Method::HEAD)
+            .expect("GET can become HEAD");
+
+        let response = runtime
+            .block_on(controller.fetch(request))
+            .expect("embedded page HEAD should resolve");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.headers.get("content-length"),
+            Some(expected_length)
+        );
+        assert!(response.body.is_null());
+        assert!(runtime.block_on(response.body.bytes()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_embedded_page_routes_fail_without_a_fallback() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let error = runtime
+            .block_on(controller.fetch(Request::get("byui://missing/page")))
+            .expect_err("unknown embedded routes must fail");
+
+        assert!(matches!(
+            error,
+            net::RequestError::Provider {
+                provider: "byui page",
+                kind: net::ProviderErrorKind::ResourceMissing
+            }
+        ));
     }
 
     #[test]

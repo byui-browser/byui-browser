@@ -156,10 +156,16 @@ fn resource(url: net::Url, body: SchemeBody) -> SchemeResource {
         url,
         status: 200,
         status_text: Some("OK".into()),
-        headers: vec![(
-            net::HeaderName::from_static("x-file"),
-            net::HeaderValue::from_static("yes"),
-        )],
+        headers: vec![
+            (
+                net::HeaderName::from_static("x-file"),
+                net::HeaderValue::from_static("yes"),
+            ),
+            (
+                net::HeaderName::from_static("set-cookie"),
+                net::HeaderValue::from_static("session=must-not-leak"),
+            ),
+        ],
         media_type: Some(net::HeaderValue::from_static("text/plain")),
         origin: Origin::opaque(),
         body,
@@ -195,6 +201,7 @@ fn file_fetches_resolve_once_and_use_shared_response_finalization() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(response.url, "file:///tmp/page.html");
     assert_eq!(response.headers.get("x-file").as_deref(), Some("yes"));
+    assert!(!response.headers.has("set-cookie"));
     assert_eq!(
         runtime().block_on(response.body.bytes()).unwrap(),
         b"file-bytes"
@@ -206,6 +213,29 @@ fn file_fetches_resolve_once_and_use_shared_response_finalization() {
     assert_eq!(services.cookie_lookups.load(Ordering::SeqCst), 0);
     assert_eq!(services.cache_partitions.load(Ordering::SeqCst), 0);
     assert_eq!(services.worker_checks.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn repeated_file_fetches_resolve_again_and_do_not_use_the_http_cache() {
+    let provider = Arc::new(Provider {
+        calls: AtomicUsize::new(0),
+        outcome: Outcome::Bytes,
+    });
+    let (controller, services) = controller(provider.clone());
+
+    for _ in 0..2 {
+        let response = runtime()
+            .block_on(controller.fetch(Request::get("file:///tmp/page.html")))
+            .unwrap();
+        assert!(!response.from_cache);
+        assert_eq!(
+            runtime().block_on(response.body.bytes()).unwrap(),
+            b"file-bytes"
+        );
+    }
+
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(services.cache_partitions.load(Ordering::SeqCst), 0);
 }
 
 #[test]

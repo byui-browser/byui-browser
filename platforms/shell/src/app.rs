@@ -16,8 +16,9 @@ use webapis::AlertSink;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::error::EventLoopError;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
 use crate::toolbar::{self, ChromeState, Control};
@@ -54,6 +55,13 @@ struct App {
     /// Session history shared by all desktop platforms.
     browser_state: chrome::BrowserState,
     refresh: Option<browser::refresh::RefreshClient>,
+    /// Address text currently shown in the toolbar.
+    address: String,
+    /// Address text to restore when Escape cancels an edit.
+    address_before_edit: String,
+    /// Whether the current address should be replaced by the next edit.
+    address_selected: bool,
+    modifiers: ModifiersState,
     /// Loaded document, retained independently of the size-dependent pixmap.
     loaded_page: Option<browser::Page>,
     /// Pointer position in logical pixels while it is over the window.
@@ -159,6 +167,10 @@ impl App {
             },
             cursor: None,
             browser_state: chrome::BrowserState::new(),
+            address: String::from("byui://welcome"),
+            address_before_edit: String::from("byui://welcome"),
+            address_selected: false,
+            modifiers: ModifiersState::default(),
             loaded_page: None,
             page: None,
             frame: Vec::new(),
@@ -186,8 +198,91 @@ impl App {
     fn page_loaded(&mut self, url: &str, page: browser::Page) {
         self.loaded_page = Some(page);
         self.browser_state.record_visit(url);
+        self.address = url.to_owned();
+        self.address_before_edit = self.address.clone();
+        self.address_selected = false;
+        self.chrome.address_focused = false;
         self.page = None;
         self.redraw();
+    }
+
+    fn begin_address_edit(&mut self) {
+        self.address_before_edit = self.address.clone();
+        self.address_selected = true;
+        self.chrome.address_focused = true;
+        self.redraw();
+    }
+
+    fn cancel_address_edit(&mut self) {
+        self.address = self.address_before_edit.clone();
+        self.address_selected = false;
+        self.chrome.address_focused = false;
+        self.redraw();
+    }
+
+    fn submit_address(&mut self) {
+        let address = self.address.trim().to_owned();
+        if address == "byui://welcome" {
+            self.page_loaded(&address, browser::welcome_page());
+        } else {
+            // The renderer currently exposes only the built-in welcome page.
+            // Keep unsupported text visible so the future navigation layer can
+            // consume it without silently changing the page.
+            self.address = address;
+            self.address_selected = false;
+            self.chrome.address_focused = false;
+            self.redraw();
+        }
+    }
+
+    fn key_input(&mut self, event: KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        let key = event.logical_key.as_ref();
+        let modifiers = self.modifiers;
+        if modifiers.control_key() {
+            if let Key::Character(character) = key {
+                match character.to_ascii_lowercase().as_str() {
+                    "l" => {
+                        self.begin_address_edit();
+                        return;
+                    }
+                    "r" => {
+                        self.activate(Control::Reload);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !self.chrome.address_focused {
+            return;
+        }
+        match key {
+            Key::Named(NamedKey::Enter) => self.submit_address(),
+            Key::Named(NamedKey::Escape) => self.cancel_address_edit(),
+            Key::Named(NamedKey::Backspace) => {
+                if self.address_selected {
+                    self.address.clear();
+                    self.address_selected = false;
+                } else {
+                    self.address.pop();
+                }
+                self.redraw();
+            }
+            Key::Character(character)
+                if !modifiers.control_key() && !modifiers.alt_key() && !modifiers.super_key() =>
+            {
+                if self.address_selected {
+                    self.address.clear();
+                    self.address_selected = false;
+                }
+                self.address.push_str(character);
+                self.redraw();
+            }
+            _ => {}
+        }
     }
 
     fn ensure_welcome_loaded(&mut self) {
@@ -242,13 +337,10 @@ impl App {
                 self.scripts_evaluated = false;
                 self.redraw();
             }
-            // Navigation, tabs, address entry, and the menu are not
+            Control::Address => self.begin_address_edit(),
+            // Navigation, tabs, and the menu are not
             // implemented yet; these controls only give visual feedback.
-            Control::Back
-            | Control::Forward
-            | Control::Address
-            | Control::NewTab
-            | Control::Menu => {}
+            Control::Back | Control::Forward | Control::NewTab | Control::Menu => {}
         }
     }
 
@@ -257,6 +349,7 @@ impl App {
             return;
         }
         self.ensure_welcome_loaded();
+        let address = self.address.clone();
         let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
             return;
         };
@@ -302,6 +395,7 @@ impl App {
                 size.height,
                 scale,
                 &self.chrome,
+                &address,
                 self.page.as_ref().map(|(_, page)| page),
                 self.font.as_ref(),
             )
@@ -311,6 +405,7 @@ impl App {
                 size.height,
                 scale,
                 &self.chrome,
+                &address,
                 self.font.as_ref(),
             )
         };
@@ -352,6 +447,9 @@ impl App {
             return;
         };
         if let Some(control) = self.chrome.hovered {
+            if control != Control::Address {
+                self.chrome.address_focused = false;
+            }
             self.chrome.pressed = Some(control);
             self.redraw();
         } else if self
@@ -459,6 +557,14 @@ impl ApplicationHandler for App {
     ) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
+            } => self.key_input(event),
             WindowEvent::Resized(_)
             | WindowEvent::ScaleFactorChanged { .. }
             | WindowEvent::ThemeChanged(_) => {
@@ -623,5 +729,54 @@ mod tests {
             app.browser_state.visited_urls(),
             &["byui://welcome", "byui://welcome"]
         );
+    }
+
+    #[test]
+    fn address_edit_can_be_cancelled_without_changing_the_page() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.begin_address_edit();
+        assert!(app.address_selected);
+        app.address.push_str("-draft");
+
+        app.cancel_address_edit();
+
+        assert_eq!(app.address, "byui://welcome");
+        assert!(!app.address_selected);
+        assert!(!app.chrome.address_focused);
+        assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);
+    }
+
+    #[test]
+    fn supported_address_submission_uses_the_existing_loader_boundary() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.begin_address_edit();
+        app.address = "byui://welcome".to_owned();
+
+        app.submit_address();
+
+        assert_eq!(app.address, "byui://welcome");
+        assert!(!app.chrome.address_focused);
+        assert_eq!(
+            app.browser_state.visited_urls(),
+            &["byui://welcome", "byui://welcome"]
+        );
+    }
+
+    #[test]
+    fn unsupported_address_submission_does_not_replace_the_loaded_page() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let original_page = app.loaded_page.clone();
+        app.begin_address_edit();
+        app.address = "https://example.com".to_owned();
+
+        app.submit_address();
+
+        assert_eq!(app.address, "https://example.com");
+        assert!(!app.chrome.address_focused);
+        assert_eq!(app.loaded_page, original_page);
+        assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);
     }
 }

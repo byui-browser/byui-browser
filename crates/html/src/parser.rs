@@ -105,10 +105,8 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
             _ if stack.iter().any(|id| {
                 matches!(
                     document.node(*id).map(|node| &node.kind),
-                    Some(NodeKind::Element(ElementData {
-                        namespace: Namespace::Svg,
-                        ..
-                    }))
+                    Some(NodeKind::Element(element))
+                        if *element.get_namespace() == Namespace::Svg
                 )
             }) =>
             {
@@ -117,11 +115,7 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
             _ => Namespace::Html,
         };
         let id = document.push_node(
-            NodeKind::Element(ElementData {
-                name: name.clone(),
-                namespace,
-                attributes,
-            }),
+            NodeKind::Element(ElementData::new(name.clone(), namespace, attributes)),
             span,
         );
         document.append_child(current_parent(&stack, root), id);
@@ -160,7 +154,7 @@ fn append_text(document: &mut HTMLDocument, parent: NodeID, text: &str, start: u
 
 fn element_name(document: &HTMLDocument, id: NodeID) -> Option<&str> {
     match &document.node(id)?.kind {
-        NodeKind::Element(element) => Some(&element.name),
+        NodeKind::Element(element) => Some(element.get_name()),
         _ => None,
     }
 }
@@ -202,10 +196,7 @@ fn parse_start_tag(tag: &str) -> (String, Vec<Attribute>) {
             }
         }
         if !attribute_name.is_empty() {
-            attributes.push(Attribute {
-                name: attribute_name,
-                value,
-            });
+            attributes.push(Attribute::new(attribute_name, value));
         }
     }
     (name, attributes)
