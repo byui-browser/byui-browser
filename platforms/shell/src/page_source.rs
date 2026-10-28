@@ -277,12 +277,14 @@ mod tests {
     fn source_panel_renders_at_each_scale_and_restores_cleanly() {
         for scale in [1.0, 2.0] {
             let base =
-                crate::toolbar::compose(800, 600, scale, &Default::default(), "", None, None).unwrap();
+                crate::toolbar::compose(800, 600, scale, &Default::default(), "", None, None)
+                    .unwrap();
             let mut frame = base.clone();
             PageSource::new("<html>source</html>").draw(&mut frame, scale, None);
             assert_ne!(frame.data(), base.data());
             let restored =
-                crate::toolbar::compose(800, 600, scale, &Default::default(), "", None, None).unwrap();
+                crate::toolbar::compose(800, 600, scale, &Default::default(), "", None, None)
+                    .unwrap();
             assert_eq!(restored.data(), base.data());
         }
     }
