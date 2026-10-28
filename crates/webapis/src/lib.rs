@@ -778,6 +778,63 @@ pub fn dispatch_event(document: &Document, arguments: &[Value]) -> JsResult<Valu
     dispatch_event_with_target(document, &Object::new(), arguments)
 }
 
+/// Dispatches a `click` event whose target is the document.
+///
+/// The event bubbles and is cancelable, as a user `click` does. Listeners
+/// registered with `document.addEventListener('click', ...)` run, in both the
+/// capture and bubble phases at the document. This does not hit-test an
+/// element, so listeners registered on an element do not run.
+///
+/// `document` must be the document registered in the realm, or a clone of it.
+/// Clones share the listener list.
+pub fn dispatch_click(document: &Document) -> JsResult<Value> {
+    let options = Object::new();
+    options.set("bubbles", Value::Boolean(true));
+    options.set("cancelable", Value::Boolean(true));
+    let event = event_constructor(&[Value::String("click".into()), Value::Object(options)])?;
+    dispatch_event(document, &[event])
+}
+
+/// Dispatches a user `click` event at the element containing `node`.
+///
+/// `node` is usually the result of a layout hit test. A non-element node,
+/// such as text, targets its nearest element ancestor, matching how pointer
+/// events are retargeted in the DOM. The event bubbles and is cancelable, so
+/// listeners on the target, its ancestors, and the document run in capture,
+/// target, and bubble order. When no element contains `node`, the click
+/// targets the document as [`dispatch_click`] does.
+///
+/// `document` must be the document registered in the realm, or a clone of it.
+/// Clones share listener lists. Returns `false` when a listener called
+/// `preventDefault()`.
+pub fn dispatch_click_at(document: &Document, node: NodeID) -> JsResult<Value> {
+    let Some(element) = nearest_element(document, node) else {
+        return dispatch_click(document);
+    };
+    let options = Object::new();
+    options.set("bubbles", Value::Boolean(true));
+    options.set("cancelable", Value::Boolean(true));
+    let event = event_constructor(&[Value::String("click".into()), Value::Object(options)])?;
+    let target_node = element.node;
+    let target = element_object(element, Arc::new(Mutex::new(document.clone())));
+    dispatch_event_at(document, Some(target_node), &target, &[event])
+}
+
+fn nearest_element(document: &Document, node: NodeID) -> Option<Element> {
+    let mut current = Some(node);
+    while let Some(node) = current {
+        if let Some(element) = element_for_node(document, node) {
+            return Some(element);
+        }
+        current = document
+            .source_document
+            .as_ref()
+            .and_then(|source| source.node(node))
+            .and_then(|node| node.parent);
+    }
+    None
+}
+
 /// Implements JavaScript `Element.getAttribute(qualifiedName)`.
 pub fn get_attribute(element: &Element, arguments: &[Value]) -> JsResult<Value> {
     let [Value::String(qualified_name)] = arguments else {
@@ -1363,9 +1420,9 @@ impl TimerQueue {
 #[cfg(test)]
 mod tests {
     use super::{
-        AlertSink, ConsoleSink, DomException, add_event_listener, alert, dispatch_event,
-        event_constructor, fetch, lock_event_target, print, register_alert, register_document,
-        register_fetch, register_print, remove_event_listener,
+        AlertSink, ConsoleSink, DomException, add_event_listener, alert, dispatch_click,
+        dispatch_event, event_constructor, fetch, lock_event_target, print, register_alert,
+        register_document, register_fetch, register_print, remove_event_listener,
     };
     use html::{Attribute, ElementData, HTMLDocument, Namespace, NodeID, NodeKind, parse_raw_html};
     use js::{JsError, Realm, Value};
@@ -1543,6 +1600,27 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_click_invokes_a_document_listener() {
+        let sink = Arc::new(TestAlert::default());
+        let html_document = parse_raw_html("<main></main>".to_owned());
+        let document = super::Document::from_html_document(&html_document);
+        let retained = document.clone();
+        let mut realm = Realm::new();
+        register_alert(&mut realm, sink.clone()).unwrap();
+        register_document(&mut realm, document).unwrap();
+
+        assert_eq!(
+            realm.evaluate_script(
+                "function callback() { alert('Clicked') }\n\
+                 document.addEventListener('click', callback)",
+            ),
+            Ok(Value::Undefined)
+        );
+        assert_eq!(dispatch_click(&retained), Ok(Value::Boolean(true)));
+        assert_eq!(sink.messages.lock().unwrap().as_slice(), ["Clicked"]);
+    }
+
+    #[test]
     fn javascript_event_dispatch_invokes_callbacks_and_remove_works() {
         let html_document = parse_raw_html("<main></main>".to_owned());
         let mut realm = Realm::new();
@@ -1654,6 +1732,34 @@ mod tests {
                  order",
             ),
             Ok(Value::String("CTB".into()))
+        );
+    }
+
+    #[test]
+    fn user_click_on_element_text_targets_the_element_and_bubbles() {
+        let html_document = parse_raw_html("<main><button id='btn'>Go</button></main>".to_owned());
+        let button = html_document.get_element_by_id("btn").unwrap();
+        let text = html_document.node(button).unwrap().children[0];
+        let document = super::Document::from_html_document(&html_document);
+        let mut realm = Realm::new();
+        register_document(&mut realm, document.clone()).unwrap();
+        realm
+            .evaluate_script(
+                "var order = ''\n\
+                 function onButton(event) { order = order + event.target.getAttribute('id') }\n\
+                 function onDocument(event) { order = order + 'D' }\n\
+                 document.getElementById('btn').addEventListener('click', onButton)\n\
+                 document.addEventListener('click', onDocument)",
+            )
+            .unwrap();
+
+        assert_eq!(
+            super::dispatch_click_at(&document, text),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            realm.evaluate_script("order"),
+            Ok(Value::String("btnD".into()))
         );
     }
 

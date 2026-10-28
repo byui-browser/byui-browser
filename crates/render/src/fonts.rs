@@ -1,5 +1,52 @@
 //! Small built-in bitmap font for the software-rendered first slice.
 
+/// The built-in 5×7 bitmap font, described in font units.
+///
+/// The em square is [`BitmapFont::UNITS_PER_EM`] units tall. Every character
+/// advances [`BitmapFont::ADVANCE`] units, including characters without a
+/// glyph, which draw nothing. Glyph rows occupy the 7 units directly above the
+/// baseline. Glyphs scale with `font-size`: at 10px one unit is one CSS pixel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BitmapFont;
+
+impl BitmapFont {
+    /// Font units per em.
+    pub const UNITS_PER_EM: f32 = 10.0;
+    /// Horizontal advance of every character, in font units.
+    pub const ADVANCE: f32 = 6.0;
+    /// Distance from the baseline to the top of the em box, in font units.
+    pub const ASCENT: f32 = 8.0;
+    /// Distance from the baseline to the bottom of the em box, in font units.
+    pub const DESCENT: f32 = 2.0;
+    /// Extra leading for `line-height: normal`, in font units, giving a normal
+    /// line height of 1.2em.
+    pub const LINE_GAP: f32 = 2.0;
+    /// Glyph bitmap width in font units.
+    pub const GLYPH_WIDTH: u32 = 5;
+    /// Glyph bitmap height in font units.
+    pub const GLYPH_HEIGHT: u32 = 7;
+
+    /// CSS pixels per font unit at `font_size` CSS pixels.
+    pub fn scale(font_size: f32) -> f32 {
+        font_size / Self::UNITS_PER_EM
+    }
+}
+
+impl layout::FontMetrics for BitmapFont {
+    fn advance(&self, _character: char, font_size: f32) -> f32 {
+        Self::ADVANCE * Self::scale(font_size)
+    }
+
+    fn vertical_metrics(&self, font_size: f32) -> layout::VerticalMetrics {
+        let scale = Self::scale(font_size);
+        layout::VerticalMetrics {
+            ascent: Self::ASCENT * scale,
+            descent: Self::DESCENT * scale,
+            line_gap: Self::LINE_GAP * scale,
+        }
+    }
+}
+
 /// Returns the seven-row, five-column bitmap glyph for a supported character.
 ///
 /// The first slice supports a small bitmap font; unsupported

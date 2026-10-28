@@ -6,7 +6,6 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use ab_glyph::FontVec;
@@ -78,6 +77,10 @@ struct App {
     /// Shared browser runtime and persistent storage backend.
     runtime: browser::BrowserRuntime,
     alerts: Arc<PageAlerts>,
+    /// Live document listeners. Clicks are delivered here, off the UI thread.
+    page_events: crate::content::PageEvents,
+    /// The pointer went down on the page and has not been released yet.
+    page_press: bool,
     scripts_evaluated: bool,
 }
 
@@ -175,6 +178,8 @@ impl App {
             last_toolbar_click: None,
             runtime,
             alerts: Arc::new(PageAlerts::new()),
+            page_events: crate::content::PageEvents::new(),
+            page_press: false,
             scripts_evaluated: false,
         }
     }
@@ -476,7 +481,45 @@ impl App {
                 // the system's own titlebar and frame keep working too.
                 let _ = window.drag_window();
             }
+        } else if self
+            .cursor
+            .is_some_and(|(x, y)| self.pointer_is_on_page(x, y))
+        {
+            self.page_press = true;
         }
+    }
+
+    /// Returns the page node under a logical-pixel window point, matching the
+    /// geometry `paint` uses to render the page card.
+    fn page_node_at(&self, x: f64, y: f64) -> Option<html::NodeID> {
+        let window = self.window.as_ref()?;
+        let page = self.loaded_page.as_ref()?;
+        let size = window.inner_size();
+        let scale = window.scale_factor();
+        let card = toolbar::page_rect(size.width, size.height, scale)?;
+        crate::content::hit_test_page(
+            page,
+            (card.width as f64 / scale).ceil() as u32,
+            (card.height as f64 / scale).ceil() as u32,
+            (x - card.x as f64 / scale) as f32,
+            (y - card.y as f64 / scale) as f32,
+        )
+    }
+
+    /// Whether `(x, y)` is over the document rather than the toolbar.
+    ///
+    /// Coordinates are logical pixels. A point on a toolbar control, including
+    /// a disabled one, is not part of the page.
+    fn pointer_is_on_page(&self, x: f64, y: f64) -> bool {
+        let Some(window) = &self.window else {
+            return false;
+        };
+        let width = window
+            .inner_size()
+            .to_logical::<f64>(window.scale_factor())
+            .width;
+        y >= toolbar::TOOLBAR_HEIGHT
+            && toolbar::hit_test(x, y, width, self.platform.window_controls_inset).is_none()
     }
 }
 
@@ -537,6 +580,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = None;
+                self.page_press = false;
                 self.set_hovered(None);
             }
             WindowEvent::MouseInput {
@@ -546,11 +590,19 @@ impl ApplicationHandler for App {
             } => match state {
                 ElementState::Pressed => self.pressed(),
                 ElementState::Released => {
+                    let page_press = self.page_press;
+                    self.page_press = false;
                     if let Some(control) = self.chrome.pressed.take() {
                         self.redraw();
                         if self.chrome.hovered == Some(control) {
                             self.activate(control);
                         }
+                    } else if page_press
+                        && let Some((x, y)) = self.cursor
+                        && self.pointer_is_on_page(x, y)
+                    {
+                        let target = self.page_node_at(x, y);
+                        self.page_events.click(target);
                     }
                 }
             },
@@ -576,13 +628,12 @@ impl ApplicationHandler for App {
             return;
         };
         self.scripts_evaluated = true;
-        // Leave this thread in the event loop. The script runs elsewhere and
-        // asks the loop to present an alert; joining it here would deadlock.
+        // Leave this thread in the event loop. The script runs on the page
+        // session thread and asks the loop to present an alert; joining that
+        // thread here would deadlock. The session stays alive so a later
+        // click can run element and `document` listeners.
         let alerts = Arc::clone(&self.alerts) as Arc<dyn AlertSink>;
-        let runtime = self.runtime.clone();
-        thread::spawn(move || {
-            crate::content::evaluate_page_script(&page, alerts, runtime);
-        });
+        self.page_events.load(&page, alerts, self.runtime.clone());
     }
 }
 

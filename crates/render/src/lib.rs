@@ -15,4 +15,5 @@ mod frame;
 
 pub use compositor::Compositor;
 pub use display_item::DisplayItem;
+pub use fonts::BitmapFont;
 pub use frame::Frame;
