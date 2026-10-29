@@ -953,6 +953,7 @@ mod tests {
     fn inspect_shows_loaded_source_without_fetching_executing_or_changing_history() {
         let mut app = app();
         let page = browser::Page {
+            url: String::new(),
             html: "<h1>Already loaded</h1>\n<script>not executed</script>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
@@ -1257,6 +1258,7 @@ mod tests {
         app.address = "example.com".to_owned();
         app.submit_address();
         let page = browser::Page {
+            url: String::new(),
             html: "<p>Loaded</p>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
@@ -1309,6 +1311,7 @@ mod tests {
         app.address = "example.org".to_owned();
         app.submit_address();
         let page = browser::Page {
+            url: String::new(),
             html: "<p>Old</p>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),

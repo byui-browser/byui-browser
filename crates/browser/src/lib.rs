@@ -31,7 +31,10 @@ pub mod file_provider;
 mod load;
 pub mod refresh;
 
-pub use load::{LoadError, Navigation, PageLoader, error_page, load_page, normalize_address};
+pub use load::{
+    LoadError, Navigation, PageLoader, error_page, load_page, normalize_address,
+    security_context_for_url,
+};
 
 /// Browser-owned resource limits for one local-file session.
 ///
@@ -231,6 +234,10 @@ pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<R
 /// is not followed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page {
+    /// Final URL the document was served from, after redirects. Empty when the
+    /// page has no network origin, such as the built-in error page; such a
+    /// page gets an isolated security context.
+    pub url: String,
     /// HTML document source.
     pub html: String,
     /// Stylesheet sources in document order: one entry per

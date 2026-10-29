@@ -8,7 +8,6 @@ use browser::{BrowserRuntime, Page};
 use html::NodeID;
 use layout::{LayoutTree, Size, layout_document};
 use render::{BitmapFont, Compositor, Frame};
-use security::{Origin, RendererSecurityContext, StoragePermission};
 use tiny_skia::Pixmap;
 use webapis::{AlertSink, ConsoleSink};
 
@@ -16,13 +15,6 @@ struct NoopConsole;
 
 impl ConsoleSink for NoopConsole {
     fn log(&self, _message: &str) {}
-}
-
-fn welcome_security_context() -> RendererSecurityContext {
-    RendererSecurityContext::new(
-        Origin::new("byui", "welcome", None),
-        StoragePermission::Allowed,
-    )
 }
 
 fn render_demo(
@@ -114,7 +106,7 @@ pub(crate) fn evaluate_page_script(
             Arc::new(NoopConsole),
             alert_sink,
             controller,
-            welcome_security_context(),
+            browser::security_context_for_url(&page.url),
         )
         .expect("the page script should execute");
 }
@@ -185,7 +177,7 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                     Arc::new(NoopConsole),
                     alert_sink,
                     controller,
-                    welcome_security_context(),
+                    browser::security_context_for_url(&page.url),
                 ) {
                     Ok(loaded) => session = Some(loaded),
                     Err(error) => eprintln!("page script failed: {error}"),
@@ -369,6 +361,7 @@ mod tests {
         let events = PageEvents::new();
         events.load(
             &Page {
+                url: String::new(),
                 html: "<main><script src=\"script.js\"></script></main>".into(),
                 stylesheets: Vec::new(),
                 scripts: vec![
@@ -492,6 +485,7 @@ mod tests {
 
         let alert = Arc::new(TestAlert::default());
         let page = Page {
+            url: String::new(),
             html: "<main><script src=\"script.js\"></script></main>".into(),
             stylesheets: Vec::new(),
             scripts: vec!["alert('rendered page')".into()],
@@ -524,6 +518,7 @@ mod tests {
 
         let welcome = browser::welcome_page();
         let page = Page {
+            url: welcome.url,
             html: welcome.html,
             stylesheets: welcome.stylesheets,
             scripts: vec!["alert('Hello from script.js')".into()],
@@ -555,6 +550,7 @@ mod tests {
         let runtime = test_runtime();
         let mut scripts_evaluated = true;
         let mut page = Page {
+            url: String::new(),
             html: "<main>Hello</main>".into(),
             stylesheets: vec!["main { background-color: #abc; color: red; }".into()],
             scripts: Vec::new(),
@@ -604,6 +600,7 @@ mod tests {
         let runtime = test_runtime();
         let mut scripts_evaluated = true;
         let mut page = Page {
+            url: String::new(),
             html: "<html><body><main>Hi</main></body></html>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),

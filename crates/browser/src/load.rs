@@ -5,6 +5,7 @@ use std::{fmt, future::Future, io, sync::Arc};
 
 use futures_util::future::join_all;
 use net::{Request, RequestController, Url};
+use security::{Origin, RendererSecurityContext, StoragePermission};
 
 use crate::{Page, attribute, request_controller};
 
@@ -171,6 +172,7 @@ where
     )
     .await;
     Ok(Page {
+        url: main.url.to_string(),
         html: main.body,
         stylesheets,
         scripts,
@@ -240,6 +242,7 @@ where
 /// cannot inject markup into the error page.
 pub fn error_page(address: &str, error: &LoadError) -> Page {
     Page {
+        url: String::new(),
         html: format!(
             "<html><body><main><h1>This page could not be loaded</h1>\
              <p>{}</p><p>{}</p></main></body></html>",
@@ -258,11 +261,33 @@ fn escape_html(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Derives the renderer security context for a document served from `url`.
+///
+/// `http`, `https` and `byui` URLs with a host get their own origin (scheme,
+/// host, effective port) with storage allowed, so `https://a.example` and
+/// `https://b.example` never share `localStorage`, and `byui://welcome` keeps
+/// the welcome page's origin. Anything else (empty, unparsable, `file:`,
+/// `data:`, hostless) gets an opaque origin with storage denied, which
+/// matches no real origin.
+pub fn security_context_for_url(url: &str) -> RendererSecurityContext {
+    if let Ok(url) = Url::parse(url)
+        && matches!(url.scheme(), "http" | "https" | "byui")
+        && let Some(host) = url.host_str()
+    {
+        return RendererSecurityContext::new(
+            Origin::new(url.scheme(), host, url.port()),
+            StoragePermission::Allowed,
+        );
+    }
+    RendererSecurityContext::new(Origin::new("opaque", "", None), StoragePermission::Denied)
+}
+
 /// The outcome of one [`PageLoader::load`] call.
 #[derive(Debug)]
 pub struct Navigation {
-    /// The normalized URL that was requested, or the trimmed typed text when
-    /// it was not a valid URL.
+    /// The final post-redirect URL on success; otherwise the normalized URL
+    /// that was requested, or the trimmed typed text when it was not a valid
+    /// URL.
     pub address: String,
     /// The loaded page, or why loading failed.
     pub result: Result<Page, LoadError>,
@@ -298,6 +323,10 @@ impl PageLoader {
         self.runtime.spawn(async move {
             let shown = normalize_address(&address).map_or(typed, |url| url.to_string());
             let result = load_page(&controller, &address).await;
+            let shown = match &result {
+                Ok(page) => page.url.clone(),
+                Err(_) => shown,
+            };
             on_done(Navigation {
                 address: shown,
                 result,
@@ -463,6 +492,42 @@ mod tests {
         assert!(page.html.contains("https://example.com/&lt;b&gt;"));
         assert!(page.html.contains("404"));
         assert!(!page.html.contains("<b>"));
+    }
+
+    #[test]
+    fn page_url_is_the_final_document_url() {
+        let (page, _) = load(&[("https://example.com/a/", "<p>hi</p>")], "example.com/a/");
+        assert_eq!(page.unwrap().url, "https://example.com/a/");
+    }
+
+    #[test]
+    fn different_https_origins_get_different_contexts() {
+        let a = security_context_for_url("https://a.example/x");
+        let b = security_context_for_url("https://b.example/x");
+        assert_ne!(a.storage_key(), b.storage_key());
+        assert_eq!(a, security_context_for_url("https://a.example/y?q#f"));
+        assert_ne!(a, security_context_for_url("http://a.example/x"));
+        assert_ne!(a, security_context_for_url("https://a.example:8443/x"));
+    }
+
+    #[test]
+    fn welcome_keeps_its_context_and_remote_pages_do_not_get_it() {
+        let welcome = RendererSecurityContext::new(
+            Origin::new("byui", "welcome", None),
+            StoragePermission::Allowed,
+        );
+        assert_eq!(security_context_for_url("byui://welcome/page"), welcome);
+        assert_ne!(security_context_for_url("https://welcome/"), welcome);
+        assert_ne!(security_context_for_url("https://example.com/"), welcome);
+    }
+
+    #[test]
+    fn unsupported_origins_are_isolated_without_storage() {
+        for url in ["", "not a url", "file:///etc/passwd", "data:text/html,hi"] {
+            let context = security_context_for_url(url);
+            assert!(!context.can_read_storage() && !context.can_write_storage());
+            assert_eq!(context.origin().scheme(), "opaque");
+        }
     }
 
     #[test]

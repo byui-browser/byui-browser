@@ -154,6 +154,7 @@ fn linked_script_finds_page_elements_and_handles_their_clicks() {
             .expect("network client"),
     );
     let page = browser::Page {
+        url: String::new(),
         html: "<main><span>Hi</span><button id=\"btn\">Click Me</button>\
                <script src=\"script.js\"></script></main>"
             .into(),
