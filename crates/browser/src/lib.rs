@@ -10,7 +10,6 @@ use std::{
     time::Duration,
 };
 
-use html::Query;
 use js::{JsResult, Realm, Value};
 use net::{Request, RequestController, SchemeProviders};
 use security::{
@@ -29,7 +28,10 @@ use webapis::{
 pub mod byui_provider;
 pub mod fetch_services;
 pub mod file_provider;
+mod load;
 pub mod refresh;
+
+pub use load::{LoadError, Navigation, PageLoader, error_page, load_page, normalize_address};
 
 /// Browser-owned resource limits for one local-file session.
 ///
@@ -223,17 +225,22 @@ pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<R
 
 /// A browser page and the resources referenced by its HTML source.
 ///
-/// Resource text is loaded through the browser-owned `byui:` provider, so
-/// native shells do not depend on the process working directory. The HTML
-/// references are resolved and validated before the page is returned.
+/// [`load_page`] fetches the resources through the request controller and
+/// resolves relative links against the document URL, so native shells do not
+/// depend on the process working directory. CSS `@import` inside a stylesheet
+/// is not followed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page {
     /// HTML document source.
     pub html: String,
-    /// CSS source referenced by the document's stylesheet link.
-    pub css: String,
-    /// JavaScript source referenced by the document's script element.
-    pub js: String,
+    /// Stylesheet sources in document order: one entry per
+    /// `<link rel="stylesheet">` that loaded and per `<style>` element. Later
+    /// entries win ties in the cascade.
+    pub stylesheets: Vec<String>,
+    /// Script sources in document order: one entry per `<script>` element,
+    /// holding its inline text or the fetched body of its `src`. A `src` that
+    /// failed to load is an empty entry, so entries stay aligned with elements.
+    pub scripts: Vec<String>,
 }
 
 /// Returns the browser-owned application-data directory for the current OS.
@@ -380,10 +387,8 @@ impl BrowserRuntime {
     /// Opens a session for a loaded [`Page`], running its linked script
     /// against the page's own document.
     ///
-    /// Scripts run in tree order. Inline scripts run their own text; a
-    /// `<script src>` element runs [`Page::js`], because a page currently
-    /// carries one resolved external script. A page with several external
-    /// scripts would run that one body for each of them. Element IDs in the
+    /// Scripts run in document order from [`Page::scripts`], which holds the
+    /// inline or fetched source of every `<script>` element. Element IDs in the
     /// session match a layout of `page.html`, so a layout hit test can be
     /// passed to [`PageSession::dispatch_click_at`].
     pub fn open_page(
@@ -396,7 +401,7 @@ impl BrowserRuntime {
     ) -> JsResult<PageSession> {
         self.boot_page(
             &page.html,
-            Some(&page.js),
+            Some(&page.scripts),
             console,
             alert_sink,
             controller,
@@ -408,7 +413,7 @@ impl BrowserRuntime {
     fn boot_page(
         &self,
         html_source: &str,
-        external_script: Option<&str>,
+        scripts: Option<&[String]>,
         console: Arc<dyn ConsoleSink>,
         alert_sink: Arc<dyn AlertSink>,
         controller: Arc<RequestController>,
@@ -424,7 +429,12 @@ impl BrowserRuntime {
         register_document(&mut realm, document)?;
         register_local_storage(&mut realm, Arc::clone(&self.storage), security_context)?;
 
-        let results = script_sources(&html_document, external_script)
+        // Without caller-supplied sources only inline script text is available.
+        let sources = match scripts {
+            Some(scripts) => scripts.to_vec(),
+            None => html_document.script_sources(),
+        };
+        let results = sources
             .iter()
             .map(|source| realm.evaluate_script(source))
             .collect::<JsResult<Vec<_>>>()?;
@@ -474,72 +484,13 @@ struct BootedPage {
     results: Vec<Value>,
 }
 
-/// Returns script sources in tree order, substituting `external_script` for
-/// `<script src>` elements when the caller has already fetched it.
-fn script_sources(document: &html::HTMLDocument, external_script: Option<&str>) -> Vec<String> {
-    let Some(external_script) = external_script else {
-        return document.script_sources();
-    };
-    (0..)
-        .map(html::NodeID::new)
-        .map_while(|id| document.node(id).map(|node| (id, node)))
-        .filter_map(|(id, node)| match &node.kind {
-            html::NodeKind::Element(element) if element.get_name() == "script" => {
-                Some(if attribute(element.get_attributes(), "src").is_some() {
-                    external_script.to_owned()
-                } else {
-                    document.text_content(id).unwrap_or_default()
-                })
-            }
-            _ => None,
-        })
-        .collect()
-}
-
 /// Loads the welcome page and resolves its local stylesheet and script links.
 pub fn welcome_page() -> Page {
     let controller = request_controller(None);
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let html = runtime
-        .block_on(fetch_text(&controller, "byui://welcome/page"))
-        .expect("welcome HTML should be available through byui:");
-    let document = html::parse_raw_html(html.clone());
-    let stylesheet_url = document
-        .query("link")
-        .into_iter()
-        .find_map(|node| {
-            node.kind.element_attributes().and_then(|attributes| {
-                (attribute(attributes, "rel") == Some("stylesheet")
-                    && attribute(attributes, "href") == Some("style.css"))
-                .then_some("byui://welcome/style.css")
-            })
-        })
-        .expect("welcome HTML must link style.css as its stylesheet");
-    let script_url = document
-        .query("script")
-        .into_iter()
-        .find_map(|node| {
-            node.kind.element_attributes().and_then(|attributes| {
-                (attribute(attributes, "src") == Some("script.js"))
-                    .then_some("byui://welcome/script.js")
-            })
-        })
-        .expect("welcome HTML must link script.js as its script");
-    let css = runtime
-        .block_on(fetch_text(&controller, stylesheet_url))
-        .expect("welcome stylesheet should be available through byui:");
-    let js = runtime
-        .block_on(fetch_text(&controller, script_url))
-        .expect("welcome script should be available through byui:");
-
-    Page { html, css, js }
-}
-
-async fn fetch_text(
-    controller: &RequestController,
-    url: &str,
-) -> Result<String, net::RequestError> {
-    controller.fetch(Request::get(url)).await?.body.text().await
+    runtime
+        .block_on(load_page(&controller, "byui://welcome/page"))
+        .expect("welcome page should be available through byui:")
 }
 
 fn attribute<'a>(attributes: &'a [html::Attribute], name: &str) -> Option<&'a str> {
@@ -547,19 +498,6 @@ fn attribute<'a>(attributes: &'a [html::Attribute], name: &str) -> Option<&'a st
         .iter()
         .find(|attribute| attribute.get_name() == name)
         .map(|attribute| attribute.get_value().as_str())
-}
-
-trait ElementAttributes {
-    fn element_attributes(&self) -> Option<&[html::Attribute]>;
-}
-
-impl ElementAttributes for html::NodeKind {
-    fn element_attributes(&self) -> Option<&[html::Attribute]> {
-        match self {
-            html::NodeKind::Element(element) => Some(element.get_attributes()),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -580,8 +518,8 @@ mod tests {
 
         assert!(page.html.contains("href=\"style.css\""));
         assert!(page.html.contains("src=\"script.js\""));
-        assert!(page.css.contains("background-color"));
-        assert!(page.js.contains("btn.addEventListener('click', callback)"));
+        assert!(page.stylesheets[0].contains("background-color"));
+        assert!(page.scripts[0].contains("btn.addEventListener('click', callback)"));
     }
 
     #[test]

@@ -89,6 +89,25 @@ struct App {
     page_source: Option<PageSource>,
     source_font: Option<FontVec>,
     source_close_pressed: bool,
+    /// Background page loader; `None` when its runtime failed to start.
+    loader: Option<browser::PageLoader>,
+    /// Wakes the event loop from loader threads; set by [`run`].
+    proxy: Option<EventLoopProxy<UserEvent>>,
+    /// Id of the newest navigation; results for older ids are ignored.
+    navigation_id: u64,
+}
+
+/// Messages that background threads post to the UI thread's event loop.
+enum UserEvent {
+    /// A page script queued an `alert` dialog in [`PageAlerts`].
+    AlertPending,
+    /// A background page load finished.
+    Navigated {
+        /// The navigation this result belongs to; stale ones are dropped.
+        id: u64,
+        /// The loaded page or the reason it failed.
+        navigation: browser::Navigation,
+    },
 }
 
 /// Delivers `alert` on the UI thread, attached to the browser window.
@@ -98,7 +117,7 @@ struct App {
 /// waits for the UI thread. A dialog with no parent window also ends the
 /// process event loop, so the browser quits as the alert closes.
 struct PageAlerts {
-    proxy: Mutex<Option<EventLoopProxy<()>>>,
+    proxy: Mutex<Option<EventLoopProxy<UserEvent>>>,
     pending: Mutex<Vec<(String, mpsc::Sender<()>)>>,
 }
 
@@ -110,7 +129,7 @@ impl PageAlerts {
         }
     }
 
-    fn set_proxy(&self, proxy: EventLoopProxy<()>) {
+    fn set_proxy(&self, proxy: EventLoopProxy<UserEvent>) {
         *self.proxy.lock().expect("alert proxy lock") = Some(proxy);
     }
 
@@ -141,7 +160,7 @@ impl AlertSink for PageAlerts {
             .lock()
             .expect("alert queue lock")
             .push((message.to_owned(), done_tx));
-        if proxy.send_event(()).is_ok() {
+        if proxy.send_event(UserEvent::AlertPending).is_ok() {
             let _ = done_rx.recv();
         }
     }
@@ -193,6 +212,11 @@ impl App {
             page_source: None,
             source_font: None,
             source_close_pressed: false,
+            loader: browser::PageLoader::new()
+                .map_err(|error| eprintln!("Page loader initialization failed: {error}"))
+                .ok(),
+            proxy: None,
+            navigation_id: 0,
         }
     }
 
@@ -204,11 +228,13 @@ impl App {
 
     /// Accepts a successfully loaded document and records one visit.
     ///
-    /// Future navigation should call this only after loading succeeds.
-    /// Repaints and Reload must not call it. The current loader and renderer
-    /// support only the welcome page; this method does not implement navigation.
+    /// Navigation calls this only after loading succeeds. Repaints, Reload,
+    /// and the error page for a failed load must not call it.
     fn page_loaded(&mut self, url: &str, page: browser::Page) {
         self.loaded_page = Some(page);
+        // Scripts of the new document run after its first frame is presented.
+        self.scripts_evaluated = false;
+        self.frame_key = None;
         self.browser_state.record_visit(url);
         self.address = url.to_owned();
         self.address_before_edit = self.address.clone();
@@ -234,16 +260,51 @@ impl App {
 
     fn submit_address(&mut self) {
         let address = self.address.trim().to_owned();
+        self.address = address.clone();
+        self.address_selected = false;
+        self.chrome.address_focused = false;
         if address == "byui://welcome" {
+            // Bump the id so an older load still in flight cannot replace it.
+            self.navigation_id += 1;
             self.page_loaded(&address, browser::welcome_page());
         } else {
-            // The renderer currently exposes only the built-in welcome page.
-            // Keep unsupported text visible so the future navigation layer can
-            // consume it without silently changing the page.
-            self.address = address;
-            self.address_selected = false;
-            self.chrome.address_focused = false;
-            self.redraw();
+            self.start_navigation(&address);
+        }
+        self.redraw();
+    }
+
+    /// Loads `address` on the background loader. The result comes back as a
+    /// [`UserEvent::Navigated`]; the UI keeps showing the current page until
+    /// then.
+    fn start_navigation(&mut self, address: &str) {
+        self.navigation_id += 1;
+        let id = self.navigation_id;
+        let (Some(loader), Some(proxy)) = (&self.loader, self.proxy.clone()) else {
+            eprintln!("Navigation unavailable: page loader is not running.");
+            return;
+        };
+        loader.load(address, move |navigation| {
+            // A closed event loop means the app is exiting; nothing to do.
+            let _ = proxy.send_event(UserEvent::Navigated { id, navigation });
+        });
+    }
+
+    /// Applies a finished load. A failure shows the built-in error page and
+    /// leaves the typed address in the bar; it is not recorded as a visit.
+    fn navigation_finished(&mut self, id: u64, navigation: browser::Navigation) {
+        if id != self.navigation_id {
+            return;
+        }
+        match navigation.result {
+            Ok(page) => self.page_loaded(&navigation.address, page),
+            Err(error) => {
+                eprintln!("Failed to load {}: {error}", navigation.address);
+                self.loaded_page = Some(browser::error_page(&navigation.address, &error));
+                self.scripts_evaluated = false;
+                self.frame_key = None;
+                self.page = None;
+                self.redraw();
+            }
         }
     }
 
@@ -716,7 +777,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             let attributes = (self.platform.configure_window)(
@@ -825,10 +886,15 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
-        if let Some(window) = &self.window {
-            let window = Rc::clone(window);
-            self.alerts.present(&window);
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::AlertPending => {
+                if let Some(window) = &self.window {
+                    let window = Rc::clone(window);
+                    self.alerts.present(&window);
+                }
+            }
+            UserEvent::Navigated { id, navigation } => self.navigation_finished(id, navigation),
         }
     }
 
@@ -854,10 +920,11 @@ impl ApplicationHandler for App {
 /// Opens the browser window described by `platform` and runs it until the
 /// user closes it.
 pub fn run(platform: Platform) -> Result<(), EventLoopError> {
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App::new(platform);
     app.alerts.set_proxy(event_loop.create_proxy());
+    app.proxy = Some(event_loop.create_proxy());
     event_loop.run_app(&mut app)
 }
 
@@ -887,8 +954,8 @@ mod tests {
         let mut app = app();
         let page = browser::Page {
             html: "<h1>Already loaded</h1>\n<script>not executed</script>".into(),
-            css: String::new(),
-            js: String::new(),
+            stylesheets: Vec::new(),
+            scripts: Vec::new(),
         };
         app.page_loaded("byui://source-fixture", page.clone());
         let before = app.browser_state.clone();
@@ -1154,18 +1221,101 @@ mod tests {
         );
     }
 
+    fn navigation(
+        address: &str,
+        result: Result<browser::Page, browser::LoadError>,
+    ) -> browser::Navigation {
+        browser::Navigation {
+            address: address.to_owned(),
+            result,
+        }
+    }
+
     #[test]
-    fn unsupported_address_submission_does_not_replace_the_loaded_page() {
+    fn other_addresses_load_in_the_background_and_keep_the_current_page() {
         let mut app = app();
         app.ensure_welcome_loaded();
         let original_page = app.loaded_page.clone();
+        let before = app.navigation_id;
         app.begin_address_edit();
-        app.address = "https://example.com".to_owned();
+        app.address = " example.com ".to_owned();
 
         app.submit_address();
 
-        assert_eq!(app.address, "https://example.com");
+        // No loader thread result has arrived, so nothing is replaced yet.
+        assert_eq!(app.navigation_id, before + 1);
+        assert_eq!(app.address, "example.com");
         assert!(!app.chrome.address_focused);
+        assert_eq!(app.loaded_page, original_page);
+        assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);
+    }
+
+    #[test]
+    fn finished_navigation_replaces_the_page_and_records_a_visit() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.address = "example.com".to_owned();
+        app.submit_address();
+        let page = browser::Page {
+            html: "<p>Loaded</p>".into(),
+            stylesheets: Vec::new(),
+            scripts: Vec::new(),
+        };
+
+        app.navigation_finished(
+            app.navigation_id,
+            navigation("https://example.com/", Ok(page.clone())),
+        );
+
+        assert_eq!(app.loaded_page, Some(page));
+        assert_eq!(app.address, "https://example.com/");
+        assert_eq!(
+            app.browser_state.visited_urls(),
+            &["byui://welcome", "https://example.com/"]
+        );
+    }
+
+    #[test]
+    fn failed_navigation_shows_an_error_page_and_keeps_the_typed_address() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.address = "example.com/gone".to_owned();
+        app.submit_address();
+        let error = browser::LoadError::Status {
+            status: 404,
+            status_text: "Not Found".into(),
+        };
+
+        app.navigation_finished(
+            app.navigation_id,
+            navigation("https://example.com/gone", Err(error)),
+        );
+
+        let page = app.loaded_page.as_ref().unwrap();
+        assert!(page.html.contains("https://example.com/gone"));
+        assert!(page.html.contains("404"));
+        assert_eq!(app.address, "example.com/gone");
+        assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);
+    }
+
+    #[test]
+    fn stale_navigation_results_are_ignored() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let original_page = app.loaded_page.clone();
+        app.address = "example.com".to_owned();
+        app.submit_address();
+        let stale = app.navigation_id;
+        app.address = "example.org".to_owned();
+        app.submit_address();
+        let page = browser::Page {
+            html: "<p>Old</p>".into(),
+            stylesheets: Vec::new(),
+            scripts: Vec::new(),
+        };
+
+        app.navigation_finished(stale, navigation("https://example.com/", Ok(page)));
+
         assert_eq!(app.loaded_page, original_page);
         assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);
     }

@@ -64,8 +64,12 @@ fn render_document(
 /// viewport. Painting and hit testing share this so they agree on geometry.
 fn layout_page(page: &Page, width: u32, height: u32) -> LayoutTree {
     let document = html::parse_raw_html(page.html.to_owned());
-    let stylesheet = css::parse_stylesheet(&page.css);
-    let styles = css::style_document(&document, &[stylesheet]);
+    let stylesheets: Vec<_> = page
+        .stylesheets
+        .iter()
+        .map(|source| css::parse_stylesheet(source))
+        .collect();
+    let styles = css::style_document(&document, &stylesheets);
     layout_document(
         &document,
         &styles,
@@ -264,7 +268,7 @@ mod tests {
     }
 
     fn welcome_color(page: &Page, property: &str) -> [u8; 4] {
-        let sheet = css::parse_stylesheet(&page.css);
+        let sheet = css::parse_stylesheet(&page.stylesheets[0]);
         let value = sheet
             .rules
             .iter()
@@ -366,10 +370,12 @@ mod tests {
         events.load(
             &Page {
                 html: "<main><script src=\"script.js\"></script></main>".into(),
-                css: String::new(),
-                js: "function callback() { alert('Clicked') }\n\
+                stylesheets: Vec::new(),
+                scripts: vec![
+                    "function callback() { alert('Clicked') }\n\
                      document.addEventListener('click', callback)"
-                    .into(),
+                        .into(),
+                ],
             },
             alert.clone(),
             test_runtime(),
@@ -487,8 +493,8 @@ mod tests {
         let alert = Arc::new(TestAlert::default());
         let page = Page {
             html: "<main><script src=\"script.js\"></script></main>".into(),
-            css: String::new(),
-            js: "alert('rendered page')".into(),
+            stylesheets: Vec::new(),
+            scripts: vec!["alert('rendered page')".into()],
         };
 
         let runtime = test_runtime();
@@ -519,8 +525,8 @@ mod tests {
         let welcome = browser::welcome_page();
         let page = Page {
             html: welcome.html,
-            css: welcome.css,
-            js: "alert('Hello from script.js')".into(),
+            stylesheets: welcome.stylesheets,
+            scripts: vec!["alert('Hello from script.js')".into()],
         };
         let alert = Arc::new(Recording::default());
         let runtime = test_runtime();
@@ -550,8 +556,8 @@ mod tests {
         let mut scripts_evaluated = true;
         let mut page = Page {
             html: "<main>Hello</main>".into(),
-            css: "main { background-color: #abc; color: red; }".into(),
-            js: String::new(),
+            stylesheets: vec!["main { background-color: #abc; color: red; }".into()],
+            scripts: Vec::new(),
         };
         let first = render_document(
             &page,
@@ -575,7 +581,7 @@ mod tests {
         );
         assert_ne!(first.pixels, changed_text.pixels);
 
-        page.css = "main { background-color: rgb(18, 52, 86); color: #abc; }".into();
+        page.stylesheets = vec!["main { background-color: rgb(18, 52, 86); color: #abc; }".into()];
         let changed_css = render_document(
             &page,
             160,
@@ -599,8 +605,8 @@ mod tests {
         let mut scripts_evaluated = true;
         let mut page = Page {
             html: "<html><body><main>Hi</main></body></html>".into(),
-            css: String::new(),
-            js: String::new(),
+            stylesheets: Vec::new(),
+            scripts: Vec::new(),
         };
         let frame = render_document(
             &page,
@@ -613,7 +619,7 @@ mod tests {
         assert_eq!(&frame.pixels[..4], &[255, 255, 255, 255]);
         assert!(frame.pixels.chunks_exact(4).any(|p| p == [0, 0, 0, 255]));
 
-        page.css = "html { background-color: #123456; color: red; }".into();
+        page.stylesheets = vec!["html { background-color: #123456; color: red; }".into()];
         let frame = render_document(
             &page,
             160,
