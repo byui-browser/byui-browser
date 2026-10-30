@@ -2,8 +2,8 @@
 //!
 //! The window, toolbar, and page rendering come from the shared
 //! `browser-shell` crate; this crate only describes the Linux window, which
-//! keeps the desktop's own decorations, and finds a system font for the
-//! toolbar text.
+//! keeps the desktop's own decorations, and finds system fonts for the
+//! toolbar and page text.
 
 #![forbid(unsafe_code)]
 
@@ -16,6 +16,7 @@ fn main() -> Result<(), winit::error::EventLoopError> {
         // buttons, and the resize borders above and around the toolbar.
         configure_window: |attributes| attributes,
         ui_font_files: linux::ui_font_files,
+        page_font_files: linux::page_font_files,
         window_controls_inset: 0.0,
     })
 }
@@ -29,7 +30,7 @@ mod linux {
     /// configured sans-serif font from fontconfig, then common distribution
     /// fonts at their usual locations.
     pub fn ui_font_files() -> Vec<PathBuf> {
-        let mut files: Vec<PathBuf> = fontconfig_sans_serif().into_iter().collect();
+        let mut files: Vec<PathBuf> = fontconfig_match("sans-serif").into_iter().collect();
         files.extend(
             [
                 // Fedora and other Noto-based desktops.
@@ -50,12 +51,41 @@ mod linux {
         files
     }
 
-    /// Asks fontconfig for the file backing the user's default sans-serif
-    /// font. Returns `None` when `fc-match` is unavailable or fails, so the
-    /// fallback list above still applies.
-    fn fontconfig_sans_serif() -> Option<PathBuf> {
+    /// Font files to try for page text, best first: the desktop's
+    /// configured serif font from fontconfig, matching the serif default of
+    /// other browsers, then common distribution serif fonts, then the
+    /// toolbar's sans-serif candidates as a last resort.
+    pub fn page_font_files() -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = fontconfig_match("serif").into_iter().collect();
+        files.extend(
+            [
+                // Metric-compatible with Times New Roman (Debian, Ubuntu,
+                // Fedora, Arch).
+                "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+                "/usr/share/fonts/liberation-serif/LiberationSerif-Regular.ttf",
+                "/usr/share/fonts/liberation/LiberationSerif-Regular.ttf",
+                // Noto-based desktops.
+                "/usr/share/fonts/google-noto/NotoSerif-Regular.ttf",
+                "/usr/share/fonts/noto/NotoSerif-Regular.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSerif-Regular.ttf",
+                // DejaVu (Debian, Ubuntu, Fedora, Arch).
+                "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+                "/usr/share/fonts/dejavu-serif-fonts/DejaVuSerif.ttf",
+                "/usr/share/fonts/TTF/DejaVuSerif.ttf",
+            ]
+            .into_iter()
+            .map(PathBuf::from),
+        );
+        files.extend(ui_font_files());
+        files
+    }
+
+    /// Asks fontconfig for the file backing the user's default font for
+    /// `pattern`, such as `serif` or `sans-serif`. Returns `None` when
+    /// `fc-match` is unavailable or fails, so the fallback lists still apply.
+    fn fontconfig_match(pattern: &str) -> Option<PathBuf> {
         let output = Command::new("fc-match")
-            .args(["--format=%{file}", "sans-serif"])
+            .args(["--format=%{file}", pattern])
             .output()
             .ok()?;
         if !output.status.success() {

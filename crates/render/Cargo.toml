@@ -11,6 +11,8 @@ rust-version.workspace = true
 common = { workspace = true }
 layout = { workspace = true }
 paint = { workspace = true }
+# Outline (TrueType/OpenType) font parsing and anti-aliased glyph rasterizing.
+ab_glyph = "0.2"
 
 [lints]
 workspace = true

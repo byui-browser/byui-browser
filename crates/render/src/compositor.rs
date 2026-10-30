@@ -1,6 +1,6 @@
 //! Software compositor and rasterization.
 
-use crate::{BitmapFont, DisplayItem, Frame, fonts::glyph};
+use crate::{BitmapFont, DisplayItem, Frame, OutlineFont, fonts::glyph};
 
 /// A software compositor for a fixed device-pixel viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +165,107 @@ impl Compositor {
             .collect::<Vec<_>>();
         self.compose(&items)
     }
+
+    /// Rasterizes a paint crate display list into a new frame, drawing text
+    /// with `font` and anti-aliasing glyph edges.
+    ///
+    /// `scale` is device pixels per CSS pixel (for example 2.0 on a Retina
+    /// display); this compositor's viewport is in device pixels. Text is
+    /// rasterized at device resolution, so it stays sharp at any scale.
+    /// Lay the document out with the same `font` so text runs fit the
+    /// widths layout measured. Rectangle edges round to the nearest device
+    /// pixel boundary, and parts outside the frame are clipped.
+    pub fn compose_paint_with_font(
+        &self,
+        list: &paint::DisplayList,
+        font: &OutlineFont,
+        scale: f32,
+    ) -> Frame {
+        let mut frame = Frame {
+            width: self.width,
+            height: self.height,
+            pixels: Self::CLEAR_COLOR.repeat((self.width * self.height) as usize),
+        };
+        for item in &list.items {
+            match item {
+                paint::DisplayItem::FillRect { rect, color } => {
+                    let edge = |value: f32, limit: u32| {
+                        (value * scale).round().clamp(0.0, limit as f32) as u32
+                    };
+                    let rgba = [color.r, color.g, color.b, color.a];
+                    for py in edge(rect.y, self.height)..edge(rect.bottom(), self.height) {
+                        for px in edge(rect.x, self.width)..edge(rect.right(), self.width) {
+                            self.put_pixel(&mut frame, px, py, rgba);
+                        }
+                    }
+                }
+                paint::DisplayItem::Text {
+                    x,
+                    baseline,
+                    font_size,
+                    text,
+                    color,
+                } => self.draw_outline_text(
+                    &mut frame,
+                    font,
+                    *font_size * scale,
+                    *x * scale,
+                    (*baseline * scale).round(),
+                    text,
+                    [color.r, color.g, color.b, color.a],
+                ),
+            }
+        }
+        frame
+    }
+
+    /// Draws `text` with `font` at an em size of `font_size` device pixels,
+    /// starting at `x` on the `baseline` (device pixels). Glyphs advance
+    /// exactly as [`layout::FontMetrics`] measures them for this font.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_outline_text(
+        &self,
+        frame: &mut Frame,
+        font: &OutlineFont,
+        font_size: f32,
+        x: f32,
+        baseline: f32,
+        text: &str,
+        rgba: [u8; 4],
+    ) {
+        use ab_glyph::{Font, ScaleFont};
+        if font_size <= 0.0 {
+            return;
+        }
+        let scaled = font.font().as_scaled(font.px_scale(font_size));
+        let mut caret = x;
+        for character in text.chars() {
+            let id = scaled.glyph_id(character);
+            let glyph =
+                id.with_scale_and_position(scaled.scale(), ab_glyph::point(caret, baseline));
+            caret += scaled.h_advance(id);
+            let Some(outline) = font.font().outline_glyph(glyph) else {
+                continue;
+            };
+            let bounds = outline.px_bounds();
+            outline.draw(|gx, gy, coverage| {
+                let px = bounds.min.x as i64 + i64::from(gx);
+                let py = bounds.min.y as i64 + i64::from(gy);
+                if px < 0 || py < 0 {
+                    return;
+                }
+                let alpha = (coverage.clamp(0.0, 1.0) * f32::from(rgba[3])).round() as u8;
+                if alpha > 0 {
+                    self.put_pixel(
+                        frame,
+                        px as u32,
+                        py as u32,
+                        [rgba[0], rgba[1], rgba[2], alpha],
+                    );
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -221,6 +322,83 @@ mod tests {
         // `I` has 5 + 5 + 5 lit cells (two bars and a 5-row stem); at scale 2
         // each cell is 4 pixels.
         assert_eq!(dark, 15 * 4);
+    }
+
+    #[test]
+    fn outline_text_is_drawn_at_device_scale_within_its_advance() {
+        use layout::FontMetrics;
+        let Some(font) = crate::fonts::tests::system_font() else {
+            return;
+        };
+        let black = paint::Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let list = paint::DisplayList {
+            items: vec![paint::DisplayItem::Text {
+                x: 4.0,
+                baseline: 20.0,
+                font_size: 16.0,
+                text: "Hi".into(),
+                color: black,
+            }],
+        };
+        let scale = 2.0;
+        let frame = Compositor::new(120, 60).compose_paint_with_font(&list, &font, scale);
+        let inked: Vec<(u32, u32)> = frame
+            .pixels
+            .chunks_exact(4)
+            .enumerate()
+            .filter(|(_, pixel)| *pixel != Compositor::CLEAR_COLOR)
+            .map(|(index, _)| (index as u32 % 120, index as u32 / 120))
+            .collect();
+        assert!(!inked.is_empty());
+        // Anti-aliased edges produce partially covered (gray) pixels.
+        assert!(frame.pixels.chunks_exact(4).any(|p| p[0] > 0 && p[0] < 255));
+        // Ink stays within the run's measured advance and above the
+        // baseline, both scaled to device pixels.
+        let right = (4.0 + font.text_width("Hi", 16.0)) * scale;
+        let ascent = font.vertical_metrics(16.0).ascent * scale;
+        for (x, y) in inked {
+            assert!(x as f32 >= 4.0 * scale - 1.0 && (x as f32) < right + 1.0);
+            assert!(y as f32 >= 20.0 * scale - ascent - 1.0 && (y as f32) < 20.0 * scale + 1.0);
+        }
+    }
+
+    #[test]
+    fn scaled_compose_fills_rects_in_device_pixels() {
+        let Some(font) = crate::fonts::tests::system_font() else {
+            return;
+        };
+        let list = paint::DisplayList {
+            items: vec![paint::DisplayItem::FillRect {
+                rect: paint::Rect {
+                    x: 1.0,
+                    y: 1.0,
+                    width: 2.0,
+                    height: 1.0,
+                },
+                color: paint::Color {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+            }],
+        };
+        let frame = Compositor::new(8, 8).compose_paint_with_font(&list, &font, 2.0);
+        let red = frame
+            .pixels
+            .chunks_exact(4)
+            .filter(|pixel| *pixel == [255, 0, 0, 255])
+            .count();
+        assert_eq!(red, 4 * 2);
+        assert_eq!(
+            &frame.pixels[(2 * 8 + 2) * 4..(2 * 8 + 2) * 4 + 4],
+            [255, 0, 0, 255]
+        );
     }
 
     #[test]

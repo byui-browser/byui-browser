@@ -33,6 +33,19 @@ fn main() -> Result<(), winit::error::EventLoopError> {
             .map(PathBuf::from)
             .collect()
         },
+        // Times is the default serif font Safari and Chrome use for pages;
+        // the UI fonts are fallbacks.
+        page_font_files: || {
+            [
+                "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+                "/System/Library/Fonts/Times.ttc",
+                "/System/Library/Fonts/Supplemental/Georgia.ttf",
+                "/System/Library/Fonts/Helvetica.ttc",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
+        },
         window_controls_inset: 72.0,
     })
 }

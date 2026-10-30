@@ -27,6 +27,19 @@ use crate::toolbar::{self, ChromeState, Control};
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
+/// A caret movement in the address field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaretMove {
+    /// One character toward the start.
+    Left,
+    /// One character toward the end.
+    Right,
+    /// Before the first character.
+    Start,
+    /// After the last character.
+    End,
+}
+
 /// How a native shell wants its window set up.
 ///
 /// Every shell keeps the operating system's own window decorations (title
@@ -41,6 +54,11 @@ pub struct Platform {
     /// Returns font files to try, in order, for toolbar text. The first one
     /// that loads is used; if none loads the toolbar omits its text.
     pub ui_font_files: fn() -> Vec<PathBuf>,
+    /// Returns font files to try, in order, for page text, with the
+    /// system's default serif font first to match other browsers. The first
+    /// one that loads is used; if none loads, pages use the built-in bitmap
+    /// font.
+    pub page_font_files: fn() -> Vec<PathBuf>,
     /// Logical width at the toolbar's left that the system's window buttons
     /// cover when they overlap the toolbar, as macOS's traffic lights do on a
     /// transparent titlebar. Zero when the system draws its buttons in a
@@ -61,8 +79,6 @@ struct App {
     address: String,
     /// Address text to restore when Escape cancels an edit.
     address_before_edit: String,
-    /// Whether the current address should be replaced by the next edit.
-    address_selected: bool,
     modifiers: ModifiersState,
     /// Loaded document, retained independently of the size-dependent pixmap.
     loaded_page: Option<browser::Page>,
@@ -195,7 +211,6 @@ impl App {
             browser_state: chrome::BrowserState::new(),
             address: String::from("byui://welcome"),
             address_before_edit: String::from("byui://welcome"),
-            address_selected: false,
             modifiers: ModifiersState::default(),
             loaded_page: None,
             page: None,
@@ -238,7 +253,8 @@ impl App {
         self.browser_state.record_visit(url);
         self.address = url.to_owned();
         self.address_before_edit = self.address.clone();
-        self.address_selected = false;
+        self.chrome.address_caret = self.address.len();
+        self.chrome.address_selected = false;
         self.chrome.address_focused = false;
         self.page = None;
         self.redraw();
@@ -246,14 +262,16 @@ impl App {
 
     fn begin_address_edit(&mut self) {
         self.address_before_edit = self.address.clone();
-        self.address_selected = true;
+        self.chrome.address_caret = self.address.len();
+        self.chrome.address_selected = true;
         self.chrome.address_focused = true;
         self.redraw();
     }
 
     fn cancel_address_edit(&mut self) {
         self.address = self.address_before_edit.clone();
-        self.address_selected = false;
+        self.chrome.address_caret = self.address.len();
+        self.chrome.address_selected = false;
         self.chrome.address_focused = false;
         self.redraw();
     }
@@ -261,7 +279,8 @@ impl App {
     fn submit_address(&mut self) {
         let address = self.address.trim().to_owned();
         self.address = address.clone();
-        self.address_selected = false;
+        self.chrome.address_caret = self.address.len();
+        self.chrome.address_selected = false;
         self.chrome.address_focused = false;
         if address == "byui://welcome" {
             // Bump the id so an older load still in flight cannot replace it.
@@ -314,7 +333,10 @@ impl App {
         }
         let key = event.logical_key.as_ref();
         let modifiers = self.modifiers;
-        if modifiers.control_key() {
+        // Command is the shortcut modifier on macOS; Control works everywhere.
+        let shortcut =
+            modifiers.control_key() || (cfg!(target_os = "macos") && modifiers.super_key());
+        if shortcut {
             if let Key::Character(character) = key {
                 match character.to_ascii_lowercase().as_str() {
                     "l" => {
@@ -323,6 +345,28 @@ impl App {
                     }
                     "r" => {
                         self.activate(Control::Reload);
+                        return;
+                    }
+                    "a" if self.chrome.address_focused => {
+                        self.chrome.address_selected = true;
+                        self.redraw();
+                        return;
+                    }
+                    "c" if self.chrome.address_focused => {
+                        if let Err(error) = arboard::Clipboard::new()
+                            .and_then(|mut clipboard| clipboard.set_text(self.address.clone()))
+                        {
+                            eprintln!("Failed to copy the address: {error}");
+                        }
+                        return;
+                    }
+                    "v" if self.chrome.address_focused => {
+                        match arboard::Clipboard::new()
+                            .and_then(|mut clipboard| clipboard.get_text())
+                        {
+                            Ok(text) => self.insert_address_text(&text),
+                            Err(error) => eprintln!("Failed to paste into the address: {error}"),
+                        }
                         return;
                     }
                     _ => {}
@@ -335,27 +379,104 @@ impl App {
         match key {
             Key::Named(NamedKey::Enter) => self.submit_address(),
             Key::Named(NamedKey::Escape) => self.cancel_address_edit(),
-            Key::Named(NamedKey::Backspace) => {
-                if self.address_selected {
-                    self.address.clear();
-                    self.address_selected = false;
-                } else {
-                    self.address.pop();
-                }
-                self.redraw();
+            Key::Named(NamedKey::Backspace) => self.delete_address_text(false),
+            Key::Named(NamedKey::Delete) => self.delete_address_text(true),
+            // Command+Left/Right jump to the ends on macOS, like Home/End.
+            Key::Named(NamedKey::ArrowLeft)
+                if cfg!(target_os = "macos") && modifiers.super_key() =>
+            {
+                self.move_address_caret(CaretMove::Start)
+            }
+            Key::Named(NamedKey::ArrowRight)
+                if cfg!(target_os = "macos") && modifiers.super_key() =>
+            {
+                self.move_address_caret(CaretMove::End)
+            }
+            Key::Named(NamedKey::ArrowLeft) => self.move_address_caret(CaretMove::Left),
+            Key::Named(NamedKey::ArrowRight) => self.move_address_caret(CaretMove::Right),
+            Key::Named(NamedKey::Home | NamedKey::ArrowUp) => {
+                self.move_address_caret(CaretMove::Start)
+            }
+            Key::Named(NamedKey::End | NamedKey::ArrowDown) => {
+                self.move_address_caret(CaretMove::End)
             }
             Key::Character(character)
                 if !modifiers.control_key() && !modifiers.alt_key() && !modifiers.super_key() =>
             {
-                if self.address_selected {
-                    self.address.clear();
-                    self.address_selected = false;
-                }
-                self.address.push_str(character);
-                self.redraw();
+                self.insert_address_text(character);
             }
             _ => {}
         }
+    }
+
+    /// Caret position clamped to a character boundary of the address.
+    fn address_caret(&self) -> usize {
+        toolbar::floor_char_boundary(&self.address, self.chrome.address_caret)
+    }
+
+    /// Types `text` at the caret, replacing the whole address when selected.
+    ///
+    /// Control characters such as the newlines of a multi-line paste are
+    /// dropped, since an address is a single line.
+    fn insert_address_text(&mut self, text: &str) {
+        if self.chrome.address_selected {
+            self.address.clear();
+            self.chrome.address_selected = false;
+        }
+        let text: String = text
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        let caret = self.address_caret();
+        self.address.insert_str(caret, &text);
+        self.chrome.address_caret = caret + text.len();
+        self.redraw();
+    }
+
+    /// Deletes the character after the caret when `forward`, else the one
+    /// before it; a selected address is cleared instead.
+    fn delete_address_text(&mut self, forward: bool) {
+        if self.chrome.address_selected {
+            self.address.clear();
+            self.chrome.address_selected = false;
+            self.chrome.address_caret = 0;
+        } else {
+            let caret = self.address_caret();
+            if forward {
+                if caret < self.address.len() {
+                    self.address.remove(caret);
+                }
+                self.chrome.address_caret = caret;
+            } else if let Some(previous) = self.address[..caret].chars().next_back() {
+                let start = caret - previous.len_utf8();
+                self.address.remove(start);
+                self.chrome.address_caret = start;
+            }
+        }
+        self.redraw();
+    }
+
+    /// Moves the caret, collapsing a selection first. Left and Right collapse
+    /// a selection to its start or end without moving further, as text
+    /// fields on every platform do.
+    fn move_address_caret(&mut self, movement: CaretMove) {
+        let caret = self.address_caret();
+        let selected = std::mem::take(&mut self.chrome.address_selected);
+        self.chrome.address_caret = match movement {
+            CaretMove::Start => 0,
+            CaretMove::End => self.address.len(),
+            CaretMove::Left if selected => 0,
+            CaretMove::Right if selected => self.address.len(),
+            CaretMove::Left => self.address[..caret]
+                .chars()
+                .next_back()
+                .map_or(caret, |previous| caret - previous.len_utf8()),
+            CaretMove::Right => self.address[caret..]
+                .chars()
+                .next()
+                .map_or(caret, |next| caret + next.len_utf8()),
+        };
+        self.redraw();
     }
 
     fn ensure_welcome_loaded(&mut self) {
@@ -920,6 +1041,7 @@ impl ApplicationHandler<UserEvent> for App {
 /// Opens the browser window described by `platform` and runs it until the
 /// user closes it.
 pub fn run(platform: Platform) -> Result<(), EventLoopError> {
+    crate::content::load_page_font((platform.page_font_files)());
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App::new(platform);
@@ -943,6 +1065,7 @@ mod tests {
             Platform {
                 configure_window: |attributes| attributes,
                 ui_font_files: Vec::new,
+                page_font_files: Vec::new,
                 window_controls_inset: 0.0,
             },
             browser::BrowserRuntime::in_memory(),
@@ -1194,15 +1317,68 @@ mod tests {
         let mut app = app();
         app.ensure_welcome_loaded();
         app.begin_address_edit();
-        assert!(app.address_selected);
+        assert!(app.chrome.address_selected);
         app.address.push_str("-draft");
 
         app.cancel_address_edit();
 
         assert_eq!(app.address, "byui://welcome");
-        assert!(!app.address_selected);
+        assert!(!app.chrome.address_selected);
         assert!(!app.chrome.address_focused);
         assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);
+    }
+
+    #[test]
+    fn pasted_text_replaces_a_selected_address_on_one_line() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.begin_address_edit();
+
+        app.insert_address_text("example.com/\r\npath\t");
+        assert_eq!(app.address, "example.com/path");
+        assert!(!app.chrome.address_selected);
+
+        app.insert_address_text("?q=1");
+        assert_eq!(app.address, "example.com/path?q=1");
+    }
+
+    #[test]
+    fn arrow_keys_collapse_the_selection_and_move_the_caret() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.begin_address_edit();
+
+        app.move_address_caret(CaretMove::Left);
+        assert!(!app.chrome.address_selected);
+        assert_eq!(app.chrome.address_caret, 0);
+
+        app.move_address_caret(CaretMove::Right);
+        app.move_address_caret(CaretMove::Right);
+        app.insert_address_text("X");
+        assert_eq!(app.address, "byXui://welcome");
+        assert_eq!(app.chrome.address_caret, 3);
+
+        app.delete_address_text(false);
+        app.delete_address_text(true);
+        assert_eq!(app.address, "byi://welcome");
+        assert_eq!(app.chrome.address_caret, 2);
+
+        app.move_address_caret(CaretMove::End);
+        app.move_address_caret(CaretMove::Right);
+        assert_eq!(app.chrome.address_caret, app.address.len());
+    }
+
+    #[test]
+    fn caret_steps_over_multi_byte_characters() {
+        let mut app = app();
+        app.address = "aé".to_owned();
+        app.begin_address_edit();
+        app.move_address_caret(CaretMove::Right);
+        app.move_address_caret(CaretMove::Left);
+        assert_eq!(app.chrome.address_caret, 1);
+        app.move_address_caret(CaretMove::Right);
+        app.delete_address_text(false);
+        assert_eq!(app.address, "a");
     }
 
     #[test]
