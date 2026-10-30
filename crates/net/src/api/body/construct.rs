@@ -141,6 +141,15 @@ impl Body {
         .with_length(Some(length))
     }
 
+    /// Creates a single response body from immutable static bytes without copying them.
+    pub(crate) fn once_static_with_signal(body: &'static [u8], signal: AbortSignal) -> Self {
+        Self::from_stream_with_signal(
+            futures_util::stream::once(async move { Ok(Bytes::from_static(body)) }),
+            signal,
+        )
+        .with_length(Some(body.len() as u64))
+    }
+
     #[cfg(test)]
     /// Creates a single buffered body for body-state tests.
     pub(crate) fn once(body: Vec<u8>) -> Self {

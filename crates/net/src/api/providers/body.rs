@@ -75,7 +75,7 @@ impl SchemeBody {
         match self {
             Self::Null | Self::NullWithLength(_) => Body::null(),
             Self::Bytes(bytes) => Body::once_with_signal(bytes, signal),
-            Self::StaticBytes(bytes) => Body::once_with_signal(bytes.to_vec(), signal),
+            Self::StaticBytes(bytes) => Body::once_static_with_signal(bytes, signal),
             Self::Stream(stream) => {
                 let stream = stream.map(|chunk| chunk.map(Bytes::from));
                 Body::from_stream_with_signal(stream, signal)
