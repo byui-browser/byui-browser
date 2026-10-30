@@ -16,14 +16,32 @@ fn public_api_round_trip() {
 
 #[test]
 fn public_api_is_origin_scoped() {
-    let first = StorageKey::new(Origin::with_port("https", "example.com", 443));
-    let second = StorageKey::new(Origin::with_port("https", "other.example", 443));
+    let first = RendererSecurityContext::new(
+        Origin::with_port("https", "example.com", 443),
+        StoragePermission::Allowed,
+    );
+    let second = RendererSecurityContext::new(
+        Origin::with_port("https", "other.example", 443),
+        StoragePermission::Allowed,
+    );
     let mut storage = OriginStorage::new();
 
-    storage.set_item(&first, "theme", "dark");
+    storage
+        .set_item(&first, "theme", "dark")
+        .expect("first context can write");
 
-    assert_eq!(storage.get_item(&first, "theme"), Some("dark"));
-    assert_eq!(storage.get_item(&second, "theme"), None);
+    assert_eq!(
+        storage
+            .get_item(&first, "theme")
+            .expect("first context can read"),
+        Some("dark")
+    );
+    assert_eq!(
+        storage
+            .get_item(&second, "theme")
+            .expect("second context can read its own storage"),
+        None
+    );
 }
 
 fn test_directory(name: &str) -> PathBuf {
