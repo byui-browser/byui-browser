@@ -47,6 +47,81 @@ impl layout::FontMetrics for BitmapFont {
     }
 }
 
+/// A scalable outline font (TrueType or OpenType) for page text.
+///
+/// Sizes are em sizes in CSS pixels, as `font-size` specifies them, so text
+/// set at 16px has a 16px em square. Layout measures with this font through
+/// [`layout::FontMetrics`], and [`crate::Compositor::compose_paint_with_font`]
+/// draws with the same advances, so line breaks and painted glyphs agree.
+///
+/// Limitation: glyphs are mapped one per character and advanced without
+/// kerning or shaping, so ligatures and complex scripts are not supported.
+/// Characters the font has no glyph for draw the font's missing-glyph shape.
+#[derive(Debug, Clone)]
+pub struct OutlineFont {
+    font: ab_glyph::FontArc,
+    /// Font units per em; converts em sizes to the font's design units.
+    units_per_em: f32,
+}
+
+impl OutlineFont {
+    /// Parses font file `data`, using the first face of a font collection.
+    ///
+    /// Returns `None` when the data is not a supported font.
+    pub fn from_bytes(data: Vec<u8>) -> Option<Self> {
+        let font = ab_glyph::FontArc::try_from_vec(data).ok()?;
+        let units_per_em = ab_glyph::Font::units_per_em(&font)?;
+        Some(Self { font, units_per_em })
+    }
+
+    /// Loads the first of `paths` that reads and parses as a font, or `None`
+    /// when none does.
+    pub fn load_first<P: AsRef<std::path::Path>>(
+        paths: impl IntoIterator<Item = P>,
+    ) -> Option<Self> {
+        paths
+            .into_iter()
+            .find_map(|path| Self::from_bytes(std::fs::read(path).ok()?))
+    }
+
+    /// Design units to CSS pixels at an em size of `font_size` CSS pixels.
+    fn units_to_px(&self, font_size: f32) -> f32 {
+        font_size / self.units_per_em
+    }
+
+    /// The `ab_glyph` scale for an em size of `font_size` pixels. `PxScale`
+    /// measures ascent-to-descent height rather than the em square.
+    pub(crate) fn px_scale(&self, font_size: f32) -> ab_glyph::PxScale {
+        ab_glyph::PxScale::from(
+            ab_glyph::Font::height_unscaled(&self.font) * self.units_to_px(font_size),
+        )
+    }
+
+    /// The parsed font, for rasterizing.
+    pub(crate) fn font(&self) -> &ab_glyph::FontArc {
+        &self.font
+    }
+}
+
+impl layout::FontMetrics for OutlineFont {
+    fn advance(&self, character: char, font_size: f32) -> f32 {
+        use ab_glyph::Font;
+        let id = self.font.glyph_id(character);
+        self.font.h_advance_unscaled(id) * self.units_to_px(font_size)
+    }
+
+    fn vertical_metrics(&self, font_size: f32) -> layout::VerticalMetrics {
+        use ab_glyph::Font;
+        let scale = self.units_to_px(font_size);
+        layout::VerticalMetrics {
+            ascent: self.font.ascent_unscaled() * scale,
+            // `ab_glyph` reports descent as a negative offset below the baseline.
+            descent: -self.font.descent_unscaled() * scale,
+            line_gap: self.font.line_gap_unscaled() * scale,
+        }
+    }
+}
+
 /// Returns the seven-row, five-column bitmap glyph for a supported character.
 ///
 /// The first slice supports a small bitmap font; unsupported
@@ -144,8 +219,45 @@ pub fn glyph(character: char) -> Option<[u8; 7]> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::glyph;
+pub(crate) mod tests {
+    use super::{OutlineFont, glyph};
+    use layout::FontMetrics;
+
+    /// Installed fonts to exercise [`OutlineFont`] with. Tests that need one
+    /// return early on machines without any of them.
+    pub(crate) fn system_font() -> Option<OutlineFont> {
+        OutlineFont::load_first([
+            "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+            "C:/Windows/Fonts/times.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+        ])
+    }
+
+    #[test]
+    fn outline_font_rejects_data_that_is_not_a_font() {
+        assert!(OutlineFont::from_bytes(b"not a font".to_vec()).is_none());
+        assert!(OutlineFont::load_first(["/nonexistent/font.ttf"]).is_none());
+    }
+
+    #[test]
+    fn outline_font_metrics_scale_with_font_size() {
+        let Some(font) = system_font() else {
+            return;
+        };
+        let small = font.vertical_metrics(16.0);
+        let large = font.vertical_metrics(32.0);
+        assert!(small.ascent > 0.0 && small.descent > 0.0);
+        assert!((large.ascent - small.ascent * 2.0).abs() < 1e-3);
+        assert!((font.advance('W', 32.0) - font.advance('W', 16.0) * 2.0).abs() < 1e-3);
+        // A proportional font: `W` is wider than `i`.
+        assert!(font.advance('W', 16.0) > font.advance('i', 16.0));
+        // Ascent plus descent is roughly one em for text fonts.
+        let height = small.ascent + small.descent;
+        assert!((12.0..24.0).contains(&height), "content height {height}");
+    }
 
     #[test]
     fn supports_uppercase_and_lowercase_m() {
