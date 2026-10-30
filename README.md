@@ -7,6 +7,24 @@ An independent web browser built from scratch in Rust. See
 crate ownership, and collaboration rules. Team overviews live in
 [`docs/TEAMS.md`](docs/TEAMS.md).
 
+## Downloads
+
+Pushing a version tag (`v0.1.0`, or any `v*.*.*` tag) runs the
+[release workflow](.github/workflows/release.yml). It builds the native shell
+for macOS, Linux, and Windows, then attaches one archive to the
+[GitHub Release](https://github.com/byui-browser/byui-browser/releases) for that
+tag. These links always download the latest release:
+
+- [macOS (Apple Silicon)](https://github.com/byui-browser/byui-browser/releases/latest/download/byui-browser-macos-aarch64.tar.gz)
+- [Linux (x86_64)](https://github.com/byui-browser/byui-browser/releases/latest/download/byui-browser-linux-x86_64.tar.gz)
+- [Windows (x86_64)](https://github.com/byui-browser/byui-browser/releases/latest/download/byui-browser-windows-x86_64.zip)
+
+Each archive contains a `byui-browser` program (`byui-browser.exe` on
+Windows). The Linux build uses the system GTK 3 libraries, so install
+`libgtk-3-0` on Debian and Ubuntu before launching it. macOS quarantines the
+downloaded binary; clear that with
+`xattr -d com.apple.quarantine byui-browser` before the first launch.
+
 ## Repository layout
 
 ```
@@ -55,7 +73,7 @@ make test                  # unit tests across the workspace
 make test html             # tests for a single crate
 cargo test -p html -- --ignored   # backlog: contract tests not yet implemented
 make lint                  # rustfmt check + clippy (-D warnings)
-make release linux         # release build for macos | linux | windows
+make release linux         # release build of the native shell (macos, linux, or windows)
 ```
 
 The binary entry point:

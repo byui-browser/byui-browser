@@ -31,7 +31,7 @@ impl RequestController {
             media_type: None,
             origin: Origin::opaque(),
             body: if request.method() == Method::HEAD {
-                SchemeBody::Null
+                SchemeBody::NullWithLength(bytes.len())
             } else {
                 SchemeBody::Bytes(bytes)
             },

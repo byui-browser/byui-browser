@@ -328,6 +328,11 @@ impl BrowserRuntime {
     /// navigation. JavaScript cannot choose the origin or storage key. The
     /// JavaScript engine's standard `localStorage` object syntax remains a
     /// follow-up; the registered host-function path is available now.
+    ///
+    /// The returned values are the script completion values. Listeners
+    /// registered by those scripts are dropped with the temporary realm. Use
+    /// [`BrowserRuntime::open_page_session`] when a later click must reach
+    /// `document.addEventListener`.
     pub fn evaluate_page_scripts(
         &self,
         html_source: &str,
@@ -336,20 +341,159 @@ impl BrowserRuntime {
         controller: Arc<RequestController>,
         security_context: RendererSecurityContext,
     ) -> JsResult<Vec<Value>> {
-        let document = html::parse_raw_html(html_source.to_owned());
+        self.boot_page(
+            html_source,
+            None,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+        )
+        .map(|booted| booted.results)
+    }
+
+    /// Parses a page, evaluates its scripts, and keeps the document alive.
+    ///
+    /// The session shares listener storage with the script-visible `document`,
+    /// so [`PageSession::dispatch_click`] runs listeners the scripts
+    /// registered. The caller supplies the trusted renderer context created
+    /// by browser navigation.
+    pub fn open_page_session(
+        &self,
+        html_source: &str,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+    ) -> JsResult<PageSession> {
+        self.boot_page(
+            html_source,
+            None,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+        )
+        .map(|booted| booted.session)
+    }
+
+    /// Opens a session for a loaded [`Page`], running its linked script
+    /// against the page's own document.
+    ///
+    /// Scripts run in tree order. Inline scripts run their own text; a
+    /// `<script src>` element runs [`Page::js`], because a page currently
+    /// carries one resolved external script. A page with several external
+    /// scripts would run that one body for each of them. Element IDs in the
+    /// session match a layout of `page.html`, so a layout hit test can be
+    /// passed to [`PageSession::dispatch_click_at`].
+    pub fn open_page(
+        &self,
+        page: &Page,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+    ) -> JsResult<PageSession> {
+        self.boot_page(
+            &page.html,
+            Some(&page.js),
+            console,
+            alert_sink,
+            controller,
+            security_context,
+        )
+        .map(|booted| booted.session)
+    }
+
+    fn boot_page(
+        &self,
+        html_source: &str,
+        external_script: Option<&str>,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+    ) -> JsResult<BootedPage> {
+        let html_document = html::parse_raw_html(html_source.to_owned());
+        let document = Document::from_html_document(&html_document);
+        let retained = document.clone();
         let mut realm = Realm::new();
         register_print(&mut realm, console)?;
         register_alert(&mut realm, alert_sink)?;
         register_fetch(&mut realm, controller)?;
-        register_document(&mut realm, Document::from_html_document(&document))?;
+        register_document(&mut realm, document)?;
         register_local_storage(&mut realm, Arc::clone(&self.storage), security_context)?;
 
-        document
-            .script_sources()
+        let results = script_sources(&html_document, external_script)
             .iter()
             .map(|source| realm.evaluate_script(source))
-            .collect()
+            .collect::<JsResult<Vec<_>>>()?;
+        Ok(BootedPage {
+            session: PageSession {
+                realm,
+                document: retained,
+            },
+            results,
+        })
     }
+}
+
+/// A loaded document whose scripts stay alive after evaluation.
+///
+/// `document.addEventListener` stores listeners here. Input that happens
+/// after the page has loaded, such as a click on the page, is delivered with
+/// [`PageSession::dispatch_click`].
+pub struct PageSession {
+    /// Realm that evaluated the page. Listeners close over its globals.
+    #[allow(dead_code)]
+    realm: Realm,
+    document: Document,
+}
+
+impl PageSession {
+    /// Fires a `click` event at this session's document.
+    ///
+    /// Runs listeners registered with `document.addEventListener('click', ...)`.
+    /// Element hit testing is not performed.
+    pub fn dispatch_click(&self) -> JsResult<Value> {
+        webapis::dispatch_click(&self.document)
+    }
+
+    /// Fires a user `click` at the element containing `node`.
+    ///
+    /// `node` is usually a layout hit test of this session's page. The event
+    /// bubbles from that element to the document, so both element and
+    /// `document` listeners run.
+    pub fn dispatch_click_at(&self, node: html::NodeID) -> JsResult<Value> {
+        webapis::dispatch_click_at(&self.document, node)
+    }
+}
+
+struct BootedPage {
+    session: PageSession,
+    results: Vec<Value>,
+}
+
+/// Returns script sources in tree order, substituting `external_script` for
+/// `<script src>` elements when the caller has already fetched it.
+fn script_sources(document: &html::HTMLDocument, external_script: Option<&str>) -> Vec<String> {
+    let Some(external_script) = external_script else {
+        return document.script_sources();
+    };
+    (0..)
+        .map(html::NodeID::new)
+        .map_while(|id| document.node(id).map(|node| (id, node)))
+        .filter_map(|(id, node)| match &node.kind {
+            html::NodeKind::Element(element) if element.get_name() == "script" => {
+                Some(if attribute(element.get_attributes(), "src").is_some() {
+                    external_script.to_owned()
+                } else {
+                    document.text_content(id).unwrap_or_default()
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Loads the welcome page and resolves its local stylesheet and script links.
@@ -401,8 +545,8 @@ async fn fetch_text(
 fn attribute<'a>(attributes: &'a [html::Attribute], name: &str) -> Option<&'a str> {
     attributes
         .iter()
-        .find(|attribute| attribute.name == name)
-        .map(|attribute| attribute.value.as_str())
+        .find(|attribute| attribute.get_name() == name)
+        .map(|attribute| attribute.get_value().as_str())
 }
 
 trait ElementAttributes {
@@ -412,7 +556,7 @@ trait ElementAttributes {
 impl ElementAttributes for html::NodeKind {
     fn element_attributes(&self) -> Option<&[html::Attribute]> {
         match self {
-            html::NodeKind::Element(element) => Some(&element.attributes),
+            html::NodeKind::Element(element) => Some(element.get_attributes()),
             _ => None,
         }
     }
@@ -437,7 +581,70 @@ mod tests {
         assert!(page.html.contains("href=\"style.css\""));
         assert!(page.html.contains("src=\"script.js\""));
         assert!(page.css.contains("background-color"));
-        assert!(page.js.contains("const message"));
+        assert!(page.js.contains("btn.addEventListener('click', callback)"));
+    }
+
+    #[test]
+    fn embedded_page_aliases_ignore_query_and_fragment_for_lookup() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let response = runtime
+            .block_on(controller.fetch(Request::get("byui://welcome/index.html?lang=en#top")))
+            .expect("embedded page alias should resolve");
+
+        assert_eq!(response.url, "byui://welcome/index.html?lang=en#top");
+        let body = runtime.block_on(response.body.bytes()).unwrap();
+        assert_eq!(
+            response.headers.get("content-length"),
+            Some(body.len().to_string())
+        );
+        assert!(body.starts_with(b"<!doctype"));
+    }
+
+    #[test]
+    fn embedded_page_head_preserves_metadata_without_a_body() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let get_response = runtime
+            .block_on(controller.fetch(Request::get("byui://welcome/page?lang=en#top")))
+            .expect("embedded page GET should resolve");
+        let expected_length = get_response
+            .headers
+            .get("content-length")
+            .expect("embedded page GET should expose content length");
+        let mut request = Request::get("byui://welcome/page?lang=en#top");
+        request
+            .set_method(net::Method::HEAD)
+            .expect("GET can become HEAD");
+
+        let response = runtime
+            .block_on(controller.fetch(request))
+            .expect("embedded page HEAD should resolve");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.headers.get("content-length"),
+            Some(expected_length)
+        );
+        assert!(response.body.is_null());
+        assert!(runtime.block_on(response.body.bytes()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_embedded_page_routes_fail_without_a_fallback() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let error = runtime
+            .block_on(controller.fetch(Request::get("byui://missing/page")))
+            .expect_err("unknown embedded routes must fail");
+
+        assert!(matches!(
+            error,
+            net::RequestError::Provider {
+                provider: "byui page",
+                kind: net::ProviderErrorKind::ResourceMissing
+            }
+        ));
     }
 
     #[test]

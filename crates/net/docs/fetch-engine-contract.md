@@ -83,6 +83,9 @@ work.
   `blob:`, `file:`, and `byui:` are supported when their matching
   `SchemeProviders` capability is installed. Other `about:` URLs and
   unclassified schemes fail before provider or transport side effects.
+- Browser-owned `blob:` URL creation, registry lookup, revocation, and
+  lifetime are not currently composed by `crates/browser`; the generic
+  `BlobProvider` capability remains available for a future integration slice.
 - Local schemes never use HTTP transport, cookie selection or storage, or the
   HTTP response cache. Successful local results still pass through the common
   response policy, browser-service approval, filtering, and body pipeline.

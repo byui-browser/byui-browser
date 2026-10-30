@@ -42,17 +42,18 @@ else
 	cargo test $(foreach crate,$(ARGS),-p $(crate))
 endif
 
-## Release-build the browser for a platform: `make release <macos|linux|windows>`.
+## Release-build the native shell: `make release <macos|linux|windows>`.
+## The release workflow builds these same packages. Keep the two in sync.
 release:
 ifeq ($(strip $(ARGS)),)
 	$(error Usage: make release <platform> (macos|linux|windows))
 endif
 ifeq ($(ARGS),macos)
-	cargo build --release --target aarch64-apple-darwin -p browser
+	cargo build --locked --release --target aarch64-apple-darwin -p browser-macos
 else ifeq ($(ARGS),linux)
-	cargo build --release --target x86_64-unknown-linux-gnu -p browser
+	cargo build --locked --release --target x86_64-unknown-linux-gnu -p browser-linux
 else ifeq ($(ARGS),windows)
-	cargo build --release --target x86_64-pc-windows-msvc -p browser
+	cargo build --locked --release --target x86_64-pc-windows-msvc -p byui-browser-windows
 else
 	$(error Unknown platform '$(ARGS)'. Expected macos, linux, or windows)
 endif

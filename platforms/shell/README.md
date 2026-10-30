@@ -27,7 +27,14 @@ status, and response body (or an error) to the launching terminal. It bypasses
 the HTTP response cache and leaves the displayed document and history unchanged.
 Internal `byui://welcome` uses the embedded page provider, not HTTP or disk.
 HTTP and HTTPS use the Networking team's transport; address editing and navigation
-remain unimplemented, so the current UI refreshes the welcome page.
+remain staged, so the current UI refreshes the welcome page.
+
+The address field is an editable shell surface: click it or press `Ctrl+L`,
+use normal text editing plus Backspace, press Enter to submit, or Escape to
+restore the previous value. `Ctrl+R` triggers the existing repaint-only Reload
+action. Submitted HTTP and HTTPS URLs stay visible but do not claim a
+successful navigation until the renderer can load them. Tabs, Back, Forward,
+and the menu remain staged until the corresponding browser services exist.
 
 Run `cargo test -p browser refresh::tests` to verify fresh HTTP requests,
 internal pages, saved URLs, error reporting, and unchanged history.
@@ -36,3 +43,45 @@ Run `cargo test -p browser-shell app::tests` to verify visit recording and
 that redraw/resize/Reload work does not append history. Run
 `cargo run -p browser-macos` on macOS or `cargo run -p byui-browser-windows`
 on Windows to check that the existing welcome page and toolbar still work.
+
+### Page context menu
+
+Right-click inside the page card to open the shared desktop context menu.
+The menu lists **Back**, **Forward**, **Reload**, and **Inspect (page source)**.
+Back and Forward are visibly disabled placeholders: they do not highlight,
+respond to clicks, or navigate, even when history entries exist. Clicking them
+leaves the popup open. Navigation controls are not connected yet.
+Choose **Reload** to use the same asynchronous saved-URL fetch as the toolbar.
+The URL, status, and body appear in the launching terminal. History is unchanged.
+Click outside the popup or press Escape to dismiss it. Resize and focus loss also
+close it; the cached page is restored without re-running scripts on dismissal.
+The popup is clamped to the window and supports display scaling. The fourth
+item, **Inspect (page source)**, opens a read-only **Page source (loaded HTML)**
+panel using a snapshot of the loaded document. It does not fetch, execute HTML,
+select elements, or show a live DOM. Scroll with the mouse wheel, Up/Down, or
+Page Up/Page Down; Home/End jump to the beginning/end. Small trackpad deltas
+accumulate, long lines wrap, and the viewer prefers a system monospace font.
+Line numbers, a wrapped-row count, and a scroll-position indicator help with
+long documents (the indicator is not draggable). Wrapped text is cached until
+width changes, and resizing preserves the reading position where possible.
+Click the visible **Close** button, press Escape, or click the toolbar to close
+the panel and restore the cached page. Keyboard menu-item navigation and the
+three-dot menu remain future work. macOS and Windows use the same implementation.
+
+For a manual demo, run `cargo run -p browser-macos`, right-click the welcome page,
+click Reload, and look for `Refresh byui://welcome`, `Status: 200`, and the HTML.
+Try the bottom-right corner, outside-click and Escape dismissal, and resizing;
+no popup pixels should remain after dismissal. On Windows, run
+`cargo run -p byui-browser-windows` and repeat the same steps.
+
+To demonstrate Inspect, right-click the welcome page and select **Inspect (page
+source)** below Reload. Point out the “Page source (loaded HTML)” heading and
+welcome-page HTML. Press Escape to return to the page, then demonstrate that
+Reload still prints its results in the terminal. This is source viewing, not a
+full element inspector. Windows UI behavior still needs a native manual check.
+
+To test scrolling, shrink the window near its minimum size while source is open.
+Try wheel/trackpad, Up/Down, Page Up/Down, and Home/End. Resize wider and taller;
+the source panel and Close button should remain inside the window. The source
+viewer tests cover long lines and hundreds of HTML lines. This feature adds no
+navigation or startup-URL support.

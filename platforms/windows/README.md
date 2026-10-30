@@ -16,9 +16,13 @@ cargo run -p byui-browser-windows
 
 `make run` selects this shell automatically on Windows.
 
-The shell currently shows the fixed `byui://welcome` page. Reload, navigation,
-tabs, address editing, and the menu are intentionally staged for later sprints;
-Back and Forward remain disabled until browser history exists.
+The shell currently shows the built-in `byui://welcome` page. The address field
+is interactive: click it or press `Ctrl+L`, edit text, press `Enter` to submit,
+or `Escape` to cancel. `Ctrl+R` triggers the existing repaint-only Reload
+action. Only the built-in welcome URL is loadable at this stage; other submitted
+URLs remain visible without pretending that a network navigation succeeded.
+Tabs, Back, Forward, and the menu remain staged until their browser services
+exist.
 
 Windows supplies the native titlebar, resize borders, and system window
 buttons. The normal window uses Windows' rounded frame, while a maximized

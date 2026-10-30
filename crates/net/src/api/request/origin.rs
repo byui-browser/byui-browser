@@ -91,3 +91,51 @@ impl NetworkPartitionKey {
         Self { top_level_origin }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_default_and_non_default_ports_canonically() {
+        let https = Origin::parse("https://EXAMPLE.test").unwrap();
+        let https_default = Origin::parse("https://example.test:443").unwrap();
+        let https_non_default = Origin::parse("https://example.test:8443").unwrap();
+        let http = Origin::parse("http://example.test").unwrap();
+
+        assert_eq!(https.as_str(), "https://example.test");
+        assert!(https.is_same_origin(&https_default));
+        assert_eq!(https_non_default.as_str(), "https://example.test:8443");
+        assert!(!https.is_same_origin(&https_non_default));
+        assert!(!https.is_same_origin(&http));
+    }
+
+    #[test]
+    fn parse_rejects_non_origin_serializations() {
+        for value in [
+            "https://example.test/path",
+            "https://example.test/?query=one",
+            "https://example.test/#fragment",
+            "https://user@example.test/",
+            "ftp://example.test/",
+            "not an origin",
+        ] {
+            assert!(matches!(
+                Origin::parse(value),
+                Err(RequestError::InvalidOrigin(actual)) if actual == value
+            ));
+        }
+    }
+
+    #[test]
+    fn opaque_origins_do_not_match_any_origin_including_themselves() {
+        let first = Origin::opaque();
+        let second = Origin::opaque();
+        let tuple = Origin::parse("https://example.test").unwrap();
+
+        assert!(first.is_opaque());
+        assert!(!first.is_same_origin(&first));
+        assert!(!first.is_same_origin(&second));
+        assert!(!first.is_same_origin(&tuple));
+    }
+}

@@ -10,5 +10,7 @@ Run the shell on each native operating system after platform-specific changes:
 
 For every shell, confirm the welcome page renders, Reload responds, disabled
 Back and Forward do not drag or maximize the window, and the address field
-shows the text cursor when hovered. Navigation and address editing are not
-expected until the browser engine exposes those APIs.
+shows the text cursor when hovered. Click the address field or press `Ctrl+L`
+to focus and select it, type replacement text, verify Backspace and Escape,
+and confirm Enter submits the built-in `byui://welcome` URL. Unsupported URLs
+must remain visible without claiming a successful navigation.

@@ -20,8 +20,19 @@ pub type ProviderBodyStream =
 pub enum SchemeBody {
     /// A response that must not yield body bytes.
     Null,
+    /// A response that must not yield body bytes but has a known selected
+    /// representation length.
+    ///
+    /// Providers use this for metadata-only responses such as `HEAD`, where
+    /// callers need `Content-Length` without allocating or copying the body.
+    NullWithLength(usize),
     /// A fully materialized response body.
     Bytes(Vec<u8>),
+    /// A response body backed by compile-time static bytes.
+    ///
+    /// Providers use this when the selected representation already lives in
+    /// immutable static storage, avoiding a per-request allocation.
+    StaticBytes(&'static [u8]),
     /// A sendable response stream whose chunks are converted into an
     /// abort-aware [`Body`].
     Stream(ProviderBodyStream),
@@ -46,14 +57,25 @@ pub struct SchemeResource {
 }
 
 impl SchemeBody {
+    /// Returns the known selected representation length, when one exists.
+    pub(crate) fn known_length(&self) -> Option<usize> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes.len()),
+            Self::StaticBytes(bytes) => Some(bytes.len()),
+            Self::NullWithLength(length) => Some(*length),
+            Self::Null | Self::Stream(_) => None,
+        }
+    }
+
     /// Converts provider body data into the shared abort-aware engine body model.
     pub(crate) fn into_body(self, signal: AbortSignal, force_null: bool) -> Body {
         if force_null {
             return Body::null();
         }
         match self {
-            Self::Null => Body::null(),
+            Self::Null | Self::NullWithLength(_) => Body::null(),
             Self::Bytes(bytes) => Body::once_with_signal(bytes, signal),
+            Self::StaticBytes(bytes) => Body::once_with_signal(bytes.to_vec(), signal),
             Self::Stream(stream) => {
                 let stream = stream.map(|chunk| chunk.map(Bytes::from));
                 Body::from_stream_with_signal(stream, signal)

@@ -15,7 +15,9 @@ use std::{
 
 use common::{TestServer, read_request, runtime};
 use futures_util::StreamExt;
-use net::{CacheMode, Config, Request, RequestController, RequestError};
+use net::{AbortController, CacheMode, Config, Request, RequestController, RequestError};
+
+const SCHEDULER_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[test]
 fn fetch_yields_body_chunks_before_response_completion() {
@@ -58,9 +60,12 @@ fn incomplete_stream_forwards_error_and_is_not_cached() {
             b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nvalid".to_vec()
         }
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = RequestController::builder(Config {
+        max_in_flight: 1,
+        ..Config::default()
+    })
+    .build()
+    .unwrap();
 
     let (partial, retry) = runtime().block_on(async {
         let mut response = controller.fetch(Request::get(server.url())).await.unwrap();
@@ -75,7 +80,13 @@ fn incomplete_stream_forwards_error_and_is_not_cached() {
                 }
             }
         }
-        let retry = controller.fetch(Request::get(server.url())).await.unwrap();
+        let retry = tokio::time::timeout(
+            SCHEDULER_RELEASE_TIMEOUT,
+            controller.fetch(Request::get(server.url())),
+        )
+        .await
+        .expect("errored stream should release its scheduler permit")
+        .unwrap();
         (partial, (error, retry))
     });
 
@@ -110,7 +121,54 @@ fn dropping_a_stream_releases_its_scheduler_permit_and_does_not_cache() {
             b"body"
         );
         drop(response);
-        let retry = controller.fetch(Request::get(server.url())).await.unwrap();
+        let retry = tokio::time::timeout(
+            SCHEDULER_RELEASE_TIMEOUT,
+            controller.fetch(Request::get(server.url())),
+        )
+        .await
+        .expect("dropped stream should release its scheduler permit")
+        .unwrap();
+        assert!(!retry.from_cache);
+        assert_eq!(retry.body.bytes().await.unwrap(), b"body");
+    });
+
+    server.join();
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn aborting_after_headers_releases_the_permit_and_does_not_cache() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let observed_hits = Arc::clone(&hits);
+    let server = TestServer::start(2, move |_| {
+        observed_hits.fetch_add(1, Ordering::SeqCst);
+        b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody".to_vec()
+    });
+    let controller = RequestController::builder(Config {
+        max_in_flight: 1,
+        ..Config::default()
+    })
+    .build()
+    .unwrap();
+
+    runtime().block_on(async {
+        let abort = AbortController::new();
+        let mut request = Request::get(server.url());
+        request.set_signal(abort.signal());
+        let response = controller.fetch(request).await.unwrap();
+        abort.abort();
+        assert!(matches!(
+            response.body.bytes().await,
+            Err(RequestError::Aborted)
+        ));
+
+        let retry = tokio::time::timeout(
+            SCHEDULER_RELEASE_TIMEOUT,
+            controller.fetch(Request::get(server.url())),
+        )
+        .await
+        .expect("aborted stream should release its scheduler permit")
+        .unwrap();
         assert!(!retry.from_cache);
         assert_eq!(retry.body.bytes().await.unwrap(), b"body");
     });
