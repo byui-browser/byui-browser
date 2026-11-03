@@ -186,7 +186,10 @@ fn denied_context_cannot_write_storage() {
         denied
             .call_global(
                 "localStorage.setItem",
-                &[Value::String("key".into()), Value::String("replacement".into())],
+                &[
+                    Value::String("key".into()),
+                    Value::String("replacement".into())
+                ],
             )
             .unwrap_err()
             .to_string(),
