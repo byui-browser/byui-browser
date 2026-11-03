@@ -33,6 +33,12 @@ pub fn get_element_by_id(document: &Document, arguments: &[Value]) -> JsResult<V
 
 /// Registers the DOM methods and `Event` constructor supported by this crate
 /// on the global JavaScript environment.
+///
+/// The same `Document` object is exposed as both the global `document` and
+/// `window.document`, matching the HTML Standard's readonly
+/// `Window.document` attribute. Assignment to `window.document` cannot replace
+/// the reference; strict-mode assignment errors are not modeled by the
+/// JavaScript engine.
 pub fn register_document(realm: &mut Realm, document: Document) -> JsResult<()> {
     let document_object = Object::new();
     let shared_document = Arc::new(Mutex::new(document));
@@ -81,7 +87,11 @@ pub fn register_document(realm: &mut Realm, document: Document) -> JsResult<()> 
     );
     realm.register_global_function("Event", Arc::new(event_constructor))?;
     realm.register_global_function("AbortController", Arc::new(abort_controller_constructor))?;
-    realm.register_global_value("document", Value::Object(document_object))
+    let document_value = Value::Object(document_object);
+    let window_object = Object::new();
+    window_object.set_read_only("document", document_value.clone());
+    realm.register_global_value("document", document_value)?;
+    realm.register_global_value("window", Value::Object(window_object))
 }
 
 /// Script-visible `document` object.
@@ -392,6 +402,27 @@ mod tests {
 
     use super::*;
     use crate::dom_exception::DomException;
+
+    #[test]
+    fn window_document_is_the_same_object_as_the_document_global() {
+        let document =
+            Document::from_html_document(&parse_raw_html("<main id='app'></main>".to_owned()));
+        let mut realm = Realm::new();
+        register_document(&mut realm, document).unwrap();
+
+        assert_eq!(
+            realm.evaluate_script("window.document === document"),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            realm.evaluate_script("window.document.getElementById('app') !== null"),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            realm.evaluate_script("window.document = null; window.document === document"),
+            Ok(Value::Boolean(true))
+        );
+    }
 
     #[test]
     fn empty_document_has_no_element_by_id() {
