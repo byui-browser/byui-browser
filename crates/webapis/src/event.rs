@@ -145,6 +145,7 @@ pub fn abort_controller_constructor(_arguments: &[Value]) -> JsResult<Value> {
 /// the constructor is callable directly.
 pub fn event_constructor(arguments: &[Value]) -> JsResult<Value> {
     let Some(event_type) = arguments.first() else {
+        log::debug!("Event() called without an event type");
         return Err(JsError::new("Event() expects an event type"));
     };
     let (bubbles, cancelable) = match arguments.get(1) {
@@ -158,6 +159,7 @@ pub fn event_constructor(arguments: &[Value]) -> JsResult<Value> {
         ),
         _ => (false, false),
     };
+    log::trace!("constructing Event {event_type}");
     Ok(Value::Object(event_object(
         event_type.to_string(),
         bubbles,
@@ -198,6 +200,7 @@ pub(crate) fn add_event_listener_at(
     arguments: &[Value],
 ) -> JsResult<Value> {
     let [event_type, callback, options @ ..] = arguments else {
+        log::debug!("addEventListener() called with too few arguments");
         return Err(JsError::new(
             "document.addEventListener() expects a type and callback",
         ));
@@ -211,11 +214,13 @@ pub(crate) fn add_event_listener_at(
             Value::Object(callback)
                 if matches!(callback.get("handleEvent"), Some(Value::Function(_))) => {}
             Value::Object(_) => {
+                log::debug!("addEventListener({event_type}) callback object has no handleEvent");
                 return Err(JsError::new(
                     "document.addEventListener() callback object must define handleEvent",
                 ));
             }
             _ => {
+                log::debug!("addEventListener({event_type}) callback has an unsupported type");
                 return Err(JsError::new(
                     "document.addEventListener() callback must be a function, object, or null",
                 ));
@@ -236,9 +241,11 @@ pub(crate) fn add_event_listener_at(
         .and_then(|signal| signal.get("aborted"))
         .is_some_and(|aborted| javascript_truthy(&aborted))
     {
+        log::debug!("addEventListener({event_type}) ignored: signal already aborted");
         return Ok(Value::Undefined);
     }
     if is_null_callback {
+        log::debug!("addEventListener({event_type}) ignored: null callback");
         return Ok(Value::Undefined);
     }
 
@@ -249,9 +256,18 @@ pub(crate) fn add_event_listener_at(
             && listener.capture == capture
             && listener.callback == *callback
     }) {
+        log::debug!("addEventListener({event_type}) ignored: duplicate listener");
         return Ok(Value::Undefined);
     }
 
+    log::debug!(
+        "addEventListener({event_type}) on {} (capture: {capture}, once: {once})",
+        if node.is_some() {
+            "element"
+        } else {
+            "document"
+        }
+    );
     target.listeners_mut().push(EventListener {
         event_type,
         callback: callback.clone(),
@@ -277,6 +293,7 @@ pub(crate) fn remove_event_listener_at(
     arguments: &[Value],
 ) -> JsResult<Value> {
     let [event_type, callback, options @ ..] = arguments else {
+        log::debug!("removeEventListener() called with too few arguments");
         return Err(JsError::new(
             "document.removeEventListener() expects a type and callback",
         ));
@@ -286,19 +303,24 @@ pub(crate) fn remove_event_listener_at(
         return Ok(Value::Undefined);
     }
     if !matches!(callback, Value::Function(_) | Value::Object(_)) {
+        log::debug!("removeEventListener({event_type}) callback has an unsupported type");
         return Err(JsError::new(
             "document.removeEventListener() callback must be a function, object, or null",
         ));
     }
     let (capture, _, _, _) = event_listener_options(options.first());
     let target_ref = event_target_for(document, node);
-    lock_event_target(&target_ref)
-        .listeners_mut()
-        .retain(|listener| {
-            !(listener.event_type == event_type
-                && listener.capture == capture
-                && listener.callback == *callback)
-        });
+    let mut target = lock_event_target(&target_ref);
+    let before = target.listeners().len();
+    target.listeners_mut().retain(|listener| {
+        !(listener.event_type == event_type
+            && listener.capture == capture
+            && listener.callback == *callback)
+    });
+    log::debug!(
+        "removeEventListener({event_type}) removed {} listeners",
+        before - target.listeners().len()
+    );
     Ok(Value::Undefined)
 }
 
@@ -350,6 +372,10 @@ fn invoke_listeners(
         .filter(|listener| listener.event_type == event_type && listener.capture == capture)
         .cloned()
         .collect::<Vec<_>>();
+    log::trace!(
+        "invoking {} {event_type} listeners (capture: {capture}, phase: {phase})",
+        listeners.len()
+    );
     for listener in listeners {
         if matches!(
             event.get("__stopImmediatePropagation"),
@@ -368,7 +394,9 @@ fn invoke_listeners(
             "__passiveListener",
             Value::Boolean(listener.passive.unwrap_or(false)),
         );
-        let _ = invoke_event_listener(&listener.callback, event);
+        if let Err(error) = invoke_event_listener(&listener.callback, event) {
+            log::warn!("{event_type} listener threw: {error}");
+        }
         event.set("__passiveListener", Value::Boolean(false));
     }
 }
@@ -388,16 +416,33 @@ pub(crate) fn dispatch_event_at(
     arguments: &[Value],
 ) -> JsResult<Value> {
     let [Value::Object(event)] = arguments else {
+        log::debug!("dispatchEvent() called without an Event object");
         return Err(JsError::new(
             "document.dispatchEvent() expects one Event object",
         ));
     };
     let Some(Value::String(event_type)) = event.get("type") else {
+        log::debug!("dispatchEvent() called with an object that has no event type");
         return Err(JsError::new(
             "document.dispatchEvent() expects an Event object",
         ));
     };
 
+    if log::log_enabled!(log::Level::Debug) {
+        let listener_count = lock_event_target(&event_target_for(document, node))
+            .listeners()
+            .iter()
+            .filter(|listener| listener.event_type == event_type)
+            .count();
+        log::debug!(
+            "dispatching {event_type} at {} ({listener_count} listeners)",
+            if node.is_some() {
+                "element"
+            } else {
+                "document"
+            }
+        );
+    }
     event.set("target", Value::Object(target_object.clone()));
     event.set("currentTarget", Value::Object(target_object.clone()));
     event.set("eventPhase", Value::Number(2.0));
@@ -533,6 +578,7 @@ pub fn dispatch_click(document: &Document) -> JsResult<Value> {
 /// `preventDefault()`.
 pub fn dispatch_click_at(document: &Document, node: NodeID) -> JsResult<Value> {
     let Some(element) = nearest_element(document, node) else {
+        log::debug!("click target has no element; dispatching at the document");
         return dispatch_click(document);
     };
     let options = Object::new();

@@ -115,11 +115,20 @@ impl FileAccessConfiguration {
                 .grant_lifetime
                 .is_some_and(|lifetime| lifetime.is_zero())
         {
+            log::warn!("file access configuration rejected: limits must be non-zero");
             return Err(FileAccessError::InvalidPath);
         }
-        let capability = Arc::new(FileAccessCapability::from_trusted_directory_selections(
-            selected_directories,
-        )?);
+        let capability = Arc::new(
+            FileAccessCapability::from_trusted_directory_selections(selected_directories)
+                .inspect_err(|error| {
+                    log::error!("file access initialization failed: {error}");
+                })?,
+        );
+        log::debug!(
+            "file access configured (max file {} bytes, session {} bytes)",
+            limits.max_file_size,
+            limits.max_session_bytes
+        );
         let navigation_authorizations =
             Arc::new(file_provider::FileNavigationAuthorizations::new());
         let grants = file_provider::FileAccessGrantSource::new(
@@ -161,6 +170,7 @@ impl FileAccessConfiguration {
         url: impl Into<String>,
     ) -> Result<Request, file_provider::FileNavigationError> {
         if !self.grants.is_active() {
+            log::warn!("file navigation refused: file access session is revoked");
             return Err(file_provider::FileNavigationError::SessionRevoked);
         }
         let mut request = Request::get(url);
@@ -176,6 +186,7 @@ impl FileAccessConfiguration {
     /// The operation revokes future file opens, clears pending navigations,
     /// and cancels setup plus live response bodies owned by this session.
     pub fn close(&self) {
+        log::debug!("file access session closing");
         self.grants.revoke();
     }
 
@@ -192,6 +203,7 @@ impl FileAccessConfiguration {
     /// This cancels pending and live work, clears unused navigation
     /// authorizations, and records a path-free shutdown audit event.
     pub fn shutdown(&self) {
+        log::debug!("file access session shutting down");
         self.grants.shutdown();
     }
 }
@@ -208,6 +220,14 @@ impl FileAccessConfiguration {
 /// permit requests carrying browser client context.
 pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<RequestController> {
     let mut providers = SchemeProviders::new().with_page(byui_provider::provider());
+    log::debug!(
+        "building request controller (file provider: {})",
+        if file_access.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     if let Some(file_access) = file_access {
         providers = providers.with_file(file_provider::provider(
             file_access.capability,
@@ -255,6 +275,7 @@ pub struct Page {
 /// The renderer and webpage must never provide this path. Tests should inject
 /// a temporary directory instead of using this process-wide location.
 pub fn application_data_directory() -> io::Result<PathBuf> {
+    log::trace!("resolving application data directory");
     #[cfg(target_os = "macos")]
     {
         home_directory().map(|home| {
@@ -322,7 +343,14 @@ impl BrowserRuntime {
     /// Callers must provide a browser-owned path, never a renderer-supplied
     /// path.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let storage = PersistentOriginStorage::open(root.as_ref().join("storage"))?;
+        let root = root.as_ref();
+        let storage = PersistentOriginStorage::open(root.join("storage")).inspect_err(|error| {
+            log::error!(
+                "storage initialization failed in {}: {error}",
+                root.display()
+            );
+        })?;
+        log::info!("runtime opened: data directory {}", root.display());
         Ok(Self {
             storage: shared_storage(storage),
         })
@@ -331,6 +359,7 @@ impl BrowserRuntime {
     /// Creates a runtime with application-lifetime storage for tests.
     #[must_use]
     pub fn in_memory() -> Self {
+        log::debug!("runtime opened with in-memory storage");
         Self {
             storage: shared_storage(OriginStorage::new()),
         }
@@ -426,6 +455,7 @@ impl BrowserRuntime {
         controller: Arc<RequestController>,
         security_context: RendererSecurityContext,
     ) -> JsResult<BootedPage> {
+        log::trace!("booting page: {} bytes of html", html_source.len());
         let html_document = html::parse_raw_html(html_source.to_owned());
         let document = Document::from_html_document(&html_document);
         let retained = document.clone();
@@ -442,10 +472,17 @@ impl BrowserRuntime {
             Some(scripts) => scripts.to_vec(),
             None => html_document.script_sources(),
         };
+        log::debug!("evaluating {} page scripts", sources.len());
         let results = sources
             .iter()
-            .map(|source| realm.evaluate_script(source))
-            .collect::<JsResult<Vec<_>>>()?;
+            .enumerate()
+            .map(|(index, source)| {
+                log::trace!("evaluating script {index}: {} bytes", source.len());
+                realm.evaluate_script(source)
+            })
+            .collect::<JsResult<Vec<_>>>()
+            .inspect_err(|error| log::warn!("page script failed: {error}"))?;
+        log::debug!("evaluated {} page scripts", results.len());
         Ok(BootedPage {
             session: PageSession {
                 realm,
@@ -494,6 +531,7 @@ struct BootedPage {
 
 /// Loads the welcome page and resolves its local stylesheet and script links.
 pub fn welcome_page() -> Page {
+    log::debug!("loading welcome page");
     let controller = request_controller(None);
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
     runtime

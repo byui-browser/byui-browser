@@ -125,6 +125,7 @@ pub(super) struct FileReadTask {
 pub(super) fn read_file_stream(mut task: FileReadTask) {
     let mut buffer = [0; FILE_READ_CHUNK_SIZE];
     let mut remaining = task.expected_length;
+    log::trace!("file read started: {remaining} bytes expected");
     loop {
         if task.cancelled.load(Ordering::Acquire)
             || task.session_cancellation.is_cancelled()
@@ -134,7 +135,8 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
             return;
         }
         if Instant::now() >= task.deadline {
-            let _ = send_chunk(
+            log::warn!("file read timed out with {remaining} bytes remaining");
+            if !send_chunk(
                 &task.sender,
                 Err(provider_resource_exhausted_error()),
                 &task.cancelled,
@@ -142,7 +144,9 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
                 &task.lease,
                 &task.signal,
                 task.deadline,
-            );
+            ) {
+                log::trace!("file read error not delivered; request went away");
+            }
             return;
         }
         if remaining == 0 {
@@ -151,9 +155,13 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
                 .read_chunk(&mut buffer[..1])
                 .map_err(provider_error)
             {
-                Ok(0) => return,
+                Ok(0) => {
+                    log::trace!("file read complete");
+                    return;
+                }
                 Ok(_) => {
-                    let _ = send_chunk(
+                    log::warn!("file grew while being read; aborting response");
+                    if !send_chunk(
                         &task.sender,
                         Err(provider_io_error()),
                         &task.cancelled,
@@ -161,11 +169,13 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
                         &task.lease,
                         &task.signal,
                         task.deadline,
-                    );
+                    ) {
+                        log::trace!("file read error not delivered; request went away");
+                    }
                     return;
                 }
                 Err(error) => {
-                    let _ = send_chunk(
+                    if !send_chunk(
                         &task.sender,
                         Err(error),
                         &task.cancelled,
@@ -173,7 +183,9 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
                         &task.lease,
                         &task.signal,
                         task.deadline,
-                    );
+                    ) {
+                        log::trace!("file read error not delivered; request went away");
+                    }
                     return;
                 }
             }
@@ -194,7 +206,7 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
         {
             Ok(0) => {
                 task.buffer_budget.release(permitted as u64);
-                let _ = send_chunk(
+                if !send_chunk(
                     &task.sender,
                     Err(provider_io_error()),
                     &task.cancelled,
@@ -202,15 +214,19 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
                     &task.lease,
                     &task.signal,
                     task.deadline,
-                );
+                ) {
+                    log::trace!("file read error not delivered; request went away");
+                }
                 return;
             }
             Ok(count) => {
                 task.buffer_budget.release((permitted - count) as u64);
                 remaining -= count as u64;
+                log::trace!("file read chunk: {count} bytes, {remaining} remaining");
                 if !task.session_budget.try_consume(count as u64) {
+                    log::warn!("file session byte budget exhausted");
                     task.buffer_budget.release(count as u64);
-                    let _ = send_chunk(
+                    if !send_chunk(
                         &task.sender,
                         Err(provider_resource_exhausted_error()),
                         &task.cancelled,
@@ -218,7 +234,9 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
                         &task.lease,
                         &task.signal,
                         task.deadline,
-                    );
+                    ) {
+                        log::trace!("file read error not delivered; request went away");
+                    }
                     return;
                 }
                 if !send_chunk(
@@ -239,7 +257,7 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
             }
             Err(error) => {
                 task.buffer_budget.release(permitted as u64);
-                let _ = send_chunk(
+                if !send_chunk(
                     &task.sender,
                     Err(error),
                     &task.cancelled,
@@ -247,7 +265,9 @@ pub(super) fn read_file_stream(mut task: FileReadTask) {
                     &task.lease,
                     &task.signal,
                     task.deadline,
-                );
+                ) {
+                    log::trace!("file read error not delivered; request went away");
+                }
                 return;
             }
         }

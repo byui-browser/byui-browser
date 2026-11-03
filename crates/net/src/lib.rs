@@ -41,6 +41,7 @@
 mod api;
 mod cache;
 mod engine;
+mod log_url;
 mod policy;
 mod scheduling;
 mod transport;
