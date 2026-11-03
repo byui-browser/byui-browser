@@ -27,7 +27,7 @@ impl LocalStorage {
     pub fn set_item(&self, key: &str, value: &str) -> JsResult<()> {
         let origin = self.security_context.origin();
         if !self.security_context.can_write_storage() {
-            log::warn!(
+            log::debug!(
                 "localStorage write denied for {}://{}:{} (key {key:?}): storage permission denied",
                 origin.scheme(),
                 origin.host(),
@@ -51,7 +51,7 @@ impl LocalStorage {
             })?
             .write_item(self.security_context.storage_key(), key, value)
             .map_err(|error| {
-                log::warn!("localStorage.setItem key {key:?} failed: {error}");
+                log::debug!("localStorage.setItem key {key:?} failed: {error}");
                 JsError::new(error.to_string())
             })
     }
@@ -60,7 +60,7 @@ impl LocalStorage {
     pub fn get_item(&self, key: &str) -> JsResult<Option<String>> {
         let origin = self.security_context.origin();
         if !self.security_context.can_read_storage() {
-            log::warn!(
+            log::debug!(
                 "localStorage read denied for {}://{}:{} (key {key:?}): storage permission denied",
                 origin.scheme(),
                 origin.host(),
@@ -78,7 +78,7 @@ impl LocalStorage {
             })?
             .read_item(self.security_context.storage_key(), key)
             .map_err(|error| {
-                log::warn!("localStorage.getItem key {key:?} failed: {error}");
+                log::debug!("localStorage.getItem key {key:?} failed: {error}");
                 JsError::new(error.to_string())
             })?;
         log::debug!(

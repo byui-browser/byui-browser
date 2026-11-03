@@ -141,7 +141,7 @@ impl FileProvider for BrowserFileProvider {
                 let opened = capability
                     .open_authorized_file(&context, &grant, &setup_lease, path)
                     .inspect_err(|error| {
-                        log::warn!("file provider could not open file: {error}");
+                        log::debug!("file provider could not open file: {error}");
                     })
                     .map_err(|error| {
                         if setup_lease.is_current() {

@@ -77,7 +77,7 @@ impl Origin {
     // Networking team provides scheme, host, and port extraction.
     pub fn parse(url: &str) -> Result<Self, SecurityError> {
         if url.is_empty() {
-            log::warn!("rejected empty url while parsing origin");
+            log::debug!("rejected empty url while parsing origin");
             return Err(SecurityError::InvalidOrigin(String::new()));
         }
         todo!("TODO(security): extract origin from: {url:?}")

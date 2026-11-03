@@ -480,7 +480,7 @@ impl BrowserRuntime {
                 realm.evaluate_script(source)
             })
             .collect::<JsResult<Vec<_>>>()
-            .inspect_err(|error| log::error!("page scripts failed to evaluate: {error}"))?;
+            .inspect_err(|error| log::warn!("page script failed: {error}"))?;
         log::debug!("evaluated {} page scripts", results.len());
         Ok(BootedPage {
             session: PageSession {

@@ -13,12 +13,18 @@
 //! | Level   | Use it for | Example |
 //! | ------- | ---------- | ------- |
 //! | `error` | An operation failed and the user will notice: a page did not load, storage could not open, a script threw. | `Failed to load https://example.com: connection refused` |
-//! | `warn`  | Something went wrong but the browser recovered or degraded: a subresource was skipped, a font fell back, a request was blocked by policy, an unknown CSS property was dropped. | `No page font could be loaded; text will not render` |
+//! | `warn`  | Something went wrong but the browser recovered or degraded: a subresource was skipped, a font fell back, a request was blocked by policy. Also an uncaught exception from page script, because the browser has no developer console to show it. | `page script failed: TypeError: x is not a function` |
 //! | `info`  | One line per major user-visible milestone: startup, window creation, navigation start and finish, storage opened. Readable by a non-developer. | `Navigating to byui://welcome` |
 //! | `debug` | Per-subsystem detail a developer needs to follow one operation: request and response summaries, cache hits, parse and layout summaries, script evaluation start and end. | `GET https://example.com -> 200 (1532 bytes)` |
 //! | `trace` | Very high-volume detail that would drown everything else: individual tokens, DOM nodes, selector matches, bytecode instructions, every repaint and input event. | `token StartTag(<p>)` |
 //!
 //! The default level is `warn`, so a normal run prints only problems.
+//!
+//! Report each failure **once** at `warn` or `error`, in the layer that owns
+//! the outcome (for a page load, `browser::load`). Lower layers that see the
+//! same failure, and Web APIs whose error the page already receives as a JS
+//! exception, log it at `debug`. Code that reruns on every window resize or
+//! page click (styling, layout, painting) never logs above `debug`.
 //!
 //! # Workspace crates and dependencies
 //!
@@ -41,8 +47,9 @@
 //!   the longest matching target wins. The special target `deps` sets the
 //!   level for every third-party crate.
 //! - `-v`, `-vv`, `-vvv` raise the default level to `info`, `debug`, `trace`.
-//! - `-q` / `--quiet` lowers the default level to `error`; `-qq` turns
-//!   logging off.
+//! - `-q` / `--quiet` lowers the level to `error`; `-qq` turns logging off.
+//!   Both also quiet third-party crates. When flags repeat, the last wins
+//!   (`-vv -v` is `info`).
 //! - `--log-file <path>` appends log lines to a file instead of standard
 //!   error, which is useful on Windows where the GUI has no console.
 //! - When no level option is given, the `BYUI_LOG` environment variable is
@@ -114,7 +121,8 @@ Logging options:
                        third-party crates stay at warn unless you add
                        `deps=<level>` or name them (e.g. `hyper=debug`).
   -v, -vv, -vvv        Log at info, debug, or trace level.
-  -q, -qq              Log only errors, or nothing at all.
+  -q, -qq              Log only errors, or nothing at all (including
+                       third-party crates).
   --log-file <path>    Append log lines to <path> instead of standard error.
   -h, --help           Print this help and exit.
 
@@ -151,6 +159,9 @@ pub struct LogConfig {
     /// Whether the command line asked for help (`-h` / `--help`). Callers
     /// should print their usage plus [`USAGE`] and exit.
     pub help_requested: bool,
+    /// Whether a `deps=<level>` directive set `dependency_level`; when it
+    /// did, later bare levels and `-v`/`-q` flags leave it alone.
+    dependency_level_explicit: bool,
 }
 
 impl Default for LogConfig {
@@ -161,6 +172,7 @@ impl Default for LogConfig {
             targets: Vec::new(),
             file: None,
             help_requested: false,
+            dependency_level_explicit: false,
         }
     }
 }
@@ -174,7 +186,8 @@ pub enum LogConfigError {
     /// A `target=level` directive had an empty target. Holds the directive.
     EmptyTarget(String),
     /// An option that takes a value (such as `--log-level`) was last on the
-    /// command line. Holds the option name.
+    /// command line, or was followed by another option instead of a value.
+    /// Holds the option name.
     MissingValue(&'static str),
 }
 
@@ -242,25 +255,21 @@ impl LogConfig {
             match arg.as_str() {
                 "-h" | "--help" => config.help_requested = true,
                 "--log-level" => {
-                    let spec = args
-                        .next()
-                        .ok_or(LogConfigError::MissingValue("--log-level"))?;
+                    let spec = option_value(args.next(), "--log-level")?;
                     config.reset_levels();
                     config.apply_spec(&spec)?;
                     level_from_args = true;
                 }
                 "--log-file" => {
-                    let path = args
-                        .next()
-                        .ok_or(LogConfigError::MissingValue("--log-file"))?;
+                    let path = option_value(args.next(), "--log-file")?;
                     config.file = Some(PathBuf::from(path));
                 }
                 "--verbose" => {
-                    config.default_level = verbosity_level(1);
+                    config.set_default_level(verbosity_level(1));
                     level_from_args = true;
                 }
                 "--quiet" => {
-                    config.default_level = LevelFilter::Error;
+                    config.set_default_level(LevelFilter::Error);
                     level_from_args = true;
                 }
                 _ => {
@@ -271,14 +280,14 @@ impl LogConfig {
                     } else if let Some(path) = arg.strip_prefix("--log-file=") {
                         config.file = Some(PathBuf::from(path));
                     } else if let Some(count) = repeated_flag(&arg, 'v') {
-                        config.default_level = verbosity_level(count);
+                        config.set_default_level(verbosity_level(count));
                         level_from_args = true;
                     } else if let Some(count) = repeated_flag(&arg, 'q') {
-                        config.default_level = if count == 1 {
+                        config.set_default_level(if count == 1 {
                             LevelFilter::Error
                         } else {
                             LevelFilter::Off
-                        };
+                        });
                         level_from_args = true;
                     } else {
                         remaining.push(arg);
@@ -287,7 +296,9 @@ impl LogConfig {
             }
         }
 
-        if let Some(spec) = env_spec.filter(|_| !level_from_args) {
+        // Skip the environment for `--help`, so a malformed `BYUI_LOG` cannot
+        // stop the help text from printing.
+        if let Some(spec) = env_spec.filter(|_| !level_from_args && !config.help_requested) {
             config.apply_spec(spec)?;
         }
         Ok((config, remaining))
@@ -324,7 +335,19 @@ impl LogConfig {
     fn reset_levels(&mut self) {
         self.default_level = DEFAULT_LEVEL;
         self.dependency_level = DEFAULT_DEPENDENCY_LEVEL;
+        self.dependency_level_explicit = false;
         self.targets.clear();
+    }
+
+    /// Sets the workspace level. Unless `deps=<level>` was given, a level
+    /// quieter than [`DEFAULT_DEPENDENCY_LEVEL`] also quiets dependencies, so
+    /// `-q`, `-qq`, and `off` silence everything while `-v` leaves
+    /// dependencies at their default.
+    fn set_default_level(&mut self, level: LevelFilter) {
+        self.default_level = level;
+        if !self.dependency_level_explicit {
+            self.dependency_level = DEFAULT_DEPENDENCY_LEVEL.min(level);
+        }
     }
 
     fn apply_spec(&mut self, spec: &str) -> Result<(), LogConfigError> {
@@ -338,15 +361,25 @@ impl LogConfig {
                     let level = parse_level(level.trim())?;
                     if target == DEPENDENCIES_TARGET {
                         self.dependency_level = level;
+                        self.dependency_level_explicit = true;
                         continue;
                     }
                     self.targets.retain(|entry| entry.target != target);
                     self.targets.push(TargetLevel { target, level });
                 }
-                None => self.default_level = parse_level(directive)?,
+                None => self.set_default_level(parse_level(directive)?),
             }
         }
         Ok(())
+    }
+}
+
+/// Returns the value that follows a value-taking option, rejecting a missing
+/// value or another option (such as `--log-file --log-level`) in its place.
+fn option_value(value: Option<String>, option: &'static str) -> Result<String, LogConfigError> {
+    match value {
+        Some(value) if !(value.starts_with('-') && value.len() > 1) => Ok(value),
+        _ => Err(LogConfigError::MissingValue(option)),
     }
 }
 
@@ -720,6 +753,47 @@ mod tests {
             WORKSPACE_CRATES.len(),
             "stale entry in WORKSPACE_CRATES"
         );
+    }
+
+    #[test]
+    fn quiet_levels_also_quiet_dependencies() {
+        assert_eq!(parse(&["-q"]).0.level_for("winit"), LevelFilter::Error);
+        assert_eq!(parse(&["-qq"]).0.level_for("hyper"), LevelFilter::Off);
+        let (config, _) = parse(&["--log-level", "off"]);
+        assert_eq!(config.level_for("reqwest"), LevelFilter::Off);
+        assert_eq!(config.max_level(), LevelFilter::Off);
+        // Louder workspace levels leave dependencies at their default ...
+        assert_eq!(parse(&["-vvv"]).0.level_for("hyper"), LevelFilter::Warn);
+        // ... the last flag wins ...
+        assert_eq!(
+            parse(&["-qq", "-v"]).0.level_for("hyper"),
+            LevelFilter::Warn
+        );
+        // ... and an explicit `deps=` is kept.
+        let (config, _) = parse(&["--log-level", "deps=debug,off"]);
+        assert_eq!(config.level_for("hyper"), LevelFilter::Debug);
+        assert_eq!(config.level_for("net"), LevelFilter::Off);
+    }
+
+    #[test]
+    fn options_reject_another_option_as_their_value() {
+        assert_eq!(
+            LogConfig::from_args_and_env(["--log-file", "--log-level", "debug"], None),
+            Err(LogConfigError::MissingValue("--log-file"))
+        );
+        assert_eq!(
+            LogConfig::from_args_and_env(["--log-level", "-v"], None),
+            Err(LogConfigError::MissingValue("--log-level"))
+        );
+        // A lone `-` is still a value.
+        let (config, _) = parse(&["--log-file", "-"]);
+        assert_eq!(config.file, Some(PathBuf::from("-")));
+    }
+
+    #[test]
+    fn help_ignores_a_malformed_environment_spec() {
+        let (config, _) = LogConfig::from_args_and_env(["--help"], Some("nope")).unwrap();
+        assert!(config.help_requested);
     }
 
     #[test]

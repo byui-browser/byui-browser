@@ -401,12 +401,15 @@ impl PersistentOriginStorage {
         let generation = match self.write_snapshot(storage_key, next_generation, &record) {
             Ok(generation) => generation,
             Err(error) => {
-                log::error!(
-                    "could not write storage snapshot for {}: {error}",
-                    storage_label(storage_key)
-                );
-                if let Some(source) = std::error::Error::source(&error) {
-                    log::error!("storage write cause: {source}");
+                match std::error::Error::source(&error) {
+                    Some(source) => log::error!(
+                        "could not write storage snapshot for {}: {error} (cause: {source})",
+                        storage_label(storage_key)
+                    ),
+                    None => log::error!(
+                        "could not write storage snapshot for {}: {error}",
+                        storage_label(storage_key)
+                    ),
                 }
                 self.restore_area(storage_key, previous);
                 return Err(error);

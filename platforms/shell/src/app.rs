@@ -246,7 +246,7 @@ impl App {
     /// Navigation calls this only after loading succeeds. Repaints, Reload,
     /// and the error page for a failed load must not call it.
     fn page_loaded(&mut self, url: &str, page: browser::Page) {
-        log::info!("page displayed: {url}");
+        log::debug!("page displayed: {url}");
         self.loaded_page = Some(page);
         // Scripts of the new document run after its first frame is presented.
         self.scripts_evaluated = false;
@@ -286,7 +286,7 @@ impl App {
         if address == "byui://welcome" {
             // Bump the id so an older load still in flight cannot replace it.
             log::debug!("address submitted: {address}");
-            log::info!("navigating to {address}");
+            log::debug!("navigating to {address}");
             self.navigation_id += 1;
             self.page_loaded(&address, browser::welcome_page());
         } else {
@@ -306,7 +306,7 @@ impl App {
             log::warn!("navigation to {address} unavailable: page loader is not running");
             return;
         };
-        log::info!("navigating to {address}");
+        log::debug!("navigating to {address}");
         loader.load(address, move |navigation| {
             // A closed event loop means the app is exiting; nothing to do.
             let _ = proxy.send_event(UserEvent::Navigated { id, navigation });
@@ -369,7 +369,7 @@ impl App {
                         if let Err(error) = arboard::Clipboard::new()
                             .and_then(|mut clipboard| clipboard.set_text(self.address.clone()))
                         {
-                            log::error!("failed to copy the address: {error}");
+                            log::warn!("failed to copy the address: {error}");
                         }
                         return;
                     }
@@ -378,7 +378,7 @@ impl App {
                             .and_then(|mut clipboard| clipboard.get_text())
                         {
                             Ok(text) => self.insert_address_text(&text),
-                            Err(error) => log::error!("failed to paste into the address: {error}"),
+                            Err(error) => log::warn!("failed to paste into the address: {error}"),
                         }
                         return;
                     }
@@ -700,7 +700,7 @@ impl App {
     fn activate(&mut self, control: Control) {
         match control {
             Control::Reload => {
-                log::info!("reload requested");
+                log::debug!("reload requested");
                 log::debug!("toolbar action: reload");
                 if let Some(refresh) = &self.refresh {
                     // Dropping the handle detaches the task; fetching stays off the UI thread.
@@ -1008,10 +1008,10 @@ impl ApplicationHandler<UserEvent> for App {
                 if log::log_enabled!(log::Level::Debug) {
                     match &event {
                         WindowEvent::Resized(size) => {
-                            log::debug!("resized: {}x{}", size.width, size.height)
+                            log::trace!("resized: {}x{}", size.width, size.height)
                         }
                         WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                            log::debug!("scale factor changed: {scale_factor}")
+                            log::trace!("scale factor changed: {scale_factor}")
                         }
                         WindowEvent::ThemeChanged(theme) => {
                             log::debug!("theme changed: {theme:?}")

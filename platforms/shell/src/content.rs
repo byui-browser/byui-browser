@@ -257,7 +257,7 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                     browser::security_context_for_url(&page.url),
                 ) {
                     Ok(loaded) => session = Some(loaded),
-                    Err(error) => log::error!("page script failed: {error}"),
+                    Err(error) => log::debug!("page script failed: {error}"),
                 }
             }
             PageCommand::Click(target) => {
@@ -292,7 +292,7 @@ pub(crate) fn render_page(
     scripts_evaluated: &mut bool,
 ) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(width, height)?;
-    log::debug!("rendering page {width}x{height} at scale {scale_factor}");
+    log::trace!("rendering page {width}x{height} at scale {scale_factor}");
     let frame = render_demo(
         page,
         width,
