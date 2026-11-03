@@ -175,7 +175,7 @@ fn denied_context_cannot_write_storage() {
         storage.clone(),
         context("https", "example.com", 443, StoragePermission::Allowed),
     );
-    let mut denied = realm(
+    let denied = realm(
         storage,
         context("https", "example.com", 443, StoragePermission::Denied),
     );
