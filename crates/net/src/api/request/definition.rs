@@ -227,6 +227,10 @@ impl Request {
             _ => parsed,
         };
         if matches!(normalized.as_str(), "CONNECT" | "TRACE" | "TRACK") {
+            log::debug!(
+                "forbidden method {normalized} rejected for request {}",
+                self.id
+            );
             return Err(RequestError::ForbiddenMethod(normalized.to_string()));
         }
         if self.context.mode == RequestMode::NoCors
@@ -275,6 +279,7 @@ impl Request {
     /// Sets or clears the body and derives its content type when absent.
     pub fn set_body(&mut self, body: Option<Body>) -> Result<(), RequestError> {
         if body.is_some() && matches!(self.method, Method::GET | Method::HEAD) {
+            log::debug!("body rejected for {} request {}", self.method, self.id);
             return Err(RequestError::BodyNotAllowed(self.method.to_string()));
         }
         self.body = body;
@@ -372,6 +377,11 @@ impl Request {
     }
 
     pub(crate) fn follow_url(&mut self, url: Url) {
+        log::trace!(
+            "request {} now targets {}",
+            self.id,
+            crate::log_url::loggable(url.as_str())
+        );
         self.url_list.push(url.clone());
         self.current_url = Some(url);
         self.redirect_count += 1;
@@ -387,6 +397,7 @@ impl Request {
     }
 
     pub(crate) fn strip_sensitive_redirect_headers(&mut self) {
+        log::trace!("stripping sensitive headers for cross-origin redirect");
         for name in [
             HeaderName::from_static("authorization"),
             HeaderName::from_static("proxy-authorization"),

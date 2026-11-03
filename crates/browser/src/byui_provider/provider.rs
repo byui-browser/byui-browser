@@ -28,10 +28,16 @@ impl PageProvider for BrowserPageProvider {
     /// Resolves a supported `byui:` page or static subresource.
     fn resolve<'a>(&'a self, request: &'a Request, url: &'a Url) -> ProviderFuture<'a> {
         let resource = find_resource(url)
-            .map(|definition| resource(request, url.clone(), definition))
-            .ok_or(RequestError::Provider {
-                provider: "byui page",
-                kind: ProviderErrorKind::ResourceMissing,
+            .map(|definition| {
+                log::debug!("byui page served: {url} ({} bytes)", definition.body.len());
+                resource(request, url.clone(), definition)
+            })
+            .ok_or_else(|| {
+                log::warn!("byui page not found: {url}");
+                RequestError::Provider {
+                    provider: "byui page",
+                    kind: ProviderErrorKind::ResourceMissing,
+                }
             });
 
         Box::pin(async move { resource })

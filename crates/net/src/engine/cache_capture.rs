@@ -66,9 +66,19 @@ pub(crate) fn with_cache_capture(
                     }
                     Some((Ok(chunk), (body, collected, capture)))
                 }
-                Some(Err(error)) => Some((Err(error), (body, collected, None))),
+                Some(Err(error)) => {
+                    if capture.is_some() {
+                        log::debug!("cache capture abandoned after body error: {error}");
+                    }
+                    Some((Err(error), (body, collected, None)))
+                }
                 None => {
                     if let Some(capture) = capture {
+                        log::trace!(
+                            "body fully consumed, storing {} bytes for {}",
+                            collected.len(),
+                            capture.url
+                        );
                         capture.cache.insert(
                             &capture.request,
                             &capture.request_url,

@@ -21,11 +21,13 @@ impl RequestController {
         url: Url,
     ) -> Result<Response, RequestError> {
         super::require_read_method(&request, "blob scheme method")?;
-        let provider = self
-            .inner
-            .providers
-            .blob()
-            .ok_or(RequestError::MissingProvider("blob"))?;
+        let provider = self.inner.providers.blob().ok_or_else(|| {
+            log::debug!(
+                "no blob provider installed for {}",
+                crate::log_url::loggable(url.as_str())
+            );
+            RequestError::MissingProvider("blob")
+        })?;
         self.finish_provider_request(
             &request,
             FetchScheme::Blob,

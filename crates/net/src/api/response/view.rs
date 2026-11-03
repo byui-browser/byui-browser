@@ -70,6 +70,10 @@ impl InternalResponse {
     ) -> Result<Self, crate::RequestError> {
         validate_scheme_resource(&resource, expected_scheme)?;
         let status = StatusCode::from_u16(resource.status).map_err(|error| {
+            log::warn!(
+                "scheme provider returned invalid status {}",
+                resource.status
+            );
             crate::RequestError::InvalidResponse(format!(
                 "scheme provider returned invalid status {}: {error}",
                 resource.status
@@ -171,6 +175,10 @@ fn validate_scheme_resource(
 ) -> Result<(), crate::RequestError> {
     let expected = expected_scheme.name();
     if resource.url.scheme() != expected {
+        log::warn!(
+            "{expected} provider returned a url with scheme {:?}, expected {expected}",
+            resource.url.scheme()
+        );
         return Err(provider_error(
             expected,
             crate::ProviderErrorKind::MalformedMetadata,
@@ -182,6 +190,7 @@ fn validate_scheme_resource(
         .as_deref()
         .is_some_and(|text| text.bytes().any(|byte| byte < 0x20 || byte == 0x7f))
     {
+        log::warn!("{expected} provider returned a status text containing control characters");
         return Err(provider_error(
             expected,
             crate::ProviderErrorKind::MalformedMetadata,
@@ -197,6 +206,9 @@ fn validate_scheme_resource(
         if !is_valid_media_type(media_type)
             || header_media_type.is_some_and(|header| header != media_type)
         {
+            log::warn!(
+                "{expected} provider returned a media type that is invalid or differs from its content-type header"
+            );
             return Err(provider_error(
                 expected,
                 crate::ProviderErrorKind::MalformedMetadata,
@@ -204,6 +216,7 @@ fn validate_scheme_resource(
         }
     }
     if header_media_type.is_some_and(|value| !is_valid_media_type(value)) {
+        log::warn!("{expected} provider returned an invalid content-type header");
         return Err(provider_error(
             expected,
             crate::ProviderErrorKind::MalformedMetadata,
@@ -213,6 +226,7 @@ fn validate_scheme_resource(
     if !resource.origin.is_opaque()
         && crate::api::request::Origin::parse(&resource.origin.as_str()).is_err()
     {
+        log::warn!("{expected} provider returned an unparseable origin");
         return Err(provider_error(
             expected,
             crate::ProviderErrorKind::InvalidOrigin,

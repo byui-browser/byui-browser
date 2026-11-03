@@ -26,8 +26,15 @@ pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
         [vertical, horizontal] => [*vertical, *horizontal, *vertical, *horizontal],
         [top, horizontal, bottom] => [*top, *horizontal, *bottom, *horizontal],
         [top, right, bottom, left] => [*top, *right, *bottom, *left],
-        _ => return Vec::new(),
+        _ => {
+            log::debug!(
+                "dropping invalid {prefix} shorthand value `{}`",
+                declaration.value
+            );
+            return Vec::new();
+        }
     };
+    log::trace!("expanding {prefix} shorthand `{}`", declaration.value);
     SIDES
         .iter()
         .zip(sides)

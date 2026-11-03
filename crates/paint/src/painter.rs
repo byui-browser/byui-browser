@@ -25,6 +25,7 @@ pub const CANVAS_COLOR: Color = Color {
 /// Only backgrounds and text are painted; borders, outlines, and other
 /// decorations are not supported yet.
 pub fn paint_document(tree: &LayoutTree) -> DisplayList {
+    log::trace!("building display list");
     let mut items = Vec::new();
     for item in tree.paint_order() {
         match item {
@@ -61,6 +62,12 @@ pub fn paint_document(tree: &LayoutTree) -> DisplayList {
                     });
                 }
             }
+        }
+    }
+    log::debug!("display list built: {} items", items.len());
+    if log::log_enabled!(log::Level::Trace) {
+        for item in &items {
+            log::trace!("display item: {item:?}");
         }
     }
     DisplayList { items }

@@ -42,7 +42,6 @@ pub(crate) fn reqwest_transport(config: Config) -> Result<Arc<dyn Transport>, re
 }
 
 /// HTTP transport implementation that owns one reusable reqwest client.
-/// HTTP transport implementation that owns one reusable reqwest client.
 struct ReqwestTransport {
     client: Client,
 }
@@ -54,6 +53,11 @@ impl ReqwestTransport {
             .redirect(reqwest::redirect::Policy::none())
             .pool_idle_timeout(config.pool_idle_timeout)
             .pool_max_idle_per_host(config.pool_max_idle_per_host);
+        log::debug!(
+            "building http client: pool_max_idle_per_host={}, custom user agent={}",
+            config.pool_max_idle_per_host,
+            config.user_agent.is_some()
+        );
         if let Some(user_agent) = config.user_agent {
             builder = builder.user_agent(user_agent);
         }
@@ -86,8 +90,16 @@ impl Transport for ReqwestTransport {
             let mut headers = request_headers.to_reqwest();
             headers.remove(REFERER);
             if let Some(referrer) = request.referrer_value(&url) {
-                if let Ok(value) = HeaderValue::try_from(referrer) {
-                    headers.insert(REFERER, value);
+                match HeaderValue::try_from(referrer) {
+                    Ok(value) => {
+                        headers.insert(REFERER, value);
+                    }
+                    Err(_) => {
+                        log::debug!(
+                            "referrer is not a valid header value; sent {} without it",
+                            crate::log_url::loggable(url.as_str())
+                        )
+                    }
                 }
             }
             let method = request.method.clone();
@@ -97,9 +109,18 @@ impl Transport for ReqwestTransport {
             }
             let response = tokio::select! {
                 _ = signal.cancelled() => return Err(RequestError::Aborted),
-                response = builder.send() => response.map_err(|error| RequestError::Transport(error.to_string()))?,
+                response = builder.send() => response.map_err(|error| {
+                    let message = error.to_string();
+                    // reqwest's Display embeds the request URL; keep it out of logs.
+                    log::debug!("transport send failed: {}", error.without_url());
+                    RequestError::Transport(message)
+                })?,
             };
             let status = response.status();
+            log::trace!(
+                "transport headers received: {status}, content-length {:?}",
+                response.content_length()
+            );
             let headers = response.headers().clone();
             let response_url = response.url().to_string();
             let mut body = if has_null_body(&method, status) {

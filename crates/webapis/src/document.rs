@@ -17,11 +17,13 @@ use crate::selector::{SelectorError, SimpleSelector, parse_selector_list};
 /// Implements JavaScript `document.getElementById(id)`.
 pub fn get_element_by_id(document: &Document, arguments: &[Value]) -> JsResult<Value> {
     let [Value::String(id)] = arguments else {
+        log::debug!("document.getElementById() called with invalid arguments");
         return Err(JsError::new(
             "document.getElementById() expects one id string",
         ));
     };
 
+    log::debug!("document.getElementById({id:?})");
     Ok(match document.get_element_by_id(id) {
         Some(element) => Value::Object(element_object(
             element.clone(),
@@ -34,6 +36,10 @@ pub fn get_element_by_id(document: &Document, arguments: &[Value]) -> JsResult<V
 /// Registers the DOM methods and `Event` constructor supported by this crate
 /// on the global JavaScript environment.
 pub fn register_document(realm: &mut Realm, document: Document) -> JsResult<()> {
+    log::debug!(
+        "registering document bindings ({} elements)",
+        document.elements.len()
+    );
     let document_object = Object::new();
     let shared_document = Arc::new(Mutex::new(document));
     let get_element_document = shared_document.clone();
@@ -42,10 +48,12 @@ pub fn register_document(realm: &mut Realm, document: Document) -> JsResult<()> 
         Arc::new(move |arguments| {
             let document = get_element_document.lock().unwrap();
             let [Value::String(id)] = arguments else {
+                log::debug!("document.getElementById() called with invalid arguments");
                 return Err(JsError::new(
                     "document.getElementById() expects one id string",
                 ));
             };
+            log::debug!("document.getElementById({id:?}) bridged to the DOM");
             Ok(match document.get_element_by_id(id).cloned() {
                 Some(element) => {
                     Value::Object(element_object(element, get_element_document.clone()))
@@ -149,16 +157,21 @@ impl Document {
     pub fn create_element(&mut self, local_name: &str) -> JsResult<Element> {
         let document = self.source_document.get_or_insert_with(HTMLDocument::new);
 
-        let node = document
-            .create_element(local_name)
-            .map_err(|error| JsError::new(error.to_string()))?;
+        let node = document.create_element(local_name).map_err(|error| {
+            log::debug!("createElement({local_name:?}) failed: {error}");
+            JsError::new(error.to_string())
+        })?;
+        log::debug!("document.createElement({local_name:?})");
 
         let element = match document.node(node) {
             Some(html::Node {
                 kind: NodeKind::Element(element),
                 ..
             }) => element,
-            _ => return Err(JsError::new("created node is not an element")),
+            _ => {
+                log::error!("createElement({local_name:?}) produced a non-element node");
+                return Err(JsError::new("created node is not an element"));
+            }
         };
 
         Ok(Element {
@@ -188,10 +201,17 @@ impl Document {
         qualified_name: &str,
         value: &str,
     ) -> JsResult<Value> {
+        log::debug!(
+            "setAttribute {qualified_name:?} ({} bytes) bridged to the DOM",
+            value.len()
+        );
         let document = self.source_document.get_or_insert_with(HTMLDocument::new);
         document
             .set_attribute(node, qualified_name, value)
-            .map_err(|error| JsError::new(error.to_string()))?;
+            .map_err(|error| {
+                log::debug!("setAttribute {qualified_name:?} failed: {error}");
+                JsError::new(error.to_string())
+            })?;
         self.elements = collect_elements(document);
         Ok(Value::Undefined)
     }
@@ -230,6 +250,7 @@ impl Document {
             return;
         };
 
+        log::debug!("removing node from the DOM");
         document.remove(node);
         self.elements = collect_elements(document);
     }
@@ -243,7 +264,10 @@ impl Document {
     /// Supported selectors are element names, `*`, IDs, classes, compound
     /// combinations of those forms, and comma-separated selector lists.
     pub fn query_selector_all(&self, selector: &str) -> Result<Vec<NodeID>, SelectorError> {
-        let selectors = parse_selector_list(selector)?;
+        log::debug!("querySelectorAll({selector:?})");
+        let selectors = parse_selector_list(selector).inspect_err(|error| {
+            log::debug!("querySelectorAll({selector:?}) rejected: {error:?}");
+        })?;
         let mut matches = Vec::new();
         let Some(document) = &self.source_document else {
             return Ok(matches);
@@ -272,6 +296,10 @@ impl Document {
         }
 
         collect(document, document.root, &selectors, &mut matches);
+        log::debug!(
+            "querySelectorAll({selector:?}) matched {} nodes",
+            matches.len()
+        );
         Ok(matches)
     }
 
@@ -290,17 +318,23 @@ impl Document {
         let source = self.source_document.as_ref().unwrap();
         let root = source.root;
         let child_id = child;
-        let child_node = source.node(child_id).ok_or(DomException::NotFoundError)?;
+        log::debug!("document.appendChild bridged to the DOM");
+        let child_node = source.node(child_id).ok_or_else(|| {
+            log::debug!("appendChild failed: child node not found");
+            DomException::NotFoundError
+        })?;
 
         if child_id == root || matches!(child_node.kind, NodeKind::Document) {
+            log::debug!("appendChild failed: cannot append a document node");
             return Err(DomException::HierarchyRequestError);
         }
 
         match &child_node.kind {
             NodeKind::Comment(_) | NodeKind::Element(_) | NodeKind::Doctype { .. } => {}
-            NodeKind::Text(_) => return Err(DomException::HierarchyRequestError),
-            NodeKind::Document => return Err(DomException::HierarchyRequestError),
-            NodeKind::None => return Err(DomException::HierarchyRequestError),
+            NodeKind::Text(_) | NodeKind::Document | NodeKind::None => {
+                log::debug!("appendChild failed: node kind cannot be a document child");
+                return Err(DomException::HierarchyRequestError);
+            }
         }
 
         let root_node = source
@@ -323,6 +357,7 @@ impl Document {
                 (NodeKind::Element(_), NodeKind::Element(_))
                 | (NodeKind::Doctype { .. }, NodeKind::Doctype { .. })
                 | (NodeKind::Doctype { .. }, NodeKind::Element(_)) => {
+                    log::debug!("appendChild failed: document would have duplicate children");
                     return Err(DomException::HierarchyRequestError);
                 }
                 _ => {}
@@ -349,6 +384,10 @@ impl Document {
         document.nodes[child_id.get()].parent = Some(root);
         document.nodes[root.get()].children.push(child_id);
         self.elements = collect_elements(document);
+        log::debug!(
+            "appendChild done; document has {} elements",
+            self.elements.len()
+        );
 
         Ok(child)
     }

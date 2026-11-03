@@ -21,11 +21,13 @@ impl RequestController {
         url: Url,
     ) -> Result<Response, RequestError> {
         super::require_read_method(&request, "byui scheme method")?;
-        let provider = self
-            .inner
-            .providers
-            .page()
-            .ok_or(RequestError::MissingProvider("byui page"))?;
+        let provider = self.inner.providers.page().ok_or_else(|| {
+            log::debug!(
+                "no byui page provider installed for {}",
+                crate::log_url::loggable(url.as_str())
+            );
+            RequestError::MissingProvider("byui page")
+        })?;
         self.finish_provider_request(
             &request,
             FetchScheme::Byui,

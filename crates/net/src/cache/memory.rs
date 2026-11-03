@@ -47,18 +47,49 @@ impl ResponseCache {
         // Clone the response while the read lock is held, then release the lock
         // before returning so callers never hold cache state during network work.
         let entries = self.entries.read().expect("cache lock poisoned");
-        let cached = entries.get(&key)?;
-        (allow_stale || cached.expires_at > Instant::now()).then(|| cached.as_response())
+        let Some(cached) = entries.get(&key) else {
+            log::trace!(
+                "cache lookup found no entry for {} {}",
+                request.method,
+                crate::log_url::loggable(url.as_str())
+            );
+            return None;
+        };
+        let usable = allow_stale || cached.expires_at > Instant::now();
+        if !usable {
+            log::trace!(
+                "cache entry expired for {} {}",
+                request.method,
+                crate::log_url::loggable(url.as_str())
+            );
+        }
+        usable.then(|| cached.as_response())
     }
 
     /// Stores a successful response when its headers provide a positive TTL.
     pub(crate) fn insert(&self, request: &Request, url: &Url, response: &StoredResponse) {
         if !response.status.is_success() {
+            log::trace!(
+                "cache store skipped for {}: status {} is not successful",
+                crate::log_url::loggable(url.as_str()),
+                response.status
+            );
             return;
         }
         let Some(ttl) = cache_ttl(&response.headers) else {
+            log::trace!(
+                "cache store skipped for {}: no usable max-age",
+                crate::log_url::loggable(url.as_str())
+            );
             return;
         };
+        log::debug!(
+            "cache store: {} {} ({} bytes, ttl {}s)",
+            request.method,
+            crate::log_url::loggable(url.as_str()),
+            response.body.len(),
+            ttl.as_secs()
+        );
         self.entries.write().expect("cache lock poisoned").insert(
             cache_key(request, url),
             CachedResponse::from_response(response, ttl),
@@ -67,7 +98,9 @@ impl ResponseCache {
 
     /// Removes every response currently held by the cache.
     pub(crate) fn clear(&self) {
-        self.entries.write().expect("cache lock poisoned").clear();
+        let mut entries = self.entries.write().expect("cache lock poisoned");
+        log::debug!("cache cleared ({} entries)", entries.len());
+        entries.clear();
     }
 }
 

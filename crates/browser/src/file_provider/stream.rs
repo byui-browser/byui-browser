@@ -39,6 +39,7 @@ impl Stream for FileBodyStream {
                 return Poll::Ready(None);
             }
             self.reported_timeout = true;
+            log::debug!("file body stream hit its read deadline");
             self.cancelled.store(true, Ordering::Release);
             return Poll::Ready(Some(Err(RequestError::Provider {
                 provider: "file",
@@ -50,6 +51,7 @@ impl Stream for FileBodyStream {
                 return Poll::Ready(None);
             }
             self.reported_session_cancellation = true;
+            log::debug!("file body stream aborted: session revoked");
             return Poll::Ready(Some(Err(RequestError::Aborted)));
         }
         match self.receiver.poll_recv(context) {
@@ -58,12 +60,19 @@ impl Stream for FileBodyStream {
                     Poll::Ready(None)
                 } else {
                     self.reported_session_cancellation = true;
+                    log::debug!("file body stream aborted: lease revoked mid-stream");
                     Poll::Ready(Some(Err(RequestError::Aborted)))
                 }
             }
             Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(chunk.into_bytes()))),
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(error))) => {
+                log::debug!("file body stream provider error: {error}");
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                log::trace!("file body stream ended");
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
     }

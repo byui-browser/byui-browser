@@ -22,7 +22,14 @@ impl RequestController {
         request: Request,
         url: Url,
     ) -> Result<Response, RequestError> {
-        let (media_type, bytes) = parse_data_url(&url)?;
+        let (media_type, bytes) = parse_data_url(&url).inspect_err(|error| {
+            log::warn!("data URL rejected: {error}");
+        })?;
+        log::trace!(
+            "data URL decoded: media type {:?}, {} bytes",
+            media_type,
+            bytes.len()
+        );
         let resource = SchemeResource {
             url,
             status: 200,

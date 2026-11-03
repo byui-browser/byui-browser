@@ -106,8 +106,15 @@ impl RequestControllerBuilder {
         let max_in_flight = config.max_in_flight;
         let max_keepalive_body_size = config.max_keepalive_body_size;
         let max_cache_body_size = config.max_cache_body_size;
-        let transport = reqwest_transport(config.clone())
-            .map_err(|error| RequestError::Initialization(error.to_string()))?;
+        let transport = reqwest_transport(config.clone()).map_err(|error| {
+            log::error!("http transport initialization failed: {error}");
+            RequestError::Initialization(error.to_string())
+        })?;
+        log::debug!(
+            "request controller built: max_in_flight={max_in_flight}, \
+             fetch_services={}, max_keepalive_body_size={max_keepalive_body_size}, max_cache_body_size={max_cache_body_size}",
+            services.is_some()
+        );
         Ok(RequestController {
             inner: Arc::new(ControllerInner {
                 max_keepalive_body_size,
