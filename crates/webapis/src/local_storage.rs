@@ -110,7 +110,16 @@ mod tests {
     }
 
     fn context(host: &str, permission: StoragePermission) -> RendererSecurityContext {
-        RendererSecurityContext::new(Origin::with_port("https", host, 443), permission)
+        context_for_origin("https", host, 443, permission)
+    }
+
+    fn context_for_origin(
+        scheme: &str,
+        host: &str,
+        port: u16,
+        permission: StoragePermission,
+    ) -> RendererSecurityContext {
+        RendererSecurityContext::new(Origin::with_port(scheme, host, port), permission)
     }
 
     fn test_directory() -> PathBuf {
@@ -294,6 +303,129 @@ mod tests {
             Ok(Value::String("dark".to_owned()))
         );
 
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn javascript_binding_keeps_persistent_origins_isolated_after_reopen() {
+        let path = test_directory();
+        let origins = [
+            ("https", "example.com", 443, "https-default"),
+            ("https", "other.example", 443, "other-host"),
+            ("http", "example.com", 80, "http"),
+            ("https", "example.com", 8443, "alternate-port"),
+        ];
+
+        {
+            let storage = shared_storage(PersistentOriginStorage::open(&path).unwrap());
+            for &(scheme, host, port, value) in &origins {
+                let mut realm = Realm::new();
+                register_local_storage(
+                    &mut realm,
+                    storage.clone(),
+                    context_for_origin(scheme, host, port, StoragePermission::Allowed),
+                )
+                .unwrap();
+                assert_eq!(
+                    realm.call_global(
+                        "localStorage.setItem",
+                        &[
+                            Value::String("token".into()),
+                            Value::String(value.into())
+                        ],
+                    ),
+                    Ok(Value::Undefined)
+                );
+            }
+        }
+
+        {
+            let storage = shared_storage(PersistentOriginStorage::open(&path).unwrap());
+            for &(scheme, host, port, value) in &origins {
+                let mut realm = Realm::new();
+                register_local_storage(
+                    &mut realm,
+                    storage.clone(),
+                    context_for_origin(scheme, host, port, StoragePermission::Allowed),
+                )
+                .unwrap();
+                assert_eq!(
+                    realm.call_global(
+                        "localStorage.getItem",
+                        &[Value::String("token".into())],
+                    ),
+                    Ok(Value::String(value.into()))
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn denied_context_cannot_access_persistent_storage() {
+        let path = test_directory();
+        let allowed_context = context("example.com", StoragePermission::Allowed);
+        {
+            let mut realm = Realm::new();
+            register_local_storage(
+                &mut realm,
+                shared_storage(PersistentOriginStorage::open(&path).unwrap()),
+                allowed_context.clone(),
+            )
+            .unwrap();
+            realm
+                .call_global(
+                    "localStorage.setItem",
+                    &[
+                        Value::String("key".into()),
+                        Value::String("original".into())
+                    ],
+                )
+                .unwrap();
+        }
+
+        let denied_context = context("example.com", StoragePermission::Denied);
+        let mut denied_realm = Realm::new();
+        register_local_storage(
+            &mut denied_realm,
+            shared_storage(PersistentOriginStorage::open(&path).unwrap()),
+            denied_context,
+        )
+        .unwrap();
+        assert_eq!(
+            denied_realm
+                .call_global("localStorage.getItem", &[Value::String("key".into())])
+                .unwrap_err()
+                .to_string(),
+            "localStorage read access denied"
+        );
+        assert_eq!(
+            denied_realm
+                .call_global(
+                    "localStorage.setItem",
+                    &[
+                        Value::String("key".into()),
+                        Value::String("replacement".into())
+                    ],
+                )
+                .unwrap_err()
+                .to_string(),
+            "localStorage write access denied"
+        );
+
+        let mut allowed_realm = Realm::new();
+        register_local_storage(
+            &mut allowed_realm,
+            shared_storage(PersistentOriginStorage::open(&path).unwrap()),
+            allowed_context,
+        )
+        .unwrap();
+        assert_eq!(
+            allowed_realm
+                .call_global("localStorage.getItem", &[Value::String("key".into())]),
+            Ok(Value::String("original".into()))
+        );
         let _ = std::fs::remove_dir_all(path);
     }
 }
