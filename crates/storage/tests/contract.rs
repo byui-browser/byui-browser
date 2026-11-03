@@ -82,7 +82,7 @@ fn different_schemes_cannot_share_storage() {
     let mut storage = OriginStorage::new();
 
     storage.set_item(&https, "theme", "dark");
-    
+
     assert_eq!(storage.get_item(&https, "theme"), Some("dark"));
     assert_eq!(storage.get_item(&http, "theme"), None);
 }
