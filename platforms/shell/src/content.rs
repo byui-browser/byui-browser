@@ -213,11 +213,17 @@ impl PageEvents {
         alert_sink: Arc<dyn AlertSink>,
         runtime: BrowserRuntime,
     ) {
-        let _ = self.commands.send(PageCommand::Load {
-            page: page.clone(),
-            alert_sink,
-            runtime,
-        });
+        if self
+            .commands
+            .send(PageCommand::Load {
+                page: page.clone(),
+                alert_sink,
+                runtime,
+            })
+            .is_err()
+        {
+            log::warn!("page session is not running; dropped load of {}", page.url);
+        }
     }
 
     /// Dispatches a `click` at `target`, or at the document when the click
@@ -226,7 +232,9 @@ impl PageEvents {
     /// A click sent before the first load finishes is applied after that
     /// load, because the session thread handles one command at a time.
     pub(crate) fn click(&self, target: Option<NodeID>) {
-        let _ = self.commands.send(PageCommand::Click(target));
+        if self.commands.send(PageCommand::Click(target)).is_err() {
+            log::warn!("page session is not running; dropped click");
+        }
     }
 }
 

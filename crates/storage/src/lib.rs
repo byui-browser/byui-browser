@@ -544,7 +544,12 @@ impl PersistentOriginStorage {
 
             let result = file.write_all(record).and_then(|()| file.sync_all());
             if result.is_err() {
-                let _ = fs::remove_file(&path);
+                if let Err(error) = fs::remove_file(&path) {
+                    log::warn!(
+                        "could not remove partial snapshot {}: {error}",
+                        path.display()
+                    );
+                }
             }
             result?;
             return Ok(generation);
@@ -552,12 +557,23 @@ impl PersistentOriginStorage {
     }
 
     fn remove_old_snapshots(&self, storage_key: &StorageKey, newest: u64) {
-        if let Ok(snapshots) = self.snapshots(storage_key) {
-            for (generation, path) in snapshots {
-                if generation.saturating_add(1) < newest {
-                    let _ = fs::remove_file(path);
+        match self.snapshots(storage_key) {
+            Ok(snapshots) => {
+                for (generation, path) in snapshots {
+                    if generation.saturating_add(1) < newest
+                        && let Err(error) = fs::remove_file(&path)
+                    {
+                        log::warn!(
+                            "could not remove stale snapshot {}: {error}",
+                            path.display()
+                        );
+                    }
                 }
             }
+            Err(error) => log::debug!(
+                "could not list snapshots for {}; stale snapshots kept: {error}",
+                storage_label(storage_key)
+            ),
         }
     }
 

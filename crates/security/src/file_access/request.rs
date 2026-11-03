@@ -111,6 +111,8 @@ impl FileAccessSession {
         if let Ok(mut state) = self.state.lock() {
             state.active = false;
             state.generation = state.generation.wrapping_add(1);
+        } else {
+            log::warn!("file access session lock poisoned; revoke skipped, access stays denied");
         }
     }
 

@@ -121,7 +121,7 @@ impl FileAccessConfiguration {
         let capability = Arc::new(
             FileAccessCapability::from_trusted_directory_selections(selected_directories)
                 .inspect_err(|error| {
-                    log::error!("file access initialization failed: {error:?}");
+                    log::error!("file access initialization failed: {error}");
                 })?,
         );
         log::debug!(
@@ -346,7 +346,7 @@ impl BrowserRuntime {
         let root = root.as_ref();
         let storage = PersistentOriginStorage::open(root.join("storage")).inspect_err(|error| {
             log::error!(
-                "storage initialization failed in {}: {error:?}",
+                "storage initialization failed in {}: {error}",
                 root.display()
             );
         })?;
@@ -480,7 +480,7 @@ impl BrowserRuntime {
                 realm.evaluate_script(source)
             })
             .collect::<JsResult<Vec<_>>>()
-            .inspect_err(|error| log::error!("page scripts failed to evaluate: {error:?}"))?;
+            .inspect_err(|error| log::error!("page scripts failed to evaluate: {error}"))?;
         log::debug!("evaluated {} page scripts", results.len());
         Ok(BootedPage {
             session: PageSession {

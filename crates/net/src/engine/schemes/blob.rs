@@ -22,7 +22,7 @@ impl RequestController {
     ) -> Result<Response, RequestError> {
         super::require_read_method(&request, "blob scheme method")?;
         let provider = self.inner.providers.blob().ok_or_else(|| {
-            log::warn!("no blob provider installed for {url}");
+            log::debug!("no blob provider installed for {url}");
             RequestError::MissingProvider("blob")
         })?;
         let resource = super::await_provider(&request, provider.resolve(&request, &url)).await?;

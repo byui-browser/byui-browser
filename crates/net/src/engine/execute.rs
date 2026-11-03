@@ -31,7 +31,9 @@ impl RequestController {
                 response.response_type
             ),
             Err(RequestError::Aborted) => log::debug!("fetch aborted: {method} {url}"),
-            Err(error) => log::error!("fetch failed: {method} {url}: {error}"),
+            // Debug, not error: the caller (page load, subresource, page script)
+            // decides how serious a failed fetch is and reports it once.
+            Err(error) => log::debug!("fetch failed: {method} {url}: {error}"),
         }
         result
     }

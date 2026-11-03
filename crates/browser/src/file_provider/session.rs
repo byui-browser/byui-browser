@@ -166,6 +166,10 @@ impl FileAccessGrantSource {
             );
             self.record(FileAccessAuditEvent::Replaced);
             self.schedule_expiry(current.generation);
+        } else {
+            log::warn!(
+                "file access state lock poisoned; grant replace skipped, access stays denied"
+            );
         }
     }
 
@@ -180,6 +184,8 @@ impl FileAccessGrantSource {
             self.navigation_authorizations.clear();
             log::debug!("file access grant revoked");
             self.record(FileAccessAuditEvent::Revoked);
+        } else {
+            log::warn!("file access state lock poisoned; revoke skipped, access stays denied");
         }
     }
 
@@ -228,6 +234,8 @@ impl FileAccessGrantSource {
     fn record(&self, event: FileAccessAuditEvent) {
         if let Ok(mut events) = self.audit.lock() {
             events.push(event);
+        } else {
+            log::warn!("file access audit lock poisoned; audit event dropped");
         }
     }
 
@@ -277,6 +285,8 @@ fn expire_generation(
     if let Some(audit) = audit.upgrade() {
         if let Ok(mut events) = audit.lock() {
             events.push(FileAccessAuditEvent::Expired);
+        } else {
+            log::warn!("file access audit lock poisoned; expiry audit event dropped");
         }
     }
 }

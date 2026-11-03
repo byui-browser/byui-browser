@@ -329,7 +329,8 @@ impl App {
                 self.page_loaded(&navigation.address, page)
             }
             Err(error) => {
-                log::error!("failed to load {}: {error}", navigation.address);
+                // `browser::load` already logged the failure at error level.
+                log::debug!("showing error page for {}: {error}", navigation.address);
                 self.loaded_page = Some(browser::error_page(&navigation.address, &error));
                 self.scripts_evaluated = false;
                 self.frame_key = None;
@@ -889,7 +890,9 @@ impl App {
                 self.last_toolbar_click = Some(now);
                 // Empty toolbar space moves the window, like a titlebar;
                 // the system's own titlebar and frame keep working too.
-                let _ = window.drag_window();
+                if let Err(error) = window.drag_window() {
+                    log::debug!("window drag could not start: {error}");
+                }
             }
         } else if self
             .cursor

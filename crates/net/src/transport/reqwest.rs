@@ -90,8 +90,13 @@ impl Transport for ReqwestTransport {
             let mut headers = request_headers.to_reqwest();
             headers.remove(REFERER);
             if let Some(referrer) = request.referrer_value(&url) {
-                if let Ok(value) = HeaderValue::try_from(referrer) {
-                    headers.insert(REFERER, value);
+                match HeaderValue::try_from(referrer) {
+                    Ok(value) => {
+                        headers.insert(REFERER, value);
+                    }
+                    Err(_) => {
+                        log::debug!("referrer is not a valid header value; sent {url} without it")
+                    }
                 }
             }
             let is_head = request.method == reqwest::Method::HEAD;
