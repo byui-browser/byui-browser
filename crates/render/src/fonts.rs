@@ -73,12 +73,12 @@ impl OutlineFont {
         let font = match ab_glyph::FontArc::try_from_vec(data) {
             Ok(font) => font,
             Err(error) => {
-                log::error!("font data ({size} bytes) could not be parsed: {error}");
+                log::debug!("font data ({size} bytes) could not be parsed: {error}");
                 return None;
             }
         };
         let Some(units_per_em) = ab_glyph::Font::units_per_em(&font) else {
-            log::error!("font data ({size} bytes) has no units-per-em; it cannot be used");
+            log::debug!("font data ({size} bytes) has no units-per-em; it cannot be used");
             return None;
         };
         log::debug!("font loaded: {size} bytes, {units_per_em} units per em");
@@ -107,7 +107,11 @@ impl OutlineFont {
             }
         });
         if font.is_none() {
-            log::warn!("no font file could be loaded; falling back to the built-in bitmap font");
+            // Debug, not warn: the caller knows what the font was for and
+            // reports the fallback once (e.g. the shell's page font).
+            log::debug!(
+                "no candidate font file could be loaded; text falls back to the built-in bitmap font"
+            );
         }
         font
     }

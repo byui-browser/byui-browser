@@ -117,7 +117,8 @@ and the longest match wins. Levels and `-v` apply to the browser's own crates;
 third-party crates (winit, reqwest, hyper, ...) stay at `warn` unless you add
 `deps=<level>` or name one (`--log-level debug,hyper=trace`). New workspace
 crates must be added to `WORKSPACE_CRATES` in `common::logging`; a test checks
-this. See `crates/common/src/logging.rs` for the
+this. The logger strips `user:password@` from any URL in a log line before
+writing it. See `crates/common/src/logging.rs` for the
 guidance on choosing a level when you add a log line.
 
 ## Development workflow

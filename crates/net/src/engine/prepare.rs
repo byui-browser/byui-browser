@@ -20,7 +20,10 @@ impl RequestController {
         mut request: Request,
     ) -> Result<(Request, ValidatedUrl, bool), RequestError> {
         if request.signal.is_aborted() {
-            log::debug!("request aborted before preparation: {}", request.url());
+            log::debug!(
+                "request aborted before preparation: {}",
+                crate::log_url::loggable(request.url())
+            );
             return Err(RequestError::Aborted);
         }
         let validated_url = self
@@ -28,7 +31,11 @@ impl RequestController {
             .policy
             .validate_request(&request, self.inner.max_keepalive_body_size)
             .inspect_err(|error| {
-                log::warn!("request rejected by policy: {} ({error})", request.url());
+                log::debug!(
+                    "request rejected by policy: {} ({})",
+                    crate::log_url::loggable(request.url()),
+                    crate::log_url::loggable_error(error)
+                );
             })?;
         request.prepare_url(validated_url.url.clone());
 
@@ -40,7 +47,7 @@ impl RequestController {
             {
                 log::warn!(
                     "service-worker interception is unsupported: {}",
-                    request.url()
+                    crate::log_url::loggable(request.url())
                 );
                 return Err(RequestError::UnsupportedFeature(
                     "service-worker interception",
@@ -53,7 +60,7 @@ impl RequestController {
         {
             log::warn!(
                 "request needs browser services but none are installed: {}",
-                request.url()
+                crate::log_url::loggable(request.url())
             );
             return Err(RequestError::UnsupportedFeature("browser services"));
         }
@@ -66,7 +73,7 @@ impl RequestController {
         }
         log::trace!(
             "request prepared: {} scheme={:?} cacheable={cacheable}",
-            validated_url.url,
+            crate::log_url::loggable(validated_url.url.as_str()),
             validated_url.scheme
         );
         Ok((request, validated_url, cacheable))

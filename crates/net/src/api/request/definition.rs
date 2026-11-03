@@ -304,7 +304,11 @@ impl Request {
     }
 
     pub(crate) fn follow_url(&mut self, url: Url) {
-        log::trace!("request {} now targets {url}", self.id);
+        log::trace!(
+            "request {} now targets {}",
+            self.id,
+            crate::log_url::loggable(url.as_str())
+        );
         self.url_list.push(url.clone());
         self.current_url = Some(url);
         self.redirect_count += 1;

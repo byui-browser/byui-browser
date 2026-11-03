@@ -41,13 +41,16 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
         dom.nodes.len(),
         stylesheets.len()
     );
-    let ignored_at_rules: usize = stylesheets.iter().map(|sheet| sheet.at_rules.len()).sum();
-    if ignored_at_rules > 0 {
-        // Debug, not warn: the shell restyles the page on every repaint and
-        // hit test, so a warning here would repeat every frame.
-        log::debug!(
-            "{ignored_at_rules} at-rules in author stylesheets are not applied by the cascade"
-        );
+    if log::log_enabled!(log::Level::Debug) {
+        let ignored_at_rules: usize = stylesheets.iter().map(|sheet| sheet.at_rules.len()).sum();
+        if ignored_at_rules > 0 {
+            // Debug, not warn: the shell caches the rendered page but restyles
+            // it on window resize and on page clicks (hit tests), so a warning
+            // here would repeat on each of those.
+            log::debug!(
+                "{ignored_at_rules} at-rules in author stylesheets are not applied by the cascade"
+            );
+        }
     }
     let mut computed: Vec<(NodeID, Vec<Declaration>)> = Vec::new();
     let mut root_font_size = None;

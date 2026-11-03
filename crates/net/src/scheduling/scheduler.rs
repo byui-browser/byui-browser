@@ -66,7 +66,7 @@ impl RequestScheduler {
         log::trace!(
             "scheduler admitting {} {} ({} permits available)",
             request.request.method,
-            request.url,
+            crate::log_url::loggable(request.url.as_str()),
             self.permits.available_permits()
         );
         let permit = self.permits.clone().acquire_owned();

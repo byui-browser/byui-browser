@@ -114,7 +114,10 @@ impl RequestPolicy {
         if request.context.mode == crate::RequestMode::Navigate && scheme != FetchScheme::File {
             return Err(RequestError::UnsupportedFeature("navigation fetch"));
         }
-        log::trace!("request validated: {url} as {scheme:?}");
+        log::trace!(
+            "request validated: {} as {scheme:?}",
+            crate::log_url::loggable(url.as_str())
+        );
         Ok(ValidatedUrl { url, scheme })
     }
 
@@ -145,7 +148,10 @@ impl RequestPolicy {
                 })
             && request.requires_cors_preflight()
         {
-            log::warn!("cors preflight is unsupported, blocking request to {url}");
+            log::warn!(
+                "cors preflight is unsupported, blocking request to {}",
+                crate::log_url::loggable(url.as_str())
+            );
             return Err(RequestError::UnsupportedFeature("CORS preflight"));
         }
         Ok(())

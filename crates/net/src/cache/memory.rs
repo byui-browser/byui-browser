@@ -48,12 +48,20 @@ impl ResponseCache {
         // before returning so callers never hold cache state during network work.
         let entries = self.entries.read().expect("cache lock poisoned");
         let Some(cached) = entries.get(&key) else {
-            log::trace!("cache lookup found no entry for {key}");
+            log::trace!(
+                "cache lookup found no entry for {} {}",
+                request.method,
+                crate::log_url::loggable(url.as_str())
+            );
             return None;
         };
         let usable = allow_stale || cached.expires_at > Instant::now();
         if !usable {
-            log::trace!("cache entry expired for {key}");
+            log::trace!(
+                "cache entry expired for {} {}",
+                request.method,
+                crate::log_url::loggable(url.as_str())
+            );
         }
         usable.then(|| cached.as_response())
     }
@@ -62,18 +70,23 @@ impl ResponseCache {
     pub(crate) fn insert(&self, request: &Request, url: &Url, response: &StoredResponse) {
         if !response.status.is_success() {
             log::trace!(
-                "cache store skipped for {url}: status {} is not successful",
+                "cache store skipped for {}: status {} is not successful",
+                crate::log_url::loggable(url.as_str()),
                 response.status
             );
             return;
         }
         let Some(ttl) = cache_ttl(&response.headers) else {
-            log::trace!("cache store skipped for {url}: no usable max-age");
+            log::trace!(
+                "cache store skipped for {}: no usable max-age",
+                crate::log_url::loggable(url.as_str())
+            );
             return;
         };
         log::debug!(
-            "cache store: {} {url} ({} bytes, ttl {}s)",
+            "cache store: {} {} ({} bytes, ttl {}s)",
             request.method,
+            crate::log_url::loggable(url.as_str()),
             response.body.len(),
             ttl.as_secs()
         );

@@ -37,11 +37,17 @@ impl CorsChecker {
         }
         match request.context.mode {
             RequestMode::SameOrigin => {
-                log::warn!("same-origin request blocked from reaching {final_url}");
+                log::warn!(
+                    "same-origin request blocked from reaching {}",
+                    crate::log_url::loggable(final_url.as_str())
+                );
                 Err(RequestError::SameOriginViolation)
             }
             RequestMode::NoCors => {
-                log::trace!("cross-origin no-cors response is opaque: {final_url}");
+                log::trace!(
+                    "cross-origin no-cors response is opaque: {}",
+                    crate::log_url::loggable(final_url.as_str())
+                );
                 Ok(ResponseType::Opaque)
             }
             RequestMode::Navigate => Ok(ResponseType::Basic),
@@ -60,13 +66,17 @@ impl CorsChecker {
                         .get("access-control-allow-credentials")
                         .is_some_and(|value| value.as_bytes() == b"true");
                 log::trace!(
-                    "cors check for {final_url}: allow-origin={allowed_origin:?} \
-                     allowed={allowed} credentials_ok={credentials_ok}"
+                    "cors check for {}: allow-origin={allowed_origin:?} \
+                     allowed={allowed} credentials_ok={credentials_ok}",
+                    crate::log_url::loggable(final_url.as_str())
                 );
                 if allowed && credentials_ok {
                     Ok(ResponseType::Cors)
                 } else {
-                    log::warn!("cors check denied response from {final_url}");
+                    log::warn!(
+                        "cors check denied response from {}",
+                        crate::log_url::loggable(final_url.as_str())
+                    );
                     Err(RequestError::CorsDenied)
                 }
             }

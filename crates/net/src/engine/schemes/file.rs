@@ -23,7 +23,10 @@ impl RequestController {
     ) -> Result<Response, RequestError> {
         super::require_read_method(&request, "file scheme method")?;
         let provider = self.inner.providers.file().ok_or_else(|| {
-            log::debug!("no file provider installed for {url}");
+            log::debug!(
+                "no file provider installed for {}",
+                crate::log_url::loggable(url.as_str())
+            );
             RequestError::MissingProvider("file")
         })?;
         let resource = super::await_provider(&request, provider.open(&request, &url)).await?;

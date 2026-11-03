@@ -32,8 +32,9 @@ impl RequestController {
                         .get_with_staleness(&request, &url, allow_stale)
                 {
                     log::debug!(
-                        "cache hit: {} {url} -> {} ({} bytes, allow_stale={allow_stale})",
+                        "cache hit: {} {} -> {} ({} bytes, allow_stale={allow_stale})",
                         request.method(),
+                        crate::log_url::loggable(url.as_str()),
                         response.status,
                         response.body.len()
                     );
@@ -70,10 +71,17 @@ impl RequestController {
                 }
             }
             if cache_lookup.is_some() {
-                log::debug!("cache miss: {} {url}", request.method());
+                log::debug!(
+                    "cache miss: {} {}",
+                    request.method(),
+                    crate::log_url::loggable(url.as_str())
+                );
             }
             if request.cache_mode == CacheMode::OnlyIfCached {
-                log::warn!("only-if-cached request has no cache entry: {url}");
+                log::debug!(
+                    "only-if-cached request has no cache entry: {}",
+                    crate::log_url::loggable(url.as_str())
+                );
                 return Err(RequestError::NetworkError);
             }
         }
@@ -83,7 +91,10 @@ impl RequestController {
         let mut response;
         loop {
             if request.signal.is_aborted() {
-                log::debug!("request aborted before transport: {url}");
+                log::debug!(
+                    "request aborted before transport: {}",
+                    crate::log_url::loggable(url.as_str())
+                );
                 return Err(RequestError::Aborted);
             }
             if let Some(services) = &self.inner.services {
@@ -98,7 +109,10 @@ impl RequestController {
                 if let Some(services) = &self.inner.services {
                     if let Some(cookie) = services.cookie_header(&request)? {
                         let value = http::HeaderValue::from_str(&cookie).map_err(|_| {
-                            log::warn!("cookie header from services is invalid; failing {url}");
+                            log::warn!(
+                                "cookie header from services is invalid; failing {}",
+                                crate::log_url::loggable(url.as_str())
+                            );
                             RequestError::InvalidHeaderValue("cookie".into())
                         })?;
                         transport_headers.insert_internal_header(http::header::COOKIE, value)?;
@@ -121,7 +135,11 @@ impl RequestController {
                 )
                 .await?;
             let status = candidate.status.as_u16();
-            log::debug!("transport response: {} {url} -> {status}", request.method());
+            log::debug!(
+                "transport response: {} {} -> {status}",
+                request.method(),
+                crate::log_url::loggable(url.as_str())
+            );
             if !matches!(status, 301 | 302 | 303 | 307 | 308) {
                 response = candidate;
                 break;
@@ -131,31 +149,52 @@ impl RequestController {
                 .headers
                 .get(http::header::LOCATION)
                 .ok_or_else(|| {
-                    log::warn!("redirect {status} from {url} has no location header");
+                    log::warn!(
+                        "redirect {status} from {} has no location header",
+                        crate::log_url::loggable(url.as_str())
+                    );
                     RequestError::RedirectFailure
                 })?
                 .to_str()
                 .map_err(|_| {
-                    log::warn!("redirect {status} from {url} has a non-text location header");
+                    log::warn!(
+                        "redirect {status} from {} has a non-text location header",
+                        crate::log_url::loggable(url.as_str())
+                    );
                     RequestError::RedirectFailure
                 })?;
             let next_url = url.join(location).map_err(|_| {
-                log::warn!("redirect {status} from {url} has an invalid location");
+                log::warn!(
+                    "redirect {status} from {} has an invalid location",
+                    crate::log_url::loggable(url.as_str())
+                );
                 RequestError::RedirectFailure
             })?;
             self.inner
                 .policy
                 .validate_redirect_target(&request, &next_url)
                 .inspect_err(|error| {
-                    log::warn!("redirect target blocked: {url} -> {next_url} ({error})");
+                    log::warn!(
+                        "redirect target blocked: {} -> {} ({})",
+                        crate::log_url::loggable(url.as_str()),
+                        crate::log_url::loggable(next_url.as_str()),
+                        crate::log_url::loggable_error(error)
+                    );
                 })?;
             match request.redirect_mode {
                 crate::RedirectMode::Error => {
-                    log::warn!("redirect {status} to {next_url} refused by redirect mode error");
+                    log::warn!(
+                        "redirect {status} to {} refused by redirect mode error",
+                        crate::log_url::loggable(next_url.as_str())
+                    );
                     return Err(RequestError::RedirectFailure);
                 }
                 crate::RedirectMode::Manual => {
-                    log::debug!("manual redirect {status}: {url} -> {next_url}");
+                    log::debug!(
+                        "manual redirect {status}: {} -> {}",
+                        crate::log_url::loggable(url.as_str()),
+                        crate::log_url::loggable(next_url.as_str())
+                    );
                     candidate.url_list = request.url_list.iter().map(ToString::to_string).collect();
                     candidate.redirect_count = request.redirect_count + 1;
                     candidate.response_type = ResponseType::OpaqueRedirect;
@@ -165,7 +204,10 @@ impl RequestController {
                 crate::RedirectMode::Follow => {}
             }
             if request.redirect_count >= 20 {
-                log::warn!("redirect limit reached at {url}");
+                log::warn!(
+                    "redirect limit reached at {}",
+                    crate::log_url::loggable(url.as_str())
+                );
                 return Err(RequestError::RedirectFailure);
             }
             if matches!(status, 307 | 308)
@@ -174,7 +216,10 @@ impl RequestController {
                     .as_ref()
                     .is_some_and(|body| !body.is_replayable())
             {
-                log::warn!("cannot replay request body for {status} redirect from {url}");
+                log::warn!(
+                    "cannot replay request body for {status} redirect from {}",
+                    crate::log_url::loggable(url.as_str())
+                );
                 return Err(RequestError::RedirectFailure);
             }
             if (matches!(status, 301 | 302) && request.method() == http::Method::POST)
@@ -187,7 +232,9 @@ impl RequestController {
                 current.scheme() != next_url.scheme() || current.origin() != next_url.origin()
             });
             log::debug!(
-                "following redirect {status}: {url} -> {next_url} (hop {})",
+                "following redirect {status}: {} -> {} (hop {})",
+                crate::log_url::loggable(url.as_str()),
+                crate::log_url::loggable(next_url.as_str()),
                 request.redirect_count + 1
             );
             if cross_origin {
@@ -220,7 +267,10 @@ impl RequestController {
 
         if cacheable && request.cache_mode != CacheMode::NoStore {
             if response.body_is_null {
-                log::trace!("storing null-body response in cache: {url}");
+                log::trace!(
+                    "storing null-body response in cache: {}",
+                    crate::log_url::loggable(url.as_str())
+                );
                 self.inner.cache.insert(
                     &request,
                     &url,

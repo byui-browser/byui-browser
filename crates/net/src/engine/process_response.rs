@@ -22,7 +22,7 @@ impl RequestController {
         log::trace!(
             "response type classified: {:?} for {}",
             response.response_type,
-            request.url()
+            crate::log_url::loggable(request.url())
         );
         crate::policy::validate_response(request, response)?;
         self.approve_response(request, response)
@@ -63,8 +63,9 @@ impl RequestController {
                 .check_response(request, &info)
                 .inspect_err(|error| {
                     log::warn!(
-                        "response rejected by browser services: {} ({error})",
-                        request.url()
+                        "response rejected by browser services: {} ({})",
+                        crate::log_url::loggable(request.url()),
+                        crate::log_url::loggable_error(error)
                     );
                 })?;
             services.response_headers(request, &info);

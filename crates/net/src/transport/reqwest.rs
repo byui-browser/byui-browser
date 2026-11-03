@@ -95,7 +95,10 @@ impl Transport for ReqwestTransport {
                         headers.insert(REFERER, value);
                     }
                     Err(_) => {
-                        log::debug!("referrer is not a valid header value; sent {url} without it")
+                        log::debug!(
+                            "referrer is not a valid header value; sent {} without it",
+                            crate::log_url::loggable(url.as_str())
+                        )
                     }
                 }
             }
@@ -107,8 +110,10 @@ impl Transport for ReqwestTransport {
             let response = tokio::select! {
                 _ = signal.cancelled() => return Err(RequestError::Aborted),
                 response = builder.send() => response.map_err(|error| {
-                log::debug!("transport send failed: {error}");
-                RequestError::Transport(error.to_string())
+                let message = error.to_string();
+                // reqwest's Display embeds the request URL; keep it out of logs.
+                log::debug!("transport send failed: {}", error.without_url());
+                RequestError::Transport(message)
             })?,
             };
             let status = response.status();

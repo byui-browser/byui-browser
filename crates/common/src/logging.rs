@@ -23,7 +23,10 @@
 //! Report each failure **once** at `warn` or `error`, in the layer that owns
 //! the outcome (for a page load, `browser::load`). Lower layers that see the
 //! same failure, and Web APIs whose error the page already receives as a JS
-//! exception, log it at `debug`. Code that reruns on every window resize or
+//! exception, log it at `debug`. One exception: the layer that applies a
+//! security policy (CORS, mixed content, credentials in a URL) may add one
+//! `warn` with the reason, because the outcome message does not say why.
+//! Code that reruns on every window resize or
 //! page click (styling, layout, painting) never logs above `debug`.
 //!
 //! # Workspace crates and dependencies
@@ -54,6 +57,13 @@
 //!   error, which is useful on Windows where the GUI has no console.
 //! - When no level option is given, the `BYUI_LOG` environment variable is
 //!   read as a spec instead.
+//!
+//! # Credentials
+//!
+//! Every line is passed through [`redact_credentials`] before it is written,
+//! so a `user:password@` inside a URL never reaches the terminal or log file,
+//! even when it arrives inside an error message or a debug dump. Crates should
+//! still avoid logging secrets in the first place; this is a safety net.
 //!
 //! # Limitations
 //!
@@ -421,6 +431,34 @@ fn target_matches(filter: &str, target: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
 }
 
+/// Removes the `user:password@` part of every URL in `text`.
+///
+/// A URL here is any `scheme://` followed by an authority; the authority ends
+/// at the first `/`, `?`, `#`, whitespace, quote, `<`, `>`, `(`, `)`, `[`,
+/// `]`, or end of text, and everything up to and including its last `@` is
+/// removed. Returns `text` unchanged (and unallocated) when nothing matches.
+pub fn redact_credentials(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('@') || !text.contains("://") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find("://") {
+        let authority_start = index + 3;
+        out.push_str(&rest[..authority_start]);
+        let after = &rest[authority_start..];
+        let authority_end = after
+            .find(|c: char| c.is_whitespace() || "/?#\"'<>()[]".contains(c))
+            .unwrap_or(after.len());
+        match after[..authority_end].rfind('@') {
+            Some(at) => rest = &after[at + 1..],
+            None => rest = after,
+        }
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
 /// An error installing the logger.
 #[derive(Debug)]
 pub enum LogInitError {
@@ -538,12 +576,13 @@ impl log::Log for Logger {
         if !self.enabled(record.metadata()) {
             return;
         }
+        let message = record.args().to_string();
         let line = format!(
             "[{:>8.3}s {:<5} {}] {}\n",
             self.started.elapsed().as_secs_f64(),
             record.level(),
             record.target(),
-            record.args()
+            redact_credentials(&message)
         );
         // A failed log write has nowhere better to be reported, so it is
         // ignored rather than allowed to disturb the browser.
@@ -794,6 +833,32 @@ mod tests {
     fn help_ignores_a_malformed_environment_spec() {
         let (config, _) = LogConfig::from_args_and_env(["--help"], Some("nope")).unwrap();
         assert!(config.help_requested);
+    }
+
+    #[test]
+    fn credentials_are_redacted_from_urls() {
+        assert_eq!(
+            redact_credentials("GET http://alice:hunter2@example.com/a?b=c failed"),
+            "GET http://example.com/a?b=c failed"
+        );
+        assert_eq!(
+            redact_credentials(
+                "load \"https://u@h.test\" then text: \"ftp://x:y@z:21\" and wss://p:q@r#f"
+            ),
+            "load \"https://h.test\" then text: \"ftp://z:21\" and wss://r#f"
+        );
+        // A password containing `@` is removed up to the last `@`.
+        assert_eq!(redact_credentials("http://a:b@c@host/"), "http://host/");
+        // An `@` after the authority is left alone.
+        assert_eq!(
+            redact_credentials("mailto via http://host/user@example.com"),
+            "mailto via http://host/user@example.com"
+        );
+        let plain = "no urls here, just user@example.com";
+        assert!(matches!(
+            redact_credentials(plain),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

@@ -49,6 +49,14 @@ pub(crate) enum Display {
     },
 }
 
+/// Whether `value` is a valid CSS-wide or color keyword that
+/// [`css::parse_color`] maps to "no color", so it is not worth logging.
+fn is_no_color_keyword(value: &str) -> bool {
+    ["transparent", "inherit", "initial", "unset", "currentcolor"]
+        .iter()
+        .any(|keyword| value.eq_ignore_ascii_case(keyword))
+}
+
 impl Display {
     const INLINE: Self = Self::Box {
         outside: DisplayOutside::Inline,
@@ -236,12 +244,13 @@ impl ComputedStyle {
         if let Some(value) = get("color") {
             match css::parse_color(value) {
                 Some(color) => style.color = color,
+                None if is_no_color_keyword(value) => {}
                 None => log::debug!("ignoring invalid color value {value:?}; using the default"),
             }
         }
         if let Some(value) = get("background-color") {
             style.background_color = css::parse_color(value);
-            if style.background_color.is_none() {
+            if style.background_color.is_none() && !is_no_color_keyword(value) {
                 log::debug!("ignoring invalid background-color value {value:?}; using transparent");
             }
         }
