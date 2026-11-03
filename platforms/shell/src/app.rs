@@ -1040,7 +1040,29 @@ impl ApplicationHandler<UserEvent> for App {
 
 /// Opens the browser window described by `platform` and runs it until the
 /// user closes it.
+///
+/// Reads the logging options (`--log-level`, `-v`, `-q`, `--log-file`; see
+/// [`common::logging::USAGE`]) from the process's command line before
+/// anything else, and prints usage and exits for `-h` / `--help`. Other
+/// arguments are reported as ignored; the shell takes no others yet.
 pub fn run(platform: Platform) -> Result<(), EventLoopError> {
+    let command_line = common::logging::init_from_command_line();
+    if command_line.help_requested {
+        println!(
+            "Usage: {} [options]\n\n{}",
+            env!("CARGO_PKG_NAME"),
+            common::logging::USAGE
+        );
+        return Ok(());
+    }
+    for argument in &command_line.remaining {
+        log::warn!("ignoring unrecognized argument `{argument}`");
+    }
+    log::info!(
+        "starting BYUI Browser {} on {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS
+    );
     crate::content::load_page_font((platform.page_font_files)());
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);

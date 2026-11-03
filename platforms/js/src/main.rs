@@ -6,6 +6,14 @@ use std::sync::Arc;
 use js::{Realm, Value};
 
 fn main() -> io::Result<()> {
+    let command_line = common::logging::init_from_command_line();
+    if command_line.help_requested {
+        println!("Usage: browser-js [options]\n\n{}", common::logging::USAGE);
+        return Ok(());
+    }
+    for argument in &command_line.remaining {
+        log::warn!("ignoring unrecognized argument `{argument}`");
+    }
     let mut realm = Realm::new();
     realm
         .register_global_function(
