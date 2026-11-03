@@ -241,8 +241,16 @@ impl Stream for Body {
                 Poll::Ready(None)
             }
             Some(Poll::Pending) => Poll::Pending,
-            Some(Poll::Ready(Some(Ok(chunk)))) => Poll::Ready(Some(Ok(chunk))),
+            Some(Poll::Ready(Some(Ok(chunk)))) => {
+                log::trace!("body chunk: {} bytes", chunk.len());
+                Poll::Ready(Some(Ok(chunk)))
+            }
             Some(Poll::Ready(Some(Err(error)))) => {
+                if matches!(error, RequestError::Aborted) {
+                    log::debug!("body stream aborted");
+                } else {
+                    log::warn!("body stream failed: {error}");
+                }
                 if let BodySource::Stream(stream) = &mut state.source {
                     *stream = None;
                 }
