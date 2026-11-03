@@ -25,10 +25,10 @@ pub use vm::Vm;
 /// A JavaScript value produced by evaluation or passed to host functions.
 ///
 /// Primitive variants own their data. [`Value::Function`] and
-/// [`Value::Object`] are reference handles: cloning the value shares the same
+/// [`Value::Object`] and [`Value::Array`] are reference handles: cloning the value shares the same
 /// function or property table, and `==`/`===` compare them by identity.
 ///
-/// Unsupported: symbols, bigints, arrays, and other built-in object kinds.
+/// Unsupported: symbols, bigints, and other built-in object kinds.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// The `undefined` value.
@@ -46,6 +46,8 @@ pub enum Value {
     /// A plain object with string-keyed properties, compared by identity.
     /// See [`Object`] for its sharing rules and limitations.
     Object(Object),
+    /// An array with JavaScript index properties and a `length` property.
+    Array(Object),
 }
 
 /// Formats the value as JavaScript's `ToString` would, so numbers print as
@@ -60,6 +62,7 @@ impl fmt::Display for Value {
             Self::String(text) => formatter.write_str(text),
             Self::Function(function) => write!(formatter, "{function}"),
             Self::Object(object) => write!(formatter, "{object}"),
+            Self::Array(object) => write!(formatter, "{object}"),
         }
     }
 }

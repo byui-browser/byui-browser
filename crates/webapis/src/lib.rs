@@ -18,6 +18,7 @@ mod fetch;
 pub mod local_storage;
 mod selector;
 mod timer;
+mod window;
 
 pub use alert::{AlertSink, alert, register_alert};
 pub use console::{ConsoleSink, print, register_print};
@@ -31,3 +32,4 @@ pub use event::{
 pub use fetch::{fetch, register_fetch};
 pub use selector::SelectorError;
 pub use timer::{TimerId, TimerQueue};
+pub use window::register_window;
