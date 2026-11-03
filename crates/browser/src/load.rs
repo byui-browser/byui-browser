@@ -142,7 +142,7 @@ where
         .map(html::NodeID::new)
         .map_while(|id| document.node(id).map(|node| (id, node)));
     for (id, node) in nodes {
-        let html::NodeKind::Element(element) = &node.kind else {
+        let html::NodeKind::Element(element) = node.get_kind() else {
             continue;
         };
         let attributes = element.get_attributes();

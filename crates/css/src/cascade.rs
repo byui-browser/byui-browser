@@ -39,11 +39,11 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
     let mut computed: Vec<(NodeID, Vec<Declaration>)> = Vec::new();
     let mut root_font_size = None;
     for (index, node) in dom.nodes.iter().enumerate() {
-        let NodeKind::Element(element) = &node.kind else {
+        let NodeKind::Element(element) = node.get_kind() else {
             continue;
         };
         let parent = node
-            .parent
+            .get_parent()
             .and_then(|parent| computed_style(&computed, parent));
         let parent_value = |property: &str| {
             parent.and_then(|declarations| {
@@ -243,14 +243,14 @@ fn matches_selector(dom: &HTMLDocument, node_id: NodeID, selector: &str) -> bool
     }
     let mut current = node_id;
     for part in parts.iter().rev().skip(1) {
-        let mut ancestor = dom.nodes[current.get()].parent;
+        let mut ancestor = dom.nodes[current.get()].get_parent();
         let mut found = None;
         while let Some(candidate) = ancestor {
             if matches_compound(dom, candidate, part) {
                 found = Some(candidate);
                 break;
             }
-            ancestor = dom.nodes[candidate.get()].parent;
+            ancestor = dom.nodes[candidate.get()].get_parent();
         }
         let Some(found) = found else { return false };
         current = found;
@@ -262,7 +262,7 @@ fn matches_compound(dom: &HTMLDocument, node_id: NodeID, selector: &str) -> bool
     let Some(node) = dom.node(node_id) else {
         return false;
     };
-    let NodeKind::Element(element) = &node.kind else {
+    let NodeKind::Element(element) = node.get_kind() else {
         return false;
     };
     let mut index = 0;

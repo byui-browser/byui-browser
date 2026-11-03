@@ -10,9 +10,12 @@ impl Default for NodeID {
 }
 
 impl NodeID {
+    // Creates NodeID with immutable id.
     pub fn new(set_value: usize) -> Self {
         Self { id: set_value }
     }
+
+    // Gets id.
     pub const fn get(&self) -> usize {
         self.id
     }

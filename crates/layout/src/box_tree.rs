@@ -125,12 +125,12 @@ impl StyleMap {
 pub(crate) fn root_element(document: &HTMLDocument) -> Option<NodeID> {
     document
         .node(document.root)?
-        .children
+        .get_children()
         .iter()
         .copied()
         .find(|child| {
             matches!(
-                document.node(*child).map(|node| &node.kind),
+                document.node(*child).map(|node| node.get_kind()),
                 Some(NodeKind::Element(_))
             )
         })
@@ -150,7 +150,7 @@ pub(crate) fn build_initial_containing_block(
     let style = Rc::clone(styles.initial());
     let children = document
         .node(document.root)
-        .map(|node| node.children.as_slice())
+        .map(|node| node.get_children().as_slice())
         .unwrap_or_default();
     BlockBox {
         node: None,
@@ -179,7 +179,7 @@ impl Builder<'_> {
         let children = self
             .document
             .node(node)
-            .map(|node| node.children.as_slice())
+            .map(|node| node.get_children().as_slice())
             .unwrap_or_default();
         BlockBox {
             node: Some(node),
@@ -246,14 +246,14 @@ impl Builder<'_> {
         let Some(dom_node) = self.document.node(node) else {
             return;
         };
-        match &dom_node.kind {
+        match dom_node.get_kind() {
             NodeKind::Text(text) => levels.push(Level::Inline(InlineItem::Text {
                 node,
                 element: dom_node
-                    .parent
+                    .get_parent()
                     .filter(|parent| self.styles.get(*parent).is_some()),
                 text: text.clone(),
-                style: self.styles.for_text_parent(dom_node.parent),
+                style: self.styles.for_text_parent(dom_node.get_parent()),
             })),
             NodeKind::Element(element) => {
                 let Some(style) = self.styles.get(node) else {
@@ -262,7 +262,7 @@ impl Builder<'_> {
                 match style.display {
                     Display::None => {}
                     Display::Contents => {
-                        for child in &dom_node.children {
+                        for child in dom_node.get_children() {
                             self.collect(*child, levels, open_inlines);
                         }
                     }
@@ -280,7 +280,7 @@ impl Builder<'_> {
                             start_edge: true,
                         }));
                         open_inlines.push((node, Rc::clone(style)));
-                        for child in &dom_node.children {
+                        for child in dom_node.get_children() {
                             self.collect(*child, levels, open_inlines);
                         }
                         open_inlines.pop();
@@ -297,7 +297,7 @@ impl Builder<'_> {
                         outside: DisplayOutside::Block,
                         ..
                     } => {
-                        let is_root = dom_node.parent == Some(self.document.root)
+                        let is_root = dom_node.get_parent() == Some(self.document.root)
                             && root_element(self.document) == Some(node);
                         // A block inside inline boxes splits them around it
                         // (CSS 2.2 §9.2.1.1).

@@ -67,7 +67,7 @@ fn propagate_canvas_background(
     let background = |node: NodeID| styles.get(node).and_then(|style| style.background_color);
     let is_element = |node: NodeID, name: &str| {
         matches!(
-            document.node(node).map(|node| &node.kind),
+            document.node(node).map(|node| node.get_kind()),
             Some(NodeKind::Element(element)) if element.get_name() == name
         )
     };
@@ -77,7 +77,7 @@ fn propagate_canvas_background(
         document
             .node(root)
             .into_iter()
-            .flat_map(|node| node.children.iter().copied())
+            .flat_map(|node| node.get_children().iter().copied())
             .find(|child| is_element(*child, "body"))
             .filter(|body| background(*body).is_some())
     } else {

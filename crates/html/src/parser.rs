@@ -104,7 +104,7 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
             "math" => Namespace::MathMl,
             _ if stack.iter().any(|id| {
                 matches!(
-                    document.node(*id).map(|node| &node.kind),
+                    document.node(*id).map(|node| node.get_kind()),
                     Some(NodeKind::Element(element))
                         if *element.get_namespace() == Namespace::Svg
                 )
@@ -153,7 +153,7 @@ fn append_text(document: &mut HTMLDocument, parent: NodeID, text: &str, start: u
 }
 
 fn element_name(document: &HTMLDocument, id: NodeID) -> Option<&str> {
-    match &document.node(id)?.kind {
+    match document.node(id)?.get_kind() {
         NodeKind::Element(element) => Some(element.get_name()),
         _ => None,
     }
