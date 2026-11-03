@@ -1,22 +1,24 @@
-//! Shared page popup: disabled Back/Forward, Reload, and page-source Inspect.
+//! Shared page popup: disabled navigation, Reload, View Page Source, and Inspect.
 
 use ab_glyph::FontVec;
 use tiny_skia::{Color, Paint, Pixmap, Rect, Transform};
 
-/// Actions offered by the page popup; Inspect only shows loaded source.
+/// Independent actions offered by the page popup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuAction {
     Reload,
     PageSource,
+    Inspect,
 }
 
 // Disabled rows deliberately have no executable action. Navigation wiring is
 // outside this feature even when BrowserState has previous/next entries.
-const MENU_ITEMS: [(&str, Option<MenuAction>); 4] = [
+const MENU_ITEMS: [(&str, Option<MenuAction>); 5] = [
     ("Back", None),
     ("Forward", None),
     ("Reload", Some(MenuAction::Reload)),
-    ("Inspect (page source)", Some(MenuAction::PageSource)),
+    ("View Page Source", Some(MenuAction::PageSource)),
+    ("Inspect", Some(MenuAction::Inspect)),
 ];
 
 /// Popup bounds in logical pixels, independent of display scaling.
@@ -29,10 +31,10 @@ pub(crate) struct ContextMenu {
 }
 
 impl ContextMenu {
-    /// Anchors a four-item popup at the pointer, clamped to the window.
+    /// Anchors a five-item popup at the pointer, clamped to the window.
     pub(crate) fn new(x: f64, y: f64, width: f64, height: f64) -> Self {
         let menu_width = 220.0_f64.min(width);
-        let menu_height = 136.0_f64.min(height);
+        let menu_height = 168.0_f64.min(height);
         Self {
             x: x.clamp(0.0, width - menu_width),
             y: y.clamp(0.0, height - menu_height),
@@ -140,10 +142,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn four_rows_have_the_requested_order_and_disabled_rows_have_no_actions() {
+    fn five_rows_have_the_requested_order_and_disabled_rows_have_no_actions() {
         assert_eq!(
             MENU_ITEMS.map(|(label, _)| label),
-            ["Back", "Forward", "Reload", "Inspect (page source)"]
+            ["Back", "Forward", "Reload", "View Page Source", "Inspect"]
         );
         let menu = ContextMenu::new(100.0, 100.0, 800.0, 600.0);
         for (row, (_, expected)) in MENU_ITEMS.into_iter().enumerate() {
@@ -165,14 +167,14 @@ mod tests {
                 assert_eq!(
                     menu.action_at(Some((
                         menu.x + 5.0,
-                        menu.y + 4.0 + (menu.height - 8.0) * 0.625
+                        menu.y + 4.0 + (menu.height - 8.0) * 0.5
                     ))),
                     Some(MenuAction::Reload)
                 );
                 assert_eq!(
                     menu.action_at(Some((
                         menu.x + 5.0,
-                        menu.y + 4.0 + (menu.height - 8.0) * 0.875
+                        menu.y + 4.0 + (menu.height - 8.0) * 0.7
                     ))),
                     Some(MenuAction::PageSource)
                 );
