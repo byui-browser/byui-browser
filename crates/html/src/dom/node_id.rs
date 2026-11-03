@@ -3,14 +3,8 @@ pub struct NodeID {
     id: usize,
 }
 
-impl Default for NodeID {
-    fn default() -> Self {
-        Self::new(0)
-    }
-}
-
 impl NodeID {
-    // Creates NodeID with immutable id.
+    // Constructs NodeID and sets immutable id.
     pub fn new(set_value: usize) -> Self {
         Self { id: set_value }
     }
@@ -20,5 +14,3 @@ impl NodeID {
         self.id
     }
 }
-
-// pub type NodeId = NodeID;
