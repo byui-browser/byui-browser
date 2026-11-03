@@ -275,6 +275,7 @@ pub struct Page {
 /// The renderer and webpage must never provide this path. Tests should inject
 /// a temporary directory instead of using this process-wide location.
 pub fn application_data_directory() -> io::Result<PathBuf> {
+    log::trace!("resolving application data directory");
     #[cfg(target_os = "macos")]
     {
         home_directory().map(|home| {
@@ -300,7 +301,6 @@ pub fn application_data_directory() -> io::Result<PathBuf> {
 
     #[cfg(target_os = "linux")]
     {
-        log::trace!("resolving application data directory");
         let root = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .or_else(|| {
