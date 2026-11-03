@@ -69,6 +69,8 @@ pub enum Token {
     Undefined,
     /// `=` assignment operator.
     Assign,
+    /// `=>` arrow function separator.
+    Arrow,
     /// `==` equality operator.
     EqualEqual,
     /// `===` strict equality operator.
@@ -239,6 +241,7 @@ pub fn tokenize_spanned(input: &str) -> Vec<SpannedToken> {
                 '*' => Token::Multiply,
                 '/' => Token::Divide,
                 '%' => Token::Remainder,
+                '=' if take_if(&mut chars, '>') => Token::Arrow,
                 '=' => match take_if(&mut chars, '=') {
                     true if take_if(&mut chars, '=') => Token::StrictEqual,
                     true => Token::EqualEqual,

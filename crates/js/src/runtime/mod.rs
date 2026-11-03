@@ -35,8 +35,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::ast::{
-    BinaryOperator, Expr, LogicalOperator, MemberProperty, Program, PropertyKey, Statement,
-    UnaryOperator, VarKind,
+    ArrowBody, BinaryOperator, Expr, LogicalOperator, MemberProperty, Program, PropertyKey,
+    Statement, UnaryOperator, VarKind,
 };
 use crate::bytecode::FunctionTemplate;
 use crate::stack::{StackGuard, with_engine_stack};
@@ -803,6 +803,20 @@ impl Interpreter {
             Expr::New { .. } => Err(unsupported_here("`new`")),
             Expr::SuperCall { .. } | Expr::SuperMember { .. } => Err(unsupported_here("`super`")),
             Expr::Identifier(name) => read(scope, name),
+            Expr::ArrowFunction { params, body } => {
+                let body = match body {
+                    ArrowBody::Expression(expression) => {
+                        vec![Statement::Return(Some((**expression).clone()))]
+                    }
+                    ArrowBody::Block(statements) => statements.clone(),
+                };
+                Ok(Value::Function(Function(Arc::new(FunctionKind::Script {
+                    name: String::new(),
+                    params: params.clone(),
+                    body,
+                    closure: Arc::clone(scope),
+                }))))
+            }
             Expr::Assign { name, value } => {
                 let value = self.evaluate(value, scope)?;
                 assign(scope, name, value.clone())?;
@@ -868,7 +882,7 @@ impl Interpreter {
             Expr::Member { object, property } => {
                 let target = self.evaluate(object, scope)?;
                 let key = self.property_key(property, scope)?;
-                let Value::Object(target) = target else {
+                let (Value::Object(target) | Value::Array(target)) = target else {
                     return Err(non_object(&target, "read", &key, "property access"));
                 };
                 Ok(target.get(&key).unwrap_or(Value::Undefined))
@@ -881,7 +895,7 @@ impl Interpreter {
                 let target = self.evaluate(object, scope)?;
                 let key = self.property_key(property, scope)?;
                 let value = self.evaluate(value, scope)?;
-                let Value::Object(target) = target else {
+                let (Value::Object(target) | Value::Array(target)) = target else {
                     return Err(non_object(&target, "set", &key, "property assignment"));
                 };
                 target.set(key, value.clone());
@@ -898,6 +912,18 @@ impl Interpreter {
                     object.set(key, value);
                 }
                 Ok(Value::Object(object))
+            }
+            Expr::Array(elements) => {
+                let array = Object::new();
+                for (index, element) in elements.iter().enumerate() {
+                    let value = match element {
+                        Some(element) => self.evaluate(element, scope)?,
+                        None => Value::Undefined,
+                    };
+                    array.set(index.to_string(), value);
+                }
+                array.set("length", Value::Number(elements.len() as f64));
+                Ok(Value::Array(array))
             }
         }
     }
@@ -982,6 +1008,7 @@ pub(crate) fn non_object(value: &Value, action: &str, key: &str, context: &str) 
         Value::String(_) => "a string",
         Value::Function(_) => "a function",
         Value::Object(_) => "an object",
+        Value::Array(_) => "an array",
     };
     JsError::with_context(
         crate::JsErrorCategory::Runtime,

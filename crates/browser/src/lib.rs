@@ -10,7 +10,6 @@ use std::{
     time::Duration,
 };
 
-use html::Query;
 use js::{JsResult, Realm, Value};
 use net::{Request, RequestController, SchemeProviders};
 use security::{
@@ -23,13 +22,19 @@ use storage::{
 use webapis::local_storage::register_local_storage;
 use webapis::{
     AlertSink, ConsoleSink, Document, register_alert, register_document, register_fetch,
-    register_print,
+    register_print, register_window,
 };
 
 pub mod byui_provider;
 pub mod fetch_services;
 pub mod file_provider;
+mod load;
 pub mod refresh;
+
+pub use load::{
+    LoadError, Navigation, PageLoader, error_page, load_page, normalize_address,
+    security_context_for_url,
+};
 
 /// Browser-owned resource limits for one local-file session.
 ///
@@ -223,17 +228,26 @@ pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<R
 
 /// A browser page and the resources referenced by its HTML source.
 ///
-/// Resource text is loaded through the browser-owned `byui:` provider, so
-/// native shells do not depend on the process working directory. The HTML
-/// references are resolved and validated before the page is returned.
+/// [`load_page`] fetches the resources through the request controller and
+/// resolves relative links against the document URL, so native shells do not
+/// depend on the process working directory. CSS `@import` inside a stylesheet
+/// is not followed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page {
+    /// Final URL the document was served from, after redirects. Empty when the
+    /// page has no network origin, such as the built-in error page; such a
+    /// page gets an isolated security context.
+    pub url: String,
     /// HTML document source.
     pub html: String,
-    /// CSS source referenced by the document's stylesheet link.
-    pub css: String,
-    /// JavaScript source referenced by the document's script element.
-    pub js: String,
+    /// Stylesheet sources in document order: one entry per
+    /// `<link rel="stylesheet">` that loaded and per `<style>` element. Later
+    /// entries win ties in the cascade.
+    pub stylesheets: Vec<String>,
+    /// Script sources in document order: one entry per `<script>` element,
+    /// holding its inline text or the fetched body of its `src`. A `src` that
+    /// failed to load is an empty entry, so entries stay aligned with elements.
+    pub scripts: Vec<String>,
 }
 
 /// Returns the browser-owned application-data directory for the current OS.
@@ -328,6 +342,11 @@ impl BrowserRuntime {
     /// navigation. JavaScript cannot choose the origin or storage key. The
     /// JavaScript engine's standard `localStorage` object syntax remains a
     /// follow-up; the registered host-function path is available now.
+    ///
+    /// The returned values are the script completion values. Listeners
+    /// registered by those scripts are dropped with the temporary realm. Use
+    /// [`BrowserRuntime::open_page_session`] when a later click must reach
+    /// `document.addEventListener`.
     pub fn evaluate_page_scripts(
         &self,
         html_source: &str,
@@ -336,86 +355,157 @@ impl BrowserRuntime {
         controller: Arc<RequestController>,
         security_context: RendererSecurityContext,
     ) -> JsResult<Vec<Value>> {
-        let document = html::parse_raw_html(html_source.to_owned());
+        self.boot_page(
+            html_source,
+            None,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+        )
+        .map(|booted| booted.results)
+    }
+
+    /// Parses a page, evaluates its scripts, and keeps the document alive.
+    ///
+    /// The session shares listener storage with the script-visible `document`,
+    /// so [`PageSession::dispatch_click`] runs listeners the scripts
+    /// registered. The caller supplies the trusted renderer context created
+    /// by browser navigation.
+    pub fn open_page_session(
+        &self,
+        html_source: &str,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+    ) -> JsResult<PageSession> {
+        self.boot_page(
+            html_source,
+            None,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+        )
+        .map(|booted| booted.session)
+    }
+
+    /// Opens a session for a loaded [`Page`], running its linked script
+    /// against the page's own document.
+    ///
+    /// Scripts run in document order from [`Page::scripts`], which holds the
+    /// inline or fetched source of every `<script>` element. Element IDs in the
+    /// session match a layout of `page.html`, so a layout hit test can be
+    /// passed to [`PageSession::dispatch_click_at`].
+    pub fn open_page(
+        &self,
+        page: &Page,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+    ) -> JsResult<PageSession> {
+        self.boot_page(
+            &page.html,
+            Some(&page.scripts),
+            console,
+            alert_sink,
+            controller,
+            security_context,
+        )
+        .map(|booted| booted.session)
+    }
+
+    fn boot_page(
+        &self,
+        html_source: &str,
+        scripts: Option<&[String]>,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+    ) -> JsResult<BootedPage> {
+        let html_document = html::parse_raw_html(html_source.to_owned());
+        let document = Document::from_html_document(&html_document);
+        let retained = document.clone();
         let mut realm = Realm::new();
         register_print(&mut realm, console)?;
         register_alert(&mut realm, alert_sink)?;
         register_fetch(&mut realm, controller)?;
-        register_document(&mut realm, Document::from_html_document(&document))?;
+        register_window(&mut realm)?;
+        register_document(&mut realm, document)?;
         register_local_storage(&mut realm, Arc::clone(&self.storage), security_context)?;
 
-        document
-            .script_sources()
+        // Without caller-supplied sources only inline script text is available.
+        let sources = match scripts {
+            Some(scripts) => scripts.to_vec(),
+            None => html_document.script_sources(),
+        };
+        let results = sources
             .iter()
             .map(|source| realm.evaluate_script(source))
-            .collect()
+            .collect::<JsResult<Vec<_>>>()?;
+        Ok(BootedPage {
+            session: PageSession {
+                realm,
+                document: retained,
+            },
+            results,
+        })
     }
+}
+
+/// A loaded document whose scripts stay alive after evaluation.
+///
+/// `document.addEventListener` stores listeners here. Input that happens
+/// after the page has loaded, such as a click on the page, is delivered with
+/// [`PageSession::dispatch_click`].
+pub struct PageSession {
+    /// Realm that evaluated the page. Listeners close over its globals.
+    #[allow(dead_code)]
+    realm: Realm,
+    document: Document,
+}
+
+impl PageSession {
+    /// Fires a `click` event at this session's document.
+    ///
+    /// Runs listeners registered with `document.addEventListener('click', ...)`.
+    /// Element hit testing is not performed.
+    pub fn dispatch_click(&self) -> JsResult<Value> {
+        webapis::dispatch_click(&self.document)
+    }
+
+    /// Fires a user `click` at the element containing `node`.
+    ///
+    /// `node` is usually a layout hit test of this session's page. The event
+    /// bubbles from that element to the document, so both element and
+    /// `document` listeners run.
+    pub fn dispatch_click_at(&self, node: html::NodeID) -> JsResult<Value> {
+        webapis::dispatch_click_at(&self.document, node)
+    }
+}
+
+struct BootedPage {
+    session: PageSession,
+    results: Vec<Value>,
 }
 
 /// Loads the welcome page and resolves its local stylesheet and script links.
 pub fn welcome_page() -> Page {
     let controller = request_controller(None);
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let html = runtime
-        .block_on(fetch_text(&controller, "byui://welcome/page"))
-        .expect("welcome HTML should be available through byui:");
-    let document = html::parse_raw_html(html.clone());
-    let stylesheet_url = document
-        .query("link")
-        .into_iter()
-        .find_map(|node| {
-            node.kind.element_attributes().and_then(|attributes| {
-                (attribute(attributes, "rel") == Some("stylesheet")
-                    && attribute(attributes, "href") == Some("style.css"))
-                .then_some("byui://welcome/style.css")
-            })
-        })
-        .expect("welcome HTML must link style.css as its stylesheet");
-    let script_url = document
-        .query("script")
-        .into_iter()
-        .find_map(|node| {
-            node.kind.element_attributes().and_then(|attributes| {
-                (attribute(attributes, "src") == Some("script.js"))
-                    .then_some("byui://welcome/script.js")
-            })
-        })
-        .expect("welcome HTML must link script.js as its script");
-    let css = runtime
-        .block_on(fetch_text(&controller, stylesheet_url))
-        .expect("welcome stylesheet should be available through byui:");
-    let js = runtime
-        .block_on(fetch_text(&controller, script_url))
-        .expect("welcome script should be available through byui:");
-
-    Page { html, css, js }
-}
-
-async fn fetch_text(
-    controller: &RequestController,
-    url: &str,
-) -> Result<String, net::RequestError> {
-    controller.fetch(Request::get(url)).await?.body.text().await
+    runtime
+        .block_on(load_page(&controller, "byui://welcome/page"))
+        .expect("welcome page should be available through byui:")
 }
 
 fn attribute<'a>(attributes: &'a [html::Attribute], name: &str) -> Option<&'a str> {
     attributes
         .iter()
-        .find(|attribute| attribute.name == name)
-        .map(|attribute| attribute.value.as_str())
-}
-
-trait ElementAttributes {
-    fn element_attributes(&self) -> Option<&[html::Attribute]>;
-}
-
-impl ElementAttributes for html::NodeKind {
-    fn element_attributes(&self) -> Option<&[html::Attribute]> {
-        match self {
-            html::NodeKind::Element(element) => Some(&element.attributes),
-            _ => None,
-        }
-    }
+        .find(|attribute| attribute.get_name() == name)
+        .map(|attribute| attribute.get_value().as_str())
 }
 
 #[cfg(test)]
@@ -436,8 +526,71 @@ mod tests {
 
         assert!(page.html.contains("href=\"style.css\""));
         assert!(page.html.contains("src=\"script.js\""));
-        assert!(page.css.contains("background-color"));
-        assert!(page.js.contains("const message"));
+        assert!(page.stylesheets[0].contains("background-color"));
+        assert!(page.scripts[0].contains("btn.addEventListener('click', callback)"));
+    }
+
+    #[test]
+    fn embedded_page_aliases_ignore_query_and_fragment_for_lookup() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let response = runtime
+            .block_on(controller.fetch(Request::get("byui://welcome/index.html?lang=en#top")))
+            .expect("embedded page alias should resolve");
+
+        assert_eq!(response.url, "byui://welcome/index.html?lang=en#top");
+        let body = runtime.block_on(response.body.bytes()).unwrap();
+        assert_eq!(
+            response.headers.get("content-length"),
+            Some(body.len().to_string())
+        );
+        assert!(body.starts_with(b"<!doctype"));
+    }
+
+    #[test]
+    fn embedded_page_head_preserves_metadata_without_a_body() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let get_response = runtime
+            .block_on(controller.fetch(Request::get("byui://welcome/page?lang=en#top")))
+            .expect("embedded page GET should resolve");
+        let expected_length = get_response
+            .headers
+            .get("content-length")
+            .expect("embedded page GET should expose content length");
+        let mut request = Request::get("byui://welcome/page?lang=en#top");
+        request
+            .set_method(net::Method::HEAD)
+            .expect("GET can become HEAD");
+
+        let response = runtime
+            .block_on(controller.fetch(request))
+            .expect("embedded page HEAD should resolve");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.headers.get("content-length"),
+            Some(expected_length)
+        );
+        assert!(response.body.is_null());
+        assert!(runtime.block_on(response.body.bytes()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_embedded_page_routes_fail_without_a_fallback() {
+        let controller = request_controller(None);
+        let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+        let error = runtime
+            .block_on(controller.fetch(Request::get("byui://missing/page")))
+            .expect_err("unknown embedded routes must fail");
+
+        assert!(matches!(
+            error,
+            net::RequestError::Provider {
+                provider: "byui page",
+                kind: net::ProviderErrorKind::ResourceMissing
+            }
+        ));
     }
 
     #[test]

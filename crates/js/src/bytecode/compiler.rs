@@ -498,6 +498,7 @@ impl Compiler {
 
     fn compile_expression(&mut self, expression: &Expr) -> Result<(), CompileError> {
         match expression {
+            Expr::ArrowFunction { .. } => Err(CompileError::unsupported("arrow functions")),
             Expr::Number(value) => self.constant(Value::Number(*value)),
             Expr::String(value) => self.constant(Value::String(value.clone())),
             Expr::Boolean(value) => self.constant(Value::Boolean(*value)),
@@ -606,6 +607,19 @@ impl Compiler {
                         }
                     }
                 }
+                Ok(())
+            }
+            Expr::Array(elements) => {
+                for element in elements {
+                    match element {
+                        Some(element) => self.compile_expression(element)?,
+                        None => self.constant(Value::Undefined)?,
+                    }
+                }
+                let count = u16::try_from(elements.len()).map_err(|_| {
+                    CompileError::unsupported("array literal with too many elements")
+                })?;
+                self.chunk.emit(Instruction::NewArray(count));
                 Ok(())
             }
         }

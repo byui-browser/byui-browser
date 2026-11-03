@@ -768,4 +768,33 @@ mod tests {
         assert!(!exposed.has("set-cookie2"));
         assert!(exposed.has("x-visible"));
     }
+
+    #[test]
+    fn no_cors_safelist_checks_content_type_range_and_forbidden_headers() {
+        let content_type = HeaderName::from_static("content-type");
+        assert!(is_cors_safelisted_header(
+            &content_type,
+            &value("text/plain; charset=UTF-8")
+        ));
+        assert!(!is_cors_safelisted_header(
+            &content_type,
+            &value("application/json")
+        ));
+
+        let range = HeaderName::from_static("range");
+        assert!(is_cors_safelisted_header(&range, &value("bytes=0-499")));
+        assert!(is_cors_safelisted_header(&range, &value("bytes=500-")));
+        assert!(!is_cors_safelisted_header(&range, &value("bytes=-500")));
+        assert!(!is_cors_safelisted_header(&range, &value("bytes=0-1-2")));
+
+        let mut request = Headers::new();
+        assert!(matches!(
+            request.append(HeaderName::from_static("host"), value("example.test")),
+            Err(RequestError::ForbiddenHeader(name)) if name == "host"
+        ));
+        assert!(matches!(
+            request.append(HeaderName::from_static("sec-fetch-site"), value("same-origin")),
+            Err(RequestError::ForbiddenHeader(name)) if name == "sec-fetch-site"
+        ));
+    }
 }
