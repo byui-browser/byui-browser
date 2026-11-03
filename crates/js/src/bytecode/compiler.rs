@@ -522,6 +522,7 @@ impl Compiler {
 
     fn compile_expression(&mut self, expression: &Expr) -> Result<(), CompileError> {
         match expression {
+            Expr::ArrowFunction { .. } => Err(CompileError::unsupported("arrow functions")),
             Expr::Number(value) => self.constant(Value::Number(*value)),
             Expr::String(value) => self.constant(Value::String(value.clone())),
             Expr::Boolean(value) => self.constant(Value::Boolean(*value)),

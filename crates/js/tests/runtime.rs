@@ -242,6 +242,16 @@ fn closures_capture_their_defining_scope() {
 }
 
 #[test]
+fn arrow_functions_support_expression_and_block_bodies_with_closures() {
+    assert_eq!(eval("let add = (a, b) => a + b; add(2, 3)"), number(5.0));
+    assert_eq!(
+        eval("function outer(x) { return y => { return x + y; }; } outer(4)(6)"),
+        number(10.0)
+    );
+    assert_eq!(eval("let identity = x => x; identity(7)"), number(7.0));
+}
+
+#[test]
 fn functions_are_values_compared_by_identity() {
     assert_eq!(eval("function f() {} let g = f; g === f"), boolean(true));
     assert_eq!(

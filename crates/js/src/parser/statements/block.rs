@@ -13,3 +13,7 @@ pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Vec<Statement>> {
     }
     Ok(body)
 }
+
+pub(in crate::parser) fn parse_arrow_block(parser: &mut Parser<'_>) -> ParseResult<Vec<Statement>> {
+    parse(parser)
+}

@@ -6,6 +6,8 @@ mod declaration;
 mod function;
 mod return_statement;
 
+pub(in crate::parser) use block::parse_arrow_block;
+
 use super::{ParseResult, Parser};
 use crate::ast::Statement;
 use crate::lexer::Token;
