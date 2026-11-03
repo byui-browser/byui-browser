@@ -138,6 +138,10 @@ impl<'tokens> Parser<'tokens> {
         self.tokens.get(self.position)
     }
 
+    fn peek_at(&self, offset: usize) -> Option<&Token> {
+        self.tokens.get(self.position + offset)
+    }
+
     fn advance(&mut self) -> Option<&Token> {
         let token = self.tokens.get(self.position);
         self.position += usize::from(token.is_some());

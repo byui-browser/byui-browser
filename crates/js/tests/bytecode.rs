@@ -38,6 +38,18 @@ fn bindings_compile_and_execute() {
 }
 
 #[test]
+fn array_literals_compile_and_preserve_order_and_identity() {
+    assert_eq!(execute("[1, 2, 3][1]"), Value::Number(2.0));
+    assert_eq!(execute("[1, , 3].length"), Value::Number(3.0));
+    assert_eq!(execute("let a = [1]; a[0] = 4; a[0]"), Value::Number(4.0));
+    assert_eq!(execute("let a = []; a === a"), Value::Boolean(true));
+    assert_eq!(
+        execute("let i = 0; [i = i + 1, i = i + 1]; i"),
+        Value::Number(2.0)
+    );
+}
+
+#[test]
 fn binding_errors_are_reported() {
     let program = parse("{ value; let value = 1; }").expect("source should parse");
     let chunk = compile(&program).expect("source should compile");
