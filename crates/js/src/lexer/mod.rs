@@ -284,6 +284,16 @@ pub fn tokenize_spanned(input: &str) -> Vec<SpannedToken> {
         tokens.push(SpannedToken { token, start, end });
     }
 
+    log::debug!(
+        "tokenized {} bytes into {} tokens",
+        input.len(),
+        tokens.len()
+    );
+    if log::log_enabled!(log::Level::Trace) {
+        for entry in &tokens {
+            log::trace!("token {:?} at {}..{}", entry.token, entry.start, entry.end);
+        }
+    }
     tokens
 }
 

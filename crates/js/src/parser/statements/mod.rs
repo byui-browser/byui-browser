@@ -11,6 +11,9 @@ use crate::ast::Statement;
 use crate::lexer::Token;
 
 pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Statement> {
+    if log::log_enabled!(log::Level::Trace) {
+        log::trace!("parsing statement starting at {:?}", parser.peek());
+    }
     match parser.peek() {
         Some(Token::LeftBrace) => Ok(Statement::Block(block::parse(parser)?)),
         Some(Token::Let | Token::Var | Token::Const) => declaration::parse(parser),
