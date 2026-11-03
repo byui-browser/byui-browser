@@ -15,9 +15,10 @@ use crate::{HostFunction, Value};
 /// Clones compare equal with `==` and `===`; separately created objects
 /// never do, even with identical properties.
 ///
-/// Properties are kept in insertion order and are always plain, writable
-/// data properties. Because the table is shared, methods take `&self` and
-/// lock it internally; the lock is never held while script code runs.
+/// Properties are kept in insertion order and are plain data properties.
+/// They are writable unless defined with [`Object::set_read_only`]. Because
+/// the table is shared, methods take `&self` and lock it internally; the lock
+/// is never held while script code runs.
 ///
 /// An object may have a prototype object. [`Object::get`] falls back to the
 /// prototype chain when an object has no such own property, while
