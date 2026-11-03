@@ -192,7 +192,10 @@ fn cloned_response_holds_one_permit_until_both_branches_are_dropped() {
     runtime().block_on(async {
         let mut request = Request::get(server.url());
         request.set_cache_mode(CacheMode::NoStore);
-        let mut first = controller.fetch(request.clone()).await.unwrap();
+        let mut first = controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
         let clone = first.try_clone().unwrap();
         drop(first);
 

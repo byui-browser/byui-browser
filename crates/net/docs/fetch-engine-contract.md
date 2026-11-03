@@ -11,10 +11,16 @@ headers pass Fetch filtering. Its abort-aware `Body` holds the scheduler permit
 until it is consumed or dropped. Body errors may occur after headers. Callers
 cannot obtain the transport response.
 
-`Body` uses one lifecycle state for helper locking, direct streaming, transport
-handoff, completion, failure, and abort. Nullness is part of that model rather
-than a parallel response flag. Declared length and media type survive live,
-cached, and provider-backed responses. `Response::try_clone` tees an unused
+`Body` owns one source and reports one lifecycle state for helper locking,
+direct streaming, transport handoff, completion, failure, and abort. Nullness
+is part of that model rather than a parallel response flag. `Body` has no
+implicit `Clone`: `Body::fork` duplicates unused buffered sources into
+independent views and tees an unused live stream. `Request::try_clone`
+duplicates buffered request bodies and rejects live streams; the controller
+transfers a live request stream to one transport attempt. Internal cache
+wrapping rejects a used or transferred source with `BodyAlreadyConsumed`.
+Declared length and media type survive live, cached, and provider-backed
+responses. `Response::try_clone` forks an unused
 live body through bounded one-chunk branches; a slow active branch applies
 backpressure, dropping a branch cancels it, and the shared scheduler permit is
 released only after the source completes or both branches are dropped. Cache

@@ -275,7 +275,7 @@ currently composed `byui:` and `file:` providers, while retaining the generic
 2. Implement credentials/cookie policy and strict same-origin/CORS/no-CORS response filtering across HTTP and local schemes.
 3. Complete per-hop redirect CORS/security and credential policy.
 4. Replace the TTL map with a partitioned HTTP cache or integrate an existing standards-aware cache.
-5. Complete shared Body cloning/teeing and JavaScript conversion semantics.
+5. Complete JavaScript body conversion semantics on top of the explicit Rust fork/tee API.
 6. Resume browser-owned `blob:` lifecycle integration when its registry owner is scheduled.
 7. Add integrity, keepalive, service-worker, CSP/mixed-content, MIME/CORP, and timing hooks as the surrounding browser subsystems become available.
 

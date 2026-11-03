@@ -1,10 +1,6 @@
-//! Shared body storage and lifecycle state.
+//! Per-view body ownership and lifecycle observation.
 
-use std::{
-    fmt,
-    pin::Pin,
-    sync::{Arc, Mutex},
-};
+use std::{fmt, pin::Pin, sync::Mutex};
 
 use bytes::Bytes;
 use futures_util::Stream;
@@ -68,12 +64,17 @@ impl From<BodyPhase> for BodyStatus {
     }
 }
 
-/// Mutable state shared by body clones and updated while the stream is polled.
+/// Lifecycle observation for one body view, independent of the tee source.
+pub(crate) struct BodyLifecycle {
+    pub(crate) phase: BodyPhase,
+}
+
+/// Owned source, metadata, and observation for one body view.
 pub(crate) struct BodyState {
     pub(crate) source: BodySource,
     pub(crate) content_type: Option<HeaderValue>,
     pub(crate) length: Option<u64>,
-    pub(crate) phase: BodyPhase,
+    pub(crate) lifecycle: BodyLifecycle,
     pub(crate) permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -81,29 +82,10 @@ pub(crate) struct BodyState {
 ///
 /// A body is either a null body, replayable bytes, a one-shot byte source, or
 /// a one-shot stream. Consumption through [`Stream`] or an `into_*` helper
-/// marks the body used. Cloning replayable bytes creates an independent body;
-/// cloning a one-shot source shares its consumption state.
+/// marks the body used. Use [`Body::fork`] to create an independent body view
+/// while it is unused; live streams are shared through a bounded tee.
 pub struct Body {
-    pub(crate) state: Arc<Mutex<BodyState>>,
-}
-
-impl Clone for Body {
-    /// Clones replayable data independently and shares one-shot consumption state.
-    fn clone(&self) -> Self {
-        let state = self
-            .state
-            .lock()
-            .expect("body state lock should not be poisoned");
-        match &state.source {
-            BodySource::Null => Self::null(),
-            BodySource::Replayable(bytes) => {
-                Self::from_bytes_with_content_type(bytes.to_vec(), state.content_type.clone())
-            }
-            BodySource::OneShotBytes(_) | BodySource::Stream(_) => Self {
-                state: Arc::clone(&self.state),
-            },
-        }
-    }
+    pub(crate) state: Mutex<BodyState>,
 }
 
 impl fmt::Debug for Body {
@@ -122,7 +104,7 @@ impl fmt::Debug for Body {
             )
             .field("content_type", &state.content_type)
             .field("length", &state.length)
-            .field("phase", &state.phase)
+            .field("phase", &state.lifecycle.phase)
             .finish_non_exhaustive()
     }
 }
@@ -130,7 +112,7 @@ impl fmt::Debug for Body {
 impl PartialEq for Body {
     /// Compares replayable payloads by value and one-shot bodies by identity.
     fn eq(&self, other: &Self) -> bool {
-        if Arc::ptr_eq(&self.state, &other.state) {
+        if std::ptr::eq(self, other) {
             return true;
         }
         let left_state = self
@@ -147,9 +129,7 @@ impl PartialEq for Body {
                 left == right && left_state.content_type == right_state.content_type
             }
             (BodySource::OneShotBytes(_), BodySource::OneShotBytes(_))
-            | (BodySource::Stream(_), BodySource::Stream(_)) => {
-                Arc::ptr_eq(&self.state, &other.state)
-            }
+            | (BodySource::Stream(_), BodySource::Stream(_)) => false,
             _ => false,
         }
     }
@@ -158,30 +138,31 @@ impl PartialEq for Body {
 impl Eq for Body {}
 
 impl Body {
-    /// Creates an independent clone when the source is safely duplicable.
-    pub fn try_clone(&self) -> Result<Self, RequestError> {
+    /// Duplicates an unused buffered source for a separate request send.
+    pub(crate) fn try_duplicate_buffered(&self) -> Result<Self, RequestError> {
         let state = self
             .state
             .lock()
             .map_err(|_| RequestError::BodyNotCloneable)?;
-        if state.phase != BodyPhase::Unused {
+        if state.lifecycle.phase != BodyPhase::Unused {
             return Err(RequestError::BodyNotCloneable);
         }
-        match &state.source {
-            BodySource::Null => Ok(Self::null()),
-            BodySource::Replayable(bytes) => Ok(Self::new(
-                BodySource::Replayable(bytes.clone()),
-                state.content_type.clone(),
-                state.length,
-            )),
-            BodySource::OneShotBytes(Some(bytes)) => Ok(Self::new(
-                BodySource::OneShotBytes(Some(bytes.clone())),
-                state.content_type.clone(),
-                state.length,
-            )),
+        let source = match &state.source {
+            BodySource::Null => BodySource::Null,
+            BodySource::Replayable(bytes) => BodySource::Replayable(bytes.clone()),
+            BodySource::OneShotBytes(Some(bytes)) => BodySource::OneShotBytes(Some(bytes.clone())),
             BodySource::OneShotBytes(None) | BodySource::Stream(_) => {
-                Err(RequestError::BodyNotCloneable)
+                return Err(RequestError::BodyNotCloneable);
             }
-        }
+        };
+        Ok(Self::new(source, state.content_type.clone(), state.length))
+    }
+
+    /// Duplicates an unused body into independently consumable views.
+    ///
+    /// Buffered sources copy their ownership; live streams share a bounded
+    /// one-chunk tee. A used or transferred source cannot be forked.
+    pub fn fork(&mut self) -> Result<Self, RequestError> {
+        self.tee()
     }
 }

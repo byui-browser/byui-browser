@@ -3,7 +3,7 @@
 use futures_util::{StreamExt, stream};
 
 use crate::{
-    api::{body::Body, request::Request, response::InternalResponse},
+    api::{body::Body, error::RequestError, request::Request, response::InternalResponse},
     cache::{ResponseCache, StoredResponse},
 };
 
@@ -35,12 +35,12 @@ pub(crate) fn with_cache_capture(
     request: Request,
     request_url: reqwest::Url,
     max_body_size: usize,
-) -> InternalResponse {
+) -> Result<InternalResponse, RequestError> {
     let status = response.status;
     let headers = response.headers.clone();
     let url = response.url_list.last().cloned().unwrap_or_default();
     let length = response.body.length();
-    let (body, permit) = response.body.into_parts();
+    let (body, permit) = response.body.try_into_parts()?;
     let capture = CacheCapture {
         cache,
         request,
@@ -92,5 +92,51 @@ pub(crate) fn with_cache_capture(
         body.attach_permit(permit);
     }
     response.body = body;
-    response
+    Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use futures_util::{StreamExt, stream};
+    use reqwest::{
+        StatusCode,
+        header::{CACHE_CONTROL, HeaderMap, HeaderValue},
+    };
+
+    use super::*;
+    use crate::api::request::FetchContext;
+
+    #[test]
+    fn disturbed_source_cannot_become_an_empty_cached_response() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let url = reqwest::Url::parse("https://example.test/resource").unwrap();
+        let request = Request::get(url.as_str());
+        let cache = ResponseCache::default();
+        let mut headers = HeaderMap::new();
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("max-age=60"));
+        let mut body = Body::from_stream(stream::iter([Ok(Bytes::from_static(b"first"))]));
+        let _ = runtime.block_on(body.next());
+        let response = InternalResponse::from_http_parts(
+            StatusCode::OK,
+            headers,
+            url.to_string(),
+            &FetchContext::default(),
+            body,
+            false,
+            false,
+        );
+
+        assert!(matches!(
+            with_cache_capture(
+                response,
+                cache.clone(),
+                request.try_clone().unwrap(),
+                url.clone(),
+                1024
+            ),
+            Err(RequestError::BodyAlreadyConsumed)
+        ));
+        assert!(cache.get(&request, &url).is_none());
+    }
 }

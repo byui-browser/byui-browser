@@ -18,13 +18,15 @@ and provider interfaces rather than importing JavaScript types into `net`.
 
 ## Architecture and maintainability follow-up
 
-Treat the following as internal refactors: preserve the documented Rust API and
-Fetch behavior, and add focused regression coverage before changing each area.
+Treat the following as internal refactors: preserve Fetch behavior and add
+focused regression coverage before changing each area. The body ownership
+slice explicitly replaces implicit `Body` and `Request` cloning with fallible
+operations, so Rust callers must migrate those calls.
 
 | Priority | Issue                                                                                                                                                                                                                                                                                                                                                                                         | Potential solution                                                                                                                                                                                                                                                                                                                                                    |
 | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| High     | `Body` combines source ownership, lifecycle state, cloning, polling, cancellation, tee buffering, and permit retention. `Clone` has different semantics for replayable and one-shot bodies.                                                                                                                                                                                                   | Separate ownership from lifecycle observation. Define one explicit cloning model, make source transfer fallible, and retain the bounded tee only if its backpressure contract is required.                                                                                                                                                                            |
-| High     | `Body::into_parts` can turn a previously transferred source into an empty stream, concealing repeated-consumption mistakes.                                                                                                                                                                                                                                                                   | Check lifecycle state and return a typed error for consumed or transferred sources, matching the transport handoff behavior.                                                                                                                                                                                                                                          |
+| Done     | `Body` previously mixed implicit cloning of replayable and one-shot sources with lifecycle observation.                                                                                                                                                                                                                                                                                      | Each body view owns its lifecycle state. `Body::fork` duplicates buffered sources or creates bounded live-stream branches, and the shared upstream tee retains its one-chunk backpressure and permit.                                                                                                                                                                  |
+| Done     | `Body::into_parts` could turn a previously transferred source into an empty stream.                                                                                                                                                                                                                                                                                                           | `Body::try_into_parts` rejects used or transferred sources with `BodyAlreadyConsumed`; cache capture propagates the error and cannot insert a fabricated empty response.                                                                                                                                                                                                  |
 | High     | The HTTP fetch path combines cache lookup, transport exchange, redirects, CORS finalization, cookie handling, and streamed cache capture. Redirect handling also keeps the original scheme dispatch, processes cookies only for the final response, bypasses common response approval for manual redirects, and carries the original cacheability decision across method-rewriting redirects. | Split it into cache lookup, one exchange, redirect control, response finalization, and cache capture. Make each redirect hop revalidate its target and scheme, process intermediate response policy/cookies in order, finalize manual redirects through the common path, and recompute cache identity after method changes. Preserve ordering with integration tests. |
 | High     | `FetchServices` is a broad capability interface combining request/response authorization, cookies, service workers, cache partitioning, and diagnostics. Most current browser implementations are no-op adapters, so ownership and failure behavior are difficult to see at call sites.                                                                                                       | Split the interface into focused capability boundaries or an explicit services aggregate. Document which decisions are per request, per redirect hop, or per response, and define fail-closed behavior for every absent or unsupported capability.                                                                                                                    |
 | Medium   | Provider-backed scheme handlers repeat the same method gate, provider lookup, cancellation wait, and response-finalization sequence across `blob:`, `file:`, and `byui:`.                                                                                                                                                                                                                     | Retain one common provider execution path and move scheme metadata, provider selection, and read-method policy into a declarative dispatch layer. Keep provider-specific ownership and error categories explicit.                                                                                                                                                     |
@@ -43,15 +45,13 @@ provider helper already removed.
 With the current browser/provider slice complete, the next work should be
 sequenced as follows:
 
-1. Finish body ownership and cloning semantics, including tee/backpressure and
-   cache capture, so every consumer can safely share or discard a response.
-2. Implement the missing CORS preflight/cache and complete per-hop redirect
+1. Implement the missing CORS preflight/cache and complete per-hop redirect
    policy before expanding browser credentials.
-3. Replace the browser's no-op `FetchServices` defaults with origin-aware
+2. Replace the browser's no-op `FetchServices` defaults with origin-aware
    cookies, service-worker decisions, and security-policy checks.
-4. Expand the process-local cache into a standards-aware, partitioned cache
+3. Expand the process-local cache into a standards-aware, partitioned cache
    with freshness, validators, revalidation, and 304 handling.
-5. Add transport limits and diagnostics, then broaden conformance coverage.
+4. Add transport limits and diagnostics, then broaden conformance coverage.
 
 The `byui:` and `file:` providers should receive maintenance fixes and
 regression tests during these slices, but they are no longer the critical path.
@@ -65,7 +65,7 @@ The Rust engine slice is implemented. `Body` has one authoritative lifecycle,
 nullness is represented by the body itself, and helper reads, direct stream
 reads, transport handoff, cache capture, failure, abort, cancellation, and drop
 have focused transition tests. Declared lengths survive live HTTP, cache, and
-provider paths. `Body::try_clone`, `Body::tee`, and `Response::try_clone`
+provider paths. `Body::fork` and `Response::try_clone`
 provide fallible cloning with a bounded one-chunk tee, branch cancellation,
 and shared scheduler-permit ownership. Cache capture has a configured size
 bound and stores only cleanly completed bodies.
@@ -232,10 +232,10 @@ also make the ownership distinction explicit without exposing controller
 internals. The existing constructor/builder tests cover all capability
 combinations and verify failures before transport or provider side effects.
 
-The builder migration and capability-combination tests are complete. Remaining
-work is to add or finish documented Rust APIs for response cloning,
-body state where it is intentionally public, response helpers, and request
-initialization. Add a Rust-consumer guide and document IPC-safe versus
+The builder migration and capability-combination tests are complete. Body
+forking, response cloning, public body status, and response helpers are also
+implemented. Remaining work includes request initialization APIs. Add a
+Rust-consumer guide and document IPC-safe versus
 process-local types. Update the browser architecture documentation and record
 the ownership decision in an ADR. Keep raw Reqwest types private.
 

@@ -60,9 +60,12 @@ covers constructor state and length metadata, URL-encoded construction,
 ArrayBuffer reads, equality and debug output, one-shot transport handoff,
 failed and aborted streams, and malformed multipart inputs.
 
-Add focused tests for:
+The body ownership slice covers explicit forks for buffered and live sources,
+bounded tee backpressure, independent view status, checked internal transfer,
+and suppression of cache insertion for disturbed sources. Add further focused
+tests for:
 
-- fallible response cloning and stream teeing once implemented;
+- response cloning across additional body types and abort timing;
 - locked, disturbed, completed, canceled, and dropped body transitions across
   direct readers and helper methods;
 - known response length through transport, cache, and provider conversion;

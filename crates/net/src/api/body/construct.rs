@@ -1,9 +1,6 @@
 //! Body constructors and request/response stream factories.
 
-use std::{
-    io,
-    sync::{Arc, Mutex},
-};
+use std::{io, sync::Mutex};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, TryStreamExt};
@@ -11,7 +8,10 @@ use http::header::HeaderValue;
 
 use crate::api::{cancellation::AbortSignal, error::RequestError};
 
-use super::{Blob, Body, BodyPhase, BodySource, BodyState, BoxedBodyStream, FormData, form_data};
+use super::{
+    Blob, Body, BodyLifecycle, BodyPhase, BodySource, BodyState, BoxedBodyStream, FormData,
+    form_data,
+};
 
 impl Body {
     /// Creates replayable bytes with no inferred media type.
@@ -76,7 +76,7 @@ impl Body {
         Self::from_bytes_with_content_type(bytes, Some(content_type))
     }
 
-    /// Creates a one-shot byte body. Clones share its consumption state.
+    /// Creates a one-shot byte body. Forking it creates independent ownership.
     pub fn one_shot_bytes(body: impl Into<Vec<u8>>) -> Self {
         let bytes = Bytes::from(body.into());
         Self::new(
@@ -176,20 +176,22 @@ impl Body {
         )
     }
 
-    /// Initializes shared body state with optional media type and byte length.
+    /// Initializes owned body state with optional media type and byte length.
     pub(super) fn new(
         source: BodySource,
         content_type: Option<HeaderValue>,
         length: Option<u64>,
     ) -> Self {
         Self {
-            state: Arc::new(Mutex::new(BodyState {
+            state: Mutex::new(BodyState {
                 source,
                 content_type,
                 length,
-                phase: BodyPhase::Unused,
+                lifecycle: BodyLifecycle {
+                    phase: BodyPhase::Unused,
+                },
                 permit: None,
-            })),
+            }),
         }
     }
 

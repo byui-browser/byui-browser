@@ -16,4 +16,4 @@ pub use form_data::{FormData, FormDataEntry};
 pub use state::{Body, BodyStatus};
 
 pub(crate) use crate::api::error::RequestError;
-pub(crate) use state::{BodyPhase, BodySource, BodyState, BoxedBodyStream};
+pub(crate) use state::{BodyLifecycle, BodyPhase, BodySource, BodyState, BoxedBodyStream};

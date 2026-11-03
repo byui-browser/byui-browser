@@ -120,6 +120,7 @@ impl Body {
         self.state
             .lock()
             .expect("body state lock should not be poisoned")
+            .lifecycle
             .phase
             != BodyPhase::Unused
     }
@@ -129,6 +130,7 @@ impl Body {
         self.state
             .lock()
             .expect("body state lock should not be poisoned")
+            .lifecycle
             .phase
             == BodyPhase::Locked
     }
@@ -138,6 +140,7 @@ impl Body {
         self.state
             .lock()
             .expect("body state lock should not be poisoned")
+            .lifecycle
             .phase
             .into()
     }

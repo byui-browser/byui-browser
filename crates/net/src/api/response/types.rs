@@ -66,7 +66,7 @@ impl Response {
     /// Cloning fails after body consumption has started. Live streams use a
     /// one-chunk-per-branch buffer so a slow clone applies backpressure.
     pub fn try_clone(&mut self) -> Result<Self, crate::RequestError> {
-        let cloned = self.body.tee()?;
+        let cloned = self.body.fork()?;
         Ok(Self {
             response_type: self.response_type,
             status: self.status,

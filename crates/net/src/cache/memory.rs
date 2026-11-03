@@ -208,7 +208,7 @@ mod tests {
     /// Verifies cache keys distinguish request methods.
     fn cache_key_distinguishes_http_methods() {
         let get = Request::get("https://example.test/resource");
-        let mut head = get.clone();
+        let mut head = get.try_clone().unwrap();
         head.method = reqwest::Method::HEAD;
 
         let url = Url::parse(&get.url).unwrap();
@@ -221,7 +221,7 @@ mod tests {
         let url = Url::parse("https://example.test/resource").unwrap();
         let mut first = Request::get(url.as_str());
         first.cache_partition = Some("site-a".into());
-        let mut second = first.clone();
+        let mut second = first.try_clone().unwrap();
         second.cache_partition = Some("site-b".into());
         assert_ne!(cache_key(&first, &url), cache_key(&second, &url));
         assert_ne!(

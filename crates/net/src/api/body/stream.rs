@@ -113,12 +113,12 @@ impl Drop for TeeBranch {
 
 impl Body {
     /// Tees an unused body, retaining one branch and returning the other.
-    pub fn tee(&mut self) -> Result<Self, RequestError> {
+    pub(super) fn tee(&mut self) -> Result<Self, RequestError> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| RequestError::BodyNotCloneable)?;
-        if state.phase != BodyPhase::Unused {
+        if state.lifecycle.phase != BodyPhase::Unused {
             return Err(RequestError::BodyNotCloneable);
         }
         let content_type = state.content_type.clone();
@@ -143,7 +143,7 @@ impl Body {
             BodySource::Stream(stream) => {
                 let stream = stream.take().ok_or(RequestError::BodyNotCloneable)?;
                 let permit = state.permit.take();
-                state.phase = BodyPhase::Transferred;
+                state.lifecycle.phase = BodyPhase::Transferred;
                 let shared = Arc::new(Mutex::new(TeeState {
                     source: Some(stream),
                     buffers: [VecDeque::new(), VecDeque::new()],
@@ -182,16 +182,16 @@ impl Stream for Body {
             .lock()
             .expect("body state lock should not be poisoned");
         if matches!(
-            state.phase,
+            state.lifecycle.phase,
             BodyPhase::Transferred | BodyPhase::Complete | BodyPhase::Failed | BodyPhase::Aborted
         ) {
             return Poll::Ready(None);
         }
-        if state.phase == BodyPhase::Unused {
-            state.phase = BodyPhase::Streaming;
+        if state.lifecycle.phase == BodyPhase::Unused {
+            state.lifecycle.phase = BodyPhase::Streaming;
         }
         if matches!(state.source, BodySource::Null) {
-            state.phase = BodyPhase::Complete;
+            state.lifecycle.phase = BodyPhase::Complete;
             state.permit = None;
             return Poll::Ready(None);
         }
@@ -201,7 +201,7 @@ impl Stream for Body {
             _ => None,
         };
         if let Some(bytes) = replayable {
-            state.phase = BodyPhase::Complete;
+            state.lifecycle.phase = BodyPhase::Complete;
             state.permit = None;
             return Poll::Ready(Some(Ok(bytes)));
         }
@@ -213,12 +213,12 @@ impl Stream for Body {
         if let Some(bytes) = one_shot {
             return match bytes {
                 Some(bytes) => {
-                    state.phase = BodyPhase::Complete;
+                    state.lifecycle.phase = BodyPhase::Complete;
                     state.permit = None;
                     Poll::Ready(Some(Ok(bytes)))
                 }
                 None => {
-                    state.phase = BodyPhase::Complete;
+                    state.lifecycle.phase = BodyPhase::Complete;
                     state.permit = None;
                     Poll::Ready(None)
                 }
@@ -236,7 +236,7 @@ impl Stream for Body {
                 if let BodySource::Stream(stream) = &mut state.source {
                     *stream = None;
                 }
-                state.phase = BodyPhase::Complete;
+                state.lifecycle.phase = BodyPhase::Complete;
                 state.permit = None;
                 Poll::Ready(None)
             }
@@ -246,7 +246,7 @@ impl Stream for Body {
                 if let BodySource::Stream(stream) = &mut state.source {
                     *stream = None;
                 }
-                state.phase = if matches!(error, RequestError::Aborted) {
+                state.lifecycle.phase = if matches!(error, RequestError::Aborted) {
                     BodyPhase::Aborted
                 } else {
                     BodyPhase::Failed

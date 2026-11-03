@@ -83,12 +83,17 @@ impl RequestController {
 
             // The scheduler owns concurrency admission. Transport remains
             // focused on HTTP I/O and connection pooling.
+            let had_nonreplayable_body = request
+                .body
+                .as_ref()
+                .is_some_and(|body| !body.is_replayable());
+            let attempt = request.for_transport()?;
             let mut candidate = self
                 .inner
                 .scheduler
                 .submit(
                     PreparedRequest {
-                        request: request.clone(),
+                        request: attempt,
                         headers: transport_headers,
                         url: url.clone(),
                     },
@@ -127,18 +132,14 @@ impl RequestController {
             if request.redirect_count >= 20 {
                 return Err(RequestError::RedirectFailure);
             }
-            if matches!(status, 307 | 308)
-                && request
-                    .body
-                    .as_ref()
-                    .is_some_and(|body| !body.is_replayable())
-            {
+            let rewrite_to_get = (matches!(status, 301 | 302)
+                && request.method() == http::Method::POST)
+                || (status == 303
+                    && !matches!(request.method(), &http::Method::GET | &http::Method::HEAD));
+            if had_nonreplayable_body && !rewrite_to_get {
                 return Err(RequestError::RedirectFailure);
             }
-            if (matches!(status, 301 | 302) && request.method() == http::Method::POST)
-                || (status == 303
-                    && !matches!(request.method(), &http::Method::GET | &http::Method::HEAD))
-            {
+            if rewrite_to_get {
                 request.rewrite_for_redirect()?;
             }
             let cross_origin = request.current_url().is_some_and(|current| {
@@ -189,10 +190,10 @@ impl RequestController {
             response = with_cache_capture(
                 response,
                 self.inner.cache.clone(),
-                request.clone(),
+                request.for_cache(),
                 url,
                 self.inner.max_cache_body_size,
-            );
+            )?;
         }
         Ok(response.expose())
     }

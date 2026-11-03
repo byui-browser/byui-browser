@@ -13,10 +13,10 @@ impl Body {
             .state
             .lock()
             .map_err(|_| RequestError::BodyAlreadyUsed)?;
-        if state.phase != BodyPhase::Unused {
+        if state.lifecycle.phase != BodyPhase::Unused {
             return Err(RequestError::BodyAlreadyUsed);
         }
-        state.phase = BodyPhase::Locked;
+        state.lifecycle.phase = BodyPhase::Locked;
         Ok(())
     }
 
