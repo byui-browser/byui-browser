@@ -1,0 +1,18 @@
+[package]
+name = "browser-js"
+description = "Interactive JavaScript shell for BYUI Browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+js = { workspace = true }
+
+[[bin]]
+name = "browser-js"
+path = "src/main.rs"
+
+[lints]
+workspace = true

@@ -7,6 +7,24 @@ An independent web browser built from scratch in Rust. See
 crate ownership, and collaboration rules. Team overviews live in
 [`docs/TEAMS.md`](docs/TEAMS.md).
 
+## Downloads
+
+Pushing a version tag (`v0.1.0`, or any `v*.*.*` tag) runs the
+[release workflow](.github/workflows/release.yml). It builds the native shell
+for macOS, Linux, and Windows, then attaches one archive to the
+[GitHub Release](https://github.com/byui-browser/byui-browser/releases) for that
+tag. These links always download the latest release:
+
+- [macOS (Apple Silicon)](https://github.com/byui-browser/byui-browser/releases/latest/download/byui-browser-macos-aarch64.tar.gz)
+- [Linux (x86_64)](https://github.com/byui-browser/byui-browser/releases/latest/download/byui-browser-linux-x86_64.tar.gz)
+- [Windows (x86_64)](https://github.com/byui-browser/byui-browser/releases/latest/download/byui-browser-windows-x86_64.zip)
+
+Each archive contains a `byui-browser` program (`byui-browser.exe` on
+Windows). The Linux build uses the system GTK 3 libraries, so install
+`libgtk-3-0` on Debian and Ubuntu before launching it. macOS quarantines the
+downloaded binary; clear that with
+`xattr -d com.apple.quarantine byui-browser` before the first launch.
+
 ## Repository layout
 
 ```
@@ -33,6 +51,8 @@ crate ownership, and collaboration rules. Team overviews live in
 └── docs/
     ├── TECH_ARCHITECTURE.md
     ├── TEAMS.md
+    ├── CI.md
+    ├── PLATFORM_TESTING.md
     └── adr/             # Architecture Decision Records
 ```
 
@@ -53,7 +73,7 @@ make test                  # unit tests across the workspace
 make test html             # tests for a single crate
 cargo test -p html -- --ignored   # backlog: contract tests not yet implemented
 make lint                  # rustfmt check + clippy (-D warnings)
-make release linux         # release build for macos | linux | windows
+make release linux         # release build of the native shell (macos, linux, or windows)
 ```
 
 The binary entry point:
@@ -62,10 +82,10 @@ The binary entry point:
 cargo run -p browser
 ```
 
-`make run` selects the platform shell automatically. The macOS shell currently
-renders the startup HTML page, parses its CSS, and executes its JavaScript
-startup script. Linux and Windows shells are not implemented yet, so the
-command reports that limitation instead of running the wrong binary.
+`make run` selects the platform shell automatically. The macOS, Linux, and
+Windows shells currently render the startup HTML page, parse its CSS, and
+execute its JavaScript startup script; see [`platforms/`](platforms/README.md)
+for what each shell needs.
 
 ## Development workflow
 
@@ -74,6 +94,7 @@ command reports that limitation instead of running the wrong binary.
 - Before merge: `make lint` and `make test` (or `make test <crate>` for changed crates)
 - Cross-crate / `common` changes need review from affected owning teams
 - Record architecture decisions in [`docs/adr/`](docs/adr/)
+- See [`docs/CI.md`](docs/CI.md) for pull-request checks and local equivalents.
 
 ## Status
 

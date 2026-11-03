@@ -2,6 +2,7 @@ use http::{
     Method,
     header::{CONTENT_TYPE, HeaderName, HeaderValue},
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use url::Url;
 
 use crate::api::{
@@ -17,6 +18,7 @@ use crate::api::headers::is_cors_safelisted_header;
 /// A browser request before conversion to a transport request.
 #[derive(Clone, Debug)]
 pub struct Request {
+    pub(crate) id: u64,
     pub(crate) url: String,
     pub(crate) method: Method,
     pub(crate) headers: Headers,
@@ -39,6 +41,8 @@ pub struct Request {
     pub(crate) cache_partition: Option<String>,
 }
 
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Relative importance assigned to a request by the network scheduler.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub enum RequestPriority {
@@ -55,6 +59,7 @@ impl Request {
     /// Creates a GET request with Fetch's default request state.
     pub fn get(url: impl Into<String>) -> Self {
         Self {
+            id: NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             url: url.into(),
             method: Method::GET,
             headers: Headers::new(),
@@ -87,6 +92,14 @@ impl Request {
     pub fn url(&self) -> &str {
         &self.url
     }
+    /// Returns this request's process-local identity.
+    ///
+    /// The identifier is stable across clones and is intended for
+    /// browser-owned request bookkeeping. It does not itself authorize any
+    /// operation.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
     /// Returns the normalized HTTP method.
     pub fn method(&self) -> &Method {
         &self.method
@@ -116,14 +129,19 @@ impl Request {
         &self.context.environment
     }
     /// Returns all URLs visited by this request, in order.
-    /// The supported single-exchange path never follows a redirect.
     pub fn url_list(&self) -> &[Url] {
         &self.url_list
     }
     /// Returns the number of redirects followed so far.
-    /// This remains zero until controller-owned redirects are implemented.
     pub fn redirect_count(&self) -> usize {
         self.redirect_count
+    }
+    /// Returns the cancellation signal associated with this request.
+    ///
+    /// Scheme providers may clone the signal when provider-owned work must
+    /// outlive the initial resolution future.
+    pub fn signal(&self) -> &AbortSignal {
+        &self.signal
     }
     /// Replaces the method after Fetch token and forbidden-method validation.
     pub fn set_method(&mut self, method: impl AsRef<str>) -> Result<(), RequestError> {
@@ -256,6 +274,7 @@ impl Request {
             }
         }
     }
+    /// Reports whether method or headers require a CORS preflight.
     pub(crate) fn requires_cors_preflight(&self) -> bool {
         !matches!(self.method, Method::GET | Method::HEAD | Method::POST)
             || self
@@ -271,11 +290,36 @@ impl Request {
             RequestPriority::High => crate::scheduling::RequestPriority::High,
         }
     }
+    /// Records the validated URL as the current and initial request URL.
     pub(crate) fn prepare_url(&mut self, url: Url) {
         if self.url_list.is_empty() {
             self.url_list.push(url.clone());
         }
         self.current_url = Some(url);
+    }
+
+    pub(crate) fn follow_url(&mut self, url: Url) {
+        self.url_list.push(url.clone());
+        self.current_url = Some(url);
+        self.redirect_count += 1;
+    }
+
+    pub(crate) fn rewrite_for_redirect(&mut self) -> Result<(), RequestError> {
+        self.set_method("GET")?;
+        self.body = None;
+        self.headers.remove_internal_header(CONTENT_TYPE);
+        self.headers
+            .remove_internal_header(HeaderName::from_static("content-length"));
+        Ok(())
+    }
+
+    pub(crate) fn strip_sensitive_redirect_headers(&mut self) {
+        for name in [
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("proxy-authorization"),
+        ] {
+            self.headers.remove_internal_header(name);
+        }
     }
     /// Builds the internal transport header channel without changing caller headers.
     pub(crate) fn fetch_headers(&self) -> Result<Headers, RequestError> {
@@ -325,6 +369,7 @@ impl Request {
             ReferrerPolicy::Empty => Some(source_origin),
         }
     }
+    /// Validates method, no-CORS, and keepalive constraints for the body.
     pub(crate) fn validate_body_state(
         &self,
         max_keepalive_body_size: u64,
@@ -353,5 +398,133 @@ impl Request {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_mode_respects_tuple_and_opaque_origins() {
+        let mut request = Request::get("https://client.test/resource");
+        request.context.environment.origin = Some(Origin::parse("https://client.test").unwrap());
+
+        request.context.credentials = CredentialsMode::Omit;
+        assert!(!request.credentials_allowed(&Url::parse("https://client.test/other").unwrap()));
+
+        request.context.credentials = CredentialsMode::SameOrigin;
+        assert!(request.credentials_allowed(&Url::parse("https://client.test/other").unwrap()));
+        assert!(
+            !request.credentials_allowed(&Url::parse("https://client.test:8443/other").unwrap())
+        );
+        assert!(!request.credentials_allowed(&Url::parse("https://remote.test/other").unwrap()));
+
+        request.context.environment.origin = Some(Origin::opaque());
+        assert!(!request.credentials_allowed(&Url::parse("https://client.test/other").unwrap()));
+
+        request.context.credentials = CredentialsMode::Include;
+        assert!(request.credentials_allowed(&Url::parse("https://remote.test/other").unwrap()));
+    }
+
+    #[test]
+    fn referrer_policies_reduce_same_origin_cross_origin_and_downgrade_targets() {
+        let source = Url::parse("https://client.test/path?query=one").unwrap();
+        let same_origin = Url::parse("https://client.test/next").unwrap();
+        let cross_origin = Url::parse("https://remote.test/next").unwrap();
+        let downgrade = Url::parse("http://remote.test/next").unwrap();
+        let mut request = Request::get("https://client.test/resource");
+        request.context.environment.referrer = Some(source.clone());
+        request.set_referrer(Referrer::Client, ReferrerPolicy::Empty);
+
+        assert_eq!(
+            request.referrer_value(&same_origin).as_deref(),
+            Some(source.as_str())
+        );
+        assert_eq!(
+            request.referrer_value(&cross_origin).as_deref(),
+            Some("https://client.test")
+        );
+        assert_eq!(request.referrer_value(&downgrade), None);
+
+        request.set_referrer(Referrer::Client, ReferrerPolicy::NoReferrer);
+        assert_eq!(request.referrer_value(&same_origin), None);
+
+        request.set_referrer(Referrer::Client, ReferrerPolicy::OriginWhenCrossOrigin);
+        assert_eq!(
+            request.referrer_value(&same_origin).as_deref(),
+            Some(source.as_str())
+        );
+        assert_eq!(
+            request.referrer_value(&cross_origin).as_deref(),
+            Some("https://client.test")
+        );
+
+        request.set_referrer(Referrer::Client, ReferrerPolicy::SameOrigin);
+        assert_eq!(
+            request.referrer_value(&same_origin).as_deref(),
+            Some(source.as_str())
+        );
+        assert_eq!(request.referrer_value(&cross_origin), None);
+
+        request.set_referrer(Referrer::Client, ReferrerPolicy::UnsafeUrl);
+        assert_eq!(
+            request.referrer_value(&downgrade).as_deref(),
+            Some(source.as_str())
+        );
+    }
+
+    #[test]
+    fn request_mutators_enforce_method_body_and_no_cors_boundaries() {
+        for method in ["CONNECT", "TRACE", "TRACK"] {
+            assert!(matches!(
+                Request::new("https://example.test/", method),
+                Err(RequestError::ForbiddenMethod(actual)) if actual == method
+            ));
+        }
+
+        let mut get = Request::get("https://example.test/");
+        assert!(matches!(
+            get.set_body(Some(Body::from_text("payload"))),
+            Err(RequestError::BodyNotAllowed(method)) if method == "GET"
+        ));
+
+        let mut no_cors = Request::get("https://example.test/");
+        no_cors.set_mode(RequestMode::NoCors).unwrap();
+        assert!(matches!(
+            no_cors.set_method("PUT"),
+            Err(RequestError::NoCorsMethod(method)) if method == "PUT"
+        ));
+        no_cors.set_method("POST").unwrap();
+        no_cors
+            .set_body(Some(Body::from_bytes_with_content_type(
+                b"{}".to_vec(),
+                Some(HeaderValue::from_static("application/json")),
+            )))
+            .unwrap();
+        assert!(matches!(
+            no_cors.validate_body_state(64),
+            Err(RequestError::ForbiddenHeader(name)) if name == "content-type"
+        ));
+    }
+
+    #[test]
+    fn keepalive_body_limit_accepts_the_boundary_and_rejects_larger_bodies() {
+        let mut at_limit = Request::new("https://example.test/", "POST").unwrap();
+        at_limit.set_keepalive(true);
+        at_limit
+            .set_body(Some(Body::from_bytes(vec![0; 4])))
+            .unwrap();
+        assert!(at_limit.validate_body_state(4).is_ok());
+
+        let mut over_limit = Request::new("https://example.test/", "POST").unwrap();
+        over_limit.set_keepalive(true);
+        over_limit
+            .set_body(Some(Body::from_bytes(vec![0; 5])))
+            .unwrap();
+        assert!(matches!(
+            over_limit.validate_body_state(4),
+            Err(RequestError::KeepaliveBodyTooLarge { limit: 4 })
+        ));
     }
 }

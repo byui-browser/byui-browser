@@ -14,12 +14,15 @@ use crate::{Config, Request, RequestController};
 use reqwest::StatusCode;
 
 #[test]
+/// Verifies a fresh cached GET avoids a second server request.
 fn cache_serves_a_fresh_get_without_a_second_network_request() {
     // The local server returns an explicit freshness lifetime. The second GET
     // should therefore be served from the client's cache.
     let (address, request_count, server) = start_cached_server();
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
 
     let (first_status, first_from_cache, first_body, second) = runtime.block_on(async {
         let first = client
@@ -50,6 +53,7 @@ fn cache_serves_a_fresh_get_without_a_second_network_request() {
     assert_eq!(request_count.load(Ordering::SeqCst), 1);
 }
 
+/// Starts the local counting server used by cache integration tests.
 fn start_cached_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
     // Bind an ephemeral local port so this test does not depend on external
     // services or a fixed port that could already be in use.
@@ -77,6 +81,7 @@ fn start_cached_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
     (address, request_count, server)
 }
 
+/// Reads and discards one HTTP request from the test server socket.
 fn read_request(stream: &mut TcpStream) {
     // Reading the request headers ensures the server does not race the client
     // before writing its response. The contents are not relevant to this test.

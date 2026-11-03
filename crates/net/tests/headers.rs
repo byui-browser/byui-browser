@@ -68,7 +68,9 @@ fn fetch_sends_headers_and_body_to_a_local_server() {
         .unwrap();
     request.set_cache_mode(CacheMode::NoStore);
 
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
     let response = runtime().block_on(controller.fetch(request)).unwrap();
 
     server.join();
@@ -148,8 +150,10 @@ fn generated_request_header_channels_do_not_mutate_caller_headers() {
     request.set_cache_mode(CacheMode::NoStore);
     assert!(request.headers().is_empty());
 
-    let controller =
-        RequestController::with_services(Config::default(), Arc::new(ChannelServices)).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(Arc::new(ChannelServices))
+        .build()
+        .unwrap();
     let response = runtime()
         .block_on(controller.fetch(request.clone()))
         .unwrap();
@@ -170,7 +174,7 @@ fn configured_user_agent_is_sent_to_the_server() {
         user_agent: Some(HeaderValue::from_static("test-browser/1.0")),
         ..Config::default()
     };
-    let controller = RequestController::new(config).unwrap();
+    let controller = RequestController::builder(config).build().unwrap();
     let response = runtime().block_on(controller.fetch(Request::get(server.url())));
 
     server.join();
@@ -191,7 +195,9 @@ fn cross_origin_fetch_exposes_only_cors_allowed_headers() {
     );
     let response = runtime()
         .block_on(
-            RequestController::with_services(Config::default(), Arc::new(TestServices))
+            RequestController::builder(Config::default())
+                .with_fetch_services(Arc::new(TestServices))
+                .build()
                 .unwrap()
                 .fetch(request),
         )
@@ -217,7 +223,9 @@ fn cross_origin_no_cors_fetch_is_opaque() {
     request.set_mode(RequestMode::NoCors).unwrap();
     let response = runtime()
         .block_on(
-            RequestController::with_services(Config::default(), Arc::new(TestServices))
+            RequestController::builder(Config::default())
+                .with_fetch_services(Arc::new(TestServices))
+                .build()
                 .unwrap()
                 .fetch(request),
         )
@@ -291,7 +299,9 @@ fn browser_services_own_cookie_and_raw_response_header_decisions() {
     request.set_cache_mode(CacheMode::NoStore);
     let response = runtime()
         .block_on(
-            RequestController::with_services(Config::default(), services)
+            RequestController::builder(Config::default())
+                .with_fetch_services(services)
+                .build()
                 .unwrap()
                 .fetch(request),
         )

@@ -31,3 +31,16 @@ impl Default for Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+
+    fn creates_default_config() {
+        let config = Config::default();
+
+        assert_eq!(config.pool_max_idle_per_host, 8);
+    }
+}

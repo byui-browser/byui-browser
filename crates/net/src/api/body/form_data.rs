@@ -125,6 +125,7 @@ pub(super) fn parse(content_type: &str, bytes: &[u8]) -> Result<FormData, Reques
     parse_multipart(bytes, boundary)
 }
 
+/// Extracts the boundary parameter from a multipart media type.
 fn multipart_boundary(content_type: &str) -> Option<&str> {
     content_type.split(';').skip(1).find_map(|parameter| {
         let (name, value) = parameter.trim().split_once('=')?;
@@ -134,6 +135,7 @@ fn multipart_boundary(content_type: &str) -> Option<&str> {
     })
 }
 
+/// Parses multipart parts into text entries or blob-backed file entries.
 fn parse_multipart(bytes: &[u8], boundary: &str) -> Result<FormData, RequestError> {
     let boundary = format!("--{boundary}");
     let body = std::str::from_utf8(bytes)
@@ -178,6 +180,7 @@ fn parse_multipart(bytes: &[u8], boundary: &str) -> Result<FormData, RequestErro
     Ok(form)
 }
 
+/// Reads a named parameter from a multipart content-disposition header.
 fn disposition_parameter(disposition: &str, requested: &str) -> Option<String> {
     disposition.split(';').skip(1).find_map(|parameter| {
         let (name, value) = parameter.trim().split_once('=')?;

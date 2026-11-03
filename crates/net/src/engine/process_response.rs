@@ -9,6 +9,33 @@ use crate::{
 };
 
 impl RequestController {
+    /// Applies shared response policy before public response exposure.
+    ///
+    /// This deliberately does not process cookies or cache entries: local
+    /// schemes do not participate in either HTTP facility.
+    pub(crate) fn finalize_response(
+        &self,
+        request: &Request,
+        response: &mut InternalResponse,
+    ) -> Result<(), RequestError> {
+        response.response_type = self.inner.cors.response_type(request, response)?;
+        crate::policy::validate_response(request, response)?;
+        self.approve_response(request, response)
+    }
+
+    /// Converts and finalizes a scheme-owned resource through the common path.
+    pub(crate) fn finalize_scheme_resource(
+        &self,
+        request: &Request,
+        resource: crate::api::providers::SchemeResource,
+        scheme: crate::policy::FetchScheme,
+    ) -> Result<crate::api::response::Response, RequestError> {
+        let mut response = InternalResponse::from_scheme_resource(resource, request, scheme)?;
+        self.finalize_response(request, &mut response)?;
+        Ok(response.expose())
+    }
+
+    /// Gives browser-owned services the final opportunity to approve a response.
     pub(crate) fn approve_response(
         &self,
         request: &Request,

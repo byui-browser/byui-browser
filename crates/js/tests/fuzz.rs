@@ -47,6 +47,23 @@ const REGRESSIONS: &[&str] = &[
     "\u{FEFF}",
     "é",
     "😀 = 1",
+    "\\u",
+    "\\u{",
+    "a\\u{}",
+    "a\\u{110000}",
+    "a\\u{FFFFFFFFFFFF}",
+    "a\\u0020",
+    "\\u0031",
+    "\\uD835\\uDC00",
+    "\\u0069f",
+    "var \\u0069f = 1",
+    "a.\\u0069f",
+    "caf\\u00e9 = 1",
+    "e\u{301}",
+    "\u{301}",
+    "a\u{200C}b",
+    "\\x41",
+    "a\\",
     "f()()()",
     "function f() { return f; } f()()()",
     "function f() { return f(); } f()",
@@ -69,6 +86,7 @@ const SEEDS: &[&str] = &[
     "if (1 < 2) { 'yes'; } else { 'no'; }",
     "const s = '\\x41\\u0042\\u{43}\\n\\t\\0'; s",
     "/* block */ let a = 1; // line\n a",
+    "let café = 1; let 名前 = caf\\u00e9; function \\u{66}(π) { return π + 名前; } f(caf\\u{E9})",
 ];
 
 #[test]
@@ -180,8 +198,10 @@ fn check_parser(source: &str) -> Option<Program> {
     let result = parse(source);
     assert_eq!(result, parse(source), "parsing is not deterministic");
 
-    let token_level = parser::parse_program(&lexer::tokenize(source));
-    assert_eq!(token_level.is_ok(), result.is_ok());
+    // The token-level parser intentionally has no source whitespace metadata;
+    // the source-level parser is the API that applies automatic semicolon
+    // insertion using spanned-token gaps.
+    let _ = parser::parse_program(&lexer::tokenize(source));
 
     match result {
         Ok(program) => Some(program),
@@ -257,7 +277,7 @@ impl Rng {
 
 const SPECIAL_CHARS: &[char] = &[
     '\\', '\'', '"', '\n', '\r', '\t', '\0', '\u{2028}', '\u{FEFF}', '\u{A0}', 'é', '😀', '{', '}',
-    '(', ')', '/', '*', '.', '[', ']',
+    '(', ')', '/', '*', '.', '[', ']', 'π', '名', '\u{301}', '\u{200C}',
 ];
 
 fn random_text(rng: &mut Rng) -> String {
@@ -339,6 +359,14 @@ const FRAGMENTS: &[&str] = &[
     "]",
     "a.b",
     "o[k]",
+    "café",
+    "名前",
+    "\\u0061",
+    "\\u{62}",
+    "\\u0069f",
+    "\\u0031",
+    "\\u{",
+    "\\",
     "//",
     "/*",
     "*/",

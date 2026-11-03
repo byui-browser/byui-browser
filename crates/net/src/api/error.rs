@@ -2,6 +2,27 @@
 
 use crate::HeaderGuard;
 
+/// Stable categories returned by browser-owned Fetch scheme providers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderErrorKind {
+    /// The requested resource does not exist.
+    ResourceMissing,
+    /// The requested resource exists but is not a type the provider can serve.
+    UnsupportedResource,
+    /// A previously valid resource is no longer available.
+    Revoked,
+    /// Browser authorization or sandbox policy denied access.
+    AccessDenied,
+    /// The provider rejected work because its bounded resource budget is full.
+    ResourceExhausted,
+    /// The provider failed after beginning its operation.
+    Io,
+    /// The provider returned metadata that violates its contract.
+    MalformedMetadata,
+    /// The provider returned an invalid or unavailable origin.
+    InvalidOrigin,
+}
+
 /// Errors that can occur while preparing, executing, or consuming a fetch.
 ///
 /// URL, method, header, capability, keepalive, and scheduler errors occur
@@ -16,7 +37,7 @@ use crate::HeaderGuard;
 /// | Variants | Recovery and body effect |
 /// | --- | --- |
 /// | `Initialization` | Fix client configuration; no request or response body exists. |
-/// | `InvalidUrl`, `InvalidOrigin`, `InvalidMethod`, `ForbiddenMethod`, `NoCorsMethod`, `ForbiddenHeader`, `InvalidHeaderName`, `InvalidHeaderValue`, `ImmutableHeaders`, `InvalidHeaderGuardTransition`, `BodyNotAllowed`, `KeepaliveBodyTooLarge`, `UnsupportedScheme`, `UnsupportedFeature` | Correct the request; no body is consumed by this failed attempt. |
+/// | `InvalidUrl`, `InvalidOrigin`, `InvalidMethod`, `ForbiddenMethod`, `NoCorsMethod`, `ForbiddenHeader`, `InvalidHeaderName`, `InvalidHeaderValue`, `ImmutableHeaders`, `InvalidHeaderGuardTransition`, `BodyNotAllowed`, `KeepaliveBodyTooLarge`, `UnsupportedScheme`, `UnsupportedFeature`, `MissingProvider`, `Provider`, `InvalidResponse` | Correct the request, provider, or response metadata; no body is exposed by this failed attempt. |
 /// | `SchedulerClosed` | Use a live controller; the request body was not sent. |
 /// | `NetworkError` | A cache-only miss; retry after cache state changes or choose another cache mode. No body was consumed. |
 /// | `BodyAlreadyConsumed` | The request body was spent by a prior attempt; create a fresh body. |
@@ -41,8 +62,19 @@ pub enum RequestError {
     RedirectFailure,
     /// A request selected a capability without an installed provider.
     UnsupportedFeature(&'static str),
+    /// A scheme requires a browser-owned provider that was not installed.
+    MissingProvider(&'static str),
+    /// A browser-owned provider failed with a stable capability outcome.
+    Provider {
+        /// Stable provider name used for diagnostics and routing assertions.
+        provider: &'static str,
+        /// Stable failure category that callers may match.
+        kind: ProviderErrorKind,
+    },
     /// The URL uses a scheme unsupported by the HTTP transport.
     UnsupportedScheme(String),
+    /// A provider or transport adapter returned invalid response metadata.
+    InvalidResponse(String),
     /// The serialized origin is malformed or is not an HTTP(S) origin.
     InvalidOrigin(String),
     /// The request method is not a valid HTTP token.
@@ -80,7 +112,10 @@ pub enum RequestError {
     /// Body bytes are not valid supported form data.
     BodyFormData(String),
     /// The keepalive body exceeds the configured byte quota.
-    KeepaliveBodyTooLarge { limit: u64 },
+    KeepaliveBodyTooLarge {
+        /// Maximum body size, in bytes, accepted by the controller.
+        limit: u64,
+    },
     /// The scheduler was shut down before the request could run.
     SchedulerClosed,
     /// The request was aborted before completion.
@@ -99,7 +134,12 @@ impl std::fmt::Display for RequestError {
             Self::SameOriginViolation => f.write_str("Same-origin request crossed origins"),
             Self::RedirectFailure => f.write_str("Redirect could not be processed"),
             Self::UnsupportedFeature(feature) => write!(f, "Unsupported Fetch feature: {feature}"),
+            Self::MissingProvider(provider) => write!(f, "Missing Fetch provider: {provider}"),
+            Self::Provider { provider, kind } => {
+                write!(f, "Fetch provider {provider} failed: {kind:?}")
+            }
             Self::UnsupportedScheme(scheme) => write!(f, "Unsupported URL scheme: {scheme}"),
+            Self::InvalidResponse(response) => write!(f, "Invalid response: {response}"),
             Self::InvalidOrigin(origin) => write!(f, "Invalid request origin: {origin}"),
             Self::InvalidMethod(method) => write!(f, "Invalid request method: {method}"),
             Self::ForbiddenMethod(method) => write!(f, "Forbidden request method: {method}"),

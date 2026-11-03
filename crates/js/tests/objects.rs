@@ -1,8 +1,9 @@
 //! Object values and member access: `object.name`, `object[key]`, member
 //! assignment, and calling host-provided methods.
 //!
-//! Scripts cannot create objects yet (no object literals), so every object
-//! here is built by the host and installed with `Realm::register_global_value`.
+//! Objects here are built by the host and installed with
+//! `Realm::register_global_value`; object literals are covered in
+//! `object_literals.rs`.
 
 use std::sync::{Arc, Mutex};
 
@@ -272,7 +273,7 @@ fn objects_are_shared_references() {
         number(9.0)
     );
     assert_eq!(
-        realm.evaluate_script("let alias = object; alias === object"),
+        realm.evaluate_script("alias === object"),
         Ok(Value::Boolean(true))
     );
     // Property changes persist across scripts and are visible to the host.
@@ -317,8 +318,8 @@ fn member_assignment_evaluates_object_then_key_then_value() {
 #[test]
 fn method_is_read_before_arguments_are_evaluated() {
     let (realm, _, log) = recording_realm();
-    let error = runtime_error(&realm, "object.missing(log('argument'))");
-    assert_eq!(error.message, "`object.missing` is not defined");
+    let error = runtime_error(&realm, "object.missing.method(log('argument'))");
+    assert_eq!(error.message, "Cannot read property `method` of undefined");
     assert!(log.lock().unwrap().is_empty());
 }
 
@@ -429,22 +430,52 @@ fn methods_do_not_receive_this() {
 // Errors -------------------------------------------------------------------------------------
 
 #[test]
-fn missing_properties_are_runtime_errors() {
+fn missing_properties_read_as_undefined() {
+    let (realm, object) = realm_with_object();
+    for source in [
+        "object.missing",
+        "object['missing']",
+        "object[1]",
+        "({}).anything",
+        "({ a: 1 }).b",
+    ] {
+        assert_eq!(
+            realm.evaluate_script(source),
+            Ok(Value::Undefined),
+            "{source}"
+        );
+    }
+    assert_eq!(
+        realm.evaluate_script("object.missing === undefined"),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(
+        realm.evaluate_script("object.missing || 'fallback'"),
+        Ok(Value::String("fallback".into()))
+    );
+    assert!(
+        !object.contains_key("missing"),
+        "reading must not create the property"
+    );
+}
+
+#[test]
+fn reading_through_a_missing_property_is_a_runtime_error() {
     let (realm, _) = realm_with_object();
     for (source, message) in [
-        ("object.missing", "`object.missing` is not defined"),
         (
             "object.value.missing",
             "Cannot read property `missing` of a number",
         ),
-        ("object['missing']", "Property `missing` is not defined"),
-        ("object.nested.deep", "`object.nested` is not defined"),
+        (
+            "object.nested.deep",
+            "Cannot read property `deep` of undefined",
+        ),
+        ("object.missing()", "`object.missing` is not a function"),
     ] {
         let error = runtime_error(&realm, source);
         assert_eq!(error.message, message, "{source}");
     }
-    let error = runtime_error(&realm, "object.missing");
-    assert_eq!(error.context.as_deref(), Some("property access"));
 }
 
 #[test]
@@ -577,8 +608,9 @@ fn global_value_names_cannot_be_empty() {
 fn scripts_can_shadow_global_objects() {
     let (realm, object) = realm_with_object();
     assert_eq!(realm.evaluate_script("let object = 5; object"), number(5.0));
-    // Reassigning the global name affects only that script.
+    // The shadowing `let` persists, so later scripts assign to it, not to the
+    // host object.
     realm.evaluate_script("object = 1").unwrap();
-    assert_eq!(realm.evaluate_script("object.value"), number(1.0));
+    assert_eq!(realm.evaluate_script("object"), number(1.0));
     assert_eq!(object.get("value"), Some(Value::Number(1.0)));
 }

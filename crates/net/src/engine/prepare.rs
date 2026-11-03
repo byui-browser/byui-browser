@@ -10,25 +10,28 @@ use crate::{
         services::ServiceWorkerDecision,
     },
     engine::RequestController,
+    policy::ValidatedUrl,
 };
 
 impl RequestController {
+    /// Validates a request and resolves browser-owned services before execution.
     pub(crate) fn prepare_request(
         &self,
         mut request: Request,
-    ) -> Result<(Request, reqwest::Url, bool), RequestError> {
+    ) -> Result<(Request, ValidatedUrl, bool), RequestError> {
         if request.signal.is_aborted() {
             return Err(RequestError::Aborted);
         }
-        let url = self
+        let validated_url = self
             .inner
             .policy
             .validate_request(&request, self.inner.max_keepalive_body_size)?;
-        request.prepare_url(url.clone());
+        request.prepare_url(validated_url.url.clone());
 
         if let Some(services) = &self.inner.services {
             services.check_request(&request)?;
-            if request.service_workers == ServiceWorkersMode::All
+            if validated_url.scheme != crate::policy::FetchScheme::File
+                && request.service_workers == ServiceWorkersMode::All
                 && services.service_worker(&request)? == ServiceWorkerDecision::Intercept
             {
                 return Err(RequestError::UnsupportedFeature(
@@ -43,12 +46,12 @@ impl RequestController {
             return Err(RequestError::UnsupportedFeature("browser services"));
         }
 
-        let cacheable = request.is_cacheable_method();
+        let cacheable = request.is_cacheable_method() && validated_url.scheme.is_http();
         if cacheable && request.cache_mode != CacheMode::NoStore {
             if let Some(services) = &self.inner.services {
                 request.cache_partition = Some(services.cache_partition(&request)?);
             }
         }
-        Ok((request, url, cacheable))
+        Ok((request, validated_url, cacheable))
     }
 }

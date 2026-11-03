@@ -1,14 +1,17 @@
 //! Top-level browser binary: evaluates the browser's built-in script demo and
-//! opens the sample HTML page in a native webview.
+//! opens the welcome page in a native webview.
 
 use std::sync::Arc;
 
-use browser::evaluate_page_scripts;
-use tao::{event_loop::{ControlFlow, EventLoop}, window::WindowBuilder};
-use webapis::ConsoleSink;
+use browser::{BrowserRuntime, application_data_directory, request_controller};
+use rfd::{MessageButtons, MessageDialog, MessageLevel};
+use security::{Origin, RendererSecurityContext, StoragePermission};
+use tao::{
+    event_loop::{ControlFlow, EventLoop},
+    window::WindowBuilder,
+};
+use webapis::{AlertSink, ConsoleSink};
 use wry::WebViewBuilder;
-
-const DEMO_HTML: &str = include_str!("../../../browser-pages/demo.html");
 
 struct StdoutConsole;
 
@@ -18,29 +21,72 @@ impl ConsoleSink for StdoutConsole {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Keep the original browser-side JavaScript and Web API smoke demo.
-    let controller = Arc::new(net::RequestController::new(net::Config::default())?);
-    evaluate_page_scripts(
-        "<script>print()</script>",
-        Arc::new(StdoutConsole),
-        controller,
-    )?;
+/// Displays browser JavaScript alerts with the native platform dialog.
+struct NativeAlert;
 
-    // 2. Create a native window and the sample HTML webview.
+impl AlertSink for NativeAlert {
+    fn alert(&self, message: &str) {
+        MessageDialog::new()
+            .set_title("BYUI Browser")
+            .set_description(message)
+            .set_level(MessageLevel::Info)
+            .set_buttons(MessageButtons::Ok)
+            .show();
+    }
+}
+
+fn main() {
+    // 1. Initialize the browser runtime and keep its script smoke demo.
+    let controller = request_controller(None);
+    let runtime = BrowserRuntime::open(
+        application_data_directory().expect("application data directory should be available"),
+    )
+    .expect("browser storage should initialize");
+    let security_context = RendererSecurityContext::new(
+        Origin::new("byui", "welcome", None),
+        StoragePermission::Allowed,
+    );
+    runtime
+        .evaluate_page_scripts(
+            "<script>print()</script>",
+            Arc::new(StdoutConsole),
+            Arc::new(NativeAlert),
+            controller,
+            security_context,
+        )
+        .expect("page scripts should evaluate");
+
+    // 2. Build the welcome page for the native webview, embedding its CSS.
+    let page = browser::welcome_page();
+    let button_markup = "<button id=\"btn\" class=\"google-button\" onclick=\"window.ipc.postMessage('go_to_google')\">Click to go to Google</button>";
+    let html = page
+        .html
+        .replace(
+            "<link rel=\"stylesheet\" href=\"style.css\">",
+            &format!("<style>{}</style>", page.stylesheets.join("\n")),
+        )
+        .replace("<button id=\"btn\">Click Me</button>", button_markup)
+        .replace("<script src=\"script.js\"></script>", "")
+        .replace(
+            "</head>",
+            "<style>.google-button { width: auto; height: auto; padding: 12px 24px; border: 0; border-radius: 6px; background: #6f42c1; color: white; cursor: pointer; } .google-button:hover { background: #59339d; }</style></head>",
+        );
+
+    // 3. Open the window and route the page button to Google.
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title("Interactive Rust Browser")
-        .build(&event_loop)?;
+        .build(&event_loop)
+        .expect("browser window should open");
     let (tx, rx) = std::sync::mpsc::channel();
     let webview = WebViewBuilder::new()
-        .with_html(DEMO_HTML)
+        .with_html(&html)
         .with_ipc_handler(move |request| {
             let _ = tx.send(request.into_body());
         })
-        .build(&window)?;
+        .build(&window)
+        .expect("browser webview should build");
 
-    // 3. Handle window events and button messages.
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(
             std::time::Instant::now() + std::time::Duration::from_millis(16),

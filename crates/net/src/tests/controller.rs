@@ -15,6 +15,7 @@ use reqwest::{
 };
 
 #[test]
+/// Verifies the convenience GET constructor sets Fetch defaults.
 fn get_request_has_expected_defaults() {
     // The convenience constructor should create the most common browser request
     // without requiring callers to initialize every field manually.
@@ -28,6 +29,7 @@ fn get_request_has_expected_defaults() {
 }
 
 #[test]
+/// Verifies custom requests retain caller headers and body data.
 fn custom_request_preserves_headers_and_body() {
     // Callers must also be able to construct non-GET requests with arbitrary
     // headers and binary request bodies.
@@ -57,9 +59,10 @@ fn custom_request_preserves_headers_and_body() {
 }
 
 #[test]
+/// Verifies default configuration provides usable pool and identity values.
 fn default_config_sets_pool_and_identity() {
     // These defaults define the initial connection-management behavior used by
-    // RequestController::new.
+    // RequestController::builder.
     let config = Config::default();
 
     assert_eq!(config.pool_max_idle_per_host, 8);
@@ -68,11 +71,14 @@ fn default_config_sets_pool_and_identity() {
 }
 
 #[test]
+/// Verifies invalid URLs return typed validation errors.
 fn invalid_urls_return_typed_errors() {
     // URL validation happens before reqwest is asked to perform network I/O,
     // so malformed input should produce a stable crate-level error variant.
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
 
     let error = runtime
         .block_on(client.fetch(Request::get("not a URL")))
@@ -82,9 +88,12 @@ fn invalid_urls_return_typed_errors() {
 }
 
 #[test]
+/// Verifies an already-aborted request performs no network work.
 fn an_aborted_request_fails_before_network_work() {
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
     let controller = AbortController::new();
     let mut request = Request::get("http://127.0.0.1:1");
     request.signal = controller.signal();
@@ -96,11 +105,14 @@ fn an_aborted_request_fails_before_network_work() {
 }
 
 #[test]
+/// Verifies only-if-cached reports a miss without contacting the server.
 fn only_if_cached_reports_a_cache_miss_without_network_access() {
     // OnlyIfCached is useful to callers that must avoid network access entirely;
     // an empty cache should fail immediately rather than attempting the URL.
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
     let mut request = Request::get("http://127.0.0.1:1");
     request.cache_mode = CacheMode::OnlyIfCached;
 
@@ -110,6 +122,7 @@ fn only_if_cached_reports_a_cache_miss_without_network_access() {
 }
 
 #[test]
+/// Verifies the controller fetches a resource from a local HTTP server.
 fn can_fetch_resource_from_local_server() {
     // Keep the test deterministic and independent of DNS, internet access, and
     // external service availability.
@@ -136,7 +149,9 @@ fn can_fetch_resource_from_local_server() {
     });
 
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
 
     let response = runtime
         .block_on(client.fetch(Request::get(&address)))
@@ -151,6 +166,7 @@ fn can_fetch_resource_from_local_server() {
 }
 
 #[test]
+/// Verifies response metadata is available before streamed body bytes.
 fn fetch_returns_headers_before_body_and_forwards_body_bytes() {
     // The server pauses after sending headers. A successful fetch call
     // therefore proves callers can inspect response metadata without waiting
@@ -188,7 +204,9 @@ fn fetch_returns_headers_before_body_and_forwards_body_bytes() {
     });
 
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
     let mut response = runtime
         .block_on(client.fetch(Request::get(&address)))
         .expect("streaming request should succeed");
@@ -216,6 +234,7 @@ fn fetch_returns_headers_before_body_and_forwards_body_bytes() {
 }
 
 #[test]
+/// Verifies a response enters cache only after body completion.
 fn fetch_is_cached_only_after_body_completion() {
     // The first response is streamed and fully consumed. The following
     // streaming request should then use the completed response from cache.
@@ -242,7 +261,9 @@ fn fetch_is_cached_only_after_body_completion() {
     });
 
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
-    let client = RequestController::new(Config::default()).expect("controller should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
     let (first, second) = runtime.block_on(async {
         let mut first = client
             .fetch(Request::get(&address))

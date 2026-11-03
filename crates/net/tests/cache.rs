@@ -15,7 +15,9 @@ fn empty_stream_body_can_be_consumed_and_cached() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 204 No Content\r\nCache-Control: max-age=60\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
     });
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
 
     let (first, second) = runtime().block_on(async {
         let first = controller.fetch(Request::get(server.url())).await.unwrap();
@@ -40,7 +42,9 @@ fn fully_consumed_stream_is_cached() {
         observed_hits.fetch_add(1, Ordering::SeqCst);
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
     });
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
 
     runtime().block_on(async {
         let response = controller.fetch(Request::get(server.url())).await.unwrap();
@@ -62,7 +66,9 @@ fn no_store_responses_are_not_cached() {
         observed_hits.fetch_add(1, Ordering::SeqCst);
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh".to_vec()
     });
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
 
     runtime().block_on(async {
         let mut request = Request::get(server.url());
@@ -91,7 +97,9 @@ fn reload_bypasses_cache_and_caches_the_refresh_when_consumed() {
         };
         format!("HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).into_bytes()
     });
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
 
     let (first, refreshed, cached) = runtime().block_on(async {
         let request = Request::get(server.url());
@@ -127,7 +135,9 @@ fn only_if_cached_returns_a_cache_hit() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nX-Cache-Test: yes\r\nConnection: close\r\n\r\ncached".to_vec()
     });
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
 
     let (from_cache, body, header) = runtime().block_on(async {
         let request = Request::get(server.url());
@@ -157,7 +167,9 @@ fn no_store_requests_are_not_cached() {
         observed_hits.fetch_add(1, Ordering::SeqCst);
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfresh".to_vec()
     });
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
 
     runtime().block_on(async {
         let mut request = Request::get(server.url());
@@ -178,7 +190,9 @@ fn clear_cache_forces_a_new_network_request() {
         observed_hits.fetch_add(1, Ordering::SeqCst);
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_vec()
     });
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
 
     runtime().block_on(async {
         let request = Request::get(server.url());
@@ -206,7 +220,9 @@ fn reload_bypasses_cached_response_and_caches_the_refresh() {
         };
         format!("HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).into_bytes()
     });
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
 
     let response = runtime().block_on(async {
         let request = Request::get(server.url());
@@ -237,7 +253,9 @@ fn only_if_cached_returns_a_cached_response_without_network_io() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
     });
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
 
     let cached = runtime().block_on(async {
         let request = Request::get(server.url());
@@ -258,7 +276,9 @@ fn cloned_controllers_share_the_response_cache() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\nshared".to_vec()
     });
-    let controller = RequestController::new(Config::default()).unwrap();
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
     let clone = controller.clone();
 
     let (first, second) = runtime().block_on(async {
