@@ -35,8 +35,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::ast::{
-    BinaryOperator, Expr, LogicalOperator, MemberProperty, Program, PropertyKey, Statement,
-    UnaryOperator, VarKind,
+    ArrowBody, BinaryOperator, Expr, LogicalOperator, MemberProperty, Program, PropertyKey,
+    Statement, UnaryOperator, VarKind,
 };
 use crate::bytecode::FunctionTemplate;
 use crate::stack::{StackGuard, with_engine_stack};
@@ -792,6 +792,20 @@ impl Interpreter {
             Expr::New { .. } => Err(unsupported_here("`new`")),
             Expr::SuperCall { .. } | Expr::SuperMember { .. } => Err(unsupported_here("`super`")),
             Expr::Identifier(name) => read(scope, name),
+            Expr::ArrowFunction { params, body } => {
+                let body = match body {
+                    ArrowBody::Expression(expression) => {
+                        vec![Statement::Return(Some((**expression).clone()))]
+                    }
+                    ArrowBody::Block(statements) => statements.clone(),
+                };
+                Ok(Value::Function(Function(Arc::new(FunctionKind::Script {
+                    name: String::new(),
+                    params: params.clone(),
+                    body,
+                    closure: Arc::clone(scope),
+                }))))
+            }
             Expr::Assign { name, value } => {
                 let value = self.evaluate(value, scope)?;
                 assign(scope, name, value.clone())?;
