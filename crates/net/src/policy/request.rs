@@ -45,7 +45,10 @@ impl FetchScheme {
             "file" => Ok(Self::File),
             "byui" => Ok(Self::Byui),
             "about" => Ok(Self::About),
-            scheme => Err(RequestError::UnsupportedScheme(scheme.to_owned())),
+            scheme => {
+                log::warn!("unsupported url scheme: {scheme}");
+                Err(RequestError::UnsupportedScheme(scheme.to_owned()))
+            }
         }
     }
 
@@ -111,6 +114,7 @@ impl RequestPolicy {
         if request.context.mode == crate::RequestMode::Navigate && scheme != FetchScheme::File {
             return Err(RequestError::UnsupportedFeature("navigation fetch"));
         }
+        log::trace!("request validated: {url} as {scheme:?}");
         Ok(ValidatedUrl { url, scheme })
     }
 
@@ -124,6 +128,10 @@ impl RequestPolicy {
 
     fn validate_target(&self, request: &Request, url: &reqwest::Url) -> Result<(), RequestError> {
         if !url.username().is_empty() || url.password().is_some() {
+            log::warn!(
+                "url with embedded credentials rejected: {}",
+                url.origin().ascii_serialization()
+            );
             return Err(RequestError::InvalidUrl(url.to_string()));
         }
         if request.context.mode == crate::RequestMode::Cors
@@ -137,6 +145,7 @@ impl RequestPolicy {
                 })
             && request.requires_cors_preflight()
         {
+            log::warn!("cors preflight is unsupported, blocking request to {url}");
             return Err(RequestError::UnsupportedFeature("CORS preflight"));
         }
         Ok(())

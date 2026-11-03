@@ -26,9 +26,11 @@ impl RequestController {
         url: Url,
     ) -> Result<Response, RequestError> {
         let Some(allowed_url) = allowed_about_url(&url) else {
+            log::warn!("about URL is not allowlisted: {url}");
             return Err(RequestError::UnsupportedFeature("about URL"));
         };
         if !matches!(request.method(), &Method::GET | &Method::HEAD) {
+            log::warn!("rejected {} request to {url}", request.method());
             return Err(RequestError::UnsupportedFeature("about scheme method"));
         }
 

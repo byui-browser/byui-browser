@@ -21,11 +21,10 @@ impl RequestController {
         url: Url,
     ) -> Result<Response, RequestError> {
         super::require_read_method(&request, "blob scheme method")?;
-        let provider = self
-            .inner
-            .providers
-            .blob()
-            .ok_or(RequestError::MissingProvider("blob"))?;
+        let provider = self.inner.providers.blob().ok_or_else(|| {
+            log::warn!("no blob provider installed for {url}");
+            RequestError::MissingProvider("blob")
+        })?;
         let resource = super::await_provider(&request, provider.resolve(&request, &url)).await?;
         self.finalize_scheme_resource(&request, resource, FetchScheme::Blob)
     }

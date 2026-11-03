@@ -31,6 +31,12 @@ impl RequestController {
                         .cache
                         .get_with_staleness(&request, &url, allow_stale)
                 {
+                    log::debug!(
+                        "cache hit: {} {url} -> {} ({} bytes, allow_stale={allow_stale})",
+                        request.method(),
+                        response.status,
+                        response.body.len()
+                    );
                     let origin = reqwest::Url::parse(&response.url)
                         .ok()
                         .and_then(|url| crate::Origin::from_url(&url).ok());
@@ -63,7 +69,11 @@ impl RequestController {
                     return Ok(internal.expose());
                 }
             }
+            if cache_lookup.is_some() {
+                log::debug!("cache miss: {} {url}", request.method());
+            }
             if request.cache_mode == CacheMode::OnlyIfCached {
+                log::warn!("only-if-cached request has no cache entry: {url}");
                 return Err(RequestError::NetworkError);
             }
         }
@@ -73,6 +83,7 @@ impl RequestController {
         let mut response;
         loop {
             if request.signal.is_aborted() {
+                log::debug!("request aborted before transport: {url}");
                 return Err(RequestError::Aborted);
             }
             if let Some(services) = &self.inner.services {
@@ -86,8 +97,10 @@ impl RequestController {
             if request.credentials_allowed(&url) {
                 if let Some(services) = &self.inner.services {
                     if let Some(cookie) = services.cookie_header(&request)? {
-                        let value = http::HeaderValue::from_str(&cookie)
-                            .map_err(|_| RequestError::InvalidHeaderValue("cookie".into()))?;
+                        let value = http::HeaderValue::from_str(&cookie).map_err(|_| {
+                            log::warn!("cookie header from services is invalid; failing {url}");
+                            RequestError::InvalidHeaderValue("cookie".into())
+                        })?;
                         transport_headers.insert_internal_header(http::header::COOKIE, value)?;
                     }
                 }
@@ -108,6 +121,7 @@ impl RequestController {
                 )
                 .await?;
             let status = candidate.status.as_u16();
+            log::debug!("transport response: {} {url} -> {status}", request.method());
             if !matches!(status, 301 | 302 | 303 | 307 | 308) {
                 response = candidate;
                 break;
@@ -116,18 +130,32 @@ impl RequestController {
             let location = candidate
                 .headers
                 .get(http::header::LOCATION)
-                .ok_or(RequestError::RedirectFailure)?
+                .ok_or_else(|| {
+                    log::warn!("redirect {status} from {url} has no location header");
+                    RequestError::RedirectFailure
+                })?
                 .to_str()
-                .map_err(|_| RequestError::RedirectFailure)?;
-            let next_url = url
-                .join(location)
-                .map_err(|_| RequestError::RedirectFailure)?;
+                .map_err(|_| {
+                    log::warn!("redirect {status} from {url} has a non-text location header");
+                    RequestError::RedirectFailure
+                })?;
+            let next_url = url.join(location).map_err(|_| {
+                log::warn!("redirect {status} from {url} has an invalid location");
+                RequestError::RedirectFailure
+            })?;
             self.inner
                 .policy
-                .validate_redirect_target(&request, &next_url)?;
+                .validate_redirect_target(&request, &next_url)
+                .inspect_err(|error| {
+                    log::warn!("redirect target blocked: {url} -> {next_url} ({error})");
+                })?;
             match request.redirect_mode {
-                crate::RedirectMode::Error => return Err(RequestError::RedirectFailure),
+                crate::RedirectMode::Error => {
+                    log::warn!("redirect {status} to {next_url} refused by redirect mode error");
+                    return Err(RequestError::RedirectFailure);
+                }
                 crate::RedirectMode::Manual => {
+                    log::debug!("manual redirect {status}: {url} -> {next_url}");
                     candidate.url_list = request.url_list.iter().map(ToString::to_string).collect();
                     candidate.redirect_count = request.redirect_count + 1;
                     candidate.response_type = ResponseType::OpaqueRedirect;
@@ -137,6 +165,7 @@ impl RequestController {
                 crate::RedirectMode::Follow => {}
             }
             if request.redirect_count >= 20 {
+                log::warn!("redirect limit reached at {url}");
                 return Err(RequestError::RedirectFailure);
             }
             if matches!(status, 307 | 308)
@@ -145,6 +174,7 @@ impl RequestController {
                     .as_ref()
                     .is_some_and(|body| !body.is_replayable())
             {
+                log::warn!("cannot replay request body for {status} redirect from {url}");
                 return Err(RequestError::RedirectFailure);
             }
             if (matches!(status, 301 | 302) && request.method() == http::Method::POST)
@@ -156,7 +186,12 @@ impl RequestController {
             let cross_origin = request.current_url().is_some_and(|current| {
                 current.scheme() != next_url.scheme() || current.origin() != next_url.origin()
             });
+            log::debug!(
+                "following redirect {status}: {url} -> {next_url} (hop {})",
+                request.redirect_count + 1
+            );
             if cross_origin {
+                log::trace!("cross-origin redirect, stripping sensitive headers");
                 request.strip_sensitive_redirect_headers();
             }
             request.follow_url(next_url.clone());
@@ -185,6 +220,7 @@ impl RequestController {
 
         if cacheable && request.cache_mode != CacheMode::NoStore {
             if response.body_is_null {
+                log::trace!("storing null-body response in cache: {url}");
                 self.inner.cache.insert(
                     &request,
                     &url,

@@ -12,6 +12,11 @@ pub mod permissions;
 
 use std::fmt;
 
+/// Formats an origin as `scheme://host:port` for log messages.
+fn origin_label(origin: &Origin) -> String {
+    format!("{}://{}:{}", origin.scheme(), origin.host(), origin.port())
+}
+
 /// A web origin: scheme, host, port. Two documents may touch each other's
 /// state only when their origins are equal.
 // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
@@ -72,6 +77,7 @@ impl Origin {
     // Networking team provides scheme, host, and port extraction.
     pub fn parse(url: &str) -> Result<Self, SecurityError> {
         if url.is_empty() {
+            log::warn!("rejected empty url while parsing origin");
             return Err(SecurityError::InvalidOrigin(String::new()));
         }
         todo!("TODO(security): extract origin from: {url:?}")
@@ -139,6 +145,11 @@ impl RendererSecurityContext {
     ///
     /// The storage key is derived from the same origin stored by this context.
     pub fn new(origin: Origin, storage_permission: StoragePermission) -> Self {
+        log::debug!(
+            "security context created for {} (storage {:?})",
+            origin_label(&origin),
+            storage_permission
+        );
         Self {
             storage_key: StorageKey::new(origin.clone()),
             origin,
@@ -212,6 +223,12 @@ impl CookieJar {
     /// currently used when storing a cookie; callers are responsible for
     /// providing a cookie with the intended domain and secure attributes.
     pub fn store(&mut self, _origin: &Origin, cookie: Cookie) {
+        log::debug!(
+            "storing cookie {:?} for domain {} (secure: {})",
+            cookie.name,
+            cookie.domain,
+            cookie.secure
+        );
         self.cookies
             .retain(|existing| existing.name != cookie.name || existing.domain != cookie.domain);
 
@@ -235,6 +252,12 @@ impl CookieJar {
             }
         }
 
+        log::debug!(
+            "{} of {} cookies match {}",
+            matching_cookies.len(),
+            self.cookies.len(),
+            origin_label(origin)
+        );
         matching_cookies
     }
 }

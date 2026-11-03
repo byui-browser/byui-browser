@@ -14,6 +14,7 @@ fn main() -> io::Result<()> {
     for argument in &command_line.remaining {
         log::warn!("ignoring unrecognized argument `{argument}`");
     }
+    log::debug!("creating javascript realm");
     let mut realm = Realm::new();
     realm
         .register_global_function(
@@ -54,10 +55,14 @@ fn main() -> io::Result<()> {
             break;
         }
 
+        log::debug!("evaluating {} bytes of script", source.len());
         match realm.evaluate_script(source) {
             Ok(value) if value != Value::Undefined => println!("{value}"),
-            Ok(_) => {}
-            Err(error) => eprintln!("{:?}: {error}", error.category),
+            Ok(_) => log::debug!("script evaluated to undefined"),
+            Err(error) => {
+                log::debug!("script failed: {:?}", error.category);
+                eprintln!("{:?}: {error}", error.category)
+            }
         }
     }
 

@@ -160,6 +160,10 @@ impl FileAccessGrantSource {
             current.cancellation = FileAccessCancellation::new();
             current.generation = current.generation.wrapping_add(1);
             self.navigation_authorizations.clear();
+            log::debug!(
+                "file access grant replaced (generation {})",
+                current.generation
+            );
             self.record(FileAccessAuditEvent::Replaced);
             self.schedule_expiry(current.generation);
         }
@@ -174,6 +178,7 @@ impl FileAccessGrantSource {
             current.cancellation.cancel();
             current.grant = None;
             self.navigation_authorizations.clear();
+            log::debug!("file access grant revoked");
             self.record(FileAccessAuditEvent::Revoked);
         }
     }
@@ -186,6 +191,7 @@ impl FileAccessGrantSource {
         if let Ok(mut current) = self.state.write() {
             revoke_current(&mut current);
             self.navigation_authorizations.clear();
+            log::debug!("file access session shut down");
             self.record(FileAccessAuditEvent::Shutdown);
         }
     }
@@ -264,6 +270,7 @@ fn expire_generation(
     if !expired {
         return;
     }
+    log::debug!("file access grant expired");
     if let Some(navigation_authorizations) = navigation_authorizations.upgrade() {
         navigation_authorizations.clear();
     }

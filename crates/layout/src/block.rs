@@ -229,6 +229,14 @@ impl Context<'_> {
         for line in &mut lines {
             line.translate(padding.left, padding.top);
         }
+        log::trace!(
+            "laid out {kind:?} node {:?}: content {}x{}, margin top/bottom {margin_top}/{margin_bottom}, {} children, {} lines",
+            block.node,
+            content_width + padding.horizontal(),
+            content_height + padding.vertical(),
+            children.len(),
+            lines.len()
+        );
         BlockResult {
             fragment: LayoutBox {
                 kind,

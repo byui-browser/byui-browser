@@ -69,8 +69,19 @@ impl OutlineFont {
     ///
     /// Returns `None` when the data is not a supported font.
     pub fn from_bytes(data: Vec<u8>) -> Option<Self> {
-        let font = ab_glyph::FontArc::try_from_vec(data).ok()?;
-        let units_per_em = ab_glyph::Font::units_per_em(&font)?;
+        let size = data.len();
+        let font = match ab_glyph::FontArc::try_from_vec(data) {
+            Ok(font) => font,
+            Err(error) => {
+                log::error!("font data ({size} bytes) could not be parsed: {error}");
+                return None;
+            }
+        };
+        let Some(units_per_em) = ab_glyph::Font::units_per_em(&font) else {
+            log::error!("font data ({size} bytes) has no units-per-em; it cannot be used");
+            return None;
+        };
+        log::debug!("font loaded: {size} bytes, {units_per_em} units per em");
         Some(Self { font, units_per_em })
     }
 
@@ -79,9 +90,26 @@ impl OutlineFont {
     pub fn load_first<P: AsRef<std::path::Path>>(
         paths: impl IntoIterator<Item = P>,
     ) -> Option<Self> {
-        paths
-            .into_iter()
-            .find_map(|path| Self::from_bytes(std::fs::read(path).ok()?))
+        let font = paths.into_iter().find_map(|path| {
+            let path = path.as_ref();
+            match std::fs::read(path) {
+                Ok(data) => {
+                    let font = Self::from_bytes(data);
+                    if font.is_some() {
+                        log::debug!("font loaded from {}", path.display());
+                    }
+                    font
+                }
+                Err(error) => {
+                    log::trace!("font candidate {} not readable: {error}", path.display());
+                    None
+                }
+            }
+        });
+        if font.is_none() {
+            log::warn!("no font file could be loaded; falling back to the built-in bitmap font");
+        }
+        font
     }
 
     /// Design units to CSS pixels at an em size of `font_size` CSS pixels.

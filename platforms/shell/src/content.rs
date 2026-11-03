@@ -28,7 +28,18 @@ static PAGE_FONT: OnceLock<Option<OutlineFont>> = OnceLock::new();
 /// an effect. If no file loads, or this is never called (as in unit tests),
 /// pages use the built-in bitmap font.
 pub(crate) fn load_page_font(files: Vec<PathBuf>) {
-    PAGE_FONT.get_or_init(|| OutlineFont::load_first(files));
+    PAGE_FONT.get_or_init(|| {
+        let candidates = files.len();
+        let font = OutlineFont::load_first(files);
+        if font.is_some() {
+            log::debug!("page font loaded (first loadable of {candidates} candidate files)");
+        } else {
+            log::warn!(
+                "no page font could be loaded from {candidates} candidate files; using the built-in bitmap font"
+            );
+        }
+        font
+    });
 }
 
 /// The loaded page font, or `None` to use the built-in bitmap font.
@@ -155,6 +166,7 @@ pub(crate) fn evaluate_page_script(
     alert_sink: Arc<dyn AlertSink>,
     runtime: BrowserRuntime,
 ) {
+    log::debug!("evaluating page script for {}", page.url);
     let controller = browser::request_controller(None);
     runtime
         .open_page(
@@ -227,6 +239,7 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                 alert_sink,
                 runtime,
             } => {
+                log::debug!("page session loading {}", page.url);
                 let controller = browser::request_controller(None);
                 match runtime.open_page(
                     &page,
@@ -236,10 +249,11 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                     browser::security_context_for_url(&page.url),
                 ) {
                     Ok(loaded) => session = Some(loaded),
-                    Err(error) => eprintln!("page script failed: {error}"),
+                    Err(error) => log::error!("page script failed: {error}"),
                 }
             }
             PageCommand::Click(target) => {
+                log::trace!("page click dispatched: {target:?}");
                 let Some(session) = &session else {
                     continue;
                 };
@@ -248,7 +262,7 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                     None => session.dispatch_click(),
                 };
                 if let Err(error) = result {
-                    eprintln!("page click failed: {error}");
+                    log::warn!("page click failed: {error}");
                 }
             }
         }
@@ -270,6 +284,7 @@ pub(crate) fn render_page(
     scripts_evaluated: &mut bool,
 ) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(width, height)?;
+    log::debug!("rendering page {width}x{height} at scale {scale_factor}");
     let frame = render_demo(
         page,
         width,

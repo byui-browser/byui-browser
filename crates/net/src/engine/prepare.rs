@@ -20,12 +20,16 @@ impl RequestController {
         mut request: Request,
     ) -> Result<(Request, ValidatedUrl, bool), RequestError> {
         if request.signal.is_aborted() {
+            log::debug!("request aborted before preparation: {}", request.url());
             return Err(RequestError::Aborted);
         }
         let validated_url = self
             .inner
             .policy
-            .validate_request(&request, self.inner.max_keepalive_body_size)?;
+            .validate_request(&request, self.inner.max_keepalive_body_size)
+            .inspect_err(|error| {
+                log::warn!("request rejected by policy: {} ({error})", request.url());
+            })?;
         request.prepare_url(validated_url.url.clone());
 
         if let Some(services) = &self.inner.services {
@@ -34,6 +38,10 @@ impl RequestController {
                 && request.service_workers == ServiceWorkersMode::All
                 && services.service_worker(&request)? == ServiceWorkerDecision::Intercept
             {
+                log::warn!(
+                    "service-worker interception is unsupported: {}",
+                    request.url()
+                );
                 return Err(RequestError::UnsupportedFeature(
                     "service-worker interception",
                 ));
@@ -43,6 +51,10 @@ impl RequestController {
             || request.destination != RequestDestination::Empty
             || request.initiator != InitiatorType::Other
         {
+            log::warn!(
+                "request needs browser services but none are installed: {}",
+                request.url()
+            );
             return Err(RequestError::UnsupportedFeature("browser services"));
         }
 
@@ -52,6 +64,11 @@ impl RequestController {
                 request.cache_partition = Some(services.cache_partition(&request)?);
             }
         }
+        log::trace!(
+            "request prepared: {} scheme={:?} cacheable={cacheable}",
+            validated_url.url,
+            validated_url.scheme
+        );
         Ok((request, validated_url, cacheable))
     }
 }

@@ -89,6 +89,12 @@ impl Display {
             _ => None,
         };
         if single.is_some() {
+            if matches!(
+                value.as_str(),
+                "table" | "inline-table" | "flex" | "inline-flex" | "grid" | "inline-grid"
+            ) {
+                log::trace!("display: {value} is not implemented; laying out as flow-root");
+            }
             return single;
         }
         let mut outside = None;
@@ -211,9 +217,13 @@ impl ComputedStyle {
                 .map(|declaration| declaration.value.trim())
         };
         let mut style = Self::anonymous(None);
-        style.display = get("display")
-            .and_then(Display::parse)
-            .unwrap_or(Display::INLINE);
+        style.display = match get("display") {
+            Some(value) => Display::parse(value).unwrap_or_else(|| {
+                log::trace!("unsupported display value {value:?}; using inline");
+                Display::INLINE
+            }),
+            None => Display::INLINE,
+        };
         if let Some(size) = get("font-size")
             .and_then(|value| css::values::compute_font_size(value, root_font_size, root_font_size))
         {

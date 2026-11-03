@@ -63,10 +63,19 @@ impl RequestScheduler {
         if request.request.signal.is_aborted() {
             return Err(RequestError::Aborted);
         }
+        log::trace!(
+            "scheduler admitting {} {} ({} permits available)",
+            request.request.method,
+            request.url,
+            self.permits.available_permits()
+        );
         let permit = self.permits.clone().acquire_owned();
         let permit = tokio::select! {
             _ = request.request.signal.cancelled() => return Err(RequestError::Aborted),
-            permit = permit => permit.map_err(|_| RequestError::SchedulerClosed)?,
+            permit = permit => permit.map_err(|_| {
+                log::error!("request scheduler is closed");
+                RequestError::SchedulerClosed
+            })?,
         };
         if request.request.signal.is_aborted() {
             return Err(RequestError::Aborted);

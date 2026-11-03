@@ -25,34 +25,78 @@ impl LocalStorage {
 
     /// Stores a value in this binding's origin area.
     pub fn set_item(&self, key: &str, value: &str) -> JsResult<()> {
+        let origin = self.security_context.origin();
         if !self.security_context.can_write_storage() {
+            log::warn!(
+                "localStorage write denied for {}://{}:{} (key {key:?}): storage permission denied",
+                origin.scheme(),
+                origin.host(),
+                origin.port()
+            );
             return Err(JsError::new("localStorage write access denied"));
         }
 
+        log::debug!(
+            "localStorage.setItem key {key:?} ({} bytes) for {}://{}:{}",
+            value.len(),
+            origin.scheme(),
+            origin.host(),
+            origin.port()
+        );
         self.storage
             .lock()
-            .map_err(|_| JsError::new("localStorage is unavailable"))?
+            .map_err(|_| {
+                log::error!("localStorage backend lock is poisoned");
+                JsError::new("localStorage is unavailable")
+            })?
             .write_item(self.security_context.storage_key(), key, value)
-            .map_err(|error| JsError::new(error.to_string()))
+            .map_err(|error| {
+                log::warn!("localStorage.setItem key {key:?} failed: {error}");
+                JsError::new(error.to_string())
+            })
     }
 
     /// Reads a value from this binding's origin area.
     pub fn get_item(&self, key: &str) -> JsResult<Option<String>> {
+        let origin = self.security_context.origin();
         if !self.security_context.can_read_storage() {
+            log::warn!(
+                "localStorage read denied for {}://{}:{} (key {key:?}): storage permission denied",
+                origin.scheme(),
+                origin.host(),
+                origin.port()
+            );
             return Err(JsError::new("localStorage read access denied"));
         }
 
-        self.storage
+        let value = self
+            .storage
             .lock()
-            .map_err(|_| JsError::new("localStorage is unavailable"))?
+            .map_err(|_| {
+                log::error!("localStorage backend lock is poisoned");
+                JsError::new("localStorage is unavailable")
+            })?
             .read_item(self.security_context.storage_key(), key)
-            .map_err(|error| JsError::new(error.to_string()))
+            .map_err(|error| {
+                log::warn!("localStorage.getItem key {key:?} failed: {error}");
+                JsError::new(error.to_string())
+            })?;
+        log::debug!(
+            "localStorage.getItem key {key:?} for {}://{}:{} (found: {}, {} bytes)",
+            origin.scheme(),
+            origin.host(),
+            origin.port(),
+            value.is_some(),
+            value.as_ref().map_or(0, String::len)
+        );
+        Ok(value)
     }
 }
 
 /// Implements JavaScript `localStorage.setItem(key, value)`.
 pub fn set_item(storage: &LocalStorage, arguments: &[Value]) -> JsResult<Value> {
     let [Value::String(key), Value::String(value)] = arguments else {
+        log::debug!("localStorage.setItem() called with invalid arguments; ignored");
         return Err(JsError::new(
             "localStorage.setItem() expects a key and value string",
         ));
@@ -65,6 +109,7 @@ pub fn set_item(storage: &LocalStorage, arguments: &[Value]) -> JsResult<Value> 
 /// Implements JavaScript `localStorage.getItem(key)`.
 pub fn get_item(storage: &LocalStorage, arguments: &[Value]) -> JsResult<Value> {
     let [Value::String(key)] = arguments else {
+        log::debug!("localStorage.getItem() called with invalid arguments; ignored");
         return Err(JsError::new(
             "localStorage.getItem() expects one key string",
         ));
@@ -82,6 +127,7 @@ pub fn register_local_storage(
     storage: SharedStorage,
     security_context: RendererSecurityContext,
 ) -> JsResult<()> {
+    log::debug!("registering localStorage bindings");
     let local_storage = LocalStorage::new(storage, security_context);
     let set_item_storage = local_storage.clone();
     let get_item_storage = local_storage;

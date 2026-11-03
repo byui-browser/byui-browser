@@ -19,6 +19,11 @@ impl RequestController {
         response: &mut InternalResponse,
     ) -> Result<(), RequestError> {
         response.response_type = self.inner.cors.response_type(request, response)?;
+        log::trace!(
+            "response type classified: {:?} for {}",
+            response.response_type,
+            request.url()
+        );
         crate::policy::validate_response(request, response)?;
         self.approve_response(request, response)
     }
@@ -54,7 +59,14 @@ impl RequestController {
                 redirect_count: response.redirect_count,
                 from_cache: response.from_cache,
             };
-            services.check_response(request, &info)?;
+            services
+                .check_response(request, &info)
+                .inspect_err(|error| {
+                    log::warn!(
+                        "response rejected by browser services: {} ({error})",
+                        request.url()
+                    );
+                })?;
             services.response_headers(request, &info);
         }
         Ok(())

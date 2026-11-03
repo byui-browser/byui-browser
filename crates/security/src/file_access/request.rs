@@ -68,6 +68,7 @@ impl FileAccessGrant {
     /// ends. Invalidated grants cannot be made active again; issue a new grant
     /// from the capability when replacing a session.
     pub fn revoke(&self) {
+        log::debug!("file access grant {} revoked", self.capability_id);
         self.session.revoke();
     }
 

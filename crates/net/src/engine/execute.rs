@@ -14,9 +14,25 @@ impl RequestController {
     /// stream to completion; dropped or failed streams are not cached. Null
     /// bodies may be cached as soon as headers arrive.
     pub async fn fetch(&self, request: Request) -> Result<Response, RequestError> {
-        let (request, validated_url, cacheable) = self.prepare_request(request)?;
+        log::debug!("fetch start: {} {}", request.method(), request.url());
+        let (request, validated_url, cacheable) =
+            self.prepare_request(request).inspect_err(|error| {
+                log::debug!("fetch rejected during preparation: {error}");
+            })?;
         let url = validated_url.url;
-        self.fetch_scheme(request, url, validated_url.scheme, cacheable)
-            .await
+        let method = request.method().clone();
+        let result = self
+            .fetch_scheme(request, url.clone(), validated_url.scheme, cacheable)
+            .await;
+        match &result {
+            Ok(response) => log::debug!(
+                "fetch done: {method} {url} -> {} ({:?})",
+                response.status,
+                response.response_type
+            ),
+            Err(RequestError::Aborted) => log::debug!("fetch aborted: {method} {url}"),
+            Err(error) => log::error!("fetch failed: {method} {url}: {error}"),
+        }
+        result
     }
 }
