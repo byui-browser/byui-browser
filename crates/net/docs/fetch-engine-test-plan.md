@@ -1,10 +1,15 @@
 # Net crate test plan
 
-Status: the current body, request, header, response, cache, redirect,
+Status as of 2026-11-03: the current body, request, header, response, cache, redirect,
 streaming, scheduler, and scheme-handler regression suites pass. The first
 body API/lifecycle test slice is now covered, including constructor metadata,
 URL-encoded and ArrayBuffer consumption, equality/debug state, one-shot
 transport consumption, failed/aborted streams, and malformed form data. The
+body ownership slice now also covers explicit buffered and live forks,
+bounded tee backpressure, response cloning for buffered, one-shot, null, and
+live bodies, abort propagation to cloned branches, direct-reader/helper-future
+drop cleanup, response/body length metadata, and cloned-stream cache and
+scheduler-permit behavior. The
 current redirect, scheduler, request-context, and unsupported-feature tests
 also cover POST rewriting, sensitive-header stripping, non-replayable 307
 requests, redirect limits, queued-request cancellation, credential/referrer
@@ -26,14 +31,14 @@ The following concrete gaps are not optional cleanup; each must be covered by
 the applicable section below or by a focused regression test when the behavior
 is implemented:
 
-- Body construction and lifecycle: remaining null/replayable/stream request
-  transport-conversion cases, direct-reader state transitions, known response
-  length through transport/cache/provider conversion, and the remaining
-  multipart text/file serialization and malformed-part errors.
+- Body construction and lifecycle: remaining direct-reader state transitions,
+  known response length through any uncovered transport/cache paths, and the
+  remaining multipart text/file serialization and malformed-part errors.
 - Body and cancellation errors: cancellation defaults and accessors, every
   stable `RequestError` display variant, and the remaining transport/body
-  conversion failures. One-shot transport consumption and the distinction
-  between body-already-used and body-already-consumed are now covered.
+  conversion failures. One-shot transport consumption, body forking, stream
+  failure/abort propagation, and the distinction between body-already-used
+  and body-already-consumed are now covered.
 - Request/header API edges: request getters and setters, forbidden methods and
   headers, remaining no-CORS method/content-type combinations, remaining
   request getter/setter coverage, header guard immutability/internal removal,
@@ -62,14 +67,15 @@ failed and aborted streams, and malformed multipart inputs.
 
 The body ownership slice covers explicit forks for buffered and live sources,
 bounded tee backpressure, independent view status, checked internal transfer,
-and suppression of cache insertion for disturbed sources. Add further focused
-tests for:
+response cloning across buffered, one-shot, null, and live bodies, abort
+propagation to cloned branches, direct-reader/helper-future source cleanup,
+and suppression of cache insertion for disturbed or failed cloned sources.
+Add further focused tests for:
 
-- response cloning across additional body types and abort timing;
 - locked, disturbed, completed, canceled, and dropped body transitions across
   direct readers and helper methods;
-- known response length through transport, cache, and provider conversion;
-- body behavior for network-error responses and `CONNECT`; and
+- known response length through any uncovered transport and cache conversion;
+- body behavior for network-error responses; and
 - permit release and cache suppression after every body failure or abort.
 
 ### 2. Scheme-provider and browser composition
@@ -92,7 +98,10 @@ and add browser-owned tests, with:
 The browser-owned provider tests cover the embedded `byui:` routes and the
 authorized file provider; keep expanding route aliases, unknown hosts/paths,
 query and fragment handling, `GET`/`HEAD` semantics, repeated loads, body
-ownership, revocation, limits, and origin policy as those integrations evolve.
+ownership and length metadata, revocation, limits, and origin policy as those
+integrations evolve. The net scheme suites now also verify provider response
+lengths, stream/null-body length semantics, shared response finalization, and
+provider cleanup after unread or partially read bodies.
 
 Browser blob registry, creation, revocation, and lifetime tests are deferred.
 Keep `net/tests/schemes/blob.rs` as generic provider-contract regression
@@ -139,7 +148,7 @@ origin parsing, relative URL resolution, connection refusal, same-origin
 response rejection, and aborting a delivered HTTP response before its body is
 read. Failed, dropped, and aborted HTTP bodies now each have a regression
 proving that their scheduler permit is released and their response is not
-cached.
+cached; cloned-response failure and abort paths have the same coverage.
 
 Add tests for keepalive quotas, service-worker decisions beyond interception,
 CSP/mixed-content/CORP/MIME policy, offline behavior, timing hooks,
