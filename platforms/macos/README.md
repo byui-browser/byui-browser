@@ -41,12 +41,15 @@ presented through `softbuffer` and `winit`.
 
 ## Rendered content demo
 
-The same command above displays **WELCOME TO BYUI BROWSER!** in a near-white
-(`#f2f5fa`) block at the top of the page card, with white content beneath it. The startup page is
-defined as HTML, has a CSS stylesheet parsed by the CSS crate, and runs a
-JavaScript startup script through the JS crate. CSS cascade/layout and DOM
-script bindings are not connected yet, so the current renderer uses its
-first-slice block styling and the script is validated for execution.
+The same command above displays **WELCOME TO BYUI BROWSER!** in the color
+specified by the welcome page's `main` CSS rule, with white content beneath it.
+The startup page is defined as HTML, has a CSS stylesheet parsed and cascaded
+by the CSS crate, and runs a JavaScript startup script through the JS crate.
+The first renderer slice paints hex, common named, and integer `rgb()`
+background and text colors; other CSS values and DOM script bindings are not
+connected yet.
+Its default white canvas and black text come from the CSS crate's bundled
+`user_agent.css`, which is cascaded before the page stylesheet.
 
 The shell parses the shared welcome document from the browser crate and calls
 `layout_tree`, `paint_document`, and `Compositor::compose_paint`. It converts the

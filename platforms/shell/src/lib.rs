@@ -18,6 +18,10 @@
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 mod content;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+mod context_menu;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+mod page_source;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 mod toolbar;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]

@@ -5,7 +5,6 @@
 use paint::{Color, DisplayItem, PaintBox, Rect, build_display_list};
 
 #[test]
-#[ignore = "TODO(paint): background painting not implemented"]
 fn box_with_background_yields_one_fill() {
     let red = Color {
         r: 255,
@@ -27,7 +26,6 @@ fn box_with_background_yields_one_fill() {
 }
 
 #[test]
-#[ignore = "TODO(paint): background painting not implemented"]
 fn box_without_background_yields_nothing() {
     let list = build_display_list(&[PaintBox {
         rect: Rect::default(),
