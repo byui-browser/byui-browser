@@ -1,14 +1,14 @@
 //! In-process rendering demo using the layout team's HTML -> paint -> frame API.
 //! The demo evaluates its page script once per document load before painting.
 
-use std::sync::{Arc, mpsc};
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 
 use browser::{BrowserRuntime, Page};
 use html::NodeID;
-use layout::{LayoutTree, Size, layout_document};
-use render::{BitmapFont, Compositor, Frame};
-use security::{Origin, RendererSecurityContext, StoragePermission};
+use layout::{FontMetrics, LayoutTree, Size, layout_document};
+use render::{BitmapFont, Compositor, Frame, OutlineFont};
 use tiny_skia::Pixmap;
 use webapis::{AlertSink, ConsoleSink};
 
@@ -18,17 +18,42 @@ impl ConsoleSink for NoopConsole {
     fn log(&self, _message: &str) {}
 }
 
-fn welcome_security_context() -> RendererSecurityContext {
-    RendererSecurityContext::new(
-        Origin::new("byui", "welcome", None),
-        StoragePermission::Allowed,
-    )
+/// The system font all page text uses, set once by [`load_page_font`].
+static PAGE_FONT: OnceLock<Option<OutlineFont>> = OnceLock::new();
+
+/// Loads the first of `files` that parses as a font as the page font.
+///
+/// Each platform shell lists its default serif font first, since browsers
+/// show pages without author fonts in a serif face. Only the first call has
+/// an effect. If no file loads, or this is never called (as in unit tests),
+/// pages use the built-in bitmap font.
+pub(crate) fn load_page_font(files: Vec<PathBuf>) {
+    PAGE_FONT.get_or_init(|| OutlineFont::load_first(files));
 }
 
+/// The loaded page font, or `None` to use the built-in bitmap font.
+///
+/// `font-family` is not supported yet, so every element shares this font.
+fn page_font() -> Option<&'static OutlineFont> {
+    PAGE_FONT.get().and_then(Option::as_ref)
+}
+
+/// The metrics layout uses, matching the font [`render_document`] draws with.
+fn page_metrics() -> &'static dyn FontMetrics {
+    match page_font() {
+        Some(font) => font,
+        None => &BitmapFont,
+    }
+}
+
+/// Renders `page` into a `width` × `height` device-pixel frame, first
+/// evaluating its script if that has not happened yet. `scale_factor` is
+/// device pixels per CSS pixel.
 fn render_demo(
     page: &browser::Page,
     width: u32,
     height: u32,
+    scale_factor: f64,
     alert_sink: Arc<dyn AlertSink>,
     runtime: &BrowserRuntime,
     scripts_evaluated: &mut bool,
@@ -40,13 +65,27 @@ fn render_demo(
         evaluate_page_script(page, Arc::clone(&alert_sink), runtime.clone());
         *scripts_evaluated = true;
     }
-    render_document(page, width, height, alert_sink, runtime, scripts_evaluated)
+    render_document(
+        page,
+        width,
+        height,
+        scale_factor,
+        alert_sink,
+        runtime,
+        scripts_evaluated,
+    )
 }
 
+/// Lays out and paints `page` into a `width` × `height` device-pixel frame.
+///
+/// With a system page font, text is rasterized at device resolution. The
+/// bitmap fallback renders at one device pixel per CSS pixel, so its frame is
+/// the CSS-pixel viewport size and [`render_page`] scales it up.
 fn render_document(
     page: &Page,
     width: u32,
     height: u32,
+    scale_factor: f64,
     alert_sink: Arc<dyn AlertSink>,
     runtime: &BrowserRuntime,
     scripts_evaluated: &mut bool,
@@ -55,17 +94,30 @@ fn render_document(
         evaluate_page_script(page, alert_sink, runtime.clone());
         *scripts_evaluated = true;
     }
-    let tree = layout_page(page, width, height);
+    let css_width = (width as f64 / scale_factor).ceil() as u32;
+    let css_height = (height as f64 / scale_factor).ceil() as u32;
+    let tree = layout_page(page, css_width, css_height);
     let display_list = paint::paint_document(&tree);
-    Compositor::new(width, height).compose_paint(&display_list)
+    match page_font() {
+        Some(font) => Compositor::new(width, height).compose_paint_with_font(
+            &display_list,
+            font,
+            scale_factor as f32,
+        ),
+        None => Compositor::new(css_width, css_height).compose_paint(&display_list),
+    }
 }
 
 /// Parses, styles, and lays out `page` for a `width` × `height` CSS-pixel
 /// viewport. Painting and hit testing share this so they agree on geometry.
 fn layout_page(page: &Page, width: u32, height: u32) -> LayoutTree {
     let document = html::parse_raw_html(page.html.to_owned());
-    let stylesheet = css::parse_stylesheet(&page.css);
-    let styles = css::style_document(&document, &[stylesheet]);
+    let stylesheets: Vec<_> = page
+        .stylesheets
+        .iter()
+        .map(|source| css::parse_stylesheet(source))
+        .collect();
+    let styles = css::style_document(&document, &stylesheets);
     layout_document(
         &document,
         &styles,
@@ -73,7 +125,7 @@ fn layout_page(page: &Page, width: u32, height: u32) -> LayoutTree {
             width: width as f32,
             height: height as f32,
         },
-        &BitmapFont,
+        page_metrics(),
     )
 }
 
@@ -110,7 +162,7 @@ pub(crate) fn evaluate_page_script(
             Arc::new(NoopConsole),
             alert_sink,
             controller,
-            welcome_security_context(),
+            browser::security_context_for_url(&page.url),
         )
         .expect("the page script should execute");
 }
@@ -181,7 +233,7 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                     Arc::new(NoopConsole),
                     alert_sink,
                     controller,
-                    welcome_security_context(),
+                    browser::security_context_for_url(&page.url),
                 ) {
                     Ok(loaded) => session = Some(loaded),
                     Err(error) => eprintln!("page script failed: {error}"),
@@ -204,9 +256,10 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
 }
 
 /// Renders the demo into a device-pixel pixmap sized for the page card.
-/// The current compositor rasterizes at 1x; nearest-neighbor scaling keeps its
-/// bitmap font at a consistent logical size on Retina. Returns `None` for an
-/// empty area.
+/// Text drawn with the system page font is rasterized at device resolution;
+/// the bitmap fallback renders at 1x and is scaled up with nearest-neighbor
+/// sampling so it keeps a consistent logical size on Retina. Returns `None`
+/// for an empty area.
 pub(crate) fn render_page(
     page: &browser::Page,
     width: u32,
@@ -219,12 +272,20 @@ pub(crate) fn render_page(
     let mut pixmap = Pixmap::new(width, height)?;
     let frame = render_demo(
         page,
-        (width as f64 / scale_factor).ceil() as u32,
-        (height as f64 / scale_factor).ceil() as u32,
+        width,
+        height,
+        scale_factor,
         alert_sink,
         runtime,
         scripts_evaluated,
     );
+    // Device pixels per frame pixel: 1 when the frame is already at device
+    // resolution, otherwise the window's scale for the 1x bitmap fallback.
+    let scale_factor = if frame.width == width {
+        1.0
+    } else {
+        scale_factor
+    };
     for (y, row) in pixmap
         .data_mut()
         .chunks_exact_mut(width as usize * 4)
@@ -264,7 +325,7 @@ mod tests {
     }
 
     fn welcome_color(page: &Page, property: &str) -> [u8; 4] {
-        let sheet = css::parse_stylesheet(&page.css);
+        let sheet = css::parse_stylesheet(&page.stylesheets[0]);
         let value = sheet
             .rules
             .iter()
@@ -287,6 +348,7 @@ mod tests {
             &page,
             160,
             120,
+            1.0,
             test_alert_sink(),
             &runtime,
             &mut scripts_evaluated,
@@ -365,11 +427,14 @@ mod tests {
         let events = PageEvents::new();
         events.load(
             &Page {
+                url: String::new(),
                 html: "<main><script src=\"script.js\"></script></main>".into(),
-                css: String::new(),
-                js: "function callback() { alert('Clicked') }\n\
+                stylesheets: Vec::new(),
+                scripts: vec![
+                    "function callback() { alert('Clicked') }\n\
                      document.addEventListener('click', callback)"
-                    .into(),
+                        .into(),
+                ],
             },
             alert.clone(),
             test_runtime(),
@@ -486,9 +551,10 @@ mod tests {
 
         let alert = Arc::new(TestAlert::default());
         let page = Page {
+            url: String::new(),
             html: "<main><script src=\"script.js\"></script></main>".into(),
-            css: String::new(),
-            js: "alert('rendered page')".into(),
+            stylesheets: Vec::new(),
+            scripts: vec!["alert('rendered page')".into()],
         };
 
         let runtime = test_runtime();
@@ -497,6 +563,7 @@ mod tests {
             &page,
             160,
             120,
+            1.0,
             alert.clone(),
             &runtime,
             &mut scripts_evaluated,
@@ -518,9 +585,10 @@ mod tests {
 
         let welcome = browser::welcome_page();
         let page = Page {
+            url: welcome.url,
             html: welcome.html,
-            css: welcome.css,
-            js: "alert('Hello from script.js')".into(),
+            stylesheets: welcome.stylesheets,
+            scripts: vec!["alert('Hello from script.js')".into()],
         };
         let alert = Arc::new(Recording::default());
         let runtime = test_runtime();
@@ -529,6 +597,7 @@ mod tests {
             &page,
             160,
             120,
+            1.0,
             alert.clone(),
             &runtime,
             &mut scripts_evaluated,
@@ -549,14 +618,16 @@ mod tests {
         let runtime = test_runtime();
         let mut scripts_evaluated = true;
         let mut page = Page {
+            url: String::new(),
             html: "<main>Hello</main>".into(),
-            css: "main { background-color: #abc; color: red; }".into(),
-            js: String::new(),
+            stylesheets: vec!["main { background-color: #abc; color: red; }".into()],
+            scripts: Vec::new(),
         };
         let first = render_document(
             &page,
             160,
             120,
+            1.0,
             test_alert_sink(),
             &runtime,
             &mut scripts_evaluated,
@@ -569,17 +640,19 @@ mod tests {
             &page,
             160,
             120,
+            1.0,
             test_alert_sink(),
             &runtime,
             &mut scripts_evaluated,
         );
         assert_ne!(first.pixels, changed_text.pixels);
 
-        page.css = "main { background-color: rgb(18, 52, 86); color: #abc; }".into();
+        page.stylesheets = vec!["main { background-color: rgb(18, 52, 86); color: #abc; }".into()];
         let changed_css = render_document(
             &page,
             160,
             120,
+            1.0,
             test_alert_sink(),
             &runtime,
             &mut scripts_evaluated,
@@ -598,14 +671,16 @@ mod tests {
         let runtime = test_runtime();
         let mut scripts_evaluated = true;
         let mut page = Page {
+            url: String::new(),
             html: "<html><body><main>Hi</main></body></html>".into(),
-            css: String::new(),
-            js: String::new(),
+            stylesheets: Vec::new(),
+            scripts: Vec::new(),
         };
         let frame = render_document(
             &page,
             160,
             120,
+            1.0,
             test_alert_sink(),
             &runtime,
             &mut scripts_evaluated,
@@ -613,11 +688,12 @@ mod tests {
         assert_eq!(&frame.pixels[..4], &[255, 255, 255, 255]);
         assert!(frame.pixels.chunks_exact(4).any(|p| p == [0, 0, 0, 255]));
 
-        page.css = "html { background-color: #123456; color: red; }".into();
+        page.stylesheets = vec!["html { background-color: #123456; color: red; }".into()];
         let frame = render_document(
             &page,
             160,
             120,
+            1.0,
             test_alert_sink(),
             &runtime,
             &mut scripts_evaluated,

@@ -27,6 +27,19 @@ use crate::toolbar::{self, ChromeState, Control};
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
+/// A caret movement in the address field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaretMove {
+    /// One character toward the start.
+    Left,
+    /// One character toward the end.
+    Right,
+    /// Before the first character.
+    Start,
+    /// After the last character.
+    End,
+}
+
 /// How a native shell wants its window set up.
 ///
 /// Every shell keeps the operating system's own window decorations (title
@@ -41,6 +54,11 @@ pub struct Platform {
     /// Returns font files to try, in order, for toolbar text. The first one
     /// that loads is used; if none loads the toolbar omits its text.
     pub ui_font_files: fn() -> Vec<PathBuf>,
+    /// Returns font files to try, in order, for page text, with the
+    /// system's default serif font first to match other browsers. The first
+    /// one that loads is used; if none loads, pages use the built-in bitmap
+    /// font.
+    pub page_font_files: fn() -> Vec<PathBuf>,
     /// Logical width at the toolbar's left that the system's window buttons
     /// cover when they overlap the toolbar, as macOS's traffic lights do on a
     /// transparent titlebar. Zero when the system draws its buttons in a
@@ -61,8 +79,6 @@ struct App {
     address: String,
     /// Address text to restore when Escape cancels an edit.
     address_before_edit: String,
-    /// Whether the current address should be replaced by the next edit.
-    address_selected: bool,
     modifiers: ModifiersState,
     /// Loaded document, retained independently of the size-dependent pixmap.
     loaded_page: Option<browser::Page>,
@@ -89,6 +105,25 @@ struct App {
     page_source: Option<PageSource>,
     source_font: Option<FontVec>,
     source_close_pressed: bool,
+    /// Background page loader; `None` when its runtime failed to start.
+    loader: Option<browser::PageLoader>,
+    /// Wakes the event loop from loader threads; set by [`run`].
+    proxy: Option<EventLoopProxy<UserEvent>>,
+    /// Id of the newest navigation; results for older ids are ignored.
+    navigation_id: u64,
+}
+
+/// Messages that background threads post to the UI thread's event loop.
+enum UserEvent {
+    /// A page script queued an `alert` dialog in [`PageAlerts`].
+    AlertPending,
+    /// A background page load finished.
+    Navigated {
+        /// The navigation this result belongs to; stale ones are dropped.
+        id: u64,
+        /// The loaded page or the reason it failed.
+        navigation: browser::Navigation,
+    },
 }
 
 /// Delivers `alert` on the UI thread, attached to the browser window.
@@ -98,7 +133,7 @@ struct App {
 /// waits for the UI thread. A dialog with no parent window also ends the
 /// process event loop, so the browser quits as the alert closes.
 struct PageAlerts {
-    proxy: Mutex<Option<EventLoopProxy<()>>>,
+    proxy: Mutex<Option<EventLoopProxy<UserEvent>>>,
     pending: Mutex<Vec<(String, mpsc::Sender<()>)>>,
 }
 
@@ -110,7 +145,7 @@ impl PageAlerts {
         }
     }
 
-    fn set_proxy(&self, proxy: EventLoopProxy<()>) {
+    fn set_proxy(&self, proxy: EventLoopProxy<UserEvent>) {
         *self.proxy.lock().expect("alert proxy lock") = Some(proxy);
     }
 
@@ -141,7 +176,7 @@ impl AlertSink for PageAlerts {
             .lock()
             .expect("alert queue lock")
             .push((message.to_owned(), done_tx));
-        if proxy.send_event(()).is_ok() {
+        if proxy.send_event(UserEvent::AlertPending).is_ok() {
             let _ = done_rx.recv();
         }
     }
@@ -176,7 +211,6 @@ impl App {
             browser_state: chrome::BrowserState::new(),
             address: String::from("byui://welcome"),
             address_before_edit: String::from("byui://welcome"),
-            address_selected: false,
             modifiers: ModifiersState::default(),
             loaded_page: None,
             page: None,
@@ -193,6 +227,11 @@ impl App {
             page_source: None,
             source_font: None,
             source_close_pressed: false,
+            loader: browser::PageLoader::new()
+                .map_err(|error| eprintln!("Page loader initialization failed: {error}"))
+                .ok(),
+            proxy: None,
+            navigation_id: 0,
         }
     }
 
@@ -204,15 +243,18 @@ impl App {
 
     /// Accepts a successfully loaded document and records one visit.
     ///
-    /// Future navigation should call this only after loading succeeds.
-    /// Repaints and Reload must not call it. The current loader and renderer
-    /// support only the welcome page; this method does not implement navigation.
+    /// Navigation calls this only after loading succeeds. Repaints, Reload,
+    /// and the error page for a failed load must not call it.
     fn page_loaded(&mut self, url: &str, page: browser::Page) {
         self.loaded_page = Some(page);
+        // Scripts of the new document run after its first frame is presented.
+        self.scripts_evaluated = false;
+        self.frame_key = None;
         self.browser_state.record_visit(url);
         self.address = url.to_owned();
         self.address_before_edit = self.address.clone();
-        self.address_selected = false;
+        self.chrome.address_caret = self.address.len();
+        self.chrome.address_selected = false;
         self.chrome.address_focused = false;
         self.page = None;
         self.redraw();
@@ -220,30 +262,68 @@ impl App {
 
     fn begin_address_edit(&mut self) {
         self.address_before_edit = self.address.clone();
-        self.address_selected = true;
+        self.chrome.address_caret = self.address.len();
+        self.chrome.address_selected = true;
         self.chrome.address_focused = true;
         self.redraw();
     }
 
     fn cancel_address_edit(&mut self) {
         self.address = self.address_before_edit.clone();
-        self.address_selected = false;
+        self.chrome.address_caret = self.address.len();
+        self.chrome.address_selected = false;
         self.chrome.address_focused = false;
         self.redraw();
     }
 
     fn submit_address(&mut self) {
         let address = self.address.trim().to_owned();
+        self.address = address.clone();
+        self.chrome.address_caret = self.address.len();
+        self.chrome.address_selected = false;
+        self.chrome.address_focused = false;
         if address == "byui://welcome" {
+            // Bump the id so an older load still in flight cannot replace it.
+            self.navigation_id += 1;
             self.page_loaded(&address, browser::welcome_page());
         } else {
-            // The renderer currently exposes only the built-in welcome page.
-            // Keep unsupported text visible so the future navigation layer can
-            // consume it without silently changing the page.
-            self.address = address;
-            self.address_selected = false;
-            self.chrome.address_focused = false;
-            self.redraw();
+            self.start_navigation(&address);
+        }
+        self.redraw();
+    }
+
+    /// Loads `address` on the background loader. The result comes back as a
+    /// [`UserEvent::Navigated`]; the UI keeps showing the current page until
+    /// then.
+    fn start_navigation(&mut self, address: &str) {
+        self.navigation_id += 1;
+        let id = self.navigation_id;
+        let (Some(loader), Some(proxy)) = (&self.loader, self.proxy.clone()) else {
+            eprintln!("Navigation unavailable: page loader is not running.");
+            return;
+        };
+        loader.load(address, move |navigation| {
+            // A closed event loop means the app is exiting; nothing to do.
+            let _ = proxy.send_event(UserEvent::Navigated { id, navigation });
+        });
+    }
+
+    /// Applies a finished load. A failure shows the built-in error page and
+    /// leaves the typed address in the bar; it is not recorded as a visit.
+    fn navigation_finished(&mut self, id: u64, navigation: browser::Navigation) {
+        if id != self.navigation_id {
+            return;
+        }
+        match navigation.result {
+            Ok(page) => self.page_loaded(&navigation.address, page),
+            Err(error) => {
+                eprintln!("Failed to load {}: {error}", navigation.address);
+                self.loaded_page = Some(browser::error_page(&navigation.address, &error));
+                self.scripts_evaluated = false;
+                self.frame_key = None;
+                self.page = None;
+                self.redraw();
+            }
         }
     }
 
@@ -253,7 +333,10 @@ impl App {
         }
         let key = event.logical_key.as_ref();
         let modifiers = self.modifiers;
-        if modifiers.control_key() {
+        // Command is the shortcut modifier on macOS; Control works everywhere.
+        let shortcut =
+            modifiers.control_key() || (cfg!(target_os = "macos") && modifiers.super_key());
+        if shortcut {
             if let Key::Character(character) = key {
                 match character.to_ascii_lowercase().as_str() {
                     "l" => {
@@ -262,6 +345,28 @@ impl App {
                     }
                     "r" => {
                         self.activate(Control::Reload);
+                        return;
+                    }
+                    "a" if self.chrome.address_focused => {
+                        self.chrome.address_selected = true;
+                        self.redraw();
+                        return;
+                    }
+                    "c" if self.chrome.address_focused => {
+                        if let Err(error) = arboard::Clipboard::new()
+                            .and_then(|mut clipboard| clipboard.set_text(self.address.clone()))
+                        {
+                            eprintln!("Failed to copy the address: {error}");
+                        }
+                        return;
+                    }
+                    "v" if self.chrome.address_focused => {
+                        match arboard::Clipboard::new()
+                            .and_then(|mut clipboard| clipboard.get_text())
+                        {
+                            Ok(text) => self.insert_address_text(&text),
+                            Err(error) => eprintln!("Failed to paste into the address: {error}"),
+                        }
                         return;
                     }
                     _ => {}
@@ -274,27 +379,104 @@ impl App {
         match key {
             Key::Named(NamedKey::Enter) => self.submit_address(),
             Key::Named(NamedKey::Escape) => self.cancel_address_edit(),
-            Key::Named(NamedKey::Backspace) => {
-                if self.address_selected {
-                    self.address.clear();
-                    self.address_selected = false;
-                } else {
-                    self.address.pop();
-                }
-                self.redraw();
+            Key::Named(NamedKey::Backspace) => self.delete_address_text(false),
+            Key::Named(NamedKey::Delete) => self.delete_address_text(true),
+            // Command+Left/Right jump to the ends on macOS, like Home/End.
+            Key::Named(NamedKey::ArrowLeft)
+                if cfg!(target_os = "macos") && modifiers.super_key() =>
+            {
+                self.move_address_caret(CaretMove::Start)
+            }
+            Key::Named(NamedKey::ArrowRight)
+                if cfg!(target_os = "macos") && modifiers.super_key() =>
+            {
+                self.move_address_caret(CaretMove::End)
+            }
+            Key::Named(NamedKey::ArrowLeft) => self.move_address_caret(CaretMove::Left),
+            Key::Named(NamedKey::ArrowRight) => self.move_address_caret(CaretMove::Right),
+            Key::Named(NamedKey::Home | NamedKey::ArrowUp) => {
+                self.move_address_caret(CaretMove::Start)
+            }
+            Key::Named(NamedKey::End | NamedKey::ArrowDown) => {
+                self.move_address_caret(CaretMove::End)
             }
             Key::Character(character)
                 if !modifiers.control_key() && !modifiers.alt_key() && !modifiers.super_key() =>
             {
-                if self.address_selected {
-                    self.address.clear();
-                    self.address_selected = false;
-                }
-                self.address.push_str(character);
-                self.redraw();
+                self.insert_address_text(character);
             }
             _ => {}
         }
+    }
+
+    /// Caret position clamped to a character boundary of the address.
+    fn address_caret(&self) -> usize {
+        toolbar::floor_char_boundary(&self.address, self.chrome.address_caret)
+    }
+
+    /// Types `text` at the caret, replacing the whole address when selected.
+    ///
+    /// Control characters such as the newlines of a multi-line paste are
+    /// dropped, since an address is a single line.
+    fn insert_address_text(&mut self, text: &str) {
+        if self.chrome.address_selected {
+            self.address.clear();
+            self.chrome.address_selected = false;
+        }
+        let text: String = text
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        let caret = self.address_caret();
+        self.address.insert_str(caret, &text);
+        self.chrome.address_caret = caret + text.len();
+        self.redraw();
+    }
+
+    /// Deletes the character after the caret when `forward`, else the one
+    /// before it; a selected address is cleared instead.
+    fn delete_address_text(&mut self, forward: bool) {
+        if self.chrome.address_selected {
+            self.address.clear();
+            self.chrome.address_selected = false;
+            self.chrome.address_caret = 0;
+        } else {
+            let caret = self.address_caret();
+            if forward {
+                if caret < self.address.len() {
+                    self.address.remove(caret);
+                }
+                self.chrome.address_caret = caret;
+            } else if let Some(previous) = self.address[..caret].chars().next_back() {
+                let start = caret - previous.len_utf8();
+                self.address.remove(start);
+                self.chrome.address_caret = start;
+            }
+        }
+        self.redraw();
+    }
+
+    /// Moves the caret, collapsing a selection first. Left and Right collapse
+    /// a selection to its start or end without moving further, as text
+    /// fields on every platform do.
+    fn move_address_caret(&mut self, movement: CaretMove) {
+        let caret = self.address_caret();
+        let selected = std::mem::take(&mut self.chrome.address_selected);
+        self.chrome.address_caret = match movement {
+            CaretMove::Start => 0,
+            CaretMove::End => self.address.len(),
+            CaretMove::Left if selected => 0,
+            CaretMove::Right if selected => self.address.len(),
+            CaretMove::Left => self.address[..caret]
+                .chars()
+                .next_back()
+                .map_or(caret, |previous| caret - previous.len_utf8()),
+            CaretMove::Right => self.address[caret..]
+                .chars()
+                .next()
+                .map_or(caret, |next| caret + next.len_utf8()),
+        };
+        self.redraw();
     }
 
     fn ensure_welcome_loaded(&mut self) {
@@ -716,7 +898,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             let attributes = (self.platform.configure_window)(
@@ -825,10 +1007,15 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
-        if let Some(window) = &self.window {
-            let window = Rc::clone(window);
-            self.alerts.present(&window);
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::AlertPending => {
+                if let Some(window) = &self.window {
+                    let window = Rc::clone(window);
+                    self.alerts.present(&window);
+                }
+            }
+            UserEvent::Navigated { id, navigation } => self.navigation_finished(id, navigation),
         }
     }
 
@@ -854,10 +1041,12 @@ impl ApplicationHandler for App {
 /// Opens the browser window described by `platform` and runs it until the
 /// user closes it.
 pub fn run(platform: Platform) -> Result<(), EventLoopError> {
-    let event_loop = EventLoop::new()?;
+    crate::content::load_page_font((platform.page_font_files)());
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App::new(platform);
     app.alerts.set_proxy(event_loop.create_proxy());
+    app.proxy = Some(event_loop.create_proxy());
     event_loop.run_app(&mut app)
 }
 
@@ -876,6 +1065,7 @@ mod tests {
             Platform {
                 configure_window: |attributes| attributes,
                 ui_font_files: Vec::new,
+                page_font_files: Vec::new,
                 window_controls_inset: 0.0,
             },
             browser::BrowserRuntime::in_memory(),
@@ -886,9 +1076,10 @@ mod tests {
     fn inspect_shows_loaded_source_without_fetching_executing_or_changing_history() {
         let mut app = app();
         let page = browser::Page {
+            url: String::new(),
             html: "<h1>Already loaded</h1>\n<script>not executed</script>".into(),
-            css: String::new(),
-            js: String::new(),
+            stylesheets: Vec::new(),
+            scripts: Vec::new(),
         };
         app.page_loaded("byui://source-fixture", page.clone());
         let before = app.browser_state.clone();
@@ -1126,15 +1317,68 @@ mod tests {
         let mut app = app();
         app.ensure_welcome_loaded();
         app.begin_address_edit();
-        assert!(app.address_selected);
+        assert!(app.chrome.address_selected);
         app.address.push_str("-draft");
 
         app.cancel_address_edit();
 
         assert_eq!(app.address, "byui://welcome");
-        assert!(!app.address_selected);
+        assert!(!app.chrome.address_selected);
         assert!(!app.chrome.address_focused);
         assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);
+    }
+
+    #[test]
+    fn pasted_text_replaces_a_selected_address_on_one_line() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.begin_address_edit();
+
+        app.insert_address_text("example.com/\r\npath\t");
+        assert_eq!(app.address, "example.com/path");
+        assert!(!app.chrome.address_selected);
+
+        app.insert_address_text("?q=1");
+        assert_eq!(app.address, "example.com/path?q=1");
+    }
+
+    #[test]
+    fn arrow_keys_collapse_the_selection_and_move_the_caret() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.begin_address_edit();
+
+        app.move_address_caret(CaretMove::Left);
+        assert!(!app.chrome.address_selected);
+        assert_eq!(app.chrome.address_caret, 0);
+
+        app.move_address_caret(CaretMove::Right);
+        app.move_address_caret(CaretMove::Right);
+        app.insert_address_text("X");
+        assert_eq!(app.address, "byXui://welcome");
+        assert_eq!(app.chrome.address_caret, 3);
+
+        app.delete_address_text(false);
+        app.delete_address_text(true);
+        assert_eq!(app.address, "byi://welcome");
+        assert_eq!(app.chrome.address_caret, 2);
+
+        app.move_address_caret(CaretMove::End);
+        app.move_address_caret(CaretMove::Right);
+        assert_eq!(app.chrome.address_caret, app.address.len());
+    }
+
+    #[test]
+    fn caret_steps_over_multi_byte_characters() {
+        let mut app = app();
+        app.address = "aé".to_owned();
+        app.begin_address_edit();
+        app.move_address_caret(CaretMove::Right);
+        app.move_address_caret(CaretMove::Left);
+        assert_eq!(app.chrome.address_caret, 1);
+        app.move_address_caret(CaretMove::Right);
+        app.delete_address_text(false);
+        assert_eq!(app.address, "a");
     }
 
     #[test]
@@ -1154,18 +1398,103 @@ mod tests {
         );
     }
 
+    fn navigation(
+        address: &str,
+        result: Result<browser::Page, browser::LoadError>,
+    ) -> browser::Navigation {
+        browser::Navigation {
+            address: address.to_owned(),
+            result,
+        }
+    }
+
     #[test]
-    fn unsupported_address_submission_does_not_replace_the_loaded_page() {
+    fn other_addresses_load_in_the_background_and_keep_the_current_page() {
         let mut app = app();
         app.ensure_welcome_loaded();
         let original_page = app.loaded_page.clone();
+        let before = app.navigation_id;
         app.begin_address_edit();
-        app.address = "https://example.com".to_owned();
+        app.address = " example.com ".to_owned();
 
         app.submit_address();
 
-        assert_eq!(app.address, "https://example.com");
+        // No loader thread result has arrived, so nothing is replaced yet.
+        assert_eq!(app.navigation_id, before + 1);
+        assert_eq!(app.address, "example.com");
         assert!(!app.chrome.address_focused);
+        assert_eq!(app.loaded_page, original_page);
+        assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);
+    }
+
+    #[test]
+    fn finished_navigation_replaces_the_page_and_records_a_visit() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.address = "example.com".to_owned();
+        app.submit_address();
+        let page = browser::Page {
+            url: String::new(),
+            html: "<p>Loaded</p>".into(),
+            stylesheets: Vec::new(),
+            scripts: Vec::new(),
+        };
+
+        app.navigation_finished(
+            app.navigation_id,
+            navigation("https://example.com/", Ok(page.clone())),
+        );
+
+        assert_eq!(app.loaded_page, Some(page));
+        assert_eq!(app.address, "https://example.com/");
+        assert_eq!(
+            app.browser_state.visited_urls(),
+            &["byui://welcome", "https://example.com/"]
+        );
+    }
+
+    #[test]
+    fn failed_navigation_shows_an_error_page_and_keeps_the_typed_address() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.address = "example.com/gone".to_owned();
+        app.submit_address();
+        let error = browser::LoadError::Status {
+            status: 404,
+            status_text: "Not Found".into(),
+        };
+
+        app.navigation_finished(
+            app.navigation_id,
+            navigation("https://example.com/gone", Err(error)),
+        );
+
+        let page = app.loaded_page.as_ref().unwrap();
+        assert!(page.html.contains("https://example.com/gone"));
+        assert!(page.html.contains("404"));
+        assert_eq!(app.address, "example.com/gone");
+        assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);
+    }
+
+    #[test]
+    fn stale_navigation_results_are_ignored() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let original_page = app.loaded_page.clone();
+        app.address = "example.com".to_owned();
+        app.submit_address();
+        let stale = app.navigation_id;
+        app.address = "example.org".to_owned();
+        app.submit_address();
+        let page = browser::Page {
+            url: String::new(),
+            html: "<p>Old</p>".into(),
+            stylesheets: Vec::new(),
+            scripts: Vec::new(),
+        };
+
+        app.navigation_finished(stale, navigation("https://example.com/", Ok(page)));
+
         assert_eq!(app.loaded_page, original_page);
         assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);
     }

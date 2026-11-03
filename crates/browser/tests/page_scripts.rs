@@ -154,14 +154,17 @@ fn linked_script_finds_page_elements_and_handles_their_clicks() {
             .expect("network client"),
     );
     let page = browser::Page {
+        url: String::new(),
         html: "<main><span>Hi</span><button id=\"btn\">Click Me</button>\
                <script src=\"script.js\"></script></main>"
             .into(),
-        css: String::new(),
-        js: "function callback() { alert('Clicked') }\n\
+        stylesheets: Vec::new(),
+        scripts: vec![
+            "function callback() { alert('Clicked') }\n\
              const btn = document.getElementById('btn')\n\
              btn.addEventListener('click', callback);"
-            .into(),
+                .into(),
+        ],
     };
 
     let session = BrowserRuntime::in_memory()

@@ -85,6 +85,15 @@ pub(crate) struct ChromeState {
     pub window_controls_inset: f32,
     /// Whether the address field owns keyboard input.
     pub address_focused: bool,
+    /// Whether the whole address is selected, so the next edit replaces it.
+    /// Drawn as a highlight instead of a caret; meaningful only while
+    /// [`ChromeState::address_focused`] is set.
+    pub address_selected: bool,
+    /// Caret position as a byte offset into the address text, drawn while the
+    /// field is focused and nothing is selected. Offsets past the end, or
+    /// inside a multi-byte character, are drawn at the nearest earlier
+    /// character boundary.
+    pub address_caret: usize,
 }
 
 /// A rectangle in device pixels.
@@ -493,18 +502,37 @@ fn draw_address_field(
         stroke(pixmap, &path, palette.text_muted, 1.3, transform);
     }
 
+    let text_x = rect.x() + 30.0;
+    let clip_x = star_x - 12.0;
+    // Logical x of the caret, before the glyph at `address_caret`.
+    let mut caret_x = text_x;
     if let Some(font) = font {
         let size = TEXT_SIZE * scale;
         let scaled = font.as_scaled(PxScale::from(size));
         let baseline = cy * scale + (scaled.ascent() + scaled.descent()) / 2.0;
-        let clip = (star_x - 12.0) * scale;
+        if state.address_focused && state.address_selected && !address.is_empty() {
+            let width = text_advance(font, size, address) / scale;
+            let right = (text_x + width).min(clip_x);
+            if let Some(highlight) =
+                Rect::from_xywh(text_x - 1.0, cy - 9.0, right - text_x + 2.0, 18.0)
+            {
+                fill(
+                    pixmap,
+                    &PathBuilder::from_rect(highlight),
+                    palette.selection,
+                    transform,
+                );
+            }
+        }
+        let caret = floor_char_boundary(address, state.address_caret);
+        caret_x = text_x + text_advance(font, size, &address[..caret]) / scale;
         draw_text(
             pixmap,
             font,
             size,
-            (rect.x() + 30.0) * scale,
+            text_x * scale,
             baseline,
-            clip,
+            clip_x * scale,
             if state.address_focused {
                 palette.text
             } else {
@@ -513,6 +541,43 @@ fn draw_address_field(
             address,
         );
     }
+    if state.address_focused && !state.address_selected {
+        let x = caret_x.min(clip_x) + 1.0;
+        if let Some(caret) = Rect::from_xywh(x, cy - 8.0, 1.5, 16.0) {
+            fill(
+                pixmap,
+                &PathBuilder::from_rect(caret),
+                palette.text,
+                transform,
+            );
+        }
+    }
+}
+
+/// Returns the largest character boundary of `text` at or before `index`.
+pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Returns the pen advance in device pixels of `text` set at `size`, matching
+/// the position [`draw_text`] returns relative to its starting `x`.
+fn text_advance(font: &FontVec, size: f32, text: &str) -> f32 {
+    let scaled = font.as_scaled(PxScale::from(size));
+    let mut advance = 0.0;
+    let mut previous = None;
+    for character in text.chars() {
+        let id = scaled.glyph_id(character);
+        if let Some(previous) = previous {
+            advance += scaled.kern(previous, id);
+        }
+        previous = Some(id);
+        advance += scaled.h_advance(id);
+    }
+    advance
 }
 
 /// Draws `text` with its baseline at `baseline` (device pixels), clipping
@@ -657,6 +722,7 @@ struct Palette {
     text: Color,
     text_muted: Color,
     accent: Color,
+    selection: Color,
 }
 
 fn light() -> Palette {
@@ -676,6 +742,7 @@ fn light() -> Palette {
         text_muted: rgba(0x6b, 0x72, 0x80, 255),
         // BYU–Idaho blue.
         accent: rgba(0x00, 0x6e, 0xb6, 255),
+        selection: rgba(0x00, 0x6e, 0xb6, 64),
     }
 }
 
@@ -695,6 +762,7 @@ fn dark() -> Palette {
         text: rgba(0xec, 0xee, 0xf2, 255),
         text_muted: rgba(0x96, 0x9c, 0xa8, 255),
         accent: rgba(0x4d, 0xa3, 0xff, 255),
+        selection: rgba(0x4d, 0xa3, 0xff, 96),
     }
 }
 
@@ -825,6 +893,8 @@ mod tests {
                         pressed: hovered,
                         dark,
                         address_focused: false,
+                        address_selected: false,
+                        address_caret: 0,
                         window_controls_inset: if dark { 72.0 } else { 0.0 },
                     };
                     let out =
@@ -902,5 +972,40 @@ mod tests {
         )
         .unwrap();
         assert_ne!(normal.data(), focused.data());
+    }
+
+    #[test]
+    fn focused_address_shows_a_caret_in_both_palettes() {
+        for dark in [false, true] {
+            let focused = ChromeState {
+                dark,
+                address_focused: true,
+                ..ChromeState::default()
+            };
+            let selected = ChromeState {
+                address_selected: true,
+                ..focused
+            };
+            let with_caret = compose(400, 200, 1.0, &focused, "", None, None).unwrap();
+            let without = compose(400, 200, 1.0, &selected, "", None, None).unwrap();
+            let rect = control_rect(Control::Address, 400.0, 0.0).unwrap();
+            // With no font the caret sits at the text origin.
+            let x = (rect.x() + 31.5) as u32;
+            let caret = pixel(&with_caret, x, CENTER_Y as u32);
+            let field = pixel(&without, x, CENTER_Y as u32);
+            // The caret uses the text color, so it contrasts with the field.
+            let lightness = |p: [u8; 4]| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]);
+            if dark {
+                assert!(
+                    lightness(caret) > lightness(field) + 300,
+                    "{caret:?} {field:?}"
+                );
+            } else {
+                assert!(
+                    lightness(caret) + 300 < lightness(field),
+                    "{caret:?} {field:?}"
+                );
+            }
+        }
     }
 }
