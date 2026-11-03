@@ -72,9 +72,10 @@ fn invalid_syntax_fixture_returns_a_syntax_error() {
 }
 
 #[test]
-#[ignore = "Array literals and indexing are not implemented yet"]
-fn arrays_fixture_will_evaluate_when_arrays_are_supported() {
-    assert!(eval(fixture("arrays.js")).is_ok());
+fn arrays_fixture_evaluates_on_the_bytecode_vm() {
+    let chunk = js::bytecode::compile(&js::parse(fixture("arrays.js")).expect("fixture parses"))
+        .expect("fixture compiles");
+    assert_eq!(js::Vm::new().execute(&chunk), Ok(Value::Number(1.0)));
 }
 
 #[test]

@@ -339,7 +339,8 @@ fn malformed_sources_return_errors_without_panicking() {
         "a[1",
         "a[1,2]",
         ".a",
-        "[1]",
+        "[1",
+        "[1 2]",
         "a.b() = 1",
         "a.b + 1 = 2",
     ] {

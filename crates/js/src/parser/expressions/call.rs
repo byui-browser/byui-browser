@@ -21,6 +21,7 @@ fn primary(parser: &mut Parser<'_>) -> ParseResult<(Expr, usize)> {
         Some(Token::New) => return parse_new(parser),
         Some(Token::Super) => return parse_super(parser),
         Some(Token::LeftBrace) => return super::object::parse(parser),
+        Some(Token::LeftBracket) => return super::array::parse(parser),
         Some(Token::LeftParen) => {
             parser.advance();
             let (expression, depth) = parser.parse_expression_with_depth(0)?;

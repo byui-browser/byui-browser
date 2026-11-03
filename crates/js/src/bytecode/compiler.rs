@@ -590,6 +590,21 @@ impl Compiler {
                 }
                 Ok(())
             }
+            Expr::Array(elements) => {
+                self.chunk.emit(Instruction::NewArray);
+                for element in elements {
+                    match element {
+                        Some(element) => {
+                            self.compile_expression(element)?;
+                            self.chunk.emit(Instruction::AppendElement);
+                        }
+                        None => {
+                            self.chunk.emit(Instruction::AppendHole);
+                        }
+                    }
+                }
+                Ok(())
+            }
             Expr::Object(properties) => {
                 self.chunk.emit(Instruction::NewObject);
                 for property in properties {

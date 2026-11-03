@@ -1,3 +1,4 @@
+mod array;
 mod assignment;
 mod binary_operator;
 mod call;

@@ -27,6 +27,7 @@
 //! - Each evaluation has a step budget (see [`DEFAULT_STEP_LIMIT`]), so
 //!   endless loops fail with an error instead of running forever.
 
+mod array;
 mod conversions;
 mod object;
 
@@ -41,6 +42,8 @@ use crate::ast::{
 use crate::bytecode::FunctionTemplate;
 use crate::stack::{StackGuard, with_engine_stack};
 use crate::{HostFunction, JsError, JsResult, Value};
+pub(crate) use array::number_index;
+pub use array::{Array, MAX_ARRAY_LENGTH};
 use conversions::{
     is_truthy, less_than, loose_equals, strict_equals, to_int32, to_number, to_primitive, to_uint32,
 };
@@ -411,16 +414,6 @@ impl Function {
             FunctionKind::Host { function, .. } => Some(function(arguments)),
             _ => None,
         }
-    }
-
-    /// Invokes this function with `arguments`.
-    ///
-    /// Script functions execute with their captured lexical environment, and
-    /// host functions receive the supplied values directly. This is used by
-    /// host APIs that need to call a JavaScript callback, such as DOM events.
-    /// Bytecode functions are not run here; the VM executes those.
-    pub fn call(&self, arguments: &[Value]) -> JsResult<Value> {
-        with_engine_stack(|| Interpreter::new(ExecutionLimits::default()).call(self, arguments))
     }
 }
 
@@ -802,6 +795,7 @@ impl Interpreter {
             Expr::This => Err(JsError::new("`this` is not defined")),
             Expr::New { .. } => Err(unsupported_here("`new`")),
             Expr::SuperCall { .. } | Expr::SuperMember { .. } => Err(unsupported_here("`super`")),
+            Expr::Array(_) => Err(unsupported_here("array literals")),
             Expr::Identifier(name) => read(scope, name),
             Expr::Assign { name, value } => {
                 let value = self.evaluate(value, scope)?;
@@ -982,6 +976,7 @@ pub(crate) fn non_object(value: &Value, action: &str, key: &str, context: &str) 
         Value::String(_) => "a string",
         Value::Function(_) => "a function",
         Value::Object(_) => "an object",
+        Value::Array(_) => "an array",
     };
     JsError::with_context(
         crate::JsErrorCategory::Runtime,

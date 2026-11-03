@@ -324,7 +324,7 @@ fn javascript_truthy(value: &Value) -> bool {
         Value::Boolean(value) => *value,
         Value::Number(value) => *value != 0.0 && !value.is_nan(),
         Value::String(value) => !value.is_empty(),
-        Value::Function(_) | Value::Object(_) => true,
+        Value::Function(_) | Value::Object(_) | Value::Array(_) => true,
     }
 }
 

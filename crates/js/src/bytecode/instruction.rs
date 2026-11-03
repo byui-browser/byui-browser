@@ -31,7 +31,8 @@ pub enum Instruction {
     LoadProperty(u16),
     /// Reads a computed property: pops the key, then the object, and pushes
     /// the value. The key is converted to a string, so `1` and `'1'` name the
-    /// same property.
+    /// same property. On an array, an index key reads the element (a hole or
+    /// an index past the end is `undefined`) and `'length'` the length.
     LoadComputedProperty,
     /// Writes a named property: pops the value, then the object, stores the
     /// value under the string constant at this pool index, and pushes the
@@ -42,6 +43,8 @@ pub enum Instruction {
     StoreProperty(u16),
     /// Writes a computed property: pops the value, the key, then the object,
     /// stores the value under the stringified key, and pushes the value back.
+    /// On an array, storing past the end pads the gap with holes, and storing
+    /// `length` truncates or pads the array.
     StoreComputedProperty,
     /// Pushes a new empty object, the start of an object literal.
     NewObject,
@@ -53,6 +56,14 @@ pub enum Instruction {
     /// key, stores the value under the stringified key on the object now at
     /// the top of the stack, and leaves the object on the stack.
     DefineComputedProperty,
+    /// Pushes a new empty array, the start of an array literal.
+    NewArray,
+    /// Appends an array literal element: pops the value and pushes it onto
+    /// the array now at the top of the stack, which stays there.
+    AppendElement,
+    /// Appends a hole to the array now at the top of the stack, which stays
+    /// there.
+    AppendHole,
     /// Duplicates the value at the top of the stack.
     Dup,
     /// Pushes the running function's `this` receiver.

@@ -7,8 +7,8 @@
 
 use crate::ast::{BinaryOperator, UnaryOperator};
 use crate::bytecode::{CallableKind, Chunk, FunctionTemplate, Instruction};
-use crate::runtime::{ExecutionLimits, non_object, to_property_key};
-use crate::{Function, JsError, JsErrorCategory, JsResult, Object, Value};
+use crate::runtime::{ExecutionLimits, non_object, number_index, to_property_key};
+use crate::{Array, Function, JsError, JsErrorCategory, JsResult, Object, Value};
 use std::sync::Arc;
 
 /// Executes a [`Chunk`] using an owned operand stack.
@@ -193,9 +193,19 @@ impl Vm {
                     self.push(load_property(&target, &key)?);
                 }
                 Instruction::LoadComputedProperty => {
-                    let key = to_property_key(&self.pop()?);
+                    let key = self.pop()?;
                     let target = self.pop()?;
-                    self.push(load_property(&target, &key)?);
+                    // Numeric indexes skip building a key string.
+                    let value = match (&target, &key) {
+                        (Value::Array(array), Value::Number(number)) => {
+                            match number_index(*number) {
+                                Some(index) => array.get(index).unwrap_or(Value::Undefined),
+                                None => load_property(&target, &to_property_key(&key))?,
+                            }
+                        }
+                        _ => load_property(&target, &to_property_key(&key))?,
+                    };
+                    self.push(value);
                 }
                 Instruction::StoreProperty(index) => {
                     let key = property_name(&chunk, index)?;
@@ -206,9 +216,16 @@ impl Vm {
                 }
                 Instruction::StoreComputedProperty => {
                     let value = self.pop()?;
-                    let key = to_property_key(&self.pop()?);
+                    let key = self.pop()?;
                     let target = self.pop()?;
-                    store_property(&target, key, &value)?;
+                    let index = match (&target, &key) {
+                        (Value::Array(_), Value::Number(number)) => number_index(*number),
+                        _ => None,
+                    };
+                    match (&target, index) {
+                        (Value::Array(array), Some(index)) => array.set(index, value.clone())?,
+                        _ => store_property(&target, to_property_key(&key), &value)?,
+                    }
                     self.push(value);
                 }
                 Instruction::LoadThis => {
@@ -327,6 +344,20 @@ impl Vm {
                     prototype.set(key, Value::Function(method));
                 }
                 Instruction::NewObject => self.push(Value::Object(Object::new())),
+                Instruction::NewArray => self.push(Value::Array(Array::new())),
+                Instruction::AppendElement => {
+                    let value = self.pop()?;
+                    match self.peek()? {
+                        Value::Array(array) => array.push(value)?,
+                        _ => return Err(JsError::runtime("array literal target is not an array")),
+                    };
+                }
+                Instruction::AppendHole => match self.peek()? {
+                    Value::Array(array) => {
+                        array.push_hole()?;
+                    }
+                    _ => return Err(JsError::runtime("array literal target is not an array")),
+                },
                 Instruction::DefineProperty(index) => {
                     let key = property_name(&chunk, index)?;
                     let value = self.pop()?;
@@ -814,6 +845,7 @@ fn property_name(chunk: &Chunk, index: u16) -> JsResult<String> {
 fn load_property(target: &Value, key: &str) -> JsResult<Value> {
     match target {
         Value::Object(object) => Ok(object.get(key).unwrap_or(Value::Undefined)),
+        Value::Array(array) => Ok(array.get_property(key)),
         Value::Function(function) if function.template().is_some() => {
             Ok(function.get_own(key).unwrap_or(Value::Undefined))
         }
@@ -824,6 +856,7 @@ fn load_property(target: &Value, key: &str) -> JsResult<Value> {
 fn store_property(target: &Value, key: String, value: &Value) -> JsResult<()> {
     match target {
         Value::Object(object) => object.set(key, value.clone()),
+        Value::Array(array) => array.set_property(&key, value.clone())?,
         Value::Function(function) if function.set_own(&key, value.clone()) => {}
         _ => return Err(non_object(target, "set", &key, "property assignment")),
     }
@@ -900,7 +933,7 @@ fn to_number(value: &Value) -> JsResult<f64> {
         Value::Undefined => Ok(f64::NAN),
         Value::String(value) if value.trim().is_empty() => Ok(0.0),
         Value::String(value) => Ok(value.trim().parse().unwrap_or(f64::NAN)),
-        Value::Function(_) | Value::Object(_) => {
+        Value::Function(_) | Value::Object(_) | Value::Array(_) => {
             Err(JsError::runtime("cannot convert object to number"))
         }
     }
@@ -920,6 +953,6 @@ fn is_truthy(value: &Value) -> bool {
         Value::Boolean(value) => *value,
         Value::Number(value) => *value != 0.0 && !value.is_nan(),
         Value::String(value) => !value.is_empty(),
-        Value::Function(_) | Value::Object(_) => true,
+        Value::Function(_) | Value::Object(_) | Value::Array(_) => true,
     }
 }

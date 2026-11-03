@@ -120,6 +120,14 @@ pub enum Expr {
     /// `{ a }` is parsed as `{ a: a }`. Methods, getters, setters, and spread
     /// (`...`) are unsupported.
     Object(Vec<ObjectProperty>),
+    /// Array literal such as `[1, , x]`, creating a new array each time it is
+    /// evaluated.
+    ///
+    /// Elements are evaluated in source order. `None` is an elision, a hole
+    /// in the array that still counts toward its length; one trailing comma
+    /// is ignored, so `[1,]` has length 1 and `[1,,]` has length 2. Spread
+    /// (`...`) is unsupported. Arrays run only on the bytecode VM.
+    Array(Vec<Option<Expr>>),
 }
 
 /// One `key: value` entry of an object literal.
