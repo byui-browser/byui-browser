@@ -47,7 +47,7 @@ on Windows to check that the existing welcome page and toolbar still work.
 ### Page context menu
 
 Right-click inside the page card to open the shared desktop context menu.
-The menu lists **Back**, **Forward**, **Reload**, and **Inspect (page source)**.
+The menu lists **Back**, **Forward**, **Reload**, **View Page Source**, and **Inspect**.
 Back and Forward are visibly disabled placeholders: they do not highlight,
 respond to clicks, or navigate, even when history entries exist. Clicking them
 leaves the popup open. Navigation controls are not connected yet.
@@ -56,7 +56,7 @@ The URL, status, and body appear in the launching terminal. History is unchanged
 Click outside the popup or press Escape to dismiss it. Resize and focus loss also
 close it; the cached page is restored without re-running scripts on dismissal.
 The popup is clamped to the window and supports display scaling. The fourth
-item, **Inspect (page source)**, opens a read-only **Page source (loaded HTML)**
+item, **View Page Source**, opens a read-only **Page source (loaded HTML)**
 panel using a snapshot of the loaded document. It does not fetch, execute HTML,
 select elements, or show a live DOM. Scroll with the mouse wheel, Up/Down, or
 Page Up/Page Down; Home/End jump to the beginning/end. Small trackpad deltas
@@ -74,8 +74,7 @@ Try the bottom-right corner, outside-click and Escape dismissal, and resizing;
 no popup pixels should remain after dismissal. On Windows, run
 `cargo run -p byui-browser-windows` and repeat the same steps.
 
-To demonstrate Inspect, right-click the welcome page and select **Inspect (page
-source)** below Reload. Point out the “Page source (loaded HTML)” heading and
+To demonstrate View Page Source, right-click the welcome page and select **View Page Source** below Reload. Point out the “Page source (loaded HTML)” heading and
 welcome-page HTML. Press Escape to return to the page, then demonstrate that
 Reload still prints its results in the terminal. This is source viewing, not a
 full element inspector. Windows UI behavior still needs a native manual check.
@@ -85,3 +84,29 @@ Try wheel/trackpad, Up/Down, Page Up/Down, and Home/End. Resize wider and taller
 the source panel and Close button should remain inside the window. The source
 viewer tests cover long lines and hundreds of HTML lines. This feature adds no
 navigation or startup-URL support.
+
+### Inspect: basic Elements panel
+
+The fifth right-click action, **Inspect**, opens a rectangular bottom panel
+inside the window. The upper webpage stays visible. **Elements — Basic
+inspector** displays an indented tree of element tags from a fresh parse of the
+loaded HTML snapshot, using only nodes the parser supplies. It is not a live
+JavaScript DOM, an element picker, or full Chrome DevTools. Text, comments, and
+attributes are not currently shown. The panel closes when navigation replaces
+the displayed document, so its snapshot cannot describe a previous page. No
+network requests or script evaluation
+are performed by opening the panel.
+
+Scroll over the panel, or use Up/Down, Page Up/Down, Home/End while the address
+field is not focused. Click **×** or press Escape to close it. Resize the window
+to check that the dock and close control remain inside it. Missing/empty HTML
+shows a diagnostic rather than crashing. The basic view is bounded to 1 MiB of
+HTML and 20,000 element entries.
+
+View Page Source remains the separate full HTML viewer with line numbers,
+wrapping, scrolling, Close, and Escape. Both views keep their own state: open
+Inspect, then right-click the upper webpage and choose View Page Source. Escape
+closes the source overlay first and reveals the still-open Elements panel;
+Escape again closes Elements. Clicking inside Elements never dispatches a
+click to the webpage underneath. Reload and the toolbar three-dot menu are
+unchanged.

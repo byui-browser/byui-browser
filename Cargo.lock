@@ -224,6 +224,7 @@ dependencies = [
  "html",
  "js",
  "layout",
+ "log",
  "net",
  "paint",
  "render",
@@ -238,7 +239,9 @@ dependencies = [
 name = "browser-js"
 version = "0.1.0"
 dependencies = [
+ "common",
  "js",
+ "log",
 ]
 
 [[package]]
@@ -246,6 +249,7 @@ name = "browser-linux"
 version = "0.1.0"
 dependencies = [
  "browser-shell",
+ "log",
  "winit",
 ]
 
@@ -265,10 +269,12 @@ dependencies = [
  "arboard",
  "browser",
  "chrome",
+ "common",
  "css",
  "html",
  "js",
  "layout",
+ "log",
  "net",
  "paint",
  "render",
@@ -433,6 +439,7 @@ name = "chrome"
 version = "0.1.0"
 dependencies = [
  "common",
+ "log",
 ]
 
 [[package]]
@@ -457,6 +464,9 @@ dependencies = [
 [[package]]
 name = "common"
 version = "0.1.0"
+dependencies = [
+ "log",
+]
 
 [[package]]
 name = "compression-codecs"
@@ -557,6 +567,7 @@ version = "0.1.0"
 dependencies = [
  "common",
  "html",
+ "log",
 ]
 
 [[package]]
@@ -579,6 +590,7 @@ name = "devtools"
 version = "0.1.0"
 dependencies = [
  "common",
+ "log",
 ]
 
 [[package]]
@@ -986,6 +998,7 @@ name = "html"
 version = "0.1.0"
 dependencies = [
  "common",
+ "log",
 ]
 
 [[package]]
@@ -1307,6 +1320,7 @@ name = "js"
 version = "0.1.0"
 dependencies = [
  "common",
+ "log",
  "unicode-ident",
 ]
 
@@ -1328,6 +1342,7 @@ dependencies = [
  "common",
  "css",
  "html",
+ "log",
  "paint",
  "png",
  "render",
@@ -1492,6 +1507,7 @@ dependencies = [
  "encoding_rs",
  "futures-util",
  "http",
+ "log",
  "reqwest",
  "serde",
  "serde_json",
@@ -1837,6 +1853,7 @@ dependencies = [
  "css",
  "html",
  "layout",
+ "log",
 ]
 
 [[package]]
@@ -2124,6 +2141,7 @@ dependencies = [
  "ab_glyph",
  "common",
  "layout",
+ "log",
  "paint",
 ]
 
@@ -2346,6 +2364,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "common",
+ "log",
 ]
 
 [[package]]
@@ -2544,6 +2563,7 @@ name = "storage"
 version = "0.1.0"
 dependencies = [
  "common",
+ "log",
  "security",
 ]
 
@@ -3195,6 +3215,7 @@ version = "0.1.0"
 dependencies = [
  "html",
  "js",
+ "log",
  "net",
  "security",
  "storage",

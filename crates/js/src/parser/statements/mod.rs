@@ -6,11 +6,16 @@ mod declaration;
 mod function;
 mod return_statement;
 
+pub(in crate::parser) use block::parse_arrow_block;
+
 use super::{ParseResult, Parser};
 use crate::ast::Statement;
 use crate::lexer::Token;
 
 pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Statement> {
+    if log::log_enabled!(log::Level::Trace) {
+        log::trace!("parsing statement starting at {:?}", parser.peek());
+    }
     match parser.peek() {
         Some(Token::LeftBrace) => Ok(Statement::Block(block::parse(parser)?)),
         Some(Token::Let | Token::Var | Token::Const) => declaration::parse(parser),

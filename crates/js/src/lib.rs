@@ -25,10 +25,10 @@ pub use vm::Vm;
 /// A JavaScript value produced by evaluation or passed to host functions.
 ///
 /// Primitive variants own their data. [`Value::Function`] and
-/// [`Value::Object`] are reference handles: cloning the value shares the same
+/// [`Value::Object`] and [`Value::Array`] are reference handles: cloning the value shares the same
 /// function or property table, and `==`/`===` compare them by identity.
 ///
-/// Unsupported: symbols, bigints, arrays, and other built-in object kinds.
+/// Unsupported: symbols, bigints, and other built-in object kinds.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// The `undefined` value.
@@ -46,6 +46,8 @@ pub enum Value {
     /// A plain object with string-keyed properties, compared by identity.
     /// See [`Object`] for its sharing rules and limitations.
     Object(Object),
+    /// An array with JavaScript index properties and a `length` property.
+    Array(Object),
 }
 
 /// Formats the value as JavaScript's `ToString` would, so numbers print as
@@ -60,6 +62,7 @@ impl fmt::Display for Value {
             Self::String(text) => formatter.write_str(text),
             Self::Function(function) => write!(formatter, "{function}"),
             Self::Object(object) => write!(formatter, "{object}"),
+            Self::Array(object) => write!(formatter, "{object}"),
         }
     }
 }
@@ -198,6 +201,11 @@ impl Realm {
     /// [`Object`] to start clean. Use [`Realm::new`] for a realm with no host
     /// globals at all.
     pub fn reset_script_state(&mut self) {
+        log::debug!(
+            "resetting script state ({} host functions, {} host values)",
+            self.functions.len(),
+            self.values.len()
+        );
         self.globals = runtime::GlobalState::new();
         for (name, function) in &self.functions {
             self.globals.install_host(name, host_value(name, function));
@@ -223,9 +231,11 @@ impl Realm {
     ) -> JsResult<()> {
         let name = name.into();
         if name.is_empty() {
+            log::warn!("rejected global function registration with an empty name");
             return Err(JsError::new("global function name cannot be empty"));
         }
 
+        log::debug!("registering global function `{name}`");
         self.values.remove(&name);
         self.globals
             .install_host(&name, host_value(&name, &function));
@@ -259,9 +269,11 @@ impl Realm {
     pub fn register_global_value(&mut self, name: impl Into<String>, value: Value) -> JsResult<()> {
         let name = name.into();
         if name.is_empty() {
+            log::warn!("rejected global value registration with an empty name");
             return Err(JsError::new("global value name cannot be empty"));
         }
 
+        log::debug!("registering global value `{name}` ({})", value_kind(&value));
         self.functions.remove(&name);
         self.globals.install_host(&name, value.clone());
         self.values.insert(name, value);
@@ -272,15 +284,20 @@ impl Realm {
     /// Values registered with [`Realm::register_global_value`] are not
     /// callable through this method, even if they are functions.
     pub fn call_global(&self, name: &str, arguments: &[Value]) -> JsResult<Value> {
-        let function = self
-            .functions
-            .get(name)
-            .ok_or_else(|| JsError::new(format!("global function `{name}` is not defined")))?;
+        let function = self.functions.get(name).ok_or_else(|| {
+            log::debug!("call to undefined global function `{name}`");
+            JsError::new(format!("global function `{name}` is not defined"))
+        })?;
+        log::trace!(
+            "calling global function `{name}` with {} arguments",
+            arguments.len()
+        );
         function(arguments)
     }
 
     /// Replaces the limits used by future script evaluations.
     pub fn set_execution_limits(&mut self, limits: runtime::ExecutionLimits) {
+        log::debug!("setting execution limits to {limits:?}");
         self.limits = limits;
     }
 
@@ -296,10 +313,37 @@ impl Realm {
     /// the realm's globals for later calls; see [`Realm`] for the
     /// redeclaration rules and [`Realm::reset_script_state`] to clear them.
     pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
-        let program = parse(source).map_err(|error| {
-            JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
-        })?;
-        self.globals.evaluate(&program, self.limits)
+        log::debug!("evaluating script ({} bytes)", source.len());
+        let result = parse(source)
+            .map_err(|error| {
+                JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+            })
+            .and_then(|program| self.globals.evaluate(&program, self.limits));
+        log_outcome("script", &result);
+        result
+    }
+}
+
+/// Names the kind of `value` for log messages, without formatting its contents.
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Undefined => "undefined",
+        Value::Null => "null",
+        Value::Boolean(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Function(_) => "function",
+        Value::Object(_) => "object",
+        Value::Array(_) => "array",
+    }
+}
+
+/// Logs how an evaluation finished. An uncaught script exception is not an
+/// engine fault, so failures are only logged at debug level.
+fn log_outcome(what: &str, result: &JsResult<Value>) {
+    match result {
+        Ok(value) => log::debug!("{what} finished with {}", value_kind(value)),
+        Err(error) => log::debug!("{what} failed ({:?}): {}", error.category, error.message),
     }
 }
 
@@ -317,6 +361,7 @@ pub use ast::{Program, Statement};
 /// Syntax errors carry a token index, UTF-8 byte offset, and one-based line and
 /// character column. Locations at end of input point just past the source.
 pub fn parse(source: &str) -> Result<Program, parser::ParseError> {
+    log::trace!("parsing {} bytes of source", source.len());
     let entries = lexer::tokenize_spanned(source);
     let starts: Vec<_> = entries.iter().map(|entry| entry.start).collect();
     let line_terminators_before: Vec<_> = entries
@@ -330,8 +375,8 @@ pub fn parse(source: &str) -> Result<Program, parser::ParseError> {
         })
         .collect();
     let tokens: Vec<_> = entries.into_iter().map(|entry| entry.token).collect();
-    parser::parse_program_with_line_terminators(&tokens, &line_terminators_before).map_err(
-        |mut error| {
+    let program = parser::parse_program_with_line_terminators(&tokens, &line_terminators_before)
+        .map_err(|mut error| {
             let offset = starts
                 .get(error.token_index)
                 .copied()
@@ -340,9 +385,16 @@ pub fn parse(source: &str) -> Result<Program, parser::ParseError> {
             error.offset = Some(offset);
             error.line = Some(prefix.chars().filter(|ch| *ch == '\n').count() + 1);
             error.column = Some(prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1);
+            log::debug!(
+                "syntax error at line {}, column {} (offset {offset}): {}",
+                error.line.unwrap_or(0),
+                error.column.unwrap_or(0),
+                error.message
+            );
             error
-        },
-    )
+        })?;
+    log::debug!("parsed {} top-level statements", program.body.len());
+    Ok(program)
 }
 
 /// Parses and evaluates source text, returning the completion value.
@@ -353,16 +405,24 @@ pub fn parse(source: &str) -> Result<Program, parser::ParseError> {
 /// but are not evaluated here; they run only through [`bytecode::compile`] and
 /// [`Vm`]. Syntax errors and runtime errors are both returned as [`JsError`].
 pub fn eval(source: &str) -> JsResult<Value> {
-    let program = parse(source).map_err(|error| {
-        JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
-    })?;
-    runtime::evaluate_program(&program)
+    log::debug!("evaluating source ({} bytes)", source.len());
+    let result = parse(source)
+        .map_err(|error| {
+            JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+        })
+        .and_then(|program| runtime::evaluate_program(&program));
+    log_outcome("source", &result);
+    result
 }
 
 /// Parses and evaluates source text using caller-provided execution limits.
 pub fn eval_with_limits(source: &str, limits: runtime::ExecutionLimits) -> JsResult<Value> {
-    let program = parse(source).map_err(|error| {
-        JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
-    })?;
-    runtime::evaluate_program_with_limits(&program, limits)
+    log::debug!("evaluating source ({} bytes) with {limits:?}", source.len());
+    let result = parse(source)
+        .map_err(|error| {
+            JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+        })
+        .and_then(|program| runtime::evaluate_program_with_limits(&program, limits));
+    log_outcome("source", &result);
+    result
 }

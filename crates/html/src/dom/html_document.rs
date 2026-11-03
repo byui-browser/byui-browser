@@ -43,6 +43,7 @@ impl HTMLDocument {
             children.push(child);
             node.set_children(children);
         }
+        log::trace!("append node {} to parent {}", child.get(), parent.get());
     }
 
     /// Removes `node` from its parent, if it has one.
@@ -88,6 +89,10 @@ impl HTMLDocument {
             self.node(element).map(|node| node.get_kind()),
             Some(NodeKind::Element(_))
         ) {
+            log::debug!(
+                "class_list failed: node {} is not an element",
+                element.get()
+            );
             return Err(DomError::NotFound);
         }
         Ok(DOMTokenList::new(self, element))
@@ -106,12 +111,15 @@ impl HTMLDocument {
     /// XML documents and custom-element creation options are not supported.
     pub fn create_element(&mut self, local_name: &str) -> Result<NodeID, DomError> {
         if !is_valid_element_local_name(local_name) {
+            log::debug!("create_element rejected invalid tag name {local_name:?}");
             return Err(DomError::InvalidCharacter);
         }
 
         let element =
             ElementData::new(local_name.to_ascii_lowercase(), Namespace::Html, Vec::new());
-        Ok(self.push_node(NodeKind::Element(element), None))
+        let id = self.push_node(NodeKind::Element(element), None);
+        log::trace!("created element <{local_name}> as node {}", id.get());
+        Ok(id)
     }
 
     /// Sets an element's attribute using the DOM `setAttribute` rules.
@@ -127,6 +135,10 @@ impl HTMLDocument {
         value: &str,
     ) -> Result<(), DomError> {
         if !is_valid_attribute_local_name(qualified_name) {
+            log::debug!(
+                "set_attribute on node {} rejected invalid attribute name {qualified_name:?}",
+                element.get()
+            );
             return Err(DomError::InvalidCharacter);
         }
 
@@ -141,6 +153,7 @@ impl HTMLDocument {
             Namespace::Svg | Namespace::MathMl => qualified_name.to_owned(),
         };
 
+        log::trace!("set attribute {name:?} on node {}", element.get());
         element_data.set_attribute(super::attribute::Attribute::new(name, value.to_owned()));
         self.node_mut(element)
             .expect("element was validated above")

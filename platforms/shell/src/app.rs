@@ -22,6 +22,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
 use crate::context_menu::{ContextMenu, MenuAction};
+use crate::elements_panel::ElementsPanel;
 use crate::page_source::PageSource;
 use crate::toolbar::{self, ChromeState, Control};
 
@@ -105,6 +106,8 @@ struct App {
     page_source: Option<PageSource>,
     source_font: Option<FontVec>,
     source_close_pressed: bool,
+    elements: Option<ElementsPanel>,
+    elements_close_pressed: bool,
     /// Background page loader; `None` when its runtime failed to start.
     loader: Option<browser::PageLoader>,
     /// Wakes the event loop from loader threads; set by [`run`].
@@ -194,7 +197,7 @@ impl App {
     fn with_runtime(platform: Platform, runtime: browser::BrowserRuntime) -> Self {
         let refresh = browser::refresh::RefreshClient::new()
             .map_err(|error| {
-                eprintln!("Refresh initialization failed: {error}");
+                log::error!("refresh initialization failed: {error}");
             })
             .ok();
         Self {
@@ -227,8 +230,10 @@ impl App {
             page_source: None,
             source_font: None,
             source_close_pressed: false,
+            elements: None,
+            elements_close_pressed: false,
             loader: browser::PageLoader::new()
-                .map_err(|error| eprintln!("Page loader initialization failed: {error}"))
+                .map_err(|error| log::error!("page loader initialization failed: {error}"))
                 .ok(),
             proxy: None,
             navigation_id: 0,
@@ -246,6 +251,9 @@ impl App {
     /// Navigation calls this only after loading succeeds. Repaints, Reload,
     /// and the error page for a failed load must not call it.
     fn page_loaded(&mut self, url: &str, page: browser::Page) {
+        log::debug!("page displayed: {url}");
+        // Elements is a document snapshot; never retain it across navigation.
+        self.close_elements();
         self.loaded_page = Some(page);
         // Scripts of the new document run after its first frame is presented.
         self.scripts_evaluated = false;
@@ -284,9 +292,12 @@ impl App {
         self.chrome.address_focused = false;
         if address == "byui://welcome" {
             // Bump the id so an older load still in flight cannot replace it.
+            log::debug!("address submitted: {address}");
+            log::debug!("navigating to {address}");
             self.navigation_id += 1;
             self.page_loaded(&address, browser::welcome_page());
         } else {
+            log::debug!("address submitted: {address}");
             self.start_navigation(&address);
         }
         self.redraw();
@@ -299,9 +310,10 @@ impl App {
         self.navigation_id += 1;
         let id = self.navigation_id;
         let (Some(loader), Some(proxy)) = (&self.loader, self.proxy.clone()) else {
-            eprintln!("Navigation unavailable: page loader is not running.");
+            log::warn!("navigation to {address} unavailable: page loader is not running");
             return;
         };
+        log::debug!("navigating to {address}");
         loader.load(address, move |navigation| {
             // A closed event loop means the app is exiting; nothing to do.
             let _ = proxy.send_event(UserEvent::Navigated { id, navigation });
@@ -315,9 +327,18 @@ impl App {
             return;
         }
         match navigation.result {
-            Ok(page) => self.page_loaded(&navigation.address, page),
+            Ok(page) => {
+                log::debug!(
+                    "loaded {} ({} bytes of html)",
+                    navigation.address,
+                    page.html.len()
+                );
+                self.page_loaded(&navigation.address, page)
+            }
             Err(error) => {
-                eprintln!("Failed to load {}: {error}", navigation.address);
+                // `browser::load` already logged the failure at error level.
+                log::debug!("showing error page for {}: {error}", navigation.address);
+                self.close_elements();
                 self.loaded_page = Some(browser::error_page(&navigation.address, &error));
                 self.scripts_evaluated = false;
                 self.frame_key = None;
@@ -356,7 +377,7 @@ impl App {
                         if let Err(error) = arboard::Clipboard::new()
                             .and_then(|mut clipboard| clipboard.set_text(self.address.clone()))
                         {
-                            eprintln!("Failed to copy the address: {error}");
+                            log::warn!("failed to copy the address: {error}");
                         }
                         return;
                     }
@@ -365,7 +386,7 @@ impl App {
                             .and_then(|mut clipboard| clipboard.get_text())
                         {
                             Ok(text) => self.insert_address_text(&text),
-                            Err(error) => eprintln!("Failed to paste into the address: {error}"),
+                            Err(error) => log::warn!("failed to paste into the address: {error}"),
                         }
                         return;
                     }
@@ -476,6 +497,7 @@ impl App {
                 .next()
                 .map_or(caret, |next| caret + next.len_utf8()),
         };
+        log::trace!("address caret moved to {}", self.chrome.address_caret);
         self.redraw();
     }
 
@@ -490,6 +512,7 @@ impl App {
     fn set_hovered(&mut self, hovered: Option<Control>) {
         let hovered = hovered.filter(|control| control.is_enabled());
         if self.chrome.hovered != hovered {
+            log::trace!("hover changed: {hovered:?}");
             self.chrome.hovered = hovered;
             if let Some(window) = &self.window {
                 window.set_cursor(if hovered == Some(Control::Address) {
@@ -520,6 +543,7 @@ impl App {
 
     fn dismiss_context_menu(&mut self) {
         if self.context_menu.take().is_some() {
+            log::trace!("context menu dismissed");
             // Restore the page underneath the popup, without re-evaluating scripts.
             self.frame_key = None;
             self.redraw();
@@ -530,6 +554,7 @@ impl App {
     fn close_page_source(&mut self) {
         self.source_close_pressed = false;
         if self.page_source.take().is_some() {
+            log::debug!("page source view closed");
             self.frame_key = None;
             self.redraw();
         }
@@ -537,6 +562,7 @@ impl App {
 
     fn show_page_source(&mut self) {
         if let Some(page) = &self.loaded_page {
+            log::debug!("page source view opened ({} bytes)", page.html.len());
             self.page_source = Some(PageSource::new(&page.html));
             self.frame_key = None;
             self.redraw();
@@ -559,7 +585,52 @@ impl App {
         }
     }
 
+    fn resize_elements(&mut self) {
+        if let (Some(panel), Some(window)) = (&mut self.elements, &self.window) {
+            let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+            panel.resize(size.width, size.height);
+        }
+    }
+
+    fn show_elements(&mut self) {
+        self.elements = Some(ElementsPanel::new(
+            self.loaded_page.as_ref().map(|page| page.html.as_str()),
+        ));
+        self.resize_elements();
+        self.chrome.address_focused = false;
+        self.page_press = false;
+        self.frame_key = None;
+        self.redraw();
+    }
+
+    fn close_elements(&mut self) {
+        if self.elements.take().is_some() {
+            self.frame_key = None;
+            self.redraw();
+        }
+        self.elements_close_pressed = false;
+        self.page_press = false;
+    }
+
     fn key_pressed(&mut self, key: &Key) {
+        if *key == Key::Named(NamedKey::Escape) {
+            if self.context_menu.is_some() {
+                self.dismiss_context_menu();
+            } else if self.page_source.is_some() {
+                self.close_page_source();
+            } else {
+                self.close_elements();
+            }
+            return;
+        }
+        if self.page_source.is_none()
+            && !self.chrome.address_focused
+            && let (Some(panel), Key::Named(key)) = (&mut self.elements, key)
+        {
+            panel.key(key);
+            self.redraw();
+            return;
+        }
         match key {
             Key::Named(NamedKey::Escape) => {
                 self.dismiss_context_menu();
@@ -577,7 +648,12 @@ impl App {
 
     fn open_context_menu(&mut self, width: u32, height: u32, scale: f64) {
         self.dismiss_context_menu();
-        if self.page_source.is_some() {
+        if self.page_source.is_some()
+            || self
+                .elements
+                .as_ref()
+                .is_some_and(|panel| panel.contains(self.cursor))
+        {
             return;
         }
         self.chrome.pressed = None;
@@ -595,6 +671,7 @@ impl App {
         {
             return;
         }
+        log::debug!("context menu opened at ({x:.0}, {y:.0})");
         self.context_menu = Some(ContextMenu::new(
             x,
             y,
@@ -625,9 +702,11 @@ impl App {
                         .menu_pressed
                         .filter(|action| Some(*action) == menu.action_at(self.cursor));
                     self.dismiss_context_menu();
+                    log::debug!("context menu action: {action:?}");
                     match action {
                         Some(MenuAction::Reload) => self.activate(Control::Reload),
                         Some(MenuAction::PageSource) => self.show_page_source(),
+                        Some(MenuAction::Inspect) => self.show_elements(),
                         None => {}
                     }
                 }
@@ -656,6 +735,27 @@ impl App {
             }
             return;
         }
+        if let Some(panel) = &self.elements {
+            let inside = panel.contains(self.cursor);
+            let close = panel.close_at(self.cursor);
+            if inside || self.elements_close_pressed {
+                match state {
+                    ElementState::Pressed => {
+                        self.elements_close_pressed = close;
+                        self.page_press = false;
+                        self.chrome.address_focused = false;
+                    }
+                    ElementState::Released => {
+                        if self.elements_close_pressed && close {
+                            self.close_elements();
+                        }
+                        self.elements_close_pressed = false;
+                        self.page_press = false;
+                    }
+                }
+                return;
+            }
+        }
         match state {
             ElementState::Pressed => self.pressed(),
             ElementState::Released => {
@@ -680,20 +780,27 @@ impl App {
     fn activate(&mut self, control: Control) {
         match control {
             Control::Reload => {
+                log::debug!("reload requested");
+                log::debug!("toolbar action: reload");
                 if let Some(refresh) = &self.refresh {
                     // Dropping the handle detaches the task; fetching stays off the UI thread.
                     drop(refresh.refresh(&self.browser_state));
                 } else {
-                    eprintln!("Refresh unavailable: initialization failed.");
+                    log::error!("refresh unavailable: initialization failed");
                 }
                 self.page = None;
                 self.scripts_evaluated = false;
                 self.redraw();
             }
-            Control::Address => self.begin_address_edit(),
+            Control::Address => {
+                log::debug!("toolbar action: address");
+                self.begin_address_edit()
+            }
             // Navigation, tabs, and the menu are not
             // implemented yet; these controls only give visual feedback.
-            Control::Back | Control::Forward | Control::NewTab | Control::Menu => {}
+            Control::Back | Control::Forward | Control::NewTab | Control::Menu => {
+                log::debug!("toolbar action: {control:?} (not implemented)");
+            }
         }
     }
 
@@ -706,6 +813,7 @@ impl App {
         let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
             return;
         };
+        let paint_started = Instant::now();
         let size = window.inner_size();
         let (Some(width), Some(height)) =
             (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
@@ -713,11 +821,14 @@ impl App {
             return;
         };
         let scale = window.scale_factor();
-        self.chrome.dark = window.theme() == Some(Theme::Dark);
+        let dark = window.theme() == Some(Theme::Dark);
+        self.chrome.dark = dark;
         let card = toolbar::page_rect(size.width, size.height, scale);
         let card_size = card.map(|card| (card.width, card.height));
-        let mut full =
-            self.page.is_none() || self.context_menu.is_some() || self.page_source.is_some();
+        let mut full = self.page.is_none()
+            || self.context_menu.is_some()
+            || self.page_source.is_some()
+            || self.elements.is_some();
         if self.page.as_ref().map(|(size, _)| *size) != card_size {
             // Paint this frame before the page script runs. Evaluation joins
             // the JS engine thread; doing that inside this draw leaves `alert`
@@ -766,6 +877,14 @@ impl App {
         let Some(mut composed) = composed else {
             return;
         };
+        if let Some(panel) = &mut self.elements {
+            panel.draw(
+                &mut composed,
+                scale,
+                self.chrome.dark,
+                self.source_font.as_ref().or(self.font.as_ref()),
+            );
+        }
         if let Some(source) = &mut self.page_source {
             source.draw(
                 &mut composed,
@@ -799,6 +918,12 @@ impl App {
         let mut buffer = surface.buffer_mut().expect("failed to get window buffer");
         buffer.copy_from_slice(&self.frame);
         buffer.present().expect("failed to present window buffer");
+        log::trace!(
+            "frame presented: {}x{} full={full} in {:?}",
+            size.width,
+            size.height,
+            paint_started.elapsed()
+        );
     }
 
     fn cursor_moved(&mut self, x: f64, y: f64) {
@@ -808,7 +933,14 @@ impl App {
         let scale = window.scale_factor();
         let width = window.inner_size().to_logical::<f64>(scale).width;
         self.cursor = Some((x, y));
-        if self.context_menu.is_some() || self.page_source.is_some() {
+        log::trace!("cursor moved: ({x:.0}, {y:.0})");
+        if self.context_menu.is_some()
+            || self.page_source.is_some()
+            || self
+                .elements
+                .as_ref()
+                .is_some_and(|panel| panel.contains(self.cursor))
+        {
             self.set_hovered(None);
             self.redraw();
             return;
@@ -854,7 +986,9 @@ impl App {
                 self.last_toolbar_click = Some(now);
                 // Empty toolbar space moves the window, like a titlebar;
                 // the system's own titlebar and frame keep working too.
-                let _ = window.drag_window();
+                if let Err(error) = window.drag_window() {
+                    log::debug!("window drag could not start: {error}");
+                }
             }
         } else if self
             .cursor
@@ -910,13 +1044,26 @@ impl ApplicationHandler<UserEvent> for App {
             let window = Rc::new(
                 event_loop
                     .create_window(attributes)
-                    .expect("failed to create window"),
+                    .unwrap_or_else(|error| {
+                        log::error!("failed to create window: {error}");
+                        panic!("failed to create window: {error}")
+                    }),
             );
-            let context =
-                softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
+            log::info!(
+                "window created: {}x{} physical pixels, scale factor {}",
+                window.inner_size().width,
+                window.inner_size().height,
+                window.scale_factor()
+            );
+            let context = softbuffer::Context::new(window.clone()).unwrap_or_else(|error| {
+                log::error!("failed to create drawing context: {error}");
+                panic!("failed to create drawing context: {error}")
+            });
             self.surface = Some(
-                softbuffer::Surface::new(&context, window.clone())
-                    .expect("failed to create window surface"),
+                softbuffer::Surface::new(&context, window.clone()).unwrap_or_else(|error| {
+                    log::error!("failed to create window surface: {error}");
+                    panic!("failed to create window surface: {error}")
+                }),
             );
             self.font = toolbar::load_ui_font((self.platform.ui_font_files)());
             self.source_font = crate::page_source::load_font();
@@ -932,7 +1079,10 @@ impl ApplicationHandler<UserEvent> for App {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                log::info!("window closed, exiting");
+                event_loop.exit()
+            }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
             }
@@ -941,6 +1091,7 @@ impl ApplicationHandler<UserEvent> for App {
                 is_synthetic: false,
                 ..
             } => {
+                log::trace!("key event: {:?}", event.state);
                 // Address editing and the context menu share one key event.
                 if event.state == ElementState::Pressed {
                     self.key_pressed(&event.logical_key);
@@ -950,7 +1101,22 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(_)
             | WindowEvent::ScaleFactorChanged { .. }
             | WindowEvent::ThemeChanged(_) => {
+                if log::log_enabled!(log::Level::Debug) {
+                    match &event {
+                        WindowEvent::Resized(size) => {
+                            log::trace!("resized: {}x{}", size.width, size.height)
+                        }
+                        WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                            log::trace!("scale factor changed: {scale_factor}")
+                        }
+                        WindowEvent::ThemeChanged(theme) => {
+                            log::debug!("theme changed: {theme:?}")
+                        }
+                        _ => {}
+                    }
+                }
                 self.dismiss_context_menu();
+                self.resize_elements();
                 self.refresh_hover();
                 self.redraw();
             }
@@ -989,6 +1155,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let rows = match delta {
                     MouseScrollDelta::LineDelta(_, y) => -f64::from(y) * 3.0,
                     MouseScrollDelta::PixelDelta(position) => {
+                        log::trace!("scroll: {:.1} px", position.y);
                         let scale = self
                             .window
                             .as_ref()
@@ -999,6 +1166,11 @@ impl ApplicationHandler<UserEvent> for App {
                 if let (Some(source), Some(window)) = (&mut self.page_source, &self.window) {
                     let size = window.inner_size().to_logical::<f64>(window.scale_factor());
                     source.wheel(rows, size.width, size.height);
+                    self.redraw();
+                } else if let Some(panel) = &mut self.elements
+                    && panel.contains(self.cursor)
+                {
+                    panel.scroll(rows);
                     self.redraw();
                 }
             }
@@ -1029,6 +1201,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         self.scripts_evaluated = true;
+        log::debug!("evaluating page scripts for {}", page.url);
         // Leave this thread in the event loop. The script runs on the page
         // session thread and asks the loop to present an alert; joining that
         // thread here would deadlock. The session stays alive so a later
@@ -1040,14 +1213,39 @@ impl ApplicationHandler<UserEvent> for App {
 
 /// Opens the browser window described by `platform` and runs it until the
 /// user closes it.
+///
+/// Reads the logging options (`--log-level`, `-v`, `-q`, `--log-file`; see
+/// [`common::logging::USAGE`]) from the process's command line before
+/// anything else, and prints usage and exits for `-h` / `--help`. Other
+/// arguments are reported as ignored; the shell takes no others yet.
 pub fn run(platform: Platform) -> Result<(), EventLoopError> {
+    let command_line = common::logging::init_from_command_line();
+    if command_line.help_requested {
+        println!(
+            "Usage: {} [options]\n\n{}",
+            env!("CARGO_PKG_NAME"),
+            common::logging::USAGE
+        );
+        return Ok(());
+    }
+    for argument in &command_line.remaining {
+        log::warn!("ignoring unrecognized argument `{argument}`");
+    }
+    log::info!(
+        "starting BYUI Browser {} on {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS
+    );
     crate::content::load_page_font((platform.page_font_files)());
+    log::debug!("creating event loop");
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App::new(platform);
     app.alerts.set_proxy(event_loop.create_proxy());
     app.proxy = Some(event_loop.create_proxy());
-    event_loop.run_app(&mut app)
+    let result = event_loop.run_app(&mut app);
+    log::info!("event loop exited");
+    result
 }
 
 #[cfg(test)]
@@ -1073,7 +1271,96 @@ mod tests {
     }
 
     #[test]
-    fn inspect_shows_loaded_source_without_fetching_executing_or_changing_history() {
+    fn official_page_loading_closes_the_previous_elements_snapshot() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.show_elements();
+        assert!(app.elements.is_some());
+        app.page_loaded("byui://welcome", browser::welcome_page());
+        assert!(app.elements.is_none());
+        assert_eq!(app.browser_state.current_url(), Some("byui://welcome"));
+        assert!(app.loaded_page.is_some());
+    }
+
+    #[test]
+    fn inspect_and_source_are_separate_actions_with_independent_interfaces() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let before = app.browser_state.clone();
+        let page = app.loaded_page.clone();
+        app.refresh = None;
+        app.scripts_evaluated = true;
+        app.cursor = Some((100.0, 100.0));
+        app.open_context_menu(800, 600, 1.0);
+        app.cursor = Some((120.0, 248.0));
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        assert!(app.elements.is_some());
+        assert!(app.page_source.is_none());
+        app.elements.as_mut().unwrap().resize(800.0, 600.0);
+        app.cursor = Some((100.0, 100.0));
+        app.open_context_menu(800, 600, 1.0);
+        app.cursor = Some((120.0, 216.0));
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        assert!(app.page_source.is_some());
+        assert!(app.elements.is_some());
+        app.key_pressed(&Key::Named(NamedKey::Escape));
+        assert!(app.page_source.is_none());
+        assert!(
+            app.elements.is_some(),
+            "closing source must not close inspector"
+        );
+        app.show_page_source();
+        app.close_elements();
+        assert!(
+            app.page_source.is_some(),
+            "closing inspector must not close source"
+        );
+        app.key_pressed(&Key::Named(NamedKey::Escape));
+        assert!(app.page_source.is_none());
+        assert_eq!(app.browser_state, before);
+        assert_eq!(app.loaded_page, page);
+        assert!(app.scripts_evaluated);
+    }
+
+    #[test]
+    fn inspector_close_button_and_escape_clear_panel_without_page_clicks() {
+        let mut app = app();
+        for escape in [false, true] {
+            app.show_elements();
+            app.elements.as_mut().unwrap().resize(800.0, 600.0);
+            app.frame_key = Some((800, 600, 1.0_f64.to_bits(), false));
+            app.scripts_evaluated = true;
+            if escape {
+                app.key_pressed(&Key::Named(NamedKey::Escape));
+            } else {
+                app.cursor = Some((770.0, 340.0));
+                app.left_mouse_input(ElementState::Pressed);
+                assert!(app.elements.is_some());
+                app.left_mouse_input(ElementState::Released);
+            }
+            assert!(app.elements.is_none());
+            assert!(app.frame_key.is_none());
+            assert!(!app.page_press);
+            assert!(app.scripts_evaluated);
+        }
+    }
+
+    #[test]
+    fn source_and_inspector_handle_unavailable_html_without_crashing() {
+        let mut app = app();
+        app.show_page_source();
+        assert!(app.page_source.is_none());
+        app.show_elements();
+        assert!(app.elements.is_some());
+        assert!(app.loaded_page.is_none());
+        app.key_pressed(&Key::Named(NamedKey::Escape));
+        assert!(app.elements.is_none());
+    }
+
+    #[test]
+    fn view_page_source_shows_loaded_html_without_fetching_executing_or_changing_history() {
         let mut app = app();
         let page = browser::Page {
             url: String::new(),

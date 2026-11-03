@@ -55,6 +55,7 @@ impl TabManager {
     // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
     pub fn close(&mut self, id: TabId) {
         if self.tabs.is_empty() {
+            log::debug!("close of tab {} ignored: no tabs are open", id.0);
             return;
         }
         todo!("TODO(chrome): close {id:?}")

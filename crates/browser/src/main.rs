@@ -36,6 +36,15 @@ impl AlertSink for NativeAlert {
 }
 
 fn main() {
+    let command_line = common::logging::init_from_command_line();
+    if command_line.help_requested {
+        println!("Usage: browser [options]\n\n{}", common::logging::USAGE);
+        return;
+    }
+    for argument in &command_line.remaining {
+        log::warn!("ignoring unrecognized argument `{argument}`");
+    }
+    log::info!("starting BYUI Browser {}", env!("CARGO_PKG_VERSION"));
     // Keep the standalone binary useful while native platform shells are
     // brought online. `make run` selects the platform shell below.
     let controller = request_controller(None);

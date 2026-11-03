@@ -20,6 +20,19 @@ impl Compositor {
 
     /// Rasterizes paint commands into a new RGBA8 frame.
     pub fn compose(&self, items: &[DisplayItem]) -> Frame {
+        log::debug!(
+            "compositing frame {}x{} from {} items",
+            self.width,
+            self.height,
+            items.len()
+        );
+        if self.width == 0 || self.height == 0 {
+            log::debug!(
+                "compositing into a zero-size surface ({}x{})",
+                self.width,
+                self.height
+            );
+        }
         let mut frame = Frame {
             width: self.width,
             height: self.height,
@@ -34,6 +47,7 @@ impl Compositor {
                     height,
                     rgba,
                 } => {
+                    log::trace!("fill rect {width}x{height} at ({x}, {y}) rgba {rgba:?}");
                     let x_end = x.saturating_add(*width).min(self.width);
                     let y_end = y.saturating_add(*height).min(self.height);
                     for py in *y..y_end {
@@ -67,8 +81,13 @@ impl Compositor {
     ) {
         let scale = BitmapFont::scale(font_size);
         if scale <= 0.0 {
+            log::trace!("skipping text at non-positive font size {font_size}");
             return;
         }
+        log::trace!(
+            "draw bitmap text {} chars at ({x}, {baseline}) size {font_size}",
+            text.chars().count()
+        );
         let top = baseline - BitmapFont::GLYPH_HEIGHT as f32 * scale;
         let rows = top.floor().max(0.0) as u32..baseline.ceil().max(0.0) as u32;
         let mut cell_x = x;
@@ -92,6 +111,8 @@ impl Compositor {
                         }
                     }
                 }
+            } else {
+                log::trace!("no bitmap glyph for {character:?}; leaving a blank cell");
             }
             cell_x += BitmapFont::ADVANCE * scale;
         }
@@ -130,6 +151,10 @@ impl Compositor {
     /// the nearest pixel boundary, so a rectangle covers the pixels whose
     /// centers it contains, and parts outside the frame are clipped.
     pub fn compose_paint(&self, list: &paint::DisplayList) -> Frame {
+        log::debug!(
+            "compositing paint display list with {} items",
+            list.items.len()
+        );
         let items = list
             .items
             .iter()
@@ -181,6 +206,19 @@ impl Compositor {
         font: &OutlineFont,
         scale: f32,
     ) -> Frame {
+        log::debug!(
+            "compositing frame {}x{} with outline font from {} items at scale {scale}",
+            self.width,
+            self.height,
+            list.items.len()
+        );
+        if self.width == 0 || self.height == 0 {
+            log::debug!(
+                "compositing into a zero-size surface ({}x{})",
+                self.width,
+                self.height
+            );
+        }
         let mut frame = Frame {
             width: self.width,
             height: self.height,
@@ -235,8 +273,13 @@ impl Compositor {
     ) {
         use ab_glyph::{Font, ScaleFont};
         if font_size <= 0.0 {
+            log::trace!("skipping text at non-positive font size {font_size}");
             return;
         }
+        log::trace!(
+            "draw outline text {} chars at ({x}, {baseline}) size {font_size}",
+            text.chars().count()
+        );
         let scaled = font.font().as_scaled(font.px_scale(font_size));
         let mut caret = x;
         for character in text.chars() {
@@ -245,6 +288,7 @@ impl Compositor {
                 id.with_scale_and_position(scaled.scale(), ab_glyph::point(caret, baseline));
             caret += scaled.h_advance(id);
             let Some(outline) = font.font().outline_glyph(glyph) else {
+                log::trace!("no outline for {character:?}; nothing drawn");
                 continue;
             };
             let bounds = outline.px_bounds();
