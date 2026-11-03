@@ -857,7 +857,7 @@ impl Interpreter {
             Expr::Member { object, property } => {
                 let target = self.evaluate(object, scope)?;
                 let key = self.property_key(property, scope)?;
-                let Value::Object(target) = target else {
+                let (Value::Object(target) | Value::Array(target)) = target else {
                     return Err(non_object(&target, "read", &key, "property access"));
                 };
                 Ok(target.get(&key).unwrap_or(Value::Undefined))
@@ -870,7 +870,7 @@ impl Interpreter {
                 let target = self.evaluate(object, scope)?;
                 let key = self.property_key(property, scope)?;
                 let value = self.evaluate(value, scope)?;
-                let Value::Object(target) = target else {
+                let (Value::Object(target) | Value::Array(target)) = target else {
                     return Err(non_object(&target, "set", &key, "property assignment"));
                 };
                 target.set(key, value.clone());
@@ -887,6 +887,18 @@ impl Interpreter {
                     object.set(key, value);
                 }
                 Ok(Value::Object(object))
+            }
+            Expr::Array(elements) => {
+                let array = Object::new();
+                for (index, element) in elements.iter().enumerate() {
+                    let value = match element {
+                        Some(element) => self.evaluate(element, scope)?,
+                        None => Value::Undefined,
+                    };
+                    array.set(index.to_string(), value);
+                }
+                array.set("length", Value::Number(elements.len() as f64));
+                Ok(Value::Array(array))
             }
         }
     }
@@ -971,6 +983,7 @@ pub(crate) fn non_object(value: &Value, action: &str, key: &str, context: &str) 
         Value::String(_) => "a string",
         Value::Function(_) => "a function",
         Value::Object(_) => "an object",
+        Value::Array(_) => "an array",
     };
     JsError::with_context(
         crate::JsErrorCategory::Runtime,

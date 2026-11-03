@@ -72,7 +72,6 @@ fn invalid_syntax_fixture_returns_a_syntax_error() {
 }
 
 #[test]
-#[ignore = "Array literals and indexing are not implemented yet"]
 fn arrays_fixture_will_evaluate_when_arrays_are_supported() {
     assert!(eval(fixture("arrays.js")).is_ok());
 }
