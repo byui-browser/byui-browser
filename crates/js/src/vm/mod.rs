@@ -337,6 +337,15 @@ impl Vm {
                     prototype.set(key, Value::Function(method));
                 }
                 Instruction::NewObject => self.push(Value::Object(Object::new())),
+                Instruction::NewArray(count) => {
+                    let values = self.pop_arguments(count)?;
+                    let array = Object::new();
+                    for (index, value) in values.into_iter().enumerate() {
+                        array.set(index.to_string(), value);
+                    }
+                    array.set("length", Value::Number(f64::from(count)));
+                    self.push(Value::Array(array));
+                }
                 Instruction::DefineProperty(index) => {
                     let key = property_name(&chunk, index)?;
                     let value = self.pop()?;
@@ -768,7 +777,7 @@ fn function_template(chunk: &Chunk, index: u16) -> JsResult<Arc<FunctionTemplate
 /// The object a constructor's instances inherit from, if it has one.
 fn prototype_of(constructor: &Function) -> Option<Object> {
     match constructor.get_own("prototype") {
-        Some(Value::Object(prototype)) => Some(prototype),
+        Some(Value::Object(prototype) | Value::Array(prototype)) => Some(prototype),
         _ => None,
     }
 }
@@ -783,7 +792,10 @@ fn not_a_constructor(value: &Value) -> JsError {
 
 /// Applies the constructor return rules to a finished construction frame.
 fn constructed_value(frame: &Frame, returned: Value) -> JsResult<Value> {
-    if matches!(returned, Value::Object(_) | Value::Function(_)) {
+    if matches!(
+        returned,
+        Value::Object(_) | Value::Array(_) | Value::Function(_)
+    ) {
         return Ok(returned);
     }
     let derived = frame
@@ -842,7 +854,9 @@ fn property_name(chunk: &Chunk, index: u16) -> JsResult<String> {
 /// value is an error.
 fn load_property(target: &Value, key: &str) -> JsResult<Value> {
     match target {
-        Value::Object(object) => Ok(object.get(key).unwrap_or(Value::Undefined)),
+        Value::Object(object) | Value::Array(object) => {
+            Ok(object.get(key).unwrap_or(Value::Undefined))
+        }
         Value::Function(function) if function.template().is_some() => {
             Ok(function.get_own(key).unwrap_or(Value::Undefined))
         }
@@ -852,7 +866,7 @@ fn load_property(target: &Value, key: &str) -> JsResult<Value> {
 
 fn store_property(target: &Value, key: String, value: &Value) -> JsResult<()> {
     match target {
-        Value::Object(object) => object.set(key, value.clone()),
+        Value::Object(object) | Value::Array(object) => object.set(key, value.clone()),
         Value::Function(function) if function.set_own(&key, value.clone()) => {}
         _ => return Err(non_object(target, "set", &key, "property assignment")),
     }
@@ -929,7 +943,7 @@ fn to_number(value: &Value) -> JsResult<f64> {
         Value::Undefined => Ok(f64::NAN),
         Value::String(value) if value.trim().is_empty() => Ok(0.0),
         Value::String(value) => Ok(value.trim().parse().unwrap_or(f64::NAN)),
-        Value::Function(_) | Value::Object(_) => {
+        Value::Function(_) | Value::Object(_) | Value::Array(_) => {
             Err(JsError::runtime("cannot convert object to number"))
         }
     }
@@ -949,6 +963,6 @@ fn is_truthy(value: &Value) -> bool {
         Value::Boolean(value) => *value,
         Value::Number(value) => *value != 0.0 && !value.is_nan(),
         Value::String(value) => !value.is_empty(),
-        Value::Function(_) | Value::Object(_) => true,
+        Value::Function(_) | Value::Object(_) | Value::Array(_) => true,
     }
 }

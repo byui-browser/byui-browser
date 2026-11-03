@@ -45,6 +45,8 @@ pub enum Instruction {
     StoreComputedProperty,
     /// Pushes a new empty object, the start of an object literal.
     NewObject,
+    /// Creates an array from the next `count` stack values, preserving order.
+    NewArray(u16),
     /// Adds an object literal property: pops the value, stores it on the
     /// object now at the top of the stack under the string constant at this
     /// pool index, and leaves the object on the stack.
