@@ -34,7 +34,36 @@ pub fn get_element_by_id(document: &Document, arguments: &[Value]) -> JsResult<V
 /// Registers the DOM methods and `Event` constructor supported by this crate
 /// on the global JavaScript environment.
 pub fn register_document(realm: &mut Realm, document: Document) -> JsResult<()> {
+    register_document_inner(realm, document, None)
+}
+
+/// Registers a document whose `location` property shares the active
+/// `window.location` object.
+pub fn register_document_with_location(
+    realm: &mut Realm,
+    document: Document,
+    location: Object,
+) -> JsResult<()> {
+    register_document_inner(realm, document, Some(location))
+}
+
+fn register_document_inner(
+    realm: &mut Realm,
+    document: Document,
+    location: Option<Object>,
+) -> JsResult<()> {
     let document_object = Object::new();
+    if let Some(location) = location {
+        let location_getter = location.clone();
+        let location_setter = location;
+        document_object.define_accessor(
+            "location",
+            Arc::new(move || Ok(Value::Object(location_getter.clone()))),
+            Some(Arc::new(move |value| {
+                location_setter.set_property("href", value)
+            })),
+        );
+    }
     let shared_document = Arc::new(Mutex::new(document));
     let get_element_document = shared_document.clone();
     document_object.set_method(

@@ -21,7 +21,8 @@ use storage::{
 };
 use webapis::local_storage::register_local_storage;
 use webapis::{
-    AlertSink, ConsoleSink, Document, register_alert, register_document, register_fetch,
+    AlertSink, ConsoleSink, Document, LocationNavigate, register_alert,
+    register_document_with_location, register_fetch, register_location_with_navigation,
     register_print,
 };
 
@@ -356,8 +357,12 @@ impl BrowserRuntime {
         security_context: RendererSecurityContext,
     ) -> JsResult<Vec<Value>> {
         self.boot_page(
-            html_source,
-            None,
+            PageInput {
+                html_source,
+                scripts: None,
+                url: None,
+            },
+            Arc::new(|_, _| {}),
             console,
             alert_sink,
             controller,
@@ -381,8 +386,12 @@ impl BrowserRuntime {
         security_context: RendererSecurityContext,
     ) -> JsResult<PageSession> {
         self.boot_page(
-            html_source,
-            None,
+            PageInput {
+                html_source,
+                scripts: None,
+                url: None,
+            },
+            Arc::new(|_, _| {}),
             console,
             alert_sink,
             controller,
@@ -406,9 +415,36 @@ impl BrowserRuntime {
         controller: Arc<RequestController>,
         security_context: RendererSecurityContext,
     ) -> JsResult<PageSession> {
+        self.open_page_with_navigation(
+            page,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+            Arc::new(|_, _| {}),
+        )
+    }
+
+    /// Opens a loaded page and routes its `Location` navigation requests to
+    /// `navigate`. The callback runs on the page script thread and should
+    /// enqueue work for the browser's navigation loop rather than load
+    /// synchronously.
+    pub fn open_page_with_navigation(
+        &self,
+        page: &Page,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+        navigate: LocationNavigate,
+    ) -> JsResult<PageSession> {
         self.boot_page(
-            &page.html,
-            Some(&page.scripts),
+            PageInput {
+                html_source: &page.html,
+                scripts: Some(&page.scripts),
+                url: Some(&page.url),
+            },
+            navigate,
             console,
             alert_sink,
             controller,
@@ -419,25 +455,30 @@ impl BrowserRuntime {
 
     fn boot_page(
         &self,
-        html_source: &str,
-        scripts: Option<&[String]>,
+        input: PageInput<'_>,
+        navigate: LocationNavigate,
         console: Arc<dyn ConsoleSink>,
         alert_sink: Arc<dyn AlertSink>,
         controller: Arc<RequestController>,
         security_context: RendererSecurityContext,
     ) -> JsResult<BootedPage> {
-        let html_document = html::parse_raw_html(html_source.to_owned());
+        let html_document = html::parse_raw_html(input.html_source.to_owned());
         let document = Document::from_html_document(&html_document);
         let retained = document.clone();
         let mut realm = Realm::new();
+        let document_url = input
+            .url
+            .and_then(|url| net::Url::parse(url).ok())
+            .unwrap_or_else(|| net::Url::parse("about:blank").expect("valid about:blank URL"));
         register_print(&mut realm, console)?;
         register_alert(&mut realm, alert_sink)?;
         register_fetch(&mut realm, controller)?;
-        register_document(&mut realm, document)?;
+        let location = register_location_with_navigation(&mut realm, document_url, navigate)?;
+        register_document_with_location(&mut realm, document, location)?;
         register_local_storage(&mut realm, Arc::clone(&self.storage), security_context)?;
 
         // Without caller-supplied sources only inline script text is available.
-        let sources = match scripts {
+        let sources = match input.scripts {
             Some(scripts) => scripts.to_vec(),
             None => html_document.script_sources(),
         };
@@ -489,6 +530,12 @@ impl PageSession {
 struct BootedPage {
     session: PageSession,
     results: Vec<Value>,
+}
+
+struct PageInput<'a> {
+    html_source: &'a str,
+    scripts: Option<&'a [String]>,
+    url: Option<&'a str>,
 }
 
 /// Loads the welcome page and resolves its local stylesheet and script links.

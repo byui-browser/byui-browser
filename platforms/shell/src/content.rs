@@ -10,7 +10,7 @@ use html::NodeID;
 use layout::{FontMetrics, LayoutTree, Size, layout_document};
 use render::{BitmapFont, Compositor, Frame, OutlineFont};
 use tiny_skia::Pixmap;
-use webapis::{AlertSink, ConsoleSink};
+use webapis::{AlertSink, ConsoleSink, LocationNavigate};
 
 struct NoopConsole;
 
@@ -172,6 +172,7 @@ enum PageCommand {
         page: Page,
         alert_sink: Arc<dyn AlertSink>,
         runtime: BrowserRuntime,
+        navigate: LocationNavigate,
     },
     Click(Option<NodeID>),
 }
@@ -200,11 +201,13 @@ impl PageEvents {
         page: &Page,
         alert_sink: Arc<dyn AlertSink>,
         runtime: BrowserRuntime,
+        navigate: LocationNavigate,
     ) {
         let _ = self.commands.send(PageCommand::Load {
             page: page.clone(),
             alert_sink,
             runtime,
+            navigate,
         });
     }
 
@@ -226,14 +229,16 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                 page,
                 alert_sink,
                 runtime,
+                navigate,
             } => {
                 let controller = browser::request_controller(None);
-                match runtime.open_page(
+                match runtime.open_page_with_navigation(
                     &page,
                     Arc::new(NoopConsole),
                     alert_sink,
                     controller,
                     browser::security_context_for_url(&page.url),
+                    navigate,
                 ) {
                     Ok(loaded) => session = Some(loaded),
                     Err(error) => eprintln!("page script failed: {error}"),
@@ -406,6 +411,32 @@ mod tests {
     }
 
     #[test]
+    fn location_navigation_requests_reach_the_browser_loader_boundary() {
+        let (navigate_tx, navigate_rx) = std::sync::mpsc::channel();
+        let events = PageEvents::new();
+        let page = Page {
+            url: "https://example.test/start".into(),
+            html: "<script>location.assign('/next')</script>".into(),
+            stylesheets: Vec::new(),
+            scripts: vec!["location.assign('/next')".into()],
+        };
+        events.load(
+            &page,
+            test_alert_sink(),
+            test_runtime(),
+            Arc::new(move |url, behavior| {
+                let _ = navigate_tx.send((url, behavior));
+            }),
+        );
+
+        let (url, behavior) = navigate_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("Location.assign should reach the navigation callback");
+        assert_eq!(url.as_str(), "https://example.test/next");
+        assert_eq!(behavior, webapis::NavigationBehavior::Auto);
+    }
+
+    #[test]
     fn a_click_after_load_runs_the_document_listener() {
         struct Recording {
             messages: std::sync::Mutex<Vec<String>>,
@@ -438,6 +469,7 @@ mod tests {
             },
             alert.clone(),
             test_runtime(),
+            Arc::new(|_, _| {}),
         );
         events.click(None);
 
@@ -496,7 +528,7 @@ mod tests {
             arrived: arrived_tx,
         });
         let events = PageEvents::new();
-        events.load(&page, alert.clone(), test_runtime());
+        events.load(&page, alert.clone(), test_runtime(), Arc::new(|_, _| {}));
         events.click(hit_test_page(&page, width, height, x, y));
 
         arrived_rx
