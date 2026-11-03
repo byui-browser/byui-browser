@@ -219,20 +219,32 @@ impl ComputedStyle {
         let mut style = Self::anonymous(None);
         style.display = match get("display") {
             Some(value) => Display::parse(value).unwrap_or_else(|| {
-                log::trace!("unsupported display value {value:?}; using inline");
+                log::debug!("ignoring invalid display value {value:?}; using inline");
                 Display::INLINE
             }),
             None => Display::INLINE,
         };
-        if let Some(size) = get("font-size")
-            .and_then(|value| css::values::compute_font_size(value, root_font_size, root_font_size))
-        {
-            style.font_size = size;
+        if let Some(value) = get("font-size") {
+            match css::values::compute_font_size(value, root_font_size, root_font_size) {
+                Some(size) => style.font_size = size,
+                None => log::debug!(
+                    "ignoring invalid font-size value {value:?}; using {}px",
+                    style.font_size
+                ),
+            }
         }
-        if let Some(color) = get("color").and_then(css::parse_color) {
-            style.color = color;
+        if let Some(value) = get("color") {
+            match css::parse_color(value) {
+                Some(color) => style.color = color,
+                None => log::debug!("ignoring invalid color value {value:?}; using the default"),
+            }
         }
-        style.background_color = get("background-color").and_then(css::parse_color);
+        if let Some(value) = get("background-color") {
+            style.background_color = css::parse_color(value);
+            if style.background_color.is_none() {
+                log::debug!("ignoring invalid background-color value {value:?}; using transparent");
+            }
+        }
 
         let context = LengthContext {
             font_size: style.font_size,
@@ -243,16 +255,31 @@ impl ComputedStyle {
         let dimension = |property: &str, allow_auto: bool, allow_negative: bool| {
             let value = get(property)?;
             if value.eq_ignore_ascii_case("auto") {
+                if !allow_auto {
+                    log::debug!("ignoring invalid {property} value {value:?}; using 0");
+                }
                 return allow_auto.then_some(Dimension::Auto);
             }
             let (parsed, amount) = match parse_percentage(value) {
                 Some(percent) => (Dimension::Percent(percent), percent),
                 None => {
-                    let px = parse_length(value)?.to_px(&context);
+                    let Some(length) = parse_length(value) else {
+                        log::debug!(
+                            "ignoring invalid {property} value {value:?}; using the initial value"
+                        );
+                        return None;
+                    };
+                    let px = length.to_px(&context);
                     (Dimension::Px(px), px)
                 }
             };
-            (allow_negative || amount >= 0.0).then_some(parsed)
+            if !allow_negative && amount < 0.0 {
+                log::debug!(
+                    "ignoring negative {property} value {value:?}; using the initial value"
+                );
+                return None;
+            }
+            Some(parsed)
         };
         let side = |prefix: &str, allow_auto: bool, allow_negative: bool| {
             Sides::from_array(["top", "right", "bottom", "left"].map(|side| {

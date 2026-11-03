@@ -249,6 +249,7 @@ name = "browser-linux"
 version = "0.1.0"
 dependencies = [
  "browser-shell",
+ "log",
  "winit",
 ]
 

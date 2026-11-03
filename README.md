@@ -113,7 +113,11 @@ cargo run -p browser-linux -- --help                      # all options
 `-vv` and `-vvv` select `debug` and `trace`; `-q` shows only errors and `-qq`
 turns logging off. `--log-file <path>` appends to a file instead of standard
 error. A spec's targets are crate names or module paths (`html::tokenizer`),
-and the longest match wins. See `crates/common/src/logging.rs` for the
+and the longest match wins. Levels and `-v` apply to the browser's own crates;
+third-party crates (winit, reqwest, hyper, ...) stay at `warn` unless you add
+`deps=<level>` or name one (`--log-level debug,hyper=trace`). New workspace
+crates must be added to `WORKSPACE_CRATES` in `common::logging`; a test checks
+this. See `crates/common/src/logging.rs` for the
 guidance on choosing a level when you add a log line.
 
 ## Development workflow

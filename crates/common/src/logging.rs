@@ -20,6 +20,16 @@
 //!
 //! The default level is `warn`, so a normal run prints only problems.
 //!
+//! # Workspace crates and dependencies
+//!
+//! A bare level (`--log-level debug`, `-v`) applies to this workspace's
+//! crates, listed in [`WORKSPACE_CRATES`]. Third-party dependencies that also
+//! log through `log` (winit, reqwest, hyper, rustls, ...) stay at
+//! [`DEFAULT_DEPENDENCY_LEVEL`] so they do not drown out browser output. Raise
+//! them with the `deps=<level>` directive, or one at a time by name
+//! (`hyper=debug`). **When you add a workspace crate, add its name to
+//! [`WORKSPACE_CRATES`]**; a test fails until you do.
+//!
 //! # Command-line options
 //!
 //! See [`USAGE`] for the help text. In short:
@@ -28,7 +38,8 @@
 //!   a comma-separated list of `level` and `target=level` directives, such as
 //!   `debug` or `warn,net=debug,js::vm=trace`. A target is a crate name
 //!   (`net`, `browser-shell`) or a module path inside one (`html::tokenizer`);
-//!   the longest matching target wins.
+//!   the longest matching target wins. The special target `deps` sets the
+//!   level for every third-party crate.
 //! - `-v`, `-vv`, `-vvv` raise the default level to `info`, `debug`, `trace`.
 //! - `-q` / `--quiet` lowers the default level to `error`; `-qq` turns
 //!   logging off.
@@ -58,6 +69,39 @@ pub const LOG_ENV_VAR: &str = "BYUI_LOG";
 /// Level used when neither the command line nor [`LOG_ENV_VAR`] chooses one.
 pub const DEFAULT_LEVEL: LevelFilter = LevelFilter::Warn;
 
+/// Level for third-party crates' records unless a `deps=<level>` or
+/// crate-specific directive says otherwise.
+pub const DEFAULT_DEPENDENCY_LEVEL: LevelFilter = LevelFilter::Warn;
+
+/// Directive target that sets the level for all third-party crates, as in
+/// `--log-level debug,deps=info`.
+pub const DEPENDENCIES_TARGET: &str = "deps";
+
+/// Log targets (crate names with `-` written as `_`) of this workspace's own
+/// crates. A bare level applies to these; every other target is a
+/// dependency. Keep in sync with the workspace `members` in `Cargo.toml`.
+pub const WORKSPACE_CRATES: &[&str] = &[
+    "browser",
+    "browser_js",
+    "browser_linux",
+    "browser_macos",
+    "browser_shell",
+    "byui_browser_windows",
+    "chrome",
+    "common",
+    "css",
+    "devtools",
+    "html",
+    "js",
+    "layout",
+    "net",
+    "paint",
+    "render",
+    "security",
+    "storage",
+    "webapis",
+];
+
 /// Help text for the logging command-line options, ready to print under a
 /// program's own usage line.
 pub const USAGE: &str = "\
@@ -66,6 +110,9 @@ Logging options:
                        (off, error, warn, info, debug, trace) or a
                        comma-separated list such as `warn,net=debug,js=trace`
                        that sets levels per crate or module. Default: warn.
+                       A bare level covers the browser's own crates;
+                       third-party crates stay at warn unless you add
+                       `deps=<level>` or name them (e.g. `hyper=debug`).
   -v, -vv, -vvv        Log at info, debug, or trace level.
   -q, -qq              Log only errors, or nothing at all.
   --log-file <path>    Append log lines to <path> instead of standard error.
@@ -91,8 +138,12 @@ pub struct TargetLevel {
 /// [`init`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogConfig {
-    /// Level for records whose target matches no entry in `targets`.
+    /// Level for records from [`WORKSPACE_CRATES`] whose target matches no
+    /// entry in `targets`.
     pub default_level: LevelFilter,
+    /// Level for records from third-party crates whose target matches no
+    /// entry in `targets`. Set with the `deps=<level>` directive.
+    pub dependency_level: LevelFilter,
     /// Per-target overrides; the longest matching target wins.
     pub targets: Vec<TargetLevel>,
     /// File to append log lines to; `None` writes to standard error.
@@ -106,6 +157,7 @@ impl Default for LogConfig {
     fn default() -> Self {
         Self {
             default_level: DEFAULT_LEVEL,
+            dependency_level: DEFAULT_DEPENDENCY_LEVEL,
             targets: Vec::new(),
             file: None,
             help_requested: false,
@@ -248,7 +300,16 @@ impl LogConfig {
             .iter()
             .filter(|entry| target_matches(&entry.target, target))
             .max_by_key(|entry| entry.target.len())
-            .map_or(self.default_level, |entry| entry.level)
+            .map_or_else(
+                || {
+                    if is_workspace_target(target) {
+                        self.default_level
+                    } else {
+                        self.dependency_level
+                    }
+                },
+                |entry| entry.level,
+            )
     }
 
     /// Returns the most verbose level any target can log, which callers use
@@ -257,11 +318,12 @@ impl LogConfig {
         self.targets
             .iter()
             .map(|entry| entry.level)
-            .fold(self.default_level, Ord::max)
+            .fold(self.default_level.max(self.dependency_level), Ord::max)
     }
 
     fn reset_levels(&mut self) {
         self.default_level = DEFAULT_LEVEL;
+        self.dependency_level = DEFAULT_DEPENDENCY_LEVEL;
         self.targets.clear();
     }
 
@@ -274,6 +336,10 @@ impl LogConfig {
                         return Err(LogConfigError::EmptyTarget(directive.to_owned()));
                     }
                     let level = parse_level(level.trim())?;
+                    if target == DEPENDENCIES_TARGET {
+                        self.dependency_level = level;
+                        continue;
+                    }
                     self.targets.retain(|entry| entry.target != target);
                     self.targets.push(TargetLevel { target, level });
                 }
@@ -306,6 +372,12 @@ fn verbosity_level(count: usize) -> LevelFilter {
 fn repeated_flag(arg: &str, flag: char) -> Option<usize> {
     let letters = arg.strip_prefix('-')?;
     (!letters.is_empty() && letters.chars().all(|c| c == flag)).then_some(letters.len())
+}
+
+/// Whether a record target belongs to one of [`WORKSPACE_CRATES`].
+fn is_workspace_target(target: &str) -> bool {
+    let crate_name = target.split("::").next().unwrap_or(target);
+    WORKSPACE_CRATES.contains(&crate_name)
 }
 
 /// Whether directive `filter` covers record target `target`: an exact match
@@ -491,7 +563,10 @@ mod tests {
         assert_eq!(config.level_for("net::fetch"), LevelFilter::Debug);
         assert_eq!(config.level_for("js::vm::frame"), LevelFilter::Trace);
         assert_eq!(config.level_for("js::lexer"), LevelFilter::Info);
-        assert_eq!(config.level_for("network"), LevelFilter::Info);
+        // `net=` must not match the unrelated `network` crate, which is a
+        // dependency and so stays at the dependency level.
+        assert_eq!(config.level_for("network"), LevelFilter::Warn);
+        assert_eq!(config.level_for("css"), LevelFilter::Info);
         assert_eq!(config.max_level(), LevelFilter::Trace);
     }
 
@@ -584,6 +659,67 @@ mod tests {
         assert!(config.help_requested);
         assert!(rest.is_empty());
         assert!(parse(&["-h"]).0.help_requested);
+    }
+
+    #[test]
+    fn dependencies_stay_at_warn_unless_asked() {
+        let (config, _) = parse(&["-vvv"]);
+        assert_eq!(config.level_for("net::engine"), LevelFilter::Trace);
+        assert_eq!(config.level_for("hyper::proto"), LevelFilter::Warn);
+        assert_eq!(config.level_for("winit"), LevelFilter::Warn);
+
+        let config = LogConfig::parse_spec("debug,deps=info,hyper=trace").unwrap();
+        assert_eq!(config.level_for("browser_shell::app"), LevelFilter::Debug);
+        assert_eq!(config.level_for("rustls::client"), LevelFilter::Info);
+        assert_eq!(config.level_for("hyper::client"), LevelFilter::Trace);
+        assert!(
+            config
+                .targets
+                .iter()
+                .all(|t| t.target != DEPENDENCIES_TARGET)
+        );
+
+        let config = LogConfig::parse_spec("deps=off").unwrap();
+        assert_eq!(config.level_for("reqwest"), LevelFilter::Off);
+        assert_eq!(config.level_for("net"), LevelFilter::Warn);
+    }
+
+    /// Every workspace member's package name must be in `WORKSPACE_CRATES`,
+    /// or `-v` would treat that crate's logs as a dependency's.
+    #[test]
+    fn workspace_crates_match_cargo_members() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let members = manifest
+            .split("members = [")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("workspace members list");
+        let mut names = Vec::new();
+        for member in members.split(',').map(|m| m.trim().trim_matches('"')) {
+            if member.is_empty() {
+                continue;
+            }
+            let package = std::fs::read_to_string(root.join(member).join("Cargo.toml")).unwrap();
+            let name = package
+                .lines()
+                .find_map(|line| line.strip_prefix("name = "))
+                .expect("package name")
+                .trim_matches('"')
+                .replace('-', "_");
+            names.push(name);
+        }
+        for name in &names {
+            assert!(
+                WORKSPACE_CRATES.contains(&name.as_str()),
+                "add `{name}` to common::logging::WORKSPACE_CRATES"
+            );
+        }
+        assert_eq!(
+            names.len(),
+            WORKSPACE_CRATES.len(),
+            "stale entry in WORKSPACE_CRATES"
+        );
     }
 
     #[test]
