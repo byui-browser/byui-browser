@@ -40,6 +40,8 @@ storage = { path = "crates/storage" }
 security = { path = "crates/security" }
 chrome = { path = "crates/chrome" }
 devtools = { path = "crates/devtools" }
+tao = "0.30"
+wry = "0.47"
 
 [workspace.lints.rust]
 unsafe_code = "warn"
