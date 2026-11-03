@@ -74,3 +74,39 @@ fn persistent_storage_is_origin_scoped() {
     );
     let _ = std::fs::remove_dir_all(path);
 }
+
+#[test]
+fn different_schemes_cannot_share_storage() {
+    let https = StorageKey::new(Origin::with_port("https", "example.com", 443));
+    let http = StorageKey::new(Origin::with_port("http", "example.com", 80));
+    let mut storage = OriginStorage::new();
+
+    storage.set_item(&https, "theme", "dark");
+    
+    assert_eq!(storage.get_item(&https, "theme"), Some("dark"));
+    assert_eq!(storage.get_item(&http, "theme"), None);
+}
+
+#[test]
+fn different_ports_cannot_share_storage() {
+    let standard_port = StorageKey::new(Origin::with_port("https", "example.com", 443));
+    let alternate_port = StorageKey::new(Origin::with_port("https", "example.com", 8443));
+    let mut storage = OriginStorage::new();
+
+    storage.set_item(&standard_port, "theme", "dark");
+
+    assert_eq!(storage.get_item(&standard_port, "theme"), Some("dark"));
+    assert_eq!(storage.get_item(&alternate_port, "theme"), None);
+}
+
+#[test]
+fn same_origin_pages_share_storage() {
+    let first = StorageKey::new(Origin::with_port("https", "example.com", 443));
+    let second = StorageKey::new(Origin::with_port("https", "example.com", 443));
+    let mut storage = OriginStorage::new();
+
+    storage.set_item(&first, "theme", "dark");
+
+    assert_eq!(storage.get_item(&first, "theme"), Some("dark"));
+    assert_eq!(storage.get_item(&second, "theme"), Some("dark"));
+}
