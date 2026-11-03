@@ -87,6 +87,35 @@ Windows shells currently render the startup HTML page, parse its CSS, and
 execute its JavaScript startup script; see [`platforms/`](platforms/README.md)
 for what each shell needs.
 
+## Logging
+
+Every crate logs through the [`log`](https://docs.rs/log) macros, and
+`common::logging` prints them to standard error. Choose how much you see when
+you start the browser:
+
+```bash
+cargo run -p browser-linux -- -v                          # info
+cargo run -p browser-linux -- --log-level debug           # debug everywhere
+cargo run -p browser-linux -- --log-level warn,net=trace  # one crate in detail
+make run LOG=debug                                        # same, through make
+BYUI_LOG=js::vm=trace cargo run -p browser-js             # via the environment
+cargo run -p browser-linux -- --help                      # all options
+```
+
+| Level   | Shows |
+| ------- | ----- |
+| `error` | Failures the user notices: a page did not load, storage could not open. |
+| `warn`  | Problems the browser recovered from: a skipped subresource, a missing font, a blocked request. **Default.** |
+| `info`  | One line per milestone: startup, window created, navigation started and finished. |
+| `debug` | Per-operation detail for developers: requests and responses, parse and layout summaries, cache hits. |
+| `trace` | Everything, including tokens, DOM nodes, bytecode, and every input event and frame. |
+
+`-vv` and `-vvv` select `debug` and `trace`; `-q` shows only errors and `-qq`
+turns logging off. `--log-file <path>` appends to a file instead of standard
+error. A spec's targets are crate names or module paths (`html::tokenizer`),
+and the longest match wins. See `crates/common/src/logging.rs` for the
+guidance on choosing a level when you add a log line.
+
 ## Development workflow
 
 - Trunk-based development on `main`
