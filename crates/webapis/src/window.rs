@@ -1,15 +1,26 @@
-//! The JavaScript [`window`](https://developer.mozilla.org/en-US/docs/Web/API/Window)
-//! global object.
+//! The script-visible `Window` object and its self-reference.
+
+use std::sync::Arc;
 
 use js::{JsResult, Object, Realm, Value};
 
-/// Registers the page's `window` object in `realm`.
+/// Registers the script-visible window globals.
 ///
-/// A fresh object is created for each realm, so separate pages cannot observe
-/// or mutate one another's window state. Window members are registered by
-/// their respective Web API bindings as those APIs are implemented.
+/// The current implementation exposes the `window` object and the global
+/// `self` alias. Their `self()` method returns the same object identity,
+/// which is the supported subset of the Window self-reference API. Screen,
+/// navigation, and other window-management APIs are not implemented yet.
 pub fn register_window(realm: &mut Realm) -> JsResult<()> {
-    realm.register_global_value("window", Value::Object(Object::new()))
+    let window = Object::new();
+    let self_window = window.clone();
+    window.set_method(
+        "self",
+        Arc::new(move |_| Ok(Value::Object(self_window.clone()))),
+    );
+
+    let window_value = Value::Object(window);
+    realm.register_global_value("window", window_value.clone())?;
+    realm.register_global_value("self", window_value)
 }
 
 #[cfg(test)]
@@ -27,6 +38,21 @@ mod tests {
             realm.evaluate_script("window"),
             Ok(Value::Object(_))
         ));
+    }
+
+    #[test]
+    fn window_self_returns_the_same_object() {
+        let mut realm = Realm::new();
+        register_window(&mut realm).unwrap();
+
+        assert_eq!(
+            realm.evaluate_script("window.self()"),
+            realm.evaluate_script("window")
+        );
+        assert_eq!(
+            realm.evaluate_script("self"),
+            realm.evaluate_script("window")
+        );
     }
 
     #[test]
