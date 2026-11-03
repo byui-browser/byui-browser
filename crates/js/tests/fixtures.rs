@@ -78,8 +78,7 @@ fn arrays_fixture_will_evaluate_when_arrays_are_supported() {
 }
 
 #[test]
-#[ignore = "Arrow functions are not implemented yet"]
-fn arrow_functions_fixture_will_evaluate_when_arrows_are_supported() {
+fn arrow_functions_fixture_evaluates() {
     assert!(eval(fixture("arrow-functions.js")).is_ok());
 }
 
