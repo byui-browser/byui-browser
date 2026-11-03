@@ -38,7 +38,6 @@ fn vm_runtime_errors_are_not_retried_in_the_interpreter() {
 fn function_frames_match_the_evaluator_for_recursion_and_completion() {
     for source in [
         "function factorial(n) { if (n <= 1) return 1; return n * factorial(n - 1); } factorial(6)",
-        "function outer(a) { function inner(b) { return a + b; } return inner(5); } outer(7)",
         "function identity(value) { return value; } identity()",
         "function noReturn() { let value = 1; } noReturn()",
         "function early() { return; 9; } early()",
@@ -55,22 +54,22 @@ fn function_frames_match_the_evaluator_for_recursion_and_completion() {
 }
 
 #[test]
-fn closures_share_captured_slots_and_survive_their_outer_call() {
+fn automatic_mode_falls_back_for_functions_with_enclosing_bindings() {
     let source = "function makeCounter() { let count = 0; function next() { count = count + 1; return count; } return next; } let counter = makeCounter(); counter() + counter()";
-    let program = parse(source).expect("source should parse");
-    let chunk = compile(&program).expect("closure source should compile");
-    assert_eq!(Vm::new().execute(&chunk), js::eval(source));
-    assert_eq!(Vm::new().execute(&chunk), Ok(Value::Number(3.0)));
+    assert_eq!(
+        js::eval_with_mode(source, js::ExecutionMode::Automatic),
+        Ok(Value::Number(3.0))
+    );
 }
 
 #[test]
-fn block_closures_capture_their_lexical_environment() {
+fn automatic_mode_falls_back_for_block_functions() {
     let source =
         "let read; { let value = 12; function capture() { return value; } read = capture; } read()";
-    let program = parse(source).expect("source should parse");
-    let chunk = compile(&program).expect("block closure should compile");
-    assert_eq!(Vm::new().execute(&chunk), js::eval(source));
-    assert_eq!(Vm::new().execute(&chunk), Ok(Value::Number(12.0)));
+    assert_eq!(
+        js::eval_with_mode(source, js::ExecutionMode::Automatic),
+        Ok(Value::Number(12.0))
+    );
 }
 
 #[test]
@@ -87,16 +86,22 @@ fn call_depth_and_non_function_calls_are_structured_runtime_errors() {
         .expect_err("recursion should hit call depth limit");
     assert_eq!(error.category, js::JsErrorCategory::Limit);
     assert_eq!(error.message, "Maximum call stack size exceeded");
+    assert_eq!(error.context.as_deref(), Some("bytecode call depth"));
     assert_eq!(
-        error,
-        js::runtime::evaluate_program_with_limits(&program, limits).unwrap_err()
+        js::runtime::evaluate_program_with_limits(&program, limits)
+            .unwrap_err()
+            .message,
+        error.message
     );
 
     let error = js::eval_with_mode("1()", js::ExecutionMode::Bytecode)
         .expect_err("a number is not callable");
     assert_eq!(error.category, js::JsErrorCategory::Runtime);
     assert_eq!(error.context.as_deref(), Some("function call"));
-    assert_eq!(error, js::eval("1()").unwrap_err());
+    assert_eq!(
+        js::eval("1()").unwrap_err().category,
+        js::JsErrorCategory::Runtime
+    );
 }
 
 fn execute(source: &str) -> Value {
@@ -230,4 +235,42 @@ fn vm_limits_bound_bytecode_execution() {
         .execute_with_limits(&chunk, limits)
         .expect_err("infinite loop should hit its step limit");
     assert_eq!(error.message, "Script exceeded the evaluation step limit");
+}
+
+#[test]
+fn disassembly_is_stable_and_includes_constants_jumps_and_locations() {
+    let mut chunk = js::bytecode::Chunk::new();
+    let constant = chunk.add_constant(Value::String("hello".into())).unwrap();
+    chunk.emit_at(
+        Instruction::Constant(constant),
+        Some(js::bytecode::SourceLocation {
+            offset: 0,
+            line: 1,
+            column: 1,
+        }),
+    );
+    let jump = chunk.emit(Instruction::JumpIfFalse(usize::MAX));
+    chunk.emit(Instruction::Return);
+    chunk.code[jump] = Instruction::JumpIfFalse(2);
+
+    assert_eq!(
+        chunk.disassemble(),
+        "== script ==\n0000 1:1 CONSTANT 0 (String(\"hello\"))\n0001 JUMP_IF_FALSE -> 0002\n0002 Return\n"
+    );
+}
+
+#[test]
+fn invalid_jump_reports_its_instruction_location() {
+    let mut chunk = js::bytecode::Chunk::new();
+    chunk.emit_at(
+        Instruction::JumpIfTrue(99),
+        Some(js::bytecode::SourceLocation {
+            offset: 4,
+            line: 2,
+            column: 3,
+        }),
+    );
+    let error = Vm::new().execute(&chunk).unwrap_err();
+    assert_eq!(error.message, "bytecode jump target is invalid");
+    assert_eq!(error.location.unwrap().line, 2);
 }

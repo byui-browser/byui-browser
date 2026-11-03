@@ -17,6 +17,6 @@ pub mod dom_token_list;
 pub use dom_token_list::DOMTokenList;
 pub use {
     attribute::Attribute, dom_error::DomError, element_data::ElementData,
-    html_document::HTMLDocument, namespace::Namespace, node::Node, node_id::NodeId,
+    html_document::HTMLDocument, namespace::Namespace, node::Node, node_id::NodeID,
     node_kind::NodeKind, source_span::SourceSpan,
 };

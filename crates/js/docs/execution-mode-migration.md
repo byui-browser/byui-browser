@@ -6,11 +6,13 @@ tree-walk interpreter only when the compiler returns its explicit unsupported
 syntax result. Compilation diagnostics and VM runtime or limit errors are
 returned; they never trigger a second evaluation.
 
-Compiled chunks support function declarations, ordered argument evaluation,
-parameters, returns, recursion, and closures over shared lexical slots. Each
-call uses a VM frame with its own chunk, instruction pointer, operand-stack
-base, and function scope. Call depth is bounded by the same
-`ExecutionLimits::call_depth_limit` setting used by the interpreter.
+Compiled chunks support top-level function declarations, ordered argument
+evaluation, parameters, returns, recursion, and class methods. Functions that
+capture enclosing local bindings and nested or block function declarations are
+currently unsupported by the compiler. `Automatic` falls back to the
+interpreter for those constructs. Each VM call uses a frame with its own chunk,
+instruction pointer, operand-stack base, and function scope. Call depth is
+bounded by `ExecutionLimits::call_depth_limit`.
 
 `Interpreter` remains available for differential comparisons. `Bytecode`
 requires the VM path. Current VM chunks own fresh bindings, so `Realm` keeps

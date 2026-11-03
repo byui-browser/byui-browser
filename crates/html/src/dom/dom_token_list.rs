@@ -1,4 +1,4 @@
-use super::{Attribute, DomError, HTMLDocument, NodeId, NodeKind};
+use super::{Attribute, DomError, HTMLDocument, NodeID, NodeKind};
 
 /// A live view of an element's whitespace-separated `class` attribute tokens.
 ///
@@ -7,11 +7,11 @@ use super::{Attribute, DomError, HTMLDocument, NodeId, NodeKind};
 /// `class` attribute while the handle is borrowed.
 pub struct DOMTokenList<'document> {
     document: &'document mut HTMLDocument,
-    element: NodeId,
+    element: NodeID,
 }
 
 impl<'document> DOMTokenList<'document> {
-    pub(crate) fn new(document: &'document mut HTMLDocument, element: NodeId) -> Self {
+    pub(crate) fn new(document: &'document mut HTMLDocument, element: NodeID) -> Self {
         Self { document, element }
     }
 
@@ -33,10 +33,10 @@ impl<'document> DOMTokenList<'document> {
             return Vec::new();
         };
         element
-            .attributes
+            .get_attributes()
             .iter()
-            .find(|attribute| attribute.name == "class")
-            .map(|attribute| parse_tokens(&attribute.value))
+            .find(|attribute| attribute.get_name() == "class")
+            .map(|attribute| parse_tokens(attribute.get_value()))
             .unwrap_or_default()
     }
 
@@ -127,10 +127,10 @@ impl<'document> DOMTokenList<'document> {
             return None;
         };
         element
-            .attributes
+            .get_attributes()
             .iter()
-            .find(|attribute| attribute.name == "class")
-            .map(|attribute| attribute.value.clone())
+            .find(|attribute| attribute.get_name() == "class")
+            .map(|attribute| attribute.get_value().clone())
     }
 
     fn write_attribute_value(&mut self, value: &str) -> Result<(), DomError> {
@@ -141,18 +141,7 @@ impl<'document> DOMTokenList<'document> {
         else {
             return Err(DomError::NotFound);
         };
-        if let Some(attribute) = element
-            .attributes
-            .iter_mut()
-            .find(|attribute| attribute.name == "class")
-        {
-            attribute.value = value.to_owned();
-        } else {
-            element.attributes.push(Attribute {
-                name: "class".to_owned(),
-                value: value.to_owned(),
-            });
-        }
+        element.set_attribute(Attribute::new("class".to_owned(), value.to_owned()));
         Ok(())
     }
 }

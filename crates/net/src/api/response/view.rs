@@ -57,8 +57,18 @@ impl InternalResponse {
                 .entry(http::header::CONTENT_TYPE)
                 .or_insert_with(|| content_type.clone());
         }
-        let force_null = request.method() == http::Method::HEAD
-            || matches!(status.as_u16(), 101 | 204 | 205 | 304);
+        let response_forbids_body = matches!(status.as_u16(), 101 | 204 | 205 | 304);
+        if !response_forbids_body {
+            if let Some(length) = resource.body.known_length() {
+                headers
+                    .entry(http::header::CONTENT_LENGTH)
+                    .or_insert_with(|| {
+                        http::HeaderValue::from_str(&length.to_string())
+                            .expect("a byte length is a valid header value")
+                    });
+            }
+        }
+        let force_null = request.method() == http::Method::HEAD || response_forbids_body;
         let (mut body, body_is_null) = resource
             .body
             .into_body(request.signal().clone(), force_null);
@@ -367,5 +377,65 @@ mod tests {
             .expose();
         assert!(null.body.is_null());
         assert!(runtime.block_on(null.body.bytes()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scheme_resources_synthesize_lengths_for_known_representations() {
+        let request = Request::get("data:,ok");
+
+        let mut bytes = resource("data:,ok");
+        bytes.body = SchemeBody::Bytes(b"bytes".to_vec());
+        let bytes = InternalResponse::from_scheme_resource(bytes, &request, FetchScheme::Data)
+            .unwrap()
+            .expose();
+        assert_eq!(bytes.headers.get("content-length").as_deref(), Some("5"));
+
+        let mut metadata_only = resource("data:,ok");
+        metadata_only.body = SchemeBody::NullWithLength(7);
+        let metadata_only =
+            InternalResponse::from_scheme_resource(metadata_only, &request, FetchScheme::Data)
+                .unwrap()
+                .expose();
+        assert_eq!(
+            metadata_only.headers.get("content-length").as_deref(),
+            Some("7")
+        );
+        assert!(metadata_only.body.is_null());
+
+        let mut stream = resource("data:,ok");
+        stream.body = SchemeBody::Stream(Box::pin(futures_util::stream::empty()));
+        let stream = InternalResponse::from_scheme_resource(stream, &request, FetchScheme::Data)
+            .unwrap()
+            .expose();
+        assert!(!stream.headers.has("content-length"));
+    }
+
+    #[test]
+    fn scheme_resource_length_preserves_explicit_metadata_and_bodyless_status_rules() {
+        let request = Request::get("data:,ok");
+
+        let mut explicit = resource("data:,ok");
+        explicit.body = SchemeBody::Bytes(b"bytes".to_vec());
+        explicit.headers.push((
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("9"),
+        ));
+        let explicit =
+            InternalResponse::from_scheme_resource(explicit, &request, FetchScheme::Data)
+                .unwrap()
+                .expose();
+        assert_eq!(explicit.headers.get("content-length").as_deref(), Some("9"));
+
+        for status in [204, 205, 304] {
+            let mut bodyless = resource("data:,ok");
+            bodyless.status = status;
+            bodyless.body = SchemeBody::Bytes(b"bytes".to_vec());
+            let bodyless =
+                InternalResponse::from_scheme_resource(bodyless, &request, FetchScheme::Data)
+                    .unwrap()
+                    .expose();
+            assert!(!bodyless.headers.has("content-length"));
+            assert!(bodyless.body.is_null());
+        }
     }
 }

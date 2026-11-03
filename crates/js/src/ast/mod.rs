@@ -66,13 +66,37 @@ pub enum Expr {
     },
     /// Property read such as `object.name` or `object[key]`.
     ///
-    /// The object is evaluated first, then a computed key. Reading a missing
-    /// property, or any property of a non-object value, is a runtime error.
+    /// The object is evaluated first, then a computed key. A missing property
+    /// reads as `undefined`; reading any property of a non-object value is a
+    /// runtime error.
     Member {
         /// Owned expression producing the object to read from.
         object: Box<Expr>,
         /// Property name, fixed or computed.
         property: MemberProperty,
+    },
+    /// The `this` keyword: the receiver of the running method or constructor.
+    This,
+    /// Construction such as `new Callee(arguments)`.
+    ///
+    /// The callee is evaluated first, then the arguments in order.
+    New {
+        /// Owned expression producing the constructor.
+        callee: Box<Expr>,
+        /// Owned arguments in evaluation order; empty for `new Callee`.
+        arguments: Vec<Expr>,
+    },
+    /// `super(arguments)` inside a derived class constructor: runs the parent
+    /// constructor and binds `this` to the instance it produces.
+    SuperCall {
+        /// Owned arguments in evaluation order.
+        arguments: Vec<Expr>,
+    },
+    /// `super.name` inside a class method: reads `name` starting from the
+    /// parent class's prototype. Calling it passes the current `this`.
+    SuperMember {
+        /// Owned property name.
+        name: String,
     },
     /// Property assignment such as `object.name = value`, yielding the
     /// assigned value.
@@ -88,6 +112,34 @@ pub enum Expr {
         /// Owned expression supplying the assigned value.
         value: Box<Expr>,
     },
+    /// Object literal such as `{ a: 1, 'b': 2, [key]: 3 }`, creating a new
+    /// object each time it is evaluated.
+    ///
+    /// Properties are evaluated in source order, each key before its value.
+    /// A repeated key keeps its first position and its last value. Shorthand
+    /// `{ a }` is parsed as `{ a: a }`. Methods, getters, setters, and spread
+    /// (`...`) are unsupported.
+    Object(Vec<ObjectProperty>),
+}
+
+/// One `key: value` entry of an object literal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectProperty {
+    /// Property name, fixed or computed.
+    pub key: PropertyKey,
+    /// Owned expression supplying the property's value.
+    pub value: Expr,
+}
+
+/// The key part of an object literal property.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropertyKey {
+    /// A fixed name written as an identifier (keywords allowed), a string,
+    /// or a number. Numbers are stored in their JavaScript string form, so
+    /// `{ 1.50: x }` has the key `"1.5"`.
+    Named(String),
+    /// `[expression]`: the key is converted to a string after evaluation.
+    Computed(Box<Expr>),
 }
 
 /// The property part of a member expression.
@@ -143,6 +195,36 @@ pub enum Statement {
     },
     /// Function return with an optional value; absence means undefined.
     Return(Option<Expr>),
+    /// Class declaration with an optional superclass.
+    ClassDeclaration(Box<ClassDefinition>),
+}
+
+/// The parsed body of a class declaration.
+///
+/// Limitations: only plain methods and one constructor are represented.
+/// Static members, accessors, fields, computed member names, and class
+/// expressions are not supported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassDefinition {
+    /// Owned class name, which also names the binding the class is stored in.
+    pub name: String,
+    /// Expression after `extends`, evaluated once when the class is defined.
+    pub superclass: Option<Expr>,
+    /// The explicit `constructor`, or `None` for the implicit one.
+    pub constructor: Option<MethodDefinition>,
+    /// Prototype methods in source order.
+    pub methods: Vec<MethodDefinition>,
+}
+
+/// A method or constructor inside a class body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MethodDefinition {
+    /// Owned method name.
+    pub name: String,
+    /// Owned parameter names in argument order.
+    pub params: Vec<String>,
+    /// Owned body statements in source order.
+    pub body: Vec<Statement>,
 }
 
 /// Keyword used to declare a binding.

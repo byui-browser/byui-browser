@@ -1,5 +1,6 @@
 //! Statement dispatch and termination for the supported grammar.
 mod block;
+mod class;
 mod control_flow;
 mod declaration;
 mod function;
@@ -15,6 +16,7 @@ pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Statement> {
         Some(Token::Let | Token::Var | Token::Const) => declaration::parse(parser),
         Some(Token::If | Token::While) => control_flow::parse(parser),
         Some(Token::Function) => function::parse(parser),
+        Some(Token::Class) => class::parse(parser),
         Some(Token::Return) => return_statement::parse(parser),
         _ => {
             let expression = parser.parse_expression(0)?;

@@ -5,7 +5,6 @@
 use render::{Compositor, DisplayItem};
 
 #[test]
-#[ignore = "TODO(render): rasterization not implemented"]
 fn fill_rect_writes_pixels_inside_and_leaves_outside_cleared() {
     let frame = Compositor::new(4, 4).compose(&[DisplayItem::FillRect {
         x: 0,

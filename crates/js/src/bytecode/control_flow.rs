@@ -10,6 +10,7 @@ impl Compiler {
             .map_err(|message| super::CompileError {
                 message: message.into(),
                 unsupported: false,
+                location: None,
             })
     }
 
@@ -19,6 +20,7 @@ impl Compiler {
             .map_err(|message| super::CompileError {
                 message: message.into(),
                 unsupported: false,
+                location: None,
             })
     }
 

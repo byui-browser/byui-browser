@@ -21,6 +21,7 @@ fn about_blank_returns_an_empty_html_response() {
         response.headers.get("content-type").as_deref(),
         Some("text/html;charset=utf-8")
     );
+    assert_eq!(response.headers.get("content-length").as_deref(), Some("0"));
     assert!(!response.body.is_null());
     assert!(
         runtime()
@@ -46,6 +47,7 @@ fn about_blank_head_preserves_metadata_and_has_a_null_body() {
         response.headers.get("content-type").as_deref(),
         Some("text/html;charset=utf-8")
     );
+    assert_eq!(response.headers.get("content-length").as_deref(), Some("0"));
     assert!(response.body.is_null());
     assert!(
         runtime()

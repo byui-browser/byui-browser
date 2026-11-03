@@ -1,6 +1,9 @@
 //! Paint data types.
 
-/// An RGBA color with 8 bits per channel.
+pub use layout::Rect;
+
+/// An RGBA color with 8 bits per channel and straight (non-premultiplied)
+/// alpha.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color {
     /// Red channel.
@@ -9,24 +12,23 @@ pub struct Color {
     pub g: u8,
     /// Blue channel.
     pub b: u8,
-    /// Alpha channel.
+    /// Alpha channel, from 0 (transparent) to 255 (opaque).
     pub a: u8,
 }
 
-/// A rectangle measured in device pixels for the legacy paint-box API.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Rect {
-    /// Horizontal position.
-    pub x: f32,
-    /// Vertical position.
-    pub y: f32,
-    /// Horizontal extent.
-    pub width: f32,
-    /// Vertical extent.
-    pub height: f32,
+impl From<css::CssColor> for Color {
+    fn from(color: css::CssColor) -> Self {
+        Self {
+            r: color.r,
+            g: color.g,
+            b: color.b,
+            a: color.a,
+        }
+    }
 }
 
-/// Legacy input to [`crate::build_display_list`].
+/// Input to [`crate::build_display_list`]: a rectangle in CSS pixels with an
+/// optional background.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PaintBox {
     /// Rectangle to paint.
