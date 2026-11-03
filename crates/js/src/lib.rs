@@ -334,6 +334,7 @@ fn value_kind(value: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Function(_) => "function",
         Value::Object(_) => "object",
+        Value::Array(_) => "array",
     }
 }
 
