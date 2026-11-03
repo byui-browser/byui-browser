@@ -92,6 +92,11 @@ impl Vm {
         chunk: &Chunk,
         limits: ExecutionLimits,
     ) -> JsResult<Value> {
+        log::debug!(
+            "executing chunk ({} instructions, {} functions)",
+            chunk.code.len(),
+            chunk.functions.len()
+        );
         self.stack.clear();
         self.callers.clear();
         self.frame = Frame {
@@ -103,6 +108,10 @@ impl Vm {
         self.loop_iterations_remaining = limits.loop_iteration_limit;
         self.call_depth_limit = usize::try_from(limits.call_depth_limit).unwrap_or(usize::MAX);
         let result = self.run();
+        match &result {
+            Ok(_) => log::debug!("chunk finished with {} steps left", self.steps_remaining),
+            Err(error) => log::debug!("chunk failed ({:?}): {}", error.category, error.message),
+        }
         // Drop references to script values held by an abandoned run.
         self.stack.clear();
         self.callers.clear();
@@ -115,6 +124,7 @@ impl Vm {
         let mut instruction_pointer = 0;
         while let Some(instruction) = chunk.code.get(instruction_pointer).copied() {
             if self.steps_remaining == 0 {
+                log::warn!("instruction step limit reached in the bytecode VM");
                 return Err(JsError::with_context(
                     crate::JsErrorCategory::Limit,
                     "Script exceeded the evaluation step limit",
@@ -406,6 +416,7 @@ impl Vm {
                 instruction_pointer = self.frame.resume;
             }
         }
+        log::error!("bytecode ended without a return instruction");
         Err(JsError::runtime(
             "bytecode ended without a return instruction",
         ))
@@ -455,6 +466,7 @@ impl Vm {
         resume: usize,
     ) -> JsResult<bool> {
         let Value::Function(function) = callee else {
+            log::debug!("call target is not a function");
             return Err(JsError::with_context(
                 JsErrorCategory::Runtime,
                 format!("`{callee}` is not a function"),
@@ -462,16 +474,26 @@ impl Vm {
             ));
         };
         let Some(template) = function.template().cloned() else {
+            log::trace!("calling host function with {} arguments", arguments.len());
             return match function.call_host(&arguments) {
                 Some(result) => {
                     self.push(result?);
                     Ok(false)
                 }
-                None => Err(JsError::runtime(
-                    "the bytecode VM cannot call functions from the tree-walk evaluator",
-                )),
+                None => {
+                    log::warn!("bytecode VM cannot call a tree-walk function");
+                    Err(JsError::runtime(
+                        "the bytecode VM cannot call functions from the tree-walk evaluator",
+                    ))
+                }
             };
         };
+        log::trace!(
+            "calling `{}` with {} arguments at depth {}",
+            template.name,
+            arguments.len(),
+            self.callers.len() + 1
+        );
         if template.kind.is_class() {
             return Err(JsError::with_context(
                 JsErrorCategory::Runtime,
@@ -552,6 +574,10 @@ impl Vm {
     /// Suspends the running frame, to resume at `resume`, and starts `frame`.
     fn enter(&mut self, mut frame: Frame, resume: usize) -> JsResult<()> {
         if self.callers.len() + 1 >= self.call_depth_limit {
+            log::warn!(
+                "call depth limit of {} reached in the bytecode VM",
+                self.call_depth_limit
+            );
             return Err(JsError::with_context(
                 JsErrorCategory::Limit,
                 "Maximum call stack size exceeded",
@@ -601,6 +627,7 @@ impl Vm {
 
     fn next_loop_iteration(&mut self) -> JsResult<()> {
         if self.loop_iterations_remaining == 0 {
+            log::warn!("loop iteration limit reached in the bytecode VM");
             return Err(JsError::with_context(
                 crate::JsErrorCategory::Limit,
                 "Script exceeded the loop iteration limit",
@@ -798,10 +825,12 @@ fn validate_jump(target: usize, chunk: &Chunk, offset: usize) -> JsResult<()> {
 }
 
 fn stack_underflow() -> JsError {
+    log::error!("bytecode operand stack underflow");
     JsError::runtime("bytecode operand stack underflow")
 }
 
 fn bytecode_error(chunk: &Chunk, offset: usize, message: &'static str) -> JsError {
+    log::error!("invalid bytecode at offset {offset}: {message}");
     let error = JsError::runtime(message);
     chunk
         .location(offset)

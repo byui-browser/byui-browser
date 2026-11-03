@@ -36,8 +36,25 @@ struct CascadePriority {
 /// descendants inherit an absolute size rather than re-resolving `em`. Other
 /// values are passed through as specified text.
 pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
+    log::debug!(
+        "styling document: {} nodes, {} author stylesheets",
+        dom.nodes.len(),
+        stylesheets.len()
+    );
+    if log::log_enabled!(log::Level::Debug) {
+        let ignored_at_rules: usize = stylesheets.iter().map(|sheet| sheet.at_rules.len()).sum();
+        if ignored_at_rules > 0 {
+            // Debug, not warn: the shell caches the rendered page but restyles
+            // it on window resize and on page clicks (hit tests), so a warning
+            // here would repeat on each of those.
+            log::debug!(
+                "{ignored_at_rules} at-rules in author stylesheets are not applied by the cascade"
+            );
+        }
+    }
     let mut computed: Vec<(NodeID, Vec<Declaration>)> = Vec::new();
     let mut root_font_size = None;
+    let mut declarations_applied = 0_usize;
     for (index, node) in dom.nodes.iter().enumerate() {
         let NodeKind::Element(element) = &node.kind else {
             continue;
@@ -76,9 +93,16 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
                 value: value.to_owned(),
             });
             for longhand in expanded {
+                declarations_applied += 1;
                 let wins = cascaded
                     .get(&longhand.property)
                     .is_none_or(|(current, _)| priority >= *current);
+                log::trace!(
+                    "declaration `{}: {}` level={} wins={wins}",
+                    longhand.property,
+                    longhand.value,
+                    priority.level
+                );
                 if wins {
                     cascaded.insert(longhand.property, (priority, longhand.value));
                 }
@@ -93,6 +117,7 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
                 if !matches_selector(dom, NodeID::new(index), &rule.selector.0) {
                     continue;
                 }
+                log::trace!("selector `{}` matches node {index}", rule.selector.0);
                 let order = sheet_index
                     .saturating_mul(1_000_000)
                     .saturating_add(rule_index);
@@ -166,7 +191,10 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
         let font_size = properties
             .get("font-size")
             .and_then(|value| values::compute_font_size(value, parent_font_size, root_size))
-            .unwrap_or(parent_font_size);
+            .unwrap_or_else(|| {
+                log::trace!("font-size not computable for node {index}; using parent size");
+                parent_font_size
+            });
         properties.insert("font-size".to_owned(), values::format_px(font_size));
         if root_font_size.is_none() {
             root_font_size = Some(font_size);
@@ -179,6 +207,10 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
                 .collect(),
         ));
     }
+    log::debug!(
+        "styled document: {} elements, {declarations_applied} longhand declarations considered",
+        computed.len()
+    );
     ComputedStyles { styles: computed }
 }
 

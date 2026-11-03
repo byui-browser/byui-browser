@@ -15,6 +15,7 @@ impl Body {
                 .lock()
                 .map_err(|_| RequestError::BodyAlreadyUsed)?;
             if state.used || state.locked {
+                log::debug!("body consume rejected: already used or locked");
                 return Err(RequestError::BodyAlreadyUsed);
             }
             state.locked = true;
@@ -23,6 +24,7 @@ impl Body {
         while let Some(chunk) = self.next().await {
             bytes.extend_from_slice(&chunk?);
         }
+        log::debug!("body consumed: {} bytes", bytes.len());
         Ok(bytes)
     }
 
@@ -43,7 +45,13 @@ impl Body {
             .and_then(metadata::charset_from_content_type)
             .and_then(|charset| Encoding::for_label(charset.as_bytes()))
             .unwrap_or(encoding_rs::UTF_8);
-        let (text, _, _) = encoding.decode(&bytes);
+        let (text, _, had_errors) = encoding.decode(&bytes);
+        if had_errors {
+            log::warn!(
+                "body text had malformed {} sequences; replacement characters inserted",
+                encoding.name()
+            );
+        }
         Ok(text.into_owned())
     }
 
@@ -56,7 +64,10 @@ impl Body {
     /// Consumes this body and deserializes JSON into the requested Rust type.
     pub async fn json<T: DeserializeOwned>(self) -> Result<T, RequestError> {
         let text = self.text().await?;
-        serde_json::from_str(&text).map_err(|error| RequestError::BodyJson(error.to_string()))
+        serde_json::from_str(&text).map_err(|error| {
+            log::debug!("body json parse failed: {error}");
+            RequestError::BodyJson(error.to_string())
+        })
     }
 
     /// Consumes this body as URL-encoded or multipart form data.

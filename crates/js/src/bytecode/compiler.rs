@@ -24,6 +24,7 @@ pub struct CompileError {
 
 impl CompileError {
     fn unsupported(construct: &str) -> Self {
+        log::warn!("bytecode compiler does not support {construct}");
         Self {
             message: format!("bytecode compiler does not support {construct} yet"),
             location: None,
@@ -140,6 +141,7 @@ impl Compiler {
             location: None,
         };
         let param_count = u16::try_from(params.len()).map_err(|_| too_many())?;
+        log::trace!("compiling function `{name}` ({} params)", params.len());
         let mut compiler = self.child(kind);
         for param in params {
             compiler.add_binding(0, param, VarKind::Var)?;
@@ -168,7 +170,29 @@ impl Compiler {
     }
 
     /// Compiles `program`, returning an owned chunk ready for [`crate::vm::Vm`].
-    pub fn compile(mut self, program: &Program) -> Result<Chunk, CompileError> {
+    pub fn compile(self, program: &Program) -> Result<Chunk, CompileError> {
+        log::debug!("compiling program ({} statements)", program.body.len());
+        match self.compile_program(program) {
+            Ok(chunk) => {
+                log::debug!(
+                    "compile finished: {} instructions, {} functions, {} constants",
+                    chunk.code.len(),
+                    chunk.functions.len(),
+                    chunk.constants.len()
+                );
+                if log::log_enabled!(log::Level::Trace) {
+                    log::trace!("bytecode: {:?}", chunk.code);
+                }
+                Ok(chunk)
+            }
+            Err(error) => {
+                log::debug!("compile failed: {}", error.message);
+                Err(error)
+            }
+        }
+    }
+
+    fn compile_program(mut self, program: &Program) -> Result<Chunk, CompileError> {
         self.collect_root_bindings(program)?;
         let root_enter = self.chunk.emit(Instruction::EnterScope(0));
         self.emit_scope_declarations(0)?;
