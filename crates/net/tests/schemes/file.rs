@@ -201,6 +201,7 @@ fn file_fetches_resolve_once_and_use_shared_response_finalization() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(response.url, "file:///tmp/page.html");
     assert_eq!(response.headers.get("x-file").as_deref(), Some("yes"));
+    assert_eq!(response.body.length(), Some(10));
     assert!(!response.headers.has("set-cookie"));
     assert_eq!(
         runtime().block_on(response.body.bytes()).unwrap(),
@@ -255,6 +256,7 @@ fn file_fetches_support_streams_and_explicit_null_bodies() {
             .unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert_eq!(response.body.is_null(), is_null);
+        assert_eq!(response.body.length(), if is_null { Some(0) } else { None });
         assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), expected);
     }
 }

@@ -1,13 +1,43 @@
-use std::io;
-use std::task::Poll;
+use std::{
+    io,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::{Context, Poll},
+};
 
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use http::header::HeaderValue;
+use tokio::sync::Notify;
 
 use crate::api::cancellation::AbortController;
 
 use super::*;
+
+struct DropSignal(Arc<AtomicUsize>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct PendingDropStream {
+    _drop: DropSignal,
+    polled: Arc<Notify>,
+}
+
+impl futures_util::Stream for PendingDropStream {
+    type Item = Result<Bytes, RequestError>;
+
+    fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.polled.notify_one();
+        Poll::Pending
+    }
+}
 
 #[test]
 /// Verifies body constructors expose their replayability and length metadata.
@@ -384,6 +414,48 @@ fn fork_rejects_locked_and_completed_views() {
         completed.fork(),
         Err(RequestError::BodyNotCloneable)
     ));
+}
+
+#[test]
+/// Verifies direct polling records streaming and drop releases its source.
+fn direct_reader_streaming_status_and_drop_release() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let polled = Arc::new(Notify::new());
+    let mut body = Body::from_stream(PendingDropStream {
+        _drop: DropSignal(drops.clone()),
+        polled: polled.clone(),
+    });
+
+    runtime.block_on(async {
+        tokio::select! {
+            item = body.next() => panic!("pending stream unexpectedly returned: {item:?}"),
+            _ = polled.notified() => {}
+        }
+    });
+    assert_eq!(body.status(), BodyStatus::Streaming);
+    drop(body);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+/// Verifies canceling a consumption helper drops its pending source.
+fn dropping_a_helper_future_releases_its_body_source() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let polled = Arc::new(Notify::new());
+    let body = Body::from_stream(PendingDropStream {
+        _drop: DropSignal(drops.clone()),
+        polled: polled.clone(),
+    });
+
+    runtime.block_on(async {
+        let task = tokio::spawn(body.bytes());
+        polled.notified().await;
+        task.abort();
+        let _ = task.await;
+    });
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
 #[test]

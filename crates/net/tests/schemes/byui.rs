@@ -196,6 +196,7 @@ fn byui_pages_resolve_once_and_preserve_page_metadata() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(response.url, "byui://welcome/page?lang=en");
     assert_eq!(response.headers.get("x-page").as_deref(), Some("welcome"));
+    assert_eq!(response.body.length(), Some(16));
     assert!(!response.headers.has("set-cookie"));
     assert_eq!(
         response.headers.get("content-type").as_deref(),
@@ -260,6 +261,15 @@ fn byui_pages_support_streams_and_explicit_null_bodies() {
             .unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert_eq!(response.body.is_null(), is_null);
+        assert_eq!(
+            response.body.length(),
+            match outcome {
+                Outcome::Stream => None,
+                Outcome::Null | Outcome::Bytes if is_null => Some(0),
+                Outcome::Bytes => Some(16),
+                _ => unreachable!("successful response outcomes were listed above"),
+            }
+        );
         assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), expected);
     }
 }

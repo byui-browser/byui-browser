@@ -389,6 +389,7 @@ mod tests {
             .unwrap()
             .expose();
         assert_eq!(bytes.headers.get("content-length").as_deref(), Some("5"));
+        assert_eq!(bytes.body.length(), Some(5));
 
         let mut metadata_only = resource("data:,ok");
         metadata_only.body = SchemeBody::NullWithLength(7);
@@ -425,6 +426,7 @@ mod tests {
                 .unwrap()
                 .expose();
         assert_eq!(explicit.headers.get("content-length").as_deref(), Some("9"));
+        assert_eq!(explicit.body.length(), Some(9));
 
         for status in [204, 205, 304] {
             let mut bodyless = resource("data:,ok");

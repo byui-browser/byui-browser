@@ -172,6 +172,64 @@ mod tests {
     }
 
     #[test]
+    fn response_clone_forks_buffered_one_shot_and_null_bodies() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for (body, expected) in [
+            (
+                Body::from_bytes(b"buffered".to_vec()),
+                b"buffered".as_slice(),
+            ),
+            (
+                Body::one_shot_bytes(b"one-shot".to_vec()),
+                b"one-shot".as_slice(),
+            ),
+            (Body::null(), b"".as_slice()),
+        ] {
+            let mut response = Response {
+                response_type: ResponseType::Basic,
+                status: 200,
+                status_text: "OK".into(),
+                headers: crate::Headers::with_guard(crate::HeaderGuard::Immutable),
+                url: "https://example.test/".into(),
+                redirected: false,
+                body,
+                from_cache: false,
+            };
+            let clone = response.try_clone().unwrap();
+            let (original, cloned) =
+                runtime.block_on(async { tokio::join!(response.body.bytes(), clone.body.bytes()) });
+            assert_eq!(original.unwrap(), expected);
+            assert_eq!(cloned.unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn response_clone_propagates_abort_to_both_live_branches() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let abort = AbortController::new();
+        let mut response = Response {
+            response_type: ResponseType::Basic,
+            status: 200,
+            status_text: "OK".into(),
+            headers: crate::Headers::with_guard(crate::HeaderGuard::Immutable),
+            url: "https://example.test/".into(),
+            redirected: false,
+            body: Body::from_stream_with_signal(
+                stream::pending::<Result<Bytes, RequestError>>(),
+                abort.signal(),
+            ),
+            from_cache: false,
+        };
+        let clone = response.try_clone().unwrap();
+        abort.abort();
+
+        let (original, cloned) =
+            runtime.block_on(async { tokio::join!(response.body.bytes(), clone.body.bytes()) });
+        assert!(matches!(original, Err(RequestError::Aborted)));
+        assert!(matches!(cloned, Err(RequestError::Aborted)));
+    }
+
+    #[test]
     /// Verifies network errors and response-derived helpers expose no body data.
     fn network_error_and_response_helpers_follow_filtered_semantics() {
         let error = Response::network_error();
@@ -179,6 +237,8 @@ mod tests {
         assert_eq!(error.status, 0);
         assert!(!error.ok());
         assert!(!error.has_body());
+        assert!(error.body.is_null());
+        assert_eq!(error.body.length(), Some(0));
         assert!(error.headers.is_empty());
 
         let response = Response {
