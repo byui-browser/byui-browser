@@ -8,8 +8,8 @@ version = 2
 yanked = "deny"
 ignore = [
     # ttf-parser is unmaintained and has no patched release. It reaches us
-    # through ab_glyph (toolbar text in platforms/macos) and only parses fonts
-    # shipped with the OS. Remove once ab_glyph moves off it or the shell
+    # through ab_glyph (toolbar text in platforms/shell and page text in
+    # crates/render) and only parses fonts shipped with the OS. Remove once ab_glyph moves off it or the shell
     # switches to a maintained parser such as skrifa.
     { id = "RUSTSEC-2026-0192", reason = "transitive via ab_glyph; no safe upgrade available" },
 ]
@@ -24,6 +24,9 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # Boost Software License: clipboard-win and error-code (via arboard, the
+    # shell's clipboard on Windows). Permissive, comparable to MIT.
+    "BSL-1.0",
     # Mozilla's root certificate data, shipped by webpki-roots (via reqwest).
     "CDLA-Permissive-2.0",
     "ISC",

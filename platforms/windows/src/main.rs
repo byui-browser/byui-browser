@@ -2,7 +2,7 @@
 //!
 //! The shared `browser-shell` crate owns the toolbar, page rendering, and
 //! pointer behavior. This crate only supplies Windows' native window setup
-//! and its system UI font candidates.
+//! and its system UI and page font candidates.
 
 #![forbid(unsafe_code)]
 
@@ -13,6 +13,7 @@ fn main() {
         // rounded normal window and square maximized treatment.
         configure_window: |attributes| attributes,
         ui_font_files: windows::ui_font_files,
+        page_font_files: windows::page_font_files,
         window_controls_inset: 0.0,
     })
     .expect("Windows browser shell event loop failed");
@@ -24,14 +25,31 @@ mod windows {
 
     /// Returns Windows UI font candidates in preference order.
     pub fn ui_font_files() -> Vec<PathBuf> {
-        [
-            r"C:\Windows\Fonts\segoeui.ttf",
-            r"C:\Windows\Fonts\segoeuil.ttf",
-            r"C:\Windows\Fonts\arial.ttf",
-        ]
-        .into_iter()
-        .map(PathBuf::from)
-        .collect()
+        fonts(&["segoeui.ttf", "segoeuil.ttf", "arial.ttf"])
+    }
+
+    /// Returns page font candidates in preference order: Times New Roman,
+    /// the serif font Edge and Chrome use by default, then other serif and
+    /// sans-serif fonts that ship with Windows.
+    pub fn page_font_files() -> Vec<PathBuf> {
+        fonts(&[
+            "times.ttf",
+            "georgia.ttf",
+            "cambria.ttc",
+            "arial.ttf",
+            "segoeui.ttf",
+        ])
+    }
+
+    /// Paths of `names` in the system fonts folder, which lives under
+    /// `%WINDIR%` (usually `C:\Windows`).
+    fn fonts(names: &[&str]) -> Vec<PathBuf> {
+        let windows =
+            std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        names
+            .iter()
+            .map(|name| windows.join("Fonts").join(name))
+            .collect()
     }
 }
 

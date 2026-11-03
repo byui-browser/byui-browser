@@ -16,12 +16,15 @@ pub enum DisplayItem {
         /// RGBA8 color.
         rgba: [u8; 4],
     },
-    /// Draws text with the built-in bitmap font.
+    /// Draws text with the built-in [`crate::BitmapFont`].
     Text {
-        /// Left edge.
-        x: u32,
-        /// Top edge.
-        y: u32,
+        /// Left edge of the first glyph cell, in device pixels.
+        x: f32,
+        /// Alphabetic baseline, in device pixels.
+        baseline: f32,
+        /// Font size in device pixels; glyphs scale by
+        /// `font_size / BitmapFont::UNITS_PER_EM`.
+        font_size: f32,
         /// Text to draw.
         text: String,
         /// RGBA8 color.
