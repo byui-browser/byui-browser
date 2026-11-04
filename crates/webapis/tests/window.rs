@@ -33,3 +33,36 @@ fn window_self_accepts_extra_arguments_without_changing_the_result() {
         Ok(Value::Boolean(true))
     );
 }
+
+#[test]
+fn window_navigator_returns_the_global_navigator_object() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.navigator() === navigator"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_navigator_returns_a_stable_object() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.navigator() === window.navigator()"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_navigator_accepts_extra_arguments_without_changing_the_result() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.navigator('ignored') === navigator"),
+        Ok(Value::Boolean(true))
+    );
+}
