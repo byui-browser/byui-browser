@@ -11,7 +11,9 @@ fn element_id(document: &HTMLDocument, name: &str) -> NodeID {
     document
         .nodes
         .iter()
-        .position(|node| matches!(&node.kind, NodeKind::Element(element) if element.name == name))
+        .position(
+            |node| matches!(node.get_kind(), NodeKind::Element(element) if element.get_name() == name),
+        )
         .map(NodeID::new)
         .unwrap_or_else(|| panic!("missing <{name}> element"))
 }
@@ -26,14 +28,14 @@ fn attribute_value<'a>(
     name: &str,
 ) -> Option<&'a str> {
     let id = element_id(document, element_name);
-    let NodeKind::Element(element) = &document.nodes[id.get()].kind else {
+    let NodeKind::Element(element) = document.nodes[id.get()].get_kind() else {
         unreachable!("element lookup returns an element")
     };
     element
-        .attributes
+        .get_attributes()
         .iter()
-        .find(|attribute| attribute.name == name)
-        .map(|attribute| attribute.value.as_str())
+        .find(|attribute| attribute.get_name() == name)
+        .map(|attribute| attribute.get_value().as_str())
 }
 
 /// Collects the text content of the first `<p>` element in document order.
@@ -197,10 +199,9 @@ fn decoded_less_than_stays_a_text_node() {
     let id = element_id(&document, "p");
     assert_eq!(document.text_content(id), Some("<h1>hello</h1>".into()));
     assert!(
-        document
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.kind, NodeKind::Text(text) if text == "<h1>hello</h1>"))
+        document.nodes.iter().any(
+            |node| matches!(node.get_kind(), NodeKind::Text(text) if text == "<h1>hello</h1>")
+        )
     );
 }
 

@@ -22,6 +22,16 @@ pub enum Expr {
     Undefined,
     /// Owned name to resolve in the execution environment.
     Identifier(String),
+    /// Arrow function with positional parameters and an expression or block body.
+    ///
+    /// The tree-walk evaluator supports arrows; the bytecode compiler currently
+    /// rejects them with an unsupported-construct error.
+    ArrowFunction {
+        /// Owned parameter names in argument order.
+        params: Vec<String>,
+        /// Function body; expression bodies return their value implicitly.
+        body: ArrowBody,
+    },
     /// Unary operation on one operand.
     Unary {
         /// Operation to apply to the operand.
@@ -120,14 +130,18 @@ pub enum Expr {
     /// `{ a }` is parsed as `{ a: a }`. Methods, getters, setters, and spread
     /// (`...`) are unsupported.
     Object(Vec<ObjectProperty>),
-    /// Array literal such as `[1, , x]`, creating a new array each time it is
-    /// evaluated.
-    ///
-    /// Elements are evaluated in source order. `None` is an elision, a hole
-    /// in the array that still counts toward its length; one trailing comma
-    /// is ignored, so `[1,]` has length 1 and `[1,,]` has length 2. Spread
-    /// (`...`) is unsupported. Arrays run only on the bytecode VM.
+    /// Array literal. `None` entries represent elisions and evaluate to
+    /// `undefined` when read by index.
     Array(Vec<Option<Expr>>),
+}
+
+/// Body of an arrow function.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArrowBody {
+    /// Expression returned implicitly when the function is called.
+    Expression(Box<Expr>),
+    /// Statements executed in source order; an explicit return supplies the result.
+    Block(Vec<Statement>),
 }
 
 /// One `key: value` entry of an object literal.

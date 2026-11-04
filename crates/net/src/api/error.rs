@@ -37,14 +37,15 @@ pub enum ProviderErrorKind {
 /// | Variants | Recovery and body effect |
 /// | --- | --- |
 /// | `Initialization` | Fix client configuration; no request or response body exists. |
-/// | `InvalidUrl`, `InvalidOrigin`, `InvalidMethod`, `ForbiddenMethod`, `NoCorsMethod`, `ForbiddenHeader`, `InvalidHeaderName`, `InvalidHeaderValue`, `ImmutableHeaders`, `InvalidHeaderGuardTransition`, `BodyNotAllowed`, `KeepaliveBodyTooLarge`, `UnsupportedScheme`, `UnsupportedFeature`, `MissingProvider`, `Provider`, `InvalidResponse` | Correct the request, provider, or response metadata; no body is exposed by this failed attempt. |
+/// | `InvalidUrl`, `InvalidOrigin`, `InvalidMethod`, `ForbiddenMethod`, `NoCorsMethod`, `ForbiddenHeader`, `InvalidHeaderName`, `InvalidHeaderValue`, `ImmutableHeaders`, `InvalidHeaderGuardTransition`, `BodyNotAllowed`, `StreamingBodyRequiresDuplex`, `KeepaliveBodyTooLarge`, `UnsupportedScheme`, `UnsupportedFeature`, `MissingProvider`, `Provider`, `InvalidResponse` | Correct the request, provider, or response metadata; no body is exposed by this failed attempt. |
 /// | `SchedulerClosed` | Use a live controller; the request body was not sent. |
 /// | `NetworkError` | A cache-only miss; retry after cache state changes or choose another cache mode. No body was consumed. |
 /// | `BodyAlreadyConsumed` | The request body was spent by a prior attempt; create a fresh body. |
+/// | `BodyNotCloneable` | Clone before disturbing the body, or use a replayable source. The original body remains authoritative. |
 /// | `BodyDecode`, `BodyJson`, `BodyFormData` | The body was read but could not be decoded or parsed; retry with a fresh response body. |
 /// | `CorsDenied`, `SameOriginViolation`, `RedirectFailure` | Internal headers arrived; the internal response body is discarded. The request body may have been sent. |
 /// | `Transport`, `Aborted` | May occur before public headers or during streaming. The request body may have been sent; a delivered response stream is spent. |
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum RequestError {
     /// A network failure before headers; retrying requires a new request.
     NetworkError,
@@ -100,11 +101,15 @@ pub enum RequestError {
     },
     /// A request body cannot be sent with this method.
     BodyNotAllowed(String),
+    /// A streaming request body requires `duplex: half` semantics.
+    StreamingBodyRequiresDuplex,
     /// A one-shot request body was consumed by an earlier send attempt.
     /// This failure occurs before headers; the original body cannot be retried.
     BodyAlreadyConsumed,
     /// A body consumption helper was called after another reader started.
     BodyAlreadyUsed,
+    /// A body cannot be cloned in its current state or without stream teeing.
+    BodyNotCloneable,
     /// Body bytes could not be decoded using the selected character encoding.
     BodyDecode(String),
     /// Body bytes are not valid JSON for the requested Rust type.
@@ -154,8 +159,12 @@ impl std::fmt::Display for RequestError {
                 write!(f, "Header guard cannot transition from {from:?} to {to:?}")
             }
             Self::BodyNotAllowed(method) => write!(f, "A request body is not allowed for {method}"),
+            Self::StreamingBodyRequiresDuplex => {
+                f.write_str("A streaming request body requires duplex mode 'half'")
+            }
             Self::BodyAlreadyConsumed => f.write_str("Request body has already been consumed"),
             Self::BodyAlreadyUsed => f.write_str("Body has already been used"),
+            Self::BodyNotCloneable => f.write_str("Body cannot be cloned in its current state"),
             Self::BodyDecode(error) => write!(f, "Body decoding failed: {error}"),
             Self::BodyJson(error) => write!(f, "Body JSON parsing failed: {error}"),
             Self::BodyFormData(error) => write!(f, "Body form-data parsing failed: {error}"),

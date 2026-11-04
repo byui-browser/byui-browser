@@ -26,9 +26,18 @@ impl RequestController {
         url: Url,
     ) -> Result<Response, RequestError> {
         let Some(allowed_url) = allowed_about_url(&url) else {
+            log::debug!(
+                "about URL is not allowlisted: {}",
+                crate::log_url::loggable(url.as_str())
+            );
             return Err(RequestError::UnsupportedFeature("about URL"));
         };
         if !matches!(request.method(), &Method::GET | &Method::HEAD) {
+            log::warn!(
+                "rejected {} request to {}",
+                request.method(),
+                crate::log_url::loggable(url.as_str())
+            );
             return Err(RequestError::UnsupportedFeature("about scheme method"));
         }
 
@@ -77,11 +86,19 @@ enum AboutBody {
 impl AboutAllowlistEntry {
     fn body(&self, method: &Method) -> SchemeBody {
         if method == Method::HEAD {
-            SchemeBody::Null
-        } else {
-            match self.body {
-                AboutBody::Empty => SchemeBody::Bytes(Vec::new()),
-            }
+            return SchemeBody::NullWithLength(self.body.len());
+        }
+        match self.body {
+            AboutBody::Empty => SchemeBody::Bytes(Vec::new()),
+        }
+    }
+}
+
+impl AboutBody {
+    /// Returns the length of the selected representation without materializing it.
+    const fn len(self) -> usize {
+        match self {
+            Self::Empty => 0,
         }
     }
 }

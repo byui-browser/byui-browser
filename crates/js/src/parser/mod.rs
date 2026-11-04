@@ -138,6 +138,10 @@ impl<'tokens> Parser<'tokens> {
         self.tokens.get(self.position)
     }
 
+    fn peek_at(&self, offset: usize) -> Option<&Token> {
+        self.tokens.get(self.position + offset)
+    }
+
     fn advance(&mut self) -> Option<&Token> {
         let token = self.tokens.get(self.position);
         self.position += usize::from(token.is_some());
@@ -190,6 +194,7 @@ impl<'tokens> Parser<'tokens> {
         parse: impl FnOnce(&mut Self) -> ParseResult<T>,
     ) -> ParseResult<T> {
         if self.depth >= MAX_NESTING {
+            log::warn!("parser nesting limit of {MAX_NESTING} reached in {context}");
             return Err(self.error(NESTING_ERROR, context));
         }
         self.depth += 1;
@@ -216,6 +221,7 @@ impl<'tokens> Parser<'tokens> {
     /// Validates the depth of a node about to be built from its children.
     fn node_depth(&self, depth: usize, context: &'static str) -> ParseResult<usize> {
         if depth > MAX_EXPRESSION_DEPTH {
+            log::warn!("expression depth limit of {MAX_EXPRESSION_DEPTH} reached in {context}");
             Err(self.error(NESTING_ERROR, context))
         } else {
             Ok(depth)

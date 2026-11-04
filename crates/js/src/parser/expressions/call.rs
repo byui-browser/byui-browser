@@ -21,7 +21,7 @@ fn primary(parser: &mut Parser<'_>) -> ParseResult<(Expr, usize)> {
         Some(Token::New) => return parse_new(parser),
         Some(Token::Super) => return parse_super(parser),
         Some(Token::LeftBrace) => return super::object::parse(parser),
-        Some(Token::LeftBracket) => return super::array::parse(parser),
+        Some(Token::LeftBracket) => return parse_array(parser),
         Some(Token::LeftParen) => {
             parser.advance();
             let (expression, depth) = parser.parse_expression_with_depth(0)?;
@@ -32,6 +32,27 @@ fn primary(parser: &mut Parser<'_>) -> ParseResult<(Expr, usize)> {
     };
     parser.advance();
     Ok((expression, 1))
+}
+
+fn parse_array(parser: &mut Parser<'_>) -> ParseResult<(Expr, usize)> {
+    parser.expect(&Token::LeftBracket, "array literal")?;
+    let mut elements = Vec::new();
+    let mut depth = 0;
+    while !parser.consume(&Token::RightBracket) {
+        if parser.consume(&Token::Comma) {
+            elements.push(None);
+            continue;
+        }
+        let (element, element_depth) = parser.parse_expression_with_depth(0)?;
+        depth = depth.max(element_depth);
+        elements.push(Some(element));
+        if !parser.consume(&Token::Comma) {
+            parser.expect(&Token::RightBracket, "array literal")?;
+            break;
+        }
+    }
+    let depth = parser.node_depth(depth + 1, "array literal")?;
+    Ok((Expr::Array(elements), depth))
 }
 
 /// Parses `new Callee(arguments)`. The callee takes member accesses but no

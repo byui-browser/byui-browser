@@ -50,20 +50,41 @@ impl PermissionPolicy {
     /// Unrecorded permissions are denied.
     #[must_use]
     pub fn check(&self, origin: &Origin, permission: PermissionKind) -> PermissionState {
-        self.decisions
-            .get(&(origin.clone(), permission))
-            .copied()
-            .unwrap_or(PermissionState::Denied)
+        let state = self.decisions.get(&(origin.clone(), permission)).copied();
+        match state {
+            Some(state) => {
+                log::trace!(
+                    "{permission:?} for {}: {state:?}",
+                    crate::origin_label(origin)
+                );
+                state
+            }
+            None => {
+                log::debug!(
+                    "{permission:?} denied for {}: no recorded decision",
+                    crate::origin_label(origin)
+                );
+                PermissionState::Denied
+            }
+        }
     }
 
     /// Grants `permission` to `origin` for the lifetime of this policy.
     pub fn grant(&mut self, origin: Origin, permission: PermissionKind) {
+        log::debug!(
+            "granting {permission:?} to {}",
+            crate::origin_label(&origin)
+        );
         self.decisions
             .insert((origin, permission), PermissionState::Granted);
     }
 
     /// Explicitly denies `permission` for `origin`.
     pub fn deny(&mut self, origin: Origin, permission: PermissionKind) {
+        log::debug!(
+            "denying {permission:?} for {}",
+            crate::origin_label(&origin)
+        );
         self.decisions
             .insert((origin, permission), PermissionState::Denied);
     }
@@ -73,6 +94,10 @@ impl PermissionPolicy {
     /// After revocation, [`Self::check`] returns [`PermissionState::Denied`]
     /// because denial is the default state.
     pub fn revoke(&mut self, origin: &Origin, permission: PermissionKind) {
+        log::debug!(
+            "revoking {permission:?} for {}",
+            crate::origin_label(origin)
+        );
         self.decisions.remove(&(origin.clone(), permission));
     }
 }

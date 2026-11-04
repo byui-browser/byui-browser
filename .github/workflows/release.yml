@@ -1,0 +1,160 @@
+name: Release
+
+# Pushing a v*.*.* tag builds the native shell for macOS, Linux, and Windows
+# and attaches the archives to a GitHub Release. Asset file names are the
+# README download URLs; keep them stable.
+#
+# `make release <macos|linux|windows>` runs the same cargo command locally.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# A second run for the same tag waits, so two publishes cannot race.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            package: browser-macos
+            src_bin: browser-macos
+            dest_bin: byui-browser
+            asset: byui-browser-macos-aarch64.tar.gz
+          - os: linux
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            package: browser-linux
+            src_bin: browser-linux
+            dest_bin: byui-browser
+            asset: byui-browser-linux-x86_64.tar.gz
+          - os: windows
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            package: byui-browser-windows
+            src_bin: byui-browser-windows.exe
+            dest_bin: byui-browser.exe
+            asset: byui-browser-windows-x86_64.zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+
+      - name: Install Linux dialog dependencies
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install --yes libgtk-3-dev
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Add release target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build release shell
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          PACKAGE: ${{ matrix.package }}
+        run: cargo build --locked --release --target "$TARGET" -p "$PACKAGE"
+
+      - name: Package archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          SRC_BIN: ${{ matrix.src_bin }}
+          DEST_BIN: ${{ matrix.dest_bin }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          src="target/${TARGET}/release/${SRC_BIN}"
+          test -f "$src"
+          rm -rf packaging
+          mkdir -p packaging dist
+          cp "$src" "packaging/${DEST_BIN}"
+          chmod +x "packaging/${DEST_BIN}"
+          if [[ "$ASSET" == *.zip ]]; then
+            tar -a -cf "dist/${ASSET}" -C packaging "$DEST_BIN"
+          elif [[ "$(uname -s)" == "Darwin" ]]; then
+            # Keep the AppleDouble sidecar out of the archive.
+            COPYFILE_DISABLE=1 tar --disable-copyfile -czf "dist/${ASSET}" -C packaging "$DEST_BIN"
+          else
+            tar -czf "dist/${ASSET}" -C packaging "$DEST_BIN"
+          fi
+          test -s "dist/${ASSET}"
+          tar -tf "dist/${ASSET}"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          ls -l dist
+          for asset in \
+            byui-browser-macos-aarch64.tar.gz \
+            byui-browser-linux-x86_64.tar.gz \
+            byui-browser-windows-x86_64.zip
+          do
+            test -s "dist/${asset}"
+          done
+
+          cat > notes.md <<'EOF'
+          Native shell builds:
+
+          - macOS (Apple Silicon): `byui-browser-macos-aarch64.tar.gz`
+          - Linux (x86_64): `byui-browser-linux-x86_64.tar.gz`
+          - Windows (x86_64): `byui-browser-windows-x86_64.zip`
+
+          Each archive contains `byui-browser` (`byui-browser.exe` on Windows).
+          The Linux build uses the system GTK 3 libraries.
+          EOF
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+            gh release edit "$tag" --draft=false --notes-file notes.md
+          else
+            gh release create "$tag" dist/* \
+              --verify-tag \
+              --title "$tag" \
+              --notes-file notes.md \
+              --generate-notes
+          fi

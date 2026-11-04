@@ -15,21 +15,26 @@ all: build
 build:
 	cargo build --workspace
 
+# `make run LOG=debug` (or any --log-level spec, e.g. LOG=warn,net=trace)
+# forwards a log level to the program being run.
+RUN_ARGS := $(if $(LOG),-- --log-level $(LOG))
+
 ## Run a platform shell: `make run shell` for the browser, or `make run js`
-## for the interactive JavaScript engine shell.
+## for the interactive JavaScript engine shell. Add `LOG=<spec>` to set the
+## log level.
 run:
 ifeq ($(ARGS),js)
-	cargo run -p browser-js
+	cargo run -p browser-js $(RUN_ARGS)
 else ifeq ($(ARGS),shell)
-	cargo run -p browser
+	cargo run -p browser $(RUN_ARGS)
 else ifeq ($(OS),Windows_NT)
-	cargo run -p byui-browser-windows
+	cargo run -p byui-browser-windows $(RUN_ARGS)
 else ifneq (,$(filter Darwin darwin,$(shell uname -s)))
-	cargo run -p browser-macos
+	cargo run -p browser-macos $(RUN_ARGS)
 else ifneq (,$(filter Linux linux,$(shell uname -s)))
-	cargo run -p browser-linux
+	cargo run -p browser-linux $(RUN_ARGS)
 else ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(shell uname -s)))
-	cargo run -p byui-browser-windows
+	cargo run -p byui-browser-windows $(RUN_ARGS)
 else
 	$(error Unsupported operating system '$(shell uname -s)')
 endif
@@ -42,17 +47,18 @@ else
 	cargo test $(foreach crate,$(ARGS),-p $(crate))
 endif
 
-## Release-build the browser for a platform: `make release <macos|linux|windows>`.
+## Release-build the native shell: `make release <macos|linux|windows>`.
+## The release workflow builds these same packages. Keep the two in sync.
 release:
 ifeq ($(strip $(ARGS)),)
 	$(error Usage: make release <platform> (macos|linux|windows))
 endif
 ifeq ($(ARGS),macos)
-	cargo build --release --target aarch64-apple-darwin -p browser
+	cargo build --locked --release --target aarch64-apple-darwin -p browser-macos
 else ifeq ($(ARGS),linux)
-	cargo build --release --target x86_64-unknown-linux-gnu -p browser
+	cargo build --locked --release --target x86_64-unknown-linux-gnu -p browser-linux
 else ifeq ($(ARGS),windows)
-	cargo build --release --target x86_64-pc-windows-msvc -p browser
+	cargo build --locked --release --target x86_64-pc-windows-msvc -p byui-browser-windows
 else
 	$(error Unknown platform '$(ARGS)'. Expected macos, linux, or windows)
 endif

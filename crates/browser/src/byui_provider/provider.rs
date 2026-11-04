@@ -26,12 +26,18 @@ impl BrowserPageProvider {
 
 impl PageProvider for BrowserPageProvider {
     /// Resolves a supported `byui:` page or static subresource.
-    fn resolve<'a>(&'a self, _request: &'a Request, url: &'a Url) -> ProviderFuture<'a> {
+    fn resolve<'a>(&'a self, request: &'a Request, url: &'a Url) -> ProviderFuture<'a> {
         let resource = find_resource(url)
-            .map(|definition| resource(url.clone(), definition))
-            .ok_or(RequestError::Provider {
-                provider: "byui page",
-                kind: ProviderErrorKind::ResourceMissing,
+            .map(|definition| {
+                log::debug!("byui page served: {url} ({} bytes)", definition.body.len());
+                resource(request, url.clone(), definition)
+            })
+            .ok_or_else(|| {
+                log::warn!("byui page not found: {url}");
+                RequestError::Provider {
+                    provider: "byui page",
+                    kind: ProviderErrorKind::ResourceMissing,
+                }
             });
 
         Box::pin(async move { resource })
@@ -39,7 +45,11 @@ impl PageProvider for BrowserPageProvider {
 }
 
 /// Builds provider-neutral metadata for one embedded resource.
-fn resource(url: Url, definition: &super::registry::ResourceDefinition) -> SchemeResource {
+fn resource(
+    request: &Request,
+    url: Url,
+    definition: &super::registry::ResourceDefinition,
+) -> SchemeResource {
     let media_type = HeaderValue::from_static(definition.media_type);
     SchemeResource {
         url,
@@ -48,7 +58,11 @@ fn resource(url: Url, definition: &super::registry::ResourceDefinition) -> Schem
         headers: vec![(HeaderName::from_static("content-type"), media_type.clone())],
         media_type: Some(media_type),
         origin: Origin::opaque(),
-        body: SchemeBody::Bytes(definition.body.to_vec()),
+        body: if request.method() == net::Method::HEAD {
+            SchemeBody::NullWithLength(definition.body.len())
+        } else {
+            SchemeBody::StaticBytes(definition.body)
+        },
     }
 }
 

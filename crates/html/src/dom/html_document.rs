@@ -29,18 +29,21 @@ impl HTMLDocument {
 
     pub fn push_node(&mut self, kind: NodeKind, span: Option<SourceSpan>) -> NodeID {
         let id = NodeID::new(self.nodes.len());
-        self.nodes.push(Node {
-            parent: None,
-            children: Vec::new(),
-            kind,
-            span,
-        });
+        let node = Node::new(None, Vec::new(), kind, span);
+        self.nodes.push(node);
         id
     }
 
     pub fn append_child(&mut self, parent: NodeID, child: NodeID) {
-        self.nodes[child.get()].parent = Some(parent);
-        self.nodes[parent.get()].children.push(child);
+        if let Some(node) = self.node_mut(child) {
+            node.set_parent(Some(parent));
+        }
+        if let Some(node) = self.node_mut(parent) {
+            let mut children = node.get_children().clone();
+            children.push(child);
+            node.set_children(children);
+        }
+        log::trace!("append node {} to parent {}", child.get(), parent.get());
     }
 
     /// Removes `node` from its parent, if it has one.
@@ -49,19 +52,25 @@ impl HTMLDocument {
     /// their existing stable IDs. Removing a detached node, the document root,
     /// or an invalid node ID has no effect.
     pub fn remove(&mut self, node: NodeID) {
-        let Some(parent) = self.node(node).and_then(|node| node.parent) else {
+        let Some(parent) = self.node(node).and_then(Node::get_parent) else {
             return;
         };
 
         if let Some(children) = self
             .nodes
             .get_mut(parent.get())
-            .map(|node| &mut node.children)
+            .map(|node| node.get_children().to_vec())
         {
-            children.retain(|child| *child != node);
+            let children = children
+                .into_iter()
+                .filter(|child| *child != node)
+                .collect();
+            if let Some(parent_node) = self.node_mut(parent) {
+                parent_node.set_children(children);
+            }
         }
         if let Some(removed) = self.nodes.get_mut(node.get()) {
-            removed.parent = None;
+            removed.set_parent(None);
         }
     }
 
@@ -77,9 +86,13 @@ impl HTMLDocument {
     /// required for DOM mutations in this Rust model.
     pub fn class_list(&mut self, element: NodeID) -> Result<DOMTokenList<'_>, DomError> {
         if !matches!(
-            self.node(element).map(|node| &node.kind),
+            self.node(element).map(|node| node.get_kind()),
             Some(NodeKind::Element(_))
         ) {
+            log::debug!(
+                "class_list failed: node {} is not an element",
+                element.get()
+            );
             return Err(DomError::NotFound);
         }
         Ok(DOMTokenList::new(self, element))
@@ -98,15 +111,15 @@ impl HTMLDocument {
     /// XML documents and custom-element creation options are not supported.
     pub fn create_element(&mut self, local_name: &str) -> Result<NodeID, DomError> {
         if !is_valid_element_local_name(local_name) {
+            log::debug!("create_element rejected invalid tag name {local_name:?}");
             return Err(DomError::InvalidCharacter);
         }
 
-        let element = ElementData {
-            name: local_name.to_ascii_lowercase(),
-            namespace: Namespace::Html,
-            attributes: Vec::new(),
-        };
-        Ok(self.push_node(NodeKind::Element(element), None))
+        let element =
+            ElementData::new(local_name.to_ascii_lowercase(), Namespace::Html, Vec::new());
+        let id = self.push_node(NodeKind::Element(element), None);
+        log::trace!("created element <{local_name}> as node {}", id.get());
+        Ok(id)
     }
 
     /// Sets an element's attribute using the DOM `setAttribute` rules.
@@ -122,31 +135,29 @@ impl HTMLDocument {
         value: &str,
     ) -> Result<(), DomError> {
         if !is_valid_attribute_local_name(qualified_name) {
+            log::debug!(
+                "set_attribute on node {} rejected invalid attribute name {qualified_name:?}",
+                element.get()
+            );
             return Err(DomError::InvalidCharacter);
         }
 
-        let node = self.node_mut(element).ok_or(DomError::NotFound)?;
-        let NodeKind::Element(element_data) = &mut node.kind else {
-            return Err(DomError::NotFound);
+        let node = self.node(element).ok_or(DomError::NotFound)?;
+        let mut element_data = match node.get_kind() {
+            NodeKind::Element(element_data) => element_data.clone(),
+            _ => return Err(DomError::NotFound),
         };
 
-        let name = match element_data.namespace {
+        let name = match element_data.get_namespace() {
             Namespace::Html => qualified_name.to_ascii_lowercase(),
             Namespace::Svg | Namespace::MathMl => qualified_name.to_owned(),
         };
 
-        if let Some(attribute) = element_data
-            .attributes
-            .iter_mut()
-            .find(|attribute| attribute.name == name)
-        {
-            attribute.value = value.to_owned();
-        } else {
-            element_data.attributes.push(super::attribute::Attribute {
-                name,
-                value: value.to_owned(),
-            });
-        }
+        log::trace!("set attribute {name:?} on node {}", element.get());
+        element_data.set_attribute(super::attribute::Attribute::new(name, value.to_owned()));
+        self.node_mut(element)
+            .expect("element was validated above")
+            .set_kind(NodeKind::Element(element_data));
 
         Ok(())
     }
@@ -163,19 +174,19 @@ impl HTMLDocument {
             let Some(node) = document.node(id) else {
                 return;
             };
-            if let NodeKind::Text(text) = &node.kind {
+            if let NodeKind::Text(text) = node.get_kind() {
                 output.push_str(text);
             }
-            for child in &node.children {
+            for child in node.get_children() {
                 descendant_text(document, *child, output);
             }
         }
 
         let node = self.node(id)?;
-        match &node.kind {
+        match node.get_kind() {
             NodeKind::Element(_) => {
                 let mut output = String::new();
-                for child in &node.children {
+                for child in node.get_children() {
                     descendant_text(self, *child, &mut output);
                 }
                 Some(output)
@@ -197,7 +208,7 @@ impl HTMLDocument {
     pub fn inner_html(&self) -> String {
         let mut output = String::new();
         if let Some(root) = self.node(self.root) {
-            for child in &root.children {
+            for child in root.get_children() {
                 self.serialize_node(*child, &mut output, false);
             }
         }
@@ -208,9 +219,9 @@ impl HTMLDocument {
         let Some(node) = self.node(id) else {
             return;
         };
-        match &node.kind {
+        match node.get_kind() {
             NodeKind::Document => {
-                for child in &node.children {
+                for child in node.get_children() {
                     self.serialize_node(*child, output, false);
                 }
             }
@@ -242,25 +253,25 @@ impl HTMLDocument {
             }
             NodeKind::Element(element) => {
                 output.push('<');
-                output.push_str(&element.name);
-                for attribute in &element.attributes {
+                output.push_str(element.get_name());
+                for attribute in element.get_attributes() {
                     output.push(' ');
-                    output.push_str(&attribute.name);
+                    output.push_str(attribute.get_name());
                     output.push_str("=\"");
-                    output.push_str(&escape_attribute(&attribute.value));
+                    output.push_str(&escape_attribute(attribute.get_value()));
                     output.push('"');
                 }
                 output.push('>');
-                let is_void =
-                    element.namespace == Namespace::Html && is_void_html_element(&element.name);
+                let is_void = *element.get_namespace() == Namespace::Html
+                    && is_void_html_element(element.get_name());
                 if !is_void {
-                    let child_raw_text = element.namespace == Namespace::Html
-                        && matches!(element.name.as_str(), "script" | "style");
-                    for child in &node.children {
+                    let child_raw_text = *element.get_namespace() == Namespace::Html
+                        && matches!(element.get_name().as_str(), "script" | "style");
+                    for child in node.get_children() {
                         self.serialize_node(*child, output, child_raw_text);
                     }
                     output.push_str("</");
-                    output.push_str(&element.name);
+                    output.push_str(element.get_name());
                     output.push('>');
                 }
             }
@@ -290,10 +301,10 @@ impl HTMLDocument {
             .iter()
             .enumerate()
             .filter_map(|(index, node)| {
-                let NodeKind::Element(element) = &node.kind else {
+                let NodeKind::Element(element) = node.get_kind() else {
                     return None;
                 };
-                (element.name == "script")
+                (element.get_name() == "script")
                     .then(|| self.text_content(NodeID::new(index)).unwrap_or_default())
             })
             .collect()
@@ -301,15 +312,14 @@ impl HTMLDocument {
 
     pub fn get_element_by_id(&self, value: &str) -> Option<NodeID> {
         fn find_in_tree(document: &HTMLDocument, parent: NodeID, value: &str) -> Option<NodeID> {
-            let children = document.node(parent)?.children.clone();
+            let children = document.node(parent)?.get_children().clone();
 
             for child in children {
                 let node = document.node(child)?;
-                if let NodeKind::Element(element) = &node.kind
-                    && element
-                        .attributes
-                        .iter()
-                        .any(|attribute| attribute.name == "id" && attribute.value == value)
+                if let NodeKind::Element(element) = node.get_kind()
+                    && element.get_attributes().iter().any(|attribute| {
+                        attribute.get_name() == "id" && attribute.get_value() == value
+                    })
                 {
                     return Some(child);
                 }

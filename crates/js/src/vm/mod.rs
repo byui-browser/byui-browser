@@ -7,8 +7,8 @@
 
 use crate::ast::{BinaryOperator, UnaryOperator};
 use crate::bytecode::{CallableKind, Chunk, FunctionTemplate, Instruction};
-use crate::runtime::{ExecutionLimits, non_object, number_index, to_property_key};
-use crate::{Array, Function, JsError, JsErrorCategory, JsResult, Object, Value};
+use crate::runtime::{ExecutionLimits, non_object, to_property_key};
+use crate::{Function, JsError, JsErrorCategory, JsResult, Object, Value};
 use std::sync::Arc;
 
 /// Executes a [`Chunk`] using an owned operand stack.
@@ -92,6 +92,11 @@ impl Vm {
         chunk: &Chunk,
         limits: ExecutionLimits,
     ) -> JsResult<Value> {
+        log::debug!(
+            "executing chunk ({} instructions, {} functions)",
+            chunk.code.len(),
+            chunk.functions.len()
+        );
         self.stack.clear();
         self.callers.clear();
         self.frame = Frame {
@@ -103,6 +108,10 @@ impl Vm {
         self.loop_iterations_remaining = limits.loop_iteration_limit;
         self.call_depth_limit = usize::try_from(limits.call_depth_limit).unwrap_or(usize::MAX);
         let result = self.run();
+        match &result {
+            Ok(_) => log::debug!("chunk finished with {} steps left", self.steps_remaining),
+            Err(error) => log::debug!("chunk failed ({:?}): {}", error.category, error.message),
+        }
         // Drop references to script values held by an abandoned run.
         self.stack.clear();
         self.callers.clear();
@@ -115,6 +124,7 @@ impl Vm {
         let mut instruction_pointer = 0;
         while let Some(instruction) = chunk.code.get(instruction_pointer).copied() {
             if self.steps_remaining == 0 {
+                log::warn!("instruction step limit reached in the bytecode VM");
                 return Err(JsError::with_context(
                     crate::JsErrorCategory::Limit,
                     "Script exceeded the evaluation step limit",
@@ -193,19 +203,9 @@ impl Vm {
                     self.push(load_property(&target, &key)?);
                 }
                 Instruction::LoadComputedProperty => {
-                    let key = self.pop()?;
+                    let key = to_property_key(&self.pop()?);
                     let target = self.pop()?;
-                    // Numeric indexes skip building a key string.
-                    let value = match (&target, &key) {
-                        (Value::Array(array), Value::Number(number)) => {
-                            match number_index(*number) {
-                                Some(index) => array.get(index).unwrap_or(Value::Undefined),
-                                None => load_property(&target, &to_property_key(&key))?,
-                            }
-                        }
-                        _ => load_property(&target, &to_property_key(&key))?,
-                    };
-                    self.push(value);
+                    self.push(load_property(&target, &key)?);
                 }
                 Instruction::StoreProperty(index) => {
                     let key = property_name(&chunk, index)?;
@@ -216,16 +216,9 @@ impl Vm {
                 }
                 Instruction::StoreComputedProperty => {
                     let value = self.pop()?;
-                    let key = self.pop()?;
+                    let key = to_property_key(&self.pop()?);
                     let target = self.pop()?;
-                    let index = match (&target, &key) {
-                        (Value::Array(_), Value::Number(number)) => number_index(*number),
-                        _ => None,
-                    };
-                    match (&target, index) {
-                        (Value::Array(array), Some(index)) => array.set(index, value.clone())?,
-                        _ => store_property(&target, to_property_key(&key), &value)?,
-                    }
+                    store_property(&target, key, &value)?;
                     self.push(value);
                 }
                 Instruction::LoadThis => {
@@ -344,20 +337,15 @@ impl Vm {
                     prototype.set(key, Value::Function(method));
                 }
                 Instruction::NewObject => self.push(Value::Object(Object::new())),
-                Instruction::NewArray => self.push(Value::Array(Array::new())),
-                Instruction::AppendElement => {
-                    let value = self.pop()?;
-                    match self.peek()? {
-                        Value::Array(array) => array.push(value)?,
-                        _ => return Err(JsError::runtime("array literal target is not an array")),
-                    };
-                }
-                Instruction::AppendHole => match self.peek()? {
-                    Value::Array(array) => {
-                        array.push_hole()?;
+                Instruction::NewArray(count) => {
+                    let values = self.pop_arguments(count)?;
+                    let array = Object::new();
+                    for (index, value) in values.into_iter().enumerate() {
+                        array.set(index.to_string(), value);
                     }
-                    _ => return Err(JsError::runtime("array literal target is not an array")),
-                },
+                    array.set("length", Value::Number(f64::from(count)));
+                    self.push(Value::Array(array));
+                }
                 Instruction::DefineProperty(index) => {
                     let key = property_name(&chunk, index)?;
                     let value = self.pop()?;
@@ -428,6 +416,7 @@ impl Vm {
                 instruction_pointer = self.frame.resume;
             }
         }
+        log::error!("bytecode ended without a return instruction");
         Err(JsError::runtime(
             "bytecode ended without a return instruction",
         ))
@@ -477,6 +466,7 @@ impl Vm {
         resume: usize,
     ) -> JsResult<bool> {
         let Value::Function(function) = callee else {
+            log::debug!("call target is not a function");
             return Err(JsError::with_context(
                 JsErrorCategory::Runtime,
                 format!("`{callee}` is not a function"),
@@ -484,16 +474,26 @@ impl Vm {
             ));
         };
         let Some(template) = function.template().cloned() else {
+            log::trace!("calling host function with {} arguments", arguments.len());
             return match function.call_host(&arguments) {
                 Some(result) => {
                     self.push(result?);
                     Ok(false)
                 }
-                None => Err(JsError::runtime(
-                    "the bytecode VM cannot call functions from the tree-walk evaluator",
-                )),
+                None => {
+                    log::warn!("bytecode VM cannot call a tree-walk function");
+                    Err(JsError::runtime(
+                        "the bytecode VM cannot call functions from the tree-walk evaluator",
+                    ))
+                }
             };
         };
+        log::trace!(
+            "calling `{}` with {} arguments at depth {}",
+            template.name,
+            arguments.len(),
+            self.callers.len() + 1
+        );
         if template.kind.is_class() {
             return Err(JsError::with_context(
                 JsErrorCategory::Runtime,
@@ -574,6 +574,10 @@ impl Vm {
     /// Suspends the running frame, to resume at `resume`, and starts `frame`.
     fn enter(&mut self, mut frame: Frame, resume: usize) -> JsResult<()> {
         if self.callers.len() + 1 >= self.call_depth_limit {
+            log::warn!(
+                "call depth limit of {} reached in the bytecode VM",
+                self.call_depth_limit
+            );
             return Err(JsError::with_context(
                 JsErrorCategory::Limit,
                 "Maximum call stack size exceeded",
@@ -623,6 +627,7 @@ impl Vm {
 
     fn next_loop_iteration(&mut self) -> JsResult<()> {
         if self.loop_iterations_remaining == 0 {
+            log::warn!("loop iteration limit reached in the bytecode VM");
             return Err(JsError::with_context(
                 crate::JsErrorCategory::Limit,
                 "Script exceeded the loop iteration limit",
@@ -772,7 +777,7 @@ fn function_template(chunk: &Chunk, index: u16) -> JsResult<Arc<FunctionTemplate
 /// The object a constructor's instances inherit from, if it has one.
 fn prototype_of(constructor: &Function) -> Option<Object> {
     match constructor.get_own("prototype") {
-        Some(Value::Object(prototype)) => Some(prototype),
+        Some(Value::Object(prototype) | Value::Array(prototype)) => Some(prototype),
         _ => None,
     }
 }
@@ -787,7 +792,10 @@ fn not_a_constructor(value: &Value) -> JsError {
 
 /// Applies the constructor return rules to a finished construction frame.
 fn constructed_value(frame: &Frame, returned: Value) -> JsResult<Value> {
-    if matches!(returned, Value::Object(_) | Value::Function(_)) {
+    if matches!(
+        returned,
+        Value::Object(_) | Value::Array(_) | Value::Function(_)
+    ) {
         return Ok(returned);
     }
     let derived = frame
@@ -817,10 +825,12 @@ fn validate_jump(target: usize, chunk: &Chunk, offset: usize) -> JsResult<()> {
 }
 
 fn stack_underflow() -> JsError {
+    log::error!("bytecode operand stack underflow");
     JsError::runtime("bytecode operand stack underflow")
 }
 
 fn bytecode_error(chunk: &Chunk, offset: usize, message: &'static str) -> JsError {
+    log::error!("invalid bytecode at offset {offset}: {message}");
     let error = JsError::runtime(message);
     chunk
         .location(offset)
@@ -844,8 +854,9 @@ fn property_name(chunk: &Chunk, index: u16) -> JsResult<String> {
 /// value is an error.
 fn load_property(target: &Value, key: &str) -> JsResult<Value> {
     match target {
-        Value::Object(object) => Ok(object.get(key).unwrap_or(Value::Undefined)),
-        Value::Array(array) => Ok(array.get_property(key)),
+        Value::Object(object) | Value::Array(object) => {
+            Ok(object.get(key).unwrap_or(Value::Undefined))
+        }
         Value::Function(function) if function.template().is_some() => {
             Ok(function.get_own(key).unwrap_or(Value::Undefined))
         }
@@ -855,8 +866,7 @@ fn load_property(target: &Value, key: &str) -> JsResult<Value> {
 
 fn store_property(target: &Value, key: String, value: &Value) -> JsResult<()> {
     match target {
-        Value::Object(object) => object.set(key, value.clone()),
-        Value::Array(array) => array.set_property(&key, value.clone())?,
+        Value::Object(object) | Value::Array(object) => object.set(key, value.clone()),
         Value::Function(function) if function.set_own(&key, value.clone()) => {}
         _ => return Err(non_object(target, "set", &key, "property assignment")),
     }

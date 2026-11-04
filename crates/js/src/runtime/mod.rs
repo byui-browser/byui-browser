@@ -27,7 +27,6 @@
 //! - Each evaluation has a step budget (see [`DEFAULT_STEP_LIMIT`]), so
 //!   endless loops fail with an error instead of running forever.
 
-mod array;
 mod conversions;
 mod object;
 
@@ -36,14 +35,12 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::ast::{
-    BinaryOperator, Expr, LogicalOperator, MemberProperty, Program, PropertyKey, Statement,
-    UnaryOperator, VarKind,
+    ArrowBody, BinaryOperator, Expr, LogicalOperator, MemberProperty, Program, PropertyKey,
+    Statement, UnaryOperator, VarKind,
 };
 use crate::bytecode::FunctionTemplate;
 use crate::stack::{StackGuard, with_engine_stack};
 use crate::{HostFunction, JsError, JsResult, Value};
-pub(crate) use array::number_index;
-pub use array::{Array, MAX_ARRAY_LENGTH};
 use conversions::{
     is_truthy, less_than, loose_equals, strict_equals, to_int32, to_number, to_primitive, to_uint32,
 };
@@ -397,23 +394,22 @@ impl Function {
         }
     }
 
-    /// Invokes this function with `arguments`.
-    ///
-    /// Script functions execute with their captured lexical environment, and
-    /// host functions receive the supplied values directly. This is used by
-    /// host APIs that need to call a JavaScript callback, such as DOM events.
-    /// Bytecode functions run only inside [`crate::vm::Vm`], so calling one
-    /// here is an error.
-    pub fn call(&self, arguments: &[Value]) -> JsResult<Value> {
-        with_engine_stack(|| Interpreter::new(ExecutionLimits::default()).call(self, arguments))
-    }
-
     /// Calls a host function directly. Returns `None` for any other kind.
     pub(crate) fn call_host(&self, arguments: &[Value]) -> Option<JsResult<Value>> {
         match &*self.0 {
             FunctionKind::Host { function, .. } => Some(function(arguments)),
             _ => None,
         }
+    }
+
+    /// Invokes this function with `arguments`.
+    ///
+    /// Script functions execute with their captured lexical environment, and
+    /// host functions receive the supplied values directly. This is used by
+    /// host APIs that need to call a JavaScript callback, such as DOM events.
+    /// Bytecode functions are not run here; the VM executes those.
+    pub fn call(&self, arguments: &[Value]) -> JsResult<Value> {
+        with_engine_stack(|| Interpreter::new(ExecutionLimits::default()).call(self, arguments))
     }
 }
 
@@ -532,6 +528,7 @@ impl GlobalState {
     /// error leaves the globals untouched. Errors thrown while running keep
     /// the effects that happened before them, as in JavaScript.
     pub(crate) fn evaluate(&self, program: &Program, limits: ExecutionLimits) -> JsResult<Value> {
+        log::trace!("evaluating {} top-level statements", program.body.len());
         with_engine_stack(|| {
             self.declare_globals(&program.body)?;
             let completion =
@@ -653,6 +650,7 @@ impl Interpreter {
     /// expression.
     fn guarded<T>(&mut self, action: impl FnOnce(&mut Self) -> JsResult<T>) -> JsResult<T> {
         if self.steps_remaining == 0 {
+            log::warn!("evaluation step limit reached in the tree-walk interpreter");
             return Err(JsError::with_context(
                 crate::JsErrorCategory::Limit,
                 STEP_LIMIT_EXCEEDED,
@@ -661,6 +659,7 @@ impl Interpreter {
         }
         self.steps_remaining -= 1;
         if self.stack.exhausted() {
+            log::warn!("native stack budget exhausted in the tree-walk interpreter");
             return Err(JsError::with_context(
                 crate::JsErrorCategory::Limit,
                 STACK_OVERFLOW,
@@ -672,6 +671,7 @@ impl Interpreter {
 
     fn next_loop_iteration(&mut self) -> JsResult<()> {
         if self.loop_iterations_remaining == 0 {
+            log::warn!("loop iteration limit reached in the tree-walk interpreter");
             return Err(JsError::with_context(
                 crate::JsErrorCategory::Limit,
                 "Script exceeded the loop iteration limit",
@@ -795,8 +795,21 @@ impl Interpreter {
             Expr::This => Err(JsError::new("`this` is not defined")),
             Expr::New { .. } => Err(unsupported_here("`new`")),
             Expr::SuperCall { .. } | Expr::SuperMember { .. } => Err(unsupported_here("`super`")),
-            Expr::Array(_) => Err(unsupported_here("array literals")),
             Expr::Identifier(name) => read(scope, name),
+            Expr::ArrowFunction { params, body } => {
+                let body = match body {
+                    ArrowBody::Expression(expression) => {
+                        vec![Statement::Return(Some((**expression).clone()))]
+                    }
+                    ArrowBody::Block(statements) => statements.clone(),
+                };
+                Ok(Value::Function(Function(Arc::new(FunctionKind::Script {
+                    name: String::new(),
+                    params: params.clone(),
+                    body,
+                    closure: Arc::clone(scope),
+                }))))
+            }
             Expr::Assign { name, value } => {
                 let value = self.evaluate(value, scope)?;
                 assign(scope, name, value.clone())?;
@@ -862,7 +875,7 @@ impl Interpreter {
             Expr::Member { object, property } => {
                 let target = self.evaluate(object, scope)?;
                 let key = self.property_key(property, scope)?;
-                let Value::Object(target) = target else {
+                let (Value::Object(target) | Value::Array(target)) = target else {
                     return Err(non_object(&target, "read", &key, "property access"));
                 };
                 Ok(target.get(&key).unwrap_or(Value::Undefined))
@@ -875,7 +888,7 @@ impl Interpreter {
                 let target = self.evaluate(object, scope)?;
                 let key = self.property_key(property, scope)?;
                 let value = self.evaluate(value, scope)?;
-                let Value::Object(target) = target else {
+                let (Value::Object(target) | Value::Array(target)) = target else {
                     return Err(non_object(&target, "set", &key, "property assignment"));
                 };
                 target.set(key, value.clone());
@@ -893,6 +906,18 @@ impl Interpreter {
                 }
                 Ok(Value::Object(object))
             }
+            Expr::Array(elements) => {
+                let array = Object::new();
+                for (index, element) in elements.iter().enumerate() {
+                    let value = match element {
+                        Some(element) => self.evaluate(element, scope)?,
+                        None => Value::Undefined,
+                    };
+                    array.set(index.to_string(), value);
+                }
+                array.set("length", Value::Number(elements.len() as f64));
+                Ok(Value::Array(array))
+            }
         }
     }
 
@@ -906,10 +931,16 @@ impl Interpreter {
 
     fn call(&mut self, function: &Function, arguments: &[Value]) -> JsResult<Value> {
         match &*function.0 {
-            FunctionKind::Host { function, .. } => function(arguments),
-            FunctionKind::Bytecode { .. } => Err(JsError::runtime(
-                "bytecode functions can only be called by the bytecode VM",
-            )),
+            FunctionKind::Host { function, .. } => {
+                log::trace!("calling host function with {} arguments", arguments.len());
+                function(arguments)
+            }
+            FunctionKind::Bytecode { .. } => {
+                log::debug!("tree-walk interpreter asked to call a bytecode function");
+                Err(JsError::runtime(
+                    "bytecode functions can only be called by the bytecode VM",
+                ))
+            }
             FunctionKind::Script {
                 params,
                 body,
@@ -917,6 +948,10 @@ impl Interpreter {
                 ..
             } => self.guarded(|interpreter| {
                 if interpreter.call_depth >= interpreter.call_depth_limit {
+                    log::warn!(
+                        "call depth limit of {} reached in the tree-walk interpreter",
+                        interpreter.call_depth_limit
+                    );
                     return Err(JsError::with_context(
                         crate::JsErrorCategory::Limit,
                         STACK_OVERFLOW,
@@ -924,6 +959,11 @@ impl Interpreter {
                     ));
                 }
                 interpreter.call_depth += 1;
+                log::trace!(
+                    "calling script function with {} arguments at depth {}",
+                    arguments.len(),
+                    interpreter.call_depth
+                );
                 let scope = child_scope(closure);
                 for (index, param) in params.iter().enumerate() {
                     declare_var(&scope, param)?;
@@ -946,6 +986,7 @@ impl Interpreter {
 
 /// The error for class syntax, which only the bytecode VM can run.
 fn unsupported_here(construct: &str) -> JsError {
+    log::warn!("tree-walk evaluator does not support {construct}");
     JsError::with_context(
         crate::JsErrorCategory::Runtime,
         format!("{construct} is only supported by the bytecode compiler"),

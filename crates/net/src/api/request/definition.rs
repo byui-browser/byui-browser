@@ -16,7 +16,7 @@ use super::{
 use crate::api::headers::is_cors_safelisted_header;
 
 /// A browser request before conversion to a transport request.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Request {
     pub(crate) id: u64,
     pub(crate) url: String,
@@ -33,6 +33,7 @@ pub struct Request {
     pub(crate) integrity: Option<String>,
     pub(crate) keepalive: bool,
     pub(crate) priority: RequestPriority,
+    pub(crate) duplex: Option<RequestDuplex>,
     pub(crate) context: FetchContext,
     pub(crate) signal: AbortSignal,
     pub(crate) url_list: Vec<Url>,
@@ -55,7 +56,74 @@ pub enum RequestPriority {
     High,
 }
 
+/// Fetch request streaming mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestDuplex {
+    /// The response is not exposed until the request body has begun sending.
+    Half,
+}
+
 impl Request {
+    /// Duplicates request metadata and an unused buffered body for an independent send.
+    ///
+    /// Live stream bodies require the original request to be sent instead of
+    /// creating a second request: forking one would impose tee backpressure.
+    pub fn try_clone(&self) -> Result<Self, RequestError> {
+        if self.body.as_ref().is_some_and(Body::is_streaming_source) {
+            return Err(RequestError::BodyNotCloneable);
+        }
+        let mut cloned = self.clone_without_body();
+        cloned.body = self
+            .body
+            .as_ref()
+            .map(Body::try_duplicate_buffered)
+            .transpose()?;
+        Ok(cloned)
+    }
+
+    /// Copies request configuration without transferring or duplicating its body.
+    fn clone_without_body(&self) -> Self {
+        Self {
+            id: self.id,
+            url: self.url.clone(),
+            method: self.method.clone(),
+            headers: self.headers.clone(),
+            body: None,
+            cache_mode: self.cache_mode,
+            redirect_mode: self.redirect_mode,
+            referrer: self.referrer.clone(),
+            referrer_policy: self.referrer_policy,
+            destination: self.destination,
+            service_workers: self.service_workers,
+            initiator: self.initiator,
+            integrity: self.integrity.clone(),
+            keepalive: self.keepalive,
+            priority: self.priority,
+            duplex: self.duplex,
+            context: self.context.clone(),
+            signal: self.signal.clone(),
+            url_list: self.url_list.clone(),
+            current_url: self.current_url.clone(),
+            redirect_count: self.redirect_count,
+            cache_partition: self.cache_partition.clone(),
+        }
+    }
+
+    /// Captures request metadata for cache matching after transport finishes.
+    pub(crate) fn for_cache(&self) -> Self {
+        self.clone_without_body()
+    }
+
+    /// Creates a transport attempt, transferring a streaming body once.
+    pub(crate) fn for_transport(&mut self) -> Result<Self, RequestError> {
+        if self.body.as_ref().is_some_and(Body::is_streaming_source) {
+            let mut attempt = self.clone_without_body();
+            attempt.body = self.body.take();
+            Ok(attempt)
+        } else {
+            self.try_clone()
+        }
+    }
     /// Creates a GET request with Fetch's default request state.
     pub fn get(url: impl Into<String>) -> Self {
         Self {
@@ -74,6 +142,7 @@ impl Request {
             integrity: None,
             keepalive: false,
             priority: RequestPriority::Auto,
+            duplex: None,
             context: FetchContext::default(),
             signal: AbortSignal::new(),
             url_list: Vec::new(),
@@ -158,6 +227,10 @@ impl Request {
             _ => parsed,
         };
         if matches!(normalized.as_str(), "CONNECT" | "TRACE" | "TRACK") {
+            log::debug!(
+                "forbidden method {normalized} rejected for request {}",
+                self.id
+            );
             return Err(RequestError::ForbiddenMethod(normalized.to_string()));
         }
         if self.context.mode == RequestMode::NoCors
@@ -206,6 +279,7 @@ impl Request {
     /// Sets or clears the body and derives its content type when absent.
     pub fn set_body(&mut self, body: Option<Body>) -> Result<(), RequestError> {
         if body.is_some() && matches!(self.method, Method::GET | Method::HEAD) {
+            log::debug!("body rejected for {} request {}", self.method, self.id);
             return Err(RequestError::BodyNotAllowed(self.method.to_string()));
         }
         self.body = body;
@@ -244,6 +318,10 @@ impl Request {
     /// Sets the scheduler priority for this request.
     pub fn set_priority(&mut self, priority: RequestPriority) {
         self.priority = priority;
+    }
+    /// Selects the request streaming mode required for a streaming body.
+    pub fn set_duplex(&mut self, duplex: Option<RequestDuplex>) {
+        self.duplex = duplex;
     }
     /// Sets the cancellation signal.
     pub fn set_signal(&mut self, signal: AbortSignal) {
@@ -299,6 +377,11 @@ impl Request {
     }
 
     pub(crate) fn follow_url(&mut self, url: Url) {
+        log::trace!(
+            "request {} now targets {}",
+            self.id,
+            crate::log_url::loggable(url.as_str())
+        );
         self.url_list.push(url.clone());
         self.current_url = Some(url);
         self.redirect_count += 1;
@@ -314,6 +397,7 @@ impl Request {
     }
 
     pub(crate) fn strip_sensitive_redirect_headers(&mut self) {
+        log::trace!("stripping sensitive headers for cross-origin redirect");
         for name in [
             HeaderName::from_static("authorization"),
             HeaderName::from_static("proxy-authorization"),
@@ -377,6 +461,11 @@ impl Request {
         if self.body.is_some() && matches!(self.method, Method::GET | Method::HEAD) {
             return Err(RequestError::BodyNotAllowed(self.method.to_string()));
         }
+        if self.body.as_ref().is_some_and(Body::is_streaming_source)
+            && self.duplex != Some(RequestDuplex::Half)
+        {
+            return Err(RequestError::StreamingBodyRequiresDuplex);
+        }
         if self.context.mode == RequestMode::NoCors
             && let Some(body) = &self.body
             && let Some(content_type) = body.content_type()
@@ -398,5 +487,152 @@ impl Request {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_mode_respects_tuple_and_opaque_origins() {
+        let mut request = Request::get("https://client.test/resource");
+        request.context.environment.origin = Some(Origin::parse("https://client.test").unwrap());
+
+        request.context.credentials = CredentialsMode::Omit;
+        assert!(!request.credentials_allowed(&Url::parse("https://client.test/other").unwrap()));
+
+        request.context.credentials = CredentialsMode::SameOrigin;
+        assert!(request.credentials_allowed(&Url::parse("https://client.test/other").unwrap()));
+        assert!(
+            !request.credentials_allowed(&Url::parse("https://client.test:8443/other").unwrap())
+        );
+        assert!(!request.credentials_allowed(&Url::parse("https://remote.test/other").unwrap()));
+
+        request.context.environment.origin = Some(Origin::opaque());
+        assert!(!request.credentials_allowed(&Url::parse("https://client.test/other").unwrap()));
+
+        request.context.credentials = CredentialsMode::Include;
+        assert!(request.credentials_allowed(&Url::parse("https://remote.test/other").unwrap()));
+    }
+
+    #[test]
+    fn referrer_policies_reduce_same_origin_cross_origin_and_downgrade_targets() {
+        let source = Url::parse("https://client.test/path?query=one").unwrap();
+        let same_origin = Url::parse("https://client.test/next").unwrap();
+        let cross_origin = Url::parse("https://remote.test/next").unwrap();
+        let downgrade = Url::parse("http://remote.test/next").unwrap();
+        let mut request = Request::get("https://client.test/resource");
+        request.context.environment.referrer = Some(source.clone());
+        request.set_referrer(Referrer::Client, ReferrerPolicy::Empty);
+
+        assert_eq!(
+            request.referrer_value(&same_origin).as_deref(),
+            Some(source.as_str())
+        );
+        assert_eq!(
+            request.referrer_value(&cross_origin).as_deref(),
+            Some("https://client.test")
+        );
+        assert_eq!(request.referrer_value(&downgrade), None);
+
+        request.set_referrer(Referrer::Client, ReferrerPolicy::NoReferrer);
+        assert_eq!(request.referrer_value(&same_origin), None);
+
+        request.set_referrer(Referrer::Client, ReferrerPolicy::OriginWhenCrossOrigin);
+        assert_eq!(
+            request.referrer_value(&same_origin).as_deref(),
+            Some(source.as_str())
+        );
+        assert_eq!(
+            request.referrer_value(&cross_origin).as_deref(),
+            Some("https://client.test")
+        );
+
+        request.set_referrer(Referrer::Client, ReferrerPolicy::SameOrigin);
+        assert_eq!(
+            request.referrer_value(&same_origin).as_deref(),
+            Some(source.as_str())
+        );
+        assert_eq!(request.referrer_value(&cross_origin), None);
+
+        request.set_referrer(Referrer::Client, ReferrerPolicy::UnsafeUrl);
+        assert_eq!(
+            request.referrer_value(&downgrade).as_deref(),
+            Some(source.as_str())
+        );
+    }
+
+    #[test]
+    fn request_mutators_enforce_method_body_and_no_cors_boundaries() {
+        for method in ["CONNECT", "TRACE", "TRACK"] {
+            assert!(matches!(
+                Request::new("https://example.test/", method),
+                Err(RequestError::ForbiddenMethod(actual)) if actual == method
+            ));
+        }
+
+        let mut get = Request::get("https://example.test/");
+        assert!(matches!(
+            get.set_body(Some(Body::from_text("payload"))),
+            Err(RequestError::BodyNotAllowed(method)) if method == "GET"
+        ));
+
+        let mut no_cors = Request::get("https://example.test/");
+        no_cors.set_mode(RequestMode::NoCors).unwrap();
+        assert!(matches!(
+            no_cors.set_method("PUT"),
+            Err(RequestError::NoCorsMethod(method)) if method == "PUT"
+        ));
+        no_cors.set_method("POST").unwrap();
+        no_cors
+            .set_body(Some(Body::from_bytes_with_content_type(
+                b"{}".to_vec(),
+                Some(HeaderValue::from_static("application/json")),
+            )))
+            .unwrap();
+        assert!(matches!(
+            no_cors.validate_body_state(64),
+            Err(RequestError::ForbiddenHeader(name)) if name == "content-type"
+        ));
+    }
+
+    #[test]
+    fn keepalive_body_limit_accepts_the_boundary_and_rejects_larger_bodies() {
+        let mut at_limit = Request::new("https://example.test/", "POST").unwrap();
+        at_limit.set_keepalive(true);
+        at_limit
+            .set_body(Some(Body::from_bytes(vec![0; 4])))
+            .unwrap();
+        assert!(at_limit.validate_body_state(4).is_ok());
+
+        let mut over_limit = Request::new("https://example.test/", "POST").unwrap();
+        over_limit.set_keepalive(true);
+        over_limit
+            .set_body(Some(Body::from_bytes(vec![0; 5])))
+            .unwrap();
+        assert!(matches!(
+            over_limit.validate_body_state(4),
+            Err(RequestError::KeepaliveBodyTooLarge { limit: 4 })
+        ));
+    }
+
+    #[test]
+    fn streaming_request_can_transfer_once_without_an_implicit_clone() {
+        let mut request = Request::new("https://example.test/", "POST").unwrap();
+        request
+            .set_body(Some(Body::stream(futures_util::stream::iter([Ok::<
+                _,
+                std::io::Error,
+            >(
+                b"payload".to_vec(),
+            )]))))
+            .unwrap();
+        assert!(matches!(
+            request.try_clone(),
+            Err(RequestError::BodyNotCloneable)
+        ));
+        assert!(request.for_transport().unwrap().body.is_some());
+        assert!(request.body.is_none());
     }
 }
