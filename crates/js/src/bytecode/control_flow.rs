@@ -9,6 +9,7 @@ impl Compiler {
             .patch_jump(jump, self.chunk.current_offset())
             .map_err(|message| super::CompileError {
                 message: message.into(),
+                unsupported: false,
                 location: None,
             })
     }
@@ -18,6 +19,7 @@ impl Compiler {
             .emit_jump(instruction)
             .map_err(|message| super::CompileError {
                 message: message.into(),
+                unsupported: false,
                 location: None,
             })
     }

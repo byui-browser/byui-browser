@@ -18,6 +18,8 @@ mod control_flow;
 pub struct CompileError {
     /// Human-readable description of the unsupported construct.
     pub message: String,
+    /// Whether the compiler rejected syntax it does not support yet.
+    pub unsupported: bool,
     /// Source location of the unsupported construct, when the compiler has one.
     pub location: Option<super::SourceLocation>,
 }
@@ -27,8 +29,14 @@ impl CompileError {
         log::warn!("bytecode compiler does not support {construct}");
         Self {
             message: format!("bytecode compiler does not support {construct} yet"),
+            unsupported: true,
             location: None,
         }
+    }
+
+    /// Returns whether compilation rejected syntax that has not been lowered.
+    pub fn is_unsupported(&self) -> bool {
+        self.unsupported
     }
 
     /// Attaches a source location to this compilation failure.
@@ -138,6 +146,7 @@ impl Compiler {
     ) -> Result<FunctionTemplate, CompileError> {
         let too_many = || CompileError {
             message: "function has too many parameters".into(),
+            unsupported: false,
             location: None,
         };
         let param_count = u16::try_from(params.len()).map_err(|_| too_many())?;
@@ -230,6 +239,7 @@ impl Compiler {
             .add_function(template)
             .map_err(|message| CompileError {
                 message: message.into(),
+                unsupported: false,
                 location: None,
             })
     }
@@ -240,6 +250,7 @@ impl Compiler {
         let name_index = self.name(name)?;
         let binding = self.binding(name).ok_or_else(|| CompileError {
             message: format!("unresolved declaration `{name}`"),
+            unsupported: false,
             location: None,
         })?;
         if binding.global {
@@ -251,6 +262,7 @@ impl Compiler {
             let depth =
                 u16::try_from(self.scopes.len() - 1 - binding.scope).map_err(|_| CompileError {
                     message: "scope nesting is too deep".into(),
+                    unsupported: false,
                     location: None,
                 })?;
             self.chunk.emit(Instruction::InitializeLocal {
@@ -308,12 +320,14 @@ impl Compiler {
             }
             return Err(CompileError {
                 message: format!("redeclaration of `{name}`"),
+                unsupported: false,
                 location: None,
             });
         }
         let slot = self.scopes[scope].slots;
         self.scopes[scope].slots = slot.checked_add(1).ok_or_else(|| CompileError {
             message: "scope has too many bindings".into(),
+            unsupported: false,
             location: None,
         })?;
         let binding = Binding {
@@ -411,6 +425,7 @@ impl Compiler {
     fn name(&mut self, name: &str) -> Result<u16, CompileError> {
         self.chunk.add_name(name).map_err(|message| CompileError {
             message: message.into(),
+            unsupported: false,
             location: None,
         })
     }
@@ -568,6 +583,7 @@ impl Compiler {
                 if self.function != Some(CallableKind::DerivedConstructor) {
                     return Err(CompileError {
                         message: "`super(...)` is only valid in a derived class constructor".into(),
+                        unsupported: false,
                         location: None,
                     });
                 }
@@ -654,6 +670,7 @@ impl Compiler {
             Some(kind) if kind != CallableKind::Function => Ok(()),
             _ => Err(CompileError {
                 message: "`super` is only valid inside a class method".into(),
+                unsupported: false,
                 location: None,
             }),
         }
@@ -665,6 +682,7 @@ impl Compiler {
         }
         u16::try_from(arguments.len()).map_err(|_| CompileError {
             message: "call has too many arguments".into(),
+            unsupported: false,
             location: None,
         })
     }
@@ -754,6 +772,7 @@ impl Compiler {
             .add_constant(Value::String(name.to_owned()))
             .map_err(|message| CompileError {
                 message: message.into(),
+                unsupported: false,
                 location: None,
             })
     }
@@ -774,6 +793,7 @@ impl Compiler {
             let depth =
                 u16::try_from(self.scopes.len() - 1 - binding.scope).map_err(|_| CompileError {
                     message: "scope nesting is too deep".into(),
+                    unsupported: false,
                     location: None,
                 })?;
             self.chunk.emit(Instruction::LoadLocal {
@@ -801,6 +821,7 @@ impl Compiler {
             let depth =
                 u16::try_from(self.scopes.len() - 1 - binding.scope).map_err(|_| CompileError {
                     message: "scope nesting is too deep".into(),
+                    unsupported: false,
                     location: None,
                 })?;
             self.chunk.emit(Instruction::StoreLocal {
@@ -838,6 +859,7 @@ impl Compiler {
             .add_constant(value)
             .map_err(|message| CompileError {
                 message: message.into(),
+                unsupported: false,
                 location: None,
             })?;
         self.chunk.emit(Instruction::Constant(index));
