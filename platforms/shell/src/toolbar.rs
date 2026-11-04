@@ -147,13 +147,18 @@ pub(crate) fn load_ui_font<P: AsRef<std::path::Path>>(
 ) -> Option<FontVec> {
     use ab_glyph::VariableFont;
 
-    candidates.into_iter().find_map(|path| {
-        let mut font = FontVec::try_from_vec(std::fs::read(path).ok()?).ok()?;
+    let font = candidates.into_iter().find_map(|path| {
+        let mut font = FontVec::try_from_vec(std::fs::read(path.as_ref()).ok()?).ok()?;
         // SF and other variable UI fonts pick the optical size designed for
         // small text; fonts without an `opsz` axis ignore this.
         font.set_variation(b"opsz", TEXT_SIZE);
+        log::debug!("font file chosen: {}", path.as_ref().display());
         Some(font)
-    })
+    });
+    if font.is_none() {
+        log::warn!("no UI font could be loaded; text will not render");
+    }
+    font
 }
 
 /// Paints the whole window: frame, page card holding `page`, and toolbar.

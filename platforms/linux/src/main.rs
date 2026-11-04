@@ -84,16 +84,31 @@ mod linux {
     /// `pattern`, such as `serif` or `sans-serif`. Returns `None` when
     /// `fc-match` is unavailable or fails, so the fallback lists still apply.
     fn fontconfig_match(pattern: &str) -> Option<PathBuf> {
-        let output = Command::new("fc-match")
+        let output = match Command::new("fc-match")
             .args(["--format=%{file}", pattern])
             .output()
-            .ok()?;
+        {
+            Ok(output) => output,
+            Err(error) => {
+                log::debug!("fc-match unavailable for {pattern}: {error}; using fallback fonts");
+                return None;
+            }
+        };
         if !output.status.success() {
+            log::debug!(
+                "fc-match {pattern} failed with {}; using fallback fonts",
+                output.status
+            );
             return None;
         }
         let path = String::from_utf8(output.stdout).ok()?;
         let path = path.trim();
-        (!path.is_empty()).then(|| PathBuf::from(path))
+        if path.is_empty() {
+            log::debug!("fc-match {pattern} returned no file; using fallback fonts");
+            return None;
+        }
+        log::debug!("fontconfig {pattern} font: {path}");
+        Some(PathBuf::from(path))
     }
 }
 

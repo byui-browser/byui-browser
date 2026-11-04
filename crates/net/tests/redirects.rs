@@ -207,6 +207,29 @@ fn non_replayable_body_cannot_follow_307_redirect() {
 }
 
 #[test]
+fn non_replayable_body_cannot_follow_method_preserving_301_redirect() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&requests);
+    let server = TestServer::start(1, move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        b"HTTP/1.1 301 Moved Permanently\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+    let mut request = Request::new(server.url(), "PUT").unwrap();
+    request
+        .set_body(Some(Body::one_shot_bytes(b"payload".to_vec())))
+        .unwrap();
+
+    let error = runtime().block_on(controller.fetch(request)).unwrap_err();
+    server.join();
+
+    assert!(matches!(error, RequestError::RedirectFailure));
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn redirect_limit_fails_before_a_twenty_second_follow_up() {
     let server = TestServer::start(21, |_| {
         b"HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

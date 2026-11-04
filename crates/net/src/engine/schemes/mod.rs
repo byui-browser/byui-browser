@@ -33,6 +33,10 @@ pub(super) fn require_read_method(
     ) {
         Ok(())
     } else {
+        log::warn!(
+            "rejected {} request to provider-backed scheme: {feature}",
+            request.method()
+        );
         Err(RequestError::UnsupportedFeature(feature))
     }
 }
@@ -44,11 +48,25 @@ async fn await_provider(
     operation: ProviderFuture<'_>,
 ) -> Result<SchemeResource, RequestError> {
     if request.signal().is_aborted() {
+        log::debug!("provider wait skipped: request already aborted");
         return Err(RequestError::Aborted);
     }
     tokio::select! {
         _ = request.signal().cancelled() => Err(RequestError::Aborted),
         result = operation => result,
+    }
+}
+
+impl RequestController {
+    /// Applies cancellation and the shared finalization path to one provider operation.
+    pub(super) async fn finish_provider_request(
+        &self,
+        request: &Request,
+        scheme: FetchScheme,
+        operation: ProviderFuture<'_>,
+    ) -> Result<Response, RequestError> {
+        let resource = await_provider(request, operation).await?;
+        self.finalize_scheme_resource(request, resource, scheme)
     }
 }
 
@@ -61,6 +79,10 @@ impl RequestController {
         scheme: FetchScheme,
         cacheable: bool,
     ) -> Result<Response, RequestError> {
+        log::debug!(
+            "scheme handler chosen: {scheme:?} for {}",
+            crate::log_url::loggable(url.as_str())
+        );
         match scheme {
             FetchScheme::Http | FetchScheme::Https => {
                 self.fetch_http(request, url, cacheable).await

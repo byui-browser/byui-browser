@@ -4,7 +4,7 @@ use super::Request;
 use crate::api::Headers;
 
 /// A request after Fetch policy validation has produced a parsed URL.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct PreparedRequest {
     /// Request metadata and caller-supplied state.
     pub(crate) request: Request,

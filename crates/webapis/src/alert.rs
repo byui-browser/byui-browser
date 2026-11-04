@@ -22,6 +22,7 @@ pub trait AlertSink: Send + Sync {
 /// `undefined`.
 pub fn alert(sink: &dyn AlertSink, arguments: &[Value]) -> JsResult<Value> {
     let message = arguments.first().map_or_else(String::new, Value::to_string);
+    log::debug!("alert bridged to sink ({} bytes)", message.len());
     sink.alert(&message);
     Ok(Value::Undefined)
 }

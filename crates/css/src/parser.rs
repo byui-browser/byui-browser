@@ -13,10 +13,17 @@ pub fn parse_stylesheet(input: &str) -> Stylesheet {
 
 /// Parse CSS and return both the useful AST and diagnostics.
 pub fn parse_stylesheet_with_errors(input: &str) -> (Stylesheet, Vec<ParseError>) {
+    log::debug!("parsing stylesheet: {} bytes", input.len());
     let source = remove_comments(input);
     let mut stylesheet = Stylesheet::default();
     parse_rule_list(&source, &mut stylesheet, None);
     let errors = stylesheet.errors.clone();
+    log::debug!(
+        "parsed stylesheet: {} rules, {} at-rules, {} errors",
+        stylesheet.rules.len(),
+        stylesheet.at_rules.len(),
+        errors.len()
+    );
     (stylesheet, errors)
 }
 
@@ -33,6 +40,10 @@ fn parse_rule_list(source: &str, stylesheet: &mut Stylesheet, base_offset: Optio
         }
 
         let Some((boundary, delimiter)) = find_boundary(&source[cursor..]) else {
+            log::debug!(
+                "unfinished css rule at offset {}",
+                base_offset.unwrap_or(0) + cursor
+            );
             stylesheet.errors.push(ParseError {
                 message: "unfinished CSS rule; expected `;` or `{`".into(),
                 offset: base_offset.unwrap_or(0) + cursor,
@@ -51,6 +62,7 @@ fn parse_rule_list(source: &str, stylesheet: &mut Stylesheet, base_offset: Optio
                 if prelude.starts_with('@') {
                     stylesheet.at_rules.push(parse_at_rule(prelude, None));
                 } else {
+                    log::debug!("dropping style rule without declaration block");
                     stylesheet.errors.push(ParseError {
                         message: "a style rule needs a declaration block".into(),
                         offset: base_offset.unwrap_or(0) + cursor,
@@ -61,6 +73,10 @@ fn parse_rule_list(source: &str, stylesheet: &mut Stylesheet, base_offset: Optio
             '{' => {
                 let block_start = boundary + 1;
                 let Some(block_end) = matching_brace(source, boundary) else {
+                    log::debug!(
+                        "unclosed `{{` in css rule at offset {}",
+                        base_offset.unwrap_or(0) + boundary
+                    );
                     stylesheet.errors.push(ParseError {
                         message: "unclosed `{` in CSS rule".into(),
                         offset: base_offset.unwrap_or(0) + boundary,
@@ -78,6 +94,7 @@ fn parse_rule_list(source: &str, stylesheet: &mut Stylesheet, base_offset: Optio
                         stylesheet,
                         base_offset.unwrap_or(0) + block_start,
                     );
+                    log::trace!("rule `{prelude}` with {} declarations", declarations.len());
                     for selector in split_selectors(prelude) {
                         stylesheet.rules.push(Rule {
                             selector: Selector(selector),
@@ -88,6 +105,10 @@ fn parse_rule_list(source: &str, stylesheet: &mut Stylesheet, base_offset: Optio
                 cursor = block_end + 1;
             }
             '}' => {
+                log::debug!(
+                    "unexpected `}}` at offset {}",
+                    base_offset.unwrap_or(0) + boundary
+                );
                 stylesheet.errors.push(ParseError {
                     message: "unexpected `}`".into(),
                     offset: base_offset.unwrap_or(0) + boundary,
@@ -103,6 +124,7 @@ fn parse_at_rule(prelude: &str, block: Option<&str>) -> AtRule {
     let mut pieces = prelude[1..].splitn(2, char::is_whitespace);
     let name = pieces.next().unwrap_or_default().to_ascii_lowercase();
     let prelude = pieces.next().unwrap_or_default().trim().to_owned();
+    log::trace!("at-rule @{name} (block={})", block.is_some());
     let mut rule = AtRule {
         name,
         prelude,
@@ -208,6 +230,7 @@ pub(crate) fn parse_declarations(
             continue;
         }
         let Some(colon) = top_level_position(statement, ':') else {
+            log::debug!("dropping declaration without `:` at offset {offset}");
             stylesheet.errors.push(ParseError {
                 message: "declaration is missing `:`".into(),
                 offset,
@@ -217,12 +240,14 @@ pub(crate) fn parse_declarations(
         let property = statement[..colon].trim();
         let value = statement[colon + 1..].trim();
         if property.is_empty() || value.is_empty() {
+            log::debug!("dropping declaration with empty property or value at offset {offset}");
             stylesheet.errors.push(ParseError {
                 message: "declaration has an empty property or value".into(),
                 offset,
             });
             continue;
         }
+        log::trace!("declaration `{property}: {value}`");
         declarations.push(Declaration {
             property: property.to_ascii_lowercase(),
             value: value.to_owned(),

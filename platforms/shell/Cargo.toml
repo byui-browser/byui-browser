@@ -8,6 +8,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+log = { workspace = true }
+common = { workspace = true }
 browser = { path = "../../crates/browser" }
 security = { workspace = true }
 net = { workspace = true }
