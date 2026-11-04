@@ -42,7 +42,7 @@ impl ElementsPanel {
             let Some(node) = document.node(id) else {
                 continue;
             };
-            let child_depth = if let html::NodeKind::Element(element) = &node.kind {
+            let child_depth = if let html::NodeKind::Element(element) = node.get_kind() {
                 panel
                     .rows
                     .push((depth, format!("<{}>", element.get_name())));
@@ -55,7 +55,7 @@ impl ElementsPanel {
                 break;
             }
             stack.extend(
-                node.children
+                node.get_children()
                     .iter()
                     .rev()
                     .map(|child| (*child, child_depth)),

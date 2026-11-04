@@ -173,11 +173,8 @@ impl Document {
         })?;
         log::debug!("document.createElement({local_name:?})");
 
-        let element = match document.node(node) {
-            Some(html::Node {
-                kind: NodeKind::Element(element),
-                ..
-            }) => element,
+        let element = match document.node(node).map(|node| node.get_kind()) {
+            Some(NodeKind::Element(element)) => element,
             _ => {
                 log::error!("createElement({local_name:?}) produced a non-element node");
                 return Err(JsError::new("created node is not an element"));
@@ -292,11 +289,11 @@ impl Document {
             let Some(parent_node) = document.node(parent) else {
                 return;
             };
-            for child in &parent_node.children {
+            for child in parent_node.get_children() {
                 let Some(node) = document.node(*child) else {
                     continue;
                 };
-                if let NodeKind::Element(element) = &node.kind {
+                if let NodeKind::Element(element) = node.get_kind() {
                     if selectors.iter().any(|selector| selector.matches(element)) {
                         matches.push(*child);
                     }
@@ -334,12 +331,12 @@ impl Document {
             DomException::NotFoundError
         })?;
 
-        if child_id == root || matches!(child_node.kind, NodeKind::Document) {
+        if child_id == root || matches!(child_node.get_kind(), NodeKind::Document) {
             log::debug!("appendChild failed: cannot append a document node");
             return Err(DomException::HierarchyRequestError);
         }
 
-        match &child_node.kind {
+        match child_node.get_kind() {
             NodeKind::Comment(_) | NodeKind::Element(_) | NodeKind::Doctype { .. } => {}
             NodeKind::Text(_) | NodeKind::Document | NodeKind::None => {
                 log::debug!("appendChild failed: node kind cannot be a document child");
@@ -350,12 +347,12 @@ impl Document {
         let root_node = source
             .node(root)
             .ok_or(DomException::HierarchyRequestError)?;
-        if !matches!(root_node.kind, NodeKind::Document) {
+        if !matches!(root_node.get_kind(), NodeKind::Document) {
             return Err(DomException::HierarchyRequestError);
         }
 
         for sibling in root_node
-            .children
+            .get_children()
             .iter()
             .copied()
             .filter(|sibling| *sibling != child_id)
@@ -363,7 +360,7 @@ impl Document {
             let Some(sibling) = source.node(sibling) else {
                 return Err(DomException::HierarchyRequestError);
             };
-            match (&child_node.kind, &sibling.kind) {
+            match (child_node.get_kind(), sibling.get_kind()) {
                 (NodeKind::Element(_), NodeKind::Element(_))
                 | (NodeKind::Doctype { .. }, NodeKind::Doctype { .. })
                 | (NodeKind::Doctype { .. }, NodeKind::Element(_)) => {
@@ -374,25 +371,29 @@ impl Document {
             }
         }
 
-        if let Some(parent) = child_node.parent {
+        if let Some(parent) = child_node.get_parent() {
             let Some(parent_node) = source.node(parent) else {
                 return Err(DomException::NotFoundError);
             };
-            if !parent_node.children.contains(&child_id) {
+            if !parent_node.get_children().contains(&child_id) {
                 return Err(DomException::NotFoundError);
             }
         }
 
         let document = self.source_document.as_mut().unwrap();
-        if let Some(parent) = document.nodes[child_id.get()].parent {
-            let siblings = &mut document.nodes[parent.get()].children;
+        if let Some(parent) = document.nodes[child_id.get()].get_parent() {
+            let siblings = document.nodes[parent.get()].get_children().to_vec();
             let Some(position) = siblings.iter().position(|sibling| *sibling == child_id) else {
                 return Err(DomException::NotFoundError);
             };
-            siblings.remove(position);
+            let mut updated_siblings = siblings;
+            updated_siblings.remove(position);
+            document.nodes[parent.get()].set_children(updated_siblings);
         }
-        document.nodes[child_id.get()].parent = Some(root);
-        document.nodes[root.get()].children.push(child_id);
+        document.nodes[child_id.get()].set_parent(Some(root));
+        let mut root_children = document.nodes[root.get()].get_children().clone();
+        root_children.push(child_id);
+        document.nodes[root.get()].set_children(root_children);
         self.elements = collect_elements(document);
         log::debug!(
             "appendChild done; document has {} elements",
@@ -409,9 +410,9 @@ fn collect_elements(document: &HTMLDocument) -> Vec<Element> {
             return;
         };
 
-        for child in &node.children {
+        for child in node.get_children() {
             if let Some(node) = document.node(*child) {
-                if let NodeKind::Element(element) = &node.kind {
+                if let NodeKind::Element(element) = node.get_kind() {
                     let id_attr = element
                         .get_attributes()
                         .iter()
@@ -534,8 +535,8 @@ mod tests {
             NodeID::new(1)
         );
         let source = document.source_document.as_ref().unwrap();
-        assert_eq!(source.node(NodeID::new(2)).unwrap().parent, None);
-        assert_eq!(source.node(NodeID::new(3)).unwrap().parent, None);
+        assert_eq!(source.node(NodeID::new(2)).unwrap().get_parent(), None);
+        assert_eq!(source.node(NodeID::new(3)).unwrap().get_parent(), None);
     }
 
     #[test]
@@ -615,7 +616,10 @@ mod tests {
 
         assert_eq!(document.append_child(child), Ok(child));
         let source = document.source_document.as_ref().unwrap();
-        assert_eq!(source.node(source.root).unwrap().children, vec![html_child]);
+        assert_eq!(
+            source.node(source.root).unwrap().get_children(),
+            &vec![html_child]
+        );
         assert_eq!(document.get_element_by_id("appended").unwrap().node, child);
     }
 
@@ -634,12 +638,15 @@ mod tests {
 
         assert_eq!(document.append_child(comment_id), Ok(comment_id));
         let source = document.source_document.as_ref().unwrap();
-        assert_eq!(source.node(element).unwrap().children, Vec::new());
+        assert_eq!(source.node(element).unwrap().get_children(), &Vec::new());
         assert_eq!(
-            source.node(source.root).unwrap().children,
-            vec![element, comment]
+            source.node(source.root).unwrap().get_children(),
+            &vec![element, comment]
         );
-        assert_eq!(source.node(comment).unwrap().parent, Some(source.root));
+        assert_eq!(
+            source.node(comment).unwrap().get_parent(),
+            Some(source.root)
+        );
     }
 
     #[test]
