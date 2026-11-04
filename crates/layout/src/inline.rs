@@ -122,6 +122,7 @@ impl Context<'_> {
         let mut open = Vec::new();
         let mut y = 0.0;
         for range in break_lines(&chunks, available_width) {
+            log::trace!("line break: pieces {}..{}", range.start, range.end);
             if let Some(line) = self.build_line(
                 range,
                 &mut prepared,
@@ -130,6 +131,14 @@ impl Context<'_> {
                 available_width,
                 y,
             ) {
+                log::trace!(
+                    "line {} at y {}: height {}, baseline {}, {} fragments",
+                    lines.len(),
+                    line.rect.y,
+                    line.rect.height,
+                    line.baseline,
+                    line.fragments.len()
+                );
                 y = line.rect.bottom();
                 lines.push(line);
             }

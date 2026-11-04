@@ -41,7 +41,15 @@ pub fn layout_document(
     viewport: Size,
     fonts: &dyn FontMetrics,
 ) -> LayoutTree {
+    log::debug!(
+        "layout pass start: viewport {}x{}",
+        viewport.width,
+        viewport.height
+    );
     let root = root_element(document);
+    if root.is_none() {
+        log::debug!("document has no root element; laying out an empty canvas");
+    }
     let style_map = StyleMap::new(document, styles, root, viewport);
     let icb = build_initial_containing_block(document, &style_map);
     let context = Context { fonts };
@@ -49,7 +57,33 @@ pub fn layout_document(
         root: context.layout_initial_containing_block(&icb, viewport),
     };
     propagate_canvas_background(&mut tree, document, &style_map, root);
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "layout pass finished: {} boxes, content height {}",
+            count_boxes(&tree.root),
+            content_height(&tree.root)
+        );
+    }
     tree
+}
+
+/// Number of boxes in the subtree rooted at `layout_box`.
+fn count_boxes(layout_box: &LayoutBox) -> usize {
+    1 + layout_box.children.iter().map(count_boxes).sum::<usize>()
+}
+
+/// Bottom edge of the lowest box or line in the subtree, relative to the
+/// subtree root's origin.
+fn content_height(layout_box: &LayoutBox) -> f32 {
+    let lines = layout_box
+        .lines
+        .iter()
+        .map(|line| layout_box.rect.y + line.rect.bottom());
+    let children = layout_box
+        .children
+        .iter()
+        .map(|child| layout_box.rect.y + content_height(child));
+    lines.chain(children).fold(layout_box.rect.height, f32::max)
 }
 
 /// Moves the root element's background to the canvas, or for HTML documents
@@ -67,7 +101,7 @@ fn propagate_canvas_background(
     let background = |node: NodeID| styles.get(node).and_then(|style| style.background_color);
     let is_element = |node: NodeID, name: &str| {
         matches!(
-            document.node(node).map(|node| &node.kind),
+            document.node(node).map(|node| node.get_kind()),
             Some(NodeKind::Element(element)) if element.get_name() == name
         )
     };
@@ -77,7 +111,7 @@ fn propagate_canvas_background(
         document
             .node(root)
             .into_iter()
-            .flat_map(|node| node.children.iter().copied())
+            .flat_map(|node| node.get_children().iter().copied())
             .find(|child| is_element(*child, "body"))
             .filter(|body| background(*body).is_some())
     } else {
@@ -86,6 +120,7 @@ fn propagate_canvas_background(
     let Some(source) = source else {
         return;
     };
+    log::trace!("canvas background propagated from node {source:?}");
     tree.root.style.background_color = background(source);
     if let Some(layout_box) = find_box_mut(&mut tree.root, source) {
         layout_box.style.background_color = None;

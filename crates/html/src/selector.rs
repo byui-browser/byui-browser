@@ -35,7 +35,7 @@ impl Query for HTMLDocument {
     fn query(&self, selector: &str) -> Vec<Node> {
         self.nodes
             .iter()
-            .filter(|node| match &node.kind {
+            .filter(|node| match node.get_kind() {
                 NodeKind::Element(element) => matches_selector(element, selector),
                 _ => false,
             })

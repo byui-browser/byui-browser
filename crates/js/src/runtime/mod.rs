@@ -528,6 +528,7 @@ impl GlobalState {
     /// error leaves the globals untouched. Errors thrown while running keep
     /// the effects that happened before them, as in JavaScript.
     pub(crate) fn evaluate(&self, program: &Program, limits: ExecutionLimits) -> JsResult<Value> {
+        log::trace!("evaluating {} top-level statements", program.body.len());
         with_engine_stack(|| {
             self.declare_globals(&program.body)?;
             let completion =
@@ -649,6 +650,7 @@ impl Interpreter {
     /// expression.
     fn guarded<T>(&mut self, action: impl FnOnce(&mut Self) -> JsResult<T>) -> JsResult<T> {
         if self.steps_remaining == 0 {
+            log::warn!("evaluation step limit reached in the tree-walk interpreter");
             return Err(JsError::with_context(
                 crate::JsErrorCategory::Limit,
                 STEP_LIMIT_EXCEEDED,
@@ -657,6 +659,7 @@ impl Interpreter {
         }
         self.steps_remaining -= 1;
         if self.stack.exhausted() {
+            log::warn!("native stack budget exhausted in the tree-walk interpreter");
             return Err(JsError::with_context(
                 crate::JsErrorCategory::Limit,
                 STACK_OVERFLOW,
@@ -668,6 +671,7 @@ impl Interpreter {
 
     fn next_loop_iteration(&mut self) -> JsResult<()> {
         if self.loop_iterations_remaining == 0 {
+            log::warn!("loop iteration limit reached in the tree-walk interpreter");
             return Err(JsError::with_context(
                 crate::JsErrorCategory::Limit,
                 "Script exceeded the loop iteration limit",
@@ -927,10 +931,16 @@ impl Interpreter {
 
     fn call(&mut self, function: &Function, arguments: &[Value]) -> JsResult<Value> {
         match &*function.0 {
-            FunctionKind::Host { function, .. } => function(arguments),
-            FunctionKind::Bytecode { .. } => Err(JsError::runtime(
-                "bytecode functions can only be called by the bytecode VM",
-            )),
+            FunctionKind::Host { function, .. } => {
+                log::trace!("calling host function with {} arguments", arguments.len());
+                function(arguments)
+            }
+            FunctionKind::Bytecode { .. } => {
+                log::debug!("tree-walk interpreter asked to call a bytecode function");
+                Err(JsError::runtime(
+                    "bytecode functions can only be called by the bytecode VM",
+                ))
+            }
             FunctionKind::Script {
                 params,
                 body,
@@ -938,6 +948,10 @@ impl Interpreter {
                 ..
             } => self.guarded(|interpreter| {
                 if interpreter.call_depth >= interpreter.call_depth_limit {
+                    log::warn!(
+                        "call depth limit of {} reached in the tree-walk interpreter",
+                        interpreter.call_depth_limit
+                    );
                     return Err(JsError::with_context(
                         crate::JsErrorCategory::Limit,
                         STACK_OVERFLOW,
@@ -945,6 +959,11 @@ impl Interpreter {
                     ));
                 }
                 interpreter.call_depth += 1;
+                log::trace!(
+                    "calling script function with {} arguments at depth {}",
+                    arguments.len(),
+                    interpreter.call_depth
+                );
                 let scope = child_scope(closure);
                 for (index, param) in params.iter().enumerate() {
                     declare_var(&scope, param)?;
@@ -967,6 +986,7 @@ impl Interpreter {
 
 /// The error for class syntax, which only the bytecode VM can run.
 fn unsupported_here(construct: &str) -> JsError {
+    log::warn!("tree-walk evaluator does not support {construct}");
     JsError::with_context(
         crate::JsErrorCategory::Runtime,
         format!("{construct} is only supported by the bytecode compiler"),

@@ -35,6 +35,19 @@ pub(crate) enum FetchScheme {
 }
 
 impl FetchScheme {
+    /// Returns the canonical scheme name used by provider diagnostics.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+            Self::Data => "data",
+            Self::Blob => "blob",
+            Self::File => "file",
+            Self::Byui => "byui",
+            Self::About => "about",
+        }
+    }
+
     /// Classifies a parsed URL or returns the typed unsupported-scheme error.
     pub(crate) fn from_url(url: &reqwest::Url) -> Result<Self, RequestError> {
         match url.scheme() {
@@ -45,7 +58,10 @@ impl FetchScheme {
             "file" => Ok(Self::File),
             "byui" => Ok(Self::Byui),
             "about" => Ok(Self::About),
-            scheme => Err(RequestError::UnsupportedScheme(scheme.to_owned())),
+            scheme => {
+                log::warn!("unsupported url scheme: {scheme}");
+                Err(RequestError::UnsupportedScheme(scheme.to_owned()))
+            }
         }
     }
 
@@ -111,6 +127,10 @@ impl RequestPolicy {
         if request.context.mode == crate::RequestMode::Navigate && scheme != FetchScheme::File {
             return Err(RequestError::UnsupportedFeature("navigation fetch"));
         }
+        log::trace!(
+            "request validated: {} as {scheme:?}",
+            crate::log_url::loggable(url.as_str())
+        );
         Ok(ValidatedUrl { url, scheme })
     }
 
@@ -124,6 +144,10 @@ impl RequestPolicy {
 
     fn validate_target(&self, request: &Request, url: &reqwest::Url) -> Result<(), RequestError> {
         if !url.username().is_empty() || url.password().is_some() {
+            log::warn!(
+                "url with embedded credentials rejected: {}",
+                url.origin().ascii_serialization()
+            );
             return Err(RequestError::InvalidUrl(url.to_string()));
         }
         if request.context.mode == crate::RequestMode::Cors
@@ -137,6 +161,10 @@ impl RequestPolicy {
                 })
             && request.requires_cors_preflight()
         {
+            log::warn!(
+                "cors preflight is unsupported, blocking request to {}",
+                crate::log_url::loggable(url.as_str())
+            );
             return Err(RequestError::UnsupportedFeature("CORS preflight"));
         }
         Ok(())
@@ -145,6 +173,10 @@ impl RequestPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
+    use futures_util::stream;
+
     use super::*;
 
     #[test]
@@ -161,6 +193,24 @@ mod tests {
                 .validate_request(&Request::get("https://example.test"), 65_536)
                 .is_ok()
         );
+    }
+
+    #[test]
+    /// Verifies streaming request bodies require explicit half-duplex mode.
+    fn streaming_bodies_require_half_duplex_mode() {
+        let mut request = Request::new("https://example.test/upload", "POST").unwrap();
+        request
+            .set_body(Some(crate::Body::stream(stream::empty::<
+                Result<Vec<u8>, io::Error>,
+            >())))
+            .unwrap();
+        assert!(matches!(
+            RequestPolicy.validate_request(&request, 65_536),
+            Err(RequestError::StreamingBodyRequiresDuplex)
+        ));
+
+        request.set_duplex(Some(crate::RequestDuplex::Half));
+        assert!(RequestPolicy.validate_request(&request, 65_536).is_ok());
     }
 
     #[test]
