@@ -382,6 +382,46 @@ impl Function {
         }
     }
 
+    /// Returns an own property of a function, such as a class's `prototype`.
+    ///
+    /// Functions created by the bytecode VM expose own properties. Functions
+    /// created by the tree-walk evaluator or host API currently do not.
+    pub fn get_own_property(&self, key: &str) -> Option<Value> {
+        self.get_own(key)
+    }
+
+    /// Sets an own property on a bytecode function.
+    ///
+    /// Returns `false` for host and tree-walk functions, whose properties are
+    /// not currently modeled.
+    pub fn set_own_property(&self, key: &str, value: Value) -> bool {
+        self.set_own(key, value)
+    }
+
+    /// Returns whether this function was compiled for the bytecode VM.
+    pub fn is_bytecode_function(&self) -> bool {
+        self.template().is_some()
+    }
+
+    /// Constructs an instance by running this bytecode function with `new`.
+    ///
+    /// Returns an error for host and tree-walk functions. A standalone
+    /// construction does not retain the VM's global environment, so a
+    /// constructor that reads global variables may also fail.
+    pub fn construct(&self, arguments: &[Value]) -> JsResult<Value> {
+        crate::Vm::construct_function(self.clone(), arguments)
+    }
+
+    /// Calls this function with an explicit receiver using a fresh bytecode
+    /// VM. Host and tree-walk functions use their existing call mechanism.
+    pub fn call_with_this(&self, receiver: Value, arguments: &[Value]) -> JsResult<Value> {
+        if self.template().is_some() {
+            crate::Vm::call_function(self.clone(), receiver, arguments)
+        } else {
+            self.call(arguments)
+        }
+    }
+
     /// Writes an own property, returning `false` for functions that cannot
     /// hold properties (script and host functions).
     pub(crate) fn set_own(&self, key: &str, value: Value) -> bool {

@@ -271,6 +271,14 @@ impl Realm {
         Ok(())
     }
 
+    /// Returns the original value registered by the host for `name`.
+    ///
+    /// This does not read a script reassignment or declaration; it is intended
+    /// for host bindings that share state across API registration functions.
+    pub fn registered_global_value(&self, name: &str) -> Option<Value> {
+        self.values.get(name).cloned()
+    }
+
     /// Calls a global registered with [`Realm::register_global_function`].
     /// Values registered with [`Realm::register_global_value`] are not
     /// callable through this method, even if they are functions.
