@@ -11,7 +11,7 @@ use crate::api::{
     config::Config,
     error::RequestError,
     request::PreparedRequest,
-    response::{InternalResponse, ResponseType},
+    response::{InternalResponse, has_null_body},
 };
 
 /// Performs HTTP I/O behind the networking policy and scheduling layers.
@@ -41,7 +41,6 @@ pub(crate) fn reqwest_transport(config: Config) -> Result<Arc<dyn Transport>, re
     Ok(Arc::new(ReqwestTransport::new(config)?))
 }
 
-/// HTTP transport implementation that owns one reusable reqwest client.
 /// HTTP transport implementation that owns one reusable reqwest client.
 struct ReqwestTransport {
     client: Client,
@@ -87,6 +86,7 @@ impl Transport for ReqwestTransport {
                 return Err(RequestError::Aborted);
             }
             let signal = request.signal.clone();
+            let context = request.context.clone();
             let mut headers = request_headers.to_reqwest();
             headers.remove(REFERER);
             if let Some(referrer) = request.referrer_value(&url) {
@@ -102,51 +102,46 @@ impl Transport for ReqwestTransport {
                     }
                 }
             }
-            let is_head = request.method == reqwest::Method::HEAD;
-            let mut builder = client.request(request.method, url).headers(headers);
+            let method = request.method.clone();
+            let mut builder = client.request(method.clone(), url).headers(headers);
             if let Some(body) = request.body {
                 builder = builder.body(body.into_reqwest_body()?);
             }
             let response = tokio::select! {
                 _ = signal.cancelled() => return Err(RequestError::Aborted),
                 response = builder.send() => response.map_err(|error| {
-                let message = error.to_string();
-                // reqwest's Display embeds the request URL; keep it out of logs.
-                log::debug!("transport send failed: {}", error.without_url());
-                RequestError::Transport(message)
-            })?,
+                    let message = error.to_string();
+                    // reqwest's Display embeds the request URL; keep it out of logs.
+                    log::debug!("transport send failed: {}", error.without_url());
+                    RequestError::Transport(message)
+                })?,
             };
             let status = response.status();
             log::trace!(
                 "transport headers received: {status}, content-length {:?}",
                 response.content_length()
             );
-            let body_is_null = is_head || matches!(status.as_u16(), 101 | 204 | 205 | 304);
             let headers = response.headers().clone();
             let response_url = response.url().to_string();
-            let content_type = headers.get(http::header::CONTENT_TYPE).cloned();
-            let body = response
-                .bytes_stream()
-                .map(|chunk| chunk.map_err(|error| RequestError::Transport(error.to_string())));
-            let mut body = Body::from_stream_with_signal(body, signal);
-            body.set_content_type(content_type);
+            let mut body = if has_null_body(&method, status) {
+                Body::null()
+            } else {
+                let body = response
+                    .bytes_stream()
+                    .map(|chunk| chunk.map_err(|error| RequestError::Transport(error.to_string())));
+                Body::from_stream_with_signal(body, signal)
+            };
+            body.set_response_metadata(&headers, None);
 
-            Ok(InternalResponse {
+            Ok(InternalResponse::from_http_parts(
                 status,
-                status_text: status.canonical_reason().unwrap_or_default().to_owned(),
                 headers,
-                url_list: vec![response_url],
-                redirect_count: 0,
-                origin: None,
-                request_origin: request.context.environment.origin.clone(),
-                request_mode: request.context.mode,
-                credentials_mode: request.context.credentials,
-                response_type: ResponseType::Basic,
+                response_url,
+                &context,
                 body,
-                body_is_null,
-                from_cache: false,
-                cookie_headers_processed: false,
-            })
+                false,
+                false,
+            ))
         })
     }
 }

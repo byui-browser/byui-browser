@@ -29,7 +29,7 @@ impl RequestController {
             );
             RequestError::MissingProvider("file")
         })?;
-        let resource = super::await_provider(&request, provider.open(&request, &url)).await?;
-        self.finalize_scheme_resource(&request, resource, FetchScheme::File)
+        self.finish_provider_request(&request, FetchScheme::File, provider.open(&request, &url))
+            .await
     }
 }

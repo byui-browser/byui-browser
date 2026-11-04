@@ -103,7 +103,6 @@ mod tests {
             credentials_mode: CredentialsMode::SameOrigin,
             response_type: ResponseType::Basic,
             body: Body::once(Vec::new()),
-            body_is_null: false,
             from_cache: false,
             cookie_headers_processed: false,
         }

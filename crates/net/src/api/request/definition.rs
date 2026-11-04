@@ -16,7 +16,7 @@ use super::{
 use crate::api::headers::is_cors_safelisted_header;
 
 /// A browser request before conversion to a transport request.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Request {
     pub(crate) id: u64,
     pub(crate) url: String,
@@ -33,6 +33,7 @@ pub struct Request {
     pub(crate) integrity: Option<String>,
     pub(crate) keepalive: bool,
     pub(crate) priority: RequestPriority,
+    pub(crate) duplex: Option<RequestDuplex>,
     pub(crate) context: FetchContext,
     pub(crate) signal: AbortSignal,
     pub(crate) url_list: Vec<Url>,
@@ -55,7 +56,74 @@ pub enum RequestPriority {
     High,
 }
 
+/// Fetch request streaming mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestDuplex {
+    /// The response is not exposed until the request body has begun sending.
+    Half,
+}
+
 impl Request {
+    /// Duplicates request metadata and an unused buffered body for an independent send.
+    ///
+    /// Live stream bodies require the original request to be sent instead of
+    /// creating a second request: forking one would impose tee backpressure.
+    pub fn try_clone(&self) -> Result<Self, RequestError> {
+        if self.body.as_ref().is_some_and(Body::is_streaming_source) {
+            return Err(RequestError::BodyNotCloneable);
+        }
+        let mut cloned = self.clone_without_body();
+        cloned.body = self
+            .body
+            .as_ref()
+            .map(Body::try_duplicate_buffered)
+            .transpose()?;
+        Ok(cloned)
+    }
+
+    /// Copies request configuration without transferring or duplicating its body.
+    fn clone_without_body(&self) -> Self {
+        Self {
+            id: self.id,
+            url: self.url.clone(),
+            method: self.method.clone(),
+            headers: self.headers.clone(),
+            body: None,
+            cache_mode: self.cache_mode,
+            redirect_mode: self.redirect_mode,
+            referrer: self.referrer.clone(),
+            referrer_policy: self.referrer_policy,
+            destination: self.destination,
+            service_workers: self.service_workers,
+            initiator: self.initiator,
+            integrity: self.integrity.clone(),
+            keepalive: self.keepalive,
+            priority: self.priority,
+            duplex: self.duplex,
+            context: self.context.clone(),
+            signal: self.signal.clone(),
+            url_list: self.url_list.clone(),
+            current_url: self.current_url.clone(),
+            redirect_count: self.redirect_count,
+            cache_partition: self.cache_partition.clone(),
+        }
+    }
+
+    /// Captures request metadata for cache matching after transport finishes.
+    pub(crate) fn for_cache(&self) -> Self {
+        self.clone_without_body()
+    }
+
+    /// Creates a transport attempt, transferring a streaming body once.
+    pub(crate) fn for_transport(&mut self) -> Result<Self, RequestError> {
+        if self.body.as_ref().is_some_and(Body::is_streaming_source) {
+            let mut attempt = self.clone_without_body();
+            attempt.body = self.body.take();
+            Ok(attempt)
+        } else {
+            self.try_clone()
+        }
+    }
     /// Creates a GET request with Fetch's default request state.
     pub fn get(url: impl Into<String>) -> Self {
         Self {
@@ -74,6 +142,7 @@ impl Request {
             integrity: None,
             keepalive: false,
             priority: RequestPriority::Auto,
+            duplex: None,
             context: FetchContext::default(),
             signal: AbortSignal::new(),
             url_list: Vec::new(),
@@ -250,6 +319,10 @@ impl Request {
     pub fn set_priority(&mut self, priority: RequestPriority) {
         self.priority = priority;
     }
+    /// Selects the request streaming mode required for a streaming body.
+    pub fn set_duplex(&mut self, duplex: Option<RequestDuplex>) {
+        self.duplex = duplex;
+    }
     /// Sets the cancellation signal.
     pub fn set_signal(&mut self, signal: AbortSignal) {
         self.signal = signal;
@@ -387,6 +460,11 @@ impl Request {
     ) -> Result<(), RequestError> {
         if self.body.is_some() && matches!(self.method, Method::GET | Method::HEAD) {
             return Err(RequestError::BodyNotAllowed(self.method.to_string()));
+        }
+        if self.body.as_ref().is_some_and(Body::is_streaming_source)
+            && self.duplex != Some(RequestDuplex::Half)
+        {
+            return Err(RequestError::StreamingBodyRequiresDuplex);
         }
         if self.context.mode == RequestMode::NoCors
             && let Some(body) = &self.body
@@ -537,5 +615,24 @@ mod tests {
             over_limit.validate_body_state(4),
             Err(RequestError::KeepaliveBodyTooLarge { limit: 4 })
         ));
+    }
+
+    #[test]
+    fn streaming_request_can_transfer_once_without_an_implicit_clone() {
+        let mut request = Request::new("https://example.test/", "POST").unwrap();
+        request
+            .set_body(Some(Body::stream(futures_util::stream::iter([Ok::<
+                _,
+                std::io::Error,
+            >(
+                b"payload".to_vec(),
+            )]))))
+            .unwrap();
+        assert!(matches!(
+            request.try_clone(),
+            Err(RequestError::BodyNotCloneable)
+        ));
+        assert!(request.for_transport().unwrap().body.is_some());
+        assert!(request.body.is_none());
     }
 }

@@ -3,7 +3,7 @@
 use futures_util::{StreamExt, stream};
 
 use crate::{
-    api::{body::Body, request::Request, response::InternalResponse},
+    api::{body::Body, error::RequestError, request::Request, response::InternalResponse},
     cache::{ResponseCache, StoredResponse},
 };
 
@@ -20,6 +20,8 @@ struct CacheCapture {
     headers: reqwest::header::HeaderMap,
     url: String,
     cookie_headers_processed: bool,
+    /// Maximum bytes retained for this cache entry.
+    max_body_size: usize,
 }
 
 /// Wraps a response body so completed network responses are copied into cache.
@@ -32,11 +34,13 @@ pub(crate) fn with_cache_capture(
     cache: ResponseCache,
     request: Request,
     request_url: reqwest::Url,
-) -> InternalResponse {
+    max_body_size: usize,
+) -> Result<InternalResponse, RequestError> {
     let status = response.status;
     let headers = response.headers.clone();
     let url = response.url_list.last().cloned().unwrap_or_default();
-    let (body, permit) = response.body.into_parts();
+    let length = response.body.length();
+    let (body, permit) = response.body.try_into_parts()?;
     let capture = CacheCapture {
         cache,
         request,
@@ -45,13 +49,21 @@ pub(crate) fn with_cache_capture(
         headers,
         url,
         cookie_headers_processed: response.cookie_headers_processed,
+        max_body_size,
     };
     let body = stream::unfold(
         (body, Vec::new(), Some(capture)),
         |(mut body, mut collected, capture)| async move {
             match body.next().await {
                 Some(Ok(chunk)) => {
-                    collected.extend_from_slice(&chunk);
+                    let capture = capture.filter(|capture| {
+                        collected.len().saturating_add(chunk.len()) <= capture.max_body_size
+                    });
+                    if capture.is_some() {
+                        collected.extend_from_slice(&chunk);
+                    } else {
+                        collected.clear();
+                    }
                     Some((Ok(chunk), (body, collected, capture)))
                 }
                 Some(Err(error)) => {
@@ -85,10 +97,56 @@ pub(crate) fn with_cache_capture(
         },
     );
     let mut body = Body::from_stream(body);
-    body.set_content_type(response.headers.get(http::header::CONTENT_TYPE).cloned());
+    body.set_response_metadata(&response.headers, length);
     if let Some(permit) = permit {
         body.attach_permit(permit);
     }
     response.body = body;
-    response
+    Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use futures_util::{StreamExt, stream};
+    use reqwest::{
+        StatusCode,
+        header::{CACHE_CONTROL, HeaderMap, HeaderValue},
+    };
+
+    use super::*;
+    use crate::api::request::FetchContext;
+
+    #[test]
+    fn disturbed_source_cannot_become_an_empty_cached_response() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let url = reqwest::Url::parse("https://example.test/resource").unwrap();
+        let request = Request::get(url.as_str());
+        let cache = ResponseCache::default();
+        let mut headers = HeaderMap::new();
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("max-age=60"));
+        let mut body = Body::from_stream(stream::iter([Ok(Bytes::from_static(b"first"))]));
+        let _ = runtime.block_on(body.next());
+        let response = InternalResponse::from_http_parts(
+            StatusCode::OK,
+            headers,
+            url.to_string(),
+            &FetchContext::default(),
+            body,
+            false,
+            false,
+        );
+
+        assert!(matches!(
+            with_cache_capture(
+                response,
+                cache.clone(),
+                request.try_clone().unwrap(),
+                url.clone(),
+                1024
+            ),
+            Err(RequestError::BodyAlreadyConsumed)
+        ));
+        assert!(cache.get(&request, &url).is_none());
+    }
 }

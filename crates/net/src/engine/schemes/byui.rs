@@ -28,7 +28,11 @@ impl RequestController {
             );
             RequestError::MissingProvider("byui page")
         })?;
-        let resource = super::await_provider(&request, provider.resolve(&request, &url)).await?;
-        self.finalize_scheme_resource(&request, resource, FetchScheme::Byui)
+        self.finish_provider_request(
+            &request,
+            FetchScheme::Byui,
+            provider.resolve(&request, &url),
+        )
+        .await
     }
 }
