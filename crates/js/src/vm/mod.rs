@@ -76,6 +76,73 @@ impl Vm {
         Self::default()
     }
 
+    /// Constructs an instance by running a bytecode function with `new`.
+    ///
+    /// The function's captured realm globals are not available to this
+    /// standalone construction path; constructors that read globals may
+    /// therefore fail. This is intended for host APIs that need to invoke a
+    /// constructor without an active script VM.
+    pub fn construct_function(function: Function, arguments: &[Value]) -> JsResult<Value> {
+        let argument_count = u16::try_from(arguments.len())
+            .map_err(|_| JsError::runtime("too many constructor arguments"))?;
+        let mut constants = Vec::with_capacity(arguments.len() + 1);
+        constants.push(Value::Function(function));
+        constants.extend_from_slice(arguments);
+        let mut code = Vec::with_capacity(arguments.len() + 3);
+        code.push(Instruction::Constant(0));
+        for index in 0..arguments.len() {
+            let index = u16::try_from(index + 1)
+                .map_err(|_| JsError::runtime("too many constructor arguments"))?;
+            code.push(Instruction::Constant(index));
+        }
+        code.push(Instruction::New(argument_count));
+        code.push(Instruction::Return);
+        let chunk = Chunk {
+            locations: vec![None; code.len()],
+            code,
+            constants,
+            names: Vec::new(),
+            functions: Vec::new(),
+        };
+        Self::new().execute(&chunk)
+    }
+
+    /// Calls `function` with an explicit receiver and arguments.
+    ///
+    /// Bytecode functions execute in a fresh VM without their original global
+    /// environment. This host entry point supports callbacks that only depend
+    /// on their receiver and arguments.
+    pub fn call_function(
+        function: Function,
+        receiver: Value,
+        arguments: &[Value],
+    ) -> JsResult<Value> {
+        let argument_count = u16::try_from(arguments.len())
+            .map_err(|_| JsError::runtime("too many function arguments"))?;
+        let mut constants = Vec::with_capacity(arguments.len() + 2);
+        constants.push(receiver);
+        constants.push(Value::Function(function));
+        constants.extend_from_slice(arguments);
+        let mut code = Vec::with_capacity(arguments.len() + 4);
+        code.push(Instruction::Constant(0));
+        code.push(Instruction::Constant(1));
+        for index in 0..arguments.len() {
+            let index = u16::try_from(index + 2)
+                .map_err(|_| JsError::runtime("too many function arguments"))?;
+            code.push(Instruction::Constant(index));
+        }
+        code.push(Instruction::CallMethod(argument_count));
+        code.push(Instruction::Return);
+        let chunk = Chunk {
+            locations: vec![None; code.len()],
+            code,
+            constants,
+            names: Vec::new(),
+            functions: Vec::new(),
+        };
+        Self::new().execute(&chunk)
+    }
+
     /// Executes `chunk` and returns its completion value.
     pub fn execute(&mut self, chunk: &Chunk) -> JsResult<Value> {
         self.execute_with_limits(chunk, ExecutionLimits::default())

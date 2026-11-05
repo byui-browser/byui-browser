@@ -25,37 +25,67 @@ pub const CANVAS_COLOR: Color = Color {
 /// Only backgrounds and text are painted; borders, outlines, and other
 /// decorations are not supported yet.
 pub fn paint_document(tree: &LayoutTree) -> DisplayList {
-    log::trace!("building display list");
+    paint(tree, 0.0, false)
+}
+
+/// Paints the part of a layout tree visible when its viewport is scrolled
+/// down by `scroll_y` CSS pixels.
+///
+/// Coordinates in the result are relative to the viewport: content moves up
+/// by `scroll_y`, while the canvas still covers the whole viewport, because
+/// the canvas is infinite. Items that lie entirely above or below the
+/// viewport are left out, so long documents paint only what is on screen.
+/// Clamp `scroll_y` to `0.0..=tree.scroll_height() - viewport height`;
+/// other values paint blank canvas past the content.
+///
+/// Only vertical scrolling is supported. With `scroll_y` of `0.0` this
+/// matches [`paint_document`] minus the culled off-screen items.
+pub fn paint_document_scrolled(tree: &LayoutTree, scroll_y: f32) -> DisplayList {
+    paint(tree, scroll_y, true)
+}
+
+fn paint(tree: &LayoutTree, scroll_y: f32, cull: bool) -> DisplayList {
+    log::trace!("building display list (scroll_y {scroll_y}, cull {cull})");
+    let viewport = tree.root.rect;
+    // Whether a content rect in document coordinates is (partly) on screen.
+    let visible = |rect: &layout::Rect| {
+        !cull || (rect.bottom() - scroll_y > viewport.y && rect.y - scroll_y < viewport.bottom())
+    };
+    let scrolled = |rect: layout::Rect| rect.translate(0.0, -scroll_y);
     let mut items = Vec::new();
     for item in tree.paint_order() {
         match item {
             PaintItem::BoxDecorations(layout_box) => {
-                let color = match (layout_box.kind, layout_box.style.background_color) {
+                let (rect, color) = match (layout_box.kind, layout_box.style.background_color) {
                     (BoxKind::Viewport, background) => {
-                        Some(background.map_or(CANVAS_COLOR, Color::from))
+                        (viewport, Some(background.map_or(CANVAS_COLOR, Color::from)))
                     }
-                    (_, background) => background.map(Color::from),
+                    (_, background) => (
+                        scrolled(layout_box.rect),
+                        background
+                            .filter(|_| visible(&layout_box.rect))
+                            .map(Color::from),
+                    ),
                 };
                 if let Some(color) = color {
-                    items.push(DisplayItem::FillRect {
-                        rect: layout_box.rect,
-                        color,
-                    });
+                    items.push(DisplayItem::FillRect { rect, color });
                 }
             }
             PaintItem::InlineBox(inline) => {
-                if let Some(color) = inline.style.background_color {
+                if let Some(color) = inline.style.background_color
+                    && visible(&inline.rect)
+                {
                     items.push(DisplayItem::FillRect {
-                        rect: inline.rect,
+                        rect: scrolled(inline.rect),
                         color: color.into(),
                     });
                 }
             }
             PaintItem::Text(text) => {
-                if !text.text.trim().is_empty() {
+                if !text.text.trim().is_empty() && visible(&text.rect) {
                     items.push(DisplayItem::Text {
                         x: text.rect.x,
-                        baseline: text.baseline,
+                        baseline: text.baseline - scroll_y,
                         font_size: text.font_size,
                         text: text.text.clone(),
                         color: text.color.into(),
@@ -152,5 +182,59 @@ mod tests {
                 "text World 33.6"
             ]
         );
+    }
+
+    #[test]
+    fn scrolling_moves_content_up_and_keeps_the_canvas_on_screen() {
+        let document = html::parse_raw_html(
+            "<body><div id=\"a\">Top</div><div id=\"b\">Bottom</div></body>".to_owned(),
+        );
+        let styles = css::style_document(
+            &document,
+            &[css::parse_stylesheet(
+                "body { margin: 0 } div { height: 100px; background-color: red }",
+            )],
+        );
+        let tree = layout_document(
+            &document,
+            &styles,
+            Size {
+                width: 160.0,
+                height: 120.0,
+            },
+            &TestFont,
+        );
+
+        let top = paint_document_scrolled(&tree, 0.0);
+        assert_eq!(top.items, paint_document(&tree).items);
+
+        let list = paint_document_scrolled(&tree, 100.0);
+        // The canvas stays at the viewport; only the second div is visible.
+        assert_eq!(
+            list.items[0],
+            DisplayItem::FillRect {
+                rect: tree.root.rect,
+                color: CANVAS_COLOR,
+            }
+        );
+        let fills: Vec<_> = list.items[1..]
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::FillRect { rect, .. } => Some(rect.y),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fills, [0.0]);
+        let texts: Vec<_> = list
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { text, baseline, .. } => Some((text.as_str(), *baseline)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].0, "Bottom");
+        assert!((texts[0].1 - 14.4).abs() < 0.01);
     }
 }
