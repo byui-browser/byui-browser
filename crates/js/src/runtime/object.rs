@@ -202,6 +202,11 @@ impl Object {
         self.set(name, Value::Function(function));
     }
 
+    /// Deletes the own property `key`, if any.
+    pub(crate) fn remove(&self, key: &str) {
+        self.properties().retain(|(name, _)| name != key);
+    }
+
     /// Returns whether the object itself, not its prototype chain, has a
     /// property named `key`.
     pub fn contains_key(&self, key: &str) -> bool {
