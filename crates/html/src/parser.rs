@@ -34,10 +34,7 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
         };
         let close = open + relative_close;
         let tag = raw[open + 1..close].trim();
-        let span = Some(SourceSpan {
-            start: open,
-            end: close + 1,
-        });
+        let span = Some(SourceSpan::new(open, close + 1));
         cursor = close + 1;
 
         // A '<' followed by whitespace is not the start of a tag. Preserve
@@ -167,7 +164,7 @@ fn append_text(document: &mut HTMLDocument, parent: NodeID, text: &str, start: u
         // Decode after tokenizing markup so a decoded `<` remains text and
         // cannot introduce new elements into the tree.
         NodeKind::Text(decode_html_entities(text, false)),
-        Some(SourceSpan { start, end }),
+        Some(SourceSpan::new(start, end)),
     );
     document.append_child(parent, id);
 }
