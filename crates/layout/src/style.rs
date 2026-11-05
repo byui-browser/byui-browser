@@ -1,11 +1,9 @@
 //! Typed computed values for the properties layout consumes.
 //!
 //! [`css::style_document`] produces cascaded, inherited declarations as text.
-//! This module parses the properties layout supports today: `display`,
-//! `margin-*`, `padding-*`, `width`, `height`, `font-size`, `color`, and
-//! `background-color`. Every other property behaves as its initial value; for
-//! example borders are absent, `line-height` is `normal`, and `white-space`
-//! is `normal`. A missing or unparsable value also falls back to the initial
+//! This module parses `display`, box dimensions and edges, text colors, and
+//! the initial flex subset (`flex-direction`, `flex-grow`, and `gap`). Other
+//! properties use their initial values. A missing or unparsable value falls back to the initial
 //! value. Lengths are resolved to CSS pixels here; percentages are kept
 //! because they resolve against the containing block during layout.
 
@@ -25,13 +23,14 @@ pub(crate) enum DisplayOutside {
 /// The inner display type: the formatting context a box establishes for its
 /// children (CSS Display 3 §2.2).
 ///
-/// Only flow layout is implemented. `table`, `flex`, `grid`, and the other
-/// independent layouts are laid out as `flow-root`, which keeps their contents
-/// in a formatting context of their own.
+/// Inner formatting context established by a generated box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DisplayInside {
     Flow,
     FlowRoot,
+    Flex,
+    Grid,
+    Table,
 }
 
 /// The computed `display` value.
@@ -88,12 +87,16 @@ impl Display {
             | "ruby-text"
             | "ruby-base-container"
             | "ruby-text-container" => Some(inline(DisplayInside::Flow)),
-            "inline-block" | "inline-table" | "inline-flex" | "inline-grid" => {
+            "inline-block" | "inline-table" | "inline-grid" => {
                 Some(inline(DisplayInside::FlowRoot))
             }
-            "flow-root" | "table" | "flex" | "grid" | "table-row-group" | "table-header-group"
-            | "table-footer-group" | "table-row" | "table-cell" | "table-column-group"
-            | "table-column" | "table-caption" => Some(block(DisplayInside::FlowRoot)),
+            "inline-flex" => Some(inline(DisplayInside::Flex)),
+            "flex" => Some(block(DisplayInside::Flex)),
+            "grid" => Some(block(DisplayInside::Grid)),
+            "table" => Some(block(DisplayInside::Table)),
+            "flow-root" | "table-row-group" | "table-header-group" | "table-footer-group"
+            | "table-row" | "table-cell" | "table-column-group" | "table-column"
+            | "table-caption" => Some(block(DisplayInside::FlowRoot)),
             _ => None,
         };
         if single.is_some() {
@@ -112,9 +115,10 @@ impl Display {
                 "block" if outside.is_none() => outside = Some(DisplayOutside::Block),
                 "inline" if outside.is_none() => outside = Some(DisplayOutside::Inline),
                 "flow" if inside.is_none() => inside = Some(DisplayInside::Flow),
-                "flow-root" | "table" | "flex" | "grid" if inside.is_none() => {
-                    inside = Some(DisplayInside::FlowRoot);
-                }
+                "flow-root" if inside.is_none() => inside = Some(DisplayInside::FlowRoot),
+                "flex" if inside.is_none() => inside = Some(DisplayInside::Flex),
+                "grid" if inside.is_none() => inside = Some(DisplayInside::Grid),
+                "table" if inside.is_none() => inside = Some(DisplayInside::Table),
                 "list-item" => {}
                 _ => return None,
             }
@@ -178,6 +182,9 @@ pub(crate) struct ComputedStyle {
     pub font_size: f32,
     pub color: CssColor,
     pub background_color: Option<CssColor>,
+    pub flex_column: bool,
+    pub flex_grow: f32,
+    pub gap: f32,
 }
 
 impl ComputedStyle {
@@ -207,6 +214,9 @@ impl ComputedStyle {
                 |parent| parent.color,
             ),
             background_color: None,
+            flex_column: false,
+            flex_grow: 0.0,
+            gap: 0.0,
         }
     }
 
@@ -254,6 +264,12 @@ impl ComputedStyle {
                 log::debug!("ignoring invalid background-color value {value:?}; using transparent");
             }
         }
+        style.flex_column =
+            get("flex-direction").is_some_and(|value| value.eq_ignore_ascii_case("column"));
+        style.flex_grow = get("flex-grow")
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0);
 
         let context = LengthContext {
             font_size: style.font_size,
@@ -300,6 +316,10 @@ impl ComputedStyle {
         style.padding = side("padding", false, false);
         style.width = dimension("width", true, false).unwrap_or(Dimension::Auto);
         style.height = dimension("height", true, false).unwrap_or(Dimension::Auto);
+        style.gap = get("gap")
+            .and_then(|value| parse_length(value).map(|length| length.to_px(&context)))
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0);
         style
     }
 }
@@ -345,6 +365,31 @@ mod tests {
             }
         );
         assert_eq!(style(&[("display", "bogus")]).display, Display::INLINE);
+    }
+
+    #[test]
+    fn display_preserves_independent_layout_modes() {
+        assert!(matches!(
+            style(&[("display", "flex")]).display,
+            Display::Box {
+                inside: DisplayInside::Flex,
+                ..
+            }
+        ));
+        assert!(matches!(
+            style(&[("display", "grid")]).display,
+            Display::Box {
+                inside: DisplayInside::Grid,
+                ..
+            }
+        ));
+        assert!(matches!(
+            style(&[("display", "table")]).display,
+            Display::Box {
+                inside: DisplayInside::Table,
+                ..
+            }
+        ));
     }
 
     #[test]

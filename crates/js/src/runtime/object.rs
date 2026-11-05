@@ -46,6 +46,9 @@ struct ObjectData {
     read_only_properties: Mutex<HashSet<String>>,
     prototype: Mutex<Option<Object>>,
     constructor: Mutex<Option<WeakFunction>>,
+    /// For the object a `catch` clause receives for an engine error: the
+    /// error itself, restored if the object is thrown again unchanged.
+    origin: Mutex<Option<crate::JsError>>,
 }
 
 /// A non-owning reference to an [`Object`], used to break reference cycles.
@@ -70,6 +73,20 @@ impl Object {
         let object = Self::new();
         *object.prototype_slot() = prototype;
         object
+    }
+
+    /// Records the engine error this object was made from.
+    pub(crate) fn set_origin(&self, error: crate::JsError) {
+        *self.0.origin.lock().unwrap_or_else(PoisonError::into_inner) = Some(error);
+    }
+
+    /// Returns the engine error this object was made from, if any.
+    pub(crate) fn origin(&self) -> Option<crate::JsError> {
+        self.0
+            .origin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn properties(&self) -> MutexGuard<'_, Vec<(String, Value)>> {
@@ -200,6 +217,11 @@ impl Object {
         let name = name.into();
         let function = Function::from_host(name.clone(), function);
         self.set(name, Value::Function(function));
+    }
+
+    /// Deletes the own property `key`, if any.
+    pub(crate) fn remove(&self, key: &str) {
+        self.properties().retain(|(name, _)| name != key);
     }
 
     /// Returns whether the object itself, not its prototype chain, has a

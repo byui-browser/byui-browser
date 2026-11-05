@@ -46,6 +46,10 @@ pub struct ResponseInfo {
 /// decisions or typed errors; the engine does not own their durable state.
 pub trait FetchServices: Send + Sync {
     /// Authorizes a request before cache lookup, cookies, or network I/O.
+    ///
+    /// The controller invokes this once for the initial request and again for
+    /// each followed redirect. Use [`Request::active_url`] when making a
+    /// per-hop decision; [`Request::url`] remains the original caller input.
     fn check_request(&self, request: &Request) -> Result<(), RequestError>;
 
     /// Authorizes complete internal response metadata before public exposure.

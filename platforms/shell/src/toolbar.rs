@@ -668,7 +668,7 @@ fn control_rect(control: Control, width: f32, inset: f32) -> Option<Rect> {
     }
 }
 
-fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<Path> {
+pub(crate) fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<Path> {
     if w <= 0.0 || h <= 0.0 {
         return None;
     }

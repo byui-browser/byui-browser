@@ -28,6 +28,17 @@ use crate::toolbar::{self, ChromeState, Control};
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
+/// CSS pixels the page scrolls per arrow-key press.
+const ARROW_SCROLL: f32 = 40.0;
+
+/// CSS pixels the page scrolls per wheel line; one wheel notch is three
+/// lines.
+const WHEEL_LINE_SCROLL: f32 = 20.0;
+
+/// CSS pixels of the previous view kept on screen by Page Up, Page Down, and
+/// Space, so the reader keeps their place.
+const PAGE_SCROLL_OVERLAP: f32 = 40.0;
+
 /// A caret movement in the address field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaretMove {
@@ -87,6 +98,12 @@ struct App {
     cursor: Option<(f64, f64)>,
     /// The rendered page and the device size it was rendered for.
     page: Option<((u32, u32), Pixmap)>,
+    /// Layout of `loaded_page` for the current viewport, kept so scrolling
+    /// repaints without laying the document out again.
+    page_layout: Option<crate::content::PageLayout>,
+    /// How far the page is scrolled down, in CSS pixels; kept within
+    /// `0..=page_layout.max_scroll()`.
+    scroll_y: f32,
     /// Last presented window contents in softbuffer's 0x00RRGGBB format,
     /// kept so chrome-only changes repaint just the toolbar strip.
     frame: Vec<u32>,
@@ -217,6 +234,8 @@ impl App {
             modifiers: ModifiersState::default(),
             loaded_page: None,
             page: None,
+            page_layout: None,
+            scroll_y: 0.0,
             frame: Vec::new(),
             frame_key: None,
             last_toolbar_click: None,
@@ -265,6 +284,8 @@ impl App {
         self.chrome.address_selected = false;
         self.chrome.address_focused = false;
         self.page = None;
+        self.page_layout = None;
+        self.scroll_y = 0.0;
         self.redraw();
     }
 
@@ -343,6 +364,8 @@ impl App {
                 self.scripts_evaluated = false;
                 self.frame_key = None;
                 self.page = None;
+                self.page_layout = None;
+                self.scroll_y = 0.0;
                 self.redraw();
             }
         }
@@ -631,19 +654,62 @@ impl App {
             self.redraw();
             return;
         }
-        match key {
-            Key::Named(NamedKey::Escape) => {
-                self.dismiss_context_menu();
-                self.close_page_source();
+        if self.page_source.is_some() {
+            match key {
+                Key::Named(NamedKey::ArrowDown) => self.scroll_page_source(1),
+                Key::Named(NamedKey::ArrowUp) => self.scroll_page_source(-1),
+                Key::Named(NamedKey::PageDown) => self.scroll_page_source_page(1),
+                Key::Named(NamedKey::PageUp) => self.scroll_page_source_page(-1),
+                Key::Named(NamedKey::Home) => self.scroll_page_source(isize::MIN),
+                Key::Named(NamedKey::End) => self.scroll_page_source(isize::MAX),
+                _ => {}
             }
-            Key::Named(NamedKey::ArrowDown) => self.scroll_page_source(1),
-            Key::Named(NamedKey::ArrowUp) => self.scroll_page_source(-1),
-            Key::Named(NamedKey::PageDown) => self.scroll_page_source_page(1),
-            Key::Named(NamedKey::PageUp) => self.scroll_page_source_page(-1),
-            Key::Named(NamedKey::Home) => self.scroll_page_source(isize::MIN),
-            Key::Named(NamedKey::End) => self.scroll_page_source(isize::MAX),
-            _ => {}
+            return;
         }
+        if self.chrome.address_focused {
+            return;
+        }
+        let page = (self.page_viewport_height() - PAGE_SCROLL_OVERLAP).max(ARROW_SCROLL);
+        let delta = match key {
+            Key::Named(NamedKey::ArrowDown) => ARROW_SCROLL,
+            Key::Named(NamedKey::ArrowUp) => -ARROW_SCROLL,
+            Key::Named(NamedKey::PageDown) => page,
+            Key::Named(NamedKey::PageUp) => -page,
+            Key::Named(NamedKey::Space) if self.modifiers.shift_key() => -page,
+            Key::Named(NamedKey::Space) => page,
+            Key::Named(NamedKey::Home) => f32::NEG_INFINITY,
+            Key::Named(NamedKey::End) => f32::INFINITY,
+            _ => return,
+        };
+        self.scroll_page_by(delta);
+    }
+
+    /// The page viewport's height in CSS pixels, or zero before the first
+    /// layout.
+    fn page_viewport_height(&self) -> f32 {
+        self.page_layout
+            .as_ref()
+            .map_or(0.0, |layout| layout.css_size().1 as f32)
+    }
+
+    /// Scrolls the page down by `delta` CSS pixels (up when negative),
+    /// stopping at the top and bottom of the document, and repaints when
+    /// the position changed.
+    fn scroll_page_by(&mut self, delta: f32) {
+        let max_scroll = self
+            .page_layout
+            .as_ref()
+            .map_or(0.0, crate::content::PageLayout::max_scroll);
+        let target = (self.scroll_y + delta).clamp(0.0, max_scroll);
+        if target == self.scroll_y {
+            return;
+        }
+        log::trace!("page scrolled to {target:.1} of {max_scroll:.1}");
+        self.dismiss_context_menu();
+        self.scroll_y = target;
+        // Only the page pixmap changes; the layout is reused.
+        self.page = None;
+        self.redraw();
     }
 
     fn open_context_menu(&mut self, width: u32, height: u32, scale: f64) {
@@ -788,7 +854,9 @@ impl App {
                 } else {
                     log::error!("refresh unavailable: initialization failed");
                 }
+                // Reload keeps the scroll position, clamped to the new layout.
                 self.page = None;
+                self.page_layout = None;
                 self.scripts_evaluated = false;
                 self.redraw();
             }
@@ -830,21 +898,23 @@ impl App {
             || self.page_source.is_some()
             || self.elements.is_some();
         if self.page.as_ref().map(|(size, _)| *size) != card_size {
-            // Paint this frame before the page script runs. Evaluation joins
-            // the JS engine thread; doing that inside this draw leaves `alert`
-            // unable to finish and the window never appears.
-            let mut scripts_already_ran = true;
+            // Painting never runs the page script: evaluation joins the JS
+            // engine thread, and doing that inside this draw leaves `alert`
+            // unable to finish. `about_to_wait` starts it after this frame.
             self.page = card.and_then(|card| {
-                crate::content::render_page(
-                    self.loaded_page.as_ref().expect("page was loaded"),
-                    card.width,
-                    card.height,
-                    scale,
-                    Arc::clone(&self.alerts) as Arc<dyn AlertSink>,
-                    &self.runtime,
-                    &mut scripts_already_ran,
-                )
-                .map(|page| ((card.width, card.height), page))
+                let css_size = crate::content::css_viewport(card.width, card.height, scale);
+                if self.page_layout.as_ref().map(|layout| layout.css_size()) != Some(css_size) {
+                    self.page_layout = Some(crate::content::PageLayout::new(
+                        self.loaded_page.as_ref().expect("page was loaded"),
+                        css_size.0,
+                        css_size.1,
+                    ));
+                }
+                let layout = self.page_layout.as_ref()?;
+                // A resize or reload can leave less to scroll than before.
+                self.scroll_y = self.scroll_y.clamp(0.0, layout.max_scroll());
+                crate::content::render_page(layout, card.width, card.height, scale, self.scroll_y)
+                    .map(|page| ((card.width, card.height), page))
             });
             full = true;
         }
@@ -999,19 +1069,17 @@ impl App {
     }
 
     /// Returns the page node under a logical-pixel window point, matching the
-    /// geometry `paint` uses to render the page card.
+    /// geometry and scroll position `paint` used to render the page card.
     fn page_node_at(&self, x: f64, y: f64) -> Option<html::NodeID> {
         let window = self.window.as_ref()?;
-        let page = self.loaded_page.as_ref()?;
+        let layout = self.page_layout.as_ref()?;
         let size = window.inner_size();
         let scale = window.scale_factor();
         let card = toolbar::page_rect(size.width, size.height, scale)?;
-        crate::content::hit_test_page(
-            page,
-            (card.width as f64 / scale).ceil() as u32,
-            (card.height as f64 / scale).ceil() as u32,
+        layout.hit_test(
             (x - card.x as f64 / scale) as f32,
             (y - card.y as f64 / scale) as f32,
+            self.scroll_y,
         )
     }
 
@@ -1152,15 +1220,18 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(false) => self.dismiss_context_menu(),
             WindowEvent::MouseWheel { delta, .. } => {
-                let rows = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => -f64::from(y) * 3.0,
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map_or(1.0, |window| window.scale_factor());
+                // Panels scroll by text rows; the page scrolls by CSS pixels.
+                let (rows, page_pixels) = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => {
+                        (-f64::from(y) * 3.0, -y * 3.0 * WHEEL_LINE_SCROLL)
+                    }
                     MouseScrollDelta::PixelDelta(position) => {
                         log::trace!("scroll: {:.1} px", position.y);
-                        let scale = self
-                            .window
-                            .as_ref()
-                            .map_or(1.0, |window| window.scale_factor());
-                        -position.y / (18.0 * scale)
+                        (-position.y / (18.0 * scale), (-position.y / scale) as f32)
                     }
                 };
                 if let (Some(source), Some(window)) = (&mut self.page_source, &self.window) {
@@ -1172,6 +1243,11 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     panel.scroll(rows);
                     self.redraw();
+                } else if self
+                    .cursor
+                    .is_some_and(|(x, y)| self.pointer_is_on_page(x, y))
+                {
+                    self.scroll_page_by(page_pixels);
                 }
             }
             WindowEvent::RedrawRequested => self.paint(),
@@ -1214,17 +1290,22 @@ impl ApplicationHandler<UserEvent> for App {
 /// Opens the browser window described by `platform` and runs it until the
 /// user closes it.
 ///
-/// Reads the logging options (`--log-level`, `-v`, `-q`, `--log-file`; see
-/// [`common::logging::USAGE`]) from the process's command line before
-/// anything else, and prints usage and exits for `-h` / `--help`. Other
-/// arguments are reported as ignored; the shell takes no others yet.
+/// Reads the logging options (`--log-level`, `-v`, `-q`, `--log-file`,
+/// `--no-log-file`; see [`common::logging::USAGE`]) from the process's
+/// command line before anything else, and prints usage and exits for `-h` /
+/// `--help`. Unless told otherwise, the log is also written to
+/// [`browser::default_log_file`]. Other arguments are reported as ignored;
+/// the shell takes no others yet.
 pub fn run(platform: Platform) -> Result<(), EventLoopError> {
-    let command_line = common::logging::init_from_command_line();
+    let default_log = browser::default_log_file().ok();
+    let command_line =
+        common::logging::init_from_command_line_with_default_file(default_log.clone());
     if command_line.help_requested {
         println!(
-            "Usage: {} [options]\n\n{}",
+            "Usage: {} [options]\n\n{}\n\n{}",
             env!("CARGO_PKG_NAME"),
-            common::logging::USAGE
+            common::logging::USAGE,
+            browser::log_file_help(default_log.as_deref())
         );
         return Ok(());
     }
@@ -1251,12 +1332,6 @@ pub fn run(platform: Platform) -> Result<(), EventLoopError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct SilentAlert;
-
-    impl AlertSink for SilentAlert {
-        fn alert(&self, _message: &str) {}
-    }
 
     fn app() -> App {
         App::with_runtime(
@@ -1559,18 +1634,15 @@ mod tests {
         // an empty content area, changed dimensions, and a changed scale.
         // A silent sink stays off the native dialog if the page script calls
         // `alert`.
-        let alert_sink: Arc<dyn AlertSink> = Arc::new(SilentAlert);
         for (width, height, scale) in [(0, 0, 1.0), (160, 120, 1.0), (320, 240, 2.0)] {
             app.ensure_welcome_loaded();
-            let rendered = crate::content::render_page(
+            let layout = crate::content::PageLayout::for_device(
                 app.loaded_page.as_ref().unwrap(),
                 width,
                 height,
                 scale,
-                Arc::clone(&alert_sink),
-                &app.runtime,
-                &mut app.scripts_evaluated,
             );
+            let rendered = crate::content::render_page(&layout, width, height, scale, app.scroll_y);
             assert_eq!(rendered.is_some(), width > 0 && height > 0);
             app.page = rendered.map(|page| ((width, height), page));
             app.scripts_evaluated = true;
@@ -1583,6 +1655,44 @@ mod tests {
         assert_eq!(app.loaded_page, original);
         assert_eq!(app.browser_state.current_url(), Some("byui://welcome"));
         assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);
+    }
+
+    #[test]
+    fn keys_scroll_the_page_within_the_document_and_navigation_resets_it() {
+        let mut app = app();
+        let page = browser::Page {
+            url: String::from("byui://long"),
+            html: "<body><div></div></body>".into(),
+            stylesheets: vec!["body { margin: 0 } div { height: 1000px }".into()],
+            scripts: Vec::new(),
+        };
+        app.page_loaded("byui://long", page.clone());
+        app.page_layout = Some(crate::content::PageLayout::new(&page, 160, 200));
+        let max_scroll = 1000.0 - 200.0;
+
+        app.key_pressed(&Key::Named(NamedKey::ArrowUp));
+        assert_eq!(app.scroll_y, 0.0, "the top is a hard stop");
+        app.key_pressed(&Key::Named(NamedKey::ArrowDown));
+        assert_eq!(app.scroll_y, ARROW_SCROLL);
+        app.key_pressed(&Key::Named(NamedKey::PageDown));
+        assert_eq!(app.scroll_y, ARROW_SCROLL + 200.0 - PAGE_SCROLL_OVERLAP);
+        app.key_pressed(&Key::Named(NamedKey::End));
+        assert_eq!(app.scroll_y, max_scroll);
+        app.key_pressed(&Key::Named(NamedKey::Space));
+        assert_eq!(app.scroll_y, max_scroll, "the bottom is a hard stop");
+        app.key_pressed(&Key::Named(NamedKey::Home));
+        assert_eq!(app.scroll_y, 0.0);
+
+        // Typing in the address field must not scroll the page.
+        app.key_pressed(&Key::Named(NamedKey::End));
+        app.begin_address_edit();
+        app.key_pressed(&Key::Named(NamedKey::Home));
+        assert_eq!(app.scroll_y, max_scroll);
+        app.cancel_address_edit();
+
+        app.page_loaded("byui://long", page);
+        assert_eq!(app.scroll_y, 0.0);
+        assert!(app.page_layout.is_none());
     }
 
     #[test]

@@ -78,7 +78,7 @@ fn arena_nodes_are_connected_with_stable_ids_and_spans() {
     );
     let text = document.push_node(
         NodeKind::Text("Hello".into()),
-        Some(html::SourceSpan { start: 0, end: 5 }),
+        Some(html::SourceSpan::new(0, 5)),
     );
     document.append_child(document.root, paragraph);
     document.append_child(paragraph, text);
@@ -89,7 +89,7 @@ fn arena_nodes_are_connected_with_stable_ids_and_spans() {
     assert_eq!(document.nodes[paragraph.get()].get_children(), &vec![text]);
     assert_eq!(
         document.nodes[text.get()].get_span(),
-        &Some(html::SourceSpan { start: 0, end: 5 })
+        &Some(html::SourceSpan::new(0, 5))
     );
 }
 
