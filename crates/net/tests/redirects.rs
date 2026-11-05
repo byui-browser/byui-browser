@@ -23,11 +23,10 @@ struct RedirectServices {
 
 impl FetchServices for RedirectServices {
     fn check_request(&self, request: &Request) -> Result<(), RequestError> {
-        self.request_urls.lock().unwrap().push(
-            request
-                .current_url()
-                .map_or_else(|| request.url().to_owned(), ToString::to_string),
-        );
+        self.request_urls
+            .lock()
+            .unwrap()
+            .push(request.active_url().to_owned());
         Ok(())
     }
 
@@ -138,6 +137,44 @@ fn manual_mode_returns_an_opaque_redirect() {
     assert_eq!(response.response_type, net::ResponseType::OpaqueRedirect);
     assert_eq!(response.status, 0);
     assert!(response.url.is_empty());
+}
+
+#[test]
+fn manual_mode_hides_a_non_http_redirect_target() {
+    let server = TestServer::start(1, |_| {
+        b"HTTP/1.1 302 Found\r\nLocation: data:text/plain,hidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+    let mut request = Request::get(server.url());
+    request.set_redirect_mode(RedirectMode::Manual);
+
+    let response = runtime().block_on(controller.fetch(request)).unwrap();
+
+    server.join();
+    assert_eq!(response.response_type, ResponseType::OpaqueRedirect);
+    assert_eq!(response.status, 0);
+    assert!(response.url.is_empty());
+}
+
+#[test]
+fn redirect_status_without_location_is_an_ordinary_response() {
+    let server = TestServer::start(1, |_| {
+        b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+
+    let response = runtime()
+        .block_on(controller.fetch(Request::get(server.url())))
+        .unwrap();
+
+    server.join();
+    assert_eq!(response.response_type, ResponseType::Basic);
+    assert_eq!(response.status, 302);
+    assert!(!response.redirected);
 }
 
 #[test]
@@ -409,6 +446,10 @@ fn each_redirect_response_runs_policy_and_cookie_processing() {
         FetchEnvironment::from_url(reqwest::Url::parse(&server.url()).unwrap()).unwrap(),
     );
     request.set_credentials_mode(CredentialsMode::Include);
+    let expected_urls = vec![
+        format!("{}/start", server.url()),
+        format!("{}/next", server.url()),
+    ];
 
     let response = runtime().block_on(controller.fetch(request)).unwrap();
     assert_eq!(runtime().block_on(collect_body(response)).unwrap(), b"ok");
@@ -423,6 +464,7 @@ fn each_redirect_response_runs_policy_and_cookie_processing() {
         vec![vec!["first=one".to_owned()], vec!["second=two".to_owned()]]
     );
     assert_eq!(services.request_urls.lock().unwrap().len(), 2);
+    assert_eq!(*services.request_urls.lock().unwrap(), expected_urls);
     assert_eq!(services.worker_checks.load(Ordering::SeqCst), 1);
 }
 
@@ -451,6 +493,57 @@ fn manual_redirect_runs_common_approval_as_opaque_redirect() {
         *services.responses.lock().unwrap(),
         vec![(302, ResponseType::OpaqueRedirect, 1)]
     );
+}
+
+#[test]
+fn manual_cross_origin_redirect_is_opaque_without_cors_approval() {
+    let server = TestServer::start(1, |_| {
+        b"HTTP/1.1 302 Found\r\nLocation: https://remote.test/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    });
+    let services = Arc::new(RedirectServices::default());
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(services.clone())
+        .build()
+        .unwrap();
+    let mut request = Request::get(server.url());
+    request.set_environment(
+        FetchEnvironment::from_url(reqwest::Url::parse("https://client.test/").unwrap()).unwrap(),
+    );
+    request.set_redirect_mode(RedirectMode::Manual);
+
+    let response = runtime().block_on(controller.fetch(request)).unwrap();
+
+    server.join();
+    assert_eq!(response.response_type, ResponseType::OpaqueRedirect);
+    assert_eq!(
+        *services.responses.lock().unwrap(),
+        vec![(302, ResponseType::OpaqueRedirect, 1)]
+    );
+}
+
+#[test]
+fn error_redirect_does_not_run_response_policy_or_store_cookies() {
+    let server = TestServer::start(1, |_| {
+        b"HTTP/1.1 302 Found\r\nLocation: /next\r\nSet-Cookie: ignored=yes\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    });
+    let services = Arc::new(RedirectServices::default());
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(services.clone())
+        .build()
+        .unwrap();
+    let mut request = Request::get(server.url());
+    request.set_environment(
+        FetchEnvironment::from_url(reqwest::Url::parse(&server.url()).unwrap()).unwrap(),
+    );
+    request.set_credentials_mode(CredentialsMode::Include);
+    request.set_redirect_mode(RedirectMode::Error);
+
+    let error = runtime().block_on(controller.fetch(request)).unwrap_err();
+
+    server.join();
+    assert!(matches!(error, RequestError::RedirectFailure));
+    assert!(services.responses.lock().unwrap().is_empty());
+    assert!(services.stored_cookies.lock().unwrap().is_empty());
 }
 
 #[test]

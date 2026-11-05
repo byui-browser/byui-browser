@@ -131,24 +131,39 @@ impl RequestController {
                 break;
             }
 
-            let location = candidate
-                .headers
-                .get(http::header::LOCATION)
-                .ok_or_else(|| {
-                    log::warn!(
-                        "redirect {status} from {} has no location header",
-                        crate::log_url::loggable(url.as_str())
-                    );
-                    RequestError::RedirectFailure
-                })?
-                .to_str()
-                .map_err(|_| {
-                    log::warn!(
-                        "redirect {status} from {} has a non-text location header",
-                        crate::log_url::loggable(url.as_str())
-                    );
-                    RequestError::RedirectFailure
-                })?;
+            let Some(location) = candidate.headers.get(http::header::LOCATION) else {
+                // A redirect status without Location is an ordinary response;
+                // there is no target for Fetch's redirect algorithm to follow.
+                response = candidate;
+                break;
+            };
+
+            if request.redirect_mode == crate::RedirectMode::Manual {
+                candidate.redirect_count = request.redirect_count + 1;
+                self.finalize_manual_redirect_response(&request, &mut candidate)?;
+                self.process_response_cookies(&request, &url, &mut candidate)?;
+                log::debug!(
+                    "manual redirect {status} returned as opaque from {}",
+                    crate::log_url::loggable(url.as_str())
+                );
+                candidate.body = Body::null();
+                return Ok(candidate.expose());
+            }
+
+            if request.redirect_mode == crate::RedirectMode::Error {
+                log::warn!(
+                    "redirect {status} from {} refused by redirect mode error",
+                    crate::log_url::loggable(url.as_str())
+                );
+                return Err(RequestError::RedirectFailure);
+            }
+            let location = location.to_str().map_err(|_| {
+                log::warn!(
+                    "redirect {status} from {} has a non-text location header",
+                    crate::log_url::loggable(url.as_str())
+                );
+                RequestError::RedirectFailure
+            })?;
             let next_url = url.join(location).map_err(|_| {
                 log::warn!(
                     "redirect {status} from {} has an invalid location",
@@ -168,28 +183,8 @@ impl RequestController {
                     );
                 })?;
 
-            if request.redirect_mode == crate::RedirectMode::Manual {
-                candidate.redirect_count = request.redirect_count + 1;
-                self.finalize_manual_redirect_response(&request, &mut candidate)?;
-                self.process_response_cookies(&request, &url, &mut candidate)?;
-                log::debug!(
-                    "manual redirect {status}: {} -> {}",
-                    crate::log_url::loggable(url.as_str()),
-                    crate::log_url::loggable(next_url.as_str())
-                );
-                candidate.body = Body::null();
-                return Ok(candidate.expose());
-            }
-
             self.finalize_response(&request, &mut candidate)?;
             self.process_response_cookies(&request, &url, &mut candidate)?;
-            if request.redirect_mode == crate::RedirectMode::Error {
-                log::warn!(
-                    "redirect {status} to {} refused by redirect mode error",
-                    crate::log_url::loggable(next_url.as_str())
-                );
-                return Err(RequestError::RedirectFailure);
-            }
             if request.redirect_count >= 20 {
                 log::warn!(
                     "redirect limit reached at {}",

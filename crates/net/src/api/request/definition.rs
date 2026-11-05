@@ -167,6 +167,18 @@ impl Request {
     pub fn url(&self) -> &str {
         &self.url
     }
+    /// Returns the URL currently being processed by the controller.
+    ///
+    /// Before preparation this is the original URL supplied by the caller.
+    /// During a redirect chain it is the URL of the current hop. Browser
+    /// services that make per-hop decisions should use this rather than
+    /// [`Request::url`], which intentionally preserves the original input.
+    pub fn active_url(&self) -> &str {
+        self.current_url
+            .as_ref()
+            .map(Url::as_str)
+            .unwrap_or(&self.url)
+    }
     /// Returns this request's process-local identity.
     ///
     /// The identifier is stable across clones and is intended for

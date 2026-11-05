@@ -27,11 +27,12 @@ impl RequestController {
         request: &Request,
         response: &mut InternalResponse,
     ) -> Result<(), RequestError> {
-        self.finalize_response_with_type(
-            request,
-            response,
-            Some(crate::api::response::ResponseType::OpaqueRedirect),
-        )
+        // A manual redirect is intentionally opaque. It must still reach
+        // browser-owned response policy, but running the CORS exposure check
+        // first would turn a hidden cross-origin redirect into CorsDenied.
+        response.response_type = crate::api::response::ResponseType::OpaqueRedirect;
+        crate::policy::validate_response(request, response)?;
+        self.approve_response(request, response)
     }
 
     /// Runs CORS validation and optionally replaces the public response class.
