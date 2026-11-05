@@ -1290,17 +1290,22 @@ impl ApplicationHandler<UserEvent> for App {
 /// Opens the browser window described by `platform` and runs it until the
 /// user closes it.
 ///
-/// Reads the logging options (`--log-level`, `-v`, `-q`, `--log-file`; see
-/// [`common::logging::USAGE`]) from the process's command line before
-/// anything else, and prints usage and exits for `-h` / `--help`. Other
-/// arguments are reported as ignored; the shell takes no others yet.
+/// Reads the logging options (`--log-level`, `-v`, `-q`, `--log-file`,
+/// `--no-log-file`; see [`common::logging::USAGE`]) from the process's
+/// command line before anything else, and prints usage and exits for `-h` /
+/// `--help`. Unless told otherwise, the log is also written to
+/// [`browser::default_log_file`]. Other arguments are reported as ignored;
+/// the shell takes no others yet.
 pub fn run(platform: Platform) -> Result<(), EventLoopError> {
-    let command_line = common::logging::init_from_command_line();
+    let default_log = browser::default_log_file().ok();
+    let command_line =
+        common::logging::init_from_command_line_with_default_file(default_log.clone());
     if command_line.help_requested {
         println!(
-            "Usage: {} [options]\n\n{}",
+            "Usage: {} [options]\n\n{}\n\n{}",
             env!("CARGO_PKG_NAME"),
-            common::logging::USAGE
+            common::logging::USAGE,
+            browser::log_file_help(default_log.as_deref())
         );
         return Ok(());
     }
