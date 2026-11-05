@@ -442,3 +442,19 @@ fn hit_testing_targets_what_is_painted_on_top() {
     // Body is the root element here; its 8px margin shows only the canvas.
     assert_eq!(tree.hit_test(1.0, 1.0), None);
 }
+
+#[test]
+fn scroll_height_covers_tall_content_and_never_undercuts_the_viewport() {
+    let (_, short) = lay_out("<body><p>short</p></body>", "", 800.0);
+    assert_eq!(short.scroll_height(), 600.0);
+
+    let (document, tall) = lay_out(
+        "<body><div id=\"tall\"></div></body>",
+        "body { margin: 8px } #tall { height: 2000px }",
+        800.0,
+    );
+    let tall_box = box_for(&tall, &document, "tall");
+    assert_eq!(tall_box.rect.bottom(), 2008.0);
+    // The body's bottom margin is part of the scrollable area.
+    assert_eq!(tall.scroll_height(), 2016.0);
+}
