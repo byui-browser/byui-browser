@@ -231,7 +231,10 @@ fn non_cacheable_post_requests_are_sent_each_time() {
         request
             .set_body(Some(Body::from_bytes(b"payload".to_vec())))
             .unwrap();
-        controller.fetch(request.clone()).await.unwrap();
+        controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
         controller.fetch(request).await.unwrap();
     });
 
@@ -310,7 +313,10 @@ fn cached_browser_response_is_rechecked_before_exposure() {
         FetchEnvironment::from_url(reqwest::Url::parse(&server.url()).unwrap()).unwrap(),
     );
     runtime().block_on(async {
-        let response = controller.fetch(request.clone()).await.unwrap();
+        let response = controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
         response.body.bytes().await.unwrap();
     });
     let error = runtime().block_on(controller.fetch(request)).unwrap_err();

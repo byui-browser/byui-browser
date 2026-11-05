@@ -130,6 +130,9 @@ pub enum Expr {
     /// `{ a }` is parsed as `{ a: a }`. Methods, getters, setters, and spread
     /// (`...`) are unsupported.
     Object(Vec<ObjectProperty>),
+    /// Array literal. `None` entries represent elisions and evaluate to
+    /// `undefined` when read by index.
+    Array(Vec<Option<Expr>>),
 }
 
 /// Body of an arrow function.

@@ -26,9 +26,18 @@ impl RequestController {
         url: Url,
     ) -> Result<Response, RequestError> {
         let Some(allowed_url) = allowed_about_url(&url) else {
+            log::debug!(
+                "about URL is not allowlisted: {}",
+                crate::log_url::loggable(url.as_str())
+            );
             return Err(RequestError::UnsupportedFeature("about URL"));
         };
         if !matches!(request.method(), &Method::GET | &Method::HEAD) {
+            log::warn!(
+                "rejected {} request to {}",
+                request.method(),
+                crate::log_url::loggable(url.as_str())
+            );
             return Err(RequestError::UnsupportedFeature("about scheme method"));
         }
 

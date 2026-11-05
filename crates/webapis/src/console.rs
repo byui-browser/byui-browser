@@ -16,9 +16,14 @@ pub trait ConsoleSink: Send + Sync {
 /// coupling Web APIs to process stdout.
 pub fn print(console: &dyn ConsoleSink, arguments: &[Value]) -> JsResult<Value> {
     if !arguments.is_empty() {
+        log::debug!(
+            "print() called with {} arguments; rejected",
+            arguments.len()
+        );
         return Err(JsError::new("print() does not accept arguments"));
     }
 
+    log::debug!("print bridged to console sink");
     console.log("JS API Team Rocks!");
     Ok(Value::Undefined)
 }
