@@ -1,5 +1,6 @@
 use js::{Realm, Value};
-use webapis::{register_window, register_window_with_url};
+use security::{Origin, RendererSecurityContext, StoragePermission};
+use webapis::{register_window, register_window_with_security_context, register_window_with_url};
 
 #[test]
 fn window_self_returns_the_current_window_object() {
@@ -63,6 +64,24 @@ fn window_navigator_accepts_extra_arguments_without_changing_the_result() {
 
     assert_eq!(
         realm.evaluate_script("window.navigator('ignored') === navigator"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_origin_uses_the_renderer_security_context() {
+    let mut realm = Realm::new();
+    register_window_with_security_context(
+        &mut realm,
+        RendererSecurityContext::new(
+            Origin::with_port("https", "example.test", 8443),
+            StoragePermission::Allowed,
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.origin === 'https://example.test:8443'"),
         Ok(Value::Boolean(true))
     );
 }

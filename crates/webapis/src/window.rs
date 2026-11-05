@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::custom_elements::CustomElementRegistry;
 use js::{JsError, JsResult, Object, Realm, Value};
 use net::Url;
+use security::RendererSecurityContext;
 
 #[derive(Clone, Debug)]
 struct HistoryEntry {
@@ -331,6 +332,23 @@ fn register_window_object(realm: &mut Realm, initial_url: &str) -> JsResult<Obje
 /// Registers the script-visible window globals using `about:blank` as its URL.
 pub fn register_window(realm: &mut Realm) -> JsResult<()> {
     register_window_object(realm, "about:blank").map(|_| ())
+}
+
+/// Registers Window globals with the immutable renderer security context's
+/// serialized origin exposed as `window.origin` and the global `origin`.
+///
+/// The origin property follows the current browser API subset and is
+/// replaceable by scripts; the security context itself remains owned by the
+/// renderer and is not exposed for mutation.
+pub fn register_window_with_security_context(
+    realm: &mut Realm,
+    security_context: RendererSecurityContext,
+) -> JsResult<()> {
+    let window = register_window_object(realm, "about:blank")?;
+    let serialized_origin = security_context.origin().ascii_serialization();
+    window.set("origin", Value::String(serialized_origin.clone()));
+    realm.register_global_value("origin", Value::String(serialized_origin))?;
+    Ok(())
 }
 
 /// Registers the script-visible window globals and returns the shared window
