@@ -72,8 +72,8 @@ fn invalid_syntax_fixture_returns_a_syntax_error() {
 }
 
 #[test]
-fn arrays_fixture_will_evaluate_when_arrays_are_supported() {
-    assert!(eval(fixture("arrays.js")).is_ok());
+fn arrays_fixture_evaluates() {
+    assert_eq!(eval(fixture("arrays.js")), Ok(Value::Number(1.0)));
 }
 
 #[test]

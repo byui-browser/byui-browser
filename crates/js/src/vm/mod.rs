@@ -7,7 +7,9 @@
 
 use crate::ast::{BinaryOperator, UnaryOperator};
 use crate::bytecode::{CallableKind, Chunk, FunctionTemplate, Instruction};
-use crate::runtime::{ExecutionLimits, non_object, to_property_key};
+use crate::runtime::{
+    ExecutionLimits, get_array_property, non_object, set_array_property, to_property_key,
+};
 use crate::{Function, JsError, JsErrorCategory, JsResult, Object, Value};
 use std::sync::Arc;
 
@@ -854,9 +856,8 @@ fn property_name(chunk: &Chunk, index: u16) -> JsResult<String> {
 /// value is an error.
 fn load_property(target: &Value, key: &str) -> JsResult<Value> {
     match target {
-        Value::Object(object) | Value::Array(object) => {
-            Ok(object.get(key).unwrap_or(Value::Undefined))
-        }
+        Value::Object(object) => Ok(object.get(key).unwrap_or(Value::Undefined)),
+        Value::Array(array) => Ok(get_array_property(array, key)),
         Value::Function(function) if function.template().is_some() => {
             Ok(function.get_own(key).unwrap_or(Value::Undefined))
         }
@@ -866,7 +867,8 @@ fn load_property(target: &Value, key: &str) -> JsResult<Value> {
 
 fn store_property(target: &Value, key: String, value: &Value) -> JsResult<()> {
     match target {
-        Value::Object(object) | Value::Array(object) => object.set(key, value.clone()),
+        Value::Object(object) => object.set(key, value.clone()),
+        Value::Array(array) => set_array_property(array, &key, value.clone())?,
         Value::Function(function) if function.set_own(&key, value.clone()) => {}
         _ => return Err(non_object(target, "set", &key, "property assignment")),
     }

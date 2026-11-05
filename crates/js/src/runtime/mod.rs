@@ -27,6 +27,7 @@
 //! - Each evaluation has a step budget (see [`DEFAULT_STEP_LIMIT`]), so
 //!   endless loops fail with an error instead of running forever.
 
+mod array;
 mod conversions;
 mod object;
 
@@ -41,6 +42,8 @@ use crate::ast::{
 use crate::bytecode::FunctionTemplate;
 use crate::stack::{StackGuard, with_engine_stack};
 use crate::{HostFunction, JsError, JsResult, Value};
+pub use array::MAX_ARRAY_LENGTH;
+pub(crate) use array::{array_to_string, get_array_property, set_array_property};
 use conversions::{
     is_truthy, less_than, loose_equals, strict_equals, to_int32, to_number, to_primitive, to_uint32,
 };
@@ -875,10 +878,11 @@ impl Interpreter {
             Expr::Member { object, property } => {
                 let target = self.evaluate(object, scope)?;
                 let key = self.property_key(property, scope)?;
-                let (Value::Object(target) | Value::Array(target)) = target else {
-                    return Err(non_object(&target, "read", &key, "property access"));
-                };
-                Ok(target.get(&key).unwrap_or(Value::Undefined))
+                match target {
+                    Value::Object(target) => Ok(target.get(&key).unwrap_or(Value::Undefined)),
+                    Value::Array(target) => Ok(get_array_property(&target, &key)),
+                    target => Err(non_object(&target, "read", &key, "property access")),
+                }
             }
             Expr::MemberAssign {
                 object,
@@ -888,10 +892,11 @@ impl Interpreter {
                 let target = self.evaluate(object, scope)?;
                 let key = self.property_key(property, scope)?;
                 let value = self.evaluate(value, scope)?;
-                let (Value::Object(target) | Value::Array(target)) = target else {
-                    return Err(non_object(&target, "set", &key, "property assignment"));
-                };
-                target.set(key, value.clone());
+                match target {
+                    Value::Object(target) => target.set(key, value.clone()),
+                    Value::Array(target) => set_array_property(&target, &key, value.clone())?,
+                    target => return Err(non_object(&target, "set", &key, "property assignment")),
+                }
                 Ok(value)
             }
             Expr::Object(properties) => {

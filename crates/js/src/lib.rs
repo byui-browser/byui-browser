@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-pub use runtime::{Function, Object};
+pub use runtime::{Function, MAX_ARRAY_LENGTH, Object};
 pub use vm::Vm;
 
 /// A JavaScript value produced by evaluation or passed to host functions.
@@ -62,7 +62,7 @@ impl fmt::Display for Value {
             Self::String(text) => formatter.write_str(text),
             Self::Function(function) => write!(formatter, "{function}"),
             Self::Object(object) => write!(formatter, "{object}"),
-            Self::Array(object) => write!(formatter, "{object}"),
+            Self::Array(array) => formatter.write_str(&runtime::array_to_string(array)),
         }
     }
 }
