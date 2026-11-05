@@ -270,6 +270,35 @@ pub struct Page {
     pub scripts: Vec<String>,
 }
 
+/// Returns the browser's default log file: `logs/browser.log` inside
+/// [`application_data_directory`], e.g.
+/// `~/.local/share/byui-browser/logs/browser.log` on Linux.
+///
+/// The entry points pass this to
+/// `common::logging::init_from_command_line_with_default_file`, which writes
+/// it alongside standard error and keeps the previous run as
+/// `logs/browser.previous.log`. Fails only when the data directory cannot
+/// be determined (for example, no home directory); the folder itself is
+/// created when the log is opened.
+pub fn default_log_file() -> io::Result<PathBuf> {
+    Ok(application_data_directory()?
+        .join("logs")
+        .join("browser.log"))
+}
+
+/// One line for `--help` saying where the default log file goes, given the
+/// result of [`default_log_file`].
+pub fn log_file_help(default_log: Option<&Path>) -> String {
+    match default_log {
+        Some(path) => format!(
+            "Log file: {} (the run before is kept as {})",
+            path.display(),
+            common::logging::previous_log_path(path).display()
+        ),
+        None => "Log file: none (the data directory is unavailable)".to_owned(),
+    }
+}
+
 /// Returns the browser-owned application-data directory for the current OS.
 ///
 /// The renderer and webpage must never provide this path. Tests should inject
@@ -550,6 +579,19 @@ fn attribute<'a>(attributes: &'a [html::Attribute], name: &str) -> Option<&'a st
 mod tests {
     use super::*;
     use security::{Origin, RendererSecurityContext, StoragePermission};
+
+    #[test]
+    fn default_log_file_lives_in_the_data_directory() {
+        // Both resolve from the same environment, so they agree whenever the
+        // data directory is available.
+        if let (Ok(log), Ok(data)) = (default_log_file(), application_data_directory()) {
+            assert_eq!(log, data.join("logs").join("browser.log"));
+        }
+        let help = log_file_help(Some(Path::new("/data/logs/browser.log")));
+        assert!(help.contains("/data/logs/browser.log"), "{help}");
+        assert!(help.contains("browser.previous.log"), "{help}");
+        assert!(log_file_help(None).contains("none"));
+    }
 
     fn storage_context() -> RendererSecurityContext {
         RendererSecurityContext::new(
