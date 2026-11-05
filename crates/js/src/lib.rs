@@ -294,11 +294,11 @@ impl Realm {
         Ok(())
     }
 
-    /// Returns the host value registered under `name`, if it has one.
+    /// Returns the original value registered by the host for `name`.
     ///
-    /// This is intended for host bindings that need to extend a shared global
-    /// object without replacing properties installed by another binding.
-    pub fn global_value(&self, name: &str) -> Option<Value> {
+    /// This does not read a script reassignment or declaration; it is intended
+    /// for host bindings that share state across API registration functions.
+    pub fn registered_global_value(&self, name: &str) -> Option<Value> {
         self.values.get(name).cloned()
     }
 

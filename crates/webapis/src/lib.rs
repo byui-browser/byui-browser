@@ -10,6 +10,7 @@
 
 mod alert;
 mod console;
+mod custom_elements;
 mod document;
 mod dom_exception;
 mod element;
@@ -22,6 +23,7 @@ mod window;
 
 pub use alert::{AlertSink, alert, register_alert};
 pub use console::{ConsoleSink, print, register_print};
+pub use custom_elements::CustomElementRegistry;
 pub use document::{Document, get_element_by_id, register_document};
 pub use dom_exception::DomException;
 pub use element::{Element, get_attribute};
