@@ -68,6 +68,28 @@ fn window_navigator_accepts_extra_arguments_without_changing_the_result() {
 }
 
 #[test]
+fn window_scroll_x_exposes_the_initial_horizontal_offset() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.scrollX === 0 && window.scrollX === window.scrollX"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_scroll_x_is_read_only() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.scrollX = 12; window.scrollX === 0"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
 fn window_history_is_stable_and_starts_at_one_entry() {
     let mut realm = Realm::new();
     register_window(&mut realm).unwrap();

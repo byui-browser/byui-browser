@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::custom_elements::CustomElementRegistry;
 use js::{JsError, JsResult, Object, Realm, Value};
 use net::Url;
 
@@ -121,13 +122,20 @@ fn invoke_popstate(window: &Object, state: &Value) {
 }
 
 fn register_window_object(realm: &mut Realm, initial_url: &str) -> JsResult<Object> {
-    let window = Object::new();
+    let window = match realm.registered_global_value("window") {
+        Some(Value::Object(window)) => window,
+        _ => Object::new(),
+    };
     let self_window = window.clone();
     let navigator = Object::new();
     let navigator_for_window = navigator.clone();
     let history = Object::new();
     let location = Object::new();
     let session = Arc::new(Mutex::new(SessionHistory::new(initial_url)?));
+    let custom_elements = match realm.registered_global_value("customElements") {
+        Some(Value::Object(registry)) => registry,
+        _ => CustomElementRegistry::new().object(),
+    };
 
     window.set_method(
         "self",
@@ -137,6 +145,10 @@ fn register_window_object(realm: &mut Realm, initial_url: &str) -> JsResult<Obje
         "navigator",
         Arc::new(move |_| Ok(Value::Object(navigator_for_window.clone()))),
     );
+    window.set("customElements", Value::Object(custom_elements.clone()));
+    // CSSOM View exposes scrollX as a readonly number. The renderer does not
+    // yet have document horizontal scrolling, so the initial offset is zero.
+    window.set_read_only("scrollX", Value::Number(0.0));
     window.set("onpopstate", Value::Null);
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__popstateListeners", Value::Object(Object::new()));
@@ -311,6 +323,7 @@ fn register_window_object(realm: &mut Realm, initial_url: &str) -> JsResult<Obje
 
     realm.register_global_value("window", Value::Object(window.clone()))?;
     realm.register_global_value("self", Value::Object(window.clone()))?;
+    realm.register_global_value("customElements", Value::Object(custom_elements))?;
     realm.register_global_value("navigator", Value::Object(navigator))?;
     Ok(window)
 }

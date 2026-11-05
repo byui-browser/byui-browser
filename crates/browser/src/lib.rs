@@ -22,7 +22,7 @@ use storage::{
 use webapis::local_storage::register_local_storage;
 use webapis::{
     AlertSink, ConsoleSink, Document, register_alert, register_document_on_window, register_fetch,
-    register_print, register_window_with_url,
+    register_print, register_window, register_window_with_url,
 };
 
 pub mod byui_provider;
@@ -468,6 +468,7 @@ impl BrowserRuntime {
         let document = Document::from_html_document(&html_document);
         let retained = document.clone();
         let mut realm = Realm::new();
+        register_window(&mut realm)?;
         register_print(&mut realm, console)?;
         register_alert(&mut realm, alert_sink)?;
         register_fetch(&mut realm, controller)?;
