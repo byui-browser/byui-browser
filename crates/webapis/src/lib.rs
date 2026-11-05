@@ -22,7 +22,7 @@ mod window;
 
 pub use alert::{AlertSink, alert, register_alert};
 pub use console::{ConsoleSink, print, register_print};
-pub use document::{Document, get_element_by_id, register_document};
+pub use document::{Document, get_element_by_id, register_document, register_document_on_window};
 pub use dom_exception::DomException;
 pub use element::{Element, get_attribute};
 pub use event::{
@@ -32,4 +32,4 @@ pub use event::{
 pub use fetch::{fetch, register_fetch};
 pub use selector::SelectorError;
 pub use timer::{TimerId, TimerQueue};
-pub use window::register_window;
+pub use window::{register_window, register_window_with_url};

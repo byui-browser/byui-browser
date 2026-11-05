@@ -21,8 +21,8 @@ use storage::{
 };
 use webapis::local_storage::register_local_storage;
 use webapis::{
-    AlertSink, ConsoleSink, Document, register_alert, register_document, register_fetch,
-    register_print, register_window,
+    AlertSink, ConsoleSink, Document, register_alert, register_document_on_window, register_fetch,
+    register_print, register_window_with_url,
 };
 
 pub mod byui_provider;
@@ -387,6 +387,7 @@ impl BrowserRuntime {
         self.boot_page(
             html_source,
             None,
+            None,
             console,
             alert_sink,
             controller,
@@ -411,6 +412,7 @@ impl BrowserRuntime {
     ) -> JsResult<PageSession> {
         self.boot_page(
             html_source,
+            None,
             None,
             console,
             alert_sink,
@@ -438,6 +440,7 @@ impl BrowserRuntime {
         self.boot_page(
             &page.html,
             Some(&page.scripts),
+            Some(&page.url),
             console,
             alert_sink,
             controller,
@@ -446,10 +449,15 @@ impl BrowserRuntime {
         .map(|booted| booted.session)
     }
 
+    // Keep the existing boot pipeline explicit: each argument is a distinct
+    // renderer service or trusted document input, and the optional URL is the
+    // only addition needed to seed the document's session history.
+    #[allow(clippy::too_many_arguments)]
     fn boot_page(
         &self,
         html_source: &str,
         scripts: Option<&[String]>,
+        initial_url: Option<&str>,
         console: Arc<dyn ConsoleSink>,
         alert_sink: Arc<dyn AlertSink>,
         controller: Arc<RequestController>,
@@ -463,8 +471,11 @@ impl BrowserRuntime {
         register_print(&mut realm, console)?;
         register_alert(&mut realm, alert_sink)?;
         register_fetch(&mut realm, controller)?;
-        register_window(&mut realm)?;
-        register_document(&mut realm, document)?;
+        let initial_url = initial_url
+            .filter(|url| !url.is_empty())
+            .unwrap_or("about:blank");
+        let window = register_window_with_url(&mut realm, initial_url)?;
+        register_document_on_window(&mut realm, document, window)?;
         register_local_storage(&mut realm, Arc::clone(&self.storage), security_context)?;
 
         // Without caller-supplied sources only inline script text is available.

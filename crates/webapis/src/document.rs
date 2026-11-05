@@ -42,6 +42,19 @@ pub fn get_element_by_id(document: &Document, arguments: &[Value]) -> JsResult<V
 /// the reference; strict-mode assignment errors are not modeled by the
 /// JavaScript engine.
 pub fn register_document(realm: &mut Realm, document: Document) -> JsResult<()> {
+    register_document_on_window(realm, document, Object::new())
+}
+
+/// Registers a document and augments the supplied script-visible window.
+///
+/// The window handle must be the one returned by
+/// [`crate::register_window_with_url`]; using a new object here would discard
+/// window state such as `history` and `location`.
+pub fn register_document_on_window(
+    realm: &mut Realm,
+    document: Document,
+    window_object: Object,
+) -> JsResult<()> {
     log::debug!(
         "registering document bindings ({} elements)",
         document.elements.len()
@@ -96,7 +109,6 @@ pub fn register_document(realm: &mut Realm, document: Document) -> JsResult<()> 
     realm.register_global_function("Event", Arc::new(event_constructor))?;
     realm.register_global_function("AbortController", Arc::new(abort_controller_constructor))?;
     let document_value = Value::Object(document_object);
-    let window_object = Object::new();
     window_object.set_read_only("document", document_value.clone());
     realm.register_global_value("document", document_value)?;
     realm.register_global_value("window", Value::Object(window_object))
