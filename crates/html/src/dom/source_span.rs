@@ -5,19 +5,16 @@ pub struct SourceSpan {
 }
 
 impl SourceSpan {
-    // Constructs SourceSpan, sets immutable start and end.
+    /// Constructs SourceSpan, sets immutable start and end.
     pub fn new(start: usize, end: usize) -> Self {
-        SourceSpan{
-            start,
-            end
-        }
+        SourceSpan { start, end }
     }
 
-    // Gets start byte.
+    /// Gets start byte.
     pub fn get_start(&self) -> usize {
         self.start
     }
-    // Gets end byte.
+    /// Gets end byte.
     pub fn get_end(&self) -> usize {
         self.end
     }
