@@ -32,4 +32,4 @@ pub use event::{
 pub use fetch::{fetch, register_fetch};
 pub use selector::SelectorError;
 pub use timer::{TimerId, TimerQueue};
-pub use window::register_window;
+pub use window::{register_window, register_window_with_security_context};

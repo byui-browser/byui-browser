@@ -44,6 +44,28 @@ impl Origin {
         self.port
     }
 
+    /// Returns the origin serialization exposed to web content.
+    ///
+    /// Opaque origins serialize as `null`. Tuple origins omit the default port
+    /// for HTTP and HTTPS, while non-default ports remain part of the result.
+    pub fn ascii_serialization(&self) -> String {
+        if self.scheme == "opaque" {
+            return "null".to_owned();
+        }
+
+        let default_port = match self.scheme.as_str() {
+            "http" => 80,
+            "https" => 443,
+            _ => 0,
+        };
+        let port = if self.port != 0 && self.port != default_port {
+            format!(":{}", self.port)
+        } else {
+            String::new()
+        };
+        format!("{}://{}{}", self.scheme, self.host, port)
+    }
+
     /// Creates an origin, using the scheme's default port when omitted.
     pub fn new(scheme: impl Into<String>, host: impl Into<String>, port: Option<u16>) -> Self {
         let scheme = scheme.into().to_ascii_lowercase();

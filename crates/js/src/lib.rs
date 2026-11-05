@@ -294,6 +294,14 @@ impl Realm {
         Ok(())
     }
 
+    /// Returns the host value registered under `name`, if it has one.
+    ///
+    /// This is intended for host bindings that need to extend a shared global
+    /// object without replacing properties installed by another binding.
+    pub fn global_value(&self, name: &str) -> Option<Value> {
+        self.values.get(name).cloned()
+    }
+
     /// Calls a global registered with [`Realm::register_global_function`].
     /// Values registered with [`Realm::register_global_value`] are not
     /// callable through this method, even if they are functions.
