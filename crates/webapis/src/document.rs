@@ -232,6 +232,21 @@ pub fn register_document(realm: &mut Realm, document: Document) -> JsResult<()> 
     Ok(())
 }
 
+/// Registers a document on an already-created window.
+///
+/// This compatibility entry point preserves the browser crate's older
+/// registration boundary. `window` must be the same object registered in
+/// `realm`; the current document registration resolves that object from the
+/// realm so the document cannot be attached to a different global.
+pub fn register_document_on_window(
+    realm: &mut Realm,
+    document: Document,
+    window: Object,
+) -> JsResult<()> {
+    let _ = window;
+    register_document(realm, document)
+}
+
 /// Script-visible `document` object.
 #[derive(Debug, Clone)]
 pub struct Document {
