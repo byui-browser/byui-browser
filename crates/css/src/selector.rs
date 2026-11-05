@@ -113,8 +113,13 @@ impl std::error::Error for SelectorParseError {}
 /// matching and semantic validation (such as whether a pseudo-class is known)
 /// are intentionally separate from parsing.
 pub fn parse_selector_list(input: &str) -> Result<SelectorList, SelectorParseError> {
+    log::trace!("parsing selector list `{input}`");
     let without_comments = remove_selector_comments(input);
-    parse_selector_list_mode(&without_comments, false)
+    let result = parse_selector_list_mode(&without_comments, false);
+    if let Err(error) = &result {
+        log::debug!("invalid selector `{input}`: {error}");
+    }
+    result
 }
 
 /// Removes CSS comments without touching comment-like text inside quoted strings.

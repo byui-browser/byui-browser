@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 pub fn user_agent_stylesheet() -> &'static Stylesheet {
     static SHEET: OnceLock<Stylesheet> = OnceLock::new();
     SHEET.get_or_init(|| {
+        log::debug!("parsing bundled user-agent stylesheet");
         let sheet = parse_stylesheet(include_str!("user_agent.css"));
         assert!(sheet.errors.is_empty(), "bundled user-agent CSS must parse");
         sheet

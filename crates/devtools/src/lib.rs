@@ -40,6 +40,11 @@ impl Console {
     /// Records one entry.
     // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
     pub fn log(&mut self, level: Level, message: &str) {
+        log::trace!(
+            "console entry recorded: {level:?}, {} bytes ({} total)",
+            message.len(),
+            self.entries.len() + 1
+        );
         self.entries.push(LogEntry {
             level,
             message: message.to_owned(),

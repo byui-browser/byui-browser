@@ -26,7 +26,7 @@ fn parses_lays_out_paints_and_writes_a_simple_element_image() {
     let element_count = document
         .nodes
         .iter()
-        .filter(|node| matches!(node.kind, html::NodeKind::Element(_)))
+        .filter(|node| matches!(node.get_kind(), html::NodeKind::Element(_)))
         .count();
     assert_eq!(element_count, 1);
 

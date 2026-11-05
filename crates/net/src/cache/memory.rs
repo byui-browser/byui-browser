@@ -47,18 +47,49 @@ impl ResponseCache {
         // Clone the response while the read lock is held, then release the lock
         // before returning so callers never hold cache state during network work.
         let entries = self.entries.read().expect("cache lock poisoned");
-        let cached = entries.get(&key)?;
-        (allow_stale || cached.expires_at > Instant::now()).then(|| cached.as_response())
+        let Some(cached) = entries.get(&key) else {
+            log::trace!(
+                "cache lookup found no entry for {} {}",
+                request.method,
+                crate::log_url::loggable(url.as_str())
+            );
+            return None;
+        };
+        let usable = allow_stale || cached.expires_at > Instant::now();
+        if !usable {
+            log::trace!(
+                "cache entry expired for {} {}",
+                request.method,
+                crate::log_url::loggable(url.as_str())
+            );
+        }
+        usable.then(|| cached.as_response())
     }
 
     /// Stores a successful response when its headers provide a positive TTL.
     pub(crate) fn insert(&self, request: &Request, url: &Url, response: &StoredResponse) {
         if !response.status.is_success() {
+            log::trace!(
+                "cache store skipped for {}: status {} is not successful",
+                crate::log_url::loggable(url.as_str()),
+                response.status
+            );
             return;
         }
         let Some(ttl) = cache_ttl(&response.headers) else {
+            log::trace!(
+                "cache store skipped for {}: no usable max-age",
+                crate::log_url::loggable(url.as_str())
+            );
             return;
         };
+        log::debug!(
+            "cache store: {} {} ({} bytes, ttl {}s)",
+            request.method,
+            crate::log_url::loggable(url.as_str()),
+            response.body.len(),
+            ttl.as_secs()
+        );
         self.entries.write().expect("cache lock poisoned").insert(
             cache_key(request, url),
             CachedResponse::from_response(response, ttl),
@@ -67,7 +98,9 @@ impl ResponseCache {
 
     /// Removes every response currently held by the cache.
     pub(crate) fn clear(&self) {
-        self.entries.write().expect("cache lock poisoned").clear();
+        let mut entries = self.entries.write().expect("cache lock poisoned");
+        log::debug!("cache cleared ({} entries)", entries.len());
+        entries.clear();
     }
 }
 
@@ -208,7 +241,7 @@ mod tests {
     /// Verifies cache keys distinguish request methods.
     fn cache_key_distinguishes_http_methods() {
         let get = Request::get("https://example.test/resource");
-        let mut head = get.clone();
+        let mut head = get.try_clone().unwrap();
         head.method = reqwest::Method::HEAD;
 
         let url = Url::parse(&get.url).unwrap();
@@ -221,7 +254,7 @@ mod tests {
         let url = Url::parse("https://example.test/resource").unwrap();
         let mut first = Request::get(url.as_str());
         first.cache_partition = Some("site-a".into());
-        let mut second = first.clone();
+        let mut second = first.try_clone().unwrap();
         second.cache_partition = Some("site-b".into());
         assert_ne!(cache_key(&first, &url), cache_key(&second, &url));
         assert_ne!(

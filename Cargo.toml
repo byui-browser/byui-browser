@@ -44,6 +44,8 @@ storage = { path = "crates/storage" }
 security = { path = "crates/security" }
 chrome = { path = "crates/chrome" }
 devtools = { path = "crates/devtools" }
+# Logging facade used by every crate; `common::logging` installs the logger.
+log = { version = "0.4", features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

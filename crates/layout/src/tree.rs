@@ -204,6 +204,7 @@ impl LayoutTree {
     pub fn paint_order(&self) -> Vec<PaintItem<'_>> {
         let mut items = Vec::new();
         paint_atomically(&self.root, &mut items);
+        log::trace!("paint order: {} items", items.len());
         items
     }
 
@@ -216,7 +217,8 @@ impl LayoutTree {
     /// are transparent to hit testing. Content overflowing its parent is still
     /// hit, since overflow clipping is not implemented.
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeID> {
-        self.paint_order()
+        let hit = self
+            .paint_order()
             .into_iter()
             .rev()
             .find_map(|item| match item {
@@ -225,7 +227,12 @@ impl LayoutTree {
                 }
                 PaintItem::InlineBox(inline) => inline.rect.contains(x, y).then_some(inline.node),
                 PaintItem::Text(text) => text.element.filter(|_| text.rect.contains(x, y)),
-            })
+            });
+        match hit {
+            Some(node) => log::trace!("hit test at ({x}, {y}): node {node:?}"),
+            None => log::trace!("hit test at ({x}, {y}): canvas (no node)"),
+        }
+        hit
     }
 }
 

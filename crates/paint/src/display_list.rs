@@ -40,7 +40,7 @@ pub struct DisplayList {
 /// without one produce nothing. For documents, use [`crate::paint_document`],
 /// which also orders painting per CSS.
 pub fn build_display_list(boxes: &[PaintBox]) -> DisplayList {
-    DisplayList {
+    let list = DisplayList {
         items: boxes
             .iter()
             .filter_map(|paint_box| {
@@ -50,7 +50,13 @@ pub fn build_display_list(boxes: &[PaintBox]) -> DisplayList {
                 })
             })
             .collect(),
-    }
+    };
+    log::debug!(
+        "display list built from {} paint boxes: {} items",
+        boxes.len(),
+        list.items.len()
+    );
+    list
 }
 
 #[cfg(test)]
