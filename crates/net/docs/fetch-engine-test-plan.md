@@ -1,52 +1,133 @@
 # Net crate test plan
 
-Status: the current request, header, response, cache, redirect, streaming,
-scheduler, and scheme-handler regression suites pass. The remaining work is
-conformance and integration coverage for behavior that is still partial or
-owned by browser services.
+Status as of 2026-11-03: the current body, request, header, response, cache, redirect,
+streaming, scheduler, and scheme-handler regression suites pass. The first
+body API/lifecycle test slice is now covered, including constructor metadata,
+URL-encoded and ArrayBuffer consumption, equality/debug state, one-shot
+transport consumption, failed/aborted streams, and malformed form data. The
+body ownership slice now also covers explicit buffered and live forks,
+bounded tee backpressure, response cloning for buffered, one-shot, null, and
+live bodies, abort propagation to cloned branches, direct-reader/helper-future
+drop cleanup, response/body length metadata, and cloned-stream cache and
+scheduler-permit behavior. The
+current redirect, scheduler, request-context, and unsupported-feature tests
+also cover POST rewriting, sensitive-header stripping, non-replayable 307
+requests, redirect limits, queued-request cancellation, credential/referrer
+decisions, and service-side-effect boundaries. The
+request-policy/transport hardening slice additionally covers forbidden
+methods and headers, no-CORS body rules, keepalive size boundaries, origin
+parsing and opaque-origin comparisons, relative URL resolution, connection
+refusal, same-origin response rejection, and post-header abort cleanup. The
+remaining work is conformance and integration coverage for behavior that is
+still partial or owned by browser services. The last recorded `cargo llvm-cov -p net` baseline
+is from 2026-10-21 (87.74% line coverage, 3,164/3,552 executable lines); it
+must be refreshed when coverage is used to reprioritize this inventory.
+Generated/debug-only formatting paths are included where they exercise public
+behavior or stable error reporting.
+
+## Coverage-derived gap inventory
+
+The following concrete gaps are not optional cleanup; each must be covered by
+the applicable section below or by a focused regression test when the behavior
+is implemented:
+
+- Body construction and lifecycle: remaining direct-reader state transitions,
+  known response length through any uncovered transport/cache paths, and the
+  remaining multipart text/file serialization and malformed-part errors.
+- Body and cancellation errors: cancellation defaults and accessors, every
+  stable `RequestError` display variant, and the remaining transport/body
+  conversion failures. One-shot transport consumption, body forking, stream
+  failure/abort propagation, and the distinction between body-already-used
+  and body-already-consumed are now covered.
+- Request/header API edges: request getters and setters, forbidden methods and
+  headers, remaining no-CORS method/content-type combinations, remaining
+  request getter/setter coverage, header guard immutability/internal removal,
+  default/invalid header parsing, and CORS-safelisted content types/ranges.
+- Origin and response validation: provider-origin mismatch/invalid-origin
+  outcomes, and the response-type decisions for navigation and credentialed
+  requests.
+- HTTP execution: cache-mode branches, missing client-origin/cache
+  revalidation/priority failures, URL joining and invalid joined URLs,
+  remaining pre-send/in-flight abort timing, remaining redirect failure paths,
+  and redirect URL-list accuracy.
+- Transport and scheduling: abort immediately before transport,
+  client initialization failures, and transport body-conversion failures.
+- Data and response boundaries: malformed percent escapes, response policy
+  failures, and controller/debug paths that must remain typed and side-effect
+  free.
 
 ## Remaining test work
 
 ### 1. Body state and response lifecycle
 
-Add focused tests for:
+The initial body API/lifecycle slice is complete. `src/api/body/tests.rs` now
+covers constructor state and length metadata, URL-encoded construction,
+ArrayBuffer reads, equality and debug output, one-shot transport handoff,
+failed and aborted streams, and malformed multipart inputs.
 
-- fallible response cloning and stream teeing once implemented;
-- locked, disturbed, completed, failed, aborted, canceled, and dropped body
-  transitions across direct readers and helper methods;
-- known response length through transport, cache, and provider conversion;
-- body behavior for network-error responses and `CONNECT`; and
+The body ownership slice covers explicit forks for buffered and live sources,
+bounded tee backpressure, independent view status, checked internal transfer,
+response cloning across buffered, one-shot, null, and live bodies, abort
+propagation to cloned branches, direct-reader/helper-future source cleanup,
+and suppression of cache insertion for disturbed or failed cloned sources.
+Add further focused tests for:
+
+- locked, disturbed, completed, canceled, and dropped body transitions across
+  direct readers and helper methods;
+- known response length through any uncovered transport and cache conversion;
+- body behavior for network-error responses; and
 - permit release and cache suppression after every body failure or abort.
 
 ### 2. Scheme-provider and browser composition
 
-Extend the existing `tests/schemes/` coverage with:
+The net crate already covers the generic provider contract and lifecycle paths
+in `tests/schemes/`. Extend that coverage for the currently composed providers,
+and add browser-owned tests, with:
 
-- concrete browser composition through `with_services_and_providers`;
+- browser composition through `browser::request_controller`, including the
+  current `byui:` and authorized `file:` providers;
 - exact-once matching-provider selection and request-context assertions;
 - missing, revoked, denied, malformed, invalid-origin, and I/O outcomes;
 - tuple and opaque provider origins;
 - response metadata, filtering, media types, empty/readable/null bodies;
 - cancellation during resolution and streaming, including provider cleanup;
 - no HTTP transport, cookie/cache, or unrelated-provider side effects; and
-- repeated `blob:`, `file:`, and `byui:` resolution without HTTP-cache reuse.
+- repeated `file:` and `byui:` resolution without HTTP-cache reuse;
+- `data:` decoding, `about:blank`, and unsupported-scheme side-effect checks.
 
-Add browser-owned tests for the embedded `byui:` provider covering route
-aliases, unknown hosts/paths, query and fragment handling, `GET`/`HEAD`
-semantics, repeated loads, body ownership, and origin policy.
+The browser-owned provider tests cover the embedded `byui:` routes and the
+authorized file provider; keep expanding route aliases, unknown hosts/paths,
+query and fragment handling, `GET`/`HEAD` semantics, repeated loads, body
+ownership and length metadata, revocation, limits, and origin policy as those
+integrations evolve. The net scheme suites now also verify provider response
+lengths, stream/null-body length semantics, shared response finalization, and
+provider cleanup after unread or partially read bodies.
+
+Browser blob registry, creation, revocation, and lifetime tests are deferred.
+Keep `net/tests/schemes/blob.rs` as generic provider-contract regression
+coverage, without adding browser composition requirements to this slice.
 
 ### 3. CORS and response filtering
 
 Complete tests for preflight requests, preflight caching, credentialed
-preflight, redirect-time CORS checks, opaque and opaque-redirect behavior, and
-network-error response construction. Retain explicit coverage proving that
+preflight, the remaining request-tainting states, and network-error response
+construction. Redirect-time simple CORS, redirect-tainted origin serialization, and
+opaque-redirect approval are covered. Retain explicit coverage proving that
 forbidden response headers never reach public responses.
 
 ### 4. Redirects and request context
 
-Add conformance cases for per-hop origin/referrer/credentials changes,
-unsupported redirect targets, method/body rewriting, sensitive-header removal,
-non-replayable bodies, URL-list accuracy, and the redirect limit.
+The redirect and request-context slice covers the redirect status/method matrix,
+content-header removal, cross-origin sensitive-header stripping, replayable and
+non-replayable body behavior, the redirect limit, HTTP(S)-only and
+credential-free targets, per-hop browser policy, service-worker bypass, intermediate
+cookie processing, simple CORS checks, redirect-taint serialization, referrer-policy
+updates, redirect-aware cache lookup, and representative credential decisions.
+
+Add conformance cases alongside future preflight, same-site cookie, full-cache,
+mixed-content, and timing integrations. Public final-URL and redirect-count
+behavior is covered; expand internal URL-list assertions if that state becomes
+observable through diagnostics.
 
 ### 5. Credentials, cookies, and cache
 
@@ -58,7 +139,21 @@ Fetch cache modes.
 
 ### 6. Policy, transport, and scheduling
 
-Add tests for integrity, keepalive quotas, service-worker decisions,
+The current tests prove integrity, cache-revalidation, priority, keepalive,
+navigation, and preflight requests fail before browser-service or network
+side effects. They also prove service-worker interception fails before cache,
+cookie, response, or transport work, and that canceling a scheduler-queued
+request releases admission for the next request.
+
+The hardening slice also covers forbidden request methods/headers, no-CORS
+content-type and range safelisting, known keepalive body-size boundaries,
+origin parsing, relative URL resolution, connection refusal, same-origin
+response rejection, and aborting a delivered HTTP response before its body is
+read. Failed, dropped, and aborted HTTP bodies now each have a regression
+proving that their scheduler permit is released and their response is not
+cached; cloned-response failure and abort paths have the same coverage.
+
+Add tests for keepalive quotas, service-worker decisions beyond interception,
 CSP/mixed-content/CORP/MIME policy, offline behavior, timing hooks,
 decompression limits and failures, range requests, explicit
 `Accept-Encoding`, per-origin scheduling, and connection failures.

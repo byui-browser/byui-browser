@@ -35,6 +35,19 @@ pub(crate) enum FetchScheme {
 }
 
 impl FetchScheme {
+    /// Returns the canonical scheme name used by provider diagnostics.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+            Self::Data => "data",
+            Self::Blob => "blob",
+            Self::File => "file",
+            Self::Byui => "byui",
+            Self::About => "about",
+        }
+    }
+
     /// Classifies a parsed URL or returns the typed unsupported-scheme error.
     pub(crate) fn from_url(url: &reqwest::Url) -> Result<Self, RequestError> {
         match url.scheme() {
@@ -45,7 +58,10 @@ impl FetchScheme {
             "file" => Ok(Self::File),
             "byui" => Ok(Self::Byui),
             "about" => Ok(Self::About),
-            scheme => Err(RequestError::UnsupportedScheme(scheme.to_owned())),
+            scheme => {
+                log::warn!("unsupported url scheme: {scheme}");
+                Err(RequestError::UnsupportedScheme(scheme.to_owned()))
+            }
         }
     }
 
@@ -78,9 +94,6 @@ impl RequestPolicy {
         if request.keepalive {
             return Err(RequestError::UnsupportedFeature("keepalive lifetime"));
         }
-        if request.context.mode == crate::RequestMode::Navigate {
-            return Err(RequestError::UnsupportedFeature("navigation fetch"));
-        }
         if request.context.mode == crate::RequestMode::SameOrigin
             && request.context.environment.origin.is_none()
         {
@@ -111,6 +124,13 @@ impl RequestPolicy {
         };
         self.validate_target(request, &url)?;
         let scheme = FetchScheme::from_url(&url)?;
+        if request.context.mode == crate::RequestMode::Navigate && scheme != FetchScheme::File {
+            return Err(RequestError::UnsupportedFeature("navigation fetch"));
+        }
+        log::trace!(
+            "request validated: {} as {scheme:?}",
+            crate::log_url::loggable(url.as_str())
+        );
         Ok(ValidatedUrl { url, scheme })
     }
 
@@ -119,24 +139,64 @@ impl RequestPolicy {
         request: &Request,
         url: &reqwest::Url,
     ) -> Result<(), RequestError> {
+        self.validate_redirect_location(url)?;
         self.validate_target(request, url)
+            .map_err(|error| match error {
+                RequestError::UnsupportedFeature(_) | RequestError::SameOriginViolation => error,
+                _ => RequestError::RedirectFailure,
+            })
+    }
+
+    /// Rejects redirect locations that cannot remain in the HTTP fetch path.
+    pub(crate) fn validate_redirect_location(
+        &self,
+        url: &reqwest::Url,
+    ) -> Result<(), RequestError> {
+        let scheme = FetchScheme::from_url(url).map_err(|_| RequestError::RedirectFailure)?;
+        if !scheme.is_http() {
+            log::warn!("redirect target uses non-HTTP scheme: {}", scheme.name());
+            return Err(RequestError::RedirectFailure);
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            log::warn!(
+                "redirect target contains embedded credentials: {}",
+                url.origin().ascii_serialization()
+            );
+            return Err(RequestError::RedirectFailure);
+        }
+        Ok(())
     }
 
     fn validate_target(&self, request: &Request, url: &reqwest::Url) -> Result<(), RequestError> {
         if !url.username().is_empty() || url.password().is_some() {
+            log::warn!(
+                "url with embedded credentials rejected: {}",
+                url.origin().ascii_serialization()
+            );
             return Err(RequestError::InvalidUrl(url.to_string()));
         }
+        if request.context.mode == crate::RequestMode::SameOrigin
+            && request.effective_origin().is_some_and(|origin| {
+                crate::Origin::from_url(url).is_ok_and(|target| !origin.is_same_origin(&target))
+            })
+            && request.redirect_count > 0
+        {
+            log::warn!(
+                "same-origin redirect target blocked before transport: {}",
+                crate::log_url::loggable(url.as_str())
+            );
+            return Err(RequestError::SameOriginViolation);
+        }
         if request.context.mode == crate::RequestMode::Cors
-            && request
-                .context
-                .environment
-                .origin
-                .as_ref()
-                .is_some_and(|origin| {
-                    crate::Origin::from_url(url).is_ok_and(|target| !origin.is_same_origin(&target))
-                })
+            && request.effective_origin().is_some_and(|origin| {
+                crate::Origin::from_url(url).is_ok_and(|target| !origin.is_same_origin(&target))
+            })
             && request.requires_cors_preflight()
         {
+            log::warn!(
+                "cors preflight is unsupported, blocking request to {}",
+                crate::log_url::loggable(url.as_str())
+            );
             return Err(RequestError::UnsupportedFeature("CORS preflight"));
         }
         Ok(())
@@ -145,6 +205,10 @@ impl RequestPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
+    use futures_util::stream;
+
     use super::*;
 
     #[test]
@@ -161,6 +225,24 @@ mod tests {
                 .validate_request(&Request::get("https://example.test"), 65_536)
                 .is_ok()
         );
+    }
+
+    #[test]
+    /// Verifies streaming request bodies require explicit half-duplex mode.
+    fn streaming_bodies_require_half_duplex_mode() {
+        let mut request = Request::new("https://example.test/upload", "POST").unwrap();
+        request
+            .set_body(Some(crate::Body::stream(stream::empty::<
+                Result<Vec<u8>, io::Error>,
+            >())))
+            .unwrap();
+        assert!(matches!(
+            RequestPolicy.validate_request(&request, 65_536),
+            Err(RequestError::StreamingBodyRequiresDuplex)
+        ));
+
+        request.set_duplex(Some(crate::RequestDuplex::Half));
+        assert!(RequestPolicy.validate_request(&request, 65_536).is_ok());
     }
 
     #[test]
@@ -236,6 +318,24 @@ mod tests {
                 .unwrap();
             assert_eq!(validated.scheme, expected);
         }
+    }
+
+    #[test]
+    fn navigation_mode_is_available_only_to_file_providers() {
+        let policy = RequestPolicy;
+        let mut file = Request::get("file:///tmp/page.html");
+        file.set_mode(crate::RequestMode::Navigate).unwrap();
+        assert_eq!(
+            policy.validate_request(&file, 65_536).unwrap().scheme,
+            FetchScheme::File
+        );
+
+        let mut http = Request::get("https://example.test/page.html");
+        http.set_mode(crate::RequestMode::Navigate).unwrap();
+        assert!(matches!(
+            policy.validate_request(&http, 65_536),
+            Err(RequestError::UnsupportedFeature("navigation fetch"))
+        ));
     }
 
     #[test]

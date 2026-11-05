@@ -19,6 +19,7 @@ members = [
     "platforms/macos",
     "platforms/windows",
     "platforms/linux",
+    "platforms/js",
 ]
 default-members = ["crates/browser"]
 
@@ -43,6 +44,8 @@ storage = { path = "crates/storage" }
 security = { path = "crates/security" }
 chrome = { path = "crates/chrome" }
 devtools = { path = "crates/devtools" }
+# Logging facade used by every crate; `common::logging` installs the logger.
+log = { version = "0.4", features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
@@ -51,6 +54,10 @@ unsafe_code = "warn"
 # code optimized in dev builds; unoptimized software rasterizing makes window
 # drags and hover feedback lag.
 [profile.dev.package.browser-shell]
+opt-level = 3
+
+# The page is rasterized again on every scroll step.
+[profile.dev.package.render]
 opt-level = 3
 
 [profile.dev.package.tiny-skia]

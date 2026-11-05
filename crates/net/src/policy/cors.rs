@@ -21,7 +21,7 @@ impl CorsChecker {
         response: &InternalResponse,
     ) -> Result<ResponseType, RequestError> {
         let final_url = response.url_list.last().ok_or(RequestError::NetworkError)?;
-        let origin = request.context.environment.origin.as_ref();
+        let origin = request.effective_origin();
         let same_origin = origin.is_some_and(|origin| {
             response
                 .origin
@@ -36,15 +36,27 @@ impl CorsChecker {
             return Ok(ResponseType::Basic);
         }
         match request.context.mode {
-            RequestMode::SameOrigin => Err(RequestError::SameOriginViolation),
-            RequestMode::NoCors => Ok(ResponseType::Opaque),
+            RequestMode::SameOrigin => {
+                log::warn!(
+                    "same-origin request blocked from reaching {}",
+                    crate::log_url::loggable(final_url.as_str())
+                );
+                Err(RequestError::SameOriginViolation)
+            }
+            RequestMode::NoCors => {
+                log::trace!(
+                    "cross-origin no-cors response is opaque: {}",
+                    crate::log_url::loggable(final_url.as_str())
+                );
+                Ok(ResponseType::Opaque)
+            }
             RequestMode::Navigate => Ok(ResponseType::Basic),
             RequestMode::Cors => {
                 let allowed_origin = response
                     .headers
                     .get("access-control-allow-origin")
                     .and_then(|value| value.to_str().ok());
-                let serialized = origin.map(Origin::as_str).unwrap_or_default();
+                let serialized = request.serialized_origin().unwrap_or_default();
                 let allowed = allowed_origin == Some(serialized.as_str())
                     || (allowed_origin == Some("*")
                         && request.context.credentials != CredentialsMode::Include);
@@ -53,9 +65,18 @@ impl CorsChecker {
                         .headers
                         .get("access-control-allow-credentials")
                         .is_some_and(|value| value.as_bytes() == b"true");
+                log::trace!(
+                    "cors check for {}: allow-origin={allowed_origin:?} \
+                     allowed={allowed} credentials_ok={credentials_ok}",
+                    crate::log_url::loggable(final_url.as_str())
+                );
                 if allowed && credentials_ok {
                     Ok(ResponseType::Cors)
                 } else {
+                    log::warn!(
+                        "cors check denied response from {}",
+                        crate::log_url::loggable(final_url.as_str())
+                    );
                     Err(RequestError::CorsDenied)
                 }
             }
@@ -82,7 +103,6 @@ mod tests {
             credentials_mode: CredentialsMode::SameOrigin,
             response_type: ResponseType::Basic,
             body: Body::once(Vec::new()),
-            body_is_null: false,
             from_cache: false,
             cookie_headers_processed: false,
         }

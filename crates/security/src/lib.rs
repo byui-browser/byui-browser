@@ -7,9 +7,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod file_access;
 pub mod permissions;
 
 use std::fmt;
+
+/// Formats an origin as `scheme://host:port` for log messages.
+fn origin_label(origin: &Origin) -> String {
+    format!("{}://{}:{}", origin.scheme(), origin.host(), origin.port())
+}
 
 /// A web origin: scheme, host, port. Two documents may touch each other's
 /// state only when their origins are equal.
@@ -36,6 +42,28 @@ impl Origin {
     /// Returns the effective port.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Returns the origin serialization exposed to web content.
+    ///
+    /// Opaque origins serialize as `null`. Tuple origins omit the default port
+    /// for HTTP and HTTPS, while non-default ports remain part of the result.
+    pub fn ascii_serialization(&self) -> String {
+        if self.scheme == "opaque" {
+            return "null".to_owned();
+        }
+
+        let default_port = match self.scheme.as_str() {
+            "http" => 80,
+            "https" => 443,
+            _ => 0,
+        };
+        let port = if self.port != 0 && self.port != default_port {
+            format!(":{}", self.port)
+        } else {
+            String::new()
+        };
+        format!("{}://{}{}", self.scheme, self.host, port)
     }
 
     /// Creates an origin, using the scheme's default port when omitted.
@@ -71,6 +99,7 @@ impl Origin {
     // Networking team provides scheme, host, and port extraction.
     pub fn parse(url: &str) -> Result<Self, SecurityError> {
         if url.is_empty() {
+            log::debug!("rejected empty url while parsing origin");
             return Err(SecurityError::InvalidOrigin(String::new()));
         }
         todo!("TODO(security): extract origin from: {url:?}")
@@ -138,6 +167,11 @@ impl RendererSecurityContext {
     ///
     /// The storage key is derived from the same origin stored by this context.
     pub fn new(origin: Origin, storage_permission: StoragePermission) -> Self {
+        log::debug!(
+            "security context created for {} (storage {:?})",
+            origin_label(&origin),
+            storage_permission
+        );
         Self {
             storage_key: StorageKey::new(origin.clone()),
             origin,
@@ -172,49 +206,81 @@ pub fn same_origin(a: &Origin, b: &Origin) -> bool {
     a == b
 }
 
-/// A cookie as stored in the jar.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+/// A cookie stored in a [`CookieJar`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cookie {
+    /// The cookie name.
     pub name: String,
+    /// The value sent with the cookie name.
     pub value: String,
+    /// The host for which the cookie is visible.
+    ///
+    /// The current implementation compares this value literally with the
+    /// requesting origin's host. It does not yet implement subdomain,
+    /// leading-dot, or other full cookie-domain matching rules.
     pub domain: String,
+    /// Whether the cookie may be returned only for HTTPS origins.
     pub secure: bool,
 }
 
-/// Cookie storage with per-origin visibility rules. A Canvas session is a
-/// cookie, so this is on the critical path to the course goal.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+/// In-memory cookie storage with basic host and secure-transport filtering.
+///
+/// Cookies are replaced when a new cookie has the same name and domain. The
+/// jar does not yet persist cookies or implement expiration, paths, or the
+/// complete browser cookie-domain model.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CookieJar {
     cookies: Vec<Cookie>,
 }
 
 impl CookieJar {
-    /// An empty jar.
+    /// Creates an empty, in-memory cookie jar.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Stores a cookie received from `origin`, applying domain/secure rules.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
-    pub fn store(&mut self, origin: &Origin, cookie: Cookie) {
-        todo!("TODO(security): store {} for {}", cookie.name, origin.host)
+    /// Stores `cookie`, replacing an existing cookie with the same name and domain.
+    ///
+    /// The `origin` argument is reserved for future validation. It is not
+    /// currently used when storing a cookie; callers are responsible for
+    /// providing a cookie with the intended domain and secure attributes.
+    pub fn store(&mut self, _origin: &Origin, cookie: Cookie) {
+        log::debug!(
+            "storing cookie {:?} for domain {} (secure: {})",
+            cookie.name,
+            cookie.domain,
+            cookie.secure
+        );
+        self.cookies
+            .retain(|existing| existing.name != cookie.name || existing.domain != cookie.domain);
+
+        self.cookies.push(cookie);
     }
 
-    /// Cookies that may be sent to `origin`.
+    /// Returns cookies that may be sent to `origin`.
     ///
-    /// Currently only handles the empty jar.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+    /// A cookie is returned when its domain exactly matches the origin host.
+    /// Secure cookies are returned only for HTTPS origins. The returned
+    /// references point into the jar and are ordered by insertion order.
     pub fn cookies_for(&self, origin: &Origin) -> Vec<&Cookie> {
-        if self.cookies.is_empty() {
-            return Vec::new();
+        let mut matching_cookies = Vec::new();
+
+        for cookie in &self.cookies {
+            let domain_matches = cookie.domain == origin.host();
+            let secure_connection = origin.scheme() == "https";
+
+            if domain_matches && (!cookie.secure || secure_connection) {
+                matching_cookies.push(cookie);
+            }
         }
-        todo!(
-            "TODO(security): filter {} cookies for {}",
+
+        log::debug!(
+            "{} of {} cookies match {}",
+            matching_cookies.len(),
             self.cookies.len(),
-            origin.host
-        )
+            origin_label(origin)
+        );
+        matching_cookies
     }
 }
 
@@ -371,5 +437,99 @@ mod tests {
             jar.cookies_for(&origin("https", "byui.edu", 443))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn stores_and_returns_cookie_for_matching_origin() {
+        let site = origin("https", "byui.edu", 443);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "abc123".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        let cookies = jar.cookies_for(&site);
+
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].name, "session");
+        assert_eq!(cookies[0].value, "abc123");
+    }
+
+    #[test]
+    fn does_not_return_cookie_for_different_origin() {
+        let site = origin("https", "byui.edu", 443);
+        let other_site = origin("https", "example.com", 443);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "abc123".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        let cookies = jar.cookies_for(&other_site);
+
+        assert!(cookies.is_empty());
+    }
+
+    #[test]
+    fn secure_cookie_is_only_returned_for_https() {
+        let https_site = origin("https", "byui.edu", 443);
+        let http_site = origin("http", "byui.edu", 80);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &https_site,
+            Cookie {
+                name: "session".into(),
+                value: "abc123".into(),
+                domain: "byui.edu".into(),
+                secure: true,
+            },
+        );
+
+        assert_eq!(jar.cookies_for(&https_site).len(), 1);
+        assert!(jar.cookies_for(&http_site).is_empty());
+    }
+
+    #[test]
+    fn newer_cookie_replaces_old_cookie() {
+        let site = origin("https", "byui.edu", 443);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "old-value".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "new-value".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        let cookies = jar.cookies_for(&site);
+
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].value, "new-value");
     }
 }

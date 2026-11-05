@@ -54,8 +54,14 @@ type ParseResult<T> = Result<T, ParseError>;
 /// Simple statements accept an explicit `;`, or an automatic semicolon at a
 /// line terminator, before `}`, or at end of input. A line terminator directly
 /// after `return` produces an empty return. Empty statements, comma
-/// declarations, and trailing commas are unsupported.
-/// Returns outside functions, constants without initializers, duplicate
+/// declarations, and trailing commas in calls are unsupported; object
+/// literals allow a trailing comma. A `{` at the start of a statement opens a
+/// block, as in JavaScript, so wrap an object literal statement in
+/// parentheses: `({ a: 1 })`.
+/// `throw` must have its operand on the same line. `try` needs a `catch`
+/// clause (with an optional identifier binding) or a `finally` block.
+/// `break` and `continue` must sit in a `while` loop of the same function and
+/// take no label. Returns outside functions, constants without initializers, duplicate
 /// parameter names, and `let`/`const`/`function` declarations used directly as
 /// an `if`, `else`, or `while` body are rejected.
 ///
@@ -114,6 +120,12 @@ struct Parser<'tokens> {
     position: usize,
     depth: usize,
     function_depth: usize,
+    /// For each `while` loop being parsed, the `function_depth` it sits at.
+    /// `break` and `continue` are valid only when the innermost loop belongs
+    /// to the function being parsed.
+    loops: Vec<usize>,
+    /// Nonzero while parsing a class method body, where `super` is valid.
+    method_depth: usize,
     line_terminators_before: &'tokens [bool],
 }
 
@@ -124,12 +136,18 @@ impl<'tokens> Parser<'tokens> {
             position: 0,
             depth: 0,
             function_depth: 0,
+            loops: Vec::new(),
+            method_depth: 0,
             line_terminators_before,
         }
     }
 
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.position)
+    }
+
+    fn peek_at(&self, offset: usize) -> Option<&Token> {
+        self.tokens.get(self.position + offset)
     }
 
     fn advance(&mut self) -> Option<&Token> {
@@ -184,6 +202,7 @@ impl<'tokens> Parser<'tokens> {
         parse: impl FnOnce(&mut Self) -> ParseResult<T>,
     ) -> ParseResult<T> {
         if self.depth >= MAX_NESTING {
+            log::warn!("parser nesting limit of {MAX_NESTING} reached in {context}");
             return Err(self.error(NESTING_ERROR, context));
         }
         self.depth += 1;
@@ -210,6 +229,7 @@ impl<'tokens> Parser<'tokens> {
     /// Validates the depth of a node about to be built from its children.
     fn node_depth(&self, depth: usize, context: &'static str) -> ParseResult<usize> {
         if depth > MAX_EXPRESSION_DEPTH {
+            log::warn!("expression depth limit of {MAX_EXPRESSION_DEPTH} reached in {context}");
             Err(self.error(NESTING_ERROR, context))
         } else {
             Ok(depth)

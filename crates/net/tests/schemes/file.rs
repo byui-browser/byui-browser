@@ -24,6 +24,7 @@ enum Outcome {
     Stream,
     Null,
     Missing,
+    Unsupported,
     Denied,
     Io,
     Malformed,
@@ -114,6 +115,10 @@ impl FileProvider for Provider {
                     provider: "file",
                     kind: ProviderErrorKind::ResourceMissing,
                 }),
+                Outcome::Unsupported => Err(RequestError::Provider {
+                    provider: "file",
+                    kind: ProviderErrorKind::UnsupportedResource,
+                }),
                 Outcome::Denied => Err(RequestError::Provider {
                     provider: "file",
                     kind: ProviderErrorKind::AccessDenied,
@@ -151,10 +156,16 @@ fn resource(url: net::Url, body: SchemeBody) -> SchemeResource {
         url,
         status: 200,
         status_text: Some("OK".into()),
-        headers: vec![(
-            net::HeaderName::from_static("x-file"),
-            net::HeaderValue::from_static("yes"),
-        )],
+        headers: vec![
+            (
+                net::HeaderName::from_static("x-file"),
+                net::HeaderValue::from_static("yes"),
+            ),
+            (
+                net::HeaderName::from_static("set-cookie"),
+                net::HeaderValue::from_static("session=must-not-leak"),
+            ),
+        ],
         media_type: Some(net::HeaderValue::from_static("text/plain")),
         origin: Origin::opaque(),
         body,
@@ -190,6 +201,8 @@ fn file_fetches_resolve_once_and_use_shared_response_finalization() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(response.url, "file:///tmp/page.html");
     assert_eq!(response.headers.get("x-file").as_deref(), Some("yes"));
+    assert_eq!(response.body.length(), Some(10));
+    assert!(!response.headers.has("set-cookie"));
     assert_eq!(
         runtime().block_on(response.body.bytes()).unwrap(),
         b"file-bytes"
@@ -199,6 +212,30 @@ fn file_fetches_resolve_once_and_use_shared_response_finalization() {
         &[Some(Origin::opaque())]
     );
     assert_eq!(services.cookie_lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(services.cache_partitions.load(Ordering::SeqCst), 0);
+    assert_eq!(services.worker_checks.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn repeated_file_fetches_resolve_again_and_do_not_use_the_http_cache() {
+    let provider = Arc::new(Provider {
+        calls: AtomicUsize::new(0),
+        outcome: Outcome::Bytes,
+    });
+    let (controller, services) = controller(provider.clone());
+
+    for _ in 0..2 {
+        let response = runtime()
+            .block_on(controller.fetch(Request::get("file:///tmp/page.html")))
+            .unwrap();
+        assert!(!response.from_cache);
+        assert_eq!(
+            runtime().block_on(response.body.bytes()).unwrap(),
+            b"file-bytes"
+        );
+    }
+
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     assert_eq!(services.cache_partitions.load(Ordering::SeqCst), 0);
 }
 
@@ -219,6 +256,7 @@ fn file_fetches_support_streams_and_explicit_null_bodies() {
             .unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert_eq!(response.body.is_null(), is_null);
+        assert_eq!(response.body.length(), if is_null { Some(0) } else { None });
         assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), expected);
     }
 }
@@ -329,6 +367,7 @@ fn dropping_unread_or_partially_read_file_bodies_releases_the_provider_stream() 
 fn file_provider_failures_retain_stable_categories() {
     for (outcome, kind) in [
         (Outcome::Missing, ProviderErrorKind::ResourceMissing),
+        (Outcome::Unsupported, ProviderErrorKind::UnsupportedResource),
         (Outcome::Denied, ProviderErrorKind::AccessDenied),
         (Outcome::Io, ProviderErrorKind::Io),
     ] {

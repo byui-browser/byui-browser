@@ -112,8 +112,13 @@ impl Headers {
         }
         self.guard = guard;
         if guard != HeaderGuard::Immutable {
-            self.entries
-                .retain(|(name, value)| allowed_header(guard, name, value));
+            self.entries.retain(|(name, value)| {
+                let keep = allowed_header(guard, name, value);
+                if !keep {
+                    log::trace!("header {name} dropped by {guard:?} guard");
+                }
+                keep
+            });
         }
         Ok(())
     }
@@ -235,6 +240,8 @@ impl Headers {
                     .is_none_or(|exposure| exposure.includes(name))
             {
                 list.entries.push((name.clone(), value.clone()));
+            } else {
+                log::trace!("response header {name} hidden from caller");
             }
         }
         list.set_guard(HeaderGuard::Immutable)
@@ -265,11 +272,13 @@ impl Headers {
     /// Validates a mutation against the current guard and Fetch header rules.
     fn check(&self, name: &HeaderName, value: &HeaderValue) -> Result<(), RequestError> {
         if self.guard == HeaderGuard::Immutable {
+            log::trace!("mutation of header {name} refused: headers are immutable");
             return Err(RequestError::ImmutableHeaders);
         }
         if allowed_header(self.guard, name, value) {
             Ok(())
         } else {
+            log::debug!("header {name} refused by {:?} guard", self.guard);
             Err(RequestError::ForbiddenHeader(name.as_str().to_owned()))
         }
     }
@@ -767,5 +776,34 @@ mod tests {
         assert!(!exposed.has("set-cookie"));
         assert!(!exposed.has("set-cookie2"));
         assert!(exposed.has("x-visible"));
+    }
+
+    #[test]
+    fn no_cors_safelist_checks_content_type_range_and_forbidden_headers() {
+        let content_type = HeaderName::from_static("content-type");
+        assert!(is_cors_safelisted_header(
+            &content_type,
+            &value("text/plain; charset=UTF-8")
+        ));
+        assert!(!is_cors_safelisted_header(
+            &content_type,
+            &value("application/json")
+        ));
+
+        let range = HeaderName::from_static("range");
+        assert!(is_cors_safelisted_header(&range, &value("bytes=0-499")));
+        assert!(is_cors_safelisted_header(&range, &value("bytes=500-")));
+        assert!(!is_cors_safelisted_header(&range, &value("bytes=-500")));
+        assert!(!is_cors_safelisted_header(&range, &value("bytes=0-1-2")));
+
+        let mut request = Headers::new();
+        assert!(matches!(
+            request.append(HeaderName::from_static("host"), value("example.test")),
+            Err(RequestError::ForbiddenHeader(name)) if name == "host"
+        ));
+        assert!(matches!(
+            request.append(HeaderName::from_static("sec-fetch-site"), value("same-origin")),
+            Err(RequestError::ForbiddenHeader(name)) if name == "sec-fetch-site"
+        ));
     }
 }

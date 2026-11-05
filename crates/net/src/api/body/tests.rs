@@ -1,36 +1,153 @@
-use std::io;
+use std::{
+    io,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::{Context, Poll},
+};
 
-use futures_util::stream;
+use bytes::Bytes;
+use futures_util::{StreamExt, stream};
 use http::header::HeaderValue;
+use tokio::sync::Notify;
+
+use crate::api::cancellation::AbortController;
 
 use super::*;
+
+struct DropSignal(Arc<AtomicUsize>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct PendingDropStream {
+    _drop: DropSignal,
+    polled: Arc<Notify>,
+}
+
+impl futures_util::Stream for PendingDropStream {
+    type Item = Result<Bytes, RequestError>;
+
+    fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.polled.notify_one();
+        Poll::Pending
+    }
+}
+
+#[test]
+/// Verifies body constructors expose their replayability and length metadata.
+fn body_constructors_report_replayability_and_length() {
+    let null = Body::null();
+    assert!(null.is_null());
+    assert!(!null.is_replayable());
+    assert_eq!(null.length(), Some(0));
+
+    let bytes = Body::from_bytes(b"hello".to_vec());
+    assert!(!bytes.is_null());
+    assert!(bytes.is_replayable());
+    assert_eq!(bytes.length(), Some(5));
+
+    let one_shot = Body::one_shot_bytes(b"hello".to_vec());
+    assert!(!one_shot.is_null());
+    assert!(!one_shot.is_replayable());
+    assert_eq!(one_shot.length(), Some(5));
+
+    let stream = Body::stream(stream::iter(vec![Ok::<Vec<u8>, io::Error>(
+        b"hello".to_vec(),
+    )]));
+    assert!(!stream.is_null());
+    assert!(!stream.is_replayable());
+    assert_eq!(stream.length(), None);
+}
+
+#[test]
+/// Verifies URL-encoded bodies expose metadata and support ArrayBuffer reads.
+fn url_encoded_body_supports_array_buffer_consumption() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let body = Body::from_url_encoded(b"name=Ada+Lovelace".to_vec());
+
+    assert_eq!(
+        body.content_type(),
+        Some(HeaderValue::from_static(
+            "application/x-www-form-urlencoded;charset=UTF-8"
+        ))
+    );
+    assert_eq!(body.length(), Some(17));
+    assert_eq!(
+        runtime.block_on(body.array_buffer()).unwrap(),
+        b"name=Ada+Lovelace"
+    );
+}
+
+#[test]
+/// Verifies body equality distinguishes value, null, and one-shot identity.
+fn body_equality_matches_replayability_rules() {
+    assert_eq!(Body::null(), Body::null());
+    assert_eq!(
+        Body::from_bytes(b"same".to_vec()),
+        Body::from_bytes(b"same")
+    );
+    assert_ne!(
+        Body::from_bytes(b"same".to_vec()),
+        Body::from_bytes(b"other")
+    );
+
+    let one_shot = Body::one_shot_bytes(b"same".to_vec());
+    assert_eq!(one_shot, one_shot);
+    assert_ne!(one_shot, Body::one_shot_bytes(b"same".to_vec()));
+}
+
+#[test]
+/// Verifies debug output reports body state without consuming the body.
+fn body_debug_reports_state_without_consuming() {
+    let body = Body::from_bytes(b"debug".to_vec());
+    let debug = format!("{body:?}");
+
+    assert!(debug.contains("is_null: false"));
+    assert!(debug.contains("replayable: true"));
+    assert!(debug.contains("length: Some(5)"));
+    assert!(!body.is_used());
+    assert!(!body.is_locked());
+}
 
 #[test]
 /// Verifies replayable body clones consume independently.
 fn replayable_clones_have_independent_consumption_state() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let body = Body::from_bytes(b"replayable".to_vec());
-    let clone = body.clone();
+    let mut body = Body::from_bytes(b"replayable".to_vec());
+    let clone = body.fork().unwrap();
 
     assert_eq!(runtime.block_on(body.bytes()).unwrap(), b"replayable");
     assert_eq!(runtime.block_on(clone.bytes()).unwrap(), b"replayable");
 }
 
 #[test]
-/// Verifies one-shot body clones share consumption state.
-fn one_shot_clones_share_consumption_state() {
+/// Verifies one-shot body forks own their bytes independently.
+fn one_shot_forks_have_independent_consumption_state() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let body = Body::one_shot_bytes(b"once".to_vec());
-    let clone = body.clone();
+    let mut body = Body::one_shot_bytes(b"once".to_vec());
+    let clone = body.fork().unwrap();
 
     assert!(!body.is_locked());
     assert_eq!(runtime.block_on(clone.bytes()).unwrap(), b"once");
-    assert!(body.is_locked());
-    assert!(body.is_used());
-    assert!(matches!(
-        runtime.block_on(body.bytes()),
-        Err(RequestError::BodyAlreadyUsed)
-    ));
+    assert!(!body.is_locked());
+    assert!(!body.is_used());
+    assert_eq!(runtime.block_on(body.bytes()).unwrap(), b"once");
+}
+
+#[test]
+/// Verifies a fork remains usable after the other body is sent.
+fn one_shot_transport_handoff_preserves_independent_fork() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut body = Body::one_shot_bytes(b"once".to_vec());
+    let fork = body.fork().unwrap();
+    body.into_reqwest_body().unwrap();
+    assert_eq!(runtime.block_on(fork.bytes()).unwrap(), b"once");
 }
 
 #[test]
@@ -81,6 +198,37 @@ fn body_consumption_helpers_decode_parse_and_preserve_form_entries() {
 }
 
 #[test]
+/// Verifies JSON always uses UTF-8 and accepts its byte-order mark.
+fn json_decoding_uses_utf8_regardless_of_content_type_charset() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let body = Body::from_bytes_with_content_type(
+        "{\"name\":\"café\"}".as_bytes().to_vec(),
+        Some(HeaderValue::from_static(
+            "application/json; charset=iso-8859-1",
+        )),
+    );
+    let value: serde_json::Value = runtime.block_on(body.json()).unwrap();
+    assert_eq!(value["name"], "café");
+
+    let body = Body::from_array_buffer([b"\xef\xbb\xbf".as_slice(), b"{\"ok\":true}"].concat());
+    let value: serde_json::Value = runtime.block_on(body.json()).unwrap();
+    assert_eq!(value["ok"], true);
+}
+
+#[test]
+/// Verifies typed-array inputs are copied into replayable body storage.
+fn typed_array_input_is_replayable_and_length_aware() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let source = [0, 1, 0xff];
+    let mut body = Body::from_typed_array(&source);
+    let clone = body.fork().unwrap();
+
+    assert_eq!(body.length(), Some(3));
+    assert_eq!(runtime.block_on(body.bytes()).unwrap(), source);
+    assert_eq!(runtime.block_on(clone.bytes()).unwrap(), source);
+}
+
+#[test]
 /// Verifies multipart parsing creates text and file entries.
 fn multipart_form_data_parses_text_and_file_parts() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -94,6 +242,55 @@ fn multipart_form_data_parses_text_and_file_parts() {
     assert!(
         matches!(entries[1], ("file", FormDataEntry::File { blob, filename: Some(filename) }) if blob.bytes() == b"hello" && filename == "a.txt")
     );
+}
+
+#[test]
+/// Verifies multipart parsing preserves arbitrary file bytes and extended names.
+fn multipart_form_data_is_binary_safe_and_decodes_rfc5987_filenames() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut bytes = b"--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"fallback.bin\"; filename*=UTF-8''caf%C3%A9.bin\r\nContent-Type: application/octet-stream\r\n\r\n".to_vec();
+    bytes.extend_from_slice(&[0, 0xff, b'\r', b'\n', 1]);
+    bytes.extend_from_slice(b"\r\n--boundary--\r\n");
+    let body = Body::from_bytes_with_content_type(
+        bytes,
+        Some(HeaderValue::from_static(
+            "multipart/form-data; boundary=boundary",
+        )),
+    );
+
+    let form = runtime.block_on(body.form_data()).unwrap();
+    let entry = form.entries().next().unwrap();
+    assert!(
+        matches!(entry, ("file", FormDataEntry::File { blob, filename: Some(filename) })
+            if filename == "café.bin" && blob.bytes() == [0, 0xff, b'\r', b'\n', 1])
+    );
+}
+
+#[test]
+/// Verifies multipart serialization emits an RFC 5987 extended filename.
+fn multipart_serialization_emits_extended_non_ascii_filename() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut form = FormData::new();
+    form.append("café", "value");
+    form.append_file(
+        "upload",
+        Blob::new([0, 0xff, 1], None),
+        Some("café.bin".into()),
+    );
+    let mut body = Body::from_form_data(form);
+    let bytes = runtime.block_on(body.fork().unwrap().bytes()).unwrap();
+
+    assert!(
+        bytes
+            .windows(b"filename*=UTF-8''caf%C3%A9.bin".len())
+            .any(|window| window == b"filename*=UTF-8''caf%C3%A9.bin")
+    );
+    assert!(bytes.windows(3).any(|window| window == [0, 0xff, 1]));
+    let parsed = runtime.block_on(body.form_data()).unwrap();
+    assert!(matches!(
+        parsed.entries().next(),
+        Some(("café", FormDataEntry::Text(value))) if value == "value"
+    ));
 }
 
 #[test]
@@ -130,20 +327,271 @@ fn form_data_constructor_selects_url_encoded_or_multipart() {
 }
 
 #[test]
-/// Verifies a stream failure marks shared body state as used.
-fn response_stream_failure_marks_the_shared_body_used() {
+/// Verifies a stream failure marks only the failed body view as used.
+fn response_stream_failure_marks_body_used() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let body = Body::stream(stream::once(async {
         Err(io::Error::other("stream failure"))
     }));
-    let clone = body.clone();
-
-    assert!(matches!(
-        runtime.block_on(clone.bytes()),
-        Err(RequestError::Transport(_))
-    ));
     assert!(matches!(
         runtime.block_on(body.bytes()),
-        Err(RequestError::BodyAlreadyUsed)
+        Err(RequestError::Transport(_))
+    ));
+}
+
+#[test]
+/// Verifies a live body tee delivers identical ordered bytes to both branches.
+fn live_body_tee_delivers_bounded_independent_branches() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut body = Body::from_stream(stream::iter([
+        Ok(Bytes::from_static(b"first")),
+        Ok(Bytes::from_static(b"second")),
+    ]));
+    body.set_content_type(Some(HeaderValue::from_static("text/plain")));
+    body.set_length(Some(11));
+    let clone = body.fork().unwrap();
+
+    let (left, right) = runtime.block_on(async { tokio::join!(body.bytes(), clone.bytes()) });
+    assert_eq!(left.unwrap(), b"firstsecond");
+    assert_eq!(right.unwrap(), b"firstsecond");
+}
+
+#[test]
+/// Verifies dropping one tee branch lets the remaining branch finish.
+fn dropping_one_tee_branch_releases_backpressure() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut body = Body::from_stream(stream::iter([
+        Ok(Bytes::from_static(b"one")),
+        Ok(Bytes::from_static(b"two")),
+    ]));
+    let clone = body.fork().unwrap();
+    drop(clone);
+
+    assert_eq!(runtime.block_on(body.bytes()).unwrap(), b"onetwo");
+}
+
+#[test]
+/// Verifies a second upstream chunk waits for the other active branch.
+fn live_fork_buffers_at_most_one_chunk_for_a_slow_branch() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut body = Body::from_stream(stream::iter([
+        Ok(Bytes::from_static(b"one")),
+        Ok(Bytes::from_static(b"two")),
+    ]));
+    let mut fork = body.fork().unwrap();
+    runtime.block_on(async {
+        assert_eq!(body.next().await.unwrap().unwrap(), b"one".as_slice());
+        assert!(matches!(futures_util::poll!(body.next()), Poll::Pending));
+        assert_eq!(fork.next().await.unwrap().unwrap(), b"one".as_slice());
+        assert_eq!(body.next().await.unwrap().unwrap(), b"two".as_slice());
+        assert_eq!(fork.next().await.unwrap().unwrap(), b"two".as_slice());
+    });
+}
+
+#[test]
+/// Verifies an internal transfer rejects a body whose reader has started.
+fn internal_transfer_rejects_a_disturbed_source() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut body = Body::from_stream(stream::iter([Ok(Bytes::from_static(b"one"))]));
+    let _ = runtime.block_on(body.next());
+    assert!(matches!(
+        body.try_into_parts(),
+        Err(RequestError::BodyAlreadyConsumed)
+    ));
+}
+
+#[test]
+/// Verifies helper locking and completed reads prevent further forks.
+fn fork_rejects_locked_and_completed_views() {
+    let mut locked = Body::from_bytes(b"locked".to_vec());
+    locked.claim_for_helper().unwrap();
+    assert!(matches!(locked.fork(), Err(RequestError::BodyNotCloneable)));
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut completed = Body::from_bytes(b"done".to_vec());
+    let _ = runtime.block_on(completed.next());
+    assert!(matches!(
+        completed.fork(),
+        Err(RequestError::BodyNotCloneable)
+    ));
+}
+
+#[test]
+/// Verifies direct polling records streaming and drop releases its source.
+fn direct_reader_streaming_status_and_drop_release() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let polled = Arc::new(Notify::new());
+    let mut body = Body::from_stream(PendingDropStream {
+        _drop: DropSignal(drops.clone()),
+        polled: polled.clone(),
+    });
+
+    runtime.block_on(async {
+        tokio::select! {
+            item = body.next() => panic!("pending stream unexpectedly returned: {item:?}"),
+            _ = polled.notified() => {}
+        }
+    });
+    assert_eq!(body.status(), BodyStatus::Streaming);
+    drop(body);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+/// Verifies canceling a consumption helper drops its pending source.
+fn dropping_a_helper_future_releases_its_body_source() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let polled = Arc::new(Notify::new());
+    let body = Body::from_stream(PendingDropStream {
+        _drop: DropSignal(drops.clone()),
+        polled: polled.clone(),
+    });
+
+    runtime.block_on(async {
+        let task = tokio::spawn(body.bytes());
+        polled.notified().await;
+        task.abort();
+        let _ = task.await;
+    });
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+/// Verifies source failures are delivered to both active tee branches.
+fn tee_forwards_source_failure_to_both_branches() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut body = Body::from_stream(stream::iter([Err(RequestError::Transport(
+        "failed".into(),
+    ))]));
+    let clone = body.fork().unwrap();
+
+    let (left, right) = runtime.block_on(async { tokio::join!(body.bytes(), clone.bytes()) });
+    assert!(matches!(left, Err(RequestError::Transport(message)) if message == "failed"));
+    assert!(matches!(right, Err(RequestError::Transport(message)) if message == "failed"));
+}
+
+#[test]
+/// Verifies fallible cloning rejects a disturbed stream without changing it.
+fn fallible_clone_rejects_a_disturbed_stream() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut body = Body::once(b"body".to_vec());
+    assert_eq!(
+        runtime.block_on(body.next()).unwrap().unwrap(),
+        b"body".as_slice()
+    );
+    assert!(matches!(body.fork(), Err(RequestError::BodyNotCloneable)));
+    assert!(runtime.block_on(body.next()).is_none());
+}
+
+#[test]
+/// Verifies direct polling disturbs only the body being read.
+fn direct_stream_read_blocks_later_helper_consumption() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut body = Body::one_shot_bytes(b"body".to_vec());
+    let clone = body.fork().unwrap();
+
+    assert_eq!(
+        runtime.block_on(body.next()).unwrap().unwrap(),
+        b"body".as_slice()
+    );
+    assert_eq!(body.status(), BodyStatus::Complete);
+    assert_eq!(runtime.block_on(clone.bytes()).unwrap(), b"body");
+}
+
+#[test]
+/// Verifies transport handoff consumes only the selected body owner.
+fn transport_handoff_leaves_fork_unused() {
+    let mut body = Body::one_shot_bytes(b"body".to_vec());
+    let mut fork = body.fork().unwrap();
+    body.into_reqwest_body().unwrap();
+    assert_eq!(fork.status(), BodyStatus::Unused);
+    assert!(fork.fork().is_ok());
+}
+
+#[test]
+/// Verifies an abort reaches both active branches and records terminal state.
+fn abort_terminates_both_tee_branches() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let abort = crate::AbortController::new();
+    let mut body = Body::from_stream_with_signal(
+        stream::pending::<Result<Bytes, RequestError>>(),
+        abort.signal(),
+    );
+    let mut clone = body.fork().unwrap();
+    abort.abort();
+
+    let (left, right) = runtime.block_on(async { tokio::join!(body.next(), clone.next()) });
+    assert!(matches!(left, Some(Err(RequestError::Aborted))));
+    assert!(matches!(right, Some(Err(RequestError::Aborted))));
+    assert_eq!(body.status(), BodyStatus::Aborted);
+    assert_eq!(clone.status(), BodyStatus::Aborted);
+}
+
+#[test]
+/// Verifies a response stream records a failed terminal state.
+fn response_stream_failure_records_failed_state() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut body = Body::stream(stream::once(async {
+        Err(io::Error::other("stream failure"))
+    }));
+    let fork = body.fork().unwrap();
+    assert!(matches!(
+        runtime.block_on(body.next()),
+        Some(Err(RequestError::Transport(_)))
+    ));
+    assert_eq!(body.status(), BodyStatus::Failed);
+    assert!(matches!(
+        runtime.block_on(fork.bytes()),
+        Err(RequestError::Transport(_))
+    ));
+}
+
+#[test]
+/// Verifies cancellation marks a live response body as aborted.
+fn response_stream_abort_records_aborted_state() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let controller = AbortController::new();
+    let mut body = Body::from_stream_with_signal(
+        stream::pending::<Result<Bytes, RequestError>>(),
+        controller.signal(),
+    );
+    let fork = body.fork().unwrap();
+    controller.abort();
+    assert!(matches!(
+        runtime.block_on(body.next()),
+        Some(Err(RequestError::Aborted))
+    ));
+    assert_eq!(body.status(), BodyStatus::Aborted);
+    assert!(matches!(
+        runtime.block_on(fork.bytes()),
+        Err(RequestError::Aborted)
+    ));
+}
+
+#[test]
+/// Verifies malformed form-data inputs return stable body errors.
+fn malformed_form_data_returns_typed_errors() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let missing_boundary = Body::from_bytes_with_content_type(
+        b"field=value".to_vec(),
+        Some(HeaderValue::from_static("multipart/form-data")),
+    );
+    assert!(matches!(
+        runtime.block_on(missing_boundary.form_data()),
+        Err(RequestError::BodyFormData(message)) if message.contains("Content-Type")
+    ));
+
+    let missing_disposition = Body::from_bytes_with_content_type(
+        b"--boundary\r\nContent-Type: text/plain\r\n\r\nvalue\r\n--boundary--\r\n".to_vec(),
+        Some(HeaderValue::from_static(
+            "multipart/form-data; boundary=boundary",
+        )),
+    );
+    assert!(matches!(
+        runtime.block_on(missing_disposition.form_data()),
+        Err(RequestError::BodyFormData(message)) if message.contains("disposition")
     ));
 }

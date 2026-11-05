@@ -4,10 +4,9 @@
 //! Window controls come from the operating system: each shell keeps its native
 //! decorations, and where those overlap the toolbar (macOS's traffic lights on
 //! a transparent titlebar) the controls shift right by
-//! [`ChromeState::window_controls_inset`]. Navigation is not implemented yet:
-//! Back and Forward are drawn disabled, and Reload, the address field, New
-//! Tab, and the menu only show hover and press feedback. The address text is a
-//! fixed label for the welcome page.
+//! [`ChromeState::window_controls_inset`]. Navigation and tabs remain staged;
+//! the address field supports focus and editing, while only the built-in
+//! `byui://welcome` page can currently be submitted.
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform};
@@ -20,7 +19,8 @@ const CONTROLS_HEIGHT: f64 = 46.0;
 /// Gap in logical pixels between the page card and the window's side and
 /// bottom edges.
 const PAGE_INSET: f64 = 8.0;
-const PAGE_RADIUS: f32 = 10.0;
+/// Corner radius in logical pixels of the page card and overlays docked to it.
+pub(crate) const PAGE_RADIUS: f32 = 10.0;
 const CENTER_Y: f32 = 26.0;
 const BUTTON_SIZE: f32 = 28.0;
 const BUTTON_TOP: f32 = CENTER_Y - BUTTON_SIZE / 2.0;
@@ -36,8 +36,6 @@ const ADDRESS_LEADING: f32 = 116.0;
 /// field usable.
 const TRAILING_MIN_WIDTH: f32 = 360.0;
 const TEXT_SIZE: f32 = 13.0;
-const ADDRESS_SCHEME: &str = "byui://";
-const ADDRESS_PAGE: &str = "welcome";
 
 /// A clickable region of the chrome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,9 +44,9 @@ pub(crate) enum Control {
     Back,
     /// Forward navigation; disabled because there is no history yet.
     Forward,
-    /// Reload; re-renders the welcome page.
+    /// Reload; fetches the current URL to the terminal and repaints the loaded page.
     Reload,
-    /// Address field; text entry is not implemented yet.
+    /// Address field; supports staged text editing.
     Address,
     /// New tab placeholder; tabs are not implemented yet.
     NewTab,
@@ -86,6 +84,17 @@ pub(crate) struct ChromeState {
     /// traffic lights do on a transparent titlebar. Zero when the system draws
     /// its buttons in a separate titlebar above the toolbar.
     pub window_controls_inset: f32,
+    /// Whether the address field owns keyboard input.
+    pub address_focused: bool,
+    /// Whether the whole address is selected, so the next edit replaces it.
+    /// Drawn as a highlight instead of a caret; meaningful only while
+    /// [`ChromeState::address_focused`] is set.
+    pub address_selected: bool,
+    /// Caret position as a byte offset into the address text, drawn while the
+    /// field is focused and nothing is selected. Offsets past the end, or
+    /// inside a multi-byte character, are drawn at the nearest earlier
+    /// character boundary.
+    pub address_caret: usize,
 }
 
 /// A rectangle in device pixels.
@@ -139,13 +148,18 @@ pub(crate) fn load_ui_font<P: AsRef<std::path::Path>>(
 ) -> Option<FontVec> {
     use ab_glyph::VariableFont;
 
-    candidates.into_iter().find_map(|path| {
-        let mut font = FontVec::try_from_vec(std::fs::read(path).ok()?).ok()?;
+    let font = candidates.into_iter().find_map(|path| {
+        let mut font = FontVec::try_from_vec(std::fs::read(path.as_ref()).ok()?).ok()?;
         // SF and other variable UI fonts pick the optical size designed for
         // small text; fonts without an `opsz` axis ignore this.
         font.set_variation(b"opsz", TEXT_SIZE);
+        log::debug!("font file chosen: {}", path.as_ref().display());
         Some(font)
-    })
+    });
+    if font.is_none() {
+        log::warn!("no UI font could be loaded; text will not render");
+    }
+    font
 }
 
 /// Paints the whole window: frame, page card holding `page`, and toolbar.
@@ -158,6 +172,7 @@ pub(crate) fn compose(
     height: u32,
     scale_factor: f64,
     state: &ChromeState,
+    address: &str,
     page: Option<&Pixmap>,
     font: Option<&FontVec>,
 ) -> Option<Pixmap> {
@@ -175,6 +190,7 @@ pub(crate) fn compose(
         state,
         palette,
         font,
+        address,
     );
     Some(pixmap)
 }
@@ -190,6 +206,7 @@ pub(crate) fn compose_controls(
     height: u32,
     scale_factor: f64,
     state: &ChromeState,
+    address: &str,
     font: Option<&FontVec>,
 ) -> Option<Pixmap> {
     let strip = controls_height_in_pixels(scale_factor).min(height);
@@ -204,6 +221,7 @@ pub(crate) fn compose_controls(
         state,
         palette,
         font,
+        address,
     );
     Some(pixmap)
 }
@@ -311,6 +329,7 @@ fn draw_toolbar(
     state: &ChromeState,
     palette: &Palette,
     font: Option<&FontVec>,
+    address: &str,
 ) {
     let transform = Transform::from_scale(scale, scale);
     let inset = state.window_controls_inset;
@@ -341,7 +360,7 @@ fn draw_toolbar(
         draw_icon(pixmap, control, cx, cy, color, transform);
     }
     if let Some(rect) = control_rect(Control::Address, width, inset) {
-        draw_address_field(pixmap, rect, scale, state, palette, font);
+        draw_address_field(pixmap, rect, scale, state, palette, font, address);
     }
 }
 
@@ -420,6 +439,7 @@ fn draw_address_field(
     state: &ChromeState,
     palette: &Palette,
     font: Option<&FontVec>,
+    address: &str,
 ) {
     let transform = Transform::from_scale(scale, scale);
     let hovered = state.hovered == Some(Control::Address);
@@ -433,7 +453,21 @@ fn draw_address_field(
     };
     fill(pixmap, &shape, field, transform);
     // A device-pixel hairline stays crisp at every scale factor.
-    stroke(pixmap, &shape, palette.field_border, 1.0 / scale, transform);
+    stroke(
+        pixmap,
+        &shape,
+        if state.address_focused {
+            palette.accent
+        } else {
+            palette.field_border
+        },
+        if state.address_focused {
+            1.25 / scale
+        } else {
+            1.0 / scale
+        },
+        transform,
+    );
 
     let cy = CENTER_Y;
     let lock_x = rect.x() + 16.0;
@@ -474,38 +508,88 @@ fn draw_address_field(
         stroke(pixmap, &path, palette.text_muted, 1.3, transform);
     }
 
+    let text_x = rect.x() + 30.0;
+    let clip_x = star_x - 12.0;
+    // Logical x of the caret, before the glyph at `address_caret`.
+    let mut caret_x = text_x;
     if let Some(font) = font {
         let size = TEXT_SIZE * scale;
         let scaled = font.as_scaled(PxScale::from(size));
         let baseline = cy * scale + (scaled.ascent() + scaled.descent()) / 2.0;
-        let clip = (star_x - 12.0) * scale;
-        let x = draw_text(
-            pixmap,
-            font,
-            size,
-            (rect.x() + 30.0) * scale,
-            baseline,
-            clip,
-            palette.text_muted,
-            ADDRESS_SCHEME,
-        );
+        if state.address_focused && state.address_selected && !address.is_empty() {
+            let width = text_advance(font, size, address) / scale;
+            let right = (text_x + width).min(clip_x);
+            if let Some(highlight) =
+                Rect::from_xywh(text_x - 1.0, cy - 9.0, right - text_x + 2.0, 18.0)
+            {
+                fill(
+                    pixmap,
+                    &PathBuilder::from_rect(highlight),
+                    palette.selection,
+                    transform,
+                );
+            }
+        }
+        let caret = floor_char_boundary(address, state.address_caret);
+        caret_x = text_x + text_advance(font, size, &address[..caret]) / scale;
         draw_text(
             pixmap,
             font,
             size,
-            x,
+            text_x * scale,
             baseline,
-            clip,
-            palette.text,
-            ADDRESS_PAGE,
+            clip_x * scale,
+            if state.address_focused {
+                palette.text
+            } else {
+                palette.text_muted
+            },
+            address,
         );
     }
+    if state.address_focused && !state.address_selected {
+        let x = caret_x.min(clip_x) + 1.0;
+        if let Some(caret) = Rect::from_xywh(x, cy - 8.0, 1.5, 16.0) {
+            fill(
+                pixmap,
+                &PathBuilder::from_rect(caret),
+                palette.text,
+                transform,
+            );
+        }
+    }
+}
+
+/// Returns the largest character boundary of `text` at or before `index`.
+pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Returns the pen advance in device pixels of `text` set at `size`, matching
+/// the position [`draw_text`] returns relative to its starting `x`.
+pub(crate) fn text_advance(font: &FontVec, size: f32, text: &str) -> f32 {
+    let scaled = font.as_scaled(PxScale::from(size));
+    let mut advance = 0.0;
+    let mut previous = None;
+    for character in text.chars() {
+        let id = scaled.glyph_id(character);
+        if let Some(previous) = previous {
+            advance += scaled.kern(previous, id);
+        }
+        previous = Some(id);
+        advance += scaled.h_advance(id);
+    }
+    advance
 }
 
 /// Draws `text` with its baseline at `baseline` (device pixels), clipping
 /// glyph pixels at `clip_x`. Returns the pen position after the last glyph.
 #[allow(clippy::too_many_arguments)]
-fn draw_text(
+pub(crate) fn draw_text(
     pixmap: &mut Pixmap,
     font: &FontVec,
     size: f32,
@@ -585,7 +669,7 @@ fn control_rect(control: Control, width: f32, inset: f32) -> Option<Rect> {
     }
 }
 
-fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<Path> {
+pub(crate) fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<Path> {
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
@@ -607,13 +691,21 @@ fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<Path> {
     builder.finish()
 }
 
-fn fill(pixmap: &mut Pixmap, path: &Path, color: Color, transform: Transform) {
+/// Fills `path` with a solid `color`.
+pub(crate) fn fill(pixmap: &mut Pixmap, path: &Path, color: Color, transform: Transform) {
     let mut paint = Paint::default();
     paint.set_color(color);
     pixmap.fill_path(path, &paint, FillRule::Winding, transform, None);
 }
 
-fn stroke(pixmap: &mut Pixmap, path: &Path, color: Color, width: f32, transform: Transform) {
+/// Strokes `path` with round caps and joins, `width` in transformed units.
+pub(crate) fn stroke(
+    pixmap: &mut Pixmap,
+    path: &Path,
+    color: Color,
+    width: f32,
+    transform: Transform,
+) {
     let mut paint = Paint::default();
     paint.set_color(color);
     let stroke = Stroke {
@@ -625,25 +717,32 @@ fn stroke(pixmap: &mut Pixmap, path: &Path, color: Color, width: f32, transform:
     pixmap.stroke_path(path, &paint, &stroke, transform, None);
 }
 
-fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
+pub(crate) fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
     Color::from_rgba8(r, g, b, a)
 }
 
-struct Palette {
-    frame_top: Color,
-    frame_bottom: Color,
-    shadow: Color,
-    card_border: Color,
-    icon: Color,
-    icon_disabled: Color,
-    hover: Color,
-    pressed: Color,
-    field: Color,
-    field_hover: Color,
-    field_border: Color,
-    text: Color,
-    text_muted: Color,
-    accent: Color,
+/// Shared browser-chrome colors for one appearance.
+pub(crate) struct Palette {
+    pub(crate) frame_top: Color,
+    pub(crate) frame_bottom: Color,
+    pub(crate) shadow: Color,
+    pub(crate) card_border: Color,
+    pub(crate) icon: Color,
+    pub(crate) icon_disabled: Color,
+    pub(crate) hover: Color,
+    pub(crate) pressed: Color,
+    pub(crate) field: Color,
+    pub(crate) field_hover: Color,
+    pub(crate) field_border: Color,
+    pub(crate) text: Color,
+    pub(crate) text_muted: Color,
+    pub(crate) accent: Color,
+    pub(crate) selection: Color,
+}
+
+/// Returns the chrome palette for the dark or light appearance.
+pub(crate) fn palette(dark: bool) -> Palette {
+    if dark { self::dark() } else { light() }
 }
 
 fn light() -> Palette {
@@ -663,6 +762,7 @@ fn light() -> Palette {
         text_muted: rgba(0x6b, 0x72, 0x80, 255),
         // BYU–Idaho blue.
         accent: rgba(0x00, 0x6e, 0xb6, 255),
+        selection: rgba(0x00, 0x6e, 0xb6, 64),
     }
 }
 
@@ -682,6 +782,7 @@ fn dark() -> Palette {
         text: rgba(0xec, 0xee, 0xf2, 255),
         text_muted: rgba(0x96, 0x9c, 0xa8, 255),
         accent: rgba(0x4d, 0xa3, 0xff, 255),
+        selection: rgba(0x4d, 0xa3, 0xff, 96),
     }
 }
 
@@ -721,7 +822,16 @@ mod tests {
             let mut page = Pixmap::new(card.width, card.height).unwrap();
             page.fill(Color::from_rgba8(255, 0, 0, 255));
             let state = ChromeState::default();
-            let out = compose(width, height, scale, &state, Some(&page), None).unwrap();
+            let out = compose(
+                width,
+                height,
+                scale,
+                &state,
+                "byui://welcome",
+                Some(&page),
+                None,
+            )
+            .unwrap();
             let middle = pixel(&out, card.x + card.width / 2, card.y + card.height / 2);
             assert_eq!(middle, [255, 0, 0, 255]);
             // The rounded corner leaves the frame showing at the card's corner.
@@ -783,7 +893,18 @@ mod tests {
 
     #[test]
     fn every_state_and_size_composes_safely() {
-        assert!(compose(0, 0, 1.0, &ChromeState::default(), None, None).is_none());
+        assert!(
+            compose(
+                0,
+                0,
+                1.0,
+                &ChromeState::default(),
+                "byui://welcome",
+                None,
+                None
+            )
+            .is_none()
+        );
         for (width, height) in [(1, 1), (20, 60), (300, 120), (1200, 800)] {
             for dark in [false, true] {
                 for hovered in [None, Some(Control::Reload), Some(Control::Address)] {
@@ -791,9 +912,13 @@ mod tests {
                         hovered,
                         pressed: hovered,
                         dark,
+                        address_focused: false,
+                        address_selected: false,
+                        address_caret: 0,
                         window_controls_inset: if dark { 72.0 } else { 0.0 },
                     };
-                    let out = compose(width, height, 1.5, &state, None, None).unwrap();
+                    let out =
+                        compose(width, height, 1.5, &state, "byui://welcome", None, None).unwrap();
                     assert_eq!(out.width(), width);
                 }
             }
@@ -809,8 +934,9 @@ mod tests {
                 dark,
                 ..ChromeState::default()
             };
-            let full = compose(width, height, scale, &state, None, None).unwrap();
-            let strip = compose_controls(width, height, scale, &state, None).unwrap();
+            let full = compose(width, height, scale, &state, "byui://welcome", None, None).unwrap();
+            let strip =
+                compose_controls(width, height, scale, &state, "byui://welcome", None).unwrap();
             assert_eq!(strip.height(), controls_height_in_pixels(scale));
             assert_eq!(strip.data(), &full.data()[..strip.data().len()]);
             // The strip ends above the card shadow.
@@ -821,13 +947,85 @@ mod tests {
 
     #[test]
     fn dark_and_light_frames_differ() {
-        let light = compose(400, 200, 1.0, &ChromeState::default(), None, None).unwrap();
+        let light = compose(
+            400,
+            200,
+            1.0,
+            &ChromeState::default(),
+            "byui://welcome",
+            None,
+            None,
+        )
+        .unwrap();
         let dark_state = ChromeState {
             dark: true,
             ..ChromeState::default()
         };
-        let dark = compose(400, 200, 1.0, &dark_state, None, None).unwrap();
+        let dark = compose(400, 200, 1.0, &dark_state, "byui://welcome", None, None).unwrap();
         assert!(pixel(&light, 200, 4)[0] > 200);
         assert!(pixel(&dark, 200, 4)[0] < 60);
+    }
+
+    #[test]
+    fn focused_address_field_has_distinct_chrome() {
+        let normal = compose(
+            400,
+            200,
+            1.0,
+            &ChromeState::default(),
+            "byui://welcome",
+            None,
+            None,
+        )
+        .unwrap();
+        let focused = compose(
+            400,
+            200,
+            1.0,
+            &ChromeState {
+                address_focused: true,
+                ..ChromeState::default()
+            },
+            "byui://welcome",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_ne!(normal.data(), focused.data());
+    }
+
+    #[test]
+    fn focused_address_shows_a_caret_in_both_palettes() {
+        for dark in [false, true] {
+            let focused = ChromeState {
+                dark,
+                address_focused: true,
+                ..ChromeState::default()
+            };
+            let selected = ChromeState {
+                address_selected: true,
+                ..focused
+            };
+            let with_caret = compose(400, 200, 1.0, &focused, "", None, None).unwrap();
+            let without = compose(400, 200, 1.0, &selected, "", None, None).unwrap();
+            let rect = control_rect(Control::Address, 400.0, 0.0).unwrap();
+            // With no font the caret sits at the text origin.
+            let x = (rect.x() + 31.5) as u32;
+            let caret = pixel(&with_caret, x, CENTER_Y as u32);
+            let field = pixel(&without, x, CENTER_Y as u32);
+            // The caret uses the text color, so it contrasts with the field.
+            let lightness = |p: [u8; 4]| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]);
+            if dark {
+                assert!(
+                    lightness(caret) > lightness(field) + 300,
+                    "{caret:?} {field:?}"
+                );
+            } else {
+                assert!(
+                    lightness(caret) + 300 < lightness(field),
+                    "{caret:?} {field:?}"
+                );
+            }
+        }
     }
 }

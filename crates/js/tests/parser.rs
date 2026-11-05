@@ -339,7 +339,6 @@ fn malformed_sources_return_errors_without_panicking() {
         "a[1",
         "a[1,2]",
         ".a",
-        "[1]",
         "a.b() = 1",
         "a.b + 1 = 2",
     ] {
@@ -436,4 +435,18 @@ fn every_prefix_of_a_program_can_be_parsed_without_panicking() {
     for end in 0..=source.len() {
         let _ = parse(&source[..end]);
     }
+}
+
+#[test]
+fn parses_mixed_ascii_unicode_and_escaped_identifiers() {
+    assert_eq!(
+        expression(r"total + caf\u00e9 * 名\u{524D}"),
+        binary(
+            id("total"),
+            B::Add,
+            binary(id("café"), B::Multiply, id("名前"))
+        )
+    );
+    assert!(parse(r"let \u0069f = 1;").is_err());
+    assert!(parse(r"let a\u0020b = 1;").is_err());
 }
