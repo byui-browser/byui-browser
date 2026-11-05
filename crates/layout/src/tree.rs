@@ -208,6 +208,21 @@ impl LayoutTree {
         items
     }
 
+    /// The height of the document's scrollable area, in CSS pixels.
+    ///
+    /// This is the larger of the viewport height and the lowest margin edge
+    /// of any box or line box, so a document shorter than the viewport has
+    /// nothing to scroll and a taller one scrolls until its last content,
+    /// including the root element's bottom margin, is visible. A viewport is
+    /// scrollable by `scroll_height() - root.rect.height` CSS pixels.
+    ///
+    /// Only vertical overflow is measured; horizontal scrolling is not
+    /// supported yet. Content of `overflow: hidden` boxes still counts, since
+    /// overflow clipping is not implemented.
+    pub fn scroll_height(&self) -> f32 {
+        lowest_edge(&self.root).max(self.root.rect.bottom())
+    }
+
     /// Returns the element under a CSS-pixel point, or `None` when the point
     /// hits only the canvas.
     ///
@@ -234,6 +249,21 @@ impl LayoutTree {
         }
         hit
     }
+}
+
+/// The lowest margin edge of `layout_box`, its line boxes, and their
+/// descendants, in absolute CSS pixels.
+fn lowest_edge(layout_box: &LayoutBox) -> f32 {
+    let own = layout_box.rect.bottom() + layout_box.margin.bottom.max(0.0);
+    let lines = layout_box.lines.iter().flat_map(|line| {
+        let atomics = line.fragments.iter().filter_map(|fragment| match fragment {
+            LineFragment::Atomic(atomic) => Some(lowest_edge(atomic)),
+            _ => None,
+        });
+        std::iter::once(line.rect.bottom()).chain(atomics)
+    });
+    let children = layout_box.children.iter().map(lowest_edge);
+    lines.chain(children).fold(own, f32::max)
 }
 
 fn paint_atomically<'a>(layout_box: &'a LayoutBox, items: &mut Vec<PaintItem<'a>>) {

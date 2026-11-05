@@ -1,104 +1,148 @@
-//! CSS selector syntax parser.
+//! CSS selector syntax: the selector AST and a token-based parser.
 //!
-//! This module parses selector text into an AST. It does not yet match selectors
-//! against the HTML DOM; matching is a separate stage of the CSS engine.
+//! [`parse_selector_list`] tokenizes selector text with
+//! [`crate::tokenizer::tokenize`] and parses the tokens into a
+//! [`SelectorList`]. The stylesheet parser reuses the same token parser for
+//! rule preludes. Matching selectors against the DOM lives in the cascade's
+//! matcher, not here.
 
+use crate::parser::skip_component_value;
+use crate::tokenizer::{Token, TokenKind, source_text, tokenize, trim_whitespace};
 use std::fmt;
 
 /// A comma-separated selector list, such as `h1, .title, #main`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SelectorList {
+    /// The complex selectors of the list, in source order.
     pub selectors: Vec<ComplexSelector>,
 }
 
 /// A selector made from compounds connected by combinators.
-/// `div.card > p.note` has three simple-selector groups? No: two compounds,
-/// `div.card` and `p.note`, connected by `Child`.
+///
+/// `div.card > p.note` has two compounds, `div.card` and `p.note`, connected
+/// by [`Combinator::Child`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ComplexSelector {
     /// A leading combinator is allowed only for relative selectors, such as
     /// the arguments of `:has(> img)`.
     pub leading_combinator: Option<Combinator>,
+    /// Compounds from left to right. A parsed selector has at least one.
     pub compounds: Vec<CompoundSelector>,
-    /// There is one combinator between each pair of compounds.
+    /// There is one combinator between each pair of compounds:
+    /// `combinators[i]` joins `compounds[i]` and `compounds[i + 1]`.
     pub combinators: Vec<Combinator>,
 }
 
 /// A collection of simple selectors that must all match the same element.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CompoundSelector {
+    /// The type or universal selector (`div`, `*`), if the compound has one.
     pub type_selector: Option<TypeSelector>,
+    /// The remaining simple selectors, in source order.
     pub simples: Vec<SimpleSelector>,
 }
 
+/// A type (`div`) or universal (`*`) selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeSelector {
-    /// Optional namespace prefix (`svg|rect`, `*|a`, or `|a`).
+    /// Optional namespace prefix (`svg|rect`, `*|a`, or `|a`). An empty string
+    /// means "no namespace" and `*` means any namespace.
     pub namespace: Option<String>,
+    /// Element name as written, or `*` for the universal selector.
     pub name: String,
 }
 
+/// How two compounds of a complex selector relate in the document tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Combinator {
+    /// Whitespace: the left compound matches an ancestor.
     Descendant,
+    /// `>`: the left compound matches the parent.
     Child,
+    /// `+`: the left compound matches the immediately preceding sibling.
     NextSibling,
+    /// `~`: the left compound matches any preceding sibling.
     SubsequentSibling,
     /// CSS Selectors Level 4 column combinator (`||`).
     Column,
 }
 
+/// One simple selector inside a compound, other than the type selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SimpleSelector {
+    /// `#name`. The value is unescaped.
     Id(String),
+    /// `.name`. The value is unescaped.
     Class(String),
+    /// `[name]`, `[name=value]`, and the other attribute forms.
     Attribute(AttributeSelector),
+    /// A pseudo-class (`:hover`) or pseudo-element (`::before`).
     Pseudo(PseudoSelector),
     /// Nesting selector (`&`) from CSS Nesting.
     Nesting,
 }
 
+/// An attribute selector such as `[type="text" i]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeSelector {
+    /// Optional namespace prefix, as for [`TypeSelector::namespace`].
     pub namespace: Option<String>,
+    /// Attribute name as written.
     pub name: String,
+    /// Comparison operator, or `None` for a presence test (`[name]`).
     pub operator: Option<AttributeOperator>,
+    /// Unescaped comparison value; present exactly when `operator` is.
     pub value: Option<String>,
-    /// Optional case-sensitivity flag (`i` or `s`).
+    /// Optional case-sensitivity flag, lowercased (`i` or `s`).
     pub modifier: Option<char>,
 }
 
+/// Attribute selector comparison operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttributeOperator {
+    /// `=`: the value equals the given value.
     Equals,
+    /// `~=`: the whitespace-separated value list contains the given word.
     Includes,
+    /// `|=`: the value equals the given value or starts with it plus `-`.
     DashMatch,
+    /// `^=`: the value starts with the given value.
     Prefix,
+    /// `$=`: the value ends with the given value.
     Suffix,
+    /// `*=`: the value contains the given value.
     Substring,
 }
 
+/// A pseudo-class or pseudo-element, with its optional argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PseudoSelector {
+    /// `true` for pseudo-elements written with `::`.
     pub element: bool,
+    /// Name as written, without colons or parenthesis.
     pub name: String,
-    /// Raw argument text inside parentheses, e.g. `2n+1` or `.item, #main`.
+    /// Raw argument text inside parentheses, e.g. `2n+1` or `.item, #main`,
+    /// with comments removed.
     pub argument: Option<String>,
     /// Parsed selector argument for selector-taking functions such as
-    /// `:is()`, `:where()`, `:not()`, `:has()`, `:host()`, and `::slotted()`.
-    /// Other function arguments (for example `:nth-child(2n + 1)`) remain raw.
+    /// `:is()`, `:where()`, `:not()`, `:has()`, `:host()`, and `::slotted()`,
+    /// and for the `of S` part of `:nth-child()`. Other function arguments
+    /// (for example `:nth-child(2n + 1)`) remain raw.
     pub nested_selectors: Option<Box<SelectorList>>,
 }
 
+/// Why selector text failed to parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectorParseError {
+    /// Byte offset into the parsed text where the problem was found.
     pub position: usize,
+    /// Human-readable description of the problem.
     pub message: String,
 }
 
 impl fmt::Display for SelectorParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} at character {}", self.message, self.position)
+        write!(f, "{} at byte {}", self.message, self.position)
     }
 }
 
@@ -106,211 +150,175 @@ impl std::error::Error for SelectorParseError {}
 
 /// Parse a full comma-separated CSS selector list.
 ///
-/// Parses the major CSS Selectors Level 4 forms, including type/universal and
-/// namespace selectors, IDs/classes/attributes, all common combinators,
-/// pseudo-classes/elements, selector-list functions, relative `:has()` arguments,
-/// the nesting selector, CSS comments, and escaped identifiers. Selector
-/// matching and semantic validation (such as whether a pseudo-class is known)
-/// are intentionally separate from parsing.
+/// The input is tokenized with [`crate::tokenizer::tokenize`] and parsed
+/// from tokens. This covers the major CSS Selectors Level 4 forms, including
+/// type/universal and namespace selectors, IDs/classes/attributes, all common
+/// combinators, pseudo-classes/elements, selector-list functions, relative
+/// `:has()` arguments, the nesting selector, comments, and escaped
+/// identifiers. Identifier and string values in the AST are unescaped.
+///
+/// `:is()` and `:where()` take forgiving selector lists (invalid entries are
+/// dropped); every other list is invalid if any entry is invalid. Semantic
+/// validation, such as whether a pseudo-class is known, is left to matching.
 pub fn parse_selector_list(input: &str) -> Result<SelectorList, SelectorParseError> {
     log::trace!("parsing selector list `{input}`");
-    let without_comments = remove_selector_comments(input);
-    let result = parse_selector_list_mode(&without_comments, false);
+    let tokens = tokenize(input);
+    let result = parse_selector_tokens(input, &tokens);
     if let Err(error) = &result {
         log::debug!("invalid selector `{input}`: {error}");
     }
     result
 }
 
-/// Removes CSS comments without touching comment-like text inside quoted strings.
-fn remove_selector_comments(input: &str) -> String {
-    let chars: Vec<char> = input.chars().collect();
-    let mut out = String::with_capacity(input.len());
-    let mut i = 0;
-    let mut quote = None;
-    while i < chars.len() {
-        let c = chars[i];
-        if let Some(q) = quote {
-            out.push(c);
-            if c == '\\' && i + 1 < chars.len() {
-                i += 1;
-                out.push(chars[i]);
-            } else if c == q {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        if c == '\'' || c == '"' {
-            quote = Some(c);
-            out.push(c);
-            i += 1;
-        } else if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
-            i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
-            }
-            if i + 1 >= chars.len() {
-                break;
-            }
-            i += 2;
-            // A comment behaves like whitespace between selector tokens.
-            out.push(' ');
-        } else {
-            out.push(c);
-            i += 1;
-        }
-    }
-    out
+/// Parses a selector list from tokens of `source`.
+///
+/// Error positions are byte offsets into `source`.
+pub(crate) fn parse_selector_tokens(
+    source: &str,
+    tokens: &[Token<'_>],
+) -> Result<SelectorList, SelectorParseError> {
+    let end = tokens.last().map_or(0, |token| token.span.end);
+    parse_list(source, tokens, end, false, false)
 }
 
-fn parse_selector_list_mode(
-    input: &str,
+/// Parses a comma-separated list. `end_offset` is the error position used
+/// when the tokens run out. A `forgiving` list drops invalid entries.
+fn parse_list(
+    source: &str,
+    tokens: &[Token<'_>],
+    end_offset: usize,
     allow_relative: bool,
+    forgiving: bool,
 ) -> Result<SelectorList, SelectorParseError> {
-    let cleaned;
-    let input = if input.contains("/*") {
-        cleaned = remove_selector_comments(input);
-        cleaned.as_str()
-    } else {
-        input
-    };
-    let mut parser = Parser::new(input);
-    parser.skip_whitespace();
-    if parser.is_eof() {
-        return parser.error("selector cannot be empty");
-    }
-
     let mut selectors = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
     loop {
-        selectors.push(parser.parse_complex_selector(allow_relative)?);
-        parser.skip_whitespace();
-        if parser.is_eof() {
+        let at_end = index >= tokens.len();
+        if !at_end && tokens[index].kind != TokenKind::Comma {
+            index = skip_component_value(tokens, index);
+            continue;
+        }
+        let piece = trim_whitespace(&tokens[start..index]);
+        let piece_end = tokens
+            .get(index)
+            .map_or(end_offset, |token| token.span.start);
+        if piece.is_empty() {
+            if !forgiving {
+                let message = if at_end && start == 0 {
+                    "selector cannot be empty"
+                } else {
+                    "expected selector after ','"
+                };
+                return Err(SelectorParseError {
+                    position: piece_end,
+                    message: message.to_owned(),
+                });
+            }
+        } else {
+            let mut parser = Parser {
+                source,
+                tokens: piece,
+                pos: 0,
+                end_offset: piece_end,
+            };
+            match parser.parse_complex_selector(allow_relative) {
+                Ok(selector) => selectors.push(selector),
+                Err(error) if forgiving => {
+                    log::debug!("dropping invalid entry from forgiving selector list: {error}");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if at_end {
             break;
         }
-        if !parser.consume(',') {
-            return parser.error("expected ',' between selectors");
-        }
-        parser.skip_whitespace();
-        if parser.is_eof() || parser.peek() == Some(',') {
-            return parser.error("expected selector after ','");
-        }
+        index += 1;
+        start = index;
     }
     Ok(SelectorList { selectors })
 }
 
-fn nth_of_selector_argument(argument: &str) -> Option<&str> {
-    // The `of` keyword is an identifier token separated from the An+B formula
-    // and selector list. CSS keywords are ASCII case-insensitive.
-    let bytes = argument.as_bytes();
-    let mut index = 0;
-    while index + 2 < bytes.len() {
-        if bytes[index].is_ascii_whitespace()
-            && bytes[index + 1].eq_ignore_ascii_case(&b'o')
-            && bytes[index + 2].eq_ignore_ascii_case(&b'f')
-            && index + 3 < bytes.len()
-            && bytes[index + 3].is_ascii_whitespace()
-        {
-            let selectors = argument[index + 3..].trim();
-            return if selectors.is_empty() {
-                None
-            } else {
-                Some(selectors)
-            };
-        }
-        index += 1;
-    }
-    None
-}
-
-struct Parser {
-    chars: Vec<char>,
+struct Parser<'s, 't, 'a> {
+    source: &'s str,
+    tokens: &'t [Token<'a>],
     pos: usize,
+    /// Error position once the tokens run out.
+    end_offset: usize,
 }
 
-impl Parser {
-    fn new(input: &str) -> Self {
-        Self {
-            chars: input.chars().collect(),
-            pos: 0,
-        }
+impl<'s, 't, 'a> Parser<'s, 't, 'a> {
+    fn peek(&self) -> Option<&TokenKind<'a>> {
+        self.peek_at(0)
     }
 
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+    fn peek_at(&self, offset: usize) -> Option<&TokenKind<'a>> {
+        self.tokens.get(self.pos + offset).map(|token| &token.kind)
     }
-    fn peek_next(&self) -> Option<char> {
-        self.chars.get(self.pos + 1).copied()
-    }
+
     fn is_eof(&self) -> bool {
-        self.pos >= self.chars.len()
+        self.pos >= self.tokens.len()
     }
-    fn consume(&mut self, c: char) -> bool {
-        if self.peek() == Some(c) {
-            self.pos += 1;
-            true
-        } else {
-            false
-        }
+
+    fn offset(&self) -> usize {
+        self.tokens
+            .get(self.pos)
+            .map_or(self.end_offset, |token| token.span.start)
     }
+
     fn error<T>(&self, message: &str) -> Result<T, SelectorParseError> {
         Err(SelectorParseError {
-            position: self.pos,
+            position: self.offset(),
             message: message.to_owned(),
         })
     }
+
     fn skip_whitespace(&mut self) -> bool {
         let start = self.pos;
-        while self.peek().is_some_and(char::is_whitespace) {
+        while self.peek() == Some(&TokenKind::Whitespace) {
             self.pos += 1;
         }
         self.pos != start
+    }
+
+    /// Whether the next two tokens are directly adjacent `|` delimiters.
+    fn at_column_combinator(&self) -> bool {
+        self.peek() == Some(&TokenKind::Delim('|'))
+            && self.peek_at(1) == Some(&TokenKind::Delim('|'))
+            && self.tokens[self.pos].span.end == self.tokens[self.pos + 1].span.start
+    }
+
+    fn peek_combinator(&self) -> Option<(Combinator, usize)> {
+        match self.peek()? {
+            TokenKind::Delim('>') => Some((Combinator::Child, 1)),
+            TokenKind::Delim('+') => Some((Combinator::NextSibling, 1)),
+            TokenKind::Delim('~') => Some((Combinator::SubsequentSibling, 1)),
+            TokenKind::Delim('|') if self.at_column_combinator() => Some((Combinator::Column, 2)),
+            _ => None,
+        }
     }
 
     fn parse_complex_selector(
         &mut self,
         allow_relative: bool,
     ) -> Result<ComplexSelector, SelectorParseError> {
-        let leading_combinator = if allow_relative {
-            match (self.peek(), self.peek_next()) {
-                (Some('>'), _) => {
-                    self.pos += 1;
-                    Some(Combinator::Child)
-                }
-                (Some('+'), _) => {
-                    self.pos += 1;
-                    Some(Combinator::NextSibling)
-                }
-                (Some('~'), _) => {
-                    self.pos += 1;
-                    Some(Combinator::SubsequentSibling)
-                }
-                (Some('|'), Some('|')) => {
-                    self.pos += 2;
-                    Some(Combinator::Column)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
         self.skip_whitespace();
+        let mut leading_combinator = None;
+        if allow_relative {
+            if let Some((combinator, width)) = self.peek_combinator() {
+                self.pos += width;
+                leading_combinator = Some(combinator);
+                self.skip_whitespace();
+            }
+        }
         let mut compounds = vec![self.parse_compound_selector()?];
         let mut combinators = Vec::new();
         loop {
             let had_space = self.skip_whitespace();
-            if self.is_eof() || self.peek() == Some(',') {
+            if self.is_eof() {
                 break;
             }
-
-            let explicit = match (self.peek(), self.peek_next()) {
-                (Some('>'), _) => Some((Combinator::Child, 1)),
-                (Some('+'), _) => Some((Combinator::NextSibling, 1)),
-                (Some('~'), _) => Some((Combinator::SubsequentSibling, 1)),
-                (Some('|'), Some('|')) => Some((Combinator::Column, 2)),
-                _ => None,
-            };
-            let combinator = if let Some((combinator, width)) = explicit {
+            let combinator = if let Some((combinator, width)) = self.peek_combinator() {
                 self.pos += width;
                 self.skip_whitespace();
                 combinator
@@ -319,8 +327,7 @@ impl Parser {
             } else {
                 return self.error("expected a combinator or end of selector");
             };
-
-            if self.is_eof() || matches!(self.peek(), Some(',' | '>' | '+' | '~')) {
+            if self.is_eof() || self.peek_combinator().is_some() {
                 return self.error("expected selector after combinator");
             }
             combinators.push(combinator);
@@ -335,31 +342,42 @@ impl Parser {
 
     fn parse_compound_selector(&mut self) -> Result<CompoundSelector, SelectorParseError> {
         let mut compound = CompoundSelector::default();
-        if self.starts_type_selector() {
+        if matches!(
+            self.peek(),
+            Some(TokenKind::Ident(_) | TokenKind::Delim('*' | '|'))
+        ) && !self.at_column_combinator()
+        {
             compound.type_selector = Some(self.parse_type_selector()?);
         }
 
         loop {
             match self.peek() {
-                Some('#') => {
+                Some(TokenKind::Hash { value, is_id }) => {
+                    if !is_id {
+                        return self.error("an ID selector must be a valid identifier");
+                    }
+                    let id = value.to_string();
                     self.pos += 1;
-                    compound
-                        .simples
-                        .push(SimpleSelector::Id(self.parse_identifier("ID")?));
+                    compound.simples.push(SimpleSelector::Id(id));
                 }
-                Some('.') => {
+                Some(TokenKind::Delim('.')) => {
                     self.pos += 1;
-                    compound
-                        .simples
-                        .push(SimpleSelector::Class(self.parse_identifier("class")?));
+                    let Some(TokenKind::Ident(name)) = self.peek() else {
+                        return self.error("expected class name");
+                    };
+                    let class = name.to_string();
+                    self.pos += 1;
+                    compound.simples.push(SimpleSelector::Class(class));
                 }
-                Some('[') => compound
-                    .simples
-                    .push(SimpleSelector::Attribute(self.parse_attribute_selector()?)),
-                Some(':') => compound
-                    .simples
-                    .push(SimpleSelector::Pseudo(self.parse_pseudo_selector()?)),
-                Some('&') => {
+                Some(TokenKind::OpenSquare) => {
+                    let attribute = self.parse_attribute_selector()?;
+                    compound.simples.push(SimpleSelector::Attribute(attribute));
+                }
+                Some(TokenKind::Colon) => {
+                    let pseudo = self.parse_pseudo_selector()?;
+                    compound.simples.push(SimpleSelector::Pseudo(pseudo));
+                }
+                Some(TokenKind::Delim('&')) => {
                     self.pos += 1;
                     compound.simples.push(SimpleSelector::Nesting);
                 }
@@ -374,84 +392,125 @@ impl Parser {
         Ok(compound)
     }
 
-    fn starts_type_selector(&self) -> bool {
-        match self.peek() {
-            Some('*') => true,
-            Some('|') => true,
-            Some('\\') => true,
-            Some(c) => is_name_start(c),
-            None => false,
-        }
-    }
-
     fn parse_type_selector(&mut self) -> Result<TypeSelector, SelectorParseError> {
-        let (namespace, name) = if self.consume('|') {
-            (
-                Some(String::new()),
-                self.parse_name_or_star("type selector")?,
-            )
-        } else {
-            let first = self.parse_name_or_star("type selector")?;
-            if self.consume('|') {
-                (
-                    Some(first),
-                    self.parse_name_or_star("type selector after namespace")?,
-                )
-            } else {
-                (None, first)
-            }
-        };
-        Ok(TypeSelector { namespace, name })
+        if self.peek() == Some(&TokenKind::Delim('|')) {
+            self.pos += 1;
+            let name = self.parse_name_or_star("type selector")?;
+            return Ok(TypeSelector {
+                namespace: Some(String::new()),
+                name,
+            });
+        }
+        let first = self.parse_name_or_star("type selector")?;
+        let namespaced = self.peek() == Some(&TokenKind::Delim('|'))
+            && matches!(
+                self.peek_at(1),
+                Some(TokenKind::Ident(_) | TokenKind::Delim('*'))
+            );
+        if namespaced {
+            self.pos += 1;
+            let name = self.parse_name_or_star("type selector after namespace")?;
+            return Ok(TypeSelector {
+                namespace: Some(first),
+                name,
+            });
+        }
+        Ok(TypeSelector {
+            namespace: None,
+            name: first,
+        })
     }
 
     fn parse_name_or_star(&mut self, context: &str) -> Result<String, SelectorParseError> {
-        if self.consume('*') {
-            return Ok("*".to_owned());
-        }
-        self.parse_identifier(context)
+        let name = match self.peek() {
+            Some(TokenKind::Delim('*')) => "*".to_owned(),
+            Some(TokenKind::Ident(name)) => name.to_string(),
+            _ => return self.error(&format!("expected {context} name")),
+        };
+        self.pos += 1;
+        Ok(name)
     }
 
-    fn parse_identifier(&mut self, context: &str) -> Result<String, SelectorParseError> {
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if is_name_char(c) {
-                self.pos += 1;
-            } else if c == '\\' {
-                self.pos += 1;
-                let Some(escaped) = self.peek() else {
-                    return self.error("incomplete CSS escape");
-                };
-                if escaped == '\n' || escaped == '\r' || escaped == '\u{000C}' {
-                    return self.error("CSS escapes cannot escape a newline");
-                }
-                if escaped.is_ascii_hexdigit() {
-                    let mut digits = 0;
-                    while self.peek().is_some_and(|next| next.is_ascii_hexdigit()) && digits < 6 {
-                        self.pos += 1;
-                        digits += 1;
-                    }
-                    if self.peek().is_some_and(char::is_whitespace) {
-                        self.pos += 1;
-                    }
-                } else {
-                    self.pos += 1;
-                }
-            } else {
-                break;
-            }
-        }
-        if self.pos == start {
+    fn parse_ident(&mut self, context: &str) -> Result<String, SelectorParseError> {
+        let Some(TokenKind::Ident(name)) = self.peek() else {
             return self.error(&format!("expected {context} name"));
+        };
+        let name = name.to_string();
+        self.pos += 1;
+        Ok(name)
+    }
+
+    /// Returns the tokens inside the block or function at the cursor and the
+    /// byte offset of its closing token, and moves past it. Reports `message`
+    /// when it is not closed by `closer`.
+    fn take_block(
+        &mut self,
+        closer: &TokenKind<'_>,
+        message: &str,
+    ) -> Result<(&'t [Token<'a>], usize), SelectorParseError> {
+        let open = self.pos;
+        let end = skip_component_value(self.tokens, open);
+        if self
+            .tokens
+            .get(end.wrapping_sub(1))
+            .map(|token| &token.kind)
+            != Some(closer)
+            || end == open + 1
+        {
+            self.pos = end;
+            return self.error(message);
         }
-        Ok(self.chars[start..self.pos].iter().collect())
+        self.pos = end;
+        let tokens: &'t [Token<'a>] = self.tokens;
+        Ok((&tokens[open + 1..end - 1], tokens[end - 1].span.start))
     }
 
     fn parse_attribute_selector(&mut self) -> Result<AttributeSelector, SelectorParseError> {
-        self.pos += 1; // '['
+        let (inner, end_offset) = self.take_block(
+            &TokenKind::CloseSquare,
+            "expected ']' to close attribute selector",
+        )?;
+        let mut parser = Parser {
+            source: self.source,
+            tokens: inner,
+            pos: 0,
+            end_offset,
+        };
+        parser.parse_attribute_contents()
+    }
+
+    fn parse_attribute_contents(&mut self) -> Result<AttributeSelector, SelectorParseError> {
         self.skip_whitespace();
-        let (namespace, name) = self.parse_attribute_name()?;
+        let (namespace, name) = match self.peek() {
+            Some(TokenKind::Delim('|')) => {
+                self.pos += 1;
+                (Some(String::new()), self.parse_ident("attribute")?)
+            }
+            Some(TokenKind::Delim('*')) => {
+                self.pos += 1;
+                if self.peek() != Some(&TokenKind::Delim('|')) {
+                    return self.error("expected '|' after wildcard attribute namespace");
+                }
+                self.pos += 1;
+                (
+                    Some("*".to_owned()),
+                    self.parse_ident("attribute after namespace")?,
+                )
+            }
+            _ => {
+                let first = self.parse_ident("attribute")?;
+                if self.peek() == Some(&TokenKind::Delim('|'))
+                    && matches!(self.peek_at(1), Some(TokenKind::Ident(_)))
+                {
+                    self.pos += 1;
+                    (Some(first), self.parse_ident("attribute after namespace")?)
+                } else {
+                    (None, first)
+                }
+            }
+        };
         self.skip_whitespace();
-        if self.consume(']') {
+        if self.is_eof() {
             return Ok(AttributeSelector {
                 namespace,
                 name,
@@ -461,34 +520,39 @@ impl Parser {
             });
         }
 
-        let operator = if self.consume('=') {
-            AttributeOperator::Equals
-        } else if self.consume('~') && self.consume('=') {
-            AttributeOperator::Includes
-        } else if self.consume('|') && self.consume('=') {
-            AttributeOperator::DashMatch
-        } else if self.consume('^') && self.consume('=') {
-            AttributeOperator::Prefix
-        } else if self.consume('$') && self.consume('=') {
-            AttributeOperator::Suffix
-        } else if self.consume('*') && self.consume('=') {
-            AttributeOperator::Substring
-        } else {
-            return self.error("expected attribute operator or ']' ");
-        };
-
-        self.skip_whitespace();
-        let value = self.parse_attribute_value()?;
-        self.skip_whitespace();
-        let modifier = match self.peek() {
-            Some(c @ ('i' | 'I' | 's' | 'S')) => {
-                self.pos += 1;
-                Some(c.to_ascii_lowercase())
-            }
+        let operator = match (self.peek(), self.peek_at(1)) {
+            (Some(TokenKind::Delim('=')), _) => Some((AttributeOperator::Equals, 1)),
+            (Some(TokenKind::Delim(prefix)), Some(TokenKind::Delim('='))) => match prefix {
+                '~' => Some((AttributeOperator::Includes, 2)),
+                '|' => Some((AttributeOperator::DashMatch, 2)),
+                '^' => Some((AttributeOperator::Prefix, 2)),
+                '$' => Some((AttributeOperator::Suffix, 2)),
+                '*' => Some((AttributeOperator::Substring, 2)),
+                _ => None,
+            },
             _ => None,
         };
+        let Some((operator, width)) = operator else {
+            return self.error("expected attribute operator or ']'");
+        };
+        self.pos += width;
         self.skip_whitespace();
-        if !self.consume(']') {
+        let value = match self.peek() {
+            Some(TokenKind::Ident(value) | TokenKind::String(value)) => value.to_string(),
+            _ => return self.error("expected an identifier or string attribute value"),
+        };
+        self.pos += 1;
+        self.skip_whitespace();
+        let modifier = match self.peek() {
+            Some(TokenKind::Ident(flag)) if flag.eq_ignore_ascii_case("i") => Some('i'),
+            Some(TokenKind::Ident(flag)) if flag.eq_ignore_ascii_case("s") => Some('s'),
+            _ => None,
+        };
+        if modifier.is_some() {
+            self.pos += 1;
+            self.skip_whitespace();
+        }
+        if !self.is_eof() {
             return self.error("expected ']' to close attribute selector");
         }
         Ok(AttributeSelector {
@@ -500,133 +564,89 @@ impl Parser {
         })
     }
 
-    fn parse_attribute_name(&mut self) -> Result<(Option<String>, String), SelectorParseError> {
-        if self.consume('|') {
-            return Ok((Some(String::new()), self.parse_identifier("attribute")?));
-        }
-        if self.consume('*') {
-            if !self.consume('|') {
-                return self.error("expected '|' after wildcard attribute namespace");
-            }
-            return Ok((
-                Some("*".to_owned()),
-                self.parse_identifier("attribute after namespace")?,
-            ));
-        }
-        let first = self.parse_identifier("attribute")?;
-        if self.consume('|') {
-            Ok((
-                Some(first),
-                self.parse_identifier("attribute after namespace")?,
-            ))
-        } else {
-            Ok((None, first))
-        }
-    }
-
-    fn parse_attribute_value(&mut self) -> Result<String, SelectorParseError> {
-        if let Some(quote @ ('\'' | '"')) = self.peek() {
-            self.pos += 1;
-            let start = self.pos;
-            while !self.is_eof() && self.peek() != Some(quote) {
-                if !self.is_eof() {
-                    self.pos += 1;
-                }
-            }
-            if self.is_eof() {
-                return self.error("unterminated quoted attribute value");
-            }
-            let value: String = self.chars[start..self.pos].iter().collect();
-            self.pos += 1;
-            Ok(value)
-        } else {
-            self.parse_identifier("attribute value")
-        }
-    }
-
     fn parse_pseudo_selector(&mut self) -> Result<PseudoSelector, SelectorParseError> {
         self.pos += 1; // ':'
-        let element = self.consume(':');
-        let name = self.parse_identifier("pseudo-selector")?;
-        let argument = if self.consume('(') {
-            Some(self.parse_function_argument()?)
-        } else {
-            None
-        };
-        let lower_name = name.to_ascii_lowercase();
-        let nested_text = match (lower_name.as_str(), argument.as_deref()) {
-            ("is" | "where" | "not" | "has" | "host" | "host-context" | "slotted", Some(text)) => {
-                Some(text)
+        let element = self.peek() == Some(&TokenKind::Colon);
+        if element {
+            self.pos += 1;
+        }
+        let (name, arguments) = match self.peek() {
+            Some(TokenKind::Ident(name)) => {
+                let name = name.to_string();
+                self.pos += 1;
+                (name, None)
             }
-            ("nth-child" | "nth-last-child", Some(text)) => nth_of_selector_argument(text),
-            _ => None,
+            Some(TokenKind::Function(name)) => {
+                let name = name.to_string();
+                let arguments = self.take_block(
+                    &TokenKind::CloseParen,
+                    "unterminated pseudo-selector argument",
+                )?;
+                (name, Some(arguments))
+            }
+            _ => return self.error("expected pseudo-selector name"),
         };
-        let nested_selectors = if let Some(text) = nested_text {
-            Some(Box::new(parse_selector_list_mode(
-                text,
-                lower_name == "has",
-            )?))
-        } else {
-            None
+        let Some((arguments, close_offset)) = arguments else {
+            return Ok(PseudoSelector {
+                element,
+                name,
+                argument: None,
+                nested_selectors: None,
+            });
+        };
+
+        let lower_name = name.to_ascii_lowercase();
+        let nested = match lower_name.as_str() {
+            "is" | "where" | "matches" | "-webkit-any" | "-moz-any" => Some(parse_list(
+                self.source,
+                arguments,
+                close_offset,
+                false,
+                true,
+            )?),
+            "not" | "host" | "host-context" | "slotted" => Some(parse_list(
+                self.source,
+                arguments,
+                close_offset,
+                false,
+                false,
+            )?),
+            "has" => Some(parse_list(
+                self.source,
+                arguments,
+                close_offset,
+                true,
+                false,
+            )?),
+            "nth-child" | "nth-last-child" => match nth_of_selector_tokens(arguments) {
+                Some(selectors) => Some(parse_list(
+                    self.source,
+                    selectors,
+                    close_offset,
+                    false,
+                    false,
+                )?),
+                None => None,
+            },
+            _ => None,
         };
         Ok(PseudoSelector {
             element,
             name,
-            argument,
-            nested_selectors,
+            argument: Some(source_text(self.source, arguments)),
+            nested_selectors: nested.map(Box::new),
         })
     }
-
-    fn parse_function_argument(&mut self) -> Result<String, SelectorParseError> {
-        let start = self.pos;
-        let mut depth = 1usize;
-        let mut quote: Option<char> = None;
-        while let Some(c) = self.peek() {
-            if let Some(q) = quote {
-                if c == '\\' {
-                    self.pos += 1;
-                    if !self.is_eof() {
-                        self.pos += 1;
-                    }
-                    continue;
-                }
-                if c == q {
-                    quote = None;
-                }
-                self.pos += 1;
-                continue;
-            }
-            match c {
-                '\'' | '"' => quote = Some(c),
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let argument: String = self.chars[start..self.pos].iter().collect();
-                        self.pos += 1;
-                        return Ok(argument.trim().to_owned());
-                    }
-                }
-                '\\' => {
-                    self.pos += 1;
-                    if !self.is_eof() {
-                        self.pos += 1;
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-            self.pos += 1;
-        }
-        self.error("unterminated pseudo-selector argument")
-    }
 }
 
-fn is_name_start(c: char) -> bool {
-    c == '_' || c == '-' || c.is_alphabetic() || c as u32 >= 0x80
-}
-fn is_name_char(c: char) -> bool {
-    is_name_start(c) || c.is_ascii_digit()
+/// Returns the selector-list tokens after the `of` keyword in an
+/// `:nth-child()` argument, if there is one.
+fn nth_of_selector_tokens<'t, 'a>(arguments: &'t [Token<'a>]) -> Option<&'t [Token<'a>]> {
+    let of = arguments.iter().position(
+        |token| matches!(&token.kind, TokenKind::Ident(word) if word.eq_ignore_ascii_case("of")),
+    )?;
+    let selectors = trim_whitespace(&arguments[of + 1..]);
+    (!selectors.is_empty()).then_some(selectors)
 }
 
 #[cfg(test)]

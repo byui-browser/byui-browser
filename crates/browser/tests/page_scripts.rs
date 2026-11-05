@@ -63,6 +63,26 @@ fn html_script_reaches_registered_web_api() {
 }
 
 #[test]
+fn html_script_history_survives_document_registration() {
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+    let result = BrowserRuntime::in_memory()
+        .evaluate_page_scripts(
+            "<script>window.history().pushState('ready', ''); window.history().state</script>",
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            security_context(),
+        )
+        .expect("history should remain available after document registration");
+
+    assert_eq!(result, vec![js::Value::String("ready".into())]);
+}
+
+#[test]
 fn html_script_reaches_registered_alert_api() {
     let console = Arc::new(TestConsole::default());
     let alert = Arc::new(TestAlert::default());

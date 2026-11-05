@@ -30,11 +30,15 @@ pub(crate) struct Context<'a> {
 /// - Canvas background propagation from the root element or `body`
 ///   (CSS Backgrounds 3 §2.11.2).
 ///
-/// Only `display`, margins, padding, `width`, `height`, `font-size`, `color`,
-/// and `background-color` are read; all other properties take their initial
-/// values. Floats, positioning, borders, min/max sizes, and table, flex, and
-/// grid layout (laid out as `flow-root`) are not implemented. Content may
-/// overflow the viewport; the root box's rect stays viewport-sized.
+/// `display:flex` and `display:inline-flex` use a single-line flex subset with
+/// `flex-direction:row|column`, `flex-grow`, and `gap`. Wrapping, shrinking,
+/// alignment, and anonymous flex items for mixed text are not implemented.
+/// Grid and table modes are preserved distinctly in computed display values,
+/// but still use ordinary flow layout. Other supported properties are
+/// margins, padding, `width`, `height`, `font-size`, `color`, and
+/// `background-color`; unsupported properties use their initial values.
+/// Floats, positioning, borders, and min/max sizes are not implemented.
+/// Content may overflow the viewport; the root box's rect stays viewport-sized.
 pub fn layout_document(
     document: &HTMLDocument,
     styles: &css::ComputedStyles,

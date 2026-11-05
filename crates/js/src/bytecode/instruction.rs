@@ -113,6 +113,26 @@ pub enum Instruction {
         /// Constant-pool index of the method name string.
         name: u16,
     },
+    /// Throws the value popped from the stack as an exception.
+    ///
+    /// The VM unwinds to the innermost active handler, which may belong to a
+    /// calling frame, and jumps to its target with the thrown value on the
+    /// stack. With no handler the script fails with a
+    /// [`JsErrorCategory::Thrown`](crate::JsErrorCategory::Thrown) error.
+    Throw,
+    /// Registers an exception handler that stays active until the matching
+    /// [`Instruction::ExitTry`].
+    ///
+    /// The operand is the instruction offset to run when a catchable error
+    /// is raised while the handler is active, from this frame or any callee.
+    /// The VM first restores the operand stack height and the lexical scope
+    /// depth recorded here, discards the frames of callees, and pushes the
+    /// thrown value, so the target starts with exactly one extra value. Both
+    /// `throw` and runtime or host errors take this path; limit errors do not.
+    EnterTry(usize),
+    /// Removes the innermost exception handler, which must belong to the
+    /// running frame. A handler that fires is removed automatically.
+    ExitTry,
     /// Enters a lexical environment with `slot_count` slots.
     EnterScope(u16),
     /// Leaves the current lexical environment.

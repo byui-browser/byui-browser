@@ -21,9 +21,27 @@ pub struct Vm {
     frame: Frame,
     /// Suspended frames of the active callers, outermost first.
     callers: Vec<Frame>,
+    /// Active exception handlers, innermost last. Each was registered by an
+    /// `EnterTry` of the frame at `frame_depth` and has not been left yet.
+    handlers: Vec<Handler>,
     steps_remaining: u64,
     loop_iterations_remaining: u64,
     call_depth_limit: usize,
+}
+
+/// An active exception handler registered by [`Instruction::EnterTry`].
+#[derive(Debug, Clone, Copy)]
+struct Handler {
+    /// Instruction offset, in the registering frame's chunk, that receives
+    /// the thrown value.
+    target: usize,
+    /// Number of suspended callers when the handler was registered, which
+    /// identifies the registering frame.
+    frame_depth: usize,
+    /// Operand stack height to restore before delivering the exception.
+    stack_height: usize,
+    /// Lexical scope depth of the registering frame to restore.
+    scope_depth: usize,
 }
 
 /// Execution state of one chunk: the program or a single call.
@@ -78,6 +96,73 @@ impl Vm {
         Self::default()
     }
 
+    /// Constructs an instance by running a bytecode function with `new`.
+    ///
+    /// The function's captured realm globals are not available to this
+    /// standalone construction path; constructors that read globals may
+    /// therefore fail. This is intended for host APIs that need to invoke a
+    /// constructor without an active script VM.
+    pub fn construct_function(function: Function, arguments: &[Value]) -> JsResult<Value> {
+        let argument_count = u16::try_from(arguments.len())
+            .map_err(|_| JsError::runtime("too many constructor arguments"))?;
+        let mut constants = Vec::with_capacity(arguments.len() + 1);
+        constants.push(Value::Function(function));
+        constants.extend_from_slice(arguments);
+        let mut code = Vec::with_capacity(arguments.len() + 3);
+        code.push(Instruction::Constant(0));
+        for index in 0..arguments.len() {
+            let index = u16::try_from(index + 1)
+                .map_err(|_| JsError::runtime("too many constructor arguments"))?;
+            code.push(Instruction::Constant(index));
+        }
+        code.push(Instruction::New(argument_count));
+        code.push(Instruction::Return);
+        let chunk = Chunk {
+            locations: vec![None; code.len()],
+            code,
+            constants,
+            names: Vec::new(),
+            functions: Vec::new(),
+        };
+        Self::new().execute(&chunk)
+    }
+
+    /// Calls `function` with an explicit receiver and arguments.
+    ///
+    /// Bytecode functions execute in a fresh VM without their original global
+    /// environment. This host entry point supports callbacks that only depend
+    /// on their receiver and arguments.
+    pub fn call_function(
+        function: Function,
+        receiver: Value,
+        arguments: &[Value],
+    ) -> JsResult<Value> {
+        let argument_count = u16::try_from(arguments.len())
+            .map_err(|_| JsError::runtime("too many function arguments"))?;
+        let mut constants = Vec::with_capacity(arguments.len() + 2);
+        constants.push(receiver);
+        constants.push(Value::Function(function));
+        constants.extend_from_slice(arguments);
+        let mut code = Vec::with_capacity(arguments.len() + 4);
+        code.push(Instruction::Constant(0));
+        code.push(Instruction::Constant(1));
+        for index in 0..arguments.len() {
+            let index = u16::try_from(index + 2)
+                .map_err(|_| JsError::runtime("too many function arguments"))?;
+            code.push(Instruction::Constant(index));
+        }
+        code.push(Instruction::CallMethod(argument_count));
+        code.push(Instruction::Return);
+        let chunk = Chunk {
+            locations: vec![None; code.len()],
+            code,
+            constants,
+            names: Vec::new(),
+            functions: Vec::new(),
+        };
+        Self::new().execute(&chunk)
+    }
+
     /// Executes `chunk` and returns its completion value.
     pub fn execute(&mut self, chunk: &Chunk) -> JsResult<Value> {
         self.execute_with_limits(chunk, ExecutionLimits::default())
@@ -101,6 +186,7 @@ impl Vm {
         );
         self.stack.clear();
         self.callers.clear();
+        self.handlers.clear();
         self.frame = Frame {
             chunk: Arc::new(chunk.clone()),
             this: Some(Value::Undefined),
@@ -117,13 +203,60 @@ impl Vm {
         // Drop references to script values held by an abandoned run.
         self.stack.clear();
         self.callers.clear();
+        self.handlers.clear();
         self.frame = Frame::default();
         result
     }
 
+    /// Runs until the program returns or an error nothing handles.
+    ///
+    /// Exceptions are resolved here, entirely inside the VM: an error raised
+    /// by an instruction, a callee, or a host function is delivered to the
+    /// innermost active handler, and execution resumes at its target.
     fn run(&mut self) -> JsResult<Value> {
+        let mut start = 0;
+        loop {
+            match self.run_from(start) {
+                Ok(value) => return Ok(value),
+                Err(error) => start = self.unwind(error)?,
+            }
+        }
+    }
+
+    /// Delivers `error` to the innermost handler and returns the offset to
+    /// resume at in the (possibly different) running frame.
+    ///
+    /// Callee frames above the handler's frame are discarded without
+    /// finishing, and the operand stack and scope depth return to what the
+    /// handler recorded. Errors that scripts cannot catch, or any error with
+    /// no handler, are returned unchanged as the script's failure.
+    fn unwind(&mut self, error: JsError) -> JsResult<usize> {
+        if !error.category.is_catchable() {
+            return Err(error);
+        }
+        let Some(handler) = self.handlers.pop() else {
+            return Err(error);
+        };
+        log::debug!(
+            "unwinding {} frame(s) to a handler: {}",
+            self.callers.len().saturating_sub(handler.frame_depth),
+            error.message
+        );
+        while self.callers.len() > handler.frame_depth {
+            self.frame = self
+                .callers
+                .pop()
+                .ok_or_else(|| JsError::runtime("bytecode call stack underflow"))?;
+        }
+        self.stack.truncate(handler.stack_height);
+        self.frame.scopes.truncate(handler.scope_depth);
+        self.push(error.into_caught_value());
+        Ok(handler.target)
+    }
+
+    fn run_from(&mut self, start: usize) -> JsResult<Value> {
         let mut chunk = Arc::clone(&self.frame.chunk);
-        let mut instruction_pointer = 0;
+        let mut instruction_pointer = start;
         while let Some(instruction) = chunk.code.get(instruction_pointer).copied() {
             if self.steps_remaining == 0 {
                 log::warn!("instruction step limit reached in the bytecode VM");
@@ -171,6 +304,29 @@ impl Vm {
                     }
                     instruction_pointer = target;
                 }
+                Instruction::Throw => {
+                    let value = self.pop()?;
+                    return Err(JsError::rethrown(value));
+                }
+                Instruction::EnterTry(target) => {
+                    validate_jump(target, &chunk, instruction_pointer - 1)?;
+                    self.handlers.push(Handler {
+                        target,
+                        frame_depth: self.callers.len(),
+                        stack_height: self.stack.len(),
+                        scope_depth: self.frame.scopes.len(),
+                    });
+                }
+                Instruction::ExitTry => match self.handlers.pop() {
+                    Some(handler) if handler.frame_depth == self.callers.len() => {}
+                    _ => {
+                        return Err(bytecode_error(
+                            &chunk,
+                            instruction_pointer - 1,
+                            "bytecode exited an exception handler it does not own",
+                        ));
+                    }
+                },
                 Instruction::Return => {
                     if self.callers.is_empty() {
                         return Ok(self.stack.pop().unwrap_or(Value::Undefined));
@@ -611,6 +767,14 @@ impl Vm {
             .pop()
             .ok_or_else(|| JsError::runtime("bytecode call stack underflow"))?;
         let finished = std::mem::replace(&mut self.frame, caller);
+        // Handlers of the finished frame cannot outlive it.
+        while self
+            .handlers
+            .last()
+            .is_some_and(|handler| handler.frame_depth > self.callers.len())
+        {
+            self.handlers.pop();
+        }
         let result = match finished.mode {
             ReturnMode::Call => returned,
             ReturnMode::Construct | ReturnMode::SuperCall => {

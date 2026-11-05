@@ -14,6 +14,14 @@ interpreter for those constructs. Each VM call uses a frame with its own chunk,
 instruction pointer, operand-stack base, and function scope. Call depth is
 bounded by `ExecutionLimits::call_depth_limit`.
 
+Exceptions (`throw`, `try`/`catch`/`finally`) and loop control (`break`,
+`continue` in `while`) compile to handler instructions and are resolved
+entirely inside the VM; see the `bytecode` module documentation for the
+design. The tree-walk interpreter implements the same semantics so
+`Realm` scripts and the `Automatic` fallback behave identically, and
+`tests/exceptions.rs` compares the two engines. Limit errors are never
+catchable and skip `finally` blocks in both engines.
+
 `Interpreter` remains available for differential comparisons. `Bytecode`
 requires the VM path. Current VM chunks own fresh bindings, so `Realm` keeps
 using the interpreter until persistent global slots and host-value resolution

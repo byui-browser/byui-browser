@@ -46,6 +46,9 @@ struct ObjectData {
     read_only_properties: Mutex<HashSet<String>>,
     prototype: Mutex<Option<Object>>,
     constructor: Mutex<Option<WeakFunction>>,
+    /// For the object a `catch` clause receives for an engine error: the
+    /// error itself, restored if the object is thrown again unchanged.
+    origin: Mutex<Option<crate::JsError>>,
 }
 
 /// A non-owning reference to an [`Object`], used to break reference cycles.
@@ -70,6 +73,20 @@ impl Object {
         let object = Self::new();
         *object.prototype_slot() = prototype;
         object
+    }
+
+    /// Records the engine error this object was made from.
+    pub(crate) fn set_origin(&self, error: crate::JsError) {
+        *self.0.origin.lock().unwrap_or_else(PoisonError::into_inner) = Some(error);
+    }
+
+    /// Returns the engine error this object was made from, if any.
+    pub(crate) fn origin(&self) -> Option<crate::JsError> {
+        self.0
+            .origin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn properties(&self) -> MutexGuard<'_, Vec<(String, Value)>> {

@@ -9,7 +9,7 @@ use html::{HTMLDocument, NodeID, NodeKind};
 use crate::style::{ComputedStyle, Display, DisplayInside, DisplayOutside};
 
 /// A block container box before layout.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct BlockBox {
     /// The generating element, or `None` for anonymous boxes and the initial
     /// containing block.
@@ -23,7 +23,7 @@ pub(crate) struct BlockBox {
 
 /// A block container holds either only block-level boxes or only inline-level
 /// content (CSS 2.2 §9.2.1.1).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum BlockContents {
     Blocks(Vec<BlockBox>),
     Inlines(Vec<InlineItem>),
@@ -31,7 +31,7 @@ pub(crate) enum BlockContents {
 
 /// Inline-level content of an inline formatting context, flattened in tree
 /// order. Inline boxes are bracketed by `Start` and `End`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum InlineItem {
     Text {
         node: NodeID,
@@ -219,7 +219,10 @@ impl Builder<'_> {
         let flow_root = matches!(
             style.display,
             Display::Box {
-                inside: DisplayInside::FlowRoot,
+                inside: DisplayInside::FlowRoot
+                    | DisplayInside::Flex
+                    | DisplayInside::Grid
+                    | DisplayInside::Table,
                 ..
             }
         );
@@ -371,7 +374,11 @@ impl Builder<'_> {
                     }
                     Display::Box {
                         outside: DisplayOutside::Inline,
-                        inside: DisplayInside::FlowRoot,
+                        inside:
+                            DisplayInside::FlowRoot
+                            | DisplayInside::Flex
+                            | DisplayInside::Grid
+                            | DisplayInside::Table,
                     } => {
                         let atomic = self.block_box(node, style, false);
                         levels.push(Level::Inline(InlineItem::Atomic(atomic)));

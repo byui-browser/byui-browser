@@ -10,10 +10,12 @@
  *    background propagates to it (CSS Backgrounds 3 §2.11.2).
  *  - Only hex, `rgb()` and basic named colors are understood by `parse_color`,
  *    so system colors (`LinkText`, `Canvas`, ...) are spelled out as hex.
- *  - The selector matcher currently supports type, class, id and descendant
- *    selectors. Rules using `>`, `+`, `~`, attribute selectors, pseudo-classes
- *    and pseudo-elements are kept here for spec fidelity; they are inert until
- *    the cascade learns those selectors.
+ *  - The selector matcher supports combinators, attribute selectors, and
+ *    structural and logical pseudo-classes. Dynamic pseudo-classes (`:hover`,
+ *    `:focus`, `:visited`, ...) and pseudo-elements never match, so those
+ *    rules are kept for spec fidelity but stay inert.
+ *  - Attribute values must be identifiers or strings, so numbers are quoted
+ *    (`[frameborder="0" i]`).
  *  - Layout consumes `display`, margins, padding, `width`, `height`,
  *    `font-size`, `color`, and `background-color`. Properties it does not
  *    consume yet (borders, list styles, `white-space`, ...) are still declared
@@ -456,7 +458,7 @@ iframe {
   border: 2px inset;
 }
 
-iframe:not([frameborder=0 i]) {
+iframe:not([frameborder="0" i]) {
   border: 2px inset;
 }
 
