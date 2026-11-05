@@ -227,7 +227,17 @@ impl Context<'_> {
         let mut lines = Vec::new();
         let flow = match &block.contents {
             BlockContents::Blocks(list) => {
-                self.layout_flow(list, content_width, specified_height, edges, &mut children)
+                if matches!(
+                    style.display,
+                    crate::style::Display::Box {
+                        inside: crate::style::DisplayInside::Flex,
+                        ..
+                    }
+                ) {
+                    self.layout_flex(list, content_width, specified_height, style, &mut children)
+                } else {
+                    self.layout_flow(list, content_width, specified_height, edges, &mut children)
+                }
             }
             BlockContents::Inlines(items) => {
                 lines = self.layout_inline(items, style, content_width);
@@ -362,6 +372,110 @@ impl Context<'_> {
                 margin_bottom: edges.own_bottom,
                 has_content,
             }
+        }
+    }
+
+    /// Lays out a single flex line in row or column direction. Wrapping,
+    /// shrink factors, alignment, and baseline alignment are not implemented.
+    fn layout_flex(
+        &self,
+        list: &[BlockBox],
+        width: f32,
+        height: Option<f32>,
+        style: &ComputedStyle,
+        children: &mut Vec<LayoutBox>,
+    ) -> FlowResult {
+        if list.is_empty() {
+            return FlowResult {
+                height: 0.0,
+                margin_top: CollapsibleMargin::default(),
+                margin_bottom: CollapsibleMargin::default(),
+                has_content: false,
+            };
+        }
+        let column = style.flex_column;
+        let available = if column { height.unwrap_or(0.0) } else { width };
+        let gaps = style.gap * list.len().saturating_sub(1) as f32;
+        let basis = list
+            .iter()
+            .map(|item| {
+                if column {
+                    item.style.height.resolve(height).unwrap_or_else(|| {
+                        self.layout_block_level(
+                            item,
+                            ContainingBlock {
+                                width,
+                                height: None,
+                            },
+                        )
+                        .fragment
+                        .rect
+                        .height
+                    })
+                } else {
+                    item.style
+                        .width
+                        .resolve(Some(width))
+                        .unwrap_or_else(|| self.intrinsic_content_sizes(item).1)
+                }
+            })
+            .collect::<Vec<_>>();
+        let grow: f32 = list.iter().map(|item| item.style.flex_grow).sum();
+        let free = (available - gaps - basis.iter().sum::<f32>()).max(0.0);
+        let mut cursor = 0.0;
+        let mut cross = 0.0_f32;
+        for (source, base) in list.iter().zip(basis) {
+            let item = source;
+            let share = if grow > 0.0 {
+                free * item.style.flex_grow / grow
+            } else {
+                0.0
+            };
+            let target = base + share;
+            let mut item = item.clone();
+            let mut computed = (*item.style).clone();
+            if column {
+                computed.height = Dimension::Px(target);
+            } else {
+                computed.width = Dimension::Px(target);
+            }
+            item.style = std::rc::Rc::new(computed);
+            let item_width = if column {
+                width
+            } else {
+                target
+                    + item
+                        .style
+                        .padding
+                        .map(|value| value.resolve_or_zero(Some(width)))
+                        .horizontal()
+            };
+            let result = self.layout_block_level(
+                &item,
+                ContainingBlock {
+                    width: item_width,
+                    height,
+                },
+            );
+            let mut fragment = result.fragment;
+            if column {
+                fragment.translate(0.0, cursor + fragment.margin.top);
+                cursor +=
+                    fragment.rect.height + fragment.margin.top + fragment.margin.bottom + style.gap;
+                cross = cross.max(fragment.rect.width);
+            } else {
+                fragment.translate(cursor + fragment.margin.left, 0.0);
+                cursor +=
+                    fragment.rect.width + fragment.margin.left + fragment.margin.right + style.gap;
+                cross = cross.max(fragment.rect.height);
+            }
+            children.push(fragment);
+        }
+        FlowResult {
+            height: if column { cursor - style.gap } else { cross },
+            margin_top: CollapsibleMargin::default(),
+            margin_bottom: CollapsibleMargin::default(),
+            has_content: true,
         }
     }
 
