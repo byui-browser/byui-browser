@@ -44,7 +44,7 @@ impl ElementData {
         self.attributes = attributes;
     }
 
-    // Gets attribute with name.
+    /// Gets attribute with name.
     pub fn get_attribute(&self, name: String) -> Option<&Attribute> {
         if let Some(index) = self
             .attributes
