@@ -18,7 +18,7 @@ impl RequestController {
     pub(crate) fn prepare_request(
         &self,
         mut request: Request,
-    ) -> Result<(Request, ValidatedUrl, bool), RequestError> {
+    ) -> Result<(Request, ValidatedUrl), RequestError> {
         if request.signal.is_aborted() {
             log::debug!(
                 "request aborted before preparation: {}",
@@ -65,17 +65,17 @@ impl RequestController {
             return Err(RequestError::UnsupportedFeature("browser services"));
         }
 
-        let cacheable = request.is_cacheable_method() && validated_url.scheme.is_http();
-        if cacheable && request.cache_mode != CacheMode::NoStore {
+        if validated_url.scheme.is_http() && request.cache_mode != CacheMode::NoStore {
             if let Some(services) = &self.inner.services {
                 request.cache_partition = Some(services.cache_partition(&request)?);
             }
         }
         log::trace!(
-            "request prepared: {} scheme={:?} cacheable={cacheable}",
+            "request prepared: {} scheme={:?} cacheable={}",
             crate::log_url::loggable(validated_url.url.as_str()),
-            validated_url.scheme
+            validated_url.scheme,
+            request.is_cacheable_method()
         );
-        Ok((request, validated_url, cacheable))
+        Ok((request, validated_url))
     }
 }

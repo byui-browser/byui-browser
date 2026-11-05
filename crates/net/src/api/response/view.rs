@@ -118,7 +118,7 @@ impl InternalResponse {
             url_list: vec![resource.url.to_string()],
             redirect_count: 0,
             origin: Some(resource.origin),
-            request_origin: request.context.environment.origin.clone(),
+            request_origin: request.effective_origin().cloned(),
             request_mode: request.context.mode,
             credentials_mode: request.context.credentials,
             response_type: ResponseType::Basic,
