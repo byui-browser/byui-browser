@@ -44,6 +44,18 @@ impl ElementData {
         self.attributes = attributes;
     }
 
+    // Gets attribute with name.
+    pub fn get_attribute(&self, name: String) -> Option<&Attribute> {
+        if let Some(index) = self
+            .attributes
+            .iter()
+            .position(|attribute_ref| attribute_ref.get_name() == &name)
+        {
+            return Option::Some(&self.attributes[index]);
+        } else {
+            return Option::None;
+        }
+    }
     // Updates or adds element attribute.
     pub fn set_attribute(&mut self, attribute: Attribute) {
         if let Some(index) = self
