@@ -8,6 +8,7 @@ use crate::ast::{
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::rc::Rc;
 use std::sync::Arc;
 
 #[path = "control_flow.rs"]
@@ -75,6 +76,38 @@ pub struct Compiler {
     /// Names of local variables of enclosing blocks and functions. A function
     /// body cannot capture them, so referring to one is a compile error.
     enclosing: HashSet<String>,
+    /// Number of statement-level values on the operand stack: completion
+    /// values waiting in enclosing sequences and loops. `break`, `continue`,
+    /// and `return` use it to discard exactly the values they leave behind.
+    live: usize,
+    /// Enclosing loops and exception handlers of the code being compiled,
+    /// outermost first.
+    control: Vec<Control>,
+}
+
+/// A construct that an abrupt exit may have to leave.
+#[derive(Debug, Clone)]
+enum Control {
+    /// A `while` loop.
+    Loop {
+        /// Value of `Compiler::live` inside the loop body.
+        live: usize,
+        /// Number of compile-time scopes outside the loop body.
+        scopes: usize,
+        /// Offset of the condition, the target of `continue`.
+        start: usize,
+        /// `break` jumps, patched to the loop exit.
+        breaks: Vec<usize>,
+    },
+    /// An active runtime exception handler.
+    Handler {
+        /// Value of `Compiler::live` where the handler was entered.
+        live: usize,
+        /// Number of compile-time scopes where the handler was entered.
+        scopes: usize,
+        /// The `finally` block that runs when this handler's region is left.
+        finally: Option<Rc<[Statement]>>,
+    },
 }
 
 #[derive(Debug)]
@@ -103,6 +136,8 @@ impl Compiler {
             function: None,
             globals: HashMap::new(),
             enclosing: HashSet::new(),
+            live: 0,
+            control: Vec::new(),
         }
     }
 
@@ -128,6 +163,8 @@ impl Compiler {
             function: Some(kind),
             globals,
             enclosing,
+            live: 0,
+            control: Vec::new(),
         }
     }
 
@@ -299,10 +336,23 @@ impl Compiler {
                 }
             }
             Statement::While { body, .. } => self.collect_vars(body)?,
+            Statement::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                let clause = handler.iter().flat_map(|clause| &clause.body);
+                for statement in block.iter().chain(clause).chain(finalizer.iter().flatten()) {
+                    self.collect_vars(statement)?;
+                }
+            }
             Statement::FunctionDeclaration { .. }
             | Statement::ClassDeclaration(_)
             | Statement::Expression(_)
             | Statement::Return(_)
+            | Statement::Throw(_)
+            | Statement::Break
+            | Statement::Continue
             | Statement::VariableDeclaration { .. } => {}
         }
         Ok(())
@@ -436,7 +486,9 @@ impl Compiler {
         wants_completion: bool,
     ) -> Result<bool, CompileError> {
         let mut has_value = false;
+        let base = self.live;
         for statement in statements {
+            self.live = base + usize::from(has_value);
             let produced = self.compile_statement(statement, true)?;
             if produced {
                 if has_value {
@@ -446,6 +498,7 @@ impl Compiler {
                 has_value = true;
             }
         }
+        self.live = base;
         if wants_completion {
             if !has_value {
                 self.constant(Value::Undefined)?;
@@ -472,20 +525,7 @@ impl Compiler {
                 }
                 Ok(is_completion)
             }
-            Statement::Block(statements) => {
-                let scope = self.enter_block()?;
-                self.collect_block_bindings(scope, statements)?;
-                let enter = self.chunk.emit(Instruction::EnterScope(0));
-                self.emit_scope_declarations(scope)?;
-                self.compile_sequence(statements, true)?;
-                self.chunk.code[enter] = Instruction::EnterScope(self.scopes[scope].slots);
-                self.chunk.emit(Instruction::ExitScope);
-                self.scopes.pop();
-                if !is_completion {
-                    self.chunk.emit(Instruction::Pop);
-                }
-                Ok(is_completion)
-            }
+            Statement::Block(statements) => self.compile_block(statements, is_completion),
             Statement::VariableDeclaration { kind, name, init } => {
                 if let Some(init) = init {
                     self.compile_expression(init)?;
@@ -517,6 +557,22 @@ impl Compiler {
                 self.compile_class(class)?;
                 Ok(false)
             }
+            Statement::Throw(value) => {
+                self.compile_expression(value)?;
+                self.chunk.emit(Instruction::Throw);
+                // Unreachable, but keeps the stack shape that callers expect.
+                if is_completion {
+                    self.constant(Value::Undefined)?;
+                }
+                Ok(is_completion)
+            }
+            Statement::Try {
+                block,
+                handler,
+                finalizer,
+            } => self.compile_try(block, handler.as_ref(), finalizer.as_deref(), is_completion),
+            Statement::Break => self.compile_loop_jump(true, is_completion),
+            Statement::Continue => self.compile_loop_jump(false, is_completion),
             Statement::Return(value) => {
                 if self.function.is_none() {
                     return Err(CompileError::unsupported("return outside a function"));
@@ -525,6 +581,11 @@ impl Compiler {
                     Some(value) => self.compile_expression(value)?,
                     None => self.constant(Value::Undefined)?,
                 }
+                // The value waits on the stack while `finally` blocks run.
+                self.live += 1;
+                let unwound = self.unwind(0, None, None);
+                self.live -= 1;
+                unwound?;
                 self.chunk.emit(Instruction::Return);
                 // Unreachable, but keeps the stack shape that callers expect.
                 if is_completion {
@@ -533,6 +594,27 @@ impl Compiler {
                 Ok(is_completion)
             }
         }
+    }
+
+    /// Compiles statements in a new lexical scope. With `is_completion` the
+    /// block leaves its completion value on the stack.
+    fn compile_block(
+        &mut self,
+        statements: &[Statement],
+        is_completion: bool,
+    ) -> Result<bool, CompileError> {
+        let scope = self.enter_block()?;
+        self.collect_block_bindings(scope, statements)?;
+        let enter = self.chunk.emit(Instruction::EnterScope(0));
+        self.emit_scope_declarations(scope)?;
+        self.compile_sequence(statements, true)?;
+        self.chunk.code[enter] = Instruction::EnterScope(self.scopes[scope].slots);
+        self.chunk.emit(Instruction::ExitScope);
+        self.scopes.pop();
+        if !is_completion {
+            self.chunk.emit(Instruction::Pop);
+        }
+        Ok(is_completion)
     }
 
     fn compile_expression(&mut self, expression: &Expr) -> Result<(), CompileError> {

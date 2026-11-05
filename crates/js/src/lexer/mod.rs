@@ -49,6 +49,18 @@ pub enum Token {
     Function,
     /// `return` keyword.
     Return,
+    /// `throw` keyword.
+    Throw,
+    /// `try` keyword.
+    Try,
+    /// `catch` keyword.
+    Catch,
+    /// `finally` keyword.
+    Finally,
+    /// `break` keyword.
+    Break,
+    /// `continue` keyword.
+    Continue,
     /// `class` keyword.
     Class,
     /// `extends` keyword.
@@ -562,6 +574,12 @@ fn keyword(name: &str) -> Option<Token> {
         "while" => Token::While,
         "function" => Token::Function,
         "return" => Token::Return,
+        "throw" => Token::Throw,
+        "try" => Token::Try,
+        "catch" => Token::Catch,
+        "finally" => Token::Finally,
+        "break" => Token::Break,
+        "continue" => Token::Continue,
         "class" => Token::Class,
         "extends" => Token::Extends,
         "new" => Token::New,

@@ -58,7 +58,10 @@ type ParseResult<T> = Result<T, ParseError>;
 /// literals allow a trailing comma. A `{` at the start of a statement opens a
 /// block, as in JavaScript, so wrap an object literal statement in
 /// parentheses: `({ a: 1 })`.
-/// Returns outside functions, constants without initializers, duplicate
+/// `throw` must have its operand on the same line. `try` needs a `catch`
+/// clause (with an optional identifier binding) or a `finally` block.
+/// `break` and `continue` must sit in a `while` loop of the same function and
+/// take no label. Returns outside functions, constants without initializers, duplicate
 /// parameter names, and `let`/`const`/`function` declarations used directly as
 /// an `if`, `else`, or `while` body are rejected.
 ///
@@ -117,6 +120,10 @@ struct Parser<'tokens> {
     position: usize,
     depth: usize,
     function_depth: usize,
+    /// For each `while` loop being parsed, the `function_depth` it sits at.
+    /// `break` and `continue` are valid only when the innermost loop belongs
+    /// to the function being parsed.
+    loops: Vec<usize>,
     /// Nonzero while parsing a class method body, where `super` is valid.
     method_depth: usize,
     line_terminators_before: &'tokens [bool],
@@ -129,6 +136,7 @@ impl<'tokens> Parser<'tokens> {
             position: 0,
             depth: 0,
             function_depth: 0,
+            loops: Vec::new(),
             method_depth: 0,
             line_terminators_before,
         }

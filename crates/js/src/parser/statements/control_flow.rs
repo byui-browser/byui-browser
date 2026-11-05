@@ -10,7 +10,14 @@ pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Statement> {
     parser.expect(&Token::LeftParen, "condition")?;
     let condition = parser.parse_expression(0)?;
     parser.expect(&Token::RightParen, "condition")?;
-    let body = Box::new(body_statement(parser)?);
+    if !is_if {
+        parser.loops.push(parser.function_depth);
+    }
+    let body = body_statement(parser);
+    if !is_if {
+        parser.loops.pop();
+    }
+    let body = Box::new(body?);
     if is_if {
         let else_branch = if parser.consume(&Token::Else) {
             Some(Box::new(body_statement(parser)?))
