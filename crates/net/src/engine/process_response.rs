@@ -18,7 +18,31 @@ impl RequestController {
         request: &Request,
         response: &mut InternalResponse,
     ) -> Result<(), RequestError> {
-        response.response_type = self.inner.cors.response_type(request, response)?;
+        self.finalize_response_with_type(request, response, None)
+    }
+
+    /// Applies shared policy to a manual redirect before exposing its opaque view.
+    pub(crate) fn finalize_manual_redirect_response(
+        &self,
+        request: &Request,
+        response: &mut InternalResponse,
+    ) -> Result<(), RequestError> {
+        self.finalize_response_with_type(
+            request,
+            response,
+            Some(crate::api::response::ResponseType::OpaqueRedirect),
+        )
+    }
+
+    /// Runs CORS validation and optionally replaces the public response class.
+    fn finalize_response_with_type(
+        &self,
+        request: &Request,
+        response: &mut InternalResponse,
+        exposed_type: Option<crate::api::response::ResponseType>,
+    ) -> Result<(), RequestError> {
+        let classified_type = self.inner.cors.response_type(request, response)?;
+        response.response_type = exposed_type.unwrap_or(classified_type);
         log::trace!(
             "response type classified: {:?} for {}",
             response.response_type,

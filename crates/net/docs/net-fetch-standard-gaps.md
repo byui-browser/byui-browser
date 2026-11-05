@@ -32,8 +32,8 @@ implemented while other `about:` URLs remain unsupported.
 | Request headers and methods | Method validation, request/no-CORS guards, internal generated-header channels, and response filtering exist; later redirect/header rules remain                                                                                                  | Medium       |
 | Request and response bodies | Authoritative buffered/streaming `Body`, helpers, metadata, fallible cloning, bounded teeing, and null-body handling exist in the committed slice; JavaScript conversion, keepalive lifetime, and the in-progress body ownership refactor remain | Medium       |
 | Credentials and cookies     | `FetchServices` exposes cookie selection/storage hooks, but the current browser service selects no cookies and stores none; matching, persistence, and policy remain provider work                                                               | Critical     |
-| CORS and response tainting  | Simple CORS checks and basic/opaque views exist; preflight and redirect checks are absent                                                                                                                                                        | Critical     |
-| Redirects                   | Controller follows validated HTTP(S) redirects with `follow`, `error`, and `manual` modes; full browser policy remains incomplete                                                                                                                | High         |
+| CORS and response tainting  | Simple CORS checks and basic/opaque views exist on every HTTP redirect hop; preflight requests and caching are absent                                                                                                                            | Critical     |
+| Redirects                   | Controller follows validated HTTP(S) redirects with per-hop policy, credentials, origin/referrer transitions, cache lookup, and `follow`, `error`, and `manual` modes; broader browser subsystems remain partial                                  | Medium       |
 | HTTP cache                  | TTL-only in-memory cache with provider-supplied partition keys; full matching/revalidation is absent                                                                                                                                             | High         |
 | Fetch policy integrations   | Browser-context requests require `FetchServices`; CSP, mixed content, CORP, SRI, and worker interception remain provider/later-step work                                                                                                         | Critical     |
 | Cancellation and lifecycle  | Basic abort signal works, but Fetch controller state/reasons/timing are absent                                                                                                                                                                   | Medium       |
@@ -125,7 +125,7 @@ This remains a critical integration gap: the provider-owned cookie store must be
 
 **Evidence:** [`CorsChecker::response_type`](../src/policy/cors.rs) enforces same-origin and simple CORS checks; [`InternalResponse::expose`](../src/api/response/view.rs) constructs a filtered view before callers see headers or body. Preflight-required requests fail before transport.
 
-The implementation still lacks preflight `OPTIONS`, a preflight cache, complete `Access-Control-Allow-*` parsing, and per-hop redirect checks. Basic credential checks for simple CORS responses exist, but credentialed preflight and redirect behavior remain absent. `SameOrigin` fails closed on cross-origin results, and `NoCors` produces an opaque view, but the complete Fetch algorithms remain unfinished.
+The implementation still lacks preflight `OPTIONS`, a preflight cache, and complete `Access-Control-Allow-*` parsing. Simple CORS validation now runs on each HTTP redirect response and redirect-tainted requests serialize their origin as `null`, but credentialed preflight remains absent. `SameOrigin` fails closed before following a cross-origin redirect, and `NoCors` produces an opaque view, but the complete Fetch algorithms remain unfinished.
 
 Basic, CORS, and opaque views now filter headers and metadata. CORS exposure
 parsing covers safelisted names, explicit lists, wildcard credentials rules,
@@ -138,19 +138,19 @@ cookie/cache exclusion, and response filtering. The current local-scheme
 handlers all have focused response and lifecycle coverage; browser-owned file
 access remains deliberately restricted to authorized top-level navigation.
 
-**Required work:** implement request tainting and the CORS-preflight request
-and cache algorithms, complete the CORS checks before exposing response data,
+**Required work:** implement the remaining request-tainting states and the CORS-preflight request
+and cache algorithms, complete `Access-Control-Allow-*` validation,
 and add focused tests for simple, preflighted, credentialed, failed, no-CORS,
 local-origin, and redirecting cross-origin requests. Shared response
 finalization and fail-closed provider-origin validation are implemented.
 
 ### 6. Redirect handling
 
-**Evidence:** [`ReqwestTransport::new`](../src/transport/reqwest.rs) disables automatic redirects, and [`RequestController::fetch_http`](../src/engine/schemes/http.rs) owns the redirect loop. The controller resolves and validates `Location`, caps redirects at 20, tracks the URL list/current URL/count, applies Fetch method/body changes, strips sensitive headers on origin changes, and supports `follow`, `error`, and opaque `manual` results. 307/308 redirects reject non-replayable request bodies.
+**Evidence:** [`ReqwestTransport::new`](../src/transport/reqwest.rs) disables automatic redirects, and [`RequestController::fetch_http`](../src/engine/schemes/http.rs) owns the redirect loop. The controller resolves `Location`, explicitly limits targets to HTTP(S), caps redirects at 20, tracks the URL list/current URL/count, applies Fetch method/body changes, strips sensitive headers on origin changes, and supports `follow`, `error`, and opaque `manual` results. 307/308 redirects reject non-replayable request bodies.
 
-The standard's complete redirect algorithm still includes more detailed per-hop CORS, credentials, referrer, cache, and security integration than this crate currently provides. Redirect targets are intended to remain limited to HTTP(S), but the redirect-specific validator currently lacks an explicit scheme guard because the shared target validator also serves local-scheme dispatch. Malformed redirects otherwise fail closed with `RedirectFailure`; unsupported cross-scheme targets need a focused regression test and typed failure path.
+Every followed hop now repeats request authorization, simple CORS response validation, browser response approval, credential-gated cookie lookup/storage, and cache matching using the current method and URL. Network redirects disable further service-worker interception, redirect-tainted requests serialize their origin as `null`, redirect responses can update the referrer policy, and manual redirects pass through common approval before exposure. Malformed, credential-bearing, and non-HTTP(S) targets fail closed with `RedirectFailure`.
 
-**Required work:** complete per-hop CORS/security and credential policy, redirect-aware cache behavior, and the remaining browser integrations.
+**Required work:** integrate future preflight, same-site cookie, full HTTP-cache, mixed-content, and other browser-security facilities through the existing per-hop boundary as those facilities are implemented. These are subsystem gaps rather than missing redirect-loop dispatch.
 
 ### 7. HTTP cache and cache modes
 
@@ -166,9 +166,9 @@ The Fetch HTTP-network-or-cache algorithm relies on an HTTP cache, cache partiti
 
 **Evidence:** [`Referrer::Client`](../src/api/request/definition.rs) now resolves through `FetchEnvironment.referrer`, and [`referrer_value`](../src/api/request/definition.rs) applies the configured reduction policy. [`Origin`](../src/api/request/origin.rs) is structured and can parse/serialize HTTP(S) tuple origins or represent opaque origins; [`Request::fetch_headers`](../src/api/request/definition.rs) derives an internal `Origin` header when required.
 
-The referrer-policy enum and explicit/client referrer reduction logic are now present, and same-origin comparison is available for structured origins. The crate still does not derive same-site relationships, apply origin changes across redirects, or connect origin state to strict same-origin, credentials, CORS, and cookie behavior. Opaque origins are represented but are not integrated into those algorithms.
+The referrer-policy enum and explicit/client referrer reduction logic are present, and same-origin comparison is available for structured origins. HTTP redirects preserve the request origin, track whether the URL list taints its serialization to `null`, enforce strict same-origin targets before transport, and use the structured origin for credentials and simple CORS decisions. The crate still does not distinguish same-site from cross-site redirect taint or implement the provider-owned SameSite cookie rules.
 
-**Required work:** connect the structured origin and client environment to same-origin/same-site, credentials, CORS, cookie, and redirect policy, then centralize the remaining origin/referrer derivation before request headers are finalized.
+**Required work:** add site computation and connect it to provider-owned cookie policy and future security integrations, then centralize the remaining origin/referrer derivation before request headers are finalized.
 
 ### 9. Security and browser integration hooks
 
