@@ -51,9 +51,9 @@ impl ElementData {
             .iter()
             .position(|attribute_ref| attribute_ref.get_name() == &name)
         {
-            return Option::Some(&self.attributes[index]);
+            Option::Some(&self.attributes[index])
         } else {
-            return Option::None;
+            Option::None
         }
     }
     // Updates or adds element attribute.
