@@ -539,6 +539,7 @@ impl GlobalState {
             Ok(match completion {
                 Completion::Normal(value) => value.unwrap_or(Value::Undefined),
                 Completion::Return(value) => value,
+                Completion::Break | Completion::Continue => Value::Undefined,
             })
         })
     }
@@ -626,6 +627,10 @@ pub fn evaluate(expression: &Expr) -> JsResult<Value> {
 enum Completion {
     Normal(Option<Value>),
     Return(Value),
+    /// `break` on its way to the innermost loop.
+    Break,
+    /// `continue` on its way to the innermost loop.
+    Continue,
 }
 
 struct Interpreter {
@@ -702,7 +707,7 @@ impl Interpreter {
             match self.execute_statement(scope, statement)? {
                 Completion::Normal(Some(result)) => value = Some(result),
                 Completion::Normal(None) => {}
-                completion @ Completion::Return(_) => return Ok(completion),
+                completion => return Ok(completion),
             }
         }
         Ok(Completion::Normal(value))
@@ -771,7 +776,8 @@ impl Interpreter {
                     self.next_loop_iteration()?;
                     match self.execute_statement(scope, body)? {
                         Completion::Normal(Some(value)) => last = value,
-                        Completion::Normal(None) => {}
+                        Completion::Normal(None) | Completion::Continue => {}
+                        Completion::Break => break,
                         completion @ Completion::Return(_) => return Ok(completion),
                     }
                 }
@@ -784,7 +790,77 @@ impl Interpreter {
                 Some(expression) => self.evaluate(expression, scope)?,
                 None => Value::Undefined,
             })),
+            Statement::Throw(expression) => {
+                let value = self.evaluate(expression, scope)?;
+                Err(JsError::rethrown(value))
+            }
+            Statement::Break => Ok(Completion::Break),
+            Statement::Continue => Ok(Completion::Continue),
+            Statement::Try {
+                block,
+                handler,
+                finalizer,
+            } => self.execute_try(scope, block, handler.as_ref(), finalizer.as_deref()),
         }
+    }
+
+    /// Runs a block in its own lexical scope.
+    fn execute_block(
+        &mut self,
+        scope: &ScopeRef,
+        statements: &[Statement],
+    ) -> JsResult<Completion> {
+        let block_scope = child_scope(scope);
+        hoist_lexical_declarations(&block_scope, statements, false)?;
+        self.execute_statements(&block_scope, statements)
+    }
+
+    /// Runs `try`, `catch`, and `finally` with the same semantics as the
+    /// bytecode VM: a catchable error from the `try` block goes to `catch`;
+    /// `finally` then runs on every exit, and completing abruptly (an error,
+    /// `return`, `break`, or `continue`) replaces the pending outcome. Limit
+    /// errors skip both clauses because they end the script.
+    fn execute_try(
+        &mut self,
+        scope: &ScopeRef,
+        block: &[Statement],
+        handler: Option<&crate::ast::CatchClause>,
+        finalizer: Option<&[Statement]>,
+    ) -> JsResult<Completion> {
+        let mut outcome = self.execute_block(scope, block);
+        if let (Some(clause), Err(error)) = (handler, &outcome)
+            && error.category.is_catchable()
+        {
+            let caught = error.clone().into_caught_value();
+            let catch_scope = child_scope(scope);
+            if let Some(param) = &clause.param {
+                catch_scope.lock_scope().bindings.insert(
+                    param.clone(),
+                    Binding {
+                        value: Some(caught),
+                        mutable: true,
+                        lexical: true,
+                        host: false,
+                    },
+                );
+            }
+            outcome = self.execute_block(&catch_scope, &clause.body);
+        }
+        if let Some(statements) = finalizer {
+            if matches!(&outcome, Err(error) if !error.category.is_catchable()) {
+                return outcome;
+            }
+            match self.execute_block(scope, statements)? {
+                Completion::Normal(_) => {}
+                abrupt => return Ok(abrupt),
+            }
+        }
+        outcome.map(|completion| match completion {
+            Completion::Normal(value) => {
+                Completion::Normal(Some(value.unwrap_or(Value::Undefined)))
+            }
+            abrupt => abrupt,
+        })
     }
 
     fn evaluate(&mut self, expression: &Expr, scope: &ScopeRef) -> JsResult<Value> {
@@ -978,12 +1054,14 @@ impl Interpreter {
                         arguments.get(index).cloned().unwrap_or(Value::Undefined),
                     );
                 }
-                let result = match interpreter.run_body(&scope, body)? {
-                    Completion::Return(value) => value,
-                    Completion::Normal(_) => Value::Undefined,
-                };
+                // The depth must be restored on errors too, because a script
+                // `catch` can resume execution in the caller.
+                let result = interpreter.run_body(&scope, body);
                 interpreter.call_depth -= 1;
-                Ok(result)
+                Ok(match result? {
+                    Completion::Return(value) => value,
+                    _ => Value::Undefined,
+                })
             }),
         }
     }
@@ -1054,6 +1132,19 @@ fn hoist_var_declarations(scope: &ScopeRef, statements: &[Statement]) -> JsResul
             }
             Statement::While { body, .. } => {
                 hoist_var_declarations(scope, std::slice::from_ref(body))?;
+            }
+            Statement::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                hoist_var_declarations(scope, block)?;
+                if let Some(clause) = handler {
+                    hoist_var_declarations(scope, &clause.body)?;
+                }
+                if let Some(statements) = finalizer {
+                    hoist_var_declarations(scope, statements)?;
+                }
             }
             _ => {}
         }

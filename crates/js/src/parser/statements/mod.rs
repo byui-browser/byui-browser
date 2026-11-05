@@ -3,6 +3,7 @@ mod block;
 mod class;
 mod control_flow;
 mod declaration;
+mod exceptions;
 mod function;
 mod return_statement;
 
@@ -23,6 +24,9 @@ pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Statement> {
         Some(Token::Function) => function::parse(parser),
         Some(Token::Class) => class::parse(parser),
         Some(Token::Return) => return_statement::parse(parser),
+        Some(Token::Throw) => exceptions::parse_throw(parser),
+        Some(Token::Try) => exceptions::parse_try(parser),
+        Some(Token::Break | Token::Continue) => exceptions::parse_jump(parser),
         _ => {
             let expression = parser.parse_expression(0)?;
             parser.terminator("expression statement")?;

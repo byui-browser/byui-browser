@@ -94,7 +94,6 @@ fn for_loop_fixture_will_evaluate_when_for_is_supported() {
 }
 
 #[test]
-#[ignore = "Exception handling is not implemented yet"]
-fn try_catch_fixture_will_evaluate_when_exceptions_are_supported() {
+fn try_catch_fixture_evaluates() {
     assert!(eval(fixture("try-catch.js")).is_ok());
 }
