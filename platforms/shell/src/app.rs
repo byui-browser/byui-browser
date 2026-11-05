@@ -897,7 +897,8 @@ impl App {
             || self.context_menu.is_some()
             || self.page_source.is_some()
             || self.elements.is_some();
-        if self.page.as_ref().map(|(size, _)| *size) != card_size {
+        let page_size_changed = self.page.as_ref().map(|(size, _)| *size) != card_size;
+        if page_size_changed {
             // Painting never runs the page script: evaluation joins the JS
             // engine thread, and doing that inside this draw leaves `alert`
             // unable to finish. `about_to_wait` starts it after this frame.
@@ -917,6 +918,11 @@ impl App {
                     .map(|page| ((card.width, card.height), page))
             });
             full = true;
+            if let Some(layout) = &self.page_layout {
+                let (width, height) = layout.css_size();
+                self.page_events
+                    .resize(webapis::ViewportSize { width, height });
+            }
         }
         let key = (size.width, size.height, scale.to_bits(), self.chrome.dark);
         if self.frame_key != Some(key) {

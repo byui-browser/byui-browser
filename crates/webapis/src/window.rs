@@ -101,7 +101,11 @@ fn register_window_with_origin(
     realm.register_global_value("window", window_value.clone())?;
     realm.register_global_value("self", window_value)?;
     realm.register_global_value("navigator", Value::Object(navigator))?;
-    realm.register_global_value("origin", Value::String(serialized_origin))
+    realm.register_global_value("origin", Value::String(serialized_origin))?;
+    realm.register_global_value(
+        "innerWidth",
+        Value::Number(viewport.map_or(0, |size| size.width) as f64),
+    )
 }
 
 #[cfg(test)]
@@ -241,6 +245,10 @@ mod tests {
 
         assert_eq!(
             realm.evaluate_script("window.innerWidth"),
+            Ok(Value::Number(800.0))
+        );
+        assert_eq!(
+            realm.evaluate_script("innerWidth"),
             Ok(Value::Number(800.0))
         );
     }

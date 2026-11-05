@@ -552,6 +552,18 @@ pub struct PageSession {
 }
 
 impl PageSession {
+    /// Updates the viewport dimensions exposed to this live page session.
+    ///
+    /// Dimensions are CSS pixels. This keeps `window.innerWidth` and the
+    /// global `innerWidth` value synchronized with the current viewport.
+    pub fn set_viewport(&mut self, viewport: ViewportSize) {
+        let width = Value::Number(viewport.width as f64);
+        if let Some(Value::Object(window)) = self.realm.registered_global_value("window") {
+            window.set("innerWidth", width.clone());
+        }
+        let _ = self.realm.register_global_value("innerWidth", width);
+    }
+
     /// Fires a `click` event at this session's document.
     ///
     /// Runs listeners registered with `document.addEventListener('click', ...)`.

@@ -240,6 +240,7 @@ enum PageCommand {
         runtime: BrowserRuntime,
         viewport: Option<ViewportSize>,
     },
+    Resize(ViewportSize),
     Click(Option<NodeID>),
 }
 
@@ -304,6 +305,13 @@ impl PageEvents {
             log::warn!("page session is not running; dropped click");
         }
     }
+
+    /// Updates the viewport dimensions exposed to the live page session.
+    pub(crate) fn resize(&self, viewport: ViewportSize) {
+        if self.commands.send(PageCommand::Resize(viewport)).is_err() {
+            log::warn!("page session is not running; dropped resize");
+        }
+    }
 }
 
 fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
@@ -338,6 +346,11 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                 match result {
                     Ok(loaded) => session = Some(loaded),
                     Err(error) => log::debug!("page script failed: {error}"),
+                }
+            }
+            PageCommand::Resize(viewport) => {
+                if let Some(session) = &mut session {
+                    session.set_viewport(viewport);
                 }
             }
             PageCommand::Click(target) => {
