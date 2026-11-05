@@ -952,7 +952,9 @@ impl App {
                 &mut composed,
                 scale,
                 self.chrome.dark,
-                self.source_font.as_ref().or(self.font.as_ref()),
+                self.cursor,
+                self.font.as_ref(),
+                self.source_font.as_ref(),
             );
         }
         if let Some(source) = &mut self.page_source {
@@ -1002,8 +1004,17 @@ impl App {
         };
         let scale = window.scale_factor();
         let width = window.inner_size().to_logical::<f64>(scale).width;
+        // Leaving the inspector must repaint it once to clear row and
+        // close-button hover feedback.
+        let left_elements = self
+            .elements
+            .as_ref()
+            .is_some_and(|panel| panel.contains(self.cursor) && !panel.contains(Some((x, y))));
         self.cursor = Some((x, y));
         log::trace!("cursor moved: ({x:.0}, {y:.0})");
+        if left_elements {
+            self.redraw();
+        }
         if self.context_menu.is_some()
             || self.page_source.is_some()
             || self
@@ -1367,7 +1378,7 @@ mod tests {
         app.scripts_evaluated = true;
         app.cursor = Some((100.0, 100.0));
         app.open_context_menu(800, 600, 1.0);
-        app.cursor = Some((120.0, 248.0));
+        app.cursor = Some(app.context_menu.unwrap().item_center(4));
         app.left_mouse_input(ElementState::Pressed);
         app.left_mouse_input(ElementState::Released);
         assert!(app.elements.is_some());
@@ -1375,7 +1386,7 @@ mod tests {
         app.elements.as_mut().unwrap().resize(800.0, 600.0);
         app.cursor = Some((100.0, 100.0));
         app.open_context_menu(800, 600, 1.0);
-        app.cursor = Some((120.0, 216.0));
+        app.cursor = Some(app.context_menu.unwrap().item_center(3));
         app.left_mouse_input(ElementState::Pressed);
         app.left_mouse_input(ElementState::Released);
         assert!(app.page_source.is_some());
@@ -1450,7 +1461,7 @@ mod tests {
         app.scripts_evaluated = true;
         app.cursor = Some((100.0, 100.0));
         app.open_context_menu(800, 600, 1.0);
-        app.cursor = Some((120.0, 216.0));
+        app.cursor = Some(app.context_menu.unwrap().item_center(3));
         app.left_mouse_input(ElementState::Pressed);
         app.left_mouse_input(ElementState::Released);
         assert!(app.context_menu.is_none());
@@ -1516,8 +1527,8 @@ mod tests {
         app.scripts_evaluated = true;
         app.cursor = Some((100.0, 100.0));
         app.open_context_menu(800, 600, 1.0);
-        for y in [120.0, 152.0] {
-            app.cursor = Some((120.0, y));
+        for row in [0, 1] {
+            app.cursor = Some(app.context_menu.unwrap().item_center(row));
             app.left_mouse_input(ElementState::Pressed);
             app.left_mouse_input(ElementState::Released);
             assert!(app.context_menu.is_some());
@@ -1556,7 +1567,7 @@ mod tests {
         let document = app.loaded_page.clone();
         app.cursor = Some((100.0, 100.0));
         app.open_context_menu(800, 600, 1.0);
-        app.cursor = Some((120.0, 184.0));
+        app.cursor = Some(app.context_menu.unwrap().item_center(2));
         app.scripts_evaluated = true;
         app.left_mouse_input(ElementState::Pressed);
         assert!(app.context_menu.is_some());
@@ -1602,7 +1613,7 @@ mod tests {
         let mut app = app();
         app.cursor = Some((100.0, 100.0));
         app.open_context_menu(800, 600, 1.0);
-        app.cursor = Some((120.0, 184.0));
+        app.cursor = Some(app.context_menu.unwrap().item_center(2));
         app.left_mouse_input(ElementState::Pressed);
         app.cursor = Some((300.0, 300.0));
         app.scripts_evaluated = true;
