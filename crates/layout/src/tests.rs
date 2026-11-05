@@ -122,6 +122,19 @@ fn body_margin_offsets_blocks_that_fill_the_containing_block_width() {
 }
 
 #[test]
+fn flex_row_distributes_grow_space_and_places_the_gap() {
+    let (document, tree) = lay_out(
+        "<body><div id='container'><div id='first'></div><div id='second'></div></div></body>",
+        "body { margin: 0 } #container { display: flex; width: 300px; height: 100px; gap: 10px } #first, #second { width: 50px; flex-grow: 1 }",
+        800.0,
+    );
+    let first = box_for(&tree, &document, "first");
+    let second = box_for(&tree, &document, "second");
+    assert_eq!((first.rect.x, first.rect.width), (0.0, 145.0));
+    assert_eq!((second.rect.x, second.rect.width), (155.0, 145.0));
+}
+
+#[test]
 fn parent_and_first_child_margins_collapse() {
     let (document, tree) = lay_out(
         "<html id='root'><body id='body'><h1 id='h'>T</h1></body></html>",
