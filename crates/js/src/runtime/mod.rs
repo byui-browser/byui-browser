@@ -37,20 +37,17 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::ast::{
-    ArrowBody, BinaryOperator, Expr, LogicalOperator, MemberProperty, Program, PropertyKey,
-    Statement, UnaryOperator, VarKind,
+    ArrowBody, Expr, LogicalOperator, MemberProperty, Program, PropertyKey, Statement, VarKind,
 };
 use crate::bytecode::FunctionTemplate;
 use crate::stack::{StackGuard, with_engine_stack};
 use crate::{HostFunction, JsError, JsResult, Value};
 pub use array::MAX_ARRAY_LENGTH;
 pub(crate) use array::{array_to_string, get_array_property, set_array_property};
-use conversions::{
-    is_truthy, less_than, loose_equals, strict_equals, to_int32, to_number, to_primitive, to_uint32,
-};
-pub(crate) use conversions::{number_to_string, to_property_key};
+pub(crate) use conversions::{is_truthy, number_to_string, to_property_key};
 pub use object::Object;
 use object::WeakObject;
+pub(crate) use operators::{binary, unary};
 
 const STACK_OVERFLOW: &str = "Maximum call stack size exceeded";
 

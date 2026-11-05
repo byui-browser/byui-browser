@@ -87,9 +87,15 @@ fn hand_built_chunk_reads_and_writes_elements() {
 }
 
 #[test]
-fn arrays_do_not_convert_to_numbers_on_the_vm() {
-    let error = run_vm("[] - 1").expect_err("arrays are not numbers on the VM");
-    assert!(error.message.contains("convert"), "{error:?}");
+fn arrays_convert_to_numbers_the_same_on_both_engines() {
+    // The VM shares the evaluator's operator semantics, so `[] - 1` is NaN on
+    // both instead of the VM raising a conversion error.
+    for run in [run_vm, run_tree] {
+        match run("[] - 1") {
+            Ok(Value::Number(number)) => assert!(number.is_nan()),
+            other => panic!("expected NaN, got {other:?}"),
+        }
+    }
 }
 
 #[test]
