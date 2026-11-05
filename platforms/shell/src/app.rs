@@ -1283,7 +1283,12 @@ impl ApplicationHandler<UserEvent> for App {
         // thread here would deadlock. The session stays alive so a later
         // click can run element and `document` listeners.
         let alerts = Arc::clone(&self.alerts) as Arc<dyn AlertSink>;
-        self.page_events.load(&page, alerts, self.runtime.clone());
+        let viewport = self.page_layout.as_ref().map(|layout| {
+            let (width, height) = layout.css_size();
+            webapis::ViewportSize { width, height }
+        });
+        self.page_events
+            .load_with_viewport(&page, alerts, self.runtime.clone(), viewport);
     }
 }
 

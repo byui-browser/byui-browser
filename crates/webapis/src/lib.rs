@@ -34,4 +34,7 @@ pub use event::{
 pub use fetch::{fetch, register_fetch};
 pub use selector::SelectorError;
 pub use timer::{TimerId, TimerQueue};
-pub use window::{register_window, register_window_with_security_context};
+pub use window::{
+    ViewportSize, register_window, register_window_with_security_context,
+    register_window_with_security_context_and_viewport,
+};

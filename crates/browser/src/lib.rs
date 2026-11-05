@@ -21,8 +21,9 @@ use storage::{
 };
 use webapis::local_storage::register_local_storage;
 use webapis::{
-    AlertSink, ConsoleSink, Document, register_alert, register_document, register_fetch,
-    register_print, register_window_with_security_context,
+    AlertSink, ConsoleSink, Document, ViewportSize, register_alert, register_document,
+    register_fetch, register_print, register_window_with_security_context,
+    register_window_with_security_context_and_viewport,
 };
 
 pub mod byui_provider;
@@ -391,6 +392,7 @@ impl BrowserRuntime {
             alert_sink,
             controller,
             security_context,
+            None,
         )
         .map(|booted| booted.results)
     }
@@ -416,6 +418,7 @@ impl BrowserRuntime {
             alert_sink,
             controller,
             security_context,
+            None,
         )
         .map(|booted| booted.session)
     }
@@ -442,10 +445,37 @@ impl BrowserRuntime {
             alert_sink,
             controller,
             security_context,
+            None,
         )
         .map(|booted| booted.session)
     }
 
+    /// Opens a loaded page with the viewport dimensions exposed to scripts.
+    ///
+    /// `viewport` is expressed in CSS pixels and is the value used for
+    /// `window.innerWidth` by the CSSOM View API.
+    pub fn open_page_with_viewport(
+        &self,
+        page: &Page,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+        viewport: ViewportSize,
+    ) -> JsResult<PageSession> {
+        self.boot_page(
+            &page.html,
+            Some(&page.scripts),
+            console,
+            alert_sink,
+            controller,
+            security_context,
+            Some(viewport),
+        )
+        .map(|booted| booted.session)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn boot_page(
         &self,
         html_source: &str,
@@ -454,17 +484,32 @@ impl BrowserRuntime {
         alert_sink: Arc<dyn AlertSink>,
         controller: Arc<RequestController>,
         security_context: RendererSecurityContext,
+        viewport: Option<ViewportSize>,
     ) -> JsResult<BootedPage> {
         log::trace!("booting page: {} bytes of html", html_source.len());
         let html_document = html::parse_raw_html(html_source.to_owned());
         let document = Document::from_html_document(&html_document);
         let retained = document.clone();
         let mut realm = Realm::new();
-        register_window_with_security_context(&mut realm, security_context.clone())?;
+        match viewport {
+            Some(viewport) => register_window_with_security_context_and_viewport(
+                &mut realm,
+                security_context.clone(),
+                viewport,
+            )?,
+            None => register_window_with_security_context(&mut realm, security_context.clone())?,
+        }
         register_print(&mut realm, console)?;
         register_alert(&mut realm, alert_sink)?;
         register_fetch(&mut realm, controller)?;
-        register_window_with_security_context(&mut realm, security_context.clone())?;
+        match viewport {
+            Some(viewport) => register_window_with_security_context_and_viewport(
+                &mut realm,
+                security_context.clone(),
+                viewport,
+            )?,
+            None => register_window_with_security_context(&mut realm, security_context.clone())?,
+        }
         register_document(&mut realm, document)?;
         register_local_storage(&mut realm, Arc::clone(&self.storage), security_context)?;
 

@@ -23,7 +23,7 @@ use security::{Origin, RendererSecurityContext};
 /// usual `window.navigator` property. The Navigator object is intentionally
 /// partial: no Navigator members are defined yet.
 pub fn register_window(realm: &mut Realm) -> JsResult<()> {
-    register_window_with_origin(realm, Origin::placeholder())
+    register_window_with_origin(realm, Origin::placeholder(), None)
 }
 
 /// Registers the script-visible Window globals for a renderer security context.
@@ -36,10 +36,36 @@ pub fn register_window_with_security_context(
     realm: &mut Realm,
     security_context: RendererSecurityContext,
 ) -> JsResult<()> {
-    register_window_with_origin(realm, security_context.origin().clone())
+    register_window_with_origin(realm, security_context.origin().clone(), None)
 }
 
-fn register_window_with_origin(realm: &mut Realm, origin: Origin) -> JsResult<()> {
+/// The viewport dimensions exposed to a script-visible Window.
+///
+/// Dimensions are CSS pixels, matching CSSOM View. A viewport is optional
+/// because a Window without an associated viewport must report zero for
+/// `innerWidth`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewportSize {
+    /// The viewport width in CSS pixels.
+    pub width: u32,
+    /// The viewport height in CSS pixels.
+    pub height: u32,
+}
+
+/// Registers Window globals with a renderer security context and viewport.
+pub fn register_window_with_security_context_and_viewport(
+    realm: &mut Realm,
+    security_context: RendererSecurityContext,
+    viewport: ViewportSize,
+) -> JsResult<()> {
+    register_window_with_origin(realm, security_context.origin().clone(), Some(viewport))
+}
+
+fn register_window_with_origin(
+    realm: &mut Realm,
+    origin: Origin,
+    viewport: Option<ViewportSize>,
+) -> JsResult<()> {
     let window = match realm.registered_global_value("window") {
         Some(Value::Object(window)) => window,
         _ => Object::new(),
@@ -65,6 +91,10 @@ fn register_window_with_origin(realm: &mut Realm, origin: Origin) -> JsResult<()
         Arc::new(move |_| Ok(Value::Object(navigator_for_window.clone()))),
     );
     window.set("origin", Value::String(serialized_origin.clone()));
+    window.set(
+        "innerWidth",
+        Value::Number(viewport.map_or(0, |size| size.width) as f64),
+    );
 
     let window_value = Value::Object(window);
     realm.register_global_value("customElements", Value::Object(custom_elements_object))?;
@@ -179,6 +209,50 @@ mod tests {
         assert_eq!(
             realm.evaluate_script("window.origin"),
             Ok(Value::String("null".into()))
+        );
+    }
+
+    #[test]
+    fn inner_width_is_zero_without_a_viewport() {
+        let mut realm = Realm::new();
+        register_window(&mut realm).unwrap();
+
+        assert_eq!(
+            realm.evaluate_script("window.innerWidth"),
+            Ok(Value::Number(0.0))
+        );
+    }
+
+    #[test]
+    fn inner_width_reports_the_viewport_width_in_css_pixels() {
+        let mut realm = Realm::new();
+        super::register_window_with_security_context_and_viewport(
+            &mut realm,
+            RendererSecurityContext::new(
+                Origin::new("https", "example.com", None),
+                StoragePermission::Allowed,
+            ),
+            super::ViewportSize {
+                width: 800,
+                height: 600,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            realm.evaluate_script("window.innerWidth"),
+            Ok(Value::Number(800.0))
+        );
+    }
+
+    #[test]
+    fn inner_width_is_replaceable_like_the_cssom_view_attribute() {
+        let mut realm = Realm::new();
+        register_window(&mut realm).unwrap();
+
+        assert_eq!(
+            realm.evaluate_script("window.innerWidth = 42; window.innerWidth"),
+            Ok(Value::Number(42.0))
         );
     }
 }

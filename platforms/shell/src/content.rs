@@ -10,7 +10,7 @@ use html::NodeID;
 use layout::{FontMetrics, LayoutTree, Size, layout_document};
 use render::{BitmapFont, Compositor, Frame, OutlineFont};
 use tiny_skia::Pixmap;
-use webapis::{AlertSink, ConsoleSink};
+use webapis::{AlertSink, ConsoleSink, ViewportSize};
 
 struct NoopConsole;
 
@@ -238,6 +238,7 @@ enum PageCommand {
         page: Page,
         alert_sink: Arc<dyn AlertSink>,
         runtime: BrowserRuntime,
+        viewport: Option<ViewportSize>,
     },
     Click(Option<NodeID>),
 }
@@ -261,11 +262,23 @@ impl PageEvents {
     }
 
     /// Replaces the live document with `page` and runs its script.
+    #[allow(dead_code)]
     pub(crate) fn load(
         &self,
         page: &Page,
         alert_sink: Arc<dyn AlertSink>,
         runtime: BrowserRuntime,
+    ) {
+        self.load_with_viewport(page, alert_sink, runtime, None);
+    }
+
+    /// Replaces the live document and exposes `viewport` to page scripts.
+    pub(crate) fn load_with_viewport(
+        &self,
+        page: &Page,
+        alert_sink: Arc<dyn AlertSink>,
+        runtime: BrowserRuntime,
+        viewport: Option<ViewportSize>,
     ) {
         if self
             .commands
@@ -273,6 +286,7 @@ impl PageEvents {
                 page: page.clone(),
                 alert_sink,
                 runtime,
+                viewport,
             })
             .is_err()
         {
@@ -300,16 +314,28 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                 page,
                 alert_sink,
                 runtime,
+                viewport,
             } => {
                 log::debug!("page session loading {}", page.url);
                 let controller = browser::request_controller(None);
-                match runtime.open_page(
-                    &page,
-                    Arc::new(NoopConsole),
-                    alert_sink,
-                    controller,
-                    browser::security_context_for_url(&page.url),
-                ) {
+                let result = match viewport {
+                    Some(viewport) => runtime.open_page_with_viewport(
+                        &page,
+                        Arc::new(NoopConsole),
+                        alert_sink,
+                        controller,
+                        browser::security_context_for_url(&page.url),
+                        viewport,
+                    ),
+                    None => runtime.open_page(
+                        &page,
+                        Arc::new(NoopConsole),
+                        alert_sink,
+                        controller,
+                        browser::security_context_for_url(&page.url),
+                    ),
+                };
+                match result {
                     Ok(loaded) => session = Some(loaded),
                     Err(error) => log::debug!("page script failed: {error}"),
                 }
