@@ -88,6 +88,7 @@ pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -
         Arc::new(move |arguments| {
             let document = get_attribute_document.lock().unwrap();
             let Some(element) = document.element_snapshot(node) else {
+                log::debug!("getAttribute on a node that is no longer in the document");
                 return Ok(Value::Null);
             };
             get_attribute(&element, arguments)
@@ -99,6 +100,7 @@ pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -
         "setAttribute",
         Arc::new(move |arguments| {
             let [Value::String(qualified_name), Value::String(value)] = arguments else {
+                log::debug!("Element.setAttribute() called with invalid arguments; ignored");
                 return Err(JsError::new(
                     "Element.setAttribute() expects a qualified name and value string",
                 ));
@@ -284,6 +286,7 @@ fn normalize_attribute_name(namespace: Namespace, qualified_name: &str) -> JsRes
             )
         })
     {
+        log::debug!("rejected invalid attribute name {qualified_name:?}");
         return Err(JsError::new("InvalidCharacterError"));
     }
 
@@ -296,11 +299,13 @@ fn normalize_attribute_name(namespace: Namespace, qualified_name: &str) -> JsRes
 /// Implements JavaScript `Element.getAttribute(qualifiedName)`.
 pub fn get_attribute(element: &Element, arguments: &[Value]) -> JsResult<Value> {
     let [Value::String(qualified_name)] = arguments else {
+        log::debug!("Element.getAttribute() called with invalid arguments");
         return Err(JsError::new(
             "Element.getAttribute() expects one qualified name string",
         ));
     };
 
+    log::trace!("Element.getAttribute({qualified_name:?})");
     Ok(match element.get_attribute(qualified_name) {
         Some(value) => Value::String(value.to_owned()),
         None => Value::Null,

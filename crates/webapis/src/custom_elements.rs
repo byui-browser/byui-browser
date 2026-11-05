@@ -407,7 +407,9 @@ mod tests {
         register_window(&mut realm).unwrap();
 
         assert_eq!(
-            realm.evaluate_script("window.customElements === customElements"),
+            realm.evaluate_script(
+                "window.customElements === customElements && window.document === document"
+            ),
             Ok(Value::Boolean(true))
         );
     }

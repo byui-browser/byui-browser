@@ -12,20 +12,34 @@ use net::{Request, RequestController};
 /// delegated to the networking crate's shared request controller.
 pub fn fetch(controller: &RequestController, arguments: &[Value]) -> JsResult<Value> {
     let [Value::String(url)] = arguments else {
+        log::debug!(
+            "fetch() called with invalid arguments ({} given)",
+            arguments.len()
+        );
         return Err(JsError::new("fetch() expects exactly one URL string"));
     };
 
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|error| JsError::new(format!("unable to start network runtime: {error}")))?;
+    log::debug!("fetch bridged to network controller: {url}");
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| {
+        log::error!("unable to start network runtime for fetch: {error}");
+        JsError::new(format!("unable to start network runtime: {error}"))
+    })?;
     let response = runtime
         .block_on(controller.fetch(Request::get(url)))
-        .map_err(|error| JsError::new(error.to_string()))?;
+        .map_err(|error| {
+            log::debug!("fetch of {url} failed: {error}");
+            JsError::new(error.to_string())
+        })?;
 
-    let body = runtime
-        .block_on(response.body.bytes())
-        .map_err(|error| JsError::new(error.to_string()))?;
-    let body = String::from_utf8(body)
-        .map_err(|_| JsError::new("fetch() response body is not valid UTF-8"))?;
+    let body = runtime.block_on(response.body.bytes()).map_err(|error| {
+        log::debug!("reading fetch body of {url} failed: {error}");
+        JsError::new(error.to_string())
+    })?;
+    let body = String::from_utf8(body).map_err(|_| {
+        log::debug!("fetch body of {url} is not valid UTF-8");
+        JsError::new("fetch() response body is not valid UTF-8")
+    })?;
+    log::debug!("fetch of {url} returned {} bytes", body.len());
     Ok(Value::String(body))
 }
 

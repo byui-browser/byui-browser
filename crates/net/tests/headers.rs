@@ -155,7 +155,7 @@ fn generated_request_header_channels_do_not_mutate_caller_headers() {
         .build()
         .unwrap();
     let response = runtime()
-        .block_on(controller.fetch(request.clone()))
+        .block_on(controller.fetch(request.try_clone().unwrap()))
         .unwrap();
     server.join();
 

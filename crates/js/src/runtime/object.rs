@@ -1,5 +1,6 @@
 //! Plain JavaScript objects: string-keyed property tables shared by reference.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
@@ -14,9 +15,10 @@ use crate::{HostFunction, Value};
 /// Clones compare equal with `==` and `===`; separately created objects
 /// never do, even with identical properties.
 ///
-/// Properties are kept in insertion order and are always plain, writable
-/// data properties. Because the table is shared, methods take `&self` and
-/// lock it internally; the lock is never held while script code runs.
+/// Properties are kept in insertion order and are plain data properties.
+/// They are writable unless defined with [`Object::set_read_only`]. Because
+/// the table is shared, methods take `&self` and lock it internally; the lock
+/// is never held while script code runs.
 ///
 /// An object may have a prototype object. [`Object::get`] falls back to the
 /// prototype chain when an object has no such own property, while
@@ -41,6 +43,7 @@ pub struct Object(Arc<ObjectData>);
 #[derive(Default)]
 struct ObjectData {
     properties: Mutex<Vec<(String, Value)>>,
+    read_only_properties: Mutex<HashSet<String>>,
     prototype: Mutex<Option<Object>>,
     constructor: Mutex<Option<WeakFunction>>,
 }
@@ -157,10 +160,37 @@ impl Object {
     pub fn set(&self, key: impl Into<String>, value: Value) {
         let key = key.into();
         let mut properties = self.properties();
+        if self
+            .0
+            .read_only_properties
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&key)
+        {
+            return;
+        }
         match properties.iter_mut().find(|(name, _)| *name == key) {
             Some((_, existing)) => *existing = value,
             None => properties.push((key, value)),
         }
+    }
+
+    /// Defines a non-writable own data property under `key`, replacing any
+    /// existing own value in place or appending a new property at the end of
+    /// the insertion order. Later calls to [`Object::set`] leave this value
+    /// unchanged. JavaScript strict-mode assignment errors are not modeled.
+    pub fn set_read_only(&self, key: impl Into<String>, value: Value) {
+        let key = key.into();
+        let mut properties = self.properties();
+        match properties.iter_mut().find(|(name, _)| *name == key) {
+            Some((_, existing)) => *existing = value,
+            None => properties.push((key.clone(), value)),
+        }
+        self.0
+            .read_only_properties
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key);
     }
 
     /// Stores a host function under `name` as a method that scripts can call

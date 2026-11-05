@@ -78,6 +78,11 @@ impl Context<'_> {
                 let left = margin_left.unwrap_or(0.0);
                 let right = margin_right.unwrap_or(0.0);
                 let width = (cb.width - left - right - padding).max(0.0);
+                log::trace!(
+                    "node {:?}: auto width resolved to {width} in containing block {}",
+                    block.node,
+                    cb.width
+                );
                 (left, width, cb.width - left - padding - width)
             }
             Some(width) => {
@@ -86,12 +91,24 @@ impl Context<'_> {
                 let remaining = cb.width - padding - width;
                 match (margin_left, margin_right) {
                     _ if fixed > cb.width => {
+                        log::trace!(
+                            "node {:?}: over-constrained width {width} in containing block {}; right margin absorbs the difference",
+                            block.node,
+                            cb.width
+                        );
                         // Over-constrained with `auto` margins treated as 0:
                         // the right margin absorbs the difference.
                         let left = margin_left.unwrap_or(0.0);
                         (left, width, remaining - left)
                     }
-                    (None, None) => (remaining / 2.0, width, remaining / 2.0),
+                    (None, None) => {
+                        log::trace!(
+                            "node {:?}: auto left and right margins centered at {}",
+                            block.node,
+                            remaining / 2.0
+                        );
+                        (remaining / 2.0, width, remaining / 2.0)
+                    }
                     (None, Some(right)) => (remaining - right, width, right),
                     (Some(left), _) => (left, width, remaining - left),
                 }
@@ -120,7 +137,12 @@ impl Context<'_> {
         let width = style.width.resolve(basis).unwrap_or_else(|| {
             let (min_content, max_content) = self.intrinsic_content_sizes(block);
             let available = cb_width - margin_left - margin_right - padding;
-            max_content.min(available.max(min_content))
+            let width = max_content.min(available.max(min_content));
+            log::trace!(
+                "node {:?}: inline-block shrink-to-fit width {width} (min-content {min_content}, max-content {max_content}, available {available})",
+                block.node
+            );
+            width
         });
         self.layout_block_container(
             block,
@@ -218,6 +240,12 @@ impl Context<'_> {
             }
         };
         let content_height = specified_height.unwrap_or(flow.height);
+        if specified_height.is_none() {
+            log::trace!(
+                "node {:?}: auto height resolved to {content_height}",
+                block.node
+            );
+        }
         let collapses_through = !block.establishes_bfc
             && !flow.has_content
             && padding.vertical() == 0.0
@@ -229,6 +257,14 @@ impl Context<'_> {
         for line in &mut lines {
             line.translate(padding.left, padding.top);
         }
+        log::trace!(
+            "laid out {kind:?} node {:?}: content {}x{}, margin top/bottom {margin_top}/{margin_bottom}, {} children, {} lines",
+            block.node,
+            content_width + padding.horizontal(),
+            content_height + padding.vertical(),
+            children.len(),
+            lines.len()
+        );
         BlockResult {
             fragment: LayoutBox {
                 kind,
@@ -277,10 +313,12 @@ impl Context<'_> {
         for child in list {
             let result = self.layout_block_level(child, cb);
             let y = if !has_content && edges.collapse_top {
+                log::trace!("child margin collapses with parent top margin");
                 // Still adjoining the parent's top margin: the child's margins
                 // collapse with it and the child sits at the content edge.
                 margin_top.adjoin(result.margin_top);
                 if result.collapses_through {
+                    log::trace!("empty child: margins collapse through it");
                     margin_top.adjoin(result.margin_bottom);
                 } else {
                     has_content = true;
@@ -291,6 +329,10 @@ impl Context<'_> {
             } else {
                 pending.adjoin(result.margin_top);
                 let y = cursor + pending.resolve();
+                log::trace!(
+                    "sibling margins collapsed to {} before child at y {y}",
+                    pending.resolve()
+                );
                 if result.collapses_through {
                     pending.adjoin(result.margin_bottom);
                 } else {

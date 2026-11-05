@@ -1,6 +1,109 @@
 use js::bytecode::{Instruction, compile};
 use js::{Value, Vm, parse};
 
+#[test]
+fn execution_modes_select_vm_for_programs_with_compiled_functions() {
+    assert_eq!(
+        js::eval_with_mode("let n = 2; n * 3", js::ExecutionMode::Bytecode).unwrap(),
+        Value::Number(6.0)
+    );
+    assert_eq!(
+        js::eval_with_mode(
+            "function f() { return 4; } f()",
+            js::ExecutionMode::Automatic
+        )
+        .unwrap(),
+        Value::Number(4.0)
+    );
+    let error = js::eval_with_mode("missing", js::ExecutionMode::Automatic).unwrap_err();
+    assert_eq!(error.category, js::JsErrorCategory::Runtime);
+    assert_eq!(error.message, "`missing` is not defined");
+
+    let source = "if (true) function conditional() { return 1; } 8";
+    assert_eq!(
+        js::eval_with_mode(source, js::ExecutionMode::Automatic),
+        js::eval_with_mode(source, js::ExecutionMode::Interpreter)
+    );
+}
+
+#[test]
+fn vm_runtime_errors_are_not_retried_in_the_interpreter() {
+    let error = js::eval_with_mode("const n = 1; n = 2", js::ExecutionMode::Automatic)
+        .expect_err("VM const assignment must fail");
+    assert_eq!(error.category, js::JsErrorCategory::Runtime);
+    assert_eq!(error.message, "Assignment to constant `n`");
+}
+
+#[test]
+fn function_frames_match_the_evaluator_for_recursion_and_completion() {
+    for source in [
+        "function factorial(n) { if (n <= 1) return 1; return n * factorial(n - 1); } factorial(6)",
+        "function identity(value) { return value; } identity()",
+        "function noReturn() { let value = 1; } noReturn()",
+        "function early() { return; 9; } early()",
+        "let order = 0; function pair(a, b) { return a * 10 + b; } pair(order = order + 1, order = order + 1) + order",
+    ] {
+        let program = parse(source).expect("source should parse");
+        let chunk = compile(&program).expect("function source should compile");
+        assert_eq!(
+            Vm::new().execute(&chunk),
+            js::eval(source),
+            "VM differs from evaluator for {source}"
+        );
+    }
+}
+
+#[test]
+fn automatic_mode_falls_back_for_functions_with_enclosing_bindings() {
+    let source = "function makeCounter() { let count = 0; function next() { count = count + 1; return count; } return next; } let counter = makeCounter(); counter() + counter()";
+    assert_eq!(
+        js::eval_with_mode(source, js::ExecutionMode::Automatic),
+        Ok(Value::Number(3.0))
+    );
+}
+
+#[test]
+fn automatic_mode_falls_back_for_block_functions() {
+    let source =
+        "let read; { let value = 12; function capture() { return value; } read = capture; } read()";
+    assert_eq!(
+        js::eval_with_mode(source, js::ExecutionMode::Automatic),
+        Ok(Value::Number(12.0))
+    );
+}
+
+#[test]
+fn call_depth_and_non_function_calls_are_structured_runtime_errors() {
+    let source = "function recurse() { return recurse(); } recurse()";
+    let program = parse(source).expect("source should parse");
+    let chunk = compile(&program).expect("recursive call should compile");
+    let limits = js::runtime::ExecutionLimits {
+        call_depth_limit: 2,
+        ..js::runtime::ExecutionLimits::default()
+    };
+    let error = Vm::new()
+        .execute_with_limits(&chunk, limits)
+        .expect_err("recursion should hit call depth limit");
+    assert_eq!(error.category, js::JsErrorCategory::Limit);
+    assert_eq!(error.message, "Maximum call stack size exceeded");
+    assert_eq!(error.context.as_deref(), Some("bytecode call depth"));
+    assert_eq!(
+        js::runtime::evaluate_program_with_limits(&program, limits)
+            .unwrap_err()
+            .message,
+        error.message
+    );
+
+    let error = js::eval_with_mode("1()", js::ExecutionMode::Bytecode)
+        .expect_err("a number is not callable");
+    assert_eq!(error.category, js::JsErrorCategory::Runtime);
+    assert_eq!(error.context.as_deref(), Some("function call"));
+    assert_eq!(
+        js::eval("1()").unwrap_err().category,
+        js::JsErrorCategory::Runtime
+    );
+}
+
 fn execute(source: &str) -> Value {
     let program = parse(source).expect("source should parse");
     let chunk = compile(&program).expect("source should compile");

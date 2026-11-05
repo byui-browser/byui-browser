@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+log = { workspace = true }
 common = { workspace = true }
 html = { workspace = true }
 
