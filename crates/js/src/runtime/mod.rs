@@ -27,6 +27,7 @@
 //! - Each evaluation has a step budget (see [`DEFAULT_STEP_LIMIT`]), so
 //!   endless loops fail with an error instead of running forever.
 
+mod array;
 mod conversions;
 mod object;
 
@@ -41,6 +42,8 @@ use crate::ast::{
 use crate::bytecode::FunctionTemplate;
 use crate::stack::{StackGuard, with_engine_stack};
 use crate::{HostFunction, JsError, JsResult, Value};
+pub use array::MAX_ARRAY_LENGTH;
+pub(crate) use array::{array_to_string, get_array_property, set_array_property};
 use conversions::{
     is_truthy, less_than, loose_equals, strict_equals, to_int32, to_number, to_primitive, to_uint32,
 };
@@ -382,6 +385,46 @@ impl Function {
         }
     }
 
+    /// Returns an own property of a function, such as a class's `prototype`.
+    ///
+    /// Functions created by the bytecode VM expose own properties. Functions
+    /// created by the tree-walk evaluator or host API currently do not.
+    pub fn get_own_property(&self, key: &str) -> Option<Value> {
+        self.get_own(key)
+    }
+
+    /// Sets an own property on a bytecode function.
+    ///
+    /// Returns `false` for host and tree-walk functions, whose properties are
+    /// not currently modeled.
+    pub fn set_own_property(&self, key: &str, value: Value) -> bool {
+        self.set_own(key, value)
+    }
+
+    /// Returns whether this function was compiled for the bytecode VM.
+    pub fn is_bytecode_function(&self) -> bool {
+        self.template().is_some()
+    }
+
+    /// Constructs an instance by running this bytecode function with `new`.
+    ///
+    /// Returns an error for host and tree-walk functions. A standalone
+    /// construction does not retain the VM's global environment, so a
+    /// constructor that reads global variables may also fail.
+    pub fn construct(&self, arguments: &[Value]) -> JsResult<Value> {
+        crate::Vm::construct_function(self.clone(), arguments)
+    }
+
+    /// Calls this function with an explicit receiver using a fresh bytecode
+    /// VM. Host and tree-walk functions use their existing call mechanism.
+    pub fn call_with_this(&self, receiver: Value, arguments: &[Value]) -> JsResult<Value> {
+        if self.template().is_some() {
+            crate::Vm::call_function(self.clone(), receiver, arguments)
+        } else {
+            self.call(arguments)
+        }
+    }
+
     /// Writes an own property, returning `false` for functions that cannot
     /// hold properties (script and host functions).
     pub(crate) fn set_own(&self, key: &str, value: Value) -> bool {
@@ -536,6 +579,7 @@ impl GlobalState {
             Ok(match completion {
                 Completion::Normal(value) => value.unwrap_or(Value::Undefined),
                 Completion::Return(value) => value,
+                Completion::Break | Completion::Continue => Value::Undefined,
             })
         })
     }
@@ -623,6 +667,10 @@ pub fn evaluate(expression: &Expr) -> JsResult<Value> {
 enum Completion {
     Normal(Option<Value>),
     Return(Value),
+    /// `break` on its way to the innermost loop.
+    Break,
+    /// `continue` on its way to the innermost loop.
+    Continue,
 }
 
 struct Interpreter {
@@ -699,7 +747,7 @@ impl Interpreter {
             match self.execute_statement(scope, statement)? {
                 Completion::Normal(Some(result)) => value = Some(result),
                 Completion::Normal(None) => {}
-                completion @ Completion::Return(_) => return Ok(completion),
+                completion => return Ok(completion),
             }
         }
         Ok(Completion::Normal(value))
@@ -768,7 +816,8 @@ impl Interpreter {
                     self.next_loop_iteration()?;
                     match self.execute_statement(scope, body)? {
                         Completion::Normal(Some(value)) => last = value,
-                        Completion::Normal(None) => {}
+                        Completion::Normal(None) | Completion::Continue => {}
+                        Completion::Break => break,
                         completion @ Completion::Return(_) => return Ok(completion),
                     }
                 }
@@ -781,7 +830,77 @@ impl Interpreter {
                 Some(expression) => self.evaluate(expression, scope)?,
                 None => Value::Undefined,
             })),
+            Statement::Throw(expression) => {
+                let value = self.evaluate(expression, scope)?;
+                Err(JsError::rethrown(value))
+            }
+            Statement::Break => Ok(Completion::Break),
+            Statement::Continue => Ok(Completion::Continue),
+            Statement::Try {
+                block,
+                handler,
+                finalizer,
+            } => self.execute_try(scope, block, handler.as_ref(), finalizer.as_deref()),
         }
+    }
+
+    /// Runs a block in its own lexical scope.
+    fn execute_block(
+        &mut self,
+        scope: &ScopeRef,
+        statements: &[Statement],
+    ) -> JsResult<Completion> {
+        let block_scope = child_scope(scope);
+        hoist_lexical_declarations(&block_scope, statements, false)?;
+        self.execute_statements(&block_scope, statements)
+    }
+
+    /// Runs `try`, `catch`, and `finally` with the same semantics as the
+    /// bytecode VM: a catchable error from the `try` block goes to `catch`;
+    /// `finally` then runs on every exit, and completing abruptly (an error,
+    /// `return`, `break`, or `continue`) replaces the pending outcome. Limit
+    /// errors skip both clauses because they end the script.
+    fn execute_try(
+        &mut self,
+        scope: &ScopeRef,
+        block: &[Statement],
+        handler: Option<&crate::ast::CatchClause>,
+        finalizer: Option<&[Statement]>,
+    ) -> JsResult<Completion> {
+        let mut outcome = self.execute_block(scope, block);
+        if let (Some(clause), Err(error)) = (handler, &outcome)
+            && error.category.is_catchable()
+        {
+            let caught = error.clone().into_caught_value();
+            let catch_scope = child_scope(scope);
+            if let Some(param) = &clause.param {
+                catch_scope.lock_scope().bindings.insert(
+                    param.clone(),
+                    Binding {
+                        value: Some(caught),
+                        mutable: true,
+                        lexical: true,
+                        host: false,
+                    },
+                );
+            }
+            outcome = self.execute_block(&catch_scope, &clause.body);
+        }
+        if let Some(statements) = finalizer {
+            if matches!(&outcome, Err(error) if !error.category.is_catchable()) {
+                return outcome;
+            }
+            match self.execute_block(scope, statements)? {
+                Completion::Normal(_) => {}
+                abrupt => return Ok(abrupt),
+            }
+        }
+        outcome.map(|completion| match completion {
+            Completion::Normal(value) => {
+                Completion::Normal(Some(value.unwrap_or(Value::Undefined)))
+            }
+            abrupt => abrupt,
+        })
     }
 
     fn evaluate(&mut self, expression: &Expr, scope: &ScopeRef) -> JsResult<Value> {
@@ -875,10 +994,11 @@ impl Interpreter {
             Expr::Member { object, property } => {
                 let target = self.evaluate(object, scope)?;
                 let key = self.property_key(property, scope)?;
-                let (Value::Object(target) | Value::Array(target)) = target else {
-                    return Err(non_object(&target, "read", &key, "property access"));
-                };
-                Ok(target.get(&key).unwrap_or(Value::Undefined))
+                match target {
+                    Value::Object(target) => Ok(target.get(&key).unwrap_or(Value::Undefined)),
+                    Value::Array(target) => Ok(get_array_property(&target, &key)),
+                    target => Err(non_object(&target, "read", &key, "property access")),
+                }
             }
             Expr::MemberAssign {
                 object,
@@ -888,10 +1008,11 @@ impl Interpreter {
                 let target = self.evaluate(object, scope)?;
                 let key = self.property_key(property, scope)?;
                 let value = self.evaluate(value, scope)?;
-                let (Value::Object(target) | Value::Array(target)) = target else {
-                    return Err(non_object(&target, "set", &key, "property assignment"));
-                };
-                target.set(key, value.clone());
+                match target {
+                    Value::Object(target) => target.set(key, value.clone()),
+                    Value::Array(target) => set_array_property(&target, &key, value.clone())?,
+                    target => return Err(non_object(&target, "set", &key, "property assignment")),
+                }
                 Ok(value)
             }
             Expr::Object(properties) => {
@@ -973,12 +1094,14 @@ impl Interpreter {
                         arguments.get(index).cloned().unwrap_or(Value::Undefined),
                     );
                 }
-                let result = match interpreter.run_body(&scope, body)? {
-                    Completion::Return(value) => value,
-                    Completion::Normal(_) => Value::Undefined,
-                };
+                // The depth must be restored on errors too, because a script
+                // `catch` can resume execution in the caller.
+                let result = interpreter.run_body(&scope, body);
                 interpreter.call_depth -= 1;
-                Ok(result)
+                Ok(match result? {
+                    Completion::Return(value) => value,
+                    _ => Value::Undefined,
+                })
             }),
         }
     }
@@ -1049,6 +1172,19 @@ fn hoist_var_declarations(scope: &ScopeRef, statements: &[Statement]) -> JsResul
             }
             Statement::While { body, .. } => {
                 hoist_var_declarations(scope, std::slice::from_ref(body))?;
+            }
+            Statement::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                hoist_var_declarations(scope, block)?;
+                if let Some(clause) = handler {
+                    hoist_var_declarations(scope, &clause.body)?;
+                }
+                if let Some(statements) = finalizer {
+                    hoist_var_declarations(scope, statements)?;
+                }
             }
             _ => {}
         }

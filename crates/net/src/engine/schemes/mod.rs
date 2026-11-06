@@ -77,16 +77,13 @@ impl RequestController {
         request: Request,
         url: reqwest::Url,
         scheme: FetchScheme,
-        cacheable: bool,
     ) -> Result<Response, RequestError> {
         log::debug!(
             "scheme handler chosen: {scheme:?} for {}",
             crate::log_url::loggable(url.as_str())
         );
         match scheme {
-            FetchScheme::Http | FetchScheme::Https => {
-                self.fetch_http(request, url, cacheable).await
-            }
+            FetchScheme::Http | FetchScheme::Https => self.fetch_http(request, url).await,
             FetchScheme::Data => self.fetch_data(request, url).await,
             FetchScheme::Blob => self.fetch_blob(request, url).await,
             FetchScheme::File => self.fetch_file(request, url).await,

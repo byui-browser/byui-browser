@@ -631,11 +631,11 @@ fn unsupported_syntax_is_rejected_at_parse_time() {
 }
 
 /// Some unsupported keywords and globals lex as plain identifiers, so they
-/// parse but fail at run time as undefined bindings.
+/// parse but fail at run time as undefined bindings. (`break` and `continue`
+/// used to be among them; see `tests/exceptions.rs`.)
 #[test]
 fn unsupported_keywords_and_globals_fail_at_run_time() {
     for (source, message) in [
-        ("while (true) { break; }", "`break` is not defined"),
         ("NaN", "`NaN` is not defined"),
         ("Infinity", "`Infinity` is not defined"),
         ("this", "`this` is not defined"),

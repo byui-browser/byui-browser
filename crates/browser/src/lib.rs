@@ -21,8 +21,8 @@ use storage::{
 };
 use webapis::local_storage::register_local_storage;
 use webapis::{
-    AlertSink, ConsoleSink, Document, register_alert, register_document, register_fetch,
-    register_print, register_window,
+    AlertSink, ConsoleSink, Document, register_alert, register_document_on_window, register_fetch,
+    register_print, register_window_with_security_context, register_window_with_url,
 };
 
 pub mod byui_provider;
@@ -270,6 +270,35 @@ pub struct Page {
     pub scripts: Vec<String>,
 }
 
+/// Returns the browser's default log file: `logs/browser.log` inside
+/// [`application_data_directory`], e.g.
+/// `~/.local/share/byui-browser/logs/browser.log` on Linux.
+///
+/// The entry points pass this to
+/// `common::logging::init_from_command_line_with_default_file`, which writes
+/// it alongside standard error and keeps the previous run as
+/// `logs/browser.previous.log`. Fails only when the data directory cannot
+/// be determined (for example, no home directory); the folder itself is
+/// created when the log is opened.
+pub fn default_log_file() -> io::Result<PathBuf> {
+    Ok(application_data_directory()?
+        .join("logs")
+        .join("browser.log"))
+}
+
+/// One line for `--help` saying where the default log file goes, given the
+/// result of [`default_log_file`].
+pub fn log_file_help(default_log: Option<&Path>) -> String {
+    match default_log {
+        Some(path) => format!(
+            "Log file: {} (the run before is kept as {})",
+            path.display(),
+            common::logging::previous_log_path(path).display()
+        ),
+        None => "Log file: none (the data directory is unavailable)".to_owned(),
+    }
+}
+
 /// Returns the browser-owned application-data directory for the current OS.
 ///
 /// The renderer and webpage must never provide this path. Tests should inject
@@ -387,6 +416,7 @@ impl BrowserRuntime {
         self.boot_page(
             html_source,
             None,
+            None,
             console,
             alert_sink,
             controller,
@@ -411,6 +441,7 @@ impl BrowserRuntime {
     ) -> JsResult<PageSession> {
         self.boot_page(
             html_source,
+            None,
             None,
             console,
             alert_sink,
@@ -438,6 +469,7 @@ impl BrowserRuntime {
         self.boot_page(
             &page.html,
             Some(&page.scripts),
+            Some(&page.url),
             console,
             alert_sink,
             controller,
@@ -446,10 +478,15 @@ impl BrowserRuntime {
         .map(|booted| booted.session)
     }
 
+    // Keep the existing boot pipeline explicit: each argument is a distinct
+    // renderer service or trusted document input, and the optional URL is the
+    // only addition needed to seed the document's session history.
+    #[allow(clippy::too_many_arguments)]
     fn boot_page(
         &self,
         html_source: &str,
         scripts: Option<&[String]>,
+        initial_url: Option<&str>,
         console: Arc<dyn ConsoleSink>,
         alert_sink: Arc<dyn AlertSink>,
         controller: Arc<RequestController>,
@@ -460,11 +497,15 @@ impl BrowserRuntime {
         let document = Document::from_html_document(&html_document);
         let retained = document.clone();
         let mut realm = Realm::new();
+        register_window_with_security_context(&mut realm, security_context.clone())?;
         register_print(&mut realm, console)?;
         register_alert(&mut realm, alert_sink)?;
         register_fetch(&mut realm, controller)?;
-        register_window(&mut realm)?;
-        register_document(&mut realm, document)?;
+        let initial_url = initial_url
+            .filter(|url| !url.is_empty())
+            .unwrap_or("about:blank");
+        let window = register_window_with_url(&mut realm, initial_url)?;
+        register_document_on_window(&mut realm, document, window)?;
         register_local_storage(&mut realm, Arc::clone(&self.storage), security_context)?;
 
         // Without caller-supplied sources only inline script text is available.
@@ -550,6 +591,19 @@ fn attribute<'a>(attributes: &'a [html::Attribute], name: &str) -> Option<&'a st
 mod tests {
     use super::*;
     use security::{Origin, RendererSecurityContext, StoragePermission};
+
+    #[test]
+    fn default_log_file_lives_in_the_data_directory() {
+        // Both resolve from the same environment, so they agree whenever the
+        // data directory is available.
+        if let (Ok(log), Ok(data)) = (default_log_file(), application_data_directory()) {
+            assert_eq!(log, data.join("logs").join("browser.log"));
+        }
+        let help = log_file_help(Some(Path::new("/data/logs/browser.log")));
+        assert!(help.contains("/data/logs/browser.log"), "{help}");
+        assert!(help.contains("browser.previous.log"), "{help}");
+        assert!(log_file_help(None).contains("none"));
+    }
 
     fn storage_context() -> RendererSecurityContext {
         RendererSecurityContext::new(

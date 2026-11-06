@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-pub use runtime::{Function, Object};
+pub use runtime::{Function, MAX_ARRAY_LENGTH, Object};
 pub use vm::Vm;
 
 /// A JavaScript value produced by evaluation or passed to host functions.
@@ -62,7 +62,7 @@ impl fmt::Display for Value {
             Self::String(text) => formatter.write_str(text),
             Self::Function(function) => write!(formatter, "{function}"),
             Self::Object(object) => write!(formatter, "{object}"),
-            Self::Array(object) => write!(formatter, "{object}"),
+            Self::Array(array) => formatter.write_str(&runtime::array_to_string(array)),
         }
     }
 }
@@ -78,10 +78,25 @@ pub enum JsErrorCategory {
     Limit,
     /// A registered host function reported a failure.
     Host,
+    /// A script threw a value that no `catch` clause handled. The value is in
+    /// [`JsError::thrown`].
+    Thrown,
+}
+
+impl JsErrorCategory {
+    /// Whether a script's `catch` clause and `finally` block can observe
+    /// errors of this category.
+    ///
+    /// Runtime, host, and thrown errors are exceptions. Syntax errors never
+    /// occur while running, and limit errors end the script immediately, so
+    /// a script cannot swallow an exhausted budget or run more code after it.
+    pub fn is_catchable(self) -> bool {
+        matches!(self, Self::Runtime | Self::Host | Self::Thrown)
+    }
 }
 
 /// Errors raised while parsing, evaluating, or invoking host functions.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct JsError {
     /// The broad category of the failure.
     pub category: JsErrorCategory,
@@ -91,9 +106,62 @@ pub struct JsError {
     pub context: Option<String>,
     /// Bytecode source location where the failure occurred, when available.
     pub location: Option<bytecode::SourceLocation>,
+    /// The exact value a script threw, for [`JsErrorCategory::Thrown`]
+    /// errors, so the host can inspect it. It is `None` for every other
+    /// category.
+    pub thrown: Option<Value>,
 }
 
 impl JsError {
+    /// Creates the error for an uncaught `throw` of `value`.
+    ///
+    /// Host functions may also return it to throw an arbitrary value into
+    /// the calling script, where `catch` receives `value` unchanged.
+    pub fn thrown(value: Value) -> Self {
+        Self {
+            category: JsErrorCategory::Thrown,
+            message: format!("Uncaught {}", describe_thrown(&value)),
+            context: Some("throw statement".into()),
+            location: None,
+            thrown: Some(value),
+        }
+    }
+
+    /// Returns the value a `catch` clause receives for this error.
+    ///
+    /// A thrown value is returned unchanged. Any other catchable error
+    /// becomes a new object with a string `name` (`"Error"` for runtime
+    /// errors, `"HostError"` for host errors) and a string `message`.
+    pub fn into_caught_value(self) -> Value {
+        if let Some(value) = self.thrown {
+            return value;
+        }
+        let object = Object::new();
+        let name = match self.category {
+            JsErrorCategory::Host => "HostError",
+            _ => "Error",
+        };
+        object.set("name", Value::String(name.into()));
+        object.set("message", Value::String(self.message.clone()));
+        object.set_origin(self);
+        Value::Object(object)
+    }
+
+    /// Creates the error for a script that throws `value` again.
+    ///
+    /// The object a `catch` clause received for an engine error is turned
+    /// back into that error, so a `finally` block or a `catch (e) { throw e }`
+    /// does not change the category, message, or context of what the host
+    /// finally sees. Every other value becomes [`JsError::thrown`].
+    pub(crate) fn rethrown(value: Value) -> Self {
+        if let Value::Object(object) = &value
+            && let Some(original) = object.origin()
+        {
+            return original;
+        }
+        Self::thrown(value)
+    }
+
     /// Creates an error carrying `message`.
     pub fn new(message: impl Into<String>) -> Self {
         Self::runtime(message)
@@ -106,6 +174,7 @@ impl JsError {
             message: message.into(),
             context: None,
             location: None,
+            thrown: None,
         }
     }
 
@@ -120,6 +189,7 @@ impl JsError {
             message: message.into(),
             context: Some(context.into()),
             location: None,
+            thrown: None,
         }
     }
 
@@ -137,6 +207,20 @@ impl fmt::Display for JsError {
 }
 
 impl std::error::Error for JsError {}
+
+/// Renders a thrown value for an uncaught-exception message: an object with a
+/// string `message` reads as `name: message`, anything else as `ToString`.
+fn describe_thrown(value: &Value) -> String {
+    if let Value::Object(object) = value
+        && let Some(Value::String(message)) = object.get("message")
+    {
+        return match object.get("name") {
+            Some(Value::String(name)) => format!("{name}: {message}"),
+            _ => message,
+        };
+    }
+    value.to_string()
+}
 
 /// Result type used throughout the engine, failing with [`JsError`].
 pub type JsResult<T> = Result<T, JsError>;
@@ -294,6 +378,14 @@ impl Realm {
         Ok(())
     }
 
+    /// Returns the original value registered by the host for `name`.
+    ///
+    /// This does not read a script reassignment or declaration; it is intended
+    /// for host bindings that share state across API registration functions.
+    pub fn registered_global_value(&self, name: &str) -> Option<Value> {
+        self.values.get(name).cloned()
+    }
+
     /// Calls a global registered with [`Realm::register_global_function`].
     /// Values registered with [`Realm::register_global_value`] are not
     /// callable through this method, even if they are functions.
@@ -415,7 +507,8 @@ pub fn parse(source: &str) -> Result<Program, parser::ParseError> {
 ///
 /// Runs the tree-walk interpreter described in [`runtime`]: expressions,
 /// object literals, member access, declarations, blocks, `if`, `while`,
-/// functions, calls, and `return`. Classes, `new`, `this`, and `super` parse
+/// functions, calls, `return`, `throw`, `try`/`catch`/`finally`, and `break` and
+/// `continue` in `while` loops. Classes, `new`, `this`, and `super` parse
 /// but are not evaluated here; they run only through [`bytecode::compile`] and
 /// [`Vm`]. Syntax errors and runtime errors are both returned as [`JsError`].
 pub fn eval(source: &str) -> JsResult<Value> {

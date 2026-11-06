@@ -1,25 +1,54 @@
-//! Cascade, inheritance, and selector matching.
+//! Cascade and inheritance.
+//!
+//! Selector matching lives in [`crate::matching`]; the rule hash that limits
+//! which rules an element is tested against lives in [`crate::rule_index`].
 
 use crate::computed::{ComputedStyles, computed_style};
+use crate::matching::{ElementTree, attribute};
 use crate::parser::parse_declarations;
-use crate::shorthands;
-use crate::specificity::specificity;
+use crate::rule_index::{CompiledDeclaration, CompiledSheet, RuleIndex, compile_declarations};
 use crate::stylesheet::{Declaration, Dom, Specificity, Stylesheet};
-use crate::user_agent::user_agent_stylesheet;
+use crate::user_agent::{user_agent_compiled, user_agent_stylesheet};
 use crate::values;
-use html::{HTMLDocument, NodeID, NodeKind};
-use std::collections::BTreeMap;
+use html::{NodeID, NodeKind};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 
 /// Cascade precedence for a declaration, compared lexicographically.
 ///
 /// `level` orders origins and importance per CSS Cascade 4 §6.1: normal
 /// user-agent < normal author < normal inline style < important author <
-/// important inline style < important user-agent.
+/// important inline style < important user-agent. The remaining fields are
+/// specificity and then source order: stylesheet, rule, and declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct CascadePriority {
     level: u8,
     specificity: Specificity,
-    order: usize,
+    sheet: usize,
+    rule: usize,
+    declaration: usize,
+}
+
+const USER_AGENT_NORMAL: u8 = 1;
+const AUTHOR_NORMAL: u8 = 2;
+const INLINE_NORMAL: u8 = 3;
+const AUTHOR_IMPORTANT: u8 = 4;
+const INLINE_IMPORTANT: u8 = 5;
+const USER_AGENT_IMPORTANT: u8 = 6;
+
+/// Counters from one cascade run, used for logging and regression tests.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CascadeStats {
+    /// Elements styled.
+    pub(crate) elements: usize,
+    /// Selectors that matching rules could contribute, across all sheets.
+    pub(crate) indexed_selectors: usize,
+    /// Full selector matches attempted on candidate rules.
+    pub(crate) selectors_checked: usize,
+    /// Selector matches that succeeded.
+    pub(crate) selectors_matched: usize,
+    /// Longhand declarations that competed in the cascade.
+    pub(crate) declarations_applied: usize,
 }
 
 /// Applies the bundled user-agent stylesheet, author stylesheets, inline
@@ -35,7 +64,24 @@ struct CascadePriority {
 /// gets a computed `font-size` in absolute CSS pixels (CSS Fonts 4 §2.5), so
 /// descendants inherit an absolute size rather than re-resolving `em`. Other
 /// values are passed through as specified text.
+///
+/// Selector support is described in [`crate::selector`] (syntax) and the
+/// matcher: combinators, attribute selectors, and structural and logical
+/// pseudo-classes match; dynamic pseudo-classes such as `:hover` and all
+/// pseudo-elements never match. Rules inside at-rules such as `@media` are
+/// not applied yet.
+///
+/// Cost: each stylesheet is compiled once per call, and each element is only
+/// tested against rules filed under its ID, classes, attribute names, and tag
+/// (plus rules with no such key), not against every rule.
 pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
+    style_document_with_stats(dom, stylesheets).0
+}
+
+pub(crate) fn style_document_with_stats(
+    dom: &Dom,
+    stylesheets: &[Stylesheet],
+) -> (ComputedStyles, CascadeStats) {
     log::debug!(
         "styling document: {} nodes, {} author stylesheets",
         dom.nodes.len(),
@@ -52,13 +98,34 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
             );
         }
     }
+
+    let author_sheets: Vec<CompiledSheet> =
+        stylesheets.iter().map(CompiledSheet::compile).collect();
+    let mut index = RuleIndex::default();
+    index.add_sheet(
+        user_agent_compiled(),
+        0,
+        USER_AGENT_NORMAL,
+        USER_AGENT_IMPORTANT,
+    );
+    for (position, sheet) in author_sheets.iter().enumerate() {
+        index.add_sheet(sheet, position + 1, AUTHOR_NORMAL, AUTHOR_IMPORTANT);
+    }
+    let tree = ElementTree::new(dom);
+    let mut stats = CascadeStats {
+        indexed_selectors: index.rules.len(),
+        ..CascadeStats::default()
+    };
+
     let mut computed: Vec<(NodeID, Vec<Declaration>)> = Vec::new();
     let mut root_font_size = None;
-    let mut declarations_applied = 0_usize;
-    for (index, node) in dom.nodes.iter().enumerate() {
+    let mut candidates = Vec::new();
+    let initial_color = initial_color_value();
+    for (node_index, node) in dom.nodes.iter().enumerate() {
         let NodeKind::Element(element) = node.get_kind() else {
             continue;
         };
+        stats.elements += 1;
         let parent = node
             .get_parent()
             .and_then(|parent| computed_style(&computed, parent));
@@ -67,80 +134,71 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
                 declarations
                     .iter()
                     .find(|declaration| declaration.property == property)
-                    .map(|declaration| declaration.value.clone())
+                    .map(|declaration| declaration.value.as_str())
             })
         };
 
-        let mut cascaded = BTreeMap::<String, (CascadePriority, String)>::new();
-        let mut apply = |declaration: &Declaration,
-                         normal_level: u8,
-                         important_level: u8,
-                         specificity,
-                         order| {
-            let (value, important) = split_important(&declaration.value);
-            let level = if important {
-                important_level
-            } else {
-                normal_level
-            };
-            let priority = CascadePriority {
-                level,
-                specificity,
-                order,
-            };
-            let expanded = shorthands::expand(&Declaration {
-                property: declaration.property.clone(),
-                value: value.to_owned(),
-            });
-            for longhand in expanded {
-                declarations_applied += 1;
-                let wins = cascaded
-                    .get(&longhand.property)
-                    .is_none_or(|(current, _)| priority >= *current);
-                log::trace!(
-                    "declaration `{}: {}` level={} wins={wins}",
-                    longhand.property,
-                    longhand.value,
-                    priority.level
-                );
-                if wins {
-                    cascaded.insert(longhand.property, (priority, longhand.value));
-                }
+        // Inline declarations must outlive `cascaded`, which borrows them.
+        let inline: Vec<CompiledDeclaration> = match attribute(element, "style") {
+            Some(style) => {
+                let mut inline_errors = Stylesheet::default();
+                compile_declarations(&parse_declarations(style, &mut inline_errors, 0))
             }
+            None => Vec::new(),
         };
-        for (sheet_index, (normal_level, important_level, sheet)) in
-            std::iter::once((1, 6, user_agent_stylesheet()))
-                .chain(stylesheets.iter().map(|sheet| (2, 4, sheet)))
-                .enumerate()
-        {
-            for (rule_index, rule) in sheet.rules.iter().enumerate() {
-                if !matches_selector(dom, NodeID::new(index), &rule.selector.0) {
-                    continue;
-                }
-                log::trace!("selector `{}` matches node {index}", rule.selector.0);
-                let order = sheet_index
-                    .saturating_mul(1_000_000)
-                    .saturating_add(rule_index);
-                let selector_specificity = specificity(&rule.selector);
-                for declaration in &rule.declarations {
-                    apply(
-                        declaration,
-                        normal_level,
-                        important_level,
-                        selector_specificity,
-                        order,
-                    );
-                }
+
+        let mut cascaded = HashMap::<&str, (CascadePriority, &str)>::new();
+        index.candidates(element, &mut candidates);
+        for &candidate in &candidates {
+            let indexed = &index.rules[candidate as usize];
+            stats.selectors_checked += 1;
+            if !tree.matches(&indexed.rule.selector, node_index) {
+                continue;
+            }
+            stats.selectors_matched += 1;
+            log::trace!(
+                "rule {} of sheet {} matches node {node_index}",
+                indexed.rule.rule_index,
+                indexed.sheet_index
+            );
+            for (position, declaration) in indexed.rule.declarations.iter().enumerate() {
+                let level = if declaration.important {
+                    indexed.important_level
+                } else {
+                    indexed.normal_level
+                };
+                stats.declarations_applied += 1;
+                apply(
+                    &mut cascaded,
+                    declaration,
+                    CascadePriority {
+                        level,
+                        specificity: indexed.rule.specificity,
+                        sheet: indexed.sheet_index,
+                        rule: indexed.rule.rule_index,
+                        declaration: position,
+                    },
+                );
             }
         }
-        if let Some(style) = attribute_value(element, "style") {
-            let mut inline_errors = Stylesheet::default();
-            for (position, declaration) in parse_declarations(style, &mut inline_errors, 0)
-                .iter()
-                .enumerate()
-            {
-                apply(declaration, 3, 5, Specificity(0, 0, 0), position);
-            }
+        for (position, declaration) in inline.iter().enumerate() {
+            let level = if declaration.important {
+                INLINE_IMPORTANT
+            } else {
+                INLINE_NORMAL
+            };
+            stats.declarations_applied += 1;
+            apply(
+                &mut cascaded,
+                declaration,
+                CascadePriority {
+                    level,
+                    specificity: Specificity(0, 0, 0),
+                    sheet: 0,
+                    rule: 0,
+                    declaration: position,
+                },
+            );
         }
 
         let mut properties = BTreeMap::<String, String>::new();
@@ -153,38 +211,38 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
         }
         properties
             .entry("color".to_owned())
-            .or_insert_with(initial_color_value);
+            .or_insert_with(|| initial_color.clone());
         for (property, (_, value)) in cascaded {
-            let keyword = value.trim().to_ascii_lowercase();
-            let inherit = match keyword.as_str() {
-                "inherit" => true,
-                "unset" | "revert" | "revert-layer" => is_inherited_property(&property),
-                "initial" => false,
-                _ => {
-                    properties.insert(property, value);
-                    continue;
-                }
+            let keyword = value.trim();
+            let inherit = if keyword.eq_ignore_ascii_case("inherit") {
+                true
+            } else if ["unset", "revert", "revert-layer"]
+                .iter()
+                .any(|word| keyword.eq_ignore_ascii_case(word))
+            {
+                is_inherited_property(property)
+            } else if keyword.eq_ignore_ascii_case("initial") {
+                false
+            } else {
+                properties.insert(property.to_owned(), value.to_owned());
+                continue;
             };
-            match parent_value(&property).filter(|_| inherit) {
+            match parent_value(property).filter(|_| inherit) {
                 Some(inherited) => {
-                    properties.insert(property, inherited);
+                    properties.insert(property.to_owned(), inherited.to_owned());
                 }
                 None if property == "color" => {
-                    properties.insert(property, initial_color_value());
+                    properties.insert(property.to_owned(), initial_color.clone());
                 }
                 None => {
-                    properties.remove(&property);
+                    properties.remove(property);
                 }
             }
         }
 
         let parent_font_size = parent_value("font-size")
             .and_then(|value| {
-                values::compute_font_size(
-                    &value,
-                    values::MEDIUM_FONT_SIZE,
-                    values::MEDIUM_FONT_SIZE,
-                )
+                values::compute_font_size(value, values::MEDIUM_FONT_SIZE, values::MEDIUM_FONT_SIZE)
             })
             .unwrap_or(values::MEDIUM_FONT_SIZE);
         let root_size = root_font_size.unwrap_or(values::MEDIUM_FONT_SIZE);
@@ -192,7 +250,7 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
             .get("font-size")
             .and_then(|value| values::compute_font_size(value, parent_font_size, root_size))
             .unwrap_or_else(|| {
-                log::trace!("font-size not computable for node {index}; using parent size");
+                log::trace!("font-size not computable for node {node_index}; using parent size");
                 parent_font_size
             });
         properties.insert("font-size".to_owned(), values::format_px(font_size));
@@ -200,7 +258,7 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
             root_font_size = Some(font_size);
         }
         computed.push((
-            NodeID::new(index),
+            NodeID::new(node_index),
             properties
                 .into_iter()
                 .map(|(property, value)| Declaration { property, value })
@@ -208,23 +266,42 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
         ));
     }
     log::debug!(
-        "styled document: {} elements, {declarations_applied} longhand declarations considered",
-        computed.len()
+        "styled document: {} elements, {} indexed selectors, {} selector checks ({} matched), \
+         {} longhand declarations considered",
+        stats.elements,
+        stats.indexed_selectors,
+        stats.selectors_checked,
+        stats.selectors_matched,
+        stats.declarations_applied
     );
-    ComputedStyles { styles: computed }
+    (ComputedStyles { styles: computed }, stats)
 }
 
-/// Splits a trailing `!important` annotation from a declaration value.
-fn split_important(value: &str) -> (&str, bool) {
-    let trimmed = value.trim_end();
-    let lower = trimmed.to_ascii_lowercase();
-    if let Some(before) = lower.strip_suffix("important") {
-        let before = before.trim_end();
-        if let Some(rest) = before.strip_suffix('!') {
-            return (trimmed[..rest.len()].trim_end(), true);
+/// Records `declaration` for its property if it beats the current winner.
+///
+/// Ties keep the later declaration, although the priority's source-order
+/// fields make ties between different declarations impossible.
+fn apply<'d>(
+    cascaded: &mut HashMap<&'d str, (CascadePriority, &'d str)>,
+    declaration: &'d CompiledDeclaration,
+    priority: CascadePriority,
+) {
+    log::trace!(
+        "declaration `{}: {}` level={}",
+        declaration.property,
+        declaration.value,
+        priority.level
+    );
+    match cascaded.entry(declaration.property.as_str()) {
+        Entry::Occupied(mut current) => {
+            if priority >= current.get().0 {
+                current.insert((priority, declaration.value.as_str()));
+            }
+        }
+        Entry::Vacant(slot) => {
+            slot.insert((priority, declaration.value.as_str()));
         }
     }
-    (trimmed, false)
 }
 
 /// The initial `color`, taken from the user-agent `html` rule.
@@ -255,85 +332,6 @@ fn is_inherited_property(property: &str) -> bool {
             | "text-align"
             | "visibility"
     )
-}
-
-fn attribute_value<'a>(element: &'a html::ElementData, name: &str) -> Option<&'a str> {
-    element
-        .get_attributes()
-        .iter()
-        .find(|attribute| attribute.get_name() == name)
-        .map(|attribute| attribute.get_value().as_str())
-}
-
-fn matches_selector(dom: &HTMLDocument, node_id: NodeID, selector: &str) -> bool {
-    let parts = selector.split_whitespace().collect::<Vec<_>>();
-    let Some(last) = parts.last() else {
-        return false;
-    };
-    if !matches_compound(dom, node_id, last) {
-        return false;
-    }
-    let mut current = node_id;
-    for part in parts.iter().rev().skip(1) {
-        let mut ancestor = dom.nodes[current.get()].get_parent();
-        let mut found = None;
-        while let Some(candidate) = ancestor {
-            if matches_compound(dom, candidate, part) {
-                found = Some(candidate);
-                break;
-            }
-            ancestor = dom.nodes[candidate.get()].get_parent();
-        }
-        let Some(found) = found else { return false };
-        current = found;
-    }
-    true
-}
-
-fn matches_compound(dom: &HTMLDocument, node_id: NodeID, selector: &str) -> bool {
-    let Some(node) = dom.node(node_id) else {
-        return false;
-    };
-    let NodeKind::Element(element) = node.get_kind() else {
-        return false;
-    };
-    let mut index = 0;
-    if selector
-        .as_bytes()
-        .first()
-        .is_some_and(|byte| byte.is_ascii_alphabetic())
-    {
-        let end = selector
-            .find(['#', '.', ':', '['])
-            .unwrap_or(selector.len());
-        if element.get_name() != &selector[..end].to_ascii_lowercase() {
-            return false;
-        }
-        index = end;
-    }
-    while index < selector.len() {
-        let marker = selector.as_bytes()[index] as char;
-        if marker == '#' || marker == '.' {
-            let start = index + 1;
-            let end = selector[start..]
-                .find(['#', '.', ':', '['])
-                .map_or(selector.len(), |offset| start + offset);
-            let value = &selector[start..end];
-            let matches = if marker == '#' {
-                attribute_value(element, "id") == Some(value)
-            } else {
-                attribute_value(element, "class")
-                    .is_some_and(|classes| classes.split_whitespace().any(|class| class == value))
-            };
-            if !matches {
-                return false;
-            }
-            index = end;
-        } else {
-            return false;
-        }
-    }
-    true
 }
 
 #[cfg(test)]
@@ -460,6 +458,95 @@ mod tests {
         assert_eq!(
             computed(&styles, &document, "child", "margin-left").as_deref(),
             Some("5px")
+        );
+    }
+
+    #[test]
+    fn source_order_breaks_specificity_ties_across_index_buckets() {
+        let document = html::parse_raw_html("<p id='target' class='a' data-x='1'>Hi</p>".into());
+        for (css, expected) in [
+            ("[data-x] { color: red } .a { color: blue }", "blue"),
+            (".a { color: blue } [data-x] { color: red }", "red"),
+        ] {
+            let styles = style_document(&document, &[parse_stylesheet(css)]);
+            assert_eq!(
+                computed(&styles, &document, "target", "color").as_deref(),
+                Some(expected),
+                "{css}"
+            );
+        }
+    }
+
+    #[test]
+    fn later_stylesheets_win_ties_and_declarations_keep_their_order() {
+        let document = html::parse_raw_html("<p id='target' class='a'>Hi</p>".into());
+        let first = parse_stylesheet(".a { color: red }");
+        let second = parse_stylesheet(".a { color: blue; margin: 0; margin-top: 3px }");
+        let styles = style_document(&document, &[first, second]);
+        assert_eq!(
+            computed(&styles, &document, "target", "color").as_deref(),
+            Some("blue")
+        );
+        assert_eq!(
+            computed(&styles, &document, "target", "margin-top").as_deref(),
+            Some("3px")
+        );
+        assert_eq!(
+            computed(&styles, &document, "target", "margin-left").as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn combinators_attributes_and_pseudo_classes_take_part_in_the_cascade() {
+        let document = html::parse_raw_html(
+            "<div class='card'><p id='first'>a</p><p id='second' hidden>b</p>\
+             <a id='link' href='/x'>c</a><span id='plain'>d</span></div>"
+                .into(),
+        );
+        let sheet = parse_stylesheet(
+            ".card > p:first-child { color: red } \
+             p + p { color: blue } \
+             div :not(p, a) { color: green } \
+             span:hover { color: orange } \
+             span::before { display: block }",
+        );
+        let styles = style_document(&document, &[sheet]);
+        let value = |id, property| computed(&styles, &document, id, property);
+        assert_eq!(value("first", "color").as_deref(), Some("red"));
+        assert_eq!(value("second", "color").as_deref(), Some("blue"));
+        assert_eq!(value("plain", "color").as_deref(), Some("green"));
+        // `span::before` styles a pseudo-element, never the span itself.
+        assert_eq!(value("plain", "display"), None);
+        // User-agent rules that rely on attribute and pseudo-class selectors.
+        assert_eq!(value("second", "display").as_deref(), Some("none"));
+        assert_eq!(value("link", "color").as_deref(), Some("#0000ee"));
+    }
+
+    #[test]
+    fn elements_are_only_tested_against_rules_that_could_match_them() {
+        let mut css = String::new();
+        let mut html = String::from("<div>");
+        for index in 0..500 {
+            css.push_str(&format!(
+                ".c{index} {{ color: red }} #i{index} {{ color: blue }}\n"
+            ));
+            html.push_str(&format!("<p class='c{index}' id='i{index}'>x</p>"));
+        }
+        html.push_str("</div>");
+        let document = html::parse_raw_html(html);
+        let (styles, stats) = style_document_with_stats(&document, &[parse_stylesheet(&css)]);
+        assert_eq!(
+            computed(&styles, &document, "i42", "color").as_deref(),
+            Some("blue")
+        );
+        // Testing every element against every rule would be about
+        // 500 elements x 1,000 author rules. The rule hash keeps the work to
+        // each element's own two rules plus a handful of user-agent rules.
+        assert!(stats.elements > 500);
+        assert!(
+            stats.selectors_checked < stats.elements * 10,
+            "too many selector checks: {stats:?}"
         );
     }
 }
