@@ -1,11 +1,12 @@
 use reqwest::{StatusCode, header::HeaderMap};
 
-use super::{Response, ResponseType};
+use super::{Response, ResponseType, has_null_body};
 use crate::api::{
     HeaderGuard, Headers,
     body::Body,
+    media_type::is_valid_media_type,
     providers::SchemeResource,
-    request::{CredentialsMode, Origin, Request, RequestMode},
+    request::{CredentialsMode, FetchContext, Origin, Request, RequestMode},
 };
 use crate::policy::FetchScheme;
 
@@ -25,12 +26,41 @@ pub(crate) struct InternalResponse {
     pub(crate) credentials_mode: CredentialsMode,
     pub(crate) response_type: ResponseType,
     pub(crate) body: Body,
-    pub(crate) body_is_null: bool,
     pub(crate) from_cache: bool,
     pub(crate) cookie_headers_processed: bool,
 }
 
 impl InternalResponse {
+    /// Builds internal HTTP response state from a transport or cache result.
+    pub(crate) fn from_http_parts(
+        status: StatusCode,
+        headers: HeaderMap,
+        url: String,
+        context: &FetchContext,
+        body: Body,
+        from_cache: bool,
+        cookie_headers_processed: bool,
+    ) -> Self {
+        let origin = reqwest::Url::parse(&url)
+            .ok()
+            .and_then(|url| Origin::from_url(&url).ok());
+        Self {
+            status,
+            status_text: status.canonical_reason().unwrap_or_default().to_owned(),
+            headers,
+            url_list: vec![url],
+            redirect_count: 0,
+            origin,
+            request_origin: context.environment.origin.clone(),
+            request_mode: context.mode,
+            credentials_mode: context.credentials,
+            response_type: ResponseType::Basic,
+            body,
+            from_cache,
+            cookie_headers_processed,
+        }
+    }
+
     /// Converts provider-owned resource metadata into the internal response
     /// representation used by the Fetch policy and exposure pipeline.
     pub(crate) fn from_scheme_resource(
@@ -40,6 +70,10 @@ impl InternalResponse {
     ) -> Result<Self, crate::RequestError> {
         validate_scheme_resource(&resource, expected_scheme)?;
         let status = StatusCode::from_u16(resource.status).map_err(|error| {
+            log::warn!(
+                "scheme provider returned invalid status {}",
+                resource.status
+            );
             crate::RequestError::InvalidResponse(format!(
                 "scheme provider returned invalid status {}: {error}",
                 resource.status
@@ -68,11 +102,11 @@ impl InternalResponse {
                     });
             }
         }
-        let force_null = request.method() == http::Method::HEAD || response_forbids_body;
-        let (mut body, body_is_null) = resource
+        let force_null = has_null_body(request.method(), status) || response_forbids_body;
+        let mut body = resource
             .body
             .into_body(request.signal().clone(), force_null);
-        body.set_content_type(content_type);
+        body.set_response_metadata(&headers, None);
         let status_text = resource
             .status_text
             .unwrap_or_else(|| status.canonical_reason().unwrap_or_default().to_owned());
@@ -84,12 +118,11 @@ impl InternalResponse {
             url_list: vec![resource.url.to_string()],
             redirect_count: 0,
             origin: Some(resource.origin),
-            request_origin: request.context.environment.origin.clone(),
+            request_origin: request.effective_origin().cloned(),
             request_mode: request.context.mode,
             credentials_mode: request.context.credentials,
             response_type: ResponseType::Basic,
             body,
-            body_is_null,
             from_cache: false,
             cookie_headers_processed: false,
         })
@@ -125,7 +158,7 @@ impl InternalResponse {
                 self.url_list.last().cloned().unwrap_or_default()
             },
             redirected: !hidden && self.redirect_count > 0,
-            body: if hidden || self.body_is_null {
+            body: if hidden || self.body.is_null() {
                 Body::null()
             } else {
                 self.body
@@ -140,20 +173,16 @@ fn validate_scheme_resource(
     resource: &SchemeResource,
     expected_scheme: FetchScheme,
 ) -> Result<(), crate::RequestError> {
-    let expected = match expected_scheme {
-        FetchScheme::Http => "http",
-        FetchScheme::Https => "https",
-        FetchScheme::Data => "data",
-        FetchScheme::Blob => "blob",
-        FetchScheme::File => "file",
-        FetchScheme::Byui => "byui",
-        FetchScheme::About => "about",
-    };
+    let expected = expected_scheme.name();
     if resource.url.scheme() != expected {
-        return Err(crate::RequestError::Provider {
-            provider: expected,
-            kind: crate::ProviderErrorKind::MalformedMetadata,
-        });
+        log::warn!(
+            "{expected} provider returned a url with scheme {:?}, expected {expected}",
+            resource.url.scheme()
+        );
+        return Err(provider_error(
+            expected,
+            crate::ProviderErrorKind::MalformedMetadata,
+        ));
     }
 
     if resource
@@ -161,10 +190,11 @@ fn validate_scheme_resource(
         .as_deref()
         .is_some_and(|text| text.bytes().any(|byte| byte < 0x20 || byte == 0x7f))
     {
-        return Err(crate::RequestError::Provider {
-            provider: expected,
-            kind: crate::ProviderErrorKind::MalformedMetadata,
-        });
+        log::warn!("{expected} provider returned a status text containing control characters");
+        return Err(provider_error(
+            expected,
+            crate::ProviderErrorKind::MalformedMetadata,
+        ));
     }
 
     let header_media_type = resource
@@ -173,57 +203,41 @@ fn validate_scheme_resource(
         .find(|(name, _)| name == http::header::CONTENT_TYPE)
         .map(|(_, value)| value);
     if let Some(media_type) = &resource.media_type {
-        if !valid_media_type(media_type)
+        if !is_valid_media_type(media_type)
             || header_media_type.is_some_and(|header| header != media_type)
         {
-            return Err(crate::RequestError::Provider {
-                provider: expected,
-                kind: crate::ProviderErrorKind::MalformedMetadata,
-            });
+            log::warn!(
+                "{expected} provider returned a media type that is invalid or differs from its content-type header"
+            );
+            return Err(provider_error(
+                expected,
+                crate::ProviderErrorKind::MalformedMetadata,
+            ));
         }
     }
-    if header_media_type.is_some_and(|value| !valid_media_type(value)) {
-        return Err(crate::RequestError::Provider {
-            provider: expected,
-            kind: crate::ProviderErrorKind::MalformedMetadata,
-        });
+    if header_media_type.is_some_and(|value| !is_valid_media_type(value)) {
+        log::warn!("{expected} provider returned an invalid content-type header");
+        return Err(provider_error(
+            expected,
+            crate::ProviderErrorKind::MalformedMetadata,
+        ));
     }
 
     if !resource.origin.is_opaque()
         && crate::api::request::Origin::parse(&resource.origin.as_str()).is_err()
     {
-        return Err(crate::RequestError::Provider {
-            provider: expected,
-            kind: crate::ProviderErrorKind::InvalidOrigin,
-        });
+        log::warn!("{expected} provider returned an unparseable origin");
+        return Err(provider_error(
+            expected,
+            crate::ProviderErrorKind::InvalidOrigin,
+        ));
     }
     Ok(())
 }
 
-/// Checks the syntax used for provider and response `Content-Type` metadata.
-fn valid_media_type(value: &http::HeaderValue) -> bool {
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    let mut parts = value.split(';');
-    let Some(essence) = parts.next() else {
-        return false;
-    };
-    let Some((kind, subtype)) = essence.trim().split_once('/') else {
-        return false;
-    };
-    if kind.is_empty()
-        || subtype.is_empty()
-        || kind.bytes().any(|byte| byte.is_ascii_whitespace())
-        || subtype.bytes().any(|byte| byte.is_ascii_whitespace())
-    {
-        return false;
-    }
-    parts.all(|parameter| {
-        parameter
-            .split_once('=')
-            .is_some_and(|(name, value)| !name.trim().is_empty() && !value.trim().is_empty())
-    })
+/// Constructs a stable provider validation error.
+fn provider_error(provider: &'static str, kind: crate::ProviderErrorKind) -> crate::RequestError {
+    crate::RequestError::Provider { provider, kind }
 }
 
 #[cfg(test)]
@@ -389,6 +403,7 @@ mod tests {
             .unwrap()
             .expose();
         assert_eq!(bytes.headers.get("content-length").as_deref(), Some("5"));
+        assert_eq!(bytes.body.length(), Some(5));
 
         let mut metadata_only = resource("data:,ok");
         metadata_only.body = SchemeBody::NullWithLength(7);
@@ -425,6 +440,7 @@ mod tests {
                 .unwrap()
                 .expose();
         assert_eq!(explicit.headers.get("content-length").as_deref(), Some("9"));
+        assert_eq!(explicit.body.length(), Some(9));
 
         for status in [204, 205, 304] {
             let mut bodyless = resource("data:,ok");

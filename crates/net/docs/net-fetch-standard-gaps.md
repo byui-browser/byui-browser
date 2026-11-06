@@ -8,12 +8,16 @@ null-body rules. The detailed audit below records the wider unfinished Fetch
 algorithms; see `fetch-engine-contract.md` for the current supported subset and
 capability errors.
 
-Status: audit of the implementation as of 2026-10-27, including the current
-committed `crates/net` implementation and the Feature 4.4 plan updates.
+Status: audit of the implementation as of 2026-11-03, including the current
+`crates/net` implementation, browser composition, and the Feature 4.4 plan
+updates. The working tree also contains an in-progress body ownership
+refactor; because `cargo test -p net` does not currently compile with those
+changes, body claims below describe the last coherent committed behavior and
+identify the refactor as provisional.
 
-This report compares `crates/net` with the [WHATWG Fetch Living Standard](https://fetch.spec.whatwg.org/), last updated 2026-10-06. It evaluates the networking crate as a browser-facing Fetch implementation, not merely as an HTTP client. A field or enum is counted as implemented only when it changes observable behavior at the appropriate policy boundary.
+This report compares `crates/net` with the [WHATWG Fetch Living Standard](https://fetch.spec.whatwg.org/), last updated 2026-10-19. It evaluates the networking crate as a browser-facing Fetch implementation, not merely as an HTTP client. A field or enum is counted as implemented only when it changes observable behavior at the appropriate policy boundary.
 
-The crate currently provides an HTTP(S) transport with a Fetch-shaped request model: environment-based relative URL resolution, structured HTTP(S) origins, guarded ordered request headers, replayable and one-shot request bodies, automatic body metadata and `Origin`/`Referer` preparation, filtered streamed responses, controller-owned redirect handling, abort signaling, connection pooling, keepalive body-size validation, and a small in-memory cache. Browser-context requests require a `FetchServices` provider. The crate is not yet Fetch-compatible for the full request/response algorithms. The dispatcher recognizes
+The crate currently provides an HTTP(S) transport with a Fetch-shaped request model: environment-based relative URL resolution, structured HTTP(S) origins, guarded ordered request headers, replayable and one-shot request bodies, automatic body metadata and `Origin`/`Referer` preparation, filtered streamed responses, controller-owned redirect handling, abort signaling, connection pooling, keepalive body-size checking before rejecting unsupported keepalive execution, and a small in-memory cache. Browser-context requests require a `FetchServices` provider. The crate is not yet Fetch-compatible for the full request/response algorithms. The dispatcher recognizes
 `http`, `https`, `data`, `blob`, `file`, `byui`, and `about`. `data:` is
 engine-owned and currently decodes percent-encoded and base64 payloads;
 `blob:`, `file:`, and `byui:` resolve through installed browser-owned providers
@@ -22,19 +26,19 @@ implemented while other `about:` URLs remain unsupported.
 
 ## Summary
 
-| Area                        | Current state                                                                                                                                                 | Gap severity |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
-| URL and scheme fetch        | HTTP(S), relative URLs, `data:`, `blob:`, `file:`, `byui:`, and `about:blank` fetch work; other `about:` URLs are rejected                                    | High         |
-| Request headers and methods | Method validation, request/no-CORS guards, internal generated-header channels, and response filtering exist; later redirect/header rules remain               | Medium       |
-| Request and response bodies | Shared buffered/streaming `Body`, text/blob/form-data/JSON/array-buffer helpers, and null-body handling exist; cloning/teeing and full Fetch semantics remain | Medium       |
-| Credentials and cookies     | `FetchServices` can supply and store cookies; matching, persistence, and policy belong to its provider                                                        | Critical     |
-| CORS and response tainting  | Simple CORS checks and basic/opaque views exist; preflight and redirect checks are absent                                                                     | Critical     |
-| Redirects                   | Controller follows validated HTTP(S) redirects with `follow`, `error`, and `manual` modes; full browser policy remains incomplete                             | High         |
-| HTTP cache                  | TTL-only in-memory cache with provider-supplied partition keys; full matching/revalidation is absent                                                          | High         |
-| Fetch policy integrations   | Browser-context requests require `FetchServices`; CSP, mixed content, CORP, SRI, and worker interception remain provider/later-step work                      | Critical     |
-| Cancellation and lifecycle  | Basic abort signal works, but Fetch controller state/reasons/timing are absent                                                                                | Medium       |
-| Fetch API surface           | Rust `Request`, filtered `Response`, guarded `Headers`, shared `Body`, and body helpers exist; JavaScript bindings, response constructors, and cloning remain | High         |
-| Scheduling and transport    | HTTP/2, compression, pooling, and priority mapping are available; scheduler ordering and HTTP/3 are absent                                                    | Low/Medium   |
+| Area                        | Current state                                                                                                                                                                                                                                    | Gap severity |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------ |
+| URL and scheme fetch        | HTTP(S), relative URLs, `data:`, provider-backed `blob:`, authorized `file:`, `byui:`, and `about:blank` fetch work; other `about:` URLs are rejected                                                                                            | Medium       |
+| Request headers and methods | Method validation, request/no-CORS guards, internal generated-header channels, and response filtering exist; later redirect/header rules remain                                                                                                  | Medium       |
+| Request and response bodies | Authoritative buffered/streaming `Body`, helpers, metadata, fallible cloning, bounded teeing, and null-body handling exist in the committed slice; JavaScript conversion, keepalive lifetime, and the in-progress body ownership refactor remain | Medium       |
+| Credentials and cookies     | `FetchServices` exposes cookie selection/storage hooks, but the current browser service selects no cookies and stores none; matching, persistence, and policy remain provider work                                                               | Critical     |
+| CORS and response tainting  | Simple CORS checks and basic/opaque views exist on every HTTP redirect hop; preflight requests and caching are absent                                                                                                                            | Critical     |
+| Redirects                   | Controller follows validated HTTP(S) redirects with per-hop policy, credentials, origin/referrer transitions, cache lookup, and `follow`, `error`, and `manual` modes; broader browser subsystems remain partial                                  | Medium       |
+| HTTP cache                  | TTL-only in-memory cache with provider-supplied partition keys; full matching/revalidation is absent                                                                                                                                             | High         |
+| Fetch policy integrations   | Browser-context requests require `FetchServices`; CSP, mixed content, CORP, SRI, and worker interception remain provider/later-step work                                                                                                         | Critical     |
+| Cancellation and lifecycle  | Basic abort signal works, but Fetch controller state/reasons/timing are absent                                                                                                                                                                   | Medium       |
+| Fetch API surface           | Rust `Request`, filtered `Response`, guarded `Headers`, shared `Body`, response cloning, and body helpers exist; complete JavaScript bindings remain                                                                                             | High         |
+| Scheduling and transport    | HTTP/2, compression, pooling, and priority mapping are available; scheduler ordering and HTTP/3 are absent                                                                                                                                       | Low/Medium   |
 
 ## Detailed gaps
 
@@ -62,16 +66,17 @@ Relative URLs and HTTP(S) origins work, and opaque origins are representable.
 The HTTP controller updates the URL list/current URL through its redirect loop;
 provider-assigned origins and local-scheme URL-list, credential, body, and
 filtering semantics are covered for the current provider-backed handlers;
-browser composition and browser-owned provider edge cases remain.
+remaining work is browser-owned blob lifecycle and provider edge-case coverage.
 
-**Required work:** finish the remaining `data:` edge cases; expand the
-currently supported `byui:` and authorized `file:` browser composition; and track
-URL-list/current-URL/redirect state and policy through every redirect. Provider
-metadata and the shared finalization path are implemented. Provider resolution,
-stream cancellation, failure, and body-drop cleanup are covered for the current
-local handlers.
+**Required work:** finish the remaining `data:` edge cases, expand provider
+conformance coverage for the composed `byui:` and authorized `file:` paths,
+and add browser-owned blob registry/lifecycle integration. URL-list/current-URL
+tracking, provider metadata validation, shared finalization, provider
+resolution, stream cancellation, failure, and body-drop cleanup are implemented
+for the current local handlers.
 
-Browser-owned blob URL registry and lifecycle integration are deferred.
+Browser-owned blob URL registry, revocation, and lifecycle integration remain
+deferred.
 
 ### 2. Request methods and header guards
 
@@ -96,17 +101,17 @@ body-used errors, `bytes`, `array_buffer`, `text`, `blob`, `json`, and
 `form_data` helpers, rejection of bodies on `GET`/`HEAD`, and null-body
 handling for `HEAD` plus supported null-body status codes.
 
-It still lacks Fetch-compatible stream teeing/cloning, a public response clone
-operation, typed-array/JavaScript conversion (which belongs in `webapis`),
-`duplex`, keepalive aggregate quotas, and the Fetch rule that a successful
-`CONNECT` response has no body. The provider stream variant is defined, and the
+The Rust boundary now has fallible body/response cloning, bounded stream teeing,
+typed-array byte constructors, explicit half-duplex validation, and a public
+body lifecycle status. Typed-array/JavaScript conversion still belongs in
+`webapis`, and keepalive aggregate quotas remain browser lifecycle work.
+`CONNECT` is forbidden during request construction, so no successful CONNECT
+response enters the current engine. The provider stream variant is defined, and the
 blob, file, and page handlers exercise it; stream cancellation, failure, and
 unread/partial body-drop cleanup are covered for that provider boundary.
 
-**Required work:** finish body cloning/teeing and the remaining general
-lifecycle semantics, define
-the Rust-to-JavaScript body conversion boundary, add aggregate keepalive
-quotas, and apply the body rules consistently to every scheme handler.
+**Required work:** define the Rust-to-JavaScript body conversion boundary and
+add aggregate keepalive quotas when keepalive lifetime support is integrated.
 
 ### 4. Credentials, cookies, and authentication
 
@@ -120,7 +125,7 @@ This remains a critical integration gap: the provider-owned cookie store must be
 
 **Evidence:** [`CorsChecker::response_type`](../src/policy/cors.rs) enforces same-origin and simple CORS checks; [`InternalResponse::expose`](../src/api/response/view.rs) constructs a filtered view before callers see headers or body. Preflight-required requests fail before transport.
 
-The implementation still lacks preflight `OPTIONS`, a preflight cache, complete `Access-Control-Allow-*` parsing, and per-hop redirect checks. Basic credential checks for simple CORS responses exist, but credentialed preflight and redirect behavior remain absent. `SameOrigin` fails closed on cross-origin results, and `NoCors` produces an opaque view, but the complete Fetch algorithms remain unfinished.
+The implementation still lacks preflight `OPTIONS`, a preflight cache, and complete `Access-Control-Allow-*` parsing. Simple CORS validation now runs on each HTTP redirect response and redirect-tainted requests serialize their origin as `null`, but credentialed preflight remains absent. `SameOrigin` fails closed before following a cross-origin redirect, and `NoCors` produces an opaque view, but the complete Fetch algorithms remain unfinished.
 
 Basic, CORS, and opaque views now filter headers and metadata. CORS exposure
 parsing covers safelisted names, explicit lists, wildcard credentials rules,
@@ -133,20 +138,19 @@ cookie/cache exclusion, and response filtering. The current local-scheme
 handlers all have focused response and lifecycle coverage; browser-owned file
 access remains deliberately restricted to authorized top-level navigation.
 
-**Required work:** implement request tainting and the CORS-preflight/CORS-check
-algorithms before exposing response data, extract one reusable response
-finalization path for HTTP and local schemes, validate provider-assigned
-origins fail-closed, and add focused tests for simple, preflighted,
-credentialed, failed, no-CORS, local-origin, and redirecting cross-origin
-requests.
+**Required work:** implement the remaining request-tainting states and the CORS-preflight request
+and cache algorithms, complete `Access-Control-Allow-*` validation,
+and add focused tests for simple, preflighted, credentialed, failed, no-CORS,
+local-origin, and redirecting cross-origin requests. Shared response
+finalization and fail-closed provider-origin validation are implemented.
 
 ### 6. Redirect handling
 
-**Evidence:** [`ReqwestTransport::new`](../src/transport/reqwest.rs) disables automatic redirects, and [`RequestController::fetch_http`](../src/engine/schemes/http.rs) owns the redirect loop. The controller resolves and validates `Location`, caps redirects at 20, tracks the URL list/current URL/count, applies Fetch method/body changes, strips sensitive headers on origin changes, and supports `follow`, `error`, and opaque `manual` results. 307/308 redirects reject non-replayable request bodies.
+**Evidence:** [`ReqwestTransport::new`](../src/transport/reqwest.rs) disables automatic redirects, and [`RequestController::fetch_http`](../src/engine/schemes/http.rs) owns the redirect loop. The controller resolves `Location`, explicitly limits targets to HTTP(S), caps redirects at 20, tracks the URL list/current URL/count, applies Fetch method/body changes, strips sensitive headers on origin changes, and supports `follow`, `error`, and opaque `manual` results. 307/308 redirects reject non-replayable request bodies.
 
-The standard's complete redirect algorithm still includes more detailed per-hop CORS, credentials, referrer, cache, and security integration than this crate currently provides. Redirect targets are intended to remain limited to HTTP(S), but the redirect-specific validator still needs an explicit scheme guard because the shared target validator also serves local-scheme dispatch. Malformed or unsupported redirects otherwise fail closed with `RedirectFailure` or the relevant typed policy error.
+Every followed hop now repeats request authorization, simple CORS response validation, browser response approval, credential-gated cookie lookup/storage, and cache matching using the current method and URL. Network redirects disable further service-worker interception, redirect-tainted requests serialize their origin as `null`, redirect responses can update the referrer policy, and manual redirects pass through common approval before exposure. Malformed, credential-bearing, and non-HTTP(S) targets fail closed with `RedirectFailure`.
 
-**Required work:** complete per-hop CORS/security and credential policy, redirect-aware cache behavior, and the remaining browser integrations.
+**Required work:** integrate future preflight, same-site cookie, full HTTP-cache, mixed-content, and other browser-security facilities through the existing per-hop boundary as those facilities are implemented. These are subsystem gaps rather than missing redirect-loop dispatch.
 
 ### 7. HTTP cache and cache modes
 
@@ -162,9 +166,9 @@ The Fetch HTTP-network-or-cache algorithm relies on an HTTP cache, cache partiti
 
 **Evidence:** [`Referrer::Client`](../src/api/request/definition.rs) now resolves through `FetchEnvironment.referrer`, and [`referrer_value`](../src/api/request/definition.rs) applies the configured reduction policy. [`Origin`](../src/api/request/origin.rs) is structured and can parse/serialize HTTP(S) tuple origins or represent opaque origins; [`Request::fetch_headers`](../src/api/request/definition.rs) derives an internal `Origin` header when required.
 
-The referrer-policy enum and explicit/client referrer reduction logic are now present, and same-origin comparison is available for structured origins. The crate still does not derive same-site relationships, apply origin changes across redirects, or connect origin state to strict same-origin, credentials, CORS, and cookie behavior. Opaque origins are represented but are not integrated into those algorithms.
+The referrer-policy enum and explicit/client referrer reduction logic are present, and same-origin comparison is available for structured origins. HTTP redirects preserve the request origin, track whether the URL list taints its serialization to `null`, enforce strict same-origin targets before transport, and use the structured origin for credentials and simple CORS decisions. The crate still does not distinguish same-site from cross-site redirect taint or implement the provider-owned SameSite cookie rules.
 
-**Required work:** connect the structured origin and client environment to same-origin/same-site, credentials, CORS, cookie, and redirect policy, then centralize the remaining origin/referrer derivation before request headers are finalized.
+**Required work:** add site computation and connect it to provider-owned cookie policy and future security integrations, then centralize the remaining origin/referrer derivation before request headers are finalized.
 
 ### 9. Security and browser integration hooks
 
@@ -198,12 +202,15 @@ validation, exact-once provider selection, and cancellation/lifetime behavior
 are implemented for the blob, file, and page paths and covered by focused
 scheme tests; browser-wide policy implementations remain outside `net`.
 
-`Config.max_keepalive_body_size` still checks the known body length, but even
-an in-quota keepalive request fails with `UnsupportedFeature` until lifetime
-handling exists. Integrity and navigation fetch also fail explicitly. Browser
-policy, cookie, worker-network, cache-partition, diagnostics, and
-scheme-provider inputs are supplied by browser-owned interfaces; their full
-implementations remain outside this crate.
+`Config.max_keepalive_body_size` checks the known body length, but every
+keepalive request currently fails with `UnsupportedFeature` before network I/O,
+including an in-quota request, until lifetime handling exists. Integrity still
+fails explicitly. Navigation is currently permitted only for the authorized
+`file:` provider path; other navigation fetches fail explicitly. The browser's
+current `BrowserFetchServices` is deliberately conservative: it supplies no
+cookies, ignores `Set-Cookie`, and always selects the network path for service
+workers. Browser policy, durable cookie/cache state, worker-network,
+diagnostics, and scheme-provider inputs remain outside this crate.
 
 ### 10. Cancellation and fetch lifecycle
 
@@ -223,9 +230,10 @@ algorithm state transition.
 
 **Evidence:** [`Response`](../src/api/response/types.rs) exposes filtered status, URL, headers, response type, and body. The private internal representation retains full transport metadata. The crate still exports Rust structs and a stream, not JavaScript Fetch interfaces.
 
-Remaining response work includes full redirect URL-list accuracy, response
-constructors, a public response clone operation, Fetch-compatible stream
-teeing, and complete network-error construction. `Body::array_buffer`,
+Remaining response work includes full redirect URL-list accuracy and the
+JavaScript response constructor/binding surface. Rust responses have fallible
+cloning, bounded stream teeing, `ok`/body-presence helpers, and a filtered
+network-error constructor. `Body::array_buffer`,
 `Body::form_data`, and `Body::json` exist for the supported Rust subset, but
 their JavaScript-facing conversion belongs to `webapis`. Local scheme response
 construction, provider metadata validation, and shared finalization are
@@ -274,7 +282,7 @@ currently composed `byui:` and `file:` providers, while retaining the generic
 2. Implement credentials/cookie policy and strict same-origin/CORS/no-CORS response filtering across HTTP and local schemes.
 3. Complete per-hop redirect CORS/security and credential policy.
 4. Replace the TTL map with a partitioned HTTP cache or integrate an existing standards-aware cache.
-5. Complete shared Body cloning/teeing and JavaScript conversion semantics.
+5. Complete JavaScript body conversion semantics on top of the explicit Rust fork/tee API.
 6. Resume browser-owned `blob:` lifecycle integration when its registry owner is scheduled.
 7. Add integrity, keepalive, service-worker, CSP/mixed-content, MIME/CORP, and timing hooks as the surrounding browser subsystems become available.
 

@@ -28,6 +28,22 @@ use crate::toolbar::{self, ChromeState, Control};
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
+/// CSS pixels the page scrolls per arrow-key press.
+const ARROW_SCROLL: f32 = 40.0;
+
+/// CSS pixels the page scrolls per wheel line; one wheel notch is three
+/// lines.
+const WHEEL_LINE_SCROLL: f32 = 20.0;
+
+/// CSS pixels of the previous view kept on screen by Page Up, Page Down, and
+/// Space, so the reader keeps their place.
+const PAGE_SCROLL_OVERLAP: f32 = 40.0;
+
+/// Smallest and largest supported page zoom, expressed as a multiplier.
+const PAGE_ZOOM_RANGE: (f64, f64) = (0.5, 3.0);
+/// Page zoom increment for each keyboard shortcut press.
+const PAGE_ZOOM_STEP: f64 = 0.1;
+
 /// A caret movement in the address field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaretMove {
@@ -87,6 +103,14 @@ struct App {
     cursor: Option<(f64, f64)>,
     /// The rendered page and the device size it was rendered for.
     page: Option<((u32, u32), Pixmap)>,
+    /// Layout of `loaded_page` for the current viewport, kept so scrolling
+    /// repaints without laying the document out again.
+    page_layout: Option<crate::content::PageLayout>,
+    /// How far the page is scrolled down, in CSS pixels; kept within
+    /// `0..=page_layout.max_scroll()`.
+    scroll_y: f32,
+    /// Page zoom multiplier. OS display scaling is applied separately.
+    page_zoom: f64,
     /// Last presented window contents in softbuffer's 0x00RRGGBB format,
     /// kept so chrome-only changes repaint just the toolbar strip.
     frame: Vec<u32>,
@@ -197,7 +221,7 @@ impl App {
     fn with_runtime(platform: Platform, runtime: browser::BrowserRuntime) -> Self {
         let refresh = browser::refresh::RefreshClient::new()
             .map_err(|error| {
-                eprintln!("Refresh initialization failed: {error}");
+                log::error!("refresh initialization failed: {error}");
             })
             .ok();
         Self {
@@ -217,6 +241,9 @@ impl App {
             modifiers: ModifiersState::default(),
             loaded_page: None,
             page: None,
+            page_layout: None,
+            scroll_y: 0.0,
+            page_zoom: 1.0,
             frame: Vec::new(),
             frame_key: None,
             last_toolbar_click: None,
@@ -233,7 +260,7 @@ impl App {
             elements: None,
             elements_close_pressed: false,
             loader: browser::PageLoader::new()
-                .map_err(|error| eprintln!("Page loader initialization failed: {error}"))
+                .map_err(|error| log::error!("page loader initialization failed: {error}"))
                 .ok(),
             proxy: None,
             navigation_id: 0,
@@ -251,6 +278,7 @@ impl App {
     /// Navigation calls this only after loading succeeds. Repaints, Reload,
     /// and the error page for a failed load must not call it.
     fn page_loaded(&mut self, url: &str, page: browser::Page) {
+        log::debug!("page displayed: {url}");
         // Elements is a document snapshot; never retain it across navigation.
         self.close_elements();
         self.loaded_page = Some(page);
@@ -264,6 +292,8 @@ impl App {
         self.chrome.address_selected = false;
         self.chrome.address_focused = false;
         self.page = None;
+        self.page_layout = None;
+        self.scroll_y = 0.0;
         self.redraw();
     }
 
@@ -291,9 +321,12 @@ impl App {
         self.chrome.address_focused = false;
         if address == "byui://welcome" {
             // Bump the id so an older load still in flight cannot replace it.
+            log::debug!("address submitted: {address}");
+            log::debug!("navigating to {address}");
             self.navigation_id += 1;
             self.page_loaded(&address, browser::welcome_page());
         } else {
+            log::debug!("address submitted: {address}");
             self.start_navigation(&address);
         }
         self.redraw();
@@ -306,9 +339,10 @@ impl App {
         self.navigation_id += 1;
         let id = self.navigation_id;
         let (Some(loader), Some(proxy)) = (&self.loader, self.proxy.clone()) else {
-            eprintln!("Navigation unavailable: page loader is not running.");
+            log::warn!("navigation to {address} unavailable: page loader is not running");
             return;
         };
+        log::debug!("navigating to {address}");
         loader.load(address, move |navigation| {
             // A closed event loop means the app is exiting; nothing to do.
             let _ = proxy.send_event(UserEvent::Navigated { id, navigation });
@@ -322,14 +356,24 @@ impl App {
             return;
         }
         match navigation.result {
-            Ok(page) => self.page_loaded(&navigation.address, page),
+            Ok(page) => {
+                log::debug!(
+                    "loaded {} ({} bytes of html)",
+                    navigation.address,
+                    page.html.len()
+                );
+                self.page_loaded(&navigation.address, page)
+            }
             Err(error) => {
-                eprintln!("Failed to load {}: {error}", navigation.address);
+                // `browser::load` already logged the failure at error level.
+                log::debug!("showing error page for {}: {error}", navigation.address);
                 self.close_elements();
                 self.loaded_page = Some(browser::error_page(&navigation.address, &error));
                 self.scripts_evaluated = false;
                 self.frame_key = None;
                 self.page = None;
+                self.page_layout = None;
+                self.scroll_y = 0.0;
                 self.redraw();
             }
         }
@@ -347,6 +391,18 @@ impl App {
         if shortcut {
             if let Key::Character(character) = key {
                 match character.to_ascii_lowercase().as_str() {
+                    "+" | "=" => {
+                        self.set_page_zoom(self.page_zoom + PAGE_ZOOM_STEP);
+                        return;
+                    }
+                    "-" | "_" => {
+                        self.set_page_zoom(self.page_zoom - PAGE_ZOOM_STEP);
+                        return;
+                    }
+                    "0" => {
+                        self.set_page_zoom(1.0);
+                        return;
+                    }
                     "l" => {
                         self.begin_address_edit();
                         return;
@@ -364,7 +420,7 @@ impl App {
                         if let Err(error) = arboard::Clipboard::new()
                             .and_then(|mut clipboard| clipboard.set_text(self.address.clone()))
                         {
-                            eprintln!("Failed to copy the address: {error}");
+                            log::warn!("failed to copy the address: {error}");
                         }
                         return;
                     }
@@ -373,7 +429,7 @@ impl App {
                             .and_then(|mut clipboard| clipboard.get_text())
                         {
                             Ok(text) => self.insert_address_text(&text),
-                            Err(error) => eprintln!("Failed to paste into the address: {error}"),
+                            Err(error) => log::warn!("failed to paste into the address: {error}"),
                         }
                         return;
                     }
@@ -484,6 +540,7 @@ impl App {
                 .next()
                 .map_or(caret, |next| caret + next.len_utf8()),
         };
+        log::trace!("address caret moved to {}", self.chrome.address_caret);
         self.redraw();
     }
 
@@ -498,6 +555,7 @@ impl App {
     fn set_hovered(&mut self, hovered: Option<Control>) {
         let hovered = hovered.filter(|control| control.is_enabled());
         if self.chrome.hovered != hovered {
+            log::trace!("hover changed: {hovered:?}");
             self.chrome.hovered = hovered;
             if let Some(window) = &self.window {
                 window.set_cursor(if hovered == Some(Control::Address) {
@@ -528,6 +586,7 @@ impl App {
 
     fn dismiss_context_menu(&mut self) {
         if self.context_menu.take().is_some() {
+            log::trace!("context menu dismissed");
             // Restore the page underneath the popup, without re-evaluating scripts.
             self.frame_key = None;
             self.redraw();
@@ -538,6 +597,7 @@ impl App {
     fn close_page_source(&mut self) {
         self.source_close_pressed = false;
         if self.page_source.take().is_some() {
+            log::debug!("page source view closed");
             self.frame_key = None;
             self.redraw();
         }
@@ -545,6 +605,7 @@ impl App {
 
     fn show_page_source(&mut self) {
         if let Some(page) = &self.loaded_page {
+            log::debug!("page source view opened ({} bytes)", page.html.len());
             self.page_source = Some(PageSource::new(&page.html));
             self.frame_key = None;
             self.redraw();
@@ -613,19 +674,82 @@ impl App {
             self.redraw();
             return;
         }
-        match key {
-            Key::Named(NamedKey::Escape) => {
-                self.dismiss_context_menu();
-                self.close_page_source();
+        if self.page_source.is_some() {
+            match key {
+                Key::Named(NamedKey::ArrowDown) => self.scroll_page_source(1),
+                Key::Named(NamedKey::ArrowUp) => self.scroll_page_source(-1),
+                Key::Named(NamedKey::PageDown) => self.scroll_page_source_page(1),
+                Key::Named(NamedKey::PageUp) => self.scroll_page_source_page(-1),
+                Key::Named(NamedKey::Home) => self.scroll_page_source(isize::MIN),
+                Key::Named(NamedKey::End) => self.scroll_page_source(isize::MAX),
+                _ => {}
             }
-            Key::Named(NamedKey::ArrowDown) => self.scroll_page_source(1),
-            Key::Named(NamedKey::ArrowUp) => self.scroll_page_source(-1),
-            Key::Named(NamedKey::PageDown) => self.scroll_page_source_page(1),
-            Key::Named(NamedKey::PageUp) => self.scroll_page_source_page(-1),
-            Key::Named(NamedKey::Home) => self.scroll_page_source(isize::MIN),
-            Key::Named(NamedKey::End) => self.scroll_page_source(isize::MAX),
-            _ => {}
+            return;
         }
+        if self.chrome.address_focused {
+            return;
+        }
+        let page = (self.page_viewport_height() - PAGE_SCROLL_OVERLAP).max(ARROW_SCROLL);
+        let delta = match key {
+            Key::Named(NamedKey::ArrowDown) => ARROW_SCROLL,
+            Key::Named(NamedKey::ArrowUp) => -ARROW_SCROLL,
+            Key::Named(NamedKey::PageDown) => page,
+            Key::Named(NamedKey::PageUp) => -page,
+            Key::Named(NamedKey::Space) if self.modifiers.shift_key() => -page,
+            Key::Named(NamedKey::Space) => page,
+            Key::Named(NamedKey::Home) => f32::NEG_INFINITY,
+            Key::Named(NamedKey::End) => f32::INFINITY,
+            _ => return,
+        };
+        self.scroll_page_by(delta);
+    }
+
+    /// The page viewport's height in CSS pixels, or zero before the first
+    /// layout.
+    fn page_viewport_height(&self) -> f32 {
+        self.page_layout
+            .as_ref()
+            .map_or(0.0, |layout| layout.css_size().1 as f32)
+    }
+
+    /// Scrolls the page down by `delta` CSS pixels (up when negative),
+    /// stopping at the top and bottom of the document, and repaints when
+    /// the position changed.
+    fn scroll_page_by(&mut self, delta: f32) {
+        let max_scroll = self
+            .page_layout
+            .as_ref()
+            .map_or(0.0, crate::content::PageLayout::max_scroll);
+        let target = (self.scroll_y + delta).clamp(0.0, max_scroll);
+        if target == self.scroll_y {
+            return;
+        }
+        log::trace!("page scrolled to {target:.1} of {max_scroll:.1}");
+        self.dismiss_context_menu();
+        self.scroll_y = target;
+        // Only the page pixmap changes; the layout is reused.
+        self.page = None;
+        self.redraw();
+    }
+
+    /// Changes page zoom and updates the page viewport, render scale, and
+    /// script-visible device pixel ratio together.
+    fn set_page_zoom(&mut self, zoom: f64) {
+        let zoom = zoom.clamp(PAGE_ZOOM_RANGE.0, PAGE_ZOOM_RANGE.1);
+        if (zoom - self.page_zoom).abs() < f64::EPSILON {
+            return;
+        }
+        self.page_zoom = zoom;
+        self.page = None;
+        self.page_layout = None;
+        self.scroll_y = 0.0;
+        let device_pixel_ratio = self
+            .window
+            .as_ref()
+            .map_or(zoom, |window| window.scale_factor() * zoom);
+        self.page_events.set_device_pixel_ratio(device_pixel_ratio);
+        self.frame_key = None;
+        self.redraw();
     }
 
     fn open_context_menu(&mut self, width: u32, height: u32, scale: f64) {
@@ -653,6 +777,7 @@ impl App {
         {
             return;
         }
+        log::debug!("context menu opened at ({x:.0}, {y:.0})");
         self.context_menu = Some(ContextMenu::new(
             x,
             y,
@@ -683,6 +808,7 @@ impl App {
                         .menu_pressed
                         .filter(|action| Some(*action) == menu.action_at(self.cursor));
                     self.dismiss_context_menu();
+                    log::debug!("context menu action: {action:?}");
                     match action {
                         Some(MenuAction::Reload) => self.activate(Control::Reload),
                         Some(MenuAction::PageSource) => self.show_page_source(),
@@ -760,20 +886,29 @@ impl App {
     fn activate(&mut self, control: Control) {
         match control {
             Control::Reload => {
+                log::debug!("reload requested");
+                log::debug!("toolbar action: reload");
                 if let Some(refresh) = &self.refresh {
                     // Dropping the handle detaches the task; fetching stays off the UI thread.
                     drop(refresh.refresh(&self.browser_state));
                 } else {
-                    eprintln!("Refresh unavailable: initialization failed.");
+                    log::error!("refresh unavailable: initialization failed");
                 }
+                // Reload keeps the scroll position, clamped to the new layout.
                 self.page = None;
+                self.page_layout = None;
                 self.scripts_evaluated = false;
                 self.redraw();
             }
-            Control::Address => self.begin_address_edit(),
+            Control::Address => {
+                log::debug!("toolbar action: address");
+                self.begin_address_edit()
+            }
             // Navigation, tabs, and the menu are not
             // implemented yet; these controls only give visual feedback.
-            Control::Back | Control::Forward | Control::NewTab | Control::Menu => {}
+            Control::Back | Control::Forward | Control::NewTab | Control::Menu => {
+                log::debug!("toolbar action: {control:?} (not implemented)");
+            }
         }
     }
 
@@ -786,6 +921,7 @@ impl App {
         let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
             return;
         };
+        let paint_started = Instant::now();
         let size = window.inner_size();
         let (Some(width), Some(height)) =
             (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
@@ -793,31 +929,47 @@ impl App {
             return;
         };
         let scale = window.scale_factor();
-        self.chrome.dark = window.theme() == Some(Theme::Dark);
+        let page_scale = scale * self.page_zoom;
+        let dark = window.theme() == Some(Theme::Dark);
+        self.chrome.dark = dark;
         let card = toolbar::page_rect(size.width, size.height, scale);
         let card_size = card.map(|card| (card.width, card.height));
         let mut full = self.page.is_none()
             || self.context_menu.is_some()
             || self.page_source.is_some()
             || self.elements.is_some();
-        if self.page.as_ref().map(|(size, _)| *size) != card_size {
-            // Paint this frame before the page script runs. Evaluation joins
-            // the JS engine thread; doing that inside this draw leaves `alert`
-            // unable to finish and the window never appears.
-            let mut scripts_already_ran = true;
+        let page_size_changed = self.page.as_ref().map(|(size, _)| *size) != card_size;
+        if page_size_changed {
+            // Painting never runs the page script: evaluation joins the JS
+            // engine thread, and doing that inside this draw leaves `alert`
+            // unable to finish. `about_to_wait` starts it after this frame.
             self.page = card.and_then(|card| {
+                let css_size = crate::content::css_viewport(card.width, card.height, page_scale);
+                if self.page_layout.as_ref().map(|layout| layout.css_size()) != Some(css_size) {
+                    self.page_layout = Some(crate::content::PageLayout::new(
+                        self.loaded_page.as_ref().expect("page was loaded"),
+                        css_size.0,
+                        css_size.1,
+                    ));
+                }
+                let layout = self.page_layout.as_ref()?;
+                // A resize or reload can leave less to scroll than before.
+                self.scroll_y = self.scroll_y.clamp(0.0, layout.max_scroll());
                 crate::content::render_page(
-                    self.loaded_page.as_ref().expect("page was loaded"),
+                    layout,
                     card.width,
                     card.height,
-                    scale,
-                    Arc::clone(&self.alerts) as Arc<dyn AlertSink>,
-                    &self.runtime,
-                    &mut scripts_already_ran,
+                    page_scale,
+                    self.scroll_y,
                 )
                 .map(|page| ((card.width, card.height), page))
             });
             full = true;
+            if let Some(layout) = &self.page_layout {
+                let (width, height) = layout.css_size();
+                self.page_events
+                    .resize(webapis::ViewportSize { width, height });
+            }
         }
         let key = (size.width, size.height, scale.to_bits(), self.chrome.dark);
         if self.frame_key != Some(key) {
@@ -853,7 +1005,9 @@ impl App {
                 &mut composed,
                 scale,
                 self.chrome.dark,
-                self.source_font.as_ref().or(self.font.as_ref()),
+                self.cursor,
+                self.font.as_ref(),
+                self.source_font.as_ref(),
             );
         }
         if let Some(source) = &mut self.page_source {
@@ -889,6 +1043,12 @@ impl App {
         let mut buffer = surface.buffer_mut().expect("failed to get window buffer");
         buffer.copy_from_slice(&self.frame);
         buffer.present().expect("failed to present window buffer");
+        log::trace!(
+            "frame presented: {}x{} full={full} in {:?}",
+            size.width,
+            size.height,
+            paint_started.elapsed()
+        );
     }
 
     fn cursor_moved(&mut self, x: f64, y: f64) {
@@ -897,7 +1057,17 @@ impl App {
         };
         let scale = window.scale_factor();
         let width = window.inner_size().to_logical::<f64>(scale).width;
+        // Leaving the inspector must repaint it once to clear row and
+        // close-button hover feedback.
+        let left_elements = self
+            .elements
+            .as_ref()
+            .is_some_and(|panel| panel.contains(self.cursor) && !panel.contains(Some((x, y))));
         self.cursor = Some((x, y));
+        log::trace!("cursor moved: ({x:.0}, {y:.0})");
+        if left_elements {
+            self.redraw();
+        }
         if self.context_menu.is_some()
             || self.page_source.is_some()
             || self
@@ -950,7 +1120,9 @@ impl App {
                 self.last_toolbar_click = Some(now);
                 // Empty toolbar space moves the window, like a titlebar;
                 // the system's own titlebar and frame keep working too.
-                let _ = window.drag_window();
+                if let Err(error) = window.drag_window() {
+                    log::debug!("window drag could not start: {error}");
+                }
             }
         } else if self
             .cursor
@@ -961,19 +1133,18 @@ impl App {
     }
 
     /// Returns the page node under a logical-pixel window point, matching the
-    /// geometry `paint` uses to render the page card.
+    /// geometry and scroll position `paint` used to render the page card.
     fn page_node_at(&self, x: f64, y: f64) -> Option<html::NodeID> {
         let window = self.window.as_ref()?;
-        let page = self.loaded_page.as_ref()?;
+        let layout = self.page_layout.as_ref()?;
         let size = window.inner_size();
         let scale = window.scale_factor();
         let card = toolbar::page_rect(size.width, size.height, scale)?;
-        crate::content::hit_test_page(
-            page,
-            (card.width as f64 / scale).ceil() as u32,
-            (card.height as f64 / scale).ceil() as u32,
-            (x - card.x as f64 / scale) as f32,
-            (y - card.y as f64 / scale) as f32,
+        let page_scale = scale * self.page_zoom;
+        layout.hit_test(
+            ((x * scale - card.x as f64) / page_scale) as f32,
+            ((y * scale - card.y as f64) / page_scale) as f32,
+            self.scroll_y,
         )
     }
 
@@ -1006,13 +1177,26 @@ impl ApplicationHandler<UserEvent> for App {
             let window = Rc::new(
                 event_loop
                     .create_window(attributes)
-                    .expect("failed to create window"),
+                    .unwrap_or_else(|error| {
+                        log::error!("failed to create window: {error}");
+                        panic!("failed to create window: {error}")
+                    }),
             );
-            let context =
-                softbuffer::Context::new(window.clone()).expect("failed to create drawing context");
+            log::info!(
+                "window created: {}x{} physical pixels, scale factor {}",
+                window.inner_size().width,
+                window.inner_size().height,
+                window.scale_factor()
+            );
+            let context = softbuffer::Context::new(window.clone()).unwrap_or_else(|error| {
+                log::error!("failed to create drawing context: {error}");
+                panic!("failed to create drawing context: {error}")
+            });
             self.surface = Some(
-                softbuffer::Surface::new(&context, window.clone())
-                    .expect("failed to create window surface"),
+                softbuffer::Surface::new(&context, window.clone()).unwrap_or_else(|error| {
+                    log::error!("failed to create window surface: {error}");
+                    panic!("failed to create window surface: {error}")
+                }),
             );
             self.font = toolbar::load_ui_font((self.platform.ui_font_files)());
             self.source_font = crate::page_source::load_font();
@@ -1028,7 +1212,10 @@ impl ApplicationHandler<UserEvent> for App {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                log::info!("window closed, exiting");
+                event_loop.exit()
+            }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
             }
@@ -1037,6 +1224,7 @@ impl ApplicationHandler<UserEvent> for App {
                 is_synthetic: false,
                 ..
             } => {
+                log::trace!("key event: {:?}", event.state);
                 // Address editing and the context menu share one key event.
                 if event.state == ElementState::Pressed {
                     self.key_pressed(&event.logical_key);
@@ -1046,6 +1234,26 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(_)
             | WindowEvent::ScaleFactorChanged { .. }
             | WindowEvent::ThemeChanged(_) => {
+                if log::log_enabled!(log::Level::Debug) {
+                    match &event {
+                        WindowEvent::Resized(size) => {
+                            log::trace!("resized: {}x{}", size.width, size.height)
+                        }
+                        WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                            log::trace!("scale factor changed: {scale_factor}")
+                        }
+                        WindowEvent::ThemeChanged(theme) => {
+                            log::debug!("theme changed: {theme:?}")
+                        }
+                        _ => {}
+                    }
+                }
+                if matches!(event, WindowEvent::ScaleFactorChanged { .. })
+                    && let Some(window) = &self.window
+                {
+                    self.page_events
+                        .set_device_pixel_ratio(window.scale_factor() * self.page_zoom);
+                }
                 self.dismiss_context_menu();
                 self.resize_elements();
                 self.refresh_hover();
@@ -1083,14 +1291,18 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(false) => self.dismiss_context_menu(),
             WindowEvent::MouseWheel { delta, .. } => {
-                let rows = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => -f64::from(y) * 3.0,
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map_or(1.0, |window| window.scale_factor());
+                // Panels scroll by text rows; the page scrolls by CSS pixels.
+                let (rows, page_pixels) = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => {
+                        (-f64::from(y) * 3.0, -y * 3.0 * WHEEL_LINE_SCROLL)
+                    }
                     MouseScrollDelta::PixelDelta(position) => {
-                        let scale = self
-                            .window
-                            .as_ref()
-                            .map_or(1.0, |window| window.scale_factor());
-                        -position.y / (18.0 * scale)
+                        log::trace!("scroll: {:.1} px", position.y);
+                        (-position.y / (18.0 * scale), (-position.y / scale) as f32)
                     }
                 };
                 if let (Some(source), Some(window)) = (&mut self.page_source, &self.window) {
@@ -1102,6 +1314,11 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     panel.scroll(rows);
                     self.redraw();
+                } else if self
+                    .cursor
+                    .is_some_and(|(x, y)| self.pointer_is_on_page(x, y))
+                {
+                    self.scroll_page_by(page_pixels);
                 }
             }
             WindowEvent::RedrawRequested => self.paint(),
@@ -1131,36 +1348,74 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         self.scripts_evaluated = true;
+        log::debug!("evaluating page scripts for {}", page.url);
         // Leave this thread in the event loop. The script runs on the page
         // session thread and asks the loop to present an alert; joining that
         // thread here would deadlock. The session stays alive so a later
         // click can run element and `document` listeners.
         let alerts = Arc::clone(&self.alerts) as Arc<dyn AlertSink>;
-        self.page_events.load(&page, alerts, self.runtime.clone());
+        let device_pixel_ratio = self.window.as_ref().map_or(self.page_zoom, |window| {
+            window.scale_factor() * self.page_zoom
+        });
+        let viewport = self.page_layout.as_ref().map(|layout| {
+            let (width, height) = layout.css_size();
+            webapis::ViewportSize { width, height }
+        });
+        self.page_events.load_with_viewport(
+            &page,
+            alerts,
+            self.runtime.clone(),
+            device_pixel_ratio,
+            viewport,
+        );
     }
 }
 
 /// Opens the browser window described by `platform` and runs it until the
 /// user closes it.
+///
+/// Reads the logging options (`--log-level`, `-v`, `-q`, `--log-file`,
+/// `--no-log-file`; see [`common::logging::USAGE`]) from the process's
+/// command line before anything else, and prints usage and exits for `-h` /
+/// `--help`. Unless told otherwise, the log is also written to
+/// [`browser::default_log_file`]. Other arguments are reported as ignored;
+/// the shell takes no others yet.
 pub fn run(platform: Platform) -> Result<(), EventLoopError> {
+    let default_log = browser::default_log_file().ok();
+    let command_line =
+        common::logging::init_from_command_line_with_default_file(default_log.clone());
+    if command_line.help_requested {
+        println!(
+            "Usage: {} [options]\n\n{}\n\n{}",
+            env!("CARGO_PKG_NAME"),
+            common::logging::USAGE,
+            browser::log_file_help(default_log.as_deref())
+        );
+        return Ok(());
+    }
+    for argument in &command_line.remaining {
+        log::warn!("ignoring unrecognized argument `{argument}`");
+    }
+    log::info!(
+        "starting BYUI Browser {} on {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS
+    );
     crate::content::load_page_font((platform.page_font_files)());
+    log::debug!("creating event loop");
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App::new(platform);
     app.alerts.set_proxy(event_loop.create_proxy());
     app.proxy = Some(event_loop.create_proxy());
-    event_loop.run_app(&mut app)
+    let result = event_loop.run_app(&mut app);
+    log::info!("event loop exited");
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct SilentAlert;
-
-    impl AlertSink for SilentAlert {
-        fn alert(&self, _message: &str) {}
-    }
 
     fn app() -> App {
         App::with_runtime(
@@ -1196,7 +1451,7 @@ mod tests {
         app.scripts_evaluated = true;
         app.cursor = Some((100.0, 100.0));
         app.open_context_menu(800, 600, 1.0);
-        app.cursor = Some((120.0, 248.0));
+        app.cursor = Some(app.context_menu.unwrap().item_center(4));
         app.left_mouse_input(ElementState::Pressed);
         app.left_mouse_input(ElementState::Released);
         assert!(app.elements.is_some());
@@ -1204,7 +1459,7 @@ mod tests {
         app.elements.as_mut().unwrap().resize(800.0, 600.0);
         app.cursor = Some((100.0, 100.0));
         app.open_context_menu(800, 600, 1.0);
-        app.cursor = Some((120.0, 216.0));
+        app.cursor = Some(app.context_menu.unwrap().item_center(3));
         app.left_mouse_input(ElementState::Pressed);
         app.left_mouse_input(ElementState::Released);
         assert!(app.page_source.is_some());
@@ -1279,7 +1534,7 @@ mod tests {
         app.scripts_evaluated = true;
         app.cursor = Some((100.0, 100.0));
         app.open_context_menu(800, 600, 1.0);
-        app.cursor = Some((120.0, 216.0));
+        app.cursor = Some(app.context_menu.unwrap().item_center(3));
         app.left_mouse_input(ElementState::Pressed);
         app.left_mouse_input(ElementState::Released);
         assert!(app.context_menu.is_none());
@@ -1345,8 +1600,8 @@ mod tests {
         app.scripts_evaluated = true;
         app.cursor = Some((100.0, 100.0));
         app.open_context_menu(800, 600, 1.0);
-        for y in [120.0, 152.0] {
-            app.cursor = Some((120.0, y));
+        for row in [0, 1] {
+            app.cursor = Some(app.context_menu.unwrap().item_center(row));
             app.left_mouse_input(ElementState::Pressed);
             app.left_mouse_input(ElementState::Released);
             assert!(app.context_menu.is_some());
@@ -1385,7 +1640,7 @@ mod tests {
         let document = app.loaded_page.clone();
         app.cursor = Some((100.0, 100.0));
         app.open_context_menu(800, 600, 1.0);
-        app.cursor = Some((120.0, 184.0));
+        app.cursor = Some(app.context_menu.unwrap().item_center(2));
         app.scripts_evaluated = true;
         app.left_mouse_input(ElementState::Pressed);
         assert!(app.context_menu.is_some());
@@ -1431,7 +1686,7 @@ mod tests {
         let mut app = app();
         app.cursor = Some((100.0, 100.0));
         app.open_context_menu(800, 600, 1.0);
-        app.cursor = Some((120.0, 184.0));
+        app.cursor = Some(app.context_menu.unwrap().item_center(2));
         app.left_mouse_input(ElementState::Pressed);
         app.cursor = Some((300.0, 300.0));
         app.scripts_evaluated = true;
@@ -1463,18 +1718,15 @@ mod tests {
         // an empty content area, changed dimensions, and a changed scale.
         // A silent sink stays off the native dialog if the page script calls
         // `alert`.
-        let alert_sink: Arc<dyn AlertSink> = Arc::new(SilentAlert);
         for (width, height, scale) in [(0, 0, 1.0), (160, 120, 1.0), (320, 240, 2.0)] {
             app.ensure_welcome_loaded();
-            let rendered = crate::content::render_page(
+            let layout = crate::content::PageLayout::for_device(
                 app.loaded_page.as_ref().unwrap(),
                 width,
                 height,
                 scale,
-                Arc::clone(&alert_sink),
-                &app.runtime,
-                &mut app.scripts_evaluated,
             );
+            let rendered = crate::content::render_page(&layout, width, height, scale, app.scroll_y);
             assert_eq!(rendered.is_some(), width > 0 && height > 0);
             app.page = rendered.map(|page| ((width, height), page));
             app.scripts_evaluated = true;
@@ -1487,6 +1739,44 @@ mod tests {
         assert_eq!(app.loaded_page, original);
         assert_eq!(app.browser_state.current_url(), Some("byui://welcome"));
         assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);
+    }
+
+    #[test]
+    fn keys_scroll_the_page_within_the_document_and_navigation_resets_it() {
+        let mut app = app();
+        let page = browser::Page {
+            url: String::from("byui://long"),
+            html: "<body><div></div></body>".into(),
+            stylesheets: vec!["body { margin: 0 } div { height: 1000px }".into()],
+            scripts: Vec::new(),
+        };
+        app.page_loaded("byui://long", page.clone());
+        app.page_layout = Some(crate::content::PageLayout::new(&page, 160, 200));
+        let max_scroll = 1000.0 - 200.0;
+
+        app.key_pressed(&Key::Named(NamedKey::ArrowUp));
+        assert_eq!(app.scroll_y, 0.0, "the top is a hard stop");
+        app.key_pressed(&Key::Named(NamedKey::ArrowDown));
+        assert_eq!(app.scroll_y, ARROW_SCROLL);
+        app.key_pressed(&Key::Named(NamedKey::PageDown));
+        assert_eq!(app.scroll_y, ARROW_SCROLL + 200.0 - PAGE_SCROLL_OVERLAP);
+        app.key_pressed(&Key::Named(NamedKey::End));
+        assert_eq!(app.scroll_y, max_scroll);
+        app.key_pressed(&Key::Named(NamedKey::Space));
+        assert_eq!(app.scroll_y, max_scroll, "the bottom is a hard stop");
+        app.key_pressed(&Key::Named(NamedKey::Home));
+        assert_eq!(app.scroll_y, 0.0);
+
+        // Typing in the address field must not scroll the page.
+        app.key_pressed(&Key::Named(NamedKey::End));
+        app.begin_address_edit();
+        app.key_pressed(&Key::Named(NamedKey::Home));
+        assert_eq!(app.scroll_y, max_scroll);
+        app.cancel_address_edit();
+
+        app.page_loaded("byui://long", page);
+        assert_eq!(app.scroll_y, 0.0);
+        assert!(app.page_layout.is_none());
     }
 
     #[test]

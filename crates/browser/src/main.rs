@@ -36,6 +36,22 @@ impl AlertSink for NativeAlert {
 }
 
 fn main() {
+    let default_log = browser::default_log_file().ok();
+    let command_line =
+        common::logging::init_from_command_line_with_default_file(default_log.clone());
+    if command_line.help_requested {
+        println!(
+            "Usage: browser [options]\n\n{}\n\n{}",
+            common::logging::USAGE,
+            browser::log_file_help(default_log.as_deref())
+        );
+        return;
+    }
+    for argument in &command_line.remaining {
+        log::warn!("ignoring unrecognized argument `{argument}`");
+    }
+    log::info!("starting BYUI Browser {}", env!("CARGO_PKG_VERSION"));
+
     // 1. Initialize the browser runtime and keep its script smoke demo.
     let controller = request_controller(None);
     let runtime = BrowserRuntime::open(

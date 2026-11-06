@@ -16,7 +16,7 @@ use super::{
 use crate::api::headers::is_cors_safelisted_header;
 
 /// A browser request before conversion to a transport request.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Request {
     pub(crate) id: u64,
     pub(crate) url: String,
@@ -33,7 +33,10 @@ pub struct Request {
     pub(crate) integrity: Option<String>,
     pub(crate) keepalive: bool,
     pub(crate) priority: RequestPriority,
+    pub(crate) duplex: Option<RequestDuplex>,
     pub(crate) context: FetchContext,
+    pub(crate) request_origin: Option<Origin>,
+    pub(crate) redirect_tainted: bool,
     pub(crate) signal: AbortSignal,
     pub(crate) url_list: Vec<Url>,
     pub(crate) current_url: Option<Url>,
@@ -55,7 +58,76 @@ pub enum RequestPriority {
     High,
 }
 
+/// Fetch request streaming mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestDuplex {
+    /// The response is not exposed until the request body has begun sending.
+    Half,
+}
+
 impl Request {
+    /// Duplicates request metadata and an unused buffered body for an independent send.
+    ///
+    /// Live stream bodies require the original request to be sent instead of
+    /// creating a second request: forking one would impose tee backpressure.
+    pub fn try_clone(&self) -> Result<Self, RequestError> {
+        if self.body.as_ref().is_some_and(Body::is_streaming_source) {
+            return Err(RequestError::BodyNotCloneable);
+        }
+        let mut cloned = self.clone_without_body();
+        cloned.body = self
+            .body
+            .as_ref()
+            .map(Body::try_duplicate_buffered)
+            .transpose()?;
+        Ok(cloned)
+    }
+
+    /// Copies request configuration without transferring or duplicating its body.
+    fn clone_without_body(&self) -> Self {
+        Self {
+            id: self.id,
+            url: self.url.clone(),
+            method: self.method.clone(),
+            headers: self.headers.clone(),
+            body: None,
+            cache_mode: self.cache_mode,
+            redirect_mode: self.redirect_mode,
+            referrer: self.referrer.clone(),
+            referrer_policy: self.referrer_policy,
+            destination: self.destination,
+            service_workers: self.service_workers,
+            initiator: self.initiator,
+            integrity: self.integrity.clone(),
+            keepalive: self.keepalive,
+            priority: self.priority,
+            duplex: self.duplex,
+            context: self.context.clone(),
+            request_origin: self.request_origin.clone(),
+            redirect_tainted: self.redirect_tainted,
+            signal: self.signal.clone(),
+            url_list: self.url_list.clone(),
+            current_url: self.current_url.clone(),
+            redirect_count: self.redirect_count,
+            cache_partition: self.cache_partition.clone(),
+        }
+    }
+
+    /// Captures request metadata for cache matching after transport finishes.
+    pub(crate) fn for_cache(&self) -> Self {
+        self.clone_without_body()
+    }
+
+    /// Creates a transport attempt, transferring a streaming body once.
+    pub(crate) fn for_transport(&mut self) -> Result<Self, RequestError> {
+        if self.body.as_ref().is_some_and(Body::is_streaming_source) {
+            let mut attempt = self.clone_without_body();
+            attempt.body = self.body.take();
+            Ok(attempt)
+        } else {
+            self.try_clone()
+        }
+    }
     /// Creates a GET request with Fetch's default request state.
     pub fn get(url: impl Into<String>) -> Self {
         Self {
@@ -74,7 +146,10 @@ impl Request {
             integrity: None,
             keepalive: false,
             priority: RequestPriority::Auto,
+            duplex: None,
             context: FetchContext::default(),
+            request_origin: None,
+            redirect_tainted: false,
             signal: AbortSignal::new(),
             url_list: Vec::new(),
             current_url: None,
@@ -91,6 +166,18 @@ impl Request {
     /// Returns the original URL string supplied for this request.
     pub fn url(&self) -> &str {
         &self.url
+    }
+    /// Returns the URL currently being processed by the controller.
+    ///
+    /// Before preparation this is the original URL supplied by the caller.
+    /// During a redirect chain it is the URL of the current hop. Browser
+    /// services that make per-hop decisions should use this rather than
+    /// [`Request::url`], which intentionally preserves the original input.
+    pub fn active_url(&self) -> &str {
+        self.current_url
+            .as_ref()
+            .map(Url::as_str)
+            .unwrap_or(&self.url)
     }
     /// Returns this request's process-local identity.
     ///
@@ -158,6 +245,10 @@ impl Request {
             _ => parsed,
         };
         if matches!(normalized.as_str(), "CONNECT" | "TRACE" | "TRACK") {
+            log::debug!(
+                "forbidden method {normalized} rejected for request {}",
+                self.id
+            );
             return Err(RequestError::ForbiddenMethod(normalized.to_string()));
         }
         if self.context.mode == RequestMode::NoCors
@@ -206,6 +297,7 @@ impl Request {
     /// Sets or clears the body and derives its content type when absent.
     pub fn set_body(&mut self, body: Option<Body>) -> Result<(), RequestError> {
         if body.is_some() && matches!(self.method, Method::GET | Method::HEAD) {
+            log::debug!("body rejected for {} request {}", self.method, self.id);
             return Err(RequestError::BodyNotAllowed(self.method.to_string()));
         }
         self.body = body;
@@ -216,7 +308,9 @@ impl Request {
         self.cache_mode = mode;
     }
     /// Sets the Fetch redirect mode.
-    /// `Manual` and `Error` are rejected before network I/O in this slice.
+    ///
+    /// `Follow` executes approved HTTP(S) hops, `Error` fails after receiving a
+    /// redirect response, and `Manual` returns an opaque-redirect view.
     pub fn set_redirect_mode(&mut self, mode: RedirectMode) {
         self.redirect_mode = mode;
     }
@@ -245,6 +339,10 @@ impl Request {
     pub fn set_priority(&mut self, priority: RequestPriority) {
         self.priority = priority;
     }
+    /// Selects the request streaming mode required for a streaming body.
+    pub fn set_duplex(&mut self, duplex: Option<RequestDuplex>) {
+        self.duplex = duplex;
+    }
     /// Sets the cancellation signal.
     pub fn set_signal(&mut self, signal: AbortSignal) {
         self.signal = signal;
@@ -263,16 +361,28 @@ impl Request {
         match self.context.credentials {
             CredentialsMode::Omit => false,
             CredentialsMode::Include => true,
-            CredentialsMode::SameOrigin => {
-                self.context
-                    .environment
-                    .origin
-                    .as_ref()
-                    .is_some_and(|origin| {
-                        Origin::from_url(url).is_ok_and(|target| origin.is_same_origin(&target))
-                    })
-            }
+            CredentialsMode::SameOrigin => self.effective_origin().is_some_and(|origin| {
+                Origin::from_url(url).is_ok_and(|target| origin.is_same_origin(&target))
+            }),
         }
+    }
+
+    /// Returns the request origin after any redirect-time origin transitions.
+    pub(crate) fn effective_origin(&self) -> Option<&Origin> {
+        self.request_origin
+            .as_ref()
+            .or(self.context.environment.origin.as_ref())
+    }
+
+    /// Serializes the request origin, accounting for redirect taint.
+    pub(crate) fn serialized_origin(&self) -> Option<String> {
+        self.effective_origin().map(|origin| {
+            if self.redirect_tainted {
+                "null".to_owned()
+            } else {
+                origin.as_str()
+            }
+        })
     }
     /// Reports whether method or headers require a CORS preflight.
     pub(crate) fn requires_cors_preflight(&self) -> bool {
@@ -295,10 +405,18 @@ impl Request {
         if self.url_list.is_empty() {
             self.url_list.push(url.clone());
         }
+        if self.request_origin.is_none() {
+            self.request_origin = self.context.environment.origin.clone();
+        }
         self.current_url = Some(url);
     }
 
     pub(crate) fn follow_url(&mut self, url: Url) {
+        log::trace!(
+            "request {} now targets {}",
+            self.id,
+            crate::log_url::loggable(url.as_str())
+        );
         self.url_list.push(url.clone());
         self.current_url = Some(url);
         self.redirect_count += 1;
@@ -314,12 +432,39 @@ impl Request {
     }
 
     pub(crate) fn strip_sensitive_redirect_headers(&mut self) {
+        log::trace!("stripping sensitive headers for cross-origin redirect");
         for name in [
             HeaderName::from_static("authorization"),
             HeaderName::from_static("proxy-authorization"),
         ] {
             self.headers.remove_internal_header(name);
         }
+    }
+
+    /// Applies origin and referrer-policy transitions before following a redirect.
+    pub(crate) fn apply_redirect_policy(
+        &mut self,
+        next_url: &Url,
+        response_headers: &http::HeaderMap,
+    ) {
+        if let Some(policy) = redirect_referrer_policy(response_headers) {
+            self.referrer_policy = policy;
+        }
+        let crosses_origin = self.current_url.as_ref().is_some_and(|current| {
+            current.scheme() != next_url.scheme() || current.origin() != next_url.origin()
+        });
+        if crosses_origin {
+            self.strip_sensitive_redirect_headers();
+            if self.current_url.as_ref().is_some_and(|current| {
+                Origin::from_url(current).is_ok_and(|current_origin| {
+                    self.effective_origin()
+                        .is_some_and(|origin| !origin.is_same_origin(&current_origin))
+                })
+            }) {
+                self.redirect_tainted = true;
+            }
+        }
+        self.service_workers = ServiceWorkersMode::None;
     }
     /// Builds the internal transport header channel without changing caller headers.
     pub(crate) fn fetch_headers(&self) -> Result<Headers, RequestError> {
@@ -329,9 +474,9 @@ impl Request {
         }
         let needs_origin = self.context.mode == RequestMode::Cors
             || !matches!(self.method, Method::GET | Method::HEAD);
-        if needs_origin && let Some(origin) = &self.context.environment.origin {
-            let value = HeaderValue::try_from(origin.as_str())
-                .map_err(|_| RequestError::InvalidOrigin(origin.as_str()))?;
+        if needs_origin && let Some(origin) = self.serialized_origin() {
+            let value = HeaderValue::try_from(&origin)
+                .map_err(|_| RequestError::InvalidOrigin(origin.clone()))?;
             headers.insert_internal_header(HeaderName::from_static("origin"), value)?;
         }
         Ok(headers)
@@ -377,6 +522,11 @@ impl Request {
         if self.body.is_some() && matches!(self.method, Method::GET | Method::HEAD) {
             return Err(RequestError::BodyNotAllowed(self.method.to_string()));
         }
+        if self.body.as_ref().is_some_and(Body::is_streaming_source)
+            && self.duplex != Some(RequestDuplex::Half)
+        {
+            return Err(RequestError::StreamingBodyRequiresDuplex);
+        }
         if self.context.mode == RequestMode::NoCors
             && let Some(body) = &self.body
             && let Some(content_type) = body.content_type()
@@ -399,6 +549,27 @@ impl Request {
         }
         Ok(())
     }
+}
+
+/// Selects the last recognized policy token from `Referrer-Policy` metadata.
+fn redirect_referrer_policy(headers: &http::HeaderMap) -> Option<ReferrerPolicy> {
+    headers
+        .get_all(http::header::REFERRER_POLICY)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| match token.trim().to_ascii_lowercase().as_str() {
+            "no-referrer" => Some(ReferrerPolicy::NoReferrer),
+            "no-referrer-when-downgrade" => Some(ReferrerPolicy::NoReferrerWhenDowngrade),
+            "origin" => Some(ReferrerPolicy::Origin),
+            "origin-when-cross-origin" => Some(ReferrerPolicy::OriginWhenCrossOrigin),
+            "same-origin" => Some(ReferrerPolicy::SameOrigin),
+            "strict-origin" => Some(ReferrerPolicy::StrictOrigin),
+            "strict-origin-when-cross-origin" => Some(ReferrerPolicy::StrictOriginWhenCrossOrigin),
+            "unsafe-url" => Some(ReferrerPolicy::UnsafeUrl),
+            _ => None,
+        })
+        .next_back()
 }
 
 #[cfg(test)]
@@ -526,5 +697,24 @@ mod tests {
             over_limit.validate_body_state(4),
             Err(RequestError::KeepaliveBodyTooLarge { limit: 4 })
         ));
+    }
+
+    #[test]
+    fn streaming_request_can_transfer_once_without_an_implicit_clone() {
+        let mut request = Request::new("https://example.test/", "POST").unwrap();
+        request
+            .set_body(Some(Body::stream(futures_util::stream::iter([Ok::<
+                _,
+                std::io::Error,
+            >(
+                b"payload".to_vec(),
+            )]))))
+            .unwrap();
+        assert!(matches!(
+            request.try_clone(),
+            Err(RequestError::BodyNotCloneable)
+        ));
+        assert!(request.for_transport().unwrap().body.is_some());
+        assert!(request.body.is_none());
     }
 }

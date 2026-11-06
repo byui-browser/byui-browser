@@ -1,5 +1,6 @@
 //! Plain JavaScript objects: string-keyed property tables shared by reference.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
@@ -14,9 +15,11 @@ use crate::{HostFunction, Value};
 /// Clones compare equal with `==` and `===`; separately created objects
 /// never do, even with identical properties.
 ///
-/// Properties are kept in insertion order and are always plain, writable
-/// data properties. Because the table is shared, methods take `&self` and
-/// lock it internally; the lock is never held while script code runs.
+/// Properties are kept in insertion order and are plain data properties.
+/// They are writable unless defined with [`Object::set_read_only`], or
+/// replaceable when defined with [`Object::set_replaceable_read_only`].
+/// Because the table is shared, methods take `&self` and lock it internally;
+/// the lock is never held while script code runs.
 ///
 /// An object may have a prototype object. [`Object::get`] falls back to the
 /// prototype chain when an object has no such own property, while
@@ -41,8 +44,13 @@ pub struct Object(Arc<ObjectData>);
 #[derive(Default)]
 struct ObjectData {
     properties: Mutex<Vec<(String, Value)>>,
+    read_only_properties: Mutex<HashSet<String>>,
+    replaceable_properties: Mutex<HashSet<String>>,
     prototype: Mutex<Option<Object>>,
     constructor: Mutex<Option<WeakFunction>>,
+    /// For the object a `catch` clause receives for an engine error: the
+    /// error itself, restored if the object is thrown again unchanged.
+    origin: Mutex<Option<crate::JsError>>,
 }
 
 /// A non-owning reference to an [`Object`], used to break reference cycles.
@@ -67,6 +75,20 @@ impl Object {
         let object = Self::new();
         *object.prototype_slot() = prototype;
         object
+    }
+
+    /// Records the engine error this object was made from.
+    pub(crate) fn set_origin(&self, error: crate::JsError) {
+        *self.0.origin.lock().unwrap_or_else(PoisonError::into_inner) = Some(error);
+    }
+
+    /// Returns the engine error this object was made from, if any.
+    pub(crate) fn origin(&self) -> Option<crate::JsError> {
+        self.0
+            .origin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn properties(&self) -> MutexGuard<'_, Vec<(String, Value)>> {
@@ -157,9 +179,88 @@ impl Object {
     pub fn set(&self, key: impl Into<String>, value: Value) {
         let key = key.into();
         let mut properties = self.properties();
+        let is_replaceable = self
+            .0
+            .replaceable_properties
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+        if is_replaceable {
+            self.0
+                .read_only_properties
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&key);
+        } else if self
+            .0
+            .read_only_properties
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&key)
+        {
+            return;
+        }
         match properties.iter_mut().find(|(name, _)| *name == key) {
             Some((_, existing)) => *existing = value,
             None => properties.push((key, value)),
+        }
+    }
+
+    /// Defines a non-writable own data property under `key`, replacing any
+    /// existing own value in place or appending a new property at the end of
+    /// the insertion order. Later calls to [`Object::set`] leave this value
+    /// unchanged. JavaScript strict-mode assignment errors are not modeled.
+    pub fn set_read_only(&self, key: impl Into<String>, value: Value) {
+        let key = key.into();
+        let mut properties = self.properties();
+        match properties.iter_mut().find(|(name, _)| *name == key) {
+            Some((_, existing)) => *existing = value,
+            None => properties.push((key.clone(), value)),
+        }
+        self.0
+            .read_only_properties
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key);
+    }
+
+    /// Defines a read-only host attribute that scripts may replace by
+    /// assigning an own property with the same name.
+    ///
+    /// This models Web IDL's `[Replaceable] readonly` attributes. Subsequent
+    /// calls to [`Object::set`] replace the host value with an ordinary
+    /// writable property, after which [`Object::update_replaceable_read_only`]
+    /// leaves the script's replacement intact.
+    pub fn set_replaceable_read_only(&self, key: impl Into<String>, value: Value) {
+        let key = key.into();
+        self.set_read_only(key.clone(), value);
+        self.0
+            .replaceable_properties
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key);
+    }
+
+    /// Updates a host value previously defined with
+    /// [`Object::set_replaceable_read_only`], unless script assignment has
+    /// replaced that attribute. Returns `false` when an own replacement is
+    /// present.
+    pub fn update_replaceable_read_only(&self, key: &str, value: Value) -> bool {
+        if !self
+            .0
+            .replaceable_properties
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(key)
+        {
+            return false;
+        }
+        let mut properties = self.properties();
+        if let Some((_, current)) = properties.iter_mut().find(|(name, _)| name == key) {
+            *current = value;
+            true
+        } else {
+            false
         }
     }
 
@@ -170,6 +271,11 @@ impl Object {
         let name = name.into();
         let function = Function::from_host(name.clone(), function);
         self.set(name, Value::Function(function));
+    }
+
+    /// Deletes the own property `key`, if any.
+    pub(crate) fn remove(&self, key: &str) {
+        self.properties().retain(|(name, _)| name != key);
     }
 
     /// Returns whether the object itself, not its prototype chain, has a

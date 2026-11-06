@@ -42,9 +42,23 @@ impl FileAccessCapability {
     pub fn from_trusted_directory_selections(
         selected_directories: impl IntoIterator<Item = TrustedDirectorySelection>,
     ) -> Result<Self, FileAccessError> {
+        let roots: Vec<_> = selected_directories.into_iter().collect();
+        let capability_id = next_capability_id();
+        log::debug!(
+            "file access capability {capability_id} created with {} trusted roots",
+            roots.len()
+        );
+        if log::log_enabled!(log::Level::Trace) {
+            for root in &roots {
+                log::trace!(
+                    "capability {capability_id} root: {}",
+                    root.canonical_path.display()
+                );
+            }
+        }
         Ok(Self {
-            roots: selected_directories.into_iter().collect(),
-            capability_id: next_capability_id(),
+            roots,
+            capability_id,
         })
     }
 
@@ -53,6 +67,10 @@ impl FileAccessCapability {
     /// The browser must retain the grant in browser-owned state and may revoke
     /// it when the associated permission lifetime ends.
     pub fn issue_grant(&self) -> FileAccessGrant {
+        log::debug!(
+            "issuing grant for file access capability {}",
+            self.capability_id
+        );
         FileAccessGrant::new(self.capability_id)
     }
 
@@ -69,6 +87,11 @@ impl FileAccessCapability {
         grant: &FileAccessGrant,
     ) -> Result<(), FileAccessError> {
         if grant.capability_id != self.capability_id {
+            log::warn!(
+                "file request denied: grant for capability {} presented to capability {}",
+                grant.capability_id,
+                self.capability_id
+            );
             return Err(FileAccessError::Denied);
         }
         match (
@@ -86,11 +109,25 @@ impl FileAccessCapability {
                 | FileOrigin::LocalFile,
                 FileOrigin::LocalFile,
                 FileRequestKind::Navigation,
-            ) => Ok(()),
+            ) => {
+                log::trace!(
+                    "file navigation allowed from {:?}",
+                    context.initiating_origin
+                );
+                Ok(())
+            }
             // File documents have opaque origins and no container identity in
             // this slice. Deny all subresources (including workers and nested
             // contexts) until that policy can be enforced end-to-end.
-            _ => Err(FileAccessError::Denied),
+            _ => {
+                log::warn!(
+                    "file request denied: {:?} from {:?} to {:?} is not permitted",
+                    context.kind,
+                    context.initiating_origin,
+                    context.requested_origin
+                );
+                Err(FileAccessError::Denied)
+            }
         }
     }
 
@@ -107,15 +144,31 @@ impl FileAccessCapability {
         lease: &FileAccessLease,
         requested: impl AsRef<std::path::Path>,
     ) -> Result<OpenedFile, FileAccessError> {
+        let requested = requested.as_ref();
+        log::debug!("opening authorized file {}", requested.display());
         if !lease.is_current() {
+            log::warn!(
+                "file access denied for {}: lease is no longer current",
+                requested.display()
+            );
             return Err(FileAccessError::Denied);
         }
         self.authorize_request(context, grant)?;
         let (root_index, relative) = self.authorize_path(requested)?;
         let opened = self.open_relative(root_index, &relative)?;
         if !lease.is_current() {
+            log::warn!(
+                "file access denied for {}: lease was revoked while opening",
+                requested.display()
+            );
             return Err(FileAccessError::Denied);
         }
+        log::debug!(
+            "opened {} ({} bytes, {:?})",
+            requested.display(),
+            opened.length,
+            opened.media_type
+        );
         Ok(opened)
     }
 
@@ -125,6 +178,7 @@ impl FileAccessCapability {
     ) -> Result<(usize, PathBuf), FileAccessError> {
         // Establish root eligibility without touching the filesystem. This
         // prevents a caller from learning whether an ineligible path exists.
+        log::trace!("authorizing path {}", requested.as_ref().display());
         let lexical = normalize_absolute_path(requested.as_ref())?;
         if let Some((root_index, root)) = self
             .roots
@@ -138,10 +192,19 @@ impl FileAccessCapability {
             })
             .max_by_key(|(_, root_components)| root_components.len())
         {
+            log::trace!("path matched trusted root {root_index}");
             return Ok((root_index, relative_path(&lexical[root.len()..])?));
         }
 
-        self.authorize_windows_alias(requested.as_ref())
+        log::trace!("path is outside every trusted root; trying platform aliases");
+        let result = self.authorize_windows_alias(requested.as_ref());
+        if result.is_err() {
+            log::warn!(
+                "file access denied: {} is outside every granted directory",
+                requested.as_ref().display()
+            );
+        }
+        result
     }
 
     /// Resolves a Windows path spelling that cannot be compared lexically.
@@ -212,6 +275,7 @@ impl FileAccessCapability {
         relative: &Path,
     ) -> Result<OpenedFile, FileAccessError> {
         if relative == Path::new(".") {
+            log::warn!("file open rejected: path names a trusted root directory");
             return Err(FileAccessError::UnsupportedFile);
         }
         let root = self.roots.get(root_index).ok_or(FileAccessError::Denied)?;
@@ -219,6 +283,10 @@ impl FileAccessCapability {
         let file = file.into_std();
         let metadata = file.metadata().map_err(FileAccessError::from)?;
         if !metadata.file_type().is_file() {
+            log::warn!(
+                "file open rejected: {} is not a regular file",
+                relative.display()
+            );
             return Err(FileAccessError::UnsupportedFile);
         }
         Ok(OpenedFile {
@@ -243,6 +311,7 @@ enum LexicalComponent {
 
 fn normalize_absolute_path(path: &Path) -> Result<Vec<LexicalComponent>, FileAccessError> {
     if !path.is_absolute() {
+        log::warn!("rejected non-absolute file path {}", path.display());
         return Err(FileAccessError::InvalidPath);
     }
 
@@ -347,6 +416,11 @@ pub(super) fn open_relative_nofollow(
             .file_type()
             .is_symlink()
         {
+            log::warn!(
+                "file access denied: symlink at {:?} in {}",
+                name,
+                relative.display()
+            );
             return Err(FileAccessError::Denied);
         }
         let mut options = OpenOptions::new();

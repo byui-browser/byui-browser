@@ -1,11 +1,9 @@
 //! Typed computed values for the properties layout consumes.
 //!
 //! [`css::style_document`] produces cascaded, inherited declarations as text.
-//! This module parses the properties layout supports today: `display`,
-//! `margin-*`, `padding-*`, `width`, `height`, `font-size`, `color`, and
-//! `background-color`. Every other property behaves as its initial value; for
-//! example borders are absent, `line-height` is `normal`, and `white-space`
-//! is `normal`. A missing or unparsable value also falls back to the initial
+//! This module parses `display`, box dimensions and edges, text colors, and
+//! the initial flex subset (`flex-direction`, `flex-grow`, and `gap`). Other
+//! properties use their initial values. A missing or unparsable value falls back to the initial
 //! value. Lengths are resolved to CSS pixels here; percentages are kept
 //! because they resolve against the containing block during layout.
 
@@ -25,13 +23,14 @@ pub(crate) enum DisplayOutside {
 /// The inner display type: the formatting context a box establishes for its
 /// children (CSS Display 3 §2.2).
 ///
-/// Only flow layout is implemented. `table`, `flex`, `grid`, and the other
-/// independent layouts are laid out as `flow-root`, which keeps their contents
-/// in a formatting context of their own.
+/// Inner formatting context established by a generated box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DisplayInside {
     Flow,
     FlowRoot,
+    Flex,
+    Grid,
+    Table,
 }
 
 /// The computed `display` value.
@@ -47,6 +46,14 @@ pub(crate) enum Display {
         outside: DisplayOutside,
         inside: DisplayInside,
     },
+}
+
+/// Whether `value` is a valid CSS-wide or color keyword that
+/// [`css::parse_color`] maps to "no color", so it is not worth logging.
+fn is_no_color_keyword(value: &str) -> bool {
+    ["transparent", "inherit", "initial", "unset", "currentcolor"]
+        .iter()
+        .any(|keyword| value.eq_ignore_ascii_case(keyword))
 }
 
 impl Display {
@@ -80,15 +87,25 @@ impl Display {
             | "ruby-text"
             | "ruby-base-container"
             | "ruby-text-container" => Some(inline(DisplayInside::Flow)),
-            "inline-block" | "inline-table" | "inline-flex" | "inline-grid" => {
+            "inline-block" | "inline-table" | "inline-grid" => {
                 Some(inline(DisplayInside::FlowRoot))
             }
-            "flow-root" | "table" | "flex" | "grid" | "table-row-group" | "table-header-group"
-            | "table-footer-group" | "table-row" | "table-cell" | "table-column-group"
-            | "table-column" | "table-caption" => Some(block(DisplayInside::FlowRoot)),
+            "inline-flex" => Some(inline(DisplayInside::Flex)),
+            "flex" => Some(block(DisplayInside::Flex)),
+            "grid" => Some(block(DisplayInside::Grid)),
+            "table" => Some(block(DisplayInside::Table)),
+            "flow-root" | "table-row-group" | "table-header-group" | "table-footer-group"
+            | "table-row" | "table-cell" | "table-column-group" | "table-column"
+            | "table-caption" => Some(block(DisplayInside::FlowRoot)),
             _ => None,
         };
         if single.is_some() {
+            if matches!(
+                value.as_str(),
+                "table" | "inline-table" | "flex" | "inline-flex" | "grid" | "inline-grid"
+            ) {
+                log::trace!("display: {value} is not implemented; laying out as flow-root");
+            }
             return single;
         }
         let mut outside = None;
@@ -98,9 +115,10 @@ impl Display {
                 "block" if outside.is_none() => outside = Some(DisplayOutside::Block),
                 "inline" if outside.is_none() => outside = Some(DisplayOutside::Inline),
                 "flow" if inside.is_none() => inside = Some(DisplayInside::Flow),
-                "flow-root" | "table" | "flex" | "grid" if inside.is_none() => {
-                    inside = Some(DisplayInside::FlowRoot);
-                }
+                "flow-root" if inside.is_none() => inside = Some(DisplayInside::FlowRoot),
+                "flex" if inside.is_none() => inside = Some(DisplayInside::Flex),
+                "grid" if inside.is_none() => inside = Some(DisplayInside::Grid),
+                "table" if inside.is_none() => inside = Some(DisplayInside::Table),
                 "list-item" => {}
                 _ => return None,
             }
@@ -164,6 +182,9 @@ pub(crate) struct ComputedStyle {
     pub font_size: f32,
     pub color: CssColor,
     pub background_color: Option<CssColor>,
+    pub flex_column: bool,
+    pub flex_grow: f32,
+    pub gap: f32,
 }
 
 impl ComputedStyle {
@@ -193,6 +214,9 @@ impl ComputedStyle {
                 |parent| parent.color,
             ),
             background_color: None,
+            flex_column: false,
+            flex_grow: 0.0,
+            gap: 0.0,
         }
     }
 
@@ -211,18 +235,41 @@ impl ComputedStyle {
                 .map(|declaration| declaration.value.trim())
         };
         let mut style = Self::anonymous(None);
-        style.display = get("display")
-            .and_then(Display::parse)
-            .unwrap_or(Display::INLINE);
-        if let Some(size) = get("font-size")
-            .and_then(|value| css::values::compute_font_size(value, root_font_size, root_font_size))
-        {
-            style.font_size = size;
+        style.display = match get("display") {
+            Some(value) => Display::parse(value).unwrap_or_else(|| {
+                log::debug!("ignoring invalid display value {value:?}; using inline");
+                Display::INLINE
+            }),
+            None => Display::INLINE,
+        };
+        if let Some(value) = get("font-size") {
+            match css::values::compute_font_size(value, root_font_size, root_font_size) {
+                Some(size) => style.font_size = size,
+                None => log::debug!(
+                    "ignoring invalid font-size value {value:?}; using {}px",
+                    style.font_size
+                ),
+            }
         }
-        if let Some(color) = get("color").and_then(css::parse_color) {
-            style.color = color;
+        if let Some(value) = get("color") {
+            match css::parse_color(value) {
+                Some(color) => style.color = color,
+                None if is_no_color_keyword(value) => {}
+                None => log::debug!("ignoring invalid color value {value:?}; using the default"),
+            }
         }
-        style.background_color = get("background-color").and_then(css::parse_color);
+        if let Some(value) = get("background-color") {
+            style.background_color = css::parse_color(value);
+            if style.background_color.is_none() && !is_no_color_keyword(value) {
+                log::debug!("ignoring invalid background-color value {value:?}; using transparent");
+            }
+        }
+        style.flex_column =
+            get("flex-direction").is_some_and(|value| value.eq_ignore_ascii_case("column"));
+        style.flex_grow = get("flex-grow")
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0);
 
         let context = LengthContext {
             font_size: style.font_size,
@@ -233,16 +280,31 @@ impl ComputedStyle {
         let dimension = |property: &str, allow_auto: bool, allow_negative: bool| {
             let value = get(property)?;
             if value.eq_ignore_ascii_case("auto") {
+                if !allow_auto {
+                    log::debug!("ignoring invalid {property} value {value:?}; using 0");
+                }
                 return allow_auto.then_some(Dimension::Auto);
             }
             let (parsed, amount) = match parse_percentage(value) {
                 Some(percent) => (Dimension::Percent(percent), percent),
                 None => {
-                    let px = parse_length(value)?.to_px(&context);
+                    let Some(length) = parse_length(value) else {
+                        log::debug!(
+                            "ignoring invalid {property} value {value:?}; using the initial value"
+                        );
+                        return None;
+                    };
+                    let px = length.to_px(&context);
                     (Dimension::Px(px), px)
                 }
             };
-            (allow_negative || amount >= 0.0).then_some(parsed)
+            if !allow_negative && amount < 0.0 {
+                log::debug!(
+                    "ignoring negative {property} value {value:?}; using the initial value"
+                );
+                return None;
+            }
+            Some(parsed)
         };
         let side = |prefix: &str, allow_auto: bool, allow_negative: bool| {
             Sides::from_array(["top", "right", "bottom", "left"].map(|side| {
@@ -254,6 +316,10 @@ impl ComputedStyle {
         style.padding = side("padding", false, false);
         style.width = dimension("width", true, false).unwrap_or(Dimension::Auto);
         style.height = dimension("height", true, false).unwrap_or(Dimension::Auto);
+        style.gap = get("gap")
+            .and_then(|value| parse_length(value).map(|length| length.to_px(&context)))
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0);
         style
     }
 }
@@ -299,6 +365,31 @@ mod tests {
             }
         );
         assert_eq!(style(&[("display", "bogus")]).display, Display::INLINE);
+    }
+
+    #[test]
+    fn display_preserves_independent_layout_modes() {
+        assert!(matches!(
+            style(&[("display", "flex")]).display,
+            Display::Box {
+                inside: DisplayInside::Flex,
+                ..
+            }
+        ));
+        assert!(matches!(
+            style(&[("display", "grid")]).display,
+            Display::Box {
+                inside: DisplayInside::Grid,
+                ..
+            }
+        ));
+        assert!(matches!(
+            style(&[("display", "table")]).display,
+            Display::Box {
+                inside: DisplayInside::Table,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -112,8 +112,13 @@ impl Headers {
         }
         self.guard = guard;
         if guard != HeaderGuard::Immutable {
-            self.entries
-                .retain(|(name, value)| allowed_header(guard, name, value));
+            self.entries.retain(|(name, value)| {
+                let keep = allowed_header(guard, name, value);
+                if !keep {
+                    log::trace!("header {name} dropped by {guard:?} guard");
+                }
+                keep
+            });
         }
         Ok(())
     }
@@ -235,6 +240,8 @@ impl Headers {
                     .is_none_or(|exposure| exposure.includes(name))
             {
                 list.entries.push((name.clone(), value.clone()));
+            } else {
+                log::trace!("response header {name} hidden from caller");
             }
         }
         list.set_guard(HeaderGuard::Immutable)
@@ -265,11 +272,13 @@ impl Headers {
     /// Validates a mutation against the current guard and Fetch header rules.
     fn check(&self, name: &HeaderName, value: &HeaderValue) -> Result<(), RequestError> {
         if self.guard == HeaderGuard::Immutable {
+            log::trace!("mutation of header {name} refused: headers are immutable");
             return Err(RequestError::ImmutableHeaders);
         }
         if allowed_header(self.guard, name, value) {
             Ok(())
         } else {
+            log::debug!("header {name} refused by {:?} guard", self.guard);
             Err(RequestError::ForbiddenHeader(name.as_str().to_owned()))
         }
     }
