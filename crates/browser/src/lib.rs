@@ -22,7 +22,8 @@ use storage::{
 use webapis::local_storage::register_local_storage;
 use webapis::{
     AlertSink, ConsoleSink, Document, register_alert, register_document_on_window, register_fetch,
-    register_print, register_window_with_security_context, register_window_with_url,
+    register_print, register_window_with_security_context,
+    register_window_with_url_and_device_pixel_ratio,
 };
 
 pub mod byui_provider;
@@ -421,6 +422,7 @@ impl BrowserRuntime {
             alert_sink,
             controller,
             security_context,
+            1.0,
         )
         .map(|booted| booted.results)
     }
@@ -447,6 +449,7 @@ impl BrowserRuntime {
             alert_sink,
             controller,
             security_context,
+            1.0,
         )
         .map(|booted| booted.session)
     }
@@ -466,6 +469,32 @@ impl BrowserRuntime {
         controller: Arc<RequestController>,
         security_context: RendererSecurityContext,
     ) -> JsResult<PageSession> {
+        self.open_page_with_device_pixel_ratio(
+            page,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+            1.0,
+        )
+    }
+
+    /// Opens a loaded page with the current output device scale exposed to
+    /// its scripts as `window.devicePixelRatio`.
+    ///
+    /// `device_pixel_ratio` is the number of device pixels per CSS pixel. It
+    /// must be finite and greater than zero. Existing callers can continue to
+    /// use [`BrowserRuntime::open_page`], which supplies the default value of
+    /// `1.0`.
+    pub fn open_page_with_device_pixel_ratio(
+        &self,
+        page: &Page,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+        device_pixel_ratio: f64,
+    ) -> JsResult<PageSession> {
         self.boot_page(
             &page.html,
             Some(&page.scripts),
@@ -474,6 +503,7 @@ impl BrowserRuntime {
             alert_sink,
             controller,
             security_context,
+            device_pixel_ratio,
         )
         .map(|booted| booted.session)
     }
@@ -491,6 +521,7 @@ impl BrowserRuntime {
         alert_sink: Arc<dyn AlertSink>,
         controller: Arc<RequestController>,
         security_context: RendererSecurityContext,
+        device_pixel_ratio: f64,
     ) -> JsResult<BootedPage> {
         log::trace!("booting page: {} bytes of html", html_source.len());
         let html_document = html::parse_raw_html(html_source.to_owned());
@@ -504,8 +535,12 @@ impl BrowserRuntime {
         let initial_url = initial_url
             .filter(|url| !url.is_empty())
             .unwrap_or("about:blank");
-        let window = register_window_with_url(&mut realm, initial_url)?;
-        register_document_on_window(&mut realm, document, window)?;
+        let window = register_window_with_url_and_device_pixel_ratio(
+            &mut realm,
+            initial_url,
+            device_pixel_ratio,
+        )?;
+        register_document_on_window(&mut realm, document, window.clone())?;
         register_local_storage(&mut realm, Arc::clone(&self.storage), security_context)?;
 
         // Without caller-supplied sources only inline script text is available.
@@ -527,6 +562,7 @@ impl BrowserRuntime {
         Ok(BootedPage {
             session: PageSession {
                 realm,
+                window,
                 document: retained,
             },
             results,
@@ -543,10 +579,27 @@ pub struct PageSession {
     /// Realm that evaluated the page. Listeners close over its globals.
     #[allow(dead_code)]
     realm: Realm,
+    window: js::Object,
     document: Document,
 }
 
 impl PageSession {
+    /// Updates the output device scale visible as `window.devicePixelRatio`.
+    ///
+    /// `device_pixel_ratio` is device pixels per CSS pixel and must be finite
+    /// and greater than zero. The update is visible to subsequent scripts
+    /// unless script assignment has replaced the Web IDL attribute.
+    pub fn set_device_pixel_ratio(&self, device_pixel_ratio: f64) -> JsResult<()> {
+        if !device_pixel_ratio.is_finite() || device_pixel_ratio <= 0.0 {
+            return Err(js::JsError::runtime(
+                "window.devicePixelRatio must be finite and greater than zero",
+            ));
+        }
+        self.window
+            .update_replaceable_read_only("devicePixelRatio", Value::Number(device_pixel_ratio));
+        Ok(())
+    }
+
     /// Fires a `click` event at this session's document.
     ///
     /// Runs listeners registered with `document.addEventListener('click', ...)`.
