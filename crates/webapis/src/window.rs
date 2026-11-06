@@ -122,7 +122,11 @@ fn invoke_popstate(window: &Object, state: &Value) {
     }
 }
 
-fn register_window_object(realm: &mut Realm, initial_url: &str) -> JsResult<Object> {
+fn register_window_object(
+    realm: &mut Realm,
+    initial_url: &str,
+    device_pixel_ratio: f64,
+) -> JsResult<Object> {
     let window = match realm.registered_global_value("window") {
         Some(Value::Object(window)) => window,
         _ => Object::new(),
@@ -150,6 +154,9 @@ fn register_window_object(realm: &mut Realm, initial_url: &str) -> JsResult<Obje
     // CSSOM View exposes scrollX as a readonly number. The renderer does not
     // yet have document horizontal scrolling, so the initial offset is zero.
     window.set_read_only("scrollX", Value::Number(0.0));
+    // The desktop shell supplies the output device scale; non-windowed
+    // callers use the specification's fallback value of 1.0.
+    window.set_replaceable_read_only("devicePixelRatio", Value::Number(device_pixel_ratio));
     window.set("onpopstate", Value::Null);
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__popstateListeners", Value::Object(Object::new()));
@@ -331,7 +338,7 @@ fn register_window_object(realm: &mut Realm, initial_url: &str) -> JsResult<Obje
 
 /// Registers the script-visible window globals using `about:blank` as its URL.
 pub fn register_window(realm: &mut Realm) -> JsResult<()> {
-    register_window_object(realm, "about:blank").map(|_| ())
+    register_window_object(realm, "about:blank", 1.0).map(|_| ())
 }
 
 /// Registers Window globals with the immutable renderer security context's
@@ -344,7 +351,7 @@ pub fn register_window_with_security_context(
     realm: &mut Realm,
     security_context: RendererSecurityContext,
 ) -> JsResult<()> {
-    let window = register_window_object(realm, "about:blank")?;
+    let window = register_window_object(realm, "about:blank", 1.0)?;
     let serialized_origin = security_context.origin().ascii_serialization();
     window.set("origin", Value::String(serialized_origin.clone()));
     realm.register_global_value("origin", Value::String(serialized_origin))?;
@@ -358,5 +365,23 @@ pub fn register_window_with_security_context(
 /// browser shell still owns cross-document navigation, so traversing an entry
 /// created by a separate loaded document is not routed back to that shell.
 pub fn register_window_with_url(realm: &mut Realm, url: &str) -> JsResult<Object> {
-    register_window_object(realm, url)
+    register_window_object(realm, url, 1.0)
+}
+
+/// Registers the script-visible window globals for `url` with the output
+/// device scale exposed as the read-only `window.devicePixelRatio` value.
+///
+/// `device_pixel_ratio` is the number of device pixels per CSS pixel and must
+/// be finite and greater than zero. Call this before evaluating page scripts.
+pub fn register_window_with_url_and_device_pixel_ratio(
+    realm: &mut Realm,
+    url: &str,
+    device_pixel_ratio: f64,
+) -> JsResult<Object> {
+    if !device_pixel_ratio.is_finite() || device_pixel_ratio <= 0.0 {
+        return Err(JsError::runtime(
+            "window.devicePixelRatio must be finite and greater than zero",
+        ));
+    }
+    register_window_object(realm, url, device_pixel_ratio)
 }

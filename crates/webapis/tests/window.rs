@@ -1,6 +1,9 @@
 use js::{Realm, Value};
 use security::{Origin, RendererSecurityContext, StoragePermission};
-use webapis::{register_window, register_window_with_security_context, register_window_with_url};
+use webapis::{
+    register_window, register_window_with_security_context, register_window_with_url,
+    register_window_with_url_and_device_pixel_ratio,
+};
 
 #[test]
 fn window_self_returns_the_current_window_object() {
@@ -105,6 +108,45 @@ fn window_scroll_x_is_read_only() {
     assert_eq!(
         realm.evaluate_script("window.scrollX = 12; window.scrollX === 0"),
         Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn device_pixel_ratio_exposes_the_output_scale_and_is_replaceable() {
+    let mut realm = Realm::new();
+    register_window_with_url_and_device_pixel_ratio(&mut realm, "https://example.test/", 1.5)
+        .unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.devicePixelRatio === 1.5"),
+        Ok(Value::Boolean(true))
+    );
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    assert!(window.update_replaceable_read_only("devicePixelRatio", Value::Number(1.75),));
+    assert_eq!(
+        realm.evaluate_script("window.devicePixelRatio === 1.75"),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(
+        realm.evaluate_script("window.devicePixelRatio = 2; window.devicePixelRatio === 2",),
+        Ok(Value::Boolean(true))
+    );
+    assert!(!window.update_replaceable_read_only("devicePixelRatio", Value::Number(2.5),));
+    assert_eq!(
+        realm.evaluate_script("window.devicePixelRatio === 2"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn device_pixel_ratio_requires_a_finite_positive_scale() {
+    let mut realm = Realm::new();
+
+    assert!(
+        register_window_with_url_and_device_pixel_ratio(&mut realm, "https://example.test/", 0.0,)
+            .is_err()
     );
 }
 

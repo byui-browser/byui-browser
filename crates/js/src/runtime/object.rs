@@ -16,9 +16,10 @@ use crate::{HostFunction, Value};
 /// never do, even with identical properties.
 ///
 /// Properties are kept in insertion order and are plain data properties.
-/// They are writable unless defined with [`Object::set_read_only`]. Because
-/// the table is shared, methods take `&self` and lock it internally; the lock
-/// is never held while script code runs.
+/// They are writable unless defined with [`Object::set_read_only`], or
+/// replaceable when defined with [`Object::set_replaceable_read_only`].
+/// Because the table is shared, methods take `&self` and lock it internally;
+/// the lock is never held while script code runs.
 ///
 /// An object may have a prototype object. [`Object::get`] falls back to the
 /// prototype chain when an object has no such own property, while
@@ -44,6 +45,7 @@ pub struct Object(Arc<ObjectData>);
 struct ObjectData {
     properties: Mutex<Vec<(String, Value)>>,
     read_only_properties: Mutex<HashSet<String>>,
+    replaceable_properties: Mutex<HashSet<String>>,
     prototype: Mutex<Option<Object>>,
     constructor: Mutex<Option<WeakFunction>>,
     /// For the object a `catch` clause receives for an engine error: the
@@ -177,7 +179,19 @@ impl Object {
     pub fn set(&self, key: impl Into<String>, value: Value) {
         let key = key.into();
         let mut properties = self.properties();
-        if self
+        let is_replaceable = self
+            .0
+            .replaceable_properties
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+        if is_replaceable {
+            self.0
+                .read_only_properties
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&key);
+        } else if self
             .0
             .read_only_properties
             .lock()
@@ -208,6 +222,46 @@ impl Object {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(key);
+    }
+
+    /// Defines a read-only host attribute that scripts may replace by
+    /// assigning an own property with the same name.
+    ///
+    /// This models Web IDL's `[Replaceable] readonly` attributes. Subsequent
+    /// calls to [`Object::set`] replace the host value with an ordinary
+    /// writable property, after which [`Object::update_replaceable_read_only`]
+    /// leaves the script's replacement intact.
+    pub fn set_replaceable_read_only(&self, key: impl Into<String>, value: Value) {
+        let key = key.into();
+        self.set_read_only(key.clone(), value);
+        self.0
+            .replaceable_properties
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key);
+    }
+
+    /// Updates a host value previously defined with
+    /// [`Object::set_replaceable_read_only`], unless script assignment has
+    /// replaced that attribute. Returns `false` when an own replacement is
+    /// present.
+    pub fn update_replaceable_read_only(&self, key: &str, value: Value) -> bool {
+        if !self
+            .0
+            .replaceable_properties
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(key)
+        {
+            return false;
+        }
+        let mut properties = self.properties();
+        if let Some((_, current)) = properties.iter_mut().find(|(name, _)| name == key) {
+            *current = value;
+            true
+        } else {
+            false
+        }
     }
 
     /// Stores a host function under `name` as a method that scripts can call

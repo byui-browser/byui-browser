@@ -39,6 +39,11 @@ const WHEEL_LINE_SCROLL: f32 = 20.0;
 /// Space, so the reader keeps their place.
 const PAGE_SCROLL_OVERLAP: f32 = 40.0;
 
+/// Smallest and largest supported page zoom, expressed as a multiplier.
+const PAGE_ZOOM_RANGE: (f64, f64) = (0.5, 3.0);
+/// Page zoom increment for each keyboard shortcut press.
+const PAGE_ZOOM_STEP: f64 = 0.1;
+
 /// A caret movement in the address field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaretMove {
@@ -104,6 +109,8 @@ struct App {
     /// How far the page is scrolled down, in CSS pixels; kept within
     /// `0..=page_layout.max_scroll()`.
     scroll_y: f32,
+    /// Page zoom multiplier. OS display scaling is applied separately.
+    page_zoom: f64,
     /// Last presented window contents in softbuffer's 0x00RRGGBB format,
     /// kept so chrome-only changes repaint just the toolbar strip.
     frame: Vec<u32>,
@@ -236,6 +243,7 @@ impl App {
             page: None,
             page_layout: None,
             scroll_y: 0.0,
+            page_zoom: 1.0,
             frame: Vec::new(),
             frame_key: None,
             last_toolbar_click: None,
@@ -383,6 +391,18 @@ impl App {
         if shortcut {
             if let Key::Character(character) = key {
                 match character.to_ascii_lowercase().as_str() {
+                    "+" | "=" => {
+                        self.set_page_zoom(self.page_zoom + PAGE_ZOOM_STEP);
+                        return;
+                    }
+                    "-" | "_" => {
+                        self.set_page_zoom(self.page_zoom - PAGE_ZOOM_STEP);
+                        return;
+                    }
+                    "0" => {
+                        self.set_page_zoom(1.0);
+                        return;
+                    }
                     "l" => {
                         self.begin_address_edit();
                         return;
@@ -712,6 +732,26 @@ impl App {
         self.redraw();
     }
 
+    /// Changes page zoom and updates the page viewport, render scale, and
+    /// script-visible device pixel ratio together.
+    fn set_page_zoom(&mut self, zoom: f64) {
+        let zoom = zoom.clamp(PAGE_ZOOM_RANGE.0, PAGE_ZOOM_RANGE.1);
+        if (zoom - self.page_zoom).abs() < f64::EPSILON {
+            return;
+        }
+        self.page_zoom = zoom;
+        self.page = None;
+        self.page_layout = None;
+        self.scroll_y = 0.0;
+        let device_pixel_ratio = self
+            .window
+            .as_ref()
+            .map_or(zoom, |window| window.scale_factor() * zoom);
+        self.page_events.set_device_pixel_ratio(device_pixel_ratio);
+        self.frame_key = None;
+        self.redraw();
+    }
+
     fn open_context_menu(&mut self, width: u32, height: u32, scale: f64) {
         self.dismiss_context_menu();
         if self.page_source.is_some()
@@ -889,6 +929,7 @@ impl App {
             return;
         };
         let scale = window.scale_factor();
+        let page_scale = scale * self.page_zoom;
         let dark = window.theme() == Some(Theme::Dark);
         self.chrome.dark = dark;
         let card = toolbar::page_rect(size.width, size.height, scale);
@@ -902,7 +943,7 @@ impl App {
             // engine thread, and doing that inside this draw leaves `alert`
             // unable to finish. `about_to_wait` starts it after this frame.
             self.page = card.and_then(|card| {
-                let css_size = crate::content::css_viewport(card.width, card.height, scale);
+                let css_size = crate::content::css_viewport(card.width, card.height, page_scale);
                 if self.page_layout.as_ref().map(|layout| layout.css_size()) != Some(css_size) {
                     self.page_layout = Some(crate::content::PageLayout::new(
                         self.loaded_page.as_ref().expect("page was loaded"),
@@ -913,8 +954,14 @@ impl App {
                 let layout = self.page_layout.as_ref()?;
                 // A resize or reload can leave less to scroll than before.
                 self.scroll_y = self.scroll_y.clamp(0.0, layout.max_scroll());
-                crate::content::render_page(layout, card.width, card.height, scale, self.scroll_y)
-                    .map(|page| ((card.width, card.height), page))
+                crate::content::render_page(
+                    layout,
+                    card.width,
+                    card.height,
+                    page_scale,
+                    self.scroll_y,
+                )
+                .map(|page| ((card.width, card.height), page))
             });
             full = true;
         }
@@ -1087,9 +1134,10 @@ impl App {
         let size = window.inner_size();
         let scale = window.scale_factor();
         let card = toolbar::page_rect(size.width, size.height, scale)?;
+        let page_scale = scale * self.page_zoom;
         layout.hit_test(
-            (x - card.x as f64 / scale) as f32,
-            (y - card.y as f64 / scale) as f32,
+            ((x * scale - card.x as f64) / page_scale) as f32,
+            ((y * scale - card.y as f64) / page_scale) as f32,
             self.scroll_y,
         )
     }
@@ -1194,6 +1242,12 @@ impl ApplicationHandler<UserEvent> for App {
                         _ => {}
                     }
                 }
+                if matches!(event, WindowEvent::ScaleFactorChanged { .. })
+                    && let Some(window) = &self.window
+                {
+                    self.page_events
+                        .set_device_pixel_ratio(window.scale_factor() * self.page_zoom);
+                }
                 self.dismiss_context_menu();
                 self.resize_elements();
                 self.refresh_hover();
@@ -1294,7 +1348,11 @@ impl ApplicationHandler<UserEvent> for App {
         // thread here would deadlock. The session stays alive so a later
         // click can run element and `document` listeners.
         let alerts = Arc::clone(&self.alerts) as Arc<dyn AlertSink>;
-        self.page_events.load(&page, alerts, self.runtime.clone());
+        let device_pixel_ratio = self.window.as_ref().map_or(self.page_zoom, |window| {
+            window.scale_factor() * self.page_zoom
+        });
+        self.page_events
+            .load(&page, alerts, self.runtime.clone(), device_pixel_ratio);
     }
 }
 
