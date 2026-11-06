@@ -56,6 +56,10 @@ unsafe_code = "warn"
 [profile.dev.package.browser-shell]
 opt-level = 3
 
+# The page is rasterized again on every scroll step.
+[profile.dev.package.render]
+opt-level = 3
+
 [profile.dev.package.tiny-skia]
 opt-level = 3
 

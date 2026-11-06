@@ -10,7 +10,7 @@ use html::NodeID;
 use layout::{FontMetrics, LayoutTree, Size, layout_document};
 use render::{BitmapFont, Compositor, Frame, OutlineFont};
 use tiny_skia::Pixmap;
-use webapis::{AlertSink, ConsoleSink};
+use webapis::{AlertSink, ConsoleSink, ViewportSize};
 
 struct NoopConsole;
 
@@ -60,6 +60,7 @@ fn page_metrics() -> &'static dyn FontMetrics {
 /// Renders `page` into a `width` × `height` device-pixel frame, first
 /// evaluating its script if that has not happened yet. `scale_factor` is
 /// device pixels per CSS pixel.
+#[cfg(test)]
 fn render_demo(
     page: &browser::Page,
     width: u32,
@@ -87,11 +88,10 @@ fn render_demo(
     )
 }
 
-/// Lays out and paints `page` into a `width` × `height` device-pixel frame.
-///
-/// With a system page font, text is rasterized at device resolution. The
-/// bitmap fallback renders at one device pixel per CSS pixel, so its frame is
-/// the CSS-pixel viewport size and [`render_page`] scales it up.
+/// Lays out and paints `page`, unscrolled, into a `width` × `height`
+/// device-pixel frame, first evaluating its script if that has not happened
+/// yet.
+#[cfg(test)]
 fn render_document(
     page: &Page,
     width: u32,
@@ -105,67 +105,121 @@ fn render_document(
         evaluate_page_script(page, alert_sink, runtime.clone());
         *scripts_evaluated = true;
     }
-    let css_width = (width as f64 / scale_factor).ceil() as u32;
-    let css_height = (height as f64 / scale_factor).ceil() as u32;
-    let tree = layout_page(page, css_width, css_height);
-    let display_list = paint::paint_document(&tree);
+    let layout = PageLayout::for_device(page, width, height, scale_factor);
+    compose_frame(&layout, width, height, scale_factor, 0.0)
+}
+
+/// Paints `layout` scrolled down by `scroll_y` CSS pixels into a
+/// `width` × `height` device-pixel frame.
+///
+/// With a system page font, text is rasterized at device resolution. The
+/// bitmap fallback renders at one device pixel per CSS pixel, so its frame is
+/// the CSS-pixel viewport size and [`render_page`] scales it up. The scroll
+/// offset is snapped to whole frame pixels so text does not shimmer while
+/// scrolling.
+fn compose_frame(
+    layout: &PageLayout,
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+    scroll_y: f32,
+) -> Frame {
+    let (css_width, css_height) = layout.css_size;
     match page_font() {
-        Some(font) => Compositor::new(width, height).compose_paint_with_font(
-            &display_list,
-            font,
-            scale_factor as f32,
-        ),
-        None => Compositor::new(css_width, css_height).compose_paint(&display_list),
+        Some(font) => {
+            let scale = scale_factor as f32;
+            let scroll_y = (scroll_y * scale).round() / scale;
+            let display_list = paint::paint_document_scrolled(&layout.tree, scroll_y);
+            Compositor::new(width, height).compose_paint_with_font(&display_list, font, scale)
+        }
+        None => {
+            let display_list = paint::paint_document_scrolled(&layout.tree, scroll_y.round());
+            Compositor::new(css_width, css_height).compose_paint(&display_list)
+        }
     }
 }
 
-/// Parses, styles, and lays out `page` for a `width` × `height` CSS-pixel
-/// viewport. Painting and hit testing share this so they agree on geometry.
-fn layout_page(page: &Page, width: u32, height: u32) -> LayoutTree {
-    let document = html::parse_raw_html(page.html.to_owned());
-    let stylesheets: Vec<_> = page
-        .stylesheets
-        .iter()
-        .map(|source| css::parse_stylesheet(source))
-        .collect();
-    let styles = css::style_document(&document, &stylesheets);
-    layout_document(
-        &document,
-        &styles,
-        Size {
-            width: width as f32,
-            height: height as f32,
-        },
-        page_metrics(),
+/// Returns the CSS-pixel viewport for a `width` × `height` device-pixel page
+/// area at `scale_factor` device pixels per CSS pixel.
+pub(crate) fn css_viewport(width: u32, height: u32, scale_factor: f64) -> (u32, u32) {
+    (
+        (width as f64 / scale_factor).ceil() as u32,
+        (height as f64 / scale_factor).ceil() as u32,
     )
 }
 
-/// Returns the node under a CSS-pixel point of `page` laid out at
-/// `width` × `height`, or `None` when the point hits no element box.
+/// A page parsed, styled, and laid out for one CSS-pixel viewport.
 ///
-/// Node IDs match the document a [`PageEvents`] session loads from the same
-/// page, because both parse `page.html` the same way.
-pub(crate) fn hit_test_page(
-    page: &Page,
-    width: u32,
-    height: u32,
-    x: f32,
-    y: f32,
-) -> Option<NodeID> {
-    layout_page(page, width, height).hit_test(x, y)
+/// The window keeps this between frames so scrolling only repaints; it is
+/// rebuilt when the page or the viewport size changes. Painting and hit
+/// testing share it so they agree on geometry.
+pub(crate) struct PageLayout {
+    /// The viewport width and height in CSS pixels.
+    css_size: (u32, u32),
+    tree: LayoutTree,
+}
+
+impl PageLayout {
+    /// Lays out `page` for a `width` × `height` CSS-pixel viewport.
+    pub(crate) fn new(page: &Page, width: u32, height: u32) -> Self {
+        let document = html::parse_raw_html(page.html.to_owned());
+        let stylesheets: Vec<_> = page
+            .stylesheets
+            .iter()
+            .map(|source| css::parse_stylesheet(source))
+            .collect();
+        let styles = css::style_document(&document, &stylesheets);
+        let tree = layout_document(
+            &document,
+            &styles,
+            Size {
+                width: width as f32,
+                height: height as f32,
+            },
+            page_metrics(),
+        );
+        Self {
+            css_size: (width, height),
+            tree,
+        }
+    }
+
+    /// Lays out `page` for a `width` × `height` device-pixel page area at
+    /// `scale_factor` device pixels per CSS pixel.
+    #[cfg(test)]
+    pub(crate) fn for_device(page: &Page, width: u32, height: u32, scale_factor: f64) -> Self {
+        let (css_width, css_height) = css_viewport(width, height, scale_factor);
+        Self::new(page, css_width, css_height)
+    }
+
+    /// The viewport width and height, in CSS pixels, this layout is for.
+    pub(crate) fn css_size(&self) -> (u32, u32) {
+        self.css_size
+    }
+
+    /// How far the viewport can scroll down, in CSS pixels; zero when the
+    /// whole document fits.
+    pub(crate) fn max_scroll(&self) -> f32 {
+        (self.tree.scroll_height() - self.css_size.1 as f32).max(0.0)
+    }
+
+    /// Returns the node under a viewport point in CSS pixels while the page
+    /// is scrolled down by `scroll_y`, or `None` when the point hits no
+    /// element box.
+    ///
+    /// Node IDs match the document a [`PageEvents`] session loads from the
+    /// same page, because both parse `page.html` the same way.
+    pub(crate) fn hit_test(&self, x: f32, y: f32, scroll_y: f32) -> Option<NodeID> {
+        self.tree.hit_test(x, y + scroll_y)
+    }
 }
 
 /// Evaluates the page's script for its side effects, including `alert`.
 ///
-/// Call this after the window has presented a frame. Running it inside the
-/// draw callback joins the JS engine thread while the UI thread cannot
-/// service a dialog. The listeners it registers do not outlive this call;
-/// the window uses [`PageEvents`] so a later click can reach them.
-pub(crate) fn evaluate_page_script(
-    page: &Page,
-    alert_sink: Arc<dyn AlertSink>,
-    runtime: BrowserRuntime,
-) {
+/// The window runs scripts through [`PageEvents`] instead, so listeners
+/// outlive the script; tests use this to render a page after its script ran.
+#[cfg(test)]
+fn evaluate_page_script(page: &Page, alert_sink: Arc<dyn AlertSink>, runtime: BrowserRuntime) {
     log::debug!("evaluating page script for {}", page.url);
     let controller = browser::request_controller(None);
     runtime
@@ -184,7 +238,11 @@ enum PageCommand {
         page: Page,
         alert_sink: Arc<dyn AlertSink>,
         runtime: BrowserRuntime,
+        device_pixel_ratio: f64,
+        viewport: Option<ViewportSize>,
     },
+    Resize(ViewportSize),
+    DevicePixelRatio(f64),
     Click(Option<NodeID>),
 }
 
@@ -207,11 +265,26 @@ impl PageEvents {
     }
 
     /// Replaces the live document with `page` and runs its script.
+    #[allow(dead_code)]
     pub(crate) fn load(
         &self,
         page: &Page,
         alert_sink: Arc<dyn AlertSink>,
         runtime: BrowserRuntime,
+        device_pixel_ratio: f64,
+    ) {
+        self.load_with_viewport(page, alert_sink, runtime, device_pixel_ratio, None);
+    }
+
+    /// Replaces the live document and exposes `device_pixel_ratio` and
+    /// `viewport` (CSS pixels) to page scripts.
+    pub(crate) fn load_with_viewport(
+        &self,
+        page: &Page,
+        alert_sink: Arc<dyn AlertSink>,
+        runtime: BrowserRuntime,
+        device_pixel_ratio: f64,
+        viewport: Option<ViewportSize>,
     ) {
         if self
             .commands
@@ -219,6 +292,8 @@ impl PageEvents {
                 page: page.clone(),
                 alert_sink,
                 runtime,
+                device_pixel_ratio,
+                viewport,
             })
             .is_err()
         {
@@ -226,14 +301,32 @@ impl PageEvents {
         }
     }
 
+    /// Updates the current page's output device scale after a display change.
+    pub(crate) fn set_device_pixel_ratio(&self, device_pixel_ratio: f64) {
+        if self
+            .commands
+            .send(PageCommand::DevicePixelRatio(device_pixel_ratio))
+            .is_err()
+        {
+            log::warn!("page session is not running; dropped device scale update");
+        }
+    }
+
     /// Dispatches a `click` at `target`, or at the document when the click
-    /// hit no element. `target` comes from [`hit_test_page`].
+    /// hit no element. `target` comes from [`PageLayout::hit_test`].
     ///
     /// A click sent before the first load finishes is applied after that
     /// load, because the session thread handles one command at a time.
     pub(crate) fn click(&self, target: Option<NodeID>) {
         if self.commands.send(PageCommand::Click(target)).is_err() {
             log::warn!("page session is not running; dropped click");
+        }
+    }
+
+    /// Updates the viewport dimensions exposed to the live page session.
+    pub(crate) fn resize(&self, viewport: ViewportSize) {
+        if self.commands.send(PageCommand::Resize(viewport)).is_err() {
+            log::warn!("page session is not running; dropped resize");
         }
     }
 }
@@ -246,18 +339,46 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                 page,
                 alert_sink,
                 runtime,
+                device_pixel_ratio,
+                viewport,
             } => {
                 log::debug!("page session loading {}", page.url);
                 let controller = browser::request_controller(None);
-                match runtime.open_page(
-                    &page,
-                    Arc::new(NoopConsole),
-                    alert_sink,
-                    controller,
-                    browser::security_context_for_url(&page.url),
-                ) {
+                let security_context = browser::security_context_for_url(&page.url);
+                let result = match viewport {
+                    Some(viewport) => runtime.open_page_with_viewport(
+                        &page,
+                        Arc::new(NoopConsole),
+                        alert_sink,
+                        controller,
+                        security_context,
+                        device_pixel_ratio,
+                        viewport,
+                    ),
+                    None => runtime.open_page_with_device_pixel_ratio(
+                        &page,
+                        Arc::new(NoopConsole),
+                        alert_sink,
+                        controller,
+                        security_context,
+                        device_pixel_ratio,
+                    ),
+                };
+                match result {
                     Ok(loaded) => session = Some(loaded),
                     Err(error) => log::debug!("page script failed: {error}"),
+                }
+            }
+            PageCommand::Resize(viewport) => {
+                if let Some(session) = &mut session {
+                    session.set_viewport(viewport);
+                }
+            }
+            PageCommand::DevicePixelRatio(device_pixel_ratio) => {
+                if let Some(session) = &session
+                    && let Err(error) = session.set_device_pixel_ratio(device_pixel_ratio)
+                {
+                    log::warn!("could not update window.devicePixelRatio: {error}");
                 }
             }
             PageCommand::Click(target) => {
@@ -277,34 +398,27 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
     }
 }
 
-/// Renders the demo into a device-pixel pixmap sized for the page card.
+/// Renders `layout`, scrolled down by `scroll_y` CSS pixels, into a
+/// `width` × `height` device-pixel pixmap sized for the page card.
+///
 /// Text drawn with the system page font is rasterized at device resolution;
 /// the bitmap fallback renders at 1x and is scaled up with nearest-neighbor
-/// sampling so it keeps a consistent logical size on Retina. Returns `None`
-/// for an empty area.
+/// sampling so it keeps a consistent logical size on Retina. When the
+/// document is taller than the viewport, an overlay scrollbar thumb shows
+/// the scroll position. Returns `None` for an empty area.
 pub(crate) fn render_page(
-    page: &browser::Page,
+    layout: &PageLayout,
     width: u32,
     height: u32,
     scale_factor: f64,
-    alert_sink: Arc<dyn AlertSink>,
-    runtime: &BrowserRuntime,
-    scripts_evaluated: &mut bool,
+    scroll_y: f32,
 ) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(width, height)?;
-    log::trace!("rendering page {width}x{height} at scale {scale_factor}");
-    let frame = render_demo(
-        page,
-        width,
-        height,
-        scale_factor,
-        alert_sink,
-        runtime,
-        scripts_evaluated,
-    );
+    log::trace!("rendering page {width}x{height} at scale {scale_factor}, scroll {scroll_y}");
+    let frame = compose_frame(layout, width, height, scale_factor, scroll_y);
     // Device pixels per frame pixel: 1 when the frame is already at device
     // resolution, otherwise the window's scale for the 1x bitmap fallback.
-    let scale_factor = if frame.width == width {
+    let frame_scale = if frame.width == width {
         1.0
     } else {
         scale_factor
@@ -314,9 +428,9 @@ pub(crate) fn render_page(
         .chunks_exact_mut(width as usize * 4)
         .enumerate()
     {
-        let source_y = ((y as f64 / scale_factor) as u32).min(frame.height - 1);
+        let source_y = ((y as f64 / frame_scale) as u32).min(frame.height - 1);
         for (x, pixel) in row.chunks_exact_mut(4).enumerate() {
-            let source_x = ((x as f64 / scale_factor) as u32).min(frame.width - 1);
+            let source_x = ((x as f64 / frame_scale) as u32).min(frame.width - 1);
             let offset = (source_y * frame.width + source_x) as usize * 4;
             let rgba = &frame.pixels[offset..offset + 4];
             // Composite RGBA onto the white page so the card stays opaque.
@@ -326,7 +440,46 @@ pub(crate) fn render_page(
             pixel.copy_from_slice(&[channel(rgba[0]), channel(rgba[1]), channel(rgba[2]), 255]);
         }
     }
+    draw_scrollbar(&mut pixmap, layout, scale_factor, scroll_y);
     Some(pixmap)
+}
+
+/// Draws an overlay scrollbar thumb along the right edge of the page when
+/// the document can scroll. Sizes are CSS pixels scaled to the device.
+fn draw_scrollbar(pixmap: &mut Pixmap, layout: &PageLayout, scale_factor: f64, scroll_y: f32) {
+    const THUMB_WIDTH: f32 = 6.0;
+    const MARGIN: f32 = 3.0;
+    const MIN_THUMB: f32 = 24.0;
+    let max_scroll = layout.max_scroll();
+    if max_scroll <= 0.0 {
+        return;
+    }
+    let scale = scale_factor as f32;
+    let track = pixmap.height() as f32 - 2.0 * MARGIN * scale;
+    let viewport = layout.css_size.1 as f32;
+    let thumb_height = (track * viewport / (viewport + max_scroll))
+        .max(MIN_THUMB * scale)
+        .min(track);
+    let fraction = (scroll_y / max_scroll).clamp(0.0, 1.0);
+    let Some(thumb) = crate::toolbar::rounded_rect(
+        pixmap.width() as f32 - (THUMB_WIDTH + MARGIN) * scale,
+        MARGIN * scale + fraction * (track - thumb_height),
+        THUMB_WIDTH * scale,
+        thumb_height,
+        THUMB_WIDTH * scale / 2.0,
+    ) else {
+        return;
+    };
+    let mut paint = tiny_skia::Paint::default();
+    paint.set_color_rgba8(0, 0, 0, 90);
+    paint.anti_alias = true;
+    pixmap.fill_path(
+        &thumb,
+        &paint,
+        tiny_skia::FillRule::Winding,
+        tiny_skia::Transform::identity(),
+        None,
+    );
 }
 
 #[cfg(test)]
@@ -397,19 +550,11 @@ mod tests {
     fn page_is_scaled_to_device_pixels() {
         let page_source = browser::welcome_page();
         let runtime = test_runtime();
-        let mut scripts_evaluated = false;
+        evaluate_page_script(&page_source, test_alert_sink(), runtime.clone());
         for scale in [1.0, 1.5, 2.0] {
             let (width, height) = ((160.0 * scale) as u32, (120.0 * scale) as u32);
-            let page = render_page(
-                &page_source,
-                width,
-                height,
-                scale,
-                test_alert_sink(),
-                &runtime,
-                &mut scripts_evaluated,
-            )
-            .unwrap();
+            let layout = PageLayout::for_device(&page_source, width, height, scale);
+            let page = render_page(&layout, width, height, scale, 0.0).unwrap();
             assert_eq!((page.width(), page.height()), (width, height));
             let data = page.data();
             assert_eq!(&data[..4], &[255; 4]);
@@ -461,6 +606,7 @@ mod tests {
             },
             alert.clone(),
             test_runtime(),
+            1.0,
         );
         events.click(None);
 
@@ -486,7 +632,8 @@ mod tests {
 
         let page = browser::welcome_page();
         let (width, height) = (640, 480);
-        let tree = layout_page(&page, width, height);
+        let layout = PageLayout::new(&page, width, height);
+        let tree = &layout.tree;
         let button = html::parse_raw_html(page.html.clone())
             .get_element_by_id("btn")
             .expect("welcome page has #btn");
@@ -508,7 +655,7 @@ mod tests {
         let rect = find(&tree.root, button).expect("#btn is laid out");
         let (x, y) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
         assert_eq!(
-            hit_test_page(&page, width, height, x, y),
+            layout.hit_test(x, y, 0.0),
             Some(button),
             "the button's center should hit the button"
         );
@@ -519,8 +666,8 @@ mod tests {
             arrived: arrived_tx,
         });
         let events = PageEvents::new();
-        events.load(&page, alert.clone(), test_runtime());
-        events.click(hit_test_page(&page, width, height, x, y));
+        events.load(&page, alert.clone(), test_runtime(), 1.0);
+        events.click(layout.hit_test(x, y, 0.0));
 
         arrived_rx
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -531,34 +678,85 @@ mod tests {
     #[test]
     fn tiny_and_empty_pages_are_safe() {
         let page = browser::welcome_page();
-        let runtime = test_runtime();
-        let mut scripts_evaluated = false;
-        assert!(
-            render_page(
-                &page,
-                0,
-                10,
-                1.0,
-                test_alert_sink(),
-                &runtime,
-                &mut scripts_evaluated,
-            )
-            .is_none()
-        );
+        let layout = PageLayout::for_device(&page, 0, 10, 1.0);
+        assert!(render_page(&layout, 0, 10, 1.0, 0.0).is_none());
         for (width, height) in [(1, 1), (3, 48), (17, 70)] {
-            assert!(
-                render_page(
-                    &page,
-                    width,
-                    height,
-                    2.0,
-                    test_alert_sink(),
-                    &runtime,
-                    &mut scripts_evaluated,
-                )
-                .is_some()
-            );
+            let layout = PageLayout::for_device(&page, width, height, 2.0);
+            let max_scroll = layout.max_scroll();
+            for scroll_y in [0.0, max_scroll / 2.0, max_scroll] {
+                assert!(render_page(&layout, width, height, 2.0, scroll_y).is_some());
+            }
         }
+    }
+
+    fn long_page() -> Page {
+        Page {
+            url: String::new(),
+            html: "<body><div id=\"top\"></div><div id=\"bottom\"></div></body>".into(),
+            stylesheets: vec![
+                "body { margin: 0 } div { height: 300px } \
+                 #top { background-color: red } #bottom { background-color: blue }"
+                    .into(),
+            ],
+            scripts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn scrolling_shows_lower_content_and_shifts_hit_testing() {
+        let page = long_page();
+        let layout = PageLayout::new(&page, 160, 120);
+        assert_eq!(layout.css_size(), (160, 120));
+        assert_eq!(layout.max_scroll(), 600.0 - 120.0);
+
+        let pixel = |pixmap: &Pixmap, x: u32, y: u32| {
+            let offset = (y * pixmap.width() + x) as usize * 4;
+            pixmap.data()[offset..offset + 4].to_vec()
+        };
+        let top = render_page(&layout, 160, 120, 1.0, 0.0).unwrap();
+        assert_eq!(pixel(&top, 10, 60), [255, 0, 0, 255]);
+        let scrolled = render_page(&layout, 160, 120, 1.0, 400.0).unwrap();
+        assert_eq!(pixel(&scrolled, 10, 60), [0, 0, 255, 255]);
+
+        let document = html::parse_raw_html(page.html.clone());
+        let bottom = document.get_element_by_id("bottom").unwrap();
+        let top_node = document.get_element_by_id("top").unwrap();
+        assert_eq!(layout.hit_test(10.0, 60.0, 0.0), Some(top_node));
+        assert_eq!(layout.hit_test(10.0, 60.0, 400.0), Some(bottom));
+    }
+
+    #[test]
+    fn the_scrollbar_thumb_appears_only_on_scrollable_pages_and_tracks_position() {
+        // Darkened pixels in the rightmost columns are the overlay thumb.
+        let thumb_rows = |pixmap: &Pixmap| -> Vec<u32> {
+            (0..pixmap.height())
+                .filter(|y| {
+                    let offset = (y * pixmap.width() + pixmap.width() - 6) as usize * 4;
+                    pixmap.data()[offset] < 200
+                })
+                .collect()
+        };
+        let short = Page {
+            url: String::new(),
+            html: "<body>short</body>".into(),
+            stylesheets: Vec::new(),
+            scripts: Vec::new(),
+        };
+        let layout = PageLayout::new(&short, 160, 120);
+        assert_eq!(layout.max_scroll(), 0.0);
+        assert!(thumb_rows(&render_page(&layout, 160, 120, 1.0, 0.0).unwrap()).is_empty());
+
+        let mut page = long_page();
+        page.stylesheets = vec!["body { margin: 0 } div { height: 300px }".into()];
+        let layout = PageLayout::new(&page, 160, 120);
+        let at_top = thumb_rows(&render_page(&layout, 160, 120, 1.0, 0.0).unwrap());
+        let at_end = thumb_rows(&render_page(&layout, 160, 120, 1.0, 480.0).unwrap());
+        assert!(!at_top.is_empty() && !at_end.is_empty());
+        assert!(at_top[0] < 10, "thumb starts at the top: {at_top:?}");
+        assert!(
+            *at_end.last().unwrap() > 110,
+            "thumb ends at the bottom: {at_end:?}"
+        );
     }
 
     #[test]
