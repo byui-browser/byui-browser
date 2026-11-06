@@ -388,53 +388,49 @@ impl App {
         // Command is the shortcut modifier on macOS; Control works everywhere.
         let shortcut =
             modifiers.control_key() || (cfg!(target_os = "macos") && modifiers.super_key());
-        if shortcut {
-            if let Key::Character(character) = key {
-                match character.to_ascii_lowercase().as_str() {
-                    "+" | "=" => {
-                        self.set_page_zoom(self.page_zoom + PAGE_ZOOM_STEP);
-                        return;
-                    }
-                    "-" | "_" => {
-                        self.set_page_zoom(self.page_zoom - PAGE_ZOOM_STEP);
-                        return;
-                    }
-                    "0" => {
-                        self.set_page_zoom(1.0);
-                        return;
-                    }
-                    "l" => {
-                        self.begin_address_edit();
-                        return;
-                    }
-                    "r" => {
-                        self.activate(Control::Reload);
-                        return;
-                    }
-                    "a" if self.chrome.address_focused => {
-                        self.chrome.address_selected = true;
-                        self.redraw();
-                        return;
-                    }
-                    "c" if self.chrome.address_focused => {
-                        if let Err(error) = arboard::Clipboard::new()
-                            .and_then(|mut clipboard| clipboard.set_text(self.address.clone()))
-                        {
-                            log::warn!("failed to copy the address: {error}");
-                        }
-                        return;
-                    }
-                    "v" if self.chrome.address_focused => {
-                        match arboard::Clipboard::new()
-                            .and_then(|mut clipboard| clipboard.get_text())
-                        {
-                            Ok(text) => self.insert_address_text(&text),
-                            Err(error) => log::warn!("failed to paste into the address: {error}"),
-                        }
-                        return;
-                    }
-                    _ => {}
+        if shortcut && let Key::Character(character) = key {
+            match character.to_ascii_lowercase().as_str() {
+                "+" | "=" => {
+                    self.set_page_zoom(self.page_zoom + PAGE_ZOOM_STEP);
+                    return;
                 }
+                "-" | "_" => {
+                    self.set_page_zoom(self.page_zoom - PAGE_ZOOM_STEP);
+                    return;
+                }
+                "0" => {
+                    self.set_page_zoom(1.0);
+                    return;
+                }
+                "l" => {
+                    self.begin_address_edit();
+                    return;
+                }
+                "r" => {
+                    self.activate(Control::Reload);
+                    return;
+                }
+                "a" if self.chrome.address_focused => {
+                    self.chrome.address_selected = true;
+                    self.redraw();
+                    return;
+                }
+                "c" if self.chrome.address_focused => {
+                    if let Err(error) = arboard::Clipboard::new()
+                        .and_then(|mut clipboard| clipboard.set_text(self.address.clone()))
+                    {
+                        log::warn!("failed to copy the address: {error}");
+                    }
+                    return;
+                }
+                "v" if self.chrome.address_focused => {
+                    match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+                        Ok(text) => self.insert_address_text(&text),
+                        Err(error) => log::warn!("failed to paste into the address: {error}"),
+                    }
+                    return;
+                }
+                _ => {}
             }
         }
         if !self.chrome.address_focused {

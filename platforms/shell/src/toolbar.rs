@@ -346,10 +346,10 @@ fn draw_toolbar(
             (_, Some(hovered)) if hovered == control && active => Some(palette.hover),
             _ => None,
         };
-        if let Some(color) = background {
-            if let Some(path) = rounded_rect(rect.x(), rect.y(), rect.width(), rect.height(), 7.0) {
-                fill(pixmap, &path, color, transform);
-            }
+        if let Some(color) = background
+            && let Some(path) = rounded_rect(rect.x(), rect.y(), rect.width(), rect.height(), 7.0)
+        {
+            fill(pixmap, &path, color, transform);
         }
         let color = if active {
             palette.icon

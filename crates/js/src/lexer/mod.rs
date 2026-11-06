@@ -457,12 +457,13 @@ fn read_unicode_escape(chars: &mut Chars<'_>) -> Result<char, &'static str> {
     }
 
     let mut lookahead = chars.clone();
-    if take_if(&mut lookahead, '\\') && take_if(&mut lookahead, 'u') {
-        if let Some(low @ 0xDC00..=0xDFFF) = read_unicode_code_point(&mut lookahead) {
-            *chars = lookahead;
-            let combined = 0x10000 + ((code_unit - 0xD800) << 10) + (low - 0xDC00);
-            return char::from_u32(combined).ok_or(INVALID_ESCAPE);
-        }
+    if take_if(&mut lookahead, '\\')
+        && take_if(&mut lookahead, 'u')
+        && let Some(low @ 0xDC00..=0xDFFF) = read_unicode_code_point(&mut lookahead)
+    {
+        *chars = lookahead;
+        let combined = 0x10000 + ((code_unit - 0xD800) << 10) + (low - 0xDC00);
+        return char::from_u32(combined).ok_or(INVALID_ESCAPE);
     }
     Err(UNSUPPORTED_ESCAPE)
 }

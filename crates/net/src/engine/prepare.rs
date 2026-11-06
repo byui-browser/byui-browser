@@ -65,10 +65,11 @@ impl RequestController {
             return Err(RequestError::UnsupportedFeature("browser services"));
         }
 
-        if validated_url.scheme.is_http() && request.cache_mode != CacheMode::NoStore {
-            if let Some(services) = &self.inner.services {
-                request.cache_partition = Some(services.cache_partition(&request)?);
-            }
+        if validated_url.scheme.is_http()
+            && request.cache_mode != CacheMode::NoStore
+            && let Some(services) = &self.inner.services
+        {
+            request.cache_partition = Some(services.cache_partition(&request)?);
         }
         log::trace!(
             "request prepared: {} scheme={:?} cacheable={}",

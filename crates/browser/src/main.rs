@@ -108,10 +108,10 @@ fn main() {
             std::time::Instant::now() + std::time::Duration::from_millis(16),
         );
 
-        if let Ok(message) = rx.try_recv() {
-            if message == "go_to_google" {
-                let _ = webview.load_url("https://google.com");
-            }
+        if let Ok(message) = rx.try_recv()
+            && message == "go_to_google"
+        {
+            let _ = webview.load_url("https://google.com");
         }
 
         if let tao::event::Event::WindowEvent {
