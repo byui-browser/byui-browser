@@ -237,7 +237,7 @@ fn fill_frame(pixmap: &mut Pixmap, window_height: u32, palette: &Palette) {
     let width = pixmap.width() as usize;
     for (y, row) in pixmap.data_mut().chunks_exact_mut(width * 4).enumerate() {
         let color = frame_color(y as u32, window_height, palette);
-        for pixel in row.chunks_exact_mut(4) {
+        for pixel in row.as_chunks_mut::<4>().0.iter_mut() {
             pixel.copy_from_slice(&color);
         }
     }

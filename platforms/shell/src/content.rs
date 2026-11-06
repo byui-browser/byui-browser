@@ -429,7 +429,7 @@ pub(crate) fn render_page(
         .enumerate()
     {
         let source_y = ((y as f64 / frame_scale) as u32).min(frame.height - 1);
-        for (x, pixel) in row.chunks_exact_mut(4).enumerate() {
+        for (x, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let source_x = ((x as f64 / frame_scale) as u32).min(frame.width - 1);
             let offset = (source_y * frame.width + source_x) as usize * 4;
             let rgba = &frame.pixels[offset..offset + 4];
@@ -540,7 +540,10 @@ mod tests {
         );
         assert!(
             frame.pixels[..160 * 100 * 4]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
                 .any(|p| p == welcome_color(&page, "color"))
         );
         assert_eq!(&frame.pixels[160 * 110 * 4..160 * 110 * 4 + 4], &[255; 4]);
@@ -565,7 +568,10 @@ mod tests {
                 &welcome_color(&page_source, "background-color")
             );
             assert!(
-                data.chunks_exact(4)
+                data.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .copied()
                     .any(|p| p == welcome_color(&page_source, "color"))
             );
             let bottom = ((110.0 * scale) as u32 * width) as usize * 4;
@@ -854,7 +860,15 @@ mod tests {
             &mut scripts_evaluated,
         );
         assert_eq!(&first.pixels[..4], &[170, 187, 204, 255]);
-        assert!(first.pixels.chunks_exact(4).any(|p| p == [255, 0, 0, 255]));
+        assert!(
+            first
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .any(|p| p == [255, 0, 0, 255])
+        );
 
         page.html = "<main>World</main>".into();
         let changed_text = render_document(
@@ -882,7 +896,10 @@ mod tests {
         assert!(
             changed_css
                 .pixels
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
                 .any(|p| p == [170, 187, 204, 255])
         );
     }
@@ -907,7 +924,15 @@ mod tests {
             &mut scripts_evaluated,
         );
         assert_eq!(&frame.pixels[..4], &[255, 255, 255, 255]);
-        assert!(frame.pixels.chunks_exact(4).any(|p| p == [0, 0, 0, 255]));
+        assert!(
+            frame
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .any(|p| p == [0, 0, 0, 255])
+        );
 
         page.stylesheets = vec!["html { background-color: #123456; color: red; }".into()];
         let frame = render_document(
@@ -920,6 +945,14 @@ mod tests {
             &mut scripts_evaluated,
         );
         assert_eq!(&frame.pixels[..4], &[18, 52, 86, 255]);
-        assert!(frame.pixels.chunks_exact(4).any(|p| p == [255, 0, 0, 255]));
+        assert!(
+            frame
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .any(|p| p == [255, 0, 0, 255])
+        );
     }
 }

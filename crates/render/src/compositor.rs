@@ -360,7 +360,10 @@ mod tests {
         }]);
         let dark = frame
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
             .filter(|pixel| *pixel == [0, 0, 0, 255])
             .count();
         // `I` has 5 + 5 + 5 lit cells (two bars and a 5-row stem); at scale 2
@@ -393,14 +396,25 @@ mod tests {
         let frame = Compositor::new(120, 60).compose_paint_with_font(&list, &font, scale);
         let inked: Vec<(u32, u32)> = frame
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
             .enumerate()
             .filter(|(_, pixel)| *pixel != Compositor::CLEAR_COLOR)
             .map(|(index, _)| (index as u32 % 120, index as u32 / 120))
             .collect();
         assert!(!inked.is_empty());
         // Anti-aliased edges produce partially covered (gray) pixels.
-        assert!(frame.pixels.chunks_exact(4).any(|p| p[0] > 0 && p[0] < 255));
+        assert!(
+            frame
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .any(|p| p[0] > 0 && p[0] < 255)
+        );
         // Ink stays within the run's measured advance and above the
         // baseline, both scaled to device pixels.
         let right = (4.0 + font.text_width("Hi", 16.0)) * scale;
@@ -435,7 +449,10 @@ mod tests {
         let frame = Compositor::new(8, 8).compose_paint_with_font(&list, &font, 2.0);
         let red = frame
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
             .filter(|pixel| *pixel == [255, 0, 0, 255])
             .count();
         assert_eq!(red, 4 * 2);
