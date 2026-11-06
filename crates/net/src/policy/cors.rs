@@ -21,7 +21,7 @@ impl CorsChecker {
         response: &InternalResponse,
     ) -> Result<ResponseType, RequestError> {
         let final_url = response.url_list.last().ok_or(RequestError::NetworkError)?;
-        let origin = request.context.environment.origin.as_ref();
+        let origin = request.effective_origin();
         let same_origin = origin.is_some_and(|origin| {
             response
                 .origin
@@ -56,7 +56,7 @@ impl CorsChecker {
                     .headers
                     .get("access-control-allow-origin")
                     .and_then(|value| value.to_str().ok());
-                let serialized = origin.map(Origin::as_str).unwrap_or_default();
+                let serialized = request.serialized_origin().unwrap_or_default();
                 let allowed = allowed_origin == Some(serialized.as_str())
                     || (allowed_origin == Some("*")
                         && request.context.credentials != CredentialsMode::Include);

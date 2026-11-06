@@ -238,9 +238,11 @@ enum PageCommand {
         page: Page,
         alert_sink: Arc<dyn AlertSink>,
         runtime: BrowserRuntime,
+        device_pixel_ratio: f64,
         viewport: Option<ViewportSize>,
     },
     Resize(ViewportSize),
+    DevicePixelRatio(f64),
     Click(Option<NodeID>),
 }
 
@@ -269,16 +271,19 @@ impl PageEvents {
         page: &Page,
         alert_sink: Arc<dyn AlertSink>,
         runtime: BrowserRuntime,
+        device_pixel_ratio: f64,
     ) {
-        self.load_with_viewport(page, alert_sink, runtime, None);
+        self.load_with_viewport(page, alert_sink, runtime, device_pixel_ratio, None);
     }
 
-    /// Replaces the live document and exposes `viewport` to page scripts.
+    /// Replaces the live document and exposes `device_pixel_ratio` and
+    /// `viewport` (CSS pixels) to page scripts.
     pub(crate) fn load_with_viewport(
         &self,
         page: &Page,
         alert_sink: Arc<dyn AlertSink>,
         runtime: BrowserRuntime,
+        device_pixel_ratio: f64,
         viewport: Option<ViewportSize>,
     ) {
         if self
@@ -287,11 +292,23 @@ impl PageEvents {
                 page: page.clone(),
                 alert_sink,
                 runtime,
+                device_pixel_ratio,
                 viewport,
             })
             .is_err()
         {
             log::warn!("page session is not running; dropped load of {}", page.url);
+        }
+    }
+
+    /// Updates the current page's output device scale after a display change.
+    pub(crate) fn set_device_pixel_ratio(&self, device_pixel_ratio: f64) {
+        if self
+            .commands
+            .send(PageCommand::DevicePixelRatio(device_pixel_ratio))
+            .is_err()
+        {
+            log::warn!("page session is not running; dropped device scale update");
         }
     }
 
@@ -322,25 +339,29 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                 page,
                 alert_sink,
                 runtime,
+                device_pixel_ratio,
                 viewport,
             } => {
                 log::debug!("page session loading {}", page.url);
                 let controller = browser::request_controller(None);
+                let security_context = browser::security_context_for_url(&page.url);
                 let result = match viewport {
                     Some(viewport) => runtime.open_page_with_viewport(
                         &page,
                         Arc::new(NoopConsole),
                         alert_sink,
                         controller,
-                        browser::security_context_for_url(&page.url),
+                        security_context,
+                        device_pixel_ratio,
                         viewport,
                     ),
-                    None => runtime.open_page(
+                    None => runtime.open_page_with_device_pixel_ratio(
                         &page,
                         Arc::new(NoopConsole),
                         alert_sink,
                         controller,
-                        browser::security_context_for_url(&page.url),
+                        security_context,
+                        device_pixel_ratio,
                     ),
                 };
                 match result {
@@ -351,6 +372,13 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
             PageCommand::Resize(viewport) => {
                 if let Some(session) = &mut session {
                     session.set_viewport(viewport);
+                }
+            }
+            PageCommand::DevicePixelRatio(device_pixel_ratio) => {
+                if let Some(session) = &session
+                    && let Err(error) = session.set_device_pixel_ratio(device_pixel_ratio)
+                {
+                    log::warn!("could not update window.devicePixelRatio: {error}");
                 }
             }
             PageCommand::Click(target) => {
@@ -578,6 +606,7 @@ mod tests {
             },
             alert.clone(),
             test_runtime(),
+            1.0,
         );
         events.click(None);
 
@@ -637,7 +666,7 @@ mod tests {
             arrived: arrived_tx,
         });
         let events = PageEvents::new();
-        events.load(&page, alert.clone(), test_runtime());
+        events.load(&page, alert.clone(), test_runtime(), 1.0);
         events.click(layout.hit_test(x, y, 0.0));
 
         arrived_rx

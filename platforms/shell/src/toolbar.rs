@@ -19,7 +19,8 @@ const CONTROLS_HEIGHT: f64 = 46.0;
 /// Gap in logical pixels between the page card and the window's side and
 /// bottom edges.
 const PAGE_INSET: f64 = 8.0;
-const PAGE_RADIUS: f32 = 10.0;
+/// Corner radius in logical pixels of the page card and overlays docked to it.
+pub(crate) const PAGE_RADIUS: f32 = 10.0;
 const CENTER_Y: f32 = 26.0;
 const BUTTON_SIZE: f32 = 28.0;
 const BUTTON_TOP: f32 = CENTER_Y - BUTTON_SIZE / 2.0;
@@ -570,7 +571,7 @@ pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
 
 /// Returns the pen advance in device pixels of `text` set at `size`, matching
 /// the position [`draw_text`] returns relative to its starting `x`.
-fn text_advance(font: &FontVec, size: f32, text: &str) -> f32 {
+pub(crate) fn text_advance(font: &FontVec, size: f32, text: &str) -> f32 {
     let scaled = font.as_scaled(PxScale::from(size));
     let mut advance = 0.0;
     let mut previous = None;
@@ -690,13 +691,21 @@ pub(crate) fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Optio
     builder.finish()
 }
 
-fn fill(pixmap: &mut Pixmap, path: &Path, color: Color, transform: Transform) {
+/// Fills `path` with a solid `color`.
+pub(crate) fn fill(pixmap: &mut Pixmap, path: &Path, color: Color, transform: Transform) {
     let mut paint = Paint::default();
     paint.set_color(color);
     pixmap.fill_path(path, &paint, FillRule::Winding, transform, None);
 }
 
-fn stroke(pixmap: &mut Pixmap, path: &Path, color: Color, width: f32, transform: Transform) {
+/// Strokes `path` with round caps and joins, `width` in transformed units.
+pub(crate) fn stroke(
+    pixmap: &mut Pixmap,
+    path: &Path,
+    color: Color,
+    width: f32,
+    transform: Transform,
+) {
     let mut paint = Paint::default();
     paint.set_color(color);
     let stroke = Stroke {
@@ -708,26 +717,32 @@ fn stroke(pixmap: &mut Pixmap, path: &Path, color: Color, width: f32, transform:
     pixmap.stroke_path(path, &paint, &stroke, transform, None);
 }
 
-fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
+pub(crate) fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
     Color::from_rgba8(r, g, b, a)
 }
 
-struct Palette {
-    frame_top: Color,
-    frame_bottom: Color,
-    shadow: Color,
-    card_border: Color,
-    icon: Color,
-    icon_disabled: Color,
-    hover: Color,
-    pressed: Color,
-    field: Color,
-    field_hover: Color,
-    field_border: Color,
-    text: Color,
-    text_muted: Color,
-    accent: Color,
-    selection: Color,
+/// Shared browser-chrome colors for one appearance.
+pub(crate) struct Palette {
+    pub(crate) frame_top: Color,
+    pub(crate) frame_bottom: Color,
+    pub(crate) shadow: Color,
+    pub(crate) card_border: Color,
+    pub(crate) icon: Color,
+    pub(crate) icon_disabled: Color,
+    pub(crate) hover: Color,
+    pub(crate) pressed: Color,
+    pub(crate) field: Color,
+    pub(crate) field_hover: Color,
+    pub(crate) field_border: Color,
+    pub(crate) text: Color,
+    pub(crate) text_muted: Color,
+    pub(crate) accent: Color,
+    pub(crate) selection: Color,
+}
+
+/// Returns the chrome palette for the dark or light appearance.
+pub(crate) fn palette(dark: bool) -> Palette {
+    if dark { self::dark() } else { light() }
 }
 
 fn light() -> Palette {

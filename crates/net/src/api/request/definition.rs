@@ -35,6 +35,8 @@ pub struct Request {
     pub(crate) priority: RequestPriority,
     pub(crate) duplex: Option<RequestDuplex>,
     pub(crate) context: FetchContext,
+    pub(crate) request_origin: Option<Origin>,
+    pub(crate) redirect_tainted: bool,
     pub(crate) signal: AbortSignal,
     pub(crate) url_list: Vec<Url>,
     pub(crate) current_url: Option<Url>,
@@ -101,6 +103,8 @@ impl Request {
             priority: self.priority,
             duplex: self.duplex,
             context: self.context.clone(),
+            request_origin: self.request_origin.clone(),
+            redirect_tainted: self.redirect_tainted,
             signal: self.signal.clone(),
             url_list: self.url_list.clone(),
             current_url: self.current_url.clone(),
@@ -144,6 +148,8 @@ impl Request {
             priority: RequestPriority::Auto,
             duplex: None,
             context: FetchContext::default(),
+            request_origin: None,
+            redirect_tainted: false,
             signal: AbortSignal::new(),
             url_list: Vec::new(),
             current_url: None,
@@ -160,6 +166,18 @@ impl Request {
     /// Returns the original URL string supplied for this request.
     pub fn url(&self) -> &str {
         &self.url
+    }
+    /// Returns the URL currently being processed by the controller.
+    ///
+    /// Before preparation this is the original URL supplied by the caller.
+    /// During a redirect chain it is the URL of the current hop. Browser
+    /// services that make per-hop decisions should use this rather than
+    /// [`Request::url`], which intentionally preserves the original input.
+    pub fn active_url(&self) -> &str {
+        self.current_url
+            .as_ref()
+            .map(Url::as_str)
+            .unwrap_or(&self.url)
     }
     /// Returns this request's process-local identity.
     ///
@@ -290,7 +308,9 @@ impl Request {
         self.cache_mode = mode;
     }
     /// Sets the Fetch redirect mode.
-    /// `Manual` and `Error` are rejected before network I/O in this slice.
+    ///
+    /// `Follow` executes approved HTTP(S) hops, `Error` fails after receiving a
+    /// redirect response, and `Manual` returns an opaque-redirect view.
     pub fn set_redirect_mode(&mut self, mode: RedirectMode) {
         self.redirect_mode = mode;
     }
@@ -341,16 +361,28 @@ impl Request {
         match self.context.credentials {
             CredentialsMode::Omit => false,
             CredentialsMode::Include => true,
-            CredentialsMode::SameOrigin => {
-                self.context
-                    .environment
-                    .origin
-                    .as_ref()
-                    .is_some_and(|origin| {
-                        Origin::from_url(url).is_ok_and(|target| origin.is_same_origin(&target))
-                    })
-            }
+            CredentialsMode::SameOrigin => self.effective_origin().is_some_and(|origin| {
+                Origin::from_url(url).is_ok_and(|target| origin.is_same_origin(&target))
+            }),
         }
+    }
+
+    /// Returns the request origin after any redirect-time origin transitions.
+    pub(crate) fn effective_origin(&self) -> Option<&Origin> {
+        self.request_origin
+            .as_ref()
+            .or(self.context.environment.origin.as_ref())
+    }
+
+    /// Serializes the request origin, accounting for redirect taint.
+    pub(crate) fn serialized_origin(&self) -> Option<String> {
+        self.effective_origin().map(|origin| {
+            if self.redirect_tainted {
+                "null".to_owned()
+            } else {
+                origin.as_str()
+            }
+        })
     }
     /// Reports whether method or headers require a CORS preflight.
     pub(crate) fn requires_cors_preflight(&self) -> bool {
@@ -372,6 +404,9 @@ impl Request {
     pub(crate) fn prepare_url(&mut self, url: Url) {
         if self.url_list.is_empty() {
             self.url_list.push(url.clone());
+        }
+        if self.request_origin.is_none() {
+            self.request_origin = self.context.environment.origin.clone();
         }
         self.current_url = Some(url);
     }
@@ -405,6 +440,32 @@ impl Request {
             self.headers.remove_internal_header(name);
         }
     }
+
+    /// Applies origin and referrer-policy transitions before following a redirect.
+    pub(crate) fn apply_redirect_policy(
+        &mut self,
+        next_url: &Url,
+        response_headers: &http::HeaderMap,
+    ) {
+        if let Some(policy) = redirect_referrer_policy(response_headers) {
+            self.referrer_policy = policy;
+        }
+        let crosses_origin = self.current_url.as_ref().is_some_and(|current| {
+            current.scheme() != next_url.scheme() || current.origin() != next_url.origin()
+        });
+        if crosses_origin {
+            self.strip_sensitive_redirect_headers();
+            if self.current_url.as_ref().is_some_and(|current| {
+                Origin::from_url(current).is_ok_and(|current_origin| {
+                    self.effective_origin()
+                        .is_some_and(|origin| !origin.is_same_origin(&current_origin))
+                })
+            }) {
+                self.redirect_tainted = true;
+            }
+        }
+        self.service_workers = ServiceWorkersMode::None;
+    }
     /// Builds the internal transport header channel without changing caller headers.
     pub(crate) fn fetch_headers(&self) -> Result<Headers, RequestError> {
         let mut headers = self.headers.clone();
@@ -413,9 +474,9 @@ impl Request {
         }
         let needs_origin = self.context.mode == RequestMode::Cors
             || !matches!(self.method, Method::GET | Method::HEAD);
-        if needs_origin && let Some(origin) = &self.context.environment.origin {
-            let value = HeaderValue::try_from(origin.as_str())
-                .map_err(|_| RequestError::InvalidOrigin(origin.as_str()))?;
+        if needs_origin && let Some(origin) = self.serialized_origin() {
+            let value = HeaderValue::try_from(&origin)
+                .map_err(|_| RequestError::InvalidOrigin(origin.clone()))?;
             headers.insert_internal_header(HeaderName::from_static("origin"), value)?;
         }
         Ok(headers)
@@ -488,6 +549,27 @@ impl Request {
         }
         Ok(())
     }
+}
+
+/// Selects the last recognized policy token from `Referrer-Policy` metadata.
+fn redirect_referrer_policy(headers: &http::HeaderMap) -> Option<ReferrerPolicy> {
+    headers
+        .get_all(http::header::REFERRER_POLICY)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| match token.trim().to_ascii_lowercase().as_str() {
+            "no-referrer" => Some(ReferrerPolicy::NoReferrer),
+            "no-referrer-when-downgrade" => Some(ReferrerPolicy::NoReferrerWhenDowngrade),
+            "origin" => Some(ReferrerPolicy::Origin),
+            "origin-when-cross-origin" => Some(ReferrerPolicy::OriginWhenCrossOrigin),
+            "same-origin" => Some(ReferrerPolicy::SameOrigin),
+            "strict-origin" => Some(ReferrerPolicy::StrictOrigin),
+            "strict-origin-when-cross-origin" => Some(ReferrerPolicy::StrictOriginWhenCrossOrigin),
+            "unsafe-url" => Some(ReferrerPolicy::UnsafeUrl),
+            _ => None,
+        })
+        .next_back()
 }
 
 #[cfg(test)]

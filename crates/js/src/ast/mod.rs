@@ -219,6 +219,38 @@ pub enum Statement {
     Return(Option<Expr>),
     /// Class declaration with an optional superclass.
     ClassDeclaration(Box<ClassDefinition>),
+    /// `throw expression;`: raises any value as an exception.
+    Throw(Expr),
+    /// `try { ... } catch (name) { ... } finally { ... }`.
+    ///
+    /// At least one of `handler` and `finalizer` is present. The completion
+    /// value is that of the `try` block, or of the `catch` block when it
+    /// ran; a `finally` block changes it only by completing abruptly.
+    Try {
+        /// Statements of the protected block.
+        block: Vec<Statement>,
+        /// The `catch` clause, if any.
+        handler: Option<CatchClause>,
+        /// Statements of the `finally` block, if any. They run on every
+        /// exit of the `try` and `catch` blocks, including `return`, `break`,
+        /// `continue`, and a thrown exception.
+        finalizer: Option<Vec<Statement>>,
+    },
+    /// `break;`: leaves the innermost enclosing `while` loop.
+    Break,
+    /// `continue;`: starts the next iteration of the innermost enclosing
+    /// `while` loop. Labels are unsupported.
+    Continue,
+}
+
+/// The `catch` clause of a [`Statement::Try`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatchClause {
+    /// Name bound to the caught value, or `None` for `catch { ... }`.
+    /// Destructuring parameters are unsupported.
+    pub param: Option<String>,
+    /// Statements of the clause body, which has its own block scope.
+    pub body: Vec<Statement>,
 }
 
 /// The parsed body of a class declaration.

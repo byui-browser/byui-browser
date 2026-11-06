@@ -111,8 +111,7 @@ cargo run -p browser-linux -- --help                      # all options
 | `trace` | Everything, including tokens, DOM nodes, bytecode, and every input event and frame. |
 
 `-vv` and `-vvv` select `debug` and `trace`; `-q` shows only errors and `-qq`
-turns logging off. `--log-file <path>` appends to a file instead of standard
-error. A spec's targets are crate names or module paths (`html::tokenizer`),
+turns logging off. A spec's targets are crate names or module paths (`html::tokenizer`),
 and the longest match wins. Levels and `-v` apply to the browser's own crates;
 third-party crates (winit, reqwest, hyper, ...) stay at `warn` unless you add
 `deps=<level>` or name one (`--log-level debug,hyper=trace`). New workspace
@@ -120,6 +119,35 @@ crates must be added to `WORKSPACE_CRATES` in `common::logging`; a test checks
 this. The logger strips `user:password@` from any URL in a log line before
 writing it. See `crates/common/src/logging.rs` for the
 guidance on choosing a level when you add a log line.
+
+### Log file
+
+The browser also writes every log line to a file, so there is a record to
+attach to a bug report even after the terminal is closed. The terminal output
+is unchanged.
+
+| OS      | Log file |
+| ------- | -------- |
+| Linux   | `~/.local/share/byui-browser/logs/browser.log` (or `$XDG_DATA_HOME/byui-browser/logs/`) |
+| macOS   | `~/Library/Application Support/BYUI Browser/logs/browser.log` |
+| Windows | `%APPDATA%\BYUI Browser\logs\browser.log` |
+
+Each launch starts a fresh `browser.log` and keeps the run before it as
+`browser.previous.log`, so the log of a run that crashed survives the
+relaunch and the folder never holds more than two runs. The file records the
+same levels as the terminal, so start the browser with `-v` or `-vv` when you
+want more detail in it.
+
+```bash
+cargo run -p browser-linux -- --help                     # shows the log file path
+cargo run -p browser-linux -- --no-log-file              # don't write the log file
+cargo run -p browser-linux -- --log-file /tmp/run.log    # this file instead of the terminal
+```
+
+`--log-file <path>` appends to `<path>` and writes nothing to the terminal; it
+replaces the default log file. If the log folder cannot be written, the
+browser warns once and keeps logging to the terminal. The JavaScript shell
+(`browser-js`) does not keep a log file.
 
 ## Development workflow
 

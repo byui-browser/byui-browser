@@ -110,21 +110,24 @@ coverage, without adding browser composition requirements to this slice.
 ### 3. CORS and response filtering
 
 Complete tests for preflight requests, preflight caching, credentialed
-preflight, redirect-time CORS checks, opaque and opaque-redirect behavior, and
-network-error response construction. Retain explicit coverage proving that
+preflight, the remaining request-tainting states, and network-error response
+construction. Redirect-time simple CORS, redirect-tainted origin serialization, and
+opaque-redirect approval are covered. Retain explicit coverage proving that
 forbidden response headers never reach public responses.
 
 ### 4. Redirects and request context
 
-The initial redirect and request-context slice now covers POST-to-GET
-rewriting, content-header removal, cross-origin sensitive-header stripping,
-non-replayable 307 rejection, the redirect limit, tuple/opaque credential
-decisions, and representative same-origin, cross-origin, and downgrade
-referrer behavior.
+The redirect and request-context slice covers the redirect status/method matrix,
+content-header removal, cross-origin sensitive-header stripping, replayable and
+non-replayable body behavior, the redirect limit, HTTP(S)-only and
+credential-free targets, per-hop browser policy, service-worker bypass, intermediate
+cookie processing, simple CORS checks, redirect-taint serialization, referrer-policy
+updates, redirect-aware cache lookup, and representative credential decisions.
 
-Add conformance cases for per-hop origin/referrer/credentials changes,
-unsupported redirect targets, remaining redirect status/method combinations,
-and URL-list accuracy.
+Add conformance cases alongside future preflight, same-site cookie, full-cache,
+mixed-content, and timing integrations. Public final-URL and redirect-count
+behavior is covered; expand internal URL-list assertions if that state becomes
+observable through diagnostics.
 
 ### 5. Credentials, cookies, and cache
 

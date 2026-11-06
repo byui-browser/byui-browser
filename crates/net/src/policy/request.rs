@@ -139,7 +139,32 @@ impl RequestPolicy {
         request: &Request,
         url: &reqwest::Url,
     ) -> Result<(), RequestError> {
+        self.validate_redirect_location(url)?;
         self.validate_target(request, url)
+            .map_err(|error| match error {
+                RequestError::UnsupportedFeature(_) | RequestError::SameOriginViolation => error,
+                _ => RequestError::RedirectFailure,
+            })
+    }
+
+    /// Rejects redirect locations that cannot remain in the HTTP fetch path.
+    pub(crate) fn validate_redirect_location(
+        &self,
+        url: &reqwest::Url,
+    ) -> Result<(), RequestError> {
+        let scheme = FetchScheme::from_url(url).map_err(|_| RequestError::RedirectFailure)?;
+        if !scheme.is_http() {
+            log::warn!("redirect target uses non-HTTP scheme: {}", scheme.name());
+            return Err(RequestError::RedirectFailure);
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            log::warn!(
+                "redirect target contains embedded credentials: {}",
+                url.origin().ascii_serialization()
+            );
+            return Err(RequestError::RedirectFailure);
+        }
+        Ok(())
     }
 
     fn validate_target(&self, request: &Request, url: &reqwest::Url) -> Result<(), RequestError> {
@@ -150,15 +175,22 @@ impl RequestPolicy {
             );
             return Err(RequestError::InvalidUrl(url.to_string()));
         }
+        if request.context.mode == crate::RequestMode::SameOrigin
+            && request.effective_origin().is_some_and(|origin| {
+                crate::Origin::from_url(url).is_ok_and(|target| !origin.is_same_origin(&target))
+            })
+            && request.redirect_count > 0
+        {
+            log::warn!(
+                "same-origin redirect target blocked before transport: {}",
+                crate::log_url::loggable(url.as_str())
+            );
+            return Err(RequestError::SameOriginViolation);
+        }
         if request.context.mode == crate::RequestMode::Cors
-            && request
-                .context
-                .environment
-                .origin
-                .as_ref()
-                .is_some_and(|origin| {
-                    crate::Origin::from_url(url).is_ok_and(|target| !origin.is_same_origin(&target))
-                })
+            && request.effective_origin().is_some_and(|origin| {
+                crate::Origin::from_url(url).is_ok_and(|target| !origin.is_same_origin(&target))
+            })
             && request.requires_cors_preflight()
         {
             log::warn!(
