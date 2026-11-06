@@ -38,38 +38,37 @@ impl RequestController {
                 CacheMode::NoStore | CacheMode::Reload | CacheMode::NoCache => None,
             };
             if cacheable {
-                if let Some(allow_stale) = cache_lookup {
-                    if let Some(cached) =
+                if let Some(allow_stale) = cache_lookup
+                    && let Some(cached) =
                         self.inner
                             .cache
                             .get_with_staleness(&request, &url, allow_stale)
-                    {
-                        log::debug!(
-                            "cache hit: {} {} -> {} ({} bytes, allow_stale={allow_stale})",
-                            request.method(),
-                            crate::log_url::loggable(url.as_str()),
-                            cached.status,
-                            cached.body.len()
-                        );
-                        let mut body = if has_null_body(request.method(), cached.status) {
-                            Body::null()
-                        } else {
-                            Body::once_with_signal(cached.body, request.signal.clone())
-                        };
-                        body.set_response_metadata(&cached.headers, None);
-                        let mut internal = InternalResponse::from_http_parts(
-                            cached.status,
-                            cached.headers,
-                            cached.url,
-                            &request.context,
-                            body,
-                            true,
-                            cached.cookie_headers_processed,
-                        );
-                        Self::set_response_redirect_state(&request, &mut internal);
-                        self.finalize_response(&request, &mut internal)?;
-                        return Ok(internal.expose());
-                    }
+                {
+                    log::debug!(
+                        "cache hit: {} {} -> {} ({} bytes, allow_stale={allow_stale})",
+                        request.method(),
+                        crate::log_url::loggable(url.as_str()),
+                        cached.status,
+                        cached.body.len()
+                    );
+                    let mut body = if has_null_body(request.method(), cached.status) {
+                        Body::null()
+                    } else {
+                        Body::once_with_signal(cached.body, request.signal.clone())
+                    };
+                    body.set_response_metadata(&cached.headers, None);
+                    let mut internal = InternalResponse::from_http_parts(
+                        cached.status,
+                        cached.headers,
+                        cached.url,
+                        &request.context,
+                        body,
+                        true,
+                        cached.cookie_headers_processed,
+                    );
+                    Self::set_response_redirect_state(&request, &mut internal);
+                    self.finalize_response(&request, &mut internal)?;
+                    return Ok(internal.expose());
                 }
                 if cache_lookup.is_some() {
                     log::debug!(

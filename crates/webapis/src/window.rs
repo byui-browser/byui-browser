@@ -114,10 +114,10 @@ fn invoke_popstate(window: &Object, state: &Value) {
         callbacks.push(Value::Function(callback));
     }
     for callback in callbacks {
-        if let Value::Function(callback) = callback {
-            if let Err(error) = callback.call(&[Value::Object(event.clone())]) {
-                log::warn!("popstate listener threw: {error}");
-            }
+        if let Value::Function(callback) = callback
+            && let Err(error) = callback.call(&[Value::Object(event.clone())])
+        {
+            log::warn!("popstate listener threw: {error}");
         }
     }
 }

@@ -332,10 +332,10 @@ impl<'d> ElementTree<'d> {
         let Some(element) = self.element(index) else {
             return false;
         };
-        if let Some(type_selector) = &compound.type_selector {
-            if !matches_type(type_selector, element) {
-                return false;
-            }
+        if let Some(type_selector) = &compound.type_selector
+            && !matches_type(type_selector, element)
+        {
+            return false;
         }
         compound.simples.iter().all(|simple| match simple {
             SimpleSelector::Id(id) => attribute(element, "id") == Some(id.as_str()),
@@ -478,10 +478,10 @@ impl<'d> ElementTree<'d> {
             return false;
         };
         let of_selectors = pseudo.nested_selectors.as_deref();
-        if let Some(list) = of_selectors {
-            if !self.matches_any(list, index) {
-                return false;
-            }
+        if let Some(list) = of_selectors
+            && !self.matches_any(list, index)
+        {
+            return false;
         }
         let counts = |sibling: &usize| match name {
             "nth-of-type" | "nth-last-of-type" => self.same_type(*sibling, element),

@@ -7,7 +7,7 @@ The window, toolbar, and rendering code is shared with the Linux shell in
 
 ## Run
 
-Requires macOS, Rust 1.85 or newer, and the Xcode Command Line Tools
+Requires macOS, Rust 1.88 or newer, and the Xcode Command Line Tools
 (`xcode-select --install`).
 From the repository root:
 

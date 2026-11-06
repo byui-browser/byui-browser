@@ -304,12 +304,10 @@ impl<'s, 't, 'a> Parser<'s, 't, 'a> {
     ) -> Result<ComplexSelector, SelectorParseError> {
         self.skip_whitespace();
         let mut leading_combinator = None;
-        if allow_relative {
-            if let Some((combinator, width)) = self.peek_combinator() {
-                self.pos += width;
-                leading_combinator = Some(combinator);
-                self.skip_whitespace();
-            }
+        if allow_relative && let Some((combinator, width)) = self.peek_combinator() {
+            self.pos += width;
+            leading_combinator = Some(combinator);
+            self.skip_whitespace();
         }
         let mut compounds = vec![self.parse_compound_selector()?];
         let mut combinators = Vec::new();

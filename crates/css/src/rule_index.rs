@@ -62,10 +62,10 @@ fn split_important(value: &str) -> (&str, bool) {
     let split = trimmed.len().saturating_sub("important".len());
     if trimmed.len() >= "important".len() && trimmed.is_char_boundary(split) {
         let (before, word) = trimmed.split_at(split);
-        if word.eq_ignore_ascii_case("important") {
-            if let Some(rest) = before.trim_end().strip_suffix('!') {
-                return (rest.trim_end(), true);
-            }
+        if word.eq_ignore_ascii_case("important")
+            && let Some(rest) = before.trim_end().strip_suffix('!')
+        {
+            return (rest.trim_end(), true);
         }
     }
     (trimmed, false)

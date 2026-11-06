@@ -546,13 +546,13 @@ impl PersistentOriginStorage {
             };
 
             let result = file.write_all(record).and_then(|()| file.sync_all());
-            if result.is_err() {
-                if let Err(error) = fs::remove_file(&path) {
-                    log::warn!(
-                        "could not remove partial snapshot {}: {error}",
-                        path.display()
-                    );
-                }
+            if result.is_err()
+                && let Err(error) = fs::remove_file(&path)
+            {
+                log::warn!(
+                    "could not remove partial snapshot {}: {error}",
+                    path.display()
+                );
             }
             result?;
             return Ok(generation);
