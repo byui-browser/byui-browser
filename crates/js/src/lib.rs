@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-pub use runtime::{Function, MAX_ARRAY_LENGTH, Object};
+pub use runtime::{Function, HostGetter, HostSetter, MAX_ARRAY_LENGTH, Object, WeakObject};
 pub use vm::Vm;
 
 /// A JavaScript value produced by evaluation or passed to host functions.
@@ -376,6 +376,15 @@ impl Realm {
         self.globals.install_host(&name, value.clone());
         self.values.insert(name, value);
         Ok(())
+    }
+
+    /// Registers a host callback for assignments to an existing host global.
+    ///
+    /// Reads continue to return the registered global value. Script
+    /// assignments call `setter` and leave that value installed, which lets
+    /// hosts implement global accessor properties such as `location`.
+    pub fn register_global_setter(&mut self, name: &str, setter: HostSetter) -> JsResult<()> {
+        self.globals.set_host_setter(name, setter)
     }
 
     /// Returns the original value registered by the host for `name`.

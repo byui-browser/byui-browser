@@ -17,6 +17,7 @@ mod element;
 mod event;
 mod fetch;
 pub mod local_storage;
+mod location;
 mod selector;
 mod timer;
 mod window;
@@ -24,7 +25,10 @@ mod window;
 pub use alert::{AlertSink, alert, register_alert};
 pub use console::{ConsoleSink, print, register_print};
 pub use custom_elements::CustomElementRegistry;
-pub use document::{Document, get_element_by_id, register_document, register_document_on_window};
+pub use document::{
+    Document, get_element_by_id, register_document, register_document_on_window,
+    register_document_with_location,
+};
 pub use dom_exception::DomException;
 pub use element::{Element, get_attribute};
 pub use event::{
@@ -32,6 +36,9 @@ pub use event::{
     dispatch_event, event_constructor, remove_event_listener,
 };
 pub use fetch::{fetch, register_fetch};
+pub use location::{
+    LocationNavigate, NavigationBehavior, register_location, register_location_with_navigation,
+};
 pub use selector::SelectorError;
 pub use timer::{TimerId, TimerQueue};
 pub use window::{

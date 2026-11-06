@@ -9,9 +9,10 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use ab_glyph::FontVec;
+use net::Url;
 use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use tiny_skia::Pixmap;
-use webapis::AlertSink;
+use webapis::{AlertSink, NavigationBehavior};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -150,6 +151,13 @@ enum UserEvent {
         id: u64,
         /// The loaded page or the reason it failed.
         navigation: browser::Navigation,
+        /// History behavior selected by the initiating navigation.
+        behavior: NavigationBehavior,
+    },
+    /// A page script requested navigation through its `Location` object.
+    LocationNavigate {
+        url: Url,
+        behavior: NavigationBehavior,
     },
 }
 
@@ -278,6 +286,15 @@ impl App {
     /// Navigation calls this only after loading succeeds. Repaints, Reload,
     /// and the error page for a failed load must not call it.
     fn page_loaded(&mut self, url: &str, page: browser::Page) {
+        self.page_loaded_with_behavior(url, page, NavigationBehavior::Auto);
+    }
+
+    fn page_loaded_with_behavior(
+        &mut self,
+        url: &str,
+        page: browser::Page,
+        behavior: NavigationBehavior,
+    ) {
         log::debug!("page displayed: {url}");
         // Elements is a document snapshot; never retain it across navigation.
         self.close_elements();
@@ -285,7 +302,11 @@ impl App {
         // Scripts of the new document run after its first frame is presented.
         self.scripts_evaluated = false;
         self.frame_key = None;
-        self.browser_state.record_visit(url);
+        match behavior {
+            NavigationBehavior::Auto => self.browser_state.record_visit(url),
+            NavigationBehavior::Replace => self.browser_state.replace_current(url),
+            NavigationBehavior::Reload => {}
+        }
         self.address = url.to_owned();
         self.address_before_edit = self.address.clone();
         self.chrome.address_caret = self.address.len();
@@ -336,6 +357,10 @@ impl App {
     /// [`UserEvent::Navigated`]; the UI keeps showing the current page until
     /// then.
     fn start_navigation(&mut self, address: &str) {
+        self.start_navigation_with_behavior(address, NavigationBehavior::Auto);
+    }
+
+    fn start_navigation_with_behavior(&mut self, address: &str, behavior: NavigationBehavior) {
         self.navigation_id += 1;
         let id = self.navigation_id;
         let (Some(loader), Some(proxy)) = (&self.loader, self.proxy.clone()) else {
@@ -345,13 +370,22 @@ impl App {
         log::debug!("navigating to {address}");
         loader.load(address, move |navigation| {
             // A closed event loop means the app is exiting; nothing to do.
-            let _ = proxy.send_event(UserEvent::Navigated { id, navigation });
+            let _ = proxy.send_event(UserEvent::Navigated {
+                id,
+                navigation,
+                behavior,
+            });
         });
     }
 
     /// Applies a finished load. A failure shows the built-in error page and
     /// leaves the typed address in the bar; it is not recorded as a visit.
-    fn navigation_finished(&mut self, id: u64, navigation: browser::Navigation) {
+    fn navigation_finished(
+        &mut self,
+        id: u64,
+        navigation: browser::Navigation,
+        behavior: NavigationBehavior,
+    ) {
         if id != self.navigation_id {
             return;
         }
@@ -362,7 +396,7 @@ impl App {
                     navigation.address,
                     page.html.len()
                 );
-                self.page_loaded(&navigation.address, page)
+                self.page_loaded_with_behavior(&navigation.address, page, behavior)
             }
             Err(error) => {
                 // `browser::load` already logged the failure at error level.
@@ -1330,7 +1364,14 @@ impl ApplicationHandler<UserEvent> for App {
                     self.alerts.present(&window);
                 }
             }
-            UserEvent::Navigated { id, navigation } => self.navigation_finished(id, navigation),
+            UserEvent::Navigated {
+                id,
+                navigation,
+                behavior,
+            } => self.navigation_finished(id, navigation, behavior),
+            UserEvent::LocationNavigate { url, behavior } => {
+                self.start_navigation_with_behavior(url.as_str(), behavior)
+            }
         }
     }
 
@@ -1357,12 +1398,19 @@ impl ApplicationHandler<UserEvent> for App {
             let (width, height) = layout.css_size();
             webapis::ViewportSize { width, height }
         });
+        let proxy = self.proxy.clone();
+        let navigate = Arc::new(move |url, behavior| {
+            if let Some(proxy) = &proxy {
+                let _ = proxy.send_event(UserEvent::LocationNavigate { url, behavior });
+            }
+        });
         self.page_events.load_with_viewport(
             &page,
             alerts,
             self.runtime.clone(),
             device_pixel_ratio,
             viewport,
+            navigate,
         );
     }
 }
@@ -1920,6 +1968,7 @@ mod tests {
         app.navigation_finished(
             app.navigation_id,
             navigation("https://example.com/", Ok(page.clone())),
+            NavigationBehavior::Auto,
         );
 
         assert_eq!(app.loaded_page, Some(page));
@@ -1944,6 +1993,7 @@ mod tests {
         app.navigation_finished(
             app.navigation_id,
             navigation("https://example.com/gone", Err(error)),
+            NavigationBehavior::Auto,
         );
 
         let page = app.loaded_page.as_ref().unwrap();
@@ -1970,7 +2020,11 @@ mod tests {
             scripts: Vec::new(),
         };
 
-        app.navigation_finished(stale, navigation("https://example.com/", Ok(page)));
+        app.navigation_finished(
+            stale,
+            navigation("https://example.com/", Ok(page)),
+            NavigationBehavior::Auto,
+        );
 
         assert_eq!(app.loaded_page, original_page);
         assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);

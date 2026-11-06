@@ -29,6 +29,16 @@ impl BrowserState {
         );
     }
 
+    /// Replaces the current visit with `url`, or records it when history is
+    /// empty. Used by Location's `replace()` navigation behavior.
+    pub fn replace_current(&mut self, url: &str) {
+        if let Some(current) = self.visited_urls.last_mut() {
+            *current = url.to_owned();
+        } else {
+            self.visited_urls.push(url.to_owned());
+        }
+    }
+
     /// Borrows the most recently visited URL, or `None` before the first visit.
     pub fn current_url(&self) -> Option<&str> {
         self.visited_urls.last().map(String::as_str)
@@ -78,6 +88,19 @@ mod tests {
                 "https://example.com/",
                 "https://www.byui.edu/",
             ]
+        );
+    }
+
+    #[test]
+    fn replace_current_replaces_only_the_latest_visit() {
+        let mut state = BrowserState::new();
+        state.record_visit("https://first.example/");
+        state.record_visit("https://second.example/");
+        state.replace_current("https://replacement.example/");
+
+        assert_eq!(
+            state.visited_urls(),
+            ["https://first.example/", "https://replacement.example/"]
         );
     }
 

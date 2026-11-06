@@ -45,8 +45,7 @@ use crate::{HostFunction, JsError, JsResult, Value};
 pub use array::MAX_ARRAY_LENGTH;
 pub(crate) use array::{array_to_string, get_array_property, set_array_property};
 pub(crate) use conversions::{is_truthy, number_to_string, to_property_key};
-pub use object::Object;
-use object::WeakObject;
+pub use object::{HostGetter, HostSetter, Object, WeakObject};
 pub(crate) use operators::{binary, unary};
 
 const STACK_OVERFLOW: &str = "Maximum call stack size exceeded";
@@ -98,7 +97,6 @@ impl LockScope for Mutex<Scope> {
     }
 }
 
-#[derive(Debug)]
 struct Binding {
     /// `None` while a `let` or `const` binding is before its declaration.
     value: Option<Value>,
@@ -109,6 +107,7 @@ struct Binding {
     /// since. A script-level `let`/`const` may shadow a host binding but not a
     /// script-declared one.
     host: bool,
+    setter: Option<HostSetter>,
 }
 
 #[derive(Default)]
@@ -159,6 +158,9 @@ fn assign(scope: &ScopeRef, name: &str, value: Value) -> JsResult<()> {
         if !binding.mutable {
             return Err(JsError::new(format!("Assignment to constant `{name}`")));
         }
+        if let Some(setter) = &binding.setter {
+            return setter(value);
+        }
         binding.value = Some(value);
         Ok(())
     })
@@ -190,6 +192,7 @@ fn declare_var(scope: &ScopeRef, name: &str) -> JsResult<()> {
                     mutable: true,
                     lexical: false,
                     host: false,
+                    setter: None,
                 },
             );
             Ok(())
@@ -215,6 +218,7 @@ fn declare_lexical(
             mutable,
             lexical: true,
             host: false,
+            setter: None,
         },
     );
     Ok(())
@@ -559,8 +563,23 @@ impl GlobalState {
                 mutable: true,
                 lexical: false,
                 host: true,
+                setter: None,
             },
         );
+    }
+
+    /// Sets the host hook that handles assignment to a registered global.
+    pub(crate) fn set_host_setter(&self, name: &str, setter: HostSetter) -> JsResult<()> {
+        let mut object = self.object.lock_scope();
+        let binding = object
+            .bindings
+            .get_mut(name)
+            .ok_or_else(|| JsError::new(format!("host global `{name}` is not registered")))?;
+        if !binding.host {
+            return Err(JsError::new(format!("`{name}` is not a host global")));
+        }
+        binding.setter = Some(setter);
+        Ok(())
     }
 
     /// Evaluates `program` against the persistent globals.
@@ -879,6 +898,7 @@ impl Interpreter {
                         mutable: true,
                         lexical: true,
                         host: false,
+                        setter: None,
                     },
                 );
             }
@@ -989,7 +1009,9 @@ impl Interpreter {
                 let target = self.evaluate(object, scope)?;
                 let key = self.property_key(property, scope)?;
                 match target {
-                    Value::Object(target) => Ok(target.get(&key).unwrap_or(Value::Undefined)),
+                    Value::Object(target) => {
+                        Ok(target.get_property(&key)?.unwrap_or(Value::Undefined))
+                    }
                     Value::Array(target) => Ok(get_array_property(&target, &key)),
                     target => Err(non_object(&target, "read", &key, "property access")),
                 }
@@ -1003,7 +1025,7 @@ impl Interpreter {
                 let key = self.property_key(property, scope)?;
                 let value = self.evaluate(value, scope)?;
                 match target {
-                    Value::Object(target) => target.set(key, value.clone()),
+                    Value::Object(target) => target.set_property(key, value.clone())?,
                     Value::Array(target) => set_array_property(&target, &key, value.clone())?,
                     target => return Err(non_object(&target, "set", &key, "property assignment")),
                 }

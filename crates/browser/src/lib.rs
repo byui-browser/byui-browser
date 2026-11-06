@@ -21,8 +21,9 @@ use storage::{
 };
 use webapis::local_storage::register_local_storage;
 use webapis::{
-    AlertSink, ConsoleSink, Document, ViewportSize, register_alert, register_document_on_window,
-    register_fetch, register_print, register_window_with_security_context,
+    AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, register_alert,
+    register_document_with_location, register_fetch, register_location_with_navigation,
+    register_print, register_window_with_security_context,
     register_window_with_url_device_pixel_ratio_and_viewport,
 };
 
@@ -415,9 +416,12 @@ impl BrowserRuntime {
         security_context: RendererSecurityContext,
     ) -> JsResult<Vec<Value>> {
         self.boot_page(
-            html_source,
-            None,
-            None,
+            PageInput {
+                html_source,
+                scripts: None,
+                url: None,
+            },
+            Arc::new(|_, _| {}),
             console,
             alert_sink,
             controller,
@@ -443,9 +447,12 @@ impl BrowserRuntime {
         security_context: RendererSecurityContext,
     ) -> JsResult<PageSession> {
         self.boot_page(
-            html_source,
-            None,
-            None,
+            PageInput {
+                html_source,
+                scripts: None,
+                url: None,
+            },
+            Arc::new(|_, _| {}),
             console,
             alert_sink,
             controller,
@@ -481,6 +488,68 @@ impl BrowserRuntime {
         )
     }
 
+    /// Opens a loaded page and routes its `Location` navigation requests to
+    /// `navigate`. The callback runs on the page script thread and should
+    /// enqueue work for the browser's navigation loop rather than load
+    /// synchronously.
+    pub fn open_page_with_navigation(
+        &self,
+        page: &Page,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+        navigate: LocationNavigate,
+    ) -> JsResult<PageSession> {
+        self.open_page_with_viewport_and_navigation(
+            page,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+            1.0,
+            None,
+            navigate,
+        )
+    }
+
+    /// Opens a loaded page with the output device scale, optional viewport,
+    /// and `Location` navigation handler exposed to its scripts.
+    ///
+    /// `device_pixel_ratio` is device pixels per CSS pixel and must be finite
+    /// and greater than zero. `viewport` is in CSS pixels; without one,
+    /// `window.innerWidth` is zero. `navigate` runs on the page script thread
+    /// and should enqueue work for the browser's navigation loop rather than
+    /// load synchronously.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_page_with_viewport_and_navigation(
+        &self,
+        page: &Page,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+        device_pixel_ratio: f64,
+        viewport: Option<ViewportSize>,
+        navigate: LocationNavigate,
+    ) -> JsResult<PageSession> {
+        self.boot_page(
+            PageInput {
+                html_source: &page.html,
+                scripts: Some(&page.scripts),
+                url: Some(&page.url),
+            },
+            navigate,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+            device_pixel_ratio,
+            viewport,
+        )
+        .map(|booted| booted.session)
+    }
+
     /// Opens a loaded page with the current output device scale exposed to
     /// its scripts as `window.devicePixelRatio`.
     ///
@@ -497,18 +566,16 @@ impl BrowserRuntime {
         security_context: RendererSecurityContext,
         device_pixel_ratio: f64,
     ) -> JsResult<PageSession> {
-        self.boot_page(
-            &page.html,
-            Some(&page.scripts),
-            Some(&page.url),
+        self.open_page_with_viewport_and_navigation(
+            page,
             console,
             alert_sink,
             controller,
             security_context,
             device_pixel_ratio,
             None,
+            Arc::new(|_, _| {}),
         )
-        .map(|booted| booted.session)
     }
 
     /// Opens a loaded page with the output device scale and viewport
@@ -528,18 +595,16 @@ impl BrowserRuntime {
         device_pixel_ratio: f64,
         viewport: ViewportSize,
     ) -> JsResult<PageSession> {
-        self.boot_page(
-            &page.html,
-            Some(&page.scripts),
-            Some(&page.url),
+        self.open_page_with_viewport_and_navigation(
+            page,
             console,
             alert_sink,
             controller,
             security_context,
             device_pixel_ratio,
             Some(viewport),
+            Arc::new(|_, _| {}),
         )
-        .map(|booted| booted.session)
     }
 
     // Keep the existing boot pipeline explicit: each argument is a distinct
@@ -548,9 +613,8 @@ impl BrowserRuntime {
     #[allow(clippy::too_many_arguments)]
     fn boot_page(
         &self,
-        html_source: &str,
-        scripts: Option<&[String]>,
-        initial_url: Option<&str>,
+        input: PageInput<'_>,
+        navigate: LocationNavigate,
         console: Arc<dyn ConsoleSink>,
         alert_sink: Arc<dyn AlertSink>,
         controller: Arc<RequestController>,
@@ -558,8 +622,8 @@ impl BrowserRuntime {
         device_pixel_ratio: f64,
         viewport: Option<ViewportSize>,
     ) -> JsResult<BootedPage> {
-        log::trace!("booting page: {} bytes of html", html_source.len());
-        let html_document = html::parse_raw_html(html_source.to_owned());
+        log::trace!("booting page: {} bytes of html", input.html_source.len());
+        let html_document = html::parse_raw_html(input.html_source.to_owned());
         let document = Document::from_html_document(&html_document);
         let retained = document.clone();
         let mut realm = Realm::new();
@@ -567,7 +631,8 @@ impl BrowserRuntime {
         register_print(&mut realm, console)?;
         register_alert(&mut realm, alert_sink)?;
         register_fetch(&mut realm, controller)?;
-        let initial_url = initial_url
+        let initial_url = input
+            .url
             .filter(|url| !url.is_empty())
             .unwrap_or("about:blank");
         let window = register_window_with_url_device_pixel_ratio_and_viewport(
@@ -576,11 +641,15 @@ impl BrowserRuntime {
             device_pixel_ratio,
             viewport,
         )?;
-        register_document_on_window(&mut realm, document, window.clone())?;
+        let document_url = net::Url::parse(initial_url)
+            .unwrap_or_else(|_| net::Url::parse("about:blank").expect("valid about:blank URL"));
+        // Installs the live `Location` accessor on the window registered above.
+        let location = register_location_with_navigation(&mut realm, document_url, navigate)?;
+        register_document_with_location(&mut realm, document, location)?;
         register_local_storage(&mut realm, Arc::clone(&self.storage), security_context)?;
 
         // Without caller-supplied sources only inline script text is available.
-        let sources = match scripts {
+        let sources = match input.scripts {
             Some(scripts) => scripts.to_vec(),
             None => html_document.script_sources(),
         };
@@ -667,6 +736,12 @@ impl PageSession {
 struct BootedPage {
     session: PageSession,
     results: Vec<Value>,
+}
+
+struct PageInput<'a> {
+    html_source: &'a str,
+    scripts: Option<&'a [String]>,
+    url: Option<&'a str>,
 }
 
 /// Loads the welcome page and resolves its local stylesheet and script links.

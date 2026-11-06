@@ -10,7 +10,7 @@ use html::NodeID;
 use layout::{FontMetrics, LayoutTree, Size, layout_document};
 use render::{BitmapFont, Compositor, Frame, OutlineFont};
 use tiny_skia::Pixmap;
-use webapis::{AlertSink, ConsoleSink, ViewportSize};
+use webapis::{AlertSink, ConsoleSink, LocationNavigate, ViewportSize};
 
 struct NoopConsole;
 
@@ -240,6 +240,7 @@ enum PageCommand {
         runtime: BrowserRuntime,
         device_pixel_ratio: f64,
         viewport: Option<ViewportSize>,
+        navigate: LocationNavigate,
     },
     Resize(ViewportSize),
     DevicePixelRatio(f64),
@@ -273,11 +274,19 @@ impl PageEvents {
         runtime: BrowserRuntime,
         device_pixel_ratio: f64,
     ) {
-        self.load_with_viewport(page, alert_sink, runtime, device_pixel_ratio, None);
+        self.load_with_viewport(
+            page,
+            alert_sink,
+            runtime,
+            device_pixel_ratio,
+            None,
+            Arc::new(|_, _| {}),
+        );
     }
 
     /// Replaces the live document and exposes `device_pixel_ratio` and
-    /// `viewport` (CSS pixels) to page scripts.
+    /// `viewport` (CSS pixels) to page scripts. `Location` navigation
+    /// requests from the page are passed to `navigate` on the session thread.
     pub(crate) fn load_with_viewport(
         &self,
         page: &Page,
@@ -285,6 +294,7 @@ impl PageEvents {
         runtime: BrowserRuntime,
         device_pixel_ratio: f64,
         viewport: Option<ViewportSize>,
+        navigate: LocationNavigate,
     ) {
         if self
             .commands
@@ -294,6 +304,7 @@ impl PageEvents {
                 runtime,
                 device_pixel_ratio,
                 viewport,
+                navigate,
             })
             .is_err()
         {
@@ -341,30 +352,20 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                 runtime,
                 device_pixel_ratio,
                 viewport,
+                navigate,
             } => {
                 log::debug!("page session loading {}", page.url);
                 let controller = browser::request_controller(None);
-                let security_context = browser::security_context_for_url(&page.url);
-                let result = match viewport {
-                    Some(viewport) => runtime.open_page_with_viewport(
-                        &page,
-                        Arc::new(NoopConsole),
-                        alert_sink,
-                        controller,
-                        security_context,
-                        device_pixel_ratio,
-                        viewport,
-                    ),
-                    None => runtime.open_page_with_device_pixel_ratio(
-                        &page,
-                        Arc::new(NoopConsole),
-                        alert_sink,
-                        controller,
-                        security_context,
-                        device_pixel_ratio,
-                    ),
-                };
-                match result {
+                match runtime.open_page_with_viewport_and_navigation(
+                    &page,
+                    Arc::new(NoopConsole),
+                    alert_sink,
+                    controller,
+                    browser::security_context_for_url(&page.url),
+                    device_pixel_ratio,
+                    viewport,
+                    navigate,
+                ) {
                     Ok(loaded) => session = Some(loaded),
                     Err(error) => log::debug!("page script failed: {error}"),
                 }
@@ -577,6 +578,34 @@ mod tests {
             let bottom = ((110.0 * scale) as u32 * width) as usize * 4;
             assert_eq!(&data[bottom..bottom + 4], &[255; 4]);
         }
+    }
+
+    #[test]
+    fn location_navigation_requests_reach_the_browser_loader_boundary() {
+        let (navigate_tx, navigate_rx) = std::sync::mpsc::channel();
+        let events = PageEvents::new();
+        let page = Page {
+            url: "https://example.test/start".into(),
+            html: "<script>location.assign('/next')</script>".into(),
+            stylesheets: Vec::new(),
+            scripts: vec!["location.assign('/next')".into()],
+        };
+        events.load_with_viewport(
+            &page,
+            test_alert_sink(),
+            test_runtime(),
+            1.0,
+            None,
+            Arc::new(move |url, behavior| {
+                let _ = navigate_tx.send((url, behavior));
+            }),
+        );
+
+        let (url, behavior) = navigate_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("Location.assign should reach the navigation callback");
+        assert_eq!(url.as_str(), "https://example.test/next");
+        assert_eq!(behavior, webapis::NavigationBehavior::Auto);
     }
 
     #[test]
