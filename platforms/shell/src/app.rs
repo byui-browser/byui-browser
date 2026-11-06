@@ -22,8 +22,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
+use crate::compat_panel::{CompatState, ShellAuditor, ShellScriptEngine};
 use crate::context_menu::{ContextMenu, MenuAction};
-use crate::elements_panel::ElementsPanel;
+use crate::elements_panel::{DockTab, ElementsPanel};
 use crate::page_source::PageSource;
 use crate::toolbar::{self, ChromeState, Control};
 
@@ -133,6 +134,11 @@ struct App {
     source_close_pressed: bool,
     elements: Option<ElementsPanel>,
     elements_close_pressed: bool,
+    /// Compatibility auditor, created on first use and kept for the session
+    /// so later audits reuse its engine probes.
+    auditor: Option<Arc<ShellAuditor>>,
+    /// Id of the newest audit; results for older ids are ignored.
+    audit_id: u64,
     /// Background page loader; `None` when its runtime failed to start.
     loader: Option<browser::PageLoader>,
     /// Wakes the event loop from loader threads; set by [`run`].
@@ -158,6 +164,12 @@ enum UserEvent {
     LocationNavigate {
         url: Url,
         behavior: NavigationBehavior,
+    },
+    /// A background compatibility audit finished.
+    AuditFinished {
+        /// The audit this result belongs to; stale ones are dropped.
+        id: u64,
+        report: Box<devtools::compat::AuditReport>,
     },
 }
 
@@ -267,6 +279,8 @@ impl App {
             source_close_pressed: false,
             elements: None,
             elements_close_pressed: false,
+            auditor: None,
+            audit_id: 0,
             loader: browser::PageLoader::new()
                 .map_err(|error| log::error!("page loader initialization failed: {error}"))
                 .ok(),
@@ -676,7 +690,87 @@ impl App {
         self.redraw();
     }
 
+    /// Opens the dock (if needed) on the Compatibility tab and audits the
+    /// loaded page once per dock.
+    fn show_compatibility(&mut self) {
+        if self.elements.is_none() {
+            self.show_elements();
+        }
+        self.select_dock_tab(DockTab::Compatibility);
+    }
+
+    fn select_dock_tab(&mut self, tab: DockTab) {
+        let Some(panel) = &mut self.elements else {
+            return;
+        };
+        panel.set_tab(tab);
+        if tab == DockTab::Compatibility && *panel.compat.state() == CompatState::Idle {
+            self.start_audit();
+        }
+        self.redraw();
+    }
+
+    /// Audits the loaded page off the UI thread; the result arrives as
+    /// [`UserEvent::AuditFinished`]. Without an event loop (tests) the audit
+    /// runs inline.
+    fn start_audit(&mut self) {
+        let Some(panel) = &mut self.elements else {
+            return;
+        };
+        let Some(page) = self.loaded_page.clone() else {
+            panel
+                .compat
+                .set_state(CompatState::Unavailable("No loaded page to audit"));
+            return;
+        };
+        panel.compat.set_state(CompatState::Auditing);
+        self.audit_id += 1;
+        let id = self.audit_id;
+        let auditor = Arc::clone(
+            self.auditor
+                .get_or_insert_with(|| Arc::new(ShellAuditor::new(ShellScriptEngine::new()))),
+        );
+        let script_error = self.page_events.script_error();
+        log::debug!("compatibility audit {id} started for {}", page.url);
+        let run = move || {
+            Box::new(crate::compat_panel::audit_page(
+                &auditor,
+                &page,
+                script_error.as_deref(),
+            ))
+        };
+        match self.proxy.clone() {
+            Some(proxy) => {
+                std::thread::spawn(move || {
+                    let report = run();
+                    let _ = proxy.send_event(UserEvent::AuditFinished { id, report });
+                });
+            }
+            None => {
+                let report = run();
+                self.audit_finished(id, *report);
+            }
+        }
+    }
+
+    fn audit_finished(&mut self, id: u64, report: devtools::compat::AuditReport) {
+        if id != self.audit_id {
+            log::debug!("dropping stale compatibility audit {id}");
+            return;
+        }
+        log::debug!(
+            "compatibility audit {id} finished: {} findings",
+            report.findings.len()
+        );
+        if let Some(panel) = &mut self.elements {
+            panel.compat.set_state(CompatState::Ready(report));
+            self.redraw();
+        }
+    }
+
     fn close_elements(&mut self) {
+        // Any audit still running belongs to the closed dock.
+        self.audit_id += 1;
         if self.elements.take().is_some() {
             self.frame_key = None;
             self.redraw();
@@ -843,6 +937,7 @@ impl App {
                         Some(MenuAction::Reload) => self.activate(Control::Reload),
                         Some(MenuAction::PageSource) => self.show_page_source(),
                         Some(MenuAction::Inspect) => self.show_elements(),
+                        Some(MenuAction::Compatibility) => self.show_compatibility(),
                         None => {}
                     }
                 }
@@ -875,11 +970,15 @@ impl App {
             let inside = panel.contains(self.cursor);
             let close = panel.close_at(self.cursor);
             if inside || self.elements_close_pressed {
+                let tab = panel.tab_at(self.cursor);
                 match state {
                     ElementState::Pressed => {
                         self.elements_close_pressed = close;
                         self.page_press = false;
                         self.chrome.address_focused = false;
+                        if let Some(tab) = tab {
+                            self.select_dock_tab(tab);
+                        }
                     }
                     ElementState::Released => {
                         if self.elements_close_pressed && close {
@@ -1372,6 +1471,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::LocationNavigate { url, behavior } => {
                 self.start_navigation_with_behavior(url.as_str(), behavior)
             }
+            UserEvent::AuditFinished { id, report } => self.audit_finished(id, *report),
         }
     }
 
@@ -1525,6 +1625,78 @@ mod tests {
         assert_eq!(app.browser_state, before);
         assert_eq!(app.loaded_page, page);
         assert!(app.scripts_evaluated);
+    }
+
+    #[test]
+    fn audit_compatibility_opens_the_dock_on_its_tab_with_a_report() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.scripts_evaluated = true;
+        app.cursor = Some((100.0, 100.0));
+        app.open_context_menu(800, 600, 1.0);
+        app.cursor = Some(app.context_menu.unwrap().item_center(5));
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        let panel = app.elements.as_ref().expect("the dock opens");
+        assert_eq!(panel.tab(), DockTab::Compatibility);
+        // Without an event loop the audit runs inline.
+        let CompatState::Ready(report) = panel.compat.state() else {
+            panic!("audit should have finished: {:?}", panel.compat.state());
+        };
+        assert!(report.features_checked > 0);
+        assert!(app.page_source.is_none());
+    }
+
+    #[test]
+    fn dock_tabs_switch_on_click_and_audit_only_once() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.show_elements();
+        let panel = app.elements.as_mut().unwrap();
+        panel.resize(800.0, 600.0);
+        assert_eq!(panel.tab(), DockTab::Elements);
+        assert_eq!(*panel.compat.state(), CompatState::Idle);
+        // The second header tab starts after the 84px Elements tab.
+        app.cursor = Some((8.0 + 6.0 + 84.0 + 40.0, 340.0));
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        assert!(app.elements.is_some(), "tab clicks never close the dock");
+        assert_eq!(app.elements.as_ref().unwrap().tab(), DockTab::Compatibility);
+        let first = app.audit_id;
+        app.cursor = Some((8.0 + 6.0 + 20.0, 340.0));
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        assert_eq!(app.elements.as_ref().unwrap().tab(), DockTab::Elements);
+        app.select_dock_tab(DockTab::Compatibility);
+        assert_eq!(app.audit_id, first, "a finished audit is reused");
+        app.key_pressed(&Key::Named(NamedKey::Escape));
+        assert!(app.elements.is_none());
+    }
+
+    #[test]
+    fn stale_audit_results_are_dropped() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.show_compatibility();
+        let id = app.audit_id;
+        let report = devtools::compat::AuditReport::default();
+        app.close_elements();
+        app.show_elements();
+        app.audit_finished(id, report);
+        assert_eq!(
+            *app.elements.as_ref().unwrap().compat.state(),
+            CompatState::Idle
+        );
+    }
+
+    #[test]
+    fn compatibility_without_a_page_explains_itself() {
+        let mut app = app();
+        app.show_compatibility();
+        assert_eq!(
+            *app.elements.as_ref().unwrap().compat.state(),
+            CompatState::Unavailable("No loaded page to audit")
+        );
     }
 
     #[test]

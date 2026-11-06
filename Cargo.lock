@@ -305,6 +305,7 @@ dependencies = [
  "chrome",
  "common",
  "css",
+ "devtools",
  "html",
  "js",
  "layout",
@@ -804,7 +805,12 @@ name = "devtools"
 version = "0.1.0"
 dependencies = [
  "common",
+ "css",
+ "html",
+ "js",
+ "layout",
  "log",
+ "paint",
 ]
 
 [[package]]
