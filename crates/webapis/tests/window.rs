@@ -252,3 +252,55 @@ fn history_state_is_structured_cloned() {
         Ok(Value::Boolean(true))
     );
 }
+
+#[test]
+fn inner_width_is_zero_without_a_viewport() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.innerWidth"),
+        Ok(Value::Number(0.0))
+    );
+}
+
+#[test]
+fn inner_width_reports_the_viewport_width_in_css_pixels() {
+    let mut realm = Realm::new();
+    webapis::register_window_with_security_context_and_viewport(
+        &mut realm,
+        RendererSecurityContext::new(
+            Origin::new("https", "example.com", None),
+            StoragePermission::Allowed,
+        ),
+        webapis::ViewportSize {
+            width: 800,
+            height: 600,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.innerWidth"),
+        Ok(Value::Number(800.0))
+    );
+    assert_eq!(
+        realm.evaluate_script("innerWidth"),
+        Ok(Value::Number(800.0))
+    );
+    assert_eq!(
+        realm.evaluate_script("window.origin"),
+        Ok(Value::String("https://example.com".into()))
+    );
+}
+
+#[test]
+fn inner_width_is_replaceable_like_the_cssom_view_attribute() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.innerWidth = 42; window.innerWidth"),
+        Ok(Value::Number(42.0))
+    );
+}

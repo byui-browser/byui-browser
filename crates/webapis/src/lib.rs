@@ -35,6 +35,8 @@ pub use fetch::{fetch, register_fetch};
 pub use selector::SelectorError;
 pub use timer::{TimerId, TimerQueue};
 pub use window::{
-    register_window, register_window_with_security_context, register_window_with_url,
+    ViewportSize, register_window, register_window_with_security_context,
+    register_window_with_security_context_and_viewport, register_window_with_url,
     register_window_with_url_and_device_pixel_ratio,
+    register_window_with_url_device_pixel_ratio_and_viewport,
 };

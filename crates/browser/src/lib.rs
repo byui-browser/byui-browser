@@ -21,9 +21,9 @@ use storage::{
 };
 use webapis::local_storage::register_local_storage;
 use webapis::{
-    AlertSink, ConsoleSink, Document, register_alert, register_document_on_window, register_fetch,
-    register_print, register_window_with_security_context,
-    register_window_with_url_and_device_pixel_ratio,
+    AlertSink, ConsoleSink, Document, ViewportSize, register_alert, register_document_on_window,
+    register_fetch, register_print, register_window_with_security_context,
+    register_window_with_url_device_pixel_ratio_and_viewport,
 };
 
 pub mod byui_provider;
@@ -423,6 +423,7 @@ impl BrowserRuntime {
             controller,
             security_context,
             1.0,
+            None,
         )
         .map(|booted| booted.results)
     }
@@ -450,6 +451,7 @@ impl BrowserRuntime {
             controller,
             security_context,
             1.0,
+            None,
         )
         .map(|booted| booted.session)
     }
@@ -504,6 +506,38 @@ impl BrowserRuntime {
             controller,
             security_context,
             device_pixel_ratio,
+            None,
+        )
+        .map(|booted| booted.session)
+    }
+
+    /// Opens a loaded page with the output device scale and viewport
+    /// dimensions exposed to its scripts.
+    ///
+    /// `device_pixel_ratio` is device pixels per CSS pixel and must be finite
+    /// and greater than zero. `viewport` is expressed in CSS pixels and is the
+    /// value used for `window.innerWidth` by the CSSOM View API.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_page_with_viewport(
+        &self,
+        page: &Page,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+        device_pixel_ratio: f64,
+        viewport: ViewportSize,
+    ) -> JsResult<PageSession> {
+        self.boot_page(
+            &page.html,
+            Some(&page.scripts),
+            Some(&page.url),
+            console,
+            alert_sink,
+            controller,
+            security_context,
+            device_pixel_ratio,
+            Some(viewport),
         )
         .map(|booted| booted.session)
     }
@@ -522,6 +556,7 @@ impl BrowserRuntime {
         controller: Arc<RequestController>,
         security_context: RendererSecurityContext,
         device_pixel_ratio: f64,
+        viewport: Option<ViewportSize>,
     ) -> JsResult<BootedPage> {
         log::trace!("booting page: {} bytes of html", html_source.len());
         let html_document = html::parse_raw_html(html_source.to_owned());
@@ -535,10 +570,11 @@ impl BrowserRuntime {
         let initial_url = initial_url
             .filter(|url| !url.is_empty())
             .unwrap_or("about:blank");
-        let window = register_window_with_url_and_device_pixel_ratio(
+        let window = register_window_with_url_device_pixel_ratio_and_viewport(
             &mut realm,
             initial_url,
             device_pixel_ratio,
+            viewport,
         )?;
         register_document_on_window(&mut realm, document, window.clone())?;
         register_local_storage(&mut realm, Arc::clone(&self.storage), security_context)?;
@@ -584,6 +620,16 @@ pub struct PageSession {
 }
 
 impl PageSession {
+    /// Updates the viewport dimensions exposed to this live page session.
+    ///
+    /// Dimensions are CSS pixels. This keeps `window.innerWidth` and the
+    /// global `innerWidth` value synchronized with the current viewport.
+    pub fn set_viewport(&mut self, viewport: ViewportSize) {
+        let width = Value::Number(viewport.width as f64);
+        self.window.set("innerWidth", width.clone());
+        let _ = self.realm.register_global_value("innerWidth", width);
+    }
+
     /// Updates the output device scale visible as `window.devicePixelRatio`.
     ///
     /// `device_pixel_ratio` is device pixels per CSS pixel and must be finite

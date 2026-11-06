@@ -122,10 +122,24 @@ fn invoke_popstate(window: &Object, state: &Value) {
     }
 }
 
+/// The viewport dimensions exposed to a script-visible Window.
+///
+/// Dimensions are CSS pixels, matching CSSOM View. A viewport is optional
+/// because a Window without an associated viewport must report zero for
+/// `innerWidth`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewportSize {
+    /// The viewport width in CSS pixels.
+    pub width: u32,
+    /// The viewport height in CSS pixels.
+    pub height: u32,
+}
+
 fn register_window_object(
     realm: &mut Realm,
     initial_url: &str,
     device_pixel_ratio: f64,
+    viewport: Option<ViewportSize>,
 ) -> JsResult<Object> {
     let window = match realm.registered_global_value("window") {
         Some(Value::Object(window)) => window,
@@ -157,6 +171,10 @@ fn register_window_object(
     // The desktop shell supplies the output device scale; non-windowed
     // callers use the specification's fallback value of 1.0.
     window.set_replaceable_read_only("devicePixelRatio", Value::Number(device_pixel_ratio));
+    // CSSOM View: innerWidth is the viewport width in CSS pixels, or zero
+    // when the Window has no associated viewport. It is replaceable.
+    let inner_width = Value::Number(viewport.map_or(0, |size| size.width) as f64);
+    window.set("innerWidth", inner_width.clone());
     window.set("onpopstate", Value::Null);
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__popstateListeners", Value::Object(Object::new()));
@@ -333,12 +351,13 @@ fn register_window_object(
     realm.register_global_value("self", Value::Object(window.clone()))?;
     realm.register_global_value("customElements", Value::Object(custom_elements))?;
     realm.register_global_value("navigator", Value::Object(navigator))?;
+    realm.register_global_value("innerWidth", inner_width)?;
     Ok(window)
 }
 
 /// Registers the script-visible window globals using `about:blank` as its URL.
 pub fn register_window(realm: &mut Realm) -> JsResult<()> {
-    register_window_object(realm, "about:blank", 1.0).map(|_| ())
+    register_window_object(realm, "about:blank", 1.0, None).map(|_| ())
 }
 
 /// Registers Window globals with the immutable renderer security context's
@@ -351,7 +370,7 @@ pub fn register_window_with_security_context(
     realm: &mut Realm,
     security_context: RendererSecurityContext,
 ) -> JsResult<()> {
-    let window = register_window_object(realm, "about:blank", 1.0)?;
+    let window = register_window_object(realm, "about:blank", 1.0, None)?;
     let serialized_origin = security_context.origin().ascii_serialization();
     window.set("origin", Value::String(serialized_origin.clone()));
     realm.register_global_value("origin", Value::String(serialized_origin))?;
@@ -365,7 +384,7 @@ pub fn register_window_with_security_context(
 /// browser shell still owns cross-document navigation, so traversing an entry
 /// created by a separate loaded document is not routed back to that shell.
 pub fn register_window_with_url(realm: &mut Realm, url: &str) -> JsResult<Object> {
-    register_window_object(realm, url, 1.0)
+    register_window_object(realm, url, 1.0, None)
 }
 
 /// Registers the script-visible window globals for `url` with the output
@@ -378,10 +397,38 @@ pub fn register_window_with_url_and_device_pixel_ratio(
     url: &str,
     device_pixel_ratio: f64,
 ) -> JsResult<Object> {
+    register_window_with_url_device_pixel_ratio_and_viewport(realm, url, device_pixel_ratio, None)
+}
+
+/// Registers Window globals with a renderer security context and viewport.
+///
+/// `viewport` is in CSS pixels; its width is exposed as `window.innerWidth`
+/// and the global `innerWidth`.
+pub fn register_window_with_security_context_and_viewport(
+    realm: &mut Realm,
+    security_context: RendererSecurityContext,
+    viewport: ViewportSize,
+) -> JsResult<()> {
+    register_window_with_security_context(realm, security_context)?;
+    register_window_object(realm, "about:blank", 1.0, Some(viewport)).map(|_| ())
+}
+
+/// Registers the script-visible window globals for `url` with the output
+/// device scale and, optionally, the viewport exposed to scripts.
+///
+/// `device_pixel_ratio` is the number of device pixels per CSS pixel and must
+/// be finite and greater than zero. `viewport` is in CSS pixels; without one,
+/// `window.innerWidth` is zero. Call this before evaluating page scripts.
+pub fn register_window_with_url_device_pixel_ratio_and_viewport(
+    realm: &mut Realm,
+    url: &str,
+    device_pixel_ratio: f64,
+    viewport: Option<ViewportSize>,
+) -> JsResult<Object> {
     if !device_pixel_ratio.is_finite() || device_pixel_ratio <= 0.0 {
         return Err(JsError::runtime(
             "window.devicePixelRatio must be finite and greater than zero",
         ));
     }
-    register_window_object(realm, url, device_pixel_ratio)
+    register_window_object(realm, url, device_pixel_ratio, viewport)
 }
