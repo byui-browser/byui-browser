@@ -13,26 +13,29 @@ pub(super) fn to_primitive(value: &Value) -> Value {
                     continue;
                 };
                 if let Ok(result) = method.call(&[])
-                    && !matches!(result, Value::Object(_) | Value::Function(_))
+                    && !matches!(
+                        result,
+                        Value::Object(_) | Value::Function(_) | Value::Array(_)
+                    )
                 {
                     return result;
                 }
             }
             Value::String("[object Object]".to_owned())
         }
-        Value::Function(_) => Value::String(value.to_string()),
+        Value::Function(_) | Value::Array(_) => Value::String(value.to_string()),
         other => other.clone(),
     }
 }
 
 /// `ToBoolean`.
-pub(super) fn is_truthy(value: &Value) -> bool {
+pub(crate) fn is_truthy(value: &Value) -> bool {
     match value {
         Value::Undefined | Value::Null => false,
         Value::Boolean(value) => *value,
         Value::Number(value) => *value != 0.0 && !value.is_nan(),
         Value::String(value) => !value.is_empty(),
-        Value::Function(_) | Value::Object(_) => true,
+        Value::Function(_) | Value::Object(_) | Value::Array(_) => true,
     }
 }
 
@@ -42,7 +45,7 @@ pub(super) fn to_number(value: &Value) -> f64 {
         Value::Number(number) => *number,
         Value::Boolean(true) => 1.0,
         Value::Boolean(false) | Value::Null => 0.0,
-        Value::Undefined | Value::Function(_) | Value::Object(_) => f64::NAN,
+        Value::Undefined | Value::Function(_) | Value::Object(_) | Value::Array(_) => f64::NAN,
         Value::String(text) => string_to_number(text),
     }
 }
@@ -180,6 +183,7 @@ pub(super) fn strict_equals(left: &Value, right: &Value) -> bool {
         (Value::String(left), Value::String(right)) => left == right,
         (Value::Function(left), Value::Function(right)) => left == right,
         (Value::Object(left), Value::Object(right)) => left == right,
+        (Value::Array(left), Value::Array(right)) => left == right,
         _ => false,
     }
 }
@@ -192,12 +196,14 @@ pub(super) fn loose_equals(left: &Value, right: &Value) -> bool {
         | (Value::String(text), Value::Number(number)) => *number == string_to_number(text),
         (Value::Boolean(_), _) => loose_equals(&Value::Number(to_number(left)), right),
         (_, Value::Boolean(_)) => loose_equals(left, &Value::Number(to_number(right))),
-        (Value::Function(_) | Value::Object(_), Value::Number(_) | Value::String(_)) => {
-            loose_equals(&to_primitive(left), right)
-        }
-        (Value::Number(_) | Value::String(_), Value::Function(_) | Value::Object(_)) => {
-            loose_equals(left, &to_primitive(right))
-        }
+        (
+            Value::Function(_) | Value::Object(_) | Value::Array(_),
+            Value::Number(_) | Value::String(_),
+        ) => loose_equals(&to_primitive(left), right),
+        (
+            Value::Number(_) | Value::String(_),
+            Value::Function(_) | Value::Object(_) | Value::Array(_),
+        ) => loose_equals(left, &to_primitive(right)),
         _ => strict_equals(left, right),
     }
 }

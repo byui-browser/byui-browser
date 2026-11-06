@@ -28,7 +28,7 @@ impl<'document> DOMTokenList<'document> {
     /// Returns all class tokens in document order.
     pub fn tokens(&self) -> Vec<String> {
         let Some(NodeKind::Element(element)) =
-            self.document.node(self.element).map(|node| &node.kind)
+            self.document.node(self.element).map(|node| node.get_kind())
         else {
             return Vec::new();
         };
@@ -61,6 +61,7 @@ impl<'document> DOMTokenList<'document> {
         let mut current = self.tokens();
         for token in tokens {
             if !current.iter().any(|existing| existing.as_str() == *token) {
+                log::trace!("classList add {token:?} on node {}", self.element.get());
                 current.push((*token).to_owned());
             }
         }
@@ -70,10 +71,17 @@ impl<'document> DOMTokenList<'document> {
     /// Removes each token that is present.
     pub fn remove(&mut self, tokens: &[&str]) -> Result<(), DomError> {
         validate_tokens(tokens)?;
+        let element = self.element.get();
         let current = self
             .tokens()
             .into_iter()
-            .filter(|current| !tokens.contains(&current.as_str()))
+            .filter(|current| {
+                let removed = tokens.contains(&current.as_str());
+                if removed {
+                    log::trace!("classList remove {current:?} on node {element}");
+                }
+                !removed
+            })
             .collect();
         self.write_tokens(current)
     }
@@ -98,6 +106,10 @@ impl<'document> DOMTokenList<'document> {
         let Some(index) = current.iter().position(|current| current == token) else {
             return Ok(false);
         };
+        log::trace!(
+            "classList replace {token:?} with {new_token:?} on node {}",
+            self.element.get()
+        );
         current.remove(index);
         if !current.iter().any(|current| current.as_str() == new_token) {
             current.insert(index, new_token.to_owned());
@@ -109,7 +121,11 @@ impl<'document> DOMTokenList<'document> {
     /// Reports whether the token is supported for this list's associated
     /// attribute. Class attributes define no constrained supported-token set,
     /// so the DOM Standard requires this operation to throw `TypeError`.
-    pub fn supports(&self, _token: &str) -> Result<bool, DomError> {
+    pub fn supports(&self, token: &str) -> Result<bool, DomError> {
+        log::debug!(
+            "classList supports({token:?}) on node {} failed: class has no supported-token set",
+            self.element.get()
+        );
         Err(DomError::Type)
     }
 
@@ -122,7 +138,7 @@ impl<'document> DOMTokenList<'document> {
 
     fn class_attribute_value(&self) -> Option<String> {
         let Some(NodeKind::Element(element)) =
-            self.document.node(self.element).map(|node| &node.kind)
+            self.document.node(self.element).map(|node| node.get_kind())
         else {
             return None;
         };
@@ -134,14 +150,22 @@ impl<'document> DOMTokenList<'document> {
     }
 
     fn write_attribute_value(&mut self, value: &str) -> Result<(), DomError> {
-        let Some(NodeKind::Element(element)) = self
-            .document
-            .node_mut(self.element)
-            .map(|node| &mut node.kind)
-        else {
+        let Some(node) = self.document.node(self.element) else {
+            log::debug!(
+                "classList write failed: node {} is not an element",
+                self.element.get()
+            );
             return Err(DomError::NotFound);
         };
+        let mut element = match node.get_kind() {
+            NodeKind::Element(element) => element.clone(),
+            _ => return Err(DomError::NotFound),
+        };
         element.set_attribute(Attribute::new("class".to_owned(), value.to_owned()));
+        self.document
+            .node_mut(self.element)
+            .expect("element was validated above")
+            .set_kind(NodeKind::Element(element));
         Ok(())
     }
 }
@@ -159,9 +183,11 @@ fn parse_tokens(value: &str) -> Vec<String> {
 fn validate_tokens(tokens: &[&str]) -> Result<(), DomError> {
     for token in tokens {
         if token.is_empty() {
+            log::debug!("classList rejected empty token");
             return Err(DomError::Syntax);
         }
         if token.chars().any(is_ascii_whitespace) {
+            log::debug!("classList rejected token {token:?}: contains ASCII whitespace");
             return Err(DomError::InvalidToken);
         }
     }

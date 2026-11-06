@@ -71,6 +71,8 @@ impl Element {
 pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -> Object {
     let object = Object::new();
     let node = element.node;
+    object.set("__nodeId", Value::Number(node.get() as f64));
+    object.set("localName", Value::String(element.local_name.clone()));
     let style_value = element
         .get_attribute("style")
         .map_or_else(String::new, str::to_owned);
@@ -85,25 +87,82 @@ pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -
         "getAttribute",
         Arc::new(move |arguments| {
             let document = get_attribute_document.lock().unwrap();
-            let Some(element) = document.element_by_node(node) else {
+            let Some(element) = document.element_snapshot(node) else {
+                log::debug!("getAttribute on a node that is no longer in the document");
                 return Ok(Value::Null);
             };
-            get_attribute(element, arguments)
+            get_attribute(&element, arguments)
         }),
     );
     let set_attribute_document = document.clone();
+    let set_attribute_target = object.clone();
     object.set_method(
         "setAttribute",
         Arc::new(move |arguments| {
             let [Value::String(qualified_name), Value::String(value)] = arguments else {
+                log::debug!("Element.setAttribute() called with invalid arguments; ignored");
                 return Err(JsError::new(
                     "Element.setAttribute() expects a qualified name and value string",
                 ));
             };
+            let old_value = {
+                let document = set_attribute_document.lock().unwrap();
+                document
+                    .element_snapshot(node)
+                    .and_then(|element| element.get_attribute(qualified_name).map(str::to_owned))
+            };
             set_attribute_document
                 .lock()
                 .unwrap()
-                .set_attribute(node, qualified_name, value)
+                .set_attribute(node, qualified_name, value)?;
+            let new_value = set_attribute_document
+                .lock()
+                .unwrap()
+                .element_snapshot(node)
+                .and_then(|element| element.get_attribute(qualified_name).map(str::to_owned));
+            invoke_attribute_changed_callback(
+                &set_attribute_target,
+                qualified_name,
+                old_value,
+                new_value,
+            );
+            Ok(Value::Undefined)
+        }),
+    );
+    let append_document = document.clone();
+    object.set_method(
+        "appendChild",
+        Arc::new(move |arguments| {
+            let ([Value::Object(child)] | [Value::Array(child)]) = arguments else {
+                return Err(JsError::new("Element.appendChild() expects an element"));
+            };
+            let Some(Value::Number(child_id)) = child.get("__nodeId") else {
+                return Err(JsError::new("Element.appendChild() expects an element"));
+            };
+            let child_id = html::NodeID::new(child_id as usize);
+            let was_connected = append_document.lock().unwrap().is_connected(child_id);
+            if was_connected {
+                invoke_lifecycle_callback(child, "disconnectedCallback");
+            }
+            append_document
+                .lock()
+                .unwrap()
+                .append_child_to(node, child_id)?;
+            invoke_lifecycle_callback(child, "connectedCallback");
+            Ok(Value::Object(child.clone()))
+        }),
+    );
+    let remove_document = document.clone();
+    let remove_target = object.clone();
+    object.set_method(
+        "remove",
+        Arc::new(move |_| {
+            let was_connected = remove_document.lock().unwrap().is_connected(node);
+            remove_document.lock().unwrap().remove(node);
+            if was_connected {
+                invoke_lifecycle_callback(&remove_target, "disconnectedCallback");
+            }
+            Ok(Value::Undefined)
         }),
     );
     let add_document = document.clone();
@@ -135,6 +194,50 @@ pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -
         }),
     );
     object
+}
+
+pub(crate) fn invoke_lifecycle_callback(element: &Object, name: &str) {
+    if let Some(Value::Function(callback)) = element.get(name) {
+        let _ = callback.call_with_this(Value::Object(element.clone()), &[]);
+    }
+}
+
+pub(crate) fn invoke_attribute_changed_callback(
+    element: &Object,
+    name: &str,
+    old_value: Option<String>,
+    new_value: Option<String>,
+) {
+    let Some(prototype) = element.prototype() else {
+        return;
+    };
+    let Some(Value::Function(constructor)) = prototype.get("constructor") else {
+        return;
+    };
+    let Some(Value::Array(observed)) = constructor.get_own_property("observedAttributes") else {
+        return;
+    };
+    let length = match observed.get("length") {
+        Some(Value::Number(length)) if length >= 0.0 => length as usize,
+        _ => return,
+    };
+    let observes_name = (0..length).any(|index| {
+        matches!(observed.get(&index.to_string()), Some(Value::String(value)) if value == name)
+    });
+    if !observes_name {
+        return;
+    }
+    let Some(Value::Function(callback)) = element.get("attributeChangedCallback") else {
+        return;
+    };
+    let _ = callback.call_with_this(
+        Value::Object(element.clone()),
+        &[
+            Value::String(name.to_owned()),
+            old_value.map_or(Value::Null, Value::String),
+            new_value.map_or(Value::Null, Value::String),
+        ],
+    );
 }
 
 /// Reads declarations from an HTML `style` attribute.
@@ -183,6 +286,7 @@ fn normalize_attribute_name(namespace: Namespace, qualified_name: &str) -> JsRes
             )
         })
     {
+        log::debug!("rejected invalid attribute name {qualified_name:?}");
         return Err(JsError::new("InvalidCharacterError"));
     }
 
@@ -195,11 +299,13 @@ fn normalize_attribute_name(namespace: Namespace, qualified_name: &str) -> JsRes
 /// Implements JavaScript `Element.getAttribute(qualifiedName)`.
 pub fn get_attribute(element: &Element, arguments: &[Value]) -> JsResult<Value> {
     let [Value::String(qualified_name)] = arguments else {
+        log::debug!("Element.getAttribute() called with invalid arguments");
         return Err(JsError::new(
             "Element.getAttribute() expects one qualified name string",
         ));
     };
 
+    log::trace!("Element.getAttribute({qualified_name:?})");
     Ok(match element.get_attribute(qualified_name) {
         Some(value) => Value::String(value.to_owned()),
         None => Value::Null,
@@ -286,6 +392,20 @@ mod tests {
                 .evaluate_script("document.getElementById('app').getAttribute('DATA-ADDED')")
                 .unwrap(),
             Value::String("yes".to_owned())
+        );
+    }
+
+    #[test]
+    fn javascript_can_create_and_append_an_element_to_the_document_tree() {
+        let html_document = parse_raw_html("<main id='root'></main>".to_owned());
+        let mut realm = Realm::new();
+        register_document(&mut realm, Document::from_html_document(&html_document)).unwrap();
+
+        assert_eq!(
+            realm.evaluate_script(
+                "var child = document.createElement('x-panel'); child.setAttribute('id', 'created'); document.getElementById('root').appendChild(child); document.getElementById('created') !== null"
+            ),
+            Ok(Value::Boolean(true))
         );
     }
 

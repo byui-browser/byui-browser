@@ -170,6 +170,14 @@ impl OriginStorage {
 
     /// Stores `value` under `key` in an origin area.
     pub fn set_item(&mut self, storage_key: &StorageKey, key: &str, value: &str) {
+        if !self.areas.contains_key(storage_key) {
+            log::debug!("storage area opened for {}", storage_label(storage_key));
+        }
+        log::trace!(
+            "set_item key {key:?} ({} bytes) in {}",
+            value.len(),
+            storage_label(storage_key)
+        );
         self.areas
             .entry(storage_key.clone())
             .or_default()
@@ -179,6 +187,11 @@ impl OriginStorage {
     /// Removes and returns a value from an origin area.
     pub fn remove_item(&mut self, storage_key: &StorageKey, key: &str) -> Option<String> {
         let value = self.areas.get_mut(storage_key)?.remove_item(key);
+        log::trace!(
+            "remove_item key {key:?} in {} (present: {})",
+            storage_label(storage_key),
+            value.is_some()
+        );
         if self
             .areas
             .get(storage_key)
@@ -197,6 +210,7 @@ impl OriginStorage {
 
     /// Removes every key in an origin area.
     pub fn clear(&mut self, storage_key: &StorageKey) {
+        log::debug!("clearing storage area for {}", storage_label(storage_key));
         self.areas.remove(storage_key);
     }
 
@@ -279,7 +293,16 @@ impl PersistentOriginStorage {
         limits: StorageLimits,
     ) -> Result<Self, StorageError> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root)?;
+        if let Err(error) = fs::create_dir_all(&root) {
+            log::error!("could not open storage at {}: {error}", root.display());
+            return Err(error.into());
+        }
+        log::info!("storage opened at {}", root.display());
+        log::debug!(
+            "storage limits: {} bytes per item, {} bytes per origin",
+            limits.max_item_bytes,
+            limits.max_origin_bytes
+        );
 
         Ok(Self {
             root,
@@ -297,7 +320,14 @@ impl PersistentOriginStorage {
         key: &str,
     ) -> Result<Option<String>, StorageError> {
         self.ensure_loaded(storage_key)?;
-        Ok(self.memory.get_item(storage_key, key).map(str::to_owned))
+        let value = self.memory.get_item(storage_key, key).map(str::to_owned);
+        log::debug!(
+            "read key {key:?} from {} (found: {}, {} bytes)",
+            storage_label(storage_key),
+            value.is_some(),
+            value.as_ref().map_or(0, String::len)
+        );
+        Ok(value)
     }
 
     /// Writes a value and publishes a complete new snapshot.
@@ -308,9 +338,19 @@ impl PersistentOriginStorage {
         value: &str,
     ) -> Result<(), StorageError> {
         self.ensure_loaded(storage_key)?;
+        log::debug!(
+            "write key {key:?} ({} bytes) to {}",
+            value.len(),
+            storage_label(storage_key)
+        );
 
         let item_size = key.len().saturating_add(value.len());
         if item_size > self.limits.max_item_bytes {
+            log::warn!(
+                "storage quota exceeded for {}: item of {item_size} bytes exceeds {}",
+                storage_label(storage_key),
+                self.limits.max_item_bytes
+            );
             return Err(StorageError::QuotaExceeded {
                 limit_bytes: self.limits.max_item_bytes,
                 requested_bytes: item_size,
@@ -327,6 +367,11 @@ impl PersistentOriginStorage {
 
         if area.size_bytes() > self.limits.max_origin_bytes {
             let requested_bytes = area.size_bytes();
+            log::warn!(
+                "storage quota exceeded for {}: origin would use {requested_bytes} of {} bytes",
+                storage_label(storage_key),
+                self.limits.max_origin_bytes
+            );
             self.restore_area(storage_key, previous);
             return Err(StorageError::QuotaExceeded {
                 limit_bytes: self.limits.max_origin_bytes,
@@ -337,6 +382,10 @@ impl PersistentOriginStorage {
         let record = match encode_area(storage_key, area, self.limits) {
             Ok(record) => record,
             Err(error) => {
+                log::warn!(
+                    "could not encode storage for {}: {error}",
+                    storage_label(storage_key)
+                );
                 self.restore_area(storage_key, previous);
                 return Err(error);
             }
@@ -352,11 +401,25 @@ impl PersistentOriginStorage {
         let generation = match self.write_snapshot(storage_key, next_generation, &record) {
             Ok(generation) => generation,
             Err(error) => {
+                match std::error::Error::source(&error) {
+                    Some(source) => log::error!(
+                        "could not write storage snapshot for {}: {error} (cause: {source})",
+                        storage_label(storage_key)
+                    ),
+                    None => log::error!(
+                        "could not write storage snapshot for {}: {error}",
+                        storage_label(storage_key)
+                    ),
+                }
                 self.restore_area(storage_key, previous);
                 return Err(error);
             }
         };
 
+        log::debug!(
+            "storage snapshot generation {generation} written for {}",
+            storage_label(storage_key)
+        );
         self.generations.insert(storage_key.clone(), generation);
         self.remove_old_snapshots(storage_key, generation);
         Ok(())
@@ -367,31 +430,64 @@ impl PersistentOriginStorage {
             return Ok(());
         }
 
-        let snapshots = self.snapshots(storage_key)?;
+        log::debug!("loading storage area for {}", storage_label(storage_key));
+        let snapshots = self.snapshots(storage_key).inspect_err(|error| {
+            log::error!(
+                "could not list storage snapshots for {}: {error}",
+                storage_label(storage_key)
+            );
+        })?;
         let newest_generation = snapshots.first().map_or(0, |(generation, _)| *generation);
         let mut saw_corrupt = false;
 
         for (generation, path) in snapshots {
             match read_snapshot(&path, storage_key, self.limits) {
                 Ok(area) => {
+                    log::debug!(
+                        "loaded snapshot generation {generation} for {} ({} keys)",
+                        storage_label(storage_key),
+                        area.len()
+                    );
                     self.memory.areas.insert(storage_key.clone(), area);
                     self.generations
                         .insert(storage_key.clone(), newest_generation);
                     self.loaded.insert(storage_key.clone());
                     return Ok(());
                 }
-                Err(StorageError::CorruptRecord(_)) => saw_corrupt = true,
-                Err(error) => return Err(error),
+                Err(StorageError::CorruptRecord(reason)) => {
+                    log::warn!(
+                        "skipping corrupt snapshot {} for {}: {reason}",
+                        path.display(),
+                        storage_label(storage_key)
+                    );
+                    saw_corrupt = true;
+                }
+                Err(error) => {
+                    log::error!(
+                        "could not read snapshot {} for {}: {error}",
+                        path.display(),
+                        storage_label(storage_key)
+                    );
+                    return Err(error);
+                }
             }
             self.generations.insert(storage_key.clone(), generation);
         }
 
         if saw_corrupt {
+            log::error!(
+                "storage for {} is corrupt: no valid snapshot was found",
+                storage_label(storage_key)
+            );
             return Err(StorageError::CorruptRecord(
                 "no valid snapshot was found".into(),
             ));
         }
 
+        log::debug!(
+            "no snapshots found for {}; starting empty",
+            storage_label(storage_key)
+        );
         self.loaded.insert(storage_key.clone());
         self.generations.insert(storage_key.clone(), 0);
         Ok(())
@@ -450,8 +546,13 @@ impl PersistentOriginStorage {
             };
 
             let result = file.write_all(record).and_then(|()| file.sync_all());
-            if result.is_err() {
-                let _ = fs::remove_file(&path);
+            if result.is_err()
+                && let Err(error) = fs::remove_file(&path)
+            {
+                log::warn!(
+                    "could not remove partial snapshot {}: {error}",
+                    path.display()
+                );
             }
             result?;
             return Ok(generation);
@@ -459,12 +560,23 @@ impl PersistentOriginStorage {
     }
 
     fn remove_old_snapshots(&self, storage_key: &StorageKey, newest: u64) {
-        if let Ok(snapshots) = self.snapshots(storage_key) {
-            for (generation, path) in snapshots {
-                if generation.saturating_add(1) < newest {
-                    let _ = fs::remove_file(path);
+        match self.snapshots(storage_key) {
+            Ok(snapshots) => {
+                for (generation, path) in snapshots {
+                    if generation.saturating_add(1) < newest
+                        && let Err(error) = fs::remove_file(&path)
+                    {
+                        log::warn!(
+                            "could not remove stale snapshot {}: {error}",
+                            path.display()
+                        );
+                    }
                 }
             }
+            Err(error) => log::debug!(
+                "could not list snapshots for {}; stale snapshots kept: {error}",
+                storage_label(storage_key)
+            ),
         }
     }
 
@@ -497,6 +609,12 @@ impl StorageBackend for PersistentOriginStorage {
     ) -> Result<(), StorageError> {
         Self::write_item(self, storage_key, key, value)
     }
+}
+
+/// Formats a storage key's origin as `scheme://host:port` for log messages.
+fn storage_label(storage_key: &StorageKey) -> String {
+    let origin = storage_key.get();
+    format!("{}://{}:{}", origin.scheme(), origin.host(), origin.port())
 }
 
 fn origin_file_prefix(storage_key: &StorageKey) -> String {

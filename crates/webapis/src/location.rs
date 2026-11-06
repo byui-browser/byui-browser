@@ -29,7 +29,8 @@ pub fn register_location(realm: &mut Realm, url: Url) -> JsResult<()> {
 }
 
 /// Installs the current page's live `Location` object on `window` and as the
-/// global `location` alias. Mutating a URL component, assigning `href`, or
+/// global `location` alias. An already registered `window` object is
+/// extended in place; otherwise a new one is created. Mutating a URL component, assigning `href`, or
 /// calling `assign()`, `replace()`, or `reload()` invokes `navigate` with the
 /// parsed destination and requested history behavior.
 ///
@@ -45,7 +46,12 @@ pub fn register_location_with_navigation(
 ) -> JsResult<Object> {
     let current_url = Arc::new(Mutex::new(url));
     let location = location_object(Arc::clone(&current_url), Arc::clone(&navigate));
-    let window = Object::new();
+    // Reuse a window installed by `register_window*` so its other properties
+    // survive; the accessor takes precedence over its data `location` slot.
+    let window = match realm.registered_global_value("window") {
+        Some(Value::Object(window)) => window,
+        _ => Object::new(),
+    };
     let location_for_window = location.clone();
     let window_url = Arc::clone(&current_url);
     let window_navigate = Arc::clone(&navigate);
@@ -245,10 +251,11 @@ fn set_component(
                 false
             } else {
                 let valid = updated.set_host(Some(&value)).is_ok();
-                if valid && property == "hostname" {
-                    if let Some(port) = old_port {
-                        let _ = updated.set_port(Some(port));
-                    }
+                if valid
+                    && property == "hostname"
+                    && let Some(port) = old_port
+                {
+                    let _ = updated.set_port(Some(port));
                 }
                 valid
             }

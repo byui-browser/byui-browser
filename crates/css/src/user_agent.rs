@@ -2,6 +2,7 @@
 
 use crate::color::{CssColor, parse_color};
 use crate::parser::parse_stylesheet;
+use crate::rule_index::CompiledSheet;
 use crate::stylesheet::Stylesheet;
 use std::sync::OnceLock;
 
@@ -11,10 +12,17 @@ use std::sync::OnceLock;
 pub fn user_agent_stylesheet() -> &'static Stylesheet {
     static SHEET: OnceLock<Stylesheet> = OnceLock::new();
     SHEET.get_or_init(|| {
+        log::debug!("parsing bundled user-agent stylesheet");
         let sheet = parse_stylesheet(include_str!("user_agent.css"));
         assert!(sheet.errors.is_empty(), "bundled user-agent CSS must parse");
         sheet
     })
+}
+
+/// Returns the user-agent stylesheet compiled for the cascade, built once.
+pub(crate) fn user_agent_compiled() -> &'static CompiledSheet {
+    static COMPILED: OnceLock<CompiledSheet> = OnceLock::new();
+    COMPILED.get_or_init(|| CompiledSheet::compile(user_agent_stylesheet()))
 }
 
 /// Returns a supported color default from the bundled `html` user-agent rule.

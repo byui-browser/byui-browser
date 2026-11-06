@@ -1,9 +1,22 @@
-//! Forgiving CSS stylesheet parser.
+//! Forgiving CSS stylesheet parser built on the [`crate::tokenizer`].
 //!
-//! Valid rules are kept when a neighboring rule is malformed. Malformed pieces
-//! are reported as [`ParseError`] values.
+//! The parser follows the rule and declaration algorithms of CSS Syntax Level
+//! 3 §5 ("Parsing"): it walks the token stream, consumes at-rules, qualified
+//! rules, and declaration lists, and recovers at the points the specification
+//! defines. Valid rules are kept when a neighboring rule is malformed, and the
+//! malformed pieces are reported as [`ParseError`] values whose offsets are
+//! byte offsets into the original input.
+//!
+//! Each style rule's prelude is parsed as a selector list. Per Selectors 4 §3.1
+//! a rule whose selector list is invalid is dropped as a whole. A valid list is
+//! stored as one [`Rule`] per complex selector, all sharing the declarations.
+//!
+//! Limitations: nested style rules (CSS Nesting) are reported and dropped, and
+//! at-rules nested inside a style rule's block are skipped.
 
+use crate::selector::parse_selector_tokens;
 use crate::stylesheet::{AtRule, Declaration, ParseError, Rule, Selector, Stylesheet};
+use crate::tokenizer::{Token, TokenKind, source_text, tokenize, trim_whitespace};
 
 /// Parse CSS and retain all valid rules while collecting recoverable errors.
 pub fn parse_stylesheet(input: &str) -> Stylesheet {
@@ -12,304 +25,416 @@ pub fn parse_stylesheet(input: &str) -> Stylesheet {
 }
 
 /// Parse CSS and return both the useful AST and diagnostics.
+///
+/// The diagnostics are also stored in [`Stylesheet::errors`].
 pub fn parse_stylesheet_with_errors(input: &str) -> (Stylesheet, Vec<ParseError>) {
-    let source = remove_comments(input);
+    log::debug!("parsing stylesheet: {} bytes", input.len());
+    let tokens = tokenize(input);
+    let mut parser = Parser {
+        source: input,
+        errors: Vec::new(),
+    };
     let mut stylesheet = Stylesheet::default();
-    parse_rule_list(&source, &mut stylesheet, None);
+    parser.consume_rule_list(&tokens, true, &mut stylesheet);
+    stylesheet.errors = parser.errors;
     let errors = stylesheet.errors.clone();
+    log::debug!(
+        "parsed stylesheet: {} tokens, {} rules, {} at-rules, {} errors",
+        tokens.len(),
+        stylesheet.rules.len(),
+        stylesheet.at_rules.len(),
+        errors.len()
+    );
     (stylesheet, errors)
 }
 
-fn parse_rule_list(source: &str, stylesheet: &mut Stylesheet, base_offset: Option<usize>) {
-    let mut cursor = 0;
-    while cursor < source.len() {
-        cursor += source[cursor..]
-            .chars()
-            .take_while(|character| character.is_whitespace())
-            .map(char::len_utf8)
-            .sum::<usize>();
-        if cursor >= source.len() {
-            break;
-        }
-
-        let Some((boundary, delimiter)) = find_boundary(&source[cursor..]) else {
-            stylesheet.errors.push(ParseError {
-                message: "unfinished CSS rule; expected `;` or `{`".into(),
-                offset: base_offset.unwrap_or(0) + cursor,
-            });
-            break;
-        };
-        let boundary = cursor + boundary;
-        let prelude = source[cursor..boundary].trim();
-        if prelude.is_empty() {
-            cursor = boundary + delimiter.len_utf8();
-            continue;
-        }
-
-        match delimiter {
-            ';' => {
-                if prelude.starts_with('@') {
-                    stylesheet.at_rules.push(parse_at_rule(prelude, None));
-                } else {
-                    stylesheet.errors.push(ParseError {
-                        message: "a style rule needs a declaration block".into(),
-                        offset: base_offset.unwrap_or(0) + cursor,
-                    });
-                }
-                cursor = boundary + 1;
-            }
-            '{' => {
-                let block_start = boundary + 1;
-                let Some(block_end) = matching_brace(source, boundary) else {
-                    stylesheet.errors.push(ParseError {
-                        message: "unclosed `{` in CSS rule".into(),
-                        offset: base_offset.unwrap_or(0) + boundary,
-                    });
-                    break;
-                };
-                let block = &source[block_start..block_end];
-                if prelude.starts_with('@') {
-                    stylesheet
-                        .at_rules
-                        .push(parse_at_rule(prelude, Some(block)));
-                } else {
-                    let declarations = parse_declarations(
-                        block,
-                        stylesheet,
-                        base_offset.unwrap_or(0) + block_start,
-                    );
-                    for selector in split_selectors(prelude) {
-                        stylesheet.rules.push(Rule {
-                            selector: Selector(selector),
-                            declarations: declarations.clone(),
-                        });
-                    }
-                }
-                cursor = block_end + 1;
-            }
-            '}' => {
-                stylesheet.errors.push(ParseError {
-                    message: "unexpected `}`".into(),
-                    offset: base_offset.unwrap_or(0) + boundary,
-                });
-                cursor = boundary + 1;
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
-fn parse_at_rule(prelude: &str, block: Option<&str>) -> AtRule {
-    let mut pieces = prelude[1..].splitn(2, char::is_whitespace);
-    let name = pieces.next().unwrap_or_default().to_ascii_lowercase();
-    let prelude = pieces.next().unwrap_or_default().trim().to_owned();
-    let mut rule = AtRule {
-        name,
-        prelude,
-        rules: Vec::new(),
-        declarations: Vec::new(),
-        block: block.map(str::to_owned),
-    };
-    if let Some(block) = block {
-        if matches!(
-            rule.name.as_str(),
-            "media" | "supports" | "layer" | "document" | "container"
-        ) {
-            let mut nested = Stylesheet::default();
-            parse_rule_list(block, &mut nested, None);
-            rule.rules = nested.rules;
-        } else {
-            let mut nested = Stylesheet::default();
-            rule.declarations = parse_declarations(block, &mut nested, 0);
-        }
-    }
-    rule
-}
-
-fn find_boundary(source: &str) -> Option<(usize, char)> {
-    let mut quote = None;
-    let mut escaped = false;
-    let mut parentheses: usize = 0;
-    let mut brackets: usize = 0;
-    for (index, character) in source.char_indices() {
-        if let Some(open_quote) = quote {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == open_quote {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '"' | '\'' => quote = Some(character),
-            '(' => parentheses += 1,
-            ')' => parentheses = parentheses.saturating_sub(1),
-            '[' => brackets += 1,
-            ']' => brackets = brackets.saturating_sub(1),
-            ';' | '{' | '}' if parentheses == 0 && brackets == 0 => {
-                return Some((index, character));
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn matching_brace(source: &str, opening: usize) -> Option<usize> {
-    let mut depth = 1;
-    let mut quote = None;
-    let mut escaped = false;
-    for (relative, character) in source[opening + 1..].char_indices() {
-        let index = opening + 1 + relative;
-        if let Some(open_quote) = quote {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == open_quote {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '"' | '\'' => quote = Some(character),
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(index);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn split_selectors(input: &str) -> Vec<String> {
-    split_top_level(input, ',')
-        .into_iter()
-        .map(|selector| selector.trim().to_owned())
-        .filter(|selector| !selector.is_empty())
-        .collect()
-}
-
+/// Parses the contents of a declaration block, such as a `style` attribute.
+///
+/// Errors are appended to `stylesheet.errors`, offset by `offset` bytes.
 pub(crate) fn parse_declarations(
     input: &str,
     stylesheet: &mut Stylesheet,
     offset: usize,
 ) -> Vec<Declaration> {
-    let mut declarations = Vec::new();
-    for statement in split_top_level(input, ';') {
-        let statement = statement.trim();
-        if statement.is_empty() {
-            continue;
-        }
-        let Some(colon) = top_level_position(statement, ':') else {
-            stylesheet.errors.push(ParseError {
-                message: "declaration is missing `:`".into(),
-                offset,
-            });
-            continue;
-        };
-        let property = statement[..colon].trim();
-        let value = statement[colon + 1..].trim();
-        if property.is_empty() || value.is_empty() {
-            stylesheet.errors.push(ParseError {
-                message: "declaration has an empty property or value".into(),
-                offset,
-            });
-            continue;
-        }
-        declarations.push(Declaration {
-            property: property.to_ascii_lowercase(),
-            value: value.to_owned(),
-        });
-    }
+    let tokens = tokenize(input);
+    let mut parser = Parser {
+        source: input,
+        errors: Vec::new(),
+    };
+    let declarations = parser.consume_declaration_list(&tokens);
+    stylesheet
+        .errors
+        .extend(parser.errors.into_iter().map(|error| ParseError {
+            message: error.message,
+            offset: error.offset + offset,
+        }));
     declarations
 }
 
-fn split_top_level(input: &str, delimiter: char) -> Vec<&str> {
-    let mut pieces = Vec::new();
-    let mut start = 0;
-    let mut quote = None;
-    let mut escaped = false;
-    let mut parentheses: usize = 0;
-    let mut brackets: usize = 0;
-    for (index, character) in input.char_indices() {
-        if let Some(open_quote) = quote {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == open_quote {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '"' | '\'' => quote = Some(character),
-            '(' => parentheses += 1,
-            ')' => parentheses = parentheses.saturating_sub(1),
-            '[' => brackets += 1,
-            ']' => brackets = brackets.saturating_sub(1),
-            character if character == delimiter && parentheses == 0 && brackets == 0 => {
-                pieces.push(&input[start..index]);
-                start = index + character.len_utf8();
+/// At-rules whose block holds a nested rule list, rather than declarations.
+const RULE_LIST_AT_RULES: [&str; 6] = [
+    "media",
+    "supports",
+    "layer",
+    "document",
+    "container",
+    "scope",
+];
+
+/// At-rules whose block is a declaration list.
+const DECLARATION_AT_RULES: [&str; 6] = [
+    "font-face",
+    "page",
+    "property",
+    "counter-style",
+    "font-palette-values",
+    "view-transition",
+];
+
+struct Parser<'a> {
+    source: &'a str,
+    errors: Vec<ParseError>,
+}
+
+/// Returns the index just past the component value starting at `index`.
+///
+/// A component value is a single token, or a whole `()`, `[]`, `{}` block or
+/// function including its closing token. An unclosed block runs to the end.
+pub(crate) fn skip_component_value(tokens: &[Token<'_>], index: usize) -> usize {
+    let closing = match tokens[index].kind {
+        TokenKind::OpenCurly => TokenKind::CloseCurly,
+        TokenKind::OpenSquare => TokenKind::CloseSquare,
+        TokenKind::OpenParen | TokenKind::Function(_) => TokenKind::CloseParen,
+        _ => return index + 1,
+    };
+    // Nested blocks need their own matching closers, so track a stack.
+    let mut stack = vec![closing];
+    let mut position = index + 1;
+    while position < tokens.len() {
+        let kind = &tokens[position].kind;
+        match kind {
+            TokenKind::OpenCurly => stack.push(TokenKind::CloseCurly),
+            TokenKind::OpenSquare => stack.push(TokenKind::CloseSquare),
+            TokenKind::OpenParen | TokenKind::Function(_) => stack.push(TokenKind::CloseParen),
+            TokenKind::CloseCurly | TokenKind::CloseSquare | TokenKind::CloseParen
+                if stack.last() == Some(kind) =>
+            {
+                stack.pop();
+                if stack.is_empty() {
+                    return position + 1;
+                }
             }
             _ => {}
         }
+        position += 1;
     }
-    pieces.push(&input[start..]);
+    tokens.len()
+}
+
+/// Splits `tokens` at top-level tokens for which `is_separator` is true.
+pub(crate) fn split_top_level<'t, 'a>(
+    tokens: &'t [Token<'a>],
+    is_separator: impl Fn(&TokenKind<'a>) -> bool,
+) -> Vec<&'t [Token<'a>]> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < tokens.len() {
+        if is_separator(&tokens[index].kind) {
+            pieces.push(&tokens[start..index]);
+            start = index + 1;
+            index += 1;
+        } else {
+            index = skip_component_value(tokens, index);
+        }
+    }
+    pieces.push(&tokens[start..]);
     pieces
 }
 
-fn top_level_position(input: &str, wanted: char) -> Option<usize> {
-    let pieces = split_top_level(input, wanted);
-    if pieces.len() > 1 {
-        Some(pieces[0].len())
-    } else {
-        None
+impl<'a> Parser<'a> {
+    fn error(&mut self, message: &str, offset: usize) {
+        log::debug!("css parse error at offset {offset}: {message}");
+        self.errors.push(ParseError {
+            message: message.to_owned(),
+            offset,
+        });
+    }
+
+    /// §5.4.1 "consume a list of rules".
+    fn consume_rule_list(
+        &mut self,
+        tokens: &[Token<'a>],
+        top_level: bool,
+        stylesheet: &mut Stylesheet,
+    ) {
+        let mut index = 0;
+        while index < tokens.len() {
+            match &tokens[index].kind {
+                TokenKind::Whitespace => index += 1,
+                // HTML comment markers are ignored around top-level rules.
+                TokenKind::Cdo | TokenKind::Cdc if top_level => index += 1,
+                TokenKind::AtKeyword(_) => {
+                    index = self.consume_at_rule(tokens, index, stylesheet);
+                }
+                _ => index = self.consume_qualified_rule(tokens, index, stylesheet),
+            }
+        }
+    }
+
+    /// §5.4.2 "consume an at-rule". Returns the index after the rule.
+    fn consume_at_rule(
+        &mut self,
+        tokens: &[Token<'a>],
+        start: usize,
+        stylesheet: &mut Stylesheet,
+    ) -> usize {
+        let TokenKind::AtKeyword(name) = &tokens[start].kind else {
+            unreachable!("consume_at_rule starts at an at-keyword");
+        };
+        let name = name.to_ascii_lowercase();
+        let mut index = start + 1;
+        let prelude_start = index;
+        loop {
+            match tokens.get(index).map(|token| &token.kind) {
+                None => {
+                    let prelude = &tokens[prelude_start..];
+                    stylesheet
+                        .at_rules
+                        .push(self.build_at_rule(name, prelude, None));
+                    return tokens.len();
+                }
+                Some(TokenKind::Semicolon) => {
+                    let prelude = &tokens[prelude_start..index];
+                    stylesheet
+                        .at_rules
+                        .push(self.build_at_rule(name, prelude, None));
+                    return index + 1;
+                }
+                Some(TokenKind::OpenCurly) => {
+                    let end = skip_component_value(tokens, index);
+                    let prelude = &tokens[prelude_start..index];
+                    let block = block_contents(tokens, index, end);
+                    if !closes_block(tokens, end) {
+                        self.error("unclosed `{` in CSS rule", tokens[index].span.start);
+                    }
+                    let rule = self.build_at_rule(name, prelude, Some(block));
+                    stylesheet.at_rules.push(rule);
+                    return end;
+                }
+                Some(_) => index = skip_component_value(tokens, index),
+            }
+        }
+    }
+
+    fn build_at_rule(
+        &mut self,
+        name: String,
+        prelude: &[Token<'a>],
+        block: Option<&[Token<'a>]>,
+    ) -> AtRule {
+        log::trace!("at-rule @{name} (block={})", block.is_some());
+        let mut rule = AtRule {
+            prelude: source_text(self.source, prelude),
+            rules: Vec::new(),
+            declarations: Vec::new(),
+            block: block.map(|block| source_text(self.source, block)),
+            name,
+        };
+        if let Some(block) = block {
+            if RULE_LIST_AT_RULES.contains(&rule.name.as_str()) {
+                let mut nested = Stylesheet::default();
+                self.consume_rule_list(block, false, &mut nested);
+                rule.rules = nested.rules;
+            } else if DECLARATION_AT_RULES.contains(&rule.name.as_str()) {
+                rule.declarations = self.consume_declaration_list(block);
+            }
+        }
+        rule
+    }
+
+    /// §5.4.3 "consume a qualified rule". Returns the index after the rule.
+    fn consume_qualified_rule(
+        &mut self,
+        tokens: &[Token<'a>],
+        start: usize,
+        stylesheet: &mut Stylesheet,
+    ) -> usize {
+        let mut index = start;
+        while index < tokens.len() {
+            if tokens[index].kind == TokenKind::OpenCurly {
+                let end = skip_component_value(tokens, index);
+                if !closes_block(tokens, end) {
+                    self.error("unclosed `{` in CSS rule", tokens[index].span.start);
+                }
+                let prelude = &tokens[start..index];
+                let block = block_contents(tokens, index, end);
+                self.build_style_rule(prelude, block, stylesheet);
+                return end;
+            }
+            index = skip_component_value(tokens, index);
+        }
+        self.error(
+            "unfinished CSS rule; expected `{`",
+            tokens[start].span.start,
+        );
+        tokens.len()
+    }
+
+    fn build_style_rule(
+        &mut self,
+        prelude: &[Token<'a>],
+        block: &[Token<'a>],
+        stylesheet: &mut Stylesheet,
+    ) {
+        let prelude = trim_whitespace(prelude);
+        let offset = prelude.first().map_or(0, |token| token.span.start);
+        if prelude.is_empty() {
+            self.error("a style rule needs a selector", offset);
+            self.consume_declaration_list(block);
+            return;
+        }
+        if let Err(error) = parse_selector_tokens(self.source, prelude) {
+            let message = format!("invalid selector: {}", error.message);
+            self.error(&message, error.position);
+            // The block is still consumed so its errors are reported.
+            self.consume_declaration_list(block);
+            return;
+        }
+        let declarations = self.consume_declaration_list(block);
+        let selectors = split_top_level(prelude, |kind| *kind == TokenKind::Comma);
+        log::trace!(
+            "rule with {} selectors and {} declarations",
+            selectors.len(),
+            declarations.len()
+        );
+        for selector in selectors {
+            stylesheet.rules.push(Rule {
+                selector: Selector(source_text(self.source, selector)),
+                declarations: declarations.clone(),
+            });
+        }
+    }
+
+    /// §5.4.5 "consume a list of declarations".
+    fn consume_declaration_list(&mut self, tokens: &[Token<'a>]) -> Vec<Declaration> {
+        let mut declarations = Vec::new();
+        let mut index = 0;
+        while index < tokens.len() {
+            match &tokens[index].kind {
+                TokenKind::Whitespace | TokenKind::Semicolon => index += 1,
+                TokenKind::AtKeyword(name) => {
+                    log::debug!("skipping @{name} nested in a declaration block");
+                    let mut ignored = Stylesheet::default();
+                    index = self.consume_at_rule(tokens, index, &mut ignored);
+                }
+                TokenKind::Ident(_) => {
+                    let end = find_semicolon(tokens, index);
+                    if let Some(declaration) = self.consume_declaration(&tokens[index..end]) {
+                        declarations.push(declaration);
+                    }
+                    index = end;
+                }
+                _ => {
+                    // Anything else starts a nested style rule (CSS Nesting),
+                    // which this engine does not apply. Skip the whole rule.
+                    let offset = tokens[index].span.start;
+                    let mut end = index;
+                    while end < tokens.len()
+                        && !matches!(
+                            tokens[end].kind,
+                            TokenKind::Semicolon | TokenKind::OpenCurly
+                        )
+                    {
+                        end = skip_component_value(tokens, end);
+                    }
+                    if tokens.get(end).map(|token| &token.kind) == Some(&TokenKind::OpenCurly) {
+                        self.error("nested style rules are not supported", offset);
+                        end = skip_component_value(tokens, end);
+                    } else {
+                        self.error("declaration must start with a property name", offset);
+                    }
+                    index = end;
+                }
+            }
+        }
+        declarations
+    }
+
+    /// §5.4.6 "consume a declaration" from tokens up to (not including) `;`.
+    fn consume_declaration(&mut self, tokens: &[Token<'a>]) -> Option<Declaration> {
+        let offset = tokens[0].span.start;
+        let TokenKind::Ident(name) = &tokens[0].kind else {
+            unreachable!("declarations start with an ident");
+        };
+        let mut index = 1;
+        while tokens.get(index).map(|token| &token.kind) == Some(&TokenKind::Whitespace) {
+            index += 1;
+        }
+        if tokens.get(index).map(|token| &token.kind) != Some(&TokenKind::Colon) {
+            self.error("declaration is missing `:`", offset);
+            return None;
+        }
+        let mut value = trim_whitespace(&tokens[index + 1..]);
+        let important = {
+            let mut meaningful = value
+                .iter()
+                .rev()
+                .filter(|token| token.kind != TokenKind::Whitespace);
+            matches!(
+                (meaningful.next().map(|t| &t.kind), meaningful.next().map(|t| &t.kind)),
+                (Some(TokenKind::Ident(word)), Some(TokenKind::Delim('!')))
+                    if word.eq_ignore_ascii_case("important")
+            )
+        };
+        if important {
+            let bang = value
+                .iter()
+                .rposition(|token| token.kind == TokenKind::Delim('!'))
+                .expect("important values contain `!`");
+            value = trim_whitespace(&value[..bang]);
+        }
+        if value.is_empty() {
+            self.error("declaration has an empty property or value", offset);
+            return None;
+        }
+        // Custom property names are case-sensitive; all others are not.
+        let property = if name.starts_with("--") {
+            name.to_string()
+        } else {
+            name.to_ascii_lowercase()
+        };
+        let mut value = source_text(self.source, value);
+        if important {
+            value.push_str(" !important");
+        }
+        log::trace!("declaration `{property}: {value}`");
+        Some(Declaration { property, value })
     }
 }
 
-/// Remove comments without damaging `/* ... */` text inside a quoted string.
-fn remove_comments(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut index = 0;
-    let mut quote = None;
-    let mut escaped = false;
-    while index < bytes.len() {
-        let character = bytes[index] as char;
-        if let Some(open_quote) = quote {
-            result.push(character);
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == open_quote {
-                quote = None;
-            }
-            index += 1;
-        } else if character == '"' || character == '\'' {
-            quote = Some(character);
-            result.push(character);
-            index += 1;
-        } else if index + 1 < bytes.len() && &bytes[index..index + 2] == b"/*" {
-            index += 2;
-            while index + 1 < bytes.len() && &bytes[index..index + 2] != b"*/" {
-                index += 1;
-            }
-            index = (index + 2).min(bytes.len());
-        } else {
-            result.push(character);
-            index += 1;
-        }
+/// Returns the tokens between a `{` at `open` and its closing `}`.
+fn block_contents<'t, 'a>(tokens: &'t [Token<'a>], open: usize, end: usize) -> &'t [Token<'a>] {
+    let close = if closes_block(tokens, end) {
+        end - 1
+    } else {
+        end
+    };
+    &tokens[open + 1..close.max(open + 1)]
+}
+
+/// Whether the component value ending at `end` was closed by a `}`.
+fn closes_block(tokens: &[Token<'_>], end: usize) -> bool {
+    end > 0 && end <= tokens.len() && tokens[end - 1].kind == TokenKind::CloseCurly
+}
+
+/// Returns the index of the next top-level `;` at or after `start`, or the end.
+fn find_semicolon(tokens: &[Token<'_>], start: usize) -> usize {
+    let mut index = start;
+    while index < tokens.len() && tokens[index].kind != TokenKind::Semicolon {
+        index = skip_component_value(tokens, index);
     }
-    result
+    index
 }
 
 #[cfg(test)]
@@ -322,7 +447,15 @@ mod tests {
             r#"/* comment */ body, .hero { background: url("a;b.png"); content: "}"; color: rgb(1, 2, 3) !important; }"#,
         );
         assert_eq!(sheet.rules.len(), 2);
+        assert_eq!(sheet.rules[0].selector, Selector("body".into()));
+        assert_eq!(sheet.rules[1].selector, Selector(".hero".into()));
         assert_eq!(sheet.rules[0].declarations.len(), 3);
+        assert_eq!(sheet.rules[0].declarations[0].value, r#"url("a;b.png")"#);
+        assert_eq!(sheet.rules[0].declarations[1].value, r#""}""#);
+        assert_eq!(
+            sheet.rules[0].declarations[2].value,
+            "rgb(1, 2, 3) !important"
+        );
         assert!(sheet.errors.is_empty());
     }
 
@@ -333,8 +466,17 @@ mod tests {
         );
         assert_eq!(sheet.at_rules.len(), 2);
         assert_eq!(sheet.at_rules[0].name, "media");
+        assert_eq!(sheet.at_rules[0].prelude, "screen and (min-width: 10px)");
         assert_eq!(sheet.at_rules[0].rules.len(), 1);
         assert_eq!(sheet.at_rules[1].prelude, "url('x.css')");
+        assert!(sheet.rules.is_empty());
+    }
+
+    #[test]
+    fn parses_font_face_declarations() {
+        let sheet = parse_stylesheet("@font-face { font-family: X; src: url(x.woff2) }");
+        assert_eq!(sheet.at_rules[0].declarations.len(), 2);
+        assert_eq!(sheet.at_rules[0].declarations[1].value, "url(x.woff2)");
     }
 
     #[test]
@@ -343,5 +485,127 @@ mod tests {
             parse_stylesheet_with_errors("p { color: red; broken; background: blue; }");
         assert_eq!(sheet.rules[0].declarations.len(), 2);
         assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].offset, 16);
+    }
+
+    #[test]
+    fn invalid_selector_drops_the_whole_rule_but_keeps_neighbors() {
+        let (sheet, errors) =
+            parse_stylesheet_with_errors("p, div > { color: red } #1 { color: red } a { b: c }");
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].selector, Selector("a".into()));
+        assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn values_keep_author_text_without_comments() {
+        let sheet = parse_stylesheet("p { margin: 1px/* a */2px  3px; --Brand: { x } }");
+        assert_eq!(sheet.rules[0].declarations[0].value, "1px 2px  3px");
+        assert_eq!(sheet.rules[0].declarations[1].property, "--Brand");
+        assert_eq!(sheet.rules[0].declarations[1].value, "{ x }");
+    }
+
+    #[test]
+    fn reports_unclosed_blocks_and_unfinished_rules() {
+        let (sheet, errors) = parse_stylesheet_with_errors("p { color: red");
+        assert_eq!(sheet.rules[0].declarations.len(), 1);
+        assert_eq!(errors[0].message, "unclosed `{` in CSS rule");
+
+        let (sheet, errors) = parse_stylesheet_with_errors("a { color: red } p");
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(errors[0].offset, 17);
+    }
+
+    #[test]
+    fn skips_nested_rules_inside_declaration_blocks() {
+        let (sheet, errors) =
+            parse_stylesheet_with_errors("p { color: red; &:hover { color: blue } margin: 0 }");
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].declarations.len(), 2);
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn ignores_html_comment_markers_at_top_level() {
+        let sheet = parse_stylesheet("<!-- p { color: red } -->");
+        assert_eq!(sheet.rules.len(), 1);
+        assert!(sheet.errors.is_empty());
+    }
+
+    #[test]
+    fn parses_inline_style_declarations() {
+        let mut sheet = Stylesheet::default();
+        let declarations = parse_declarations("color: red !IMPORTANT; ; width:", &mut sheet, 10);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].value, "red !important");
+        assert_eq!(sheet.errors[0].offset, 35);
+    }
+
+    #[test]
+    fn malformed_input_never_panics() {
+        // Deterministic pseudo-random soup of CSS-significant characters,
+        // including multi-byte text, escapes, and unbalanced brackets.
+        const PIECES: &[&str] = &[
+            "{",
+            "}",
+            "(",
+            ")",
+            "[",
+            "]",
+            ";",
+            ":",
+            ",",
+            "\"",
+            "'",
+            "\\",
+            "/*",
+            "*/",
+            "@",
+            "#",
+            ".",
+            "!",
+            "important",
+            "url(",
+            "a",
+            "-",
+            "--x",
+            "1",
+            "2.5e",
+            "%",
+            "px",
+            "é",
+            "日本",
+            " ",
+            "\n",
+            "\r",
+            "\0",
+            "<!--",
+            "-->",
+            ">",
+            "+",
+            "~",
+            "|",
+            "=",
+            "*",
+            "&",
+            "::",
+            "is(",
+            "nth-child(",
+            "\\31 ",
+        ];
+        let mut state = 0x2545_f491_u32;
+        for _ in 0..2_000 {
+            let mut input = String::new();
+            for _ in 0..(state % 40) {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                input.push_str(PIECES[state as usize % PIECES.len()]);
+            }
+            let sheet = parse_stylesheet(&input);
+            let _ = crate::parse_selector_list(&input);
+            let document = html::parse_raw_html("<p class='a' id='b'><a href=x>y</a></p>".into());
+            let _ = crate::style_document(&document, &[sheet]);
+        }
     }
 }

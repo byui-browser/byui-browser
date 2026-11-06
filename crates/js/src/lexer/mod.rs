@@ -49,6 +49,18 @@ pub enum Token {
     Function,
     /// `return` keyword.
     Return,
+    /// `throw` keyword.
+    Throw,
+    /// `try` keyword.
+    Try,
+    /// `catch` keyword.
+    Catch,
+    /// `finally` keyword.
+    Finally,
+    /// `break` keyword.
+    Break,
+    /// `continue` keyword.
+    Continue,
     /// `class` keyword.
     Class,
     /// `extends` keyword.
@@ -69,6 +81,8 @@ pub enum Token {
     Undefined,
     /// `=` assignment operator.
     Assign,
+    /// `=>` arrow function separator.
+    Arrow,
     /// `==` equality operator.
     EqualEqual,
     /// `===` strict equality operator.
@@ -239,6 +253,7 @@ pub fn tokenize_spanned(input: &str) -> Vec<SpannedToken> {
                 '*' => Token::Multiply,
                 '/' => Token::Divide,
                 '%' => Token::Remainder,
+                '=' if take_if(&mut chars, '>') => Token::Arrow,
                 '=' => match take_if(&mut chars, '=') {
                     true if take_if(&mut chars, '=') => Token::StrictEqual,
                     true => Token::EqualEqual,
@@ -284,6 +299,16 @@ pub fn tokenize_spanned(input: &str) -> Vec<SpannedToken> {
         tokens.push(SpannedToken { token, start, end });
     }
 
+    log::debug!(
+        "tokenized {} bytes into {} tokens",
+        input.len(),
+        tokens.len()
+    );
+    if log::log_enabled!(log::Level::Trace) {
+        for entry in &tokens {
+            log::trace!("token {:?} at {}..{}", entry.token, entry.start, entry.end);
+        }
+    }
     tokens
 }
 
@@ -432,12 +457,13 @@ fn read_unicode_escape(chars: &mut Chars<'_>) -> Result<char, &'static str> {
     }
 
     let mut lookahead = chars.clone();
-    if take_if(&mut lookahead, '\\') && take_if(&mut lookahead, 'u') {
-        if let Some(low @ 0xDC00..=0xDFFF) = read_unicode_code_point(&mut lookahead) {
-            *chars = lookahead;
-            let combined = 0x10000 + ((code_unit - 0xD800) << 10) + (low - 0xDC00);
-            return char::from_u32(combined).ok_or(INVALID_ESCAPE);
-        }
+    if take_if(&mut lookahead, '\\')
+        && take_if(&mut lookahead, 'u')
+        && let Some(low @ 0xDC00..=0xDFFF) = read_unicode_code_point(&mut lookahead)
+    {
+        *chars = lookahead;
+        let combined = 0x10000 + ((code_unit - 0xD800) << 10) + (low - 0xDC00);
+        return char::from_u32(combined).ok_or(INVALID_ESCAPE);
     }
     Err(UNSUPPORTED_ESCAPE)
 }
@@ -549,6 +575,12 @@ fn keyword(name: &str) -> Option<Token> {
         "while" => Token::While,
         "function" => Token::Function,
         "return" => Token::Return,
+        "throw" => Token::Throw,
+        "try" => Token::Try,
+        "catch" => Token::Catch,
+        "finally" => Token::Finally,
+        "break" => Token::Break,
+        "continue" => Token::Continue,
         "class" => Token::Class,
         "extends" => Token::Extends,
         "new" => Token::New,

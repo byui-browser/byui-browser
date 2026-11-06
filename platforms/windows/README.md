@@ -7,7 +7,7 @@ keeps the native Windows titlebar and frame.
 
 ## Run
 
-Requires Windows, Rust 1.85 or newer, and the Visual C++ build tools. From the
+Requires Windows, Rust 1.88 or newer, and the Visual C++ build tools. From the
 repository root:
 
 ```powershell

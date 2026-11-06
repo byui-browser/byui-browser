@@ -63,6 +63,26 @@ fn html_script_reaches_registered_web_api() {
 }
 
 #[test]
+fn html_script_history_survives_document_registration() {
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+    let result = BrowserRuntime::in_memory()
+        .evaluate_page_scripts(
+            "<script>window.history().pushState('ready', ''); window.history().state</script>",
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            security_context(),
+        )
+        .expect("history should remain available after document registration");
+
+    assert_eq!(result, vec![js::Value::String("ready".into())]);
+}
+
+#[test]
 fn html_script_reaches_registered_alert_api() {
     let console = Arc::new(TestConsole::default());
     let alert = Arc::new(TestAlert::default());
@@ -148,6 +168,50 @@ fn linked_page_script_reads_its_navigation_url_from_window_location() {
 }
 
 #[test]
+fn window_location_shares_the_window_with_viewport_and_device_scale() {
+    let navigations = Arc::new(Mutex::new(Vec::new()));
+    let captured_navigations = navigations.clone();
+    let page = browser::Page {
+        url: "https://example.com/start".into(),
+        html: String::new(),
+        stylesheets: Vec::new(),
+        scripts: vec![
+            "if (window.devicePixelRatio === 2 && window.innerWidth === 800 \
+             && window.location.href === 'https://example.com/start') location.assign('/next')"
+                .into(),
+        ],
+    };
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+
+    BrowserRuntime::in_memory()
+        .open_page_with_viewport_and_navigation(
+            &page,
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            security_context(),
+            2.0,
+            Some(webapis::ViewportSize {
+                width: 800,
+                height: 600,
+            }),
+            Arc::new(move |url, _behavior| {
+                captured_navigations.lock().unwrap().push(url.to_string());
+            }),
+        )
+        .expect("page script should evaluate");
+
+    assert_eq!(
+        navigations.lock().unwrap().as_slice(),
+        ["https://example.com/next"]
+    );
+}
+
+#[test]
 fn document_click_listener_runs_after_the_page_loads() {
     let console = Arc::new(TestConsole::default());
     let alert = Arc::new(TestAlert::default());
@@ -214,7 +278,7 @@ fn linked_script_finds_page_elements_and_handles_their_clicks() {
     let button = document.get_element_by_id("btn").expect("#btn");
     let main = document
         .node(button)
-        .and_then(|node| node.parent)
+        .and_then(|node| node.get_parent())
         .expect("main");
     session
         .dispatch_click_at(main)

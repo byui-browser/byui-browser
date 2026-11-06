@@ -122,6 +122,7 @@ impl Context<'_> {
         let mut open = Vec::new();
         let mut y = 0.0;
         for range in break_lines(&chunks, available_width) {
+            log::trace!("line break: pieces {}..{}", range.start, range.end);
             if let Some(line) = self.build_line(
                 range,
                 &mut prepared,
@@ -130,6 +131,14 @@ impl Context<'_> {
                 available_width,
                 y,
             ) {
+                log::trace!(
+                    "line {} at y {}: height {}, baseline {}, {} fragments",
+                    lines.len(),
+                    line.rect.y,
+                    line.rect.height,
+                    line.baseline,
+                    line.fragments.len()
+                );
                 y = line.rect.bottom();
                 lines.push(line);
             }
@@ -495,12 +504,13 @@ impl Context<'_> {
         x: f32,
         width: f32,
     ) {
-        if let Some(LineFragment::Text(previous)) = fragments.last_mut() {
-            if previous.node == source.node && (previous.rect.right() - x).abs() < FIT_EPSILON {
-                previous.text.push_str(text);
-                previous.rect.width += width;
-                return;
-            }
+        if let Some(LineFragment::Text(previous)) = fragments.last_mut()
+            && previous.node == source.node
+            && (previous.rect.right() - x).abs() < FIT_EPSILON
+        {
+            previous.text.push_str(text);
+            previous.rect.width += width;
+            return;
         }
         fragments.push(LineFragment::Text(TextFragment {
             node: source.node,
@@ -599,12 +609,12 @@ fn break_lines(chunks: &[Chunk], available_width: f32) -> Vec<Range<usize>> {
     let mut line: Option<Range<usize>> = None;
     let mut width = 0.0;
     for chunk in chunks {
-        if let Some(current) = &line {
-            if width + chunk.width - chunk.trailing_space > available_width + FIT_EPSILON {
-                lines.push(current.clone());
-                line = None;
-                width = 0.0;
-            }
+        if let Some(current) = &line
+            && width + chunk.width - chunk.trailing_space > available_width + FIT_EPSILON
+        {
+            lines.push(current.clone());
+            line = None;
+            width = 0.0;
         }
         let current = line.get_or_insert(chunk.pieces.start..chunk.pieces.start);
         current.end = chunk.pieces.end;

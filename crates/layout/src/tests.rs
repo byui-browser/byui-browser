@@ -122,6 +122,19 @@ fn body_margin_offsets_blocks_that_fill_the_containing_block_width() {
 }
 
 #[test]
+fn flex_row_distributes_grow_space_and_places_the_gap() {
+    let (document, tree) = lay_out(
+        "<body><div id='container'><div id='first'></div><div id='second'></div></div></body>",
+        "body { margin: 0 } #container { display: flex; width: 300px; height: 100px; gap: 10px } #first, #second { width: 50px; flex-grow: 1 }",
+        800.0,
+    );
+    let first = box_for(&tree, &document, "first");
+    let second = box_for(&tree, &document, "second");
+    assert_eq!((first.rect.x, first.rect.width), (0.0, 145.0));
+    assert_eq!((second.rect.x, second.rect.width), (155.0, 145.0));
+}
+
+#[test]
 fn parent_and_first_child_margins_collapse() {
     let (document, tree) = lay_out(
         "<html id='root'><body id='body'><h1 id='h'>T</h1></body></html>",
@@ -441,4 +454,20 @@ fn hit_testing_targets_what_is_painted_on_top() {
     );
     // Body is the root element here; its 8px margin shows only the canvas.
     assert_eq!(tree.hit_test(1.0, 1.0), None);
+}
+
+#[test]
+fn scroll_height_covers_tall_content_and_never_undercuts_the_viewport() {
+    let (_, short) = lay_out("<body><p>short</p></body>", "", 800.0);
+    assert_eq!(short.scroll_height(), 600.0);
+
+    let (document, tall) = lay_out(
+        "<body><div id=\"tall\"></div></body>",
+        "body { margin: 8px } #tall { height: 2000px }",
+        800.0,
+    );
+    let tall_box = box_for(&tall, &document, "tall");
+    assert_eq!(tall_box.rect.bottom(), 2008.0);
+    // The body's bottom margin is part of the scrollable area.
+    assert_eq!(tall.scroll_height(), 2016.0);
 }

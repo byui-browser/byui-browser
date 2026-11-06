@@ -1,7 +1,7 @@
 //! Loading a page from an address: fetch the document, then the stylesheets
 //! and scripts it references.
 
-use std::{fmt, future::Future, io, sync::Arc};
+use std::{fmt, future::Future, io, sync::Arc, time::Instant};
 
 use futures_util::future::join_all;
 use net::{Request, RequestController, Url};
@@ -12,7 +12,7 @@ use crate::{Page, attribute, request_controller};
 /// Why a page, or the main document of a page, could not be loaded.
 ///
 /// Subresource failures never surface as a `LoadError`; the loader skips the
-/// stylesheet or script and prints a diagnostic instead.
+/// stylesheet or script and logs a warning instead.
 #[derive(Debug)]
 pub enum LoadError {
     /// The typed address is empty or is not a valid URL, even after the
@@ -91,7 +91,9 @@ struct Fetched {
 
 /// Fetches `url` as text, failing on a non-2xx status.
 async fn fetch_document(controller: &RequestController, url: Url) -> Result<Fetched, LoadError> {
+    log::trace!("fetching {url}");
     let response = controller.fetch(Request::get(url.as_str())).await?;
+    log::debug!("GET {url} -> {}", response.status);
     if !(200..300).contains(&response.status) {
         return Err(LoadError::Status {
             status: response.status,
@@ -101,6 +103,7 @@ async fn fetch_document(controller: &RequestController, url: Url) -> Result<Fetc
     // The response URL is empty for filtered responses; keep the request URL.
     let final_url = Url::parse(&response.url).unwrap_or(url);
     let body = response.body.text().await?;
+    log::debug!("fetched {final_url}: {} bytes", body.len());
     Ok(Fetched {
         url: final_url,
         body,
@@ -117,7 +120,7 @@ async fn fetch_document(controller: &RequestController, url: Url) -> Result<Fetc
 /// `<link rel="stylesheet">` and `<style>` as [`Page::stylesheets`] and every
 /// `<script>` as [`Page::scripts`]. Relative `href`/`src` values are resolved
 /// against the document's final URL. A stylesheet or script that fails to
-/// load is skipped with a diagnostic on stderr; it does not fail the page.
+/// load is skipped with a logged warning; it does not fail the page.
 /// A page served over a non-`byui:` scheme may not pull `byui:` or `file:`
 /// subresources.
 ///
@@ -133,7 +136,15 @@ where
     F: Fn(Url) -> Fut,
     Fut: Future<Output = Result<Fetched, LoadError>>,
 {
-    let main = fetch(normalize_address(address)?).await?;
+    let started = Instant::now();
+    let url = normalize_address(address).inspect_err(|error| {
+        log::error!("page load failed for {:?}: {error}", address.trim());
+    })?;
+    log::info!("navigation started: {url}");
+    let main = fetch(url.clone()).await.inspect_err(|error| {
+        log::error!("page load failed for {url}: {error}");
+    })?;
+    log::trace!("parsing document {}: {} bytes", main.url, main.body.len());
     let document = html::parse_raw_html(main.body.clone());
 
     let mut sheet_slots = Vec::new();
@@ -142,7 +153,7 @@ where
         .map(html::NodeID::new)
         .map_while(|id| document.node(id).map(|node| (id, node)));
     for (id, node) in nodes {
-        let html::NodeKind::Element(element) = &node.kind else {
+        let html::NodeKind::Element(element) = node.get_kind() else {
             continue;
         };
         let attributes = element.get_attributes();
@@ -166,11 +177,27 @@ where
         }
     }
 
+    log::debug!(
+        "subresources discovered in {}: {} stylesheets, {} scripts",
+        main.url,
+        sheet_slots.len(),
+        script_slots.len()
+    );
     let (stylesheets, scripts) = futures_util::future::join(
         resolve_slots(&fetch, sheet_slots, "stylesheet", false),
         resolve_slots(&fetch, script_slots, "script", true),
     )
     .await;
+    log::debug!(
+        "subresources loaded: {} stylesheets, {} scripts",
+        stylesheets.len(),
+        scripts.len()
+    );
+    log::info!(
+        "page loaded: {} ({} ms)",
+        main.url,
+        started.elapsed().as_millis()
+    );
     Ok(Page {
         url: main.url.to_string(),
         html: main.body,
@@ -217,13 +244,16 @@ where
         match slot {
             Slot::Inline(text) => Some(text),
             Slot::Remote(Err(reason)) => {
-                eprintln!("skipping {kind}: {reason}");
+                log::warn!("skipping {kind}: {reason}");
                 None
             }
             Slot::Remote(Ok(url)) => match fetch(url.clone()).await {
-                Ok(fetched) => Some(fetched.body),
+                Ok(fetched) => {
+                    log::debug!("fetched {kind} {url}: {} bytes", fetched.body.len());
+                    Some(fetched.body)
+                }
                 Err(error) => {
-                    eprintln!("skipping {kind} {url}: {error}");
+                    log::warn!("skipping {kind} {url}: {error}");
                     None
                 }
             },
@@ -274,11 +304,11 @@ pub fn security_context_for_url(url: &str) -> RendererSecurityContext {
         && matches!(url.scheme(), "http" | "https" | "byui")
         && let Some(host) = url.host_str()
     {
-        return RendererSecurityContext::new(
-            Origin::new(url.scheme(), host, url.port()),
-            StoragePermission::Allowed,
-        );
+        let origin = Origin::new(url.scheme(), host, url.port());
+        log::debug!("security context derived: origin {origin:?}, storage allowed");
+        return RendererSecurityContext::new(origin, StoragePermission::Allowed);
     }
+    log::debug!("security context derived: opaque origin, storage denied");
     RendererSecurityContext::new(Origin::new("opaque", "", None), StoragePermission::Denied)
 }
 
@@ -320,6 +350,7 @@ impl PageLoader {
         let controller = Arc::clone(&self.controller);
         let typed = address.trim().to_owned();
         let address = address.to_owned();
+        log::debug!("page load scheduled: {typed}");
         self.runtime.spawn(async move {
             let shown = normalize_address(&address).map_or(typed, |url| url.to_string());
             let result = load_page(&controller, &address).await;

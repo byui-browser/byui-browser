@@ -10,6 +10,7 @@
 
 mod alert;
 mod console;
+mod custom_elements;
 mod document;
 mod dom_exception;
 mod element;
@@ -19,11 +20,14 @@ pub mod local_storage;
 mod location;
 mod selector;
 mod timer;
+mod window;
 
 pub use alert::{AlertSink, alert, register_alert};
 pub use console::{ConsoleSink, print, register_print};
+pub use custom_elements::CustomElementRegistry;
 pub use document::{
-    Document, get_element_by_id, register_document, register_document_with_location,
+    Document, get_element_by_id, register_document, register_document_on_window,
+    register_document_with_location,
 };
 pub use dom_exception::DomException;
 pub use element::{Element, get_attribute};
@@ -37,3 +41,9 @@ pub use location::{
 };
 pub use selector::SelectorError;
 pub use timer::{TimerId, TimerQueue};
+pub use window::{
+    ViewportSize, register_window, register_window_with_security_context,
+    register_window_with_security_context_and_viewport, register_window_with_url,
+    register_window_with_url_and_device_pixel_ratio,
+    register_window_with_url_device_pixel_ratio_and_viewport,
+};

@@ -23,6 +23,10 @@ impl BrowserState {
     /// `byui://welcome`. Every call records a visit, even for a repeated URL.
     pub fn record_visit(&mut self, url: &str) {
         self.visited_urls.push(url.to_owned());
+        log::debug!(
+            "visit recorded: {url} ({} in history)",
+            self.visited_urls.len()
+        );
     }
 
     /// Replaces the current visit with `url`, or records it when history is
