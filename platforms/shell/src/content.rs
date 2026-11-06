@@ -2,7 +2,7 @@
 //! The demo evaluates its page script once per document load before painting.
 
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 
 use browser::{BrowserRuntime, Page};
@@ -255,14 +255,28 @@ enum PageCommand {
 /// registered its listener has finished.
 pub(crate) struct PageEvents {
     commands: mpsc::Sender<PageCommand>,
+    /// The error that stopped the most recently loaded page's scripts, if
+    /// any. Written by the session thread, read by the Compatibility audit.
+    script_error: Arc<Mutex<Option<String>>>,
 }
 
 impl PageEvents {
     /// Starts the session thread. It exits when the last sender is dropped.
     pub(crate) fn new() -> Self {
         let (commands, incoming) = mpsc::channel();
-        thread::spawn(move || run_page_events(incoming));
-        Self { commands }
+        let script_error = Arc::new(Mutex::new(None));
+        let errors = Arc::clone(&script_error);
+        thread::spawn(move || run_page_events(incoming, &errors));
+        Self {
+            commands,
+            script_error,
+        }
+    }
+
+    /// The error that stopped the current page's scripts, or `None` when
+    /// they finished (or have not run yet).
+    pub(crate) fn script_error(&self) -> Option<String> {
+        self.script_error.lock().map_or(None, |error| error.clone())
     }
 
     /// Replaces the live document with `page` and runs its script.
@@ -342,7 +356,7 @@ impl PageEvents {
     }
 }
 
-fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
+fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<Option<String>>) {
     let mut session = None;
     while let Ok(command) = commands.recv() {
         match command {
@@ -355,6 +369,8 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                 navigate,
             } => {
                 log::debug!("page session loading {}", page.url);
+                // A previous page's failure must not be blamed on this one.
+                set_script_error(script_error, None);
                 let controller = browser::request_controller(None);
                 match runtime.open_page_with_viewport_and_navigation(
                     &page,
@@ -366,8 +382,14 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                     viewport,
                     navigate,
                 ) {
-                    Ok(loaded) => session = Some(loaded),
-                    Err(error) => log::debug!("page script failed: {error}"),
+                    Ok(loaded) => {
+                        session = Some(loaded);
+                        set_script_error(script_error, None);
+                    }
+                    Err(error) => {
+                        log::debug!("page script failed: {error}");
+                        set_script_error(script_error, Some(error.to_string()));
+                    }
                 }
             }
             PageCommand::Resize(viewport) => {
@@ -396,6 +418,12 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                 }
             }
         }
+    }
+}
+
+fn set_script_error(slot: &Mutex<Option<String>>, error: Option<String>) {
+    if let Ok(mut slot) = slot.lock() {
+        *slot = error;
     }
 }
 

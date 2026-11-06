@@ -15,6 +15,7 @@ security = { workspace = true }
 net = { workspace = true }
 webapis = { workspace = true }
 chrome = { workspace = true }
+devtools = { workspace = true }
 css = { workspace = true }
 html = { workspace = true }
 js = { workspace = true }

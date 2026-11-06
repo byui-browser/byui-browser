@@ -110,3 +110,33 @@ closes the source overlay first and reveals the still-open Elements panel;
 Escape again closes Elements. Clicking inside Elements never dispatches a
 click to the webpage underneath. Reload and the toolbar three-dot menu are
 unchanged.
+
+### Audit Compatibility: what this page uses that the engine cannot do yet
+
+The Inspect dock has a second tab, **Compatibility**. Open it by clicking the
+tab in the dock header, or choose **Audit Compatibility** (the last item in the
+page's right-click menu). It lists every feature the current page uses that
+does not work in this engine, grouped by area: script execution, JavaScript
+syntax, JavaScript and Web APIs, HTML, CSS parsing, properties, values,
+at-rules, and selectors. Each row shows how often the page uses the feature,
+where it first appears (for example `app.js:17` or `site.css:4`), and how the
+audit knows:
+
+- **probed** (red): the engine was tested and the feature did not work.
+  JavaScript probes run tiny scripts in a page realm set up exactly like a
+  real page's; CSS and HTML probes render a small fixture through the real
+  `css`, `layout`, and `paint` crates and compare display lists.
+- **observed** (orange): seen in this load, such as a failed `<script src>`, a
+  `type="application/ld+json"` block being run as JavaScript, or the error
+  that stopped the page's scripts.
+- **by name** (yellow): an instance member such as `.forEach` matched by
+  name, so the page might not actually be affected.
+- **documented** (gray): cannot be probed statically, but the engine documents
+  the limitation (for example `:hover` never matches).
+
+Nothing comes from a hard-coded "unsupported" list. When a team ships a
+feature, its probe starts passing and it drops out of the report. Features no
+static probe can check (such as `cursor` or `transition`) are listed under
+**Not verified**. The audit runs on a background thread the first time the
+tab is shown and reuses probe results for the rest of the session. The
+detection and probe logic lives in `devtools::compat`.
