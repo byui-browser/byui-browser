@@ -124,6 +124,41 @@ impl StorageKey {
     }
 }
 
+/// A storage key that a renderer context has authorized for use.
+///
+/// The token borrows the key owned by its [`RendererSecurityContext`]. It can
+/// only be created by validating a request or by asking the context for its
+/// own key, so storage backends do not have to trust renderer-supplied keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedStorageKey<'context> {
+    storage_key: &'context StorageKey,
+}
+
+impl<'context> TrustedStorageKey<'context> {
+    /// Returns the storage key authorized by the renderer context.
+    #[must_use]
+    pub fn storage_key(self) -> &'context StorageKey {
+        self.storage_key
+    }
+}
+
+/// Why a storage-key authorization request was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageKeyValidationError {
+    /// The requested key does not match the context's trusted key.
+    Mismatch,
+}
+
+impl fmt::Display for StorageKeyValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mismatch => formatter.write_str("storage key does not match renderer context"),
+        }
+    }
+}
+
+impl std::error::Error for StorageKeyValidationError {}
+
 /// The renderer's permission to access browser storage.
 ///
 /// This initial policy is all-or-nothing: allowing storage permits both reads
@@ -187,6 +222,38 @@ impl RendererSecurityContext {
     /// Returns the storage key associated with the renderer's origin.
     pub fn storage_key(&self) -> &StorageKey {
         &self.storage_key
+    }
+
+    /// Returns this context's trusted storage key.
+    ///
+    /// Browser code uses this when it creates a request for the renderer's
+    /// own storage area. The returned token borrows the context and cannot be
+    /// constructed from an arbitrary [`StorageKey`].
+    #[must_use]
+    pub fn trusted_storage_key(&self) -> TrustedStorageKey<'_> {
+        TrustedStorageKey {
+            storage_key: &self.storage_key,
+        }
+    }
+
+    /// Authorizes a requested storage key against this renderer context.
+    ///
+    /// Call this at a storage or IPC boundary before using a key supplied by a
+    /// renderer. A key for another origin, including a manually constructed
+    /// key, is rejected.
+    pub fn authorize_storage_key(
+        &self,
+        requested: &StorageKey,
+    ) -> Result<TrustedStorageKey<'_>, StorageKeyValidationError> {
+        if requested != &self.storage_key {
+            log::warn!(
+                "rejected storage key for {}: key does not match renderer context",
+                origin_label(&self.origin)
+            );
+            return Err(StorageKeyValidationError::Mismatch);
+        }
+
+        Ok(self.trusted_storage_key())
     }
 
     /// Whether the renderer is allowed to read storage.
@@ -428,6 +495,47 @@ mod tests {
         assert_eq!(context.storage_key().get(), &origin);
         assert!(!context.can_read_storage());
         assert!(!context.can_write_storage());
+    }
+
+    #[test]
+    fn renderer_context_authorizes_its_own_storage_key() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+
+        let authorized = context
+            .authorize_storage_key(context.storage_key())
+            .expect("context key should be authorized");
+
+        assert_eq!(authorized.storage_key(), context.storage_key());
+    }
+
+    #[test]
+    fn renderer_context_rejects_another_origins_storage_key() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+        let forged = StorageKey::new(origin("https", "example.com", 443));
+
+        assert_eq!(
+            context.authorize_storage_key(&forged),
+            Err(StorageKeyValidationError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn trusted_storage_key_comes_from_context() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+
+        assert_eq!(
+            context.trusted_storage_key().storage_key(),
+            context.storage_key()
+        );
     }
 
     #[test]
