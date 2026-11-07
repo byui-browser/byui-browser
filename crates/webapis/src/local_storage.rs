@@ -43,13 +43,14 @@ impl LocalStorage {
             origin.host(),
             origin.port()
         );
+        let trusted_storage_key = self.security_context.trusted_storage_key();
         self.storage
             .lock()
             .map_err(|_| {
                 log::error!("localStorage backend lock is poisoned");
                 JsError::new("localStorage is unavailable")
             })?
-            .write_item(self.security_context.storage_key(), key, value)
+            .write_item(&trusted_storage_key, key, value)
             .map_err(|error| {
                 log::debug!("localStorage.setItem key {key:?} failed: {error}");
                 JsError::new(error.to_string())
@@ -69,6 +70,7 @@ impl LocalStorage {
             return Err(JsError::new("localStorage read access denied"));
         }
 
+        let trusted_storage_key = self.security_context.trusted_storage_key();
         let value = self
             .storage
             .lock()
@@ -76,7 +78,7 @@ impl LocalStorage {
                 log::error!("localStorage backend lock is poisoned");
                 JsError::new("localStorage is unavailable")
             })?
-            .read_item(self.security_context.storage_key(), key)
+            .read_item(&trusted_storage_key, key)
             .map_err(|error| {
                 log::debug!("localStorage.getItem key {key:?} failed: {error}");
                 JsError::new(error.to_string())
