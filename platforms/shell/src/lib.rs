@@ -24,6 +24,8 @@ mod context_menu;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 mod elements_panel;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+mod find_in_page;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 mod page_source;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 mod toolbar;

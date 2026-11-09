@@ -8,6 +8,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Map lowercase expansions to complete original grapheme clusters for Find.
+unicode-segmentation = "1.13.3"
 log = { workspace = true }
 common = { workspace = true }
 browser = { path = "../../crates/browser" }
