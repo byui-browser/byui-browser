@@ -145,6 +145,11 @@ struct App {
     proxy: Option<EventLoopProxy<UserEvent>>,
     /// Id of the newest navigation; results for older ids are ignored.
     navigation_id: u64,
+    /// Independent sequence for the most recently started loading operation.
+    loading_id: u64,
+    navigation_loading: Option<(u64, u64)>,
+    /// A completion probe owns Reload's existing task handle; dropping it detaches.
+    reload_completion: Option<(u64, Box<dyn Fn() -> bool>)>,
 }
 
 /// Messages that background threads post to the UI thread's event loop.
@@ -286,6 +291,34 @@ impl App {
                 .ok(),
             proxy: None,
             navigation_id: 0,
+            loading_id: 0,
+            navigation_loading: None,
+            reload_completion: None,
+        }
+    }
+
+    fn begin_loading(&mut self) -> u64 {
+        self.loading_id += 1;
+        self.chrome.loading = true;
+        self.redraw();
+        self.loading_id
+    }
+
+    fn finish_loading(&mut self, id: u64) {
+        if id == self.loading_id {
+            self.chrome.loading = false;
+            self.redraw();
+        }
+    }
+
+    fn poll_reload(&mut self) {
+        if self
+            .reload_completion
+            .as_ref()
+            .is_some_and(|(_, done)| done())
+        {
+            let (id, _) = self.reload_completion.take().expect("completed reload");
+            self.finish_loading(id);
         }
     }
 
@@ -359,6 +392,9 @@ impl App {
             log::debug!("address submitted: {address}");
             log::debug!("navigating to {address}");
             self.navigation_id += 1;
+            let id = self.begin_loading();
+            self.finish_loading(id);
+            self.navigation_loading = None;
             self.page_loaded(&address, browser::welcome_page());
         } else {
             log::debug!("address submitted: {address}");
@@ -377,10 +413,14 @@ impl App {
     fn start_navigation_with_behavior(&mut self, address: &str, behavior: NavigationBehavior) {
         self.navigation_id += 1;
         let id = self.navigation_id;
+        let loading = self.begin_loading();
         let (Some(loader), Some(proxy)) = (&self.loader, self.proxy.clone()) else {
             log::warn!("navigation to {address} unavailable: page loader is not running");
+            self.finish_loading(loading);
+            self.navigation_loading = None;
             return;
         };
+        self.navigation_loading = Some((id, loading));
         log::debug!("navigating to {address}");
         loader.load(address, move |navigation| {
             // A closed event loop means the app is exiting; nothing to do.
@@ -402,6 +442,12 @@ impl App {
     ) {
         if id != self.navigation_id {
             return;
+        }
+        if let Some((navigation_id, loading)) = self.navigation_loading
+            && navigation_id == id
+        {
+            self.navigation_loading = None;
+            self.finish_loading(loading);
         }
         match navigation.result {
             Ok(page) => {
@@ -1018,8 +1064,10 @@ impl App {
                 log::debug!("reload requested");
                 log::debug!("toolbar action: reload");
                 if let Some(refresh) = &self.refresh {
-                    // Dropping the handle detaches the task; fetching stays off the UI thread.
-                    drop(refresh.refresh(&self.browser_state));
+                    if let Some(task) = refresh.refresh(&self.browser_state) {
+                        let id = self.begin_loading();
+                        self.reload_completion = Some((id, Box::new(move || task.is_finished())));
+                    }
                 } else {
                     log::error!("refresh unavailable: initialization failed");
                 }
@@ -1475,7 +1523,14 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.poll_reload();
+        event_loop.set_control_flow(if self.reload_completion.is_some() {
+            ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(40))
+        } else {
+            ControlFlow::Wait
+        });
+
         // `frame_key` is set only after a frame has been presented, so the
         // window is on screen before the page script can request an alert.
         if self.scripts_evaluated || self.frame_key.is_none() {
@@ -1571,6 +1626,124 @@ mod tests {
             },
             browser::BrowserRuntime::in_memory(),
         )
+    }
+
+    #[test]
+    fn loading_completions_only_clear_the_latest_operation() {
+        let mut app = app();
+        let old = app.begin_loading();
+        let current = app.begin_loading();
+        app.finish_loading(old);
+        assert!(app.chrome.loading);
+        app.finish_loading(current);
+        assert!(!app.chrome.loading);
+    }
+
+    #[test]
+    fn navigation_success_failure_and_stale_completion_update_loading_safely() {
+        let mut app = app();
+        for failed in [false, true] {
+            app.navigation_id += 1;
+            let id = app.navigation_id;
+            let loading = app.begin_loading();
+            app.navigation_loading = Some((id, loading));
+            app.navigation_finished(
+                id - 1,
+                navigation("old", Ok(browser::welcome_page())),
+                NavigationBehavior::Auto,
+            );
+            assert!(app.chrome.loading);
+            let result = if failed {
+                Err(browser::LoadError::Status {
+                    status: 500,
+                    status_text: "Error".into(),
+                })
+            } else {
+                Ok(browser::welcome_page())
+            };
+            app.navigation_finished(
+                id,
+                navigation("byui://welcome", result),
+                NavigationBehavior::Auto,
+            );
+            assert!(!app.chrome.loading);
+        }
+    }
+
+    #[test]
+    fn reload_completion_preserves_newer_navigation_and_history() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let history = app.browser_state.clone();
+        let id = app.begin_loading();
+        let done = Rc::new(std::cell::Cell::new(false));
+        let probe = done.clone();
+        app.reload_completion = Some((id, Box::new(move || probe.get())));
+        app.poll_reload();
+        assert!(app.chrome.loading);
+        let newer = app.begin_loading();
+        done.set(true);
+        app.poll_reload();
+        assert!(app.chrome.loading);
+        assert!(app.reload_completion.is_none());
+        app.finish_loading(newer);
+        assert!(!app.chrome.loading);
+        assert_eq!(app.browser_state, history);
+    }
+
+    #[test]
+    fn real_reload_success_and_failure_clear_loading_without_changing_history() {
+        let mut app = app();
+        for url in ["byui://welcome", "unsupported://invalid"] {
+            app.browser_state.record_visit(url);
+            let history = app.browser_state.clone();
+            let page = app.loaded_page.clone();
+            app.activate(Control::Reload);
+            assert!(app.chrome.loading);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.chrome.loading {
+                assert!(
+                    Instant::now() < deadline,
+                    "Reload completion was not observed"
+                );
+                app.poll_reload();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(app.reload_completion.is_none());
+            assert_eq!(app.browser_state, history);
+            assert_eq!(app.loaded_page, page);
+        }
+    }
+
+    #[test]
+    fn navigation_completion_does_not_clear_a_newer_reload_indicator() {
+        let mut app = app();
+        let navigation_loading = app.begin_loading();
+        app.navigation_id = 1;
+        app.navigation_loading = Some((1, navigation_loading));
+        let reload_loading = app.begin_loading();
+        app.navigation_finished(
+            1,
+            navigation("byui://welcome", Ok(browser::welcome_page())),
+            NavigationBehavior::Auto,
+        );
+        assert!(app.chrome.loading);
+        app.finish_loading(reload_loading);
+        assert!(!app.chrome.loading);
+    }
+
+    #[test]
+    fn missing_loader_or_reload_url_never_leaves_loading_active() {
+        let mut app = app();
+        app.loader = None;
+        app.start_navigation("https://example.com");
+        assert!(!app.chrome.loading);
+        app.activate(Control::Reload);
+        assert!(!app.chrome.loading);
+        app.begin_loading();
+        app.address = "byui://welcome".into();
+        app.submit_address();
+        assert!(!app.chrome.loading);
     }
 
     #[test]
