@@ -140,3 +140,26 @@ static probe can check (such as `cursor` or `transition`) are listed under
 **Not verified**. The audit runs on a background thread the first time the
 tab is shown and reuses probe results for the rest of the session. The
 detection and probe logic lives in `devtools::compat`.
+
+### Loading indicator
+
+The address field reserves a compact **Loading...** label while the newest
+navigation or Reload fetch is pending. The URL, caret and toolbar controls remain
+usable. The label uses the existing light/dark palette and scales with the window.
+Each loading operation has an ID separate from navigation IDs: an older completion
+cannot hide a newer operation's indicator. Success and failure both clear it;
+unavailable loaders and missing saved URLs do not leave it stuck.
+
+Reload still uses the existing console-only Refresh fetch and does not replace
+the document or add history. Its task handle is checked on the UI thread at
+40 ms intervals only while pending; no network work blocks the event loop.
+The label tracks fetching/loading, not completion of all page-script execution.
+Immediate embedded welcome loads may finish before a visible loading frame.
+
+On macOS run `cargo run -p browser-macos`. Submit a slow local HTTP URL and check
+that Loading... appears, then disappears on success or failure. Start a second
+load before the first finishes: the first result must not hide the second label.
+Try toolbar Reload, right-click Reload and Command-R; terminal output and history
+behavior remain unchanged. Check address editing, resizing, system appearance,
+View Page Source and Inspect. Fast responses may finish too quickly to see the
+label. Native Windows/Linux interaction still requires manual verification.
