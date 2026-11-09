@@ -81,6 +81,8 @@ pub(crate) struct ChromeState {
     pub dark: bool,
     /// Whether the newest navigation or Refresh fetch is still pending.
     pub loading: bool,
+    /// Reserve space below the toolbar for Find in Page.
+    pub find_open: bool,
     /// Logical width at the toolbar's left reserved for the operating
     /// system's own window buttons when they overlap the toolbar, as macOS's
     /// traffic lights do on a transparent titlebar. Zero when the system draws
@@ -125,6 +127,22 @@ pub(crate) fn page_rect(width: u32, height: u32, scale_factor: f64) -> Option<Pi
         width: page_width,
         height: page_height,
     })
+}
+
+/// Page viewport with the Find bar's row reserved, in device pixels.
+pub(crate) fn page_rect_with_find(
+    width: u32,
+    height: u32,
+    scale: f64,
+    find: bool,
+) -> Option<PixelRect> {
+    let mut rect = page_rect(width, height, scale)?;
+    if find {
+        let extra = (crate::find_in_page::HEIGHT as f64 * scale).round() as u32;
+        rect.y += extra;
+        rect.height = rect.height.checked_sub(extra).filter(|h| *h > 0)?;
+    }
+    Some(rect)
 }
 
 /// Returns the enabled or disabled control at a point given in logical
@@ -182,7 +200,7 @@ pub(crate) fn compose(
     let palette = &if state.dark { dark() } else { light() };
     let scale = scale_factor as f32;
     fill_frame(&mut pixmap, height, palette);
-    if let Some(card) = page_rect(width, height, scale_factor) {
+    if let Some(card) = page_rect_with_find(width, height, scale_factor, state.find_open) {
         draw_page_card(&mut pixmap, card, scale, height, palette, page);
     }
     draw_toolbar(
@@ -992,6 +1010,7 @@ mod tests {
                         pressed: hovered,
                         dark,
                         loading: false,
+                        find_open: false,
                         address_focused: false,
                         address_selected: false,
                         address_caret: 0,

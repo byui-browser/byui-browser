@@ -2,7 +2,7 @@
 
 use layout::{BoxKind, LayoutTree, PaintItem};
 
-use crate::{Color, DisplayItem, DisplayList};
+use crate::{Color, DisplayItem, DisplayList, PaintBox};
 
 /// The user agent's default canvas color: the `Canvas` system color in a light
 /// color scheme. It is used when neither the root element nor `body` has a
@@ -25,7 +25,7 @@ pub const CANVAS_COLOR: Color = Color {
 /// Only backgrounds and text are painted; borders, outlines, and other
 /// decorations are not supported yet.
 pub fn paint_document(tree: &LayoutTree) -> DisplayList {
-    paint(tree, 0.0, false)
+    paint(tree, 0.0, false, |_| Vec::new())
 }
 
 /// Paints the part of a layout tree visible when its viewport is scrolled
@@ -41,10 +41,30 @@ pub fn paint_document(tree: &LayoutTree) -> DisplayList {
 /// Only vertical scrolling is supported. With `scroll_y` of `0.0` this
 /// matches [`paint_document`] minus the culled off-screen items.
 pub fn paint_document_scrolled(tree: &LayoutTree, scroll_y: f32) -> DisplayList {
-    paint(tree, scroll_y, true)
+    paint(tree, scroll_y, true, |_| Vec::new())
 }
 
-fn paint(tree: &LayoutTree, scroll_y: f32, cull: bool) -> DisplayList {
+/// Paints a scrolled document with optional backgrounds immediately before each text run.
+///
+/// `backgrounds` receives visible layout text fragments in document
+/// coordinates. It returns colored rectangles in document CSS pixels; callers own
+/// range measurement and color policy. Rectangles follow the same scroll transform
+/// and viewport clipping as ordinary paint commands. Return an empty vector for an
+/// unchanged run. This does not alter layout, hit testing, or glyph rendering.
+pub fn paint_document_scrolled_with_text_backgrounds(
+    tree: &LayoutTree,
+    scroll_y: f32,
+    backgrounds: impl FnMut(&layout::TextFragment) -> Vec<PaintBox>,
+) -> DisplayList {
+    paint(tree, scroll_y, true, backgrounds)
+}
+
+fn paint(
+    tree: &LayoutTree,
+    scroll_y: f32,
+    cull: bool,
+    mut backgrounds: impl FnMut(&layout::TextFragment) -> Vec<PaintBox>,
+) -> DisplayList {
     log::trace!("building display list (scroll_y {scroll_y}, cull {cull})");
     let viewport = tree.root.rect;
     // Whether a content rect in document coordinates is (partly) on screen.
@@ -82,6 +102,16 @@ fn paint(tree: &LayoutTree, scroll_y: f32, cull: bool) -> DisplayList {
                 }
             }
             PaintItem::Text(text) => {
+                if visible(&text.rect) {
+                    for background in backgrounds(text) {
+                        if let Some(color) = background.background {
+                            items.push(DisplayItem::FillRect {
+                                rect: scrolled(background.rect),
+                                color,
+                            });
+                        }
+                    }
+                }
                 if !text.text.trim().is_empty() && visible(&text.rect) {
                     items.push(DisplayItem::Text {
                         x: text.rect.x,
@@ -236,5 +266,110 @@ mod tests {
         assert_eq!(texts.len(), 1);
         assert_eq!(texts[0].0, "Bottom");
         assert!((texts[0].1 - 14.4).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod text_background_tests {
+    use super::*;
+    use layout::{FontMetrics, Size, layout_document};
+    use render_test_metrics::Metrics;
+    mod render_test_metrics {
+        pub struct Metrics;
+        impl layout::FontMetrics for Metrics {
+            fn advance(&self, c: char, size: f32) -> f32 {
+                if c == 'W' { size } else { size / 4.0 }
+            }
+            fn vertical_metrics(&self, size: f32) -> layout::VerticalMetrics {
+                layout::VerticalMetrics {
+                    ascent: size * 0.8,
+                    descent: size * 0.2,
+                    line_gap: 0.0,
+                }
+            }
+        }
+    }
+    fn tree() -> LayoutTree {
+        let doc = html::parse_raw_html("<body><p>WiWi</p><p>lower</p></body>".into());
+        let styles = css::style_document(&doc, &[]);
+        layout_document(
+            &doc,
+            &styles,
+            Size {
+                width: 200.0,
+                height: 100.0,
+            },
+            &Metrics,
+        )
+    }
+    #[test]
+    fn empty_text_background_hook_preserves_normal_output_exactly() {
+        let tree = tree();
+        for scroll in [0.0, 12.5] {
+            assert_eq!(
+                paint_document_scrolled(&tree, scroll),
+                paint_document_scrolled_with_text_backgrounds(&tree, scroll, |_| Vec::new())
+            );
+        }
+    }
+    #[test]
+    fn backgrounds_are_before_their_text_and_follow_scroll_coordinates() {
+        let tree = tree();
+        let color = Color {
+            r: 255,
+            g: 220,
+            b: 0,
+            a: 140,
+        };
+        let scroll = 3.0;
+        let list = paint_document_scrolled_with_text_backgrounds(&tree, scroll, |text| {
+            vec![PaintBox {
+                rect: layout::Rect {
+                    x: text.rect.x + Metrics.text_width("W", text.font_size),
+                    y: text.rect.y,
+                    width: Metrics.text_width("i", text.font_size),
+                    height: text.rect.height,
+                },
+                background: Some(color),
+            }]
+        });
+        let original = tree
+            .paint_order()
+            .into_iter()
+            .filter_map(|item| {
+                if let PaintItem::Text(text) = item {
+                    Some(text)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for (index, item) in list.items.iter().enumerate() {
+            if let DisplayItem::Text { text, baseline, .. } = item {
+                let source = original.iter().find(|t| t.text == *text).unwrap();
+                assert_eq!(*baseline, source.baseline - scroll);
+                let DisplayItem::FillRect {
+                    rect,
+                    color: actual,
+                } = list.items[index - 1]
+                else {
+                    panic!("missing text background")
+                };
+                assert_eq!(actual, color);
+                assert_eq!(rect.y, source.rect.y - scroll);
+                assert_eq!(rect.width, Metrics.text_width("i", source.font_size));
+                assert!(rect.width < source.rect.width);
+            }
+        }
+    }
+    #[test]
+    fn offscreen_fragments_do_not_request_backgrounds() {
+        let tree = tree();
+        let mut count = 0;
+        paint_document_scrolled_with_text_backgrounds(&tree, 10000.0, |_| {
+            count += 1;
+            vec![]
+        });
+        assert_eq!(count, 0);
     }
 }

@@ -25,6 +25,7 @@ use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 use crate::compat_panel::{CompatState, ShellAuditor, ShellScriptEngine};
 use crate::context_menu::{ContextMenu, MenuAction};
 use crate::elements_panel::{DockTab, ElementsPanel};
+use crate::find_in_page::{Action as FindAction, FindInPage};
 use crate::page_source::PageSource;
 use crate::toolbar::{self, ChromeState, Control};
 
@@ -127,6 +128,9 @@ struct App {
     /// The pointer went down on the page and has not been released yet.
     page_press: bool,
     scripts_evaluated: bool,
+    find: Option<FindInPage>,
+    find_pressed: Option<FindAction>,
+    find_reveal: bool,
     context_menu: Option<ContextMenu>,
     menu_pressed: Option<MenuAction>,
     page_source: Option<PageSource>,
@@ -277,6 +281,9 @@ impl App {
             page_events: crate::content::PageEvents::new(),
             page_press: false,
             scripts_evaluated: false,
+            find: None,
+            find_pressed: None,
+            find_reveal: false,
             context_menu: None,
             menu_pressed: None,
             page_source: None,
@@ -322,6 +329,114 @@ impl App {
         }
     }
 
+    fn open_find(&mut self) {
+        self.dismiss_context_menu();
+        self.close_page_source();
+        self.chrome.address_focused = false;
+        let find = self.find.get_or_insert_with(FindInPage::default);
+        find.focus();
+        self.chrome.find_open = true;
+        self.find_reveal = true;
+        self.page = None;
+        self.page_layout = None;
+        self.frame_key = None;
+        self.redraw();
+    }
+
+    fn close_find(&mut self) {
+        self.find = None;
+        self.find_pressed = None;
+        self.chrome.find_open = false;
+        self.find_reveal = false;
+        self.page = None;
+        self.page_layout = None;
+        self.frame_key = None;
+        self.redraw();
+    }
+
+    fn find_step(&mut self, previous: bool) {
+        if let Some(find) = &mut self.find {
+            find.step(previous);
+            find.focused = true;
+            self.chrome.address_focused = false;
+        }
+        self.find_reveal = true;
+        self.page = None;
+        self.redraw();
+    }
+
+    /// Consumes Find input before either address editing or page shortcuts.
+    fn find_key(&mut self, key: &Key) -> bool {
+        let shortcut = self.modifiers.control_key()
+            || (cfg!(target_os = "macos") && self.modifiers.super_key());
+        if shortcut && matches!(key,Key::Character(c) if c.eq_ignore_ascii_case("f")) {
+            self.open_find();
+            return true;
+        }
+        if self.page_source.is_some() || self.context_menu.is_some() {
+            return false;
+        }
+        if self.elements.is_some()
+            && self.find.as_ref().is_some_and(|f| !f.focused)
+            && *key == Key::Named(NamedKey::Escape)
+        {
+            return false;
+        }
+        if self.find.is_some() && *key == Key::Named(NamedKey::Escape) {
+            self.close_find();
+            return true;
+        }
+        let Some(find) = &mut self.find else {
+            return false;
+        };
+        if !find.focused {
+            return false;
+        }
+        if shortcut {
+            match key {
+                Key::Character(c) if c.eq_ignore_ascii_case("a") => find.select_all(),
+                Key::Character(c) if c.eq_ignore_ascii_case("v") => {
+                    match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                        Ok(text) => find.insert(&text),
+                        Err(error) => log::warn!("Find paste failed: {error}"),
+                    }
+                }
+                // Let existing browser-level shortcuts (address, zoom, Reload) run.
+                Key::Character(c)
+                    if ["l", "r", "+", "=", "-", "_", "0"]
+                        .contains(&c.to_ascii_lowercase().as_str()) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        } else {
+            match key {
+                Key::Named(NamedKey::Enter) => {
+                    self.find_step(self.modifiers.shift_key());
+                    return true;
+                }
+                // Winit reports Space as a named key on macOS, not character text.
+                Key::Named(NamedKey::Space) if !self.modifiers.alt_key() => find.insert(" "),
+                Key::Named(NamedKey::Backspace) => find.delete(false),
+                Key::Named(NamedKey::Delete) => find.delete(true),
+                Key::Named(NamedKey::ArrowLeft) => find.move_caret(-1),
+                Key::Named(NamedKey::ArrowRight) => find.move_caret(1),
+                Key::Named(NamedKey::Home) => find.end(false),
+                Key::Named(NamedKey::End) => find.end(true),
+                Key::Named(NamedKey::Tab) => {
+                    find.focused = false;
+                }
+                Key::Character(c) if !self.modifiers.alt_key() => find.insert(c),
+                _ => {}
+            }
+        }
+        self.find_reveal = true;
+        self.page = None;
+        self.redraw();
+        true
+    }
+
     fn redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -346,6 +461,7 @@ impl App {
         // Elements is a document snapshot; never retain it across navigation.
         self.close_elements();
         self.loaded_page = Some(page);
+        self.find_reveal = self.find.is_some();
         // Scripts of the new document run after its first frame is presented.
         self.scripts_evaluated = false;
         self.frame_key = None;
@@ -366,6 +482,9 @@ impl App {
     }
 
     fn begin_address_edit(&mut self) {
+        if let Some(find) = &mut self.find {
+            find.focused = false;
+        }
         self.address_before_edit = self.address.clone();
         self.chrome.address_caret = self.address.len();
         self.chrome.address_selected = true;
@@ -463,6 +582,7 @@ impl App {
                 log::debug!("showing error page for {}: {error}", navigation.address);
                 self.close_elements();
                 self.loaded_page = Some(browser::error_page(&navigation.address, &error));
+                self.find_reveal = self.find.is_some();
                 self.scripts_evaluated = false;
                 self.frame_key = None;
                 self.page = None;
@@ -694,6 +814,9 @@ impl App {
     }
 
     fn show_page_source(&mut self) {
+        if let Some(find) = &mut self.find {
+            find.focused = false;
+        }
         if let Some(page) = &self.loaded_page {
             log::debug!("page source view opened ({} bytes)", page.html.len());
             self.page_source = Some(PageSource::new(&page.html));
@@ -726,6 +849,9 @@ impl App {
     }
 
     fn show_elements(&mut self) {
+        if let Some(find) = &mut self.find {
+            find.focused = false;
+        }
         self.elements = Some(ElementsPanel::new(
             self.loaded_page.as_ref().map(|page| page.html.as_str()),
         ));
@@ -910,6 +1036,7 @@ impl App {
             return;
         }
         self.page_zoom = zoom;
+        self.find_reveal = self.find.is_some();
         self.page = None;
         self.page_layout = None;
         self.scroll_y = 0.0;
@@ -937,7 +1064,8 @@ impl App {
         let Some((x, y)) = self.cursor else {
             return;
         };
-        let Some(card) = toolbar::page_rect(width, height, scale) else {
+        let Some(card) = toolbar::page_rect_with_find(width, height, scale, self.find.is_some())
+        else {
             return;
         };
         if x < f64::from(card.x) / scale
@@ -1011,6 +1139,47 @@ impl App {
                 }
             }
             return;
+        }
+        if let Some(find) = &mut self.find {
+            let width = self
+                .window
+                .as_ref()
+                .map_or(420.0, |w| w.inner_size().width as f64 / w.scale_factor())
+                as f32;
+            let on_bar = self.cursor.is_some_and(|(_, y)| {
+                y >= toolbar::TOOLBAR_HEIGHT
+                    && y < toolbar::TOOLBAR_HEIGHT + crate::find_in_page::HEIGHT as f64
+            });
+            if on_bar || self.find_pressed.is_some() {
+                let action = FindInPage::action_at(width, self.cursor);
+                match state {
+                    ElementState::Pressed => {
+                        self.find_pressed = action;
+                        self.page_press = false;
+                    }
+                    ElementState::Released => {
+                        let selected = self.find_pressed.take().filter(|a| Some(*a) == action);
+                        match selected {
+                            Some(FindAction::Close) => self.close_find(),
+                            Some(FindAction::Next) => self.find_step(false),
+                            Some(FindAction::Previous) => self.find_step(true),
+                            Some(FindAction::Field) => {
+                                if let Some(find) = &mut self.find {
+                                    find.focus();
+                                }
+                                self.chrome.address_focused = false;
+                                self.redraw();
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                return;
+            }
+            if state == ElementState::Pressed {
+                find.focused = false;
+                self.redraw();
+            }
         }
         if let Some(panel) = &self.elements {
             let inside = panel.contains(self.cursor);
@@ -1109,9 +1278,11 @@ impl App {
         let page_scale = scale * self.page_zoom;
         let dark = window.theme() == Some(Theme::Dark);
         self.chrome.dark = dark;
-        let card = toolbar::page_rect(size.width, size.height, scale);
+        let card =
+            toolbar::page_rect_with_find(size.width, size.height, scale, self.find.is_some());
         let card_size = card.map(|card| (card.width, card.height));
-        let mut full = self.page.is_none()
+        let mut full = self.find.is_some()
+            || self.page.is_none()
             || self.context_menu.is_some()
             || self.page_source.is_some()
             || self.elements.is_some();
@@ -1122,7 +1293,9 @@ impl App {
             // unable to finish. `about_to_wait` starts it after this frame.
             self.page = card.and_then(|card| {
                 let css_size = crate::content::css_viewport(card.width, card.height, page_scale);
-                if self.page_layout.as_ref().map(|layout| layout.css_size()) != Some(css_size) {
+                let layout_changed =
+                    self.page_layout.as_ref().map(|layout| layout.css_size()) != Some(css_size);
+                if layout_changed {
                     self.page_layout = Some(crate::content::PageLayout::new(
                         self.loaded_page.as_ref().expect("page was loaded"),
                         css_size.0,
@@ -1130,14 +1303,27 @@ impl App {
                     ));
                 }
                 let layout = self.page_layout.as_ref()?;
+                if let Some(find) = &mut self.find {
+                    if layout_changed {
+                        find.replace_runs(layout.find_text());
+                    }
+                    if self.find_reveal || layout_changed {
+                        if let Some(target) = find.scroll_target(layout.max_scroll()) {
+                            self.scroll_y = target;
+                        }
+                        self.find_reveal = false;
+                    }
+                }
                 // A resize or reload can leave less to scroll than before.
                 self.scroll_y = self.scroll_y.clamp(0.0, layout.max_scroll());
-                crate::content::render_page(
+                crate::content::render_page_with_find(
                     layout,
                     card.width,
                     card.height,
                     page_scale,
                     self.scroll_y,
+                    self.find.as_ref(),
+                    self.chrome.dark,
                 )
                 .map(|page| ((card.width, card.height), page))
             });
@@ -1177,6 +1363,9 @@ impl App {
         let Some(mut composed) = composed else {
             return;
         };
+        if let Some(find) = &self.find {
+            find.draw(&mut composed, scale, self.chrome.dark, self.font.as_ref());
+        }
         if let Some(panel) = &mut self.elements {
             panel.draw(
                 &mut composed,
@@ -1316,7 +1505,8 @@ impl App {
         let layout = self.page_layout.as_ref()?;
         let size = window.inner_size();
         let scale = window.scale_factor();
-        let card = toolbar::page_rect(size.width, size.height, scale)?;
+        let card =
+            toolbar::page_rect_with_find(size.width, size.height, scale, self.find.is_some())?;
         let page_scale = scale * self.page_zoom;
         layout.hit_test(
             ((x * scale - card.x as f64) / page_scale) as f32,
@@ -1338,6 +1528,11 @@ impl App {
             .to_logical::<f64>(window.scale_factor())
             .width;
         y >= toolbar::TOOLBAR_HEIGHT
+            + if self.find.is_some() {
+                crate::find_in_page::HEIGHT as f64
+            } else {
+                0.0
+            }
             && toolbar::hit_test(x, y, width, self.platform.window_controls_inset).is_none()
     }
 }
@@ -1402,6 +1597,9 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 log::trace!("key event: {:?}", event.state);
+                if event.state == ElementState::Pressed && self.find_key(&event.logical_key) {
+                    return;
+                }
                 // Address editing and the context menu share one key event.
                 if event.state == ElementState::Pressed {
                     self.key_pressed(&event.logical_key);
@@ -1430,6 +1628,9 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     self.page_events
                         .set_device_pixel_ratio(window.scale_factor() * self.page_zoom);
+                }
+                if matches!(event, WindowEvent::ThemeChanged(_)) && self.find.is_some() {
+                    self.page = None;
                 }
                 self.dismiss_context_menu();
                 self.resize_elements();
@@ -1626,6 +1827,176 @@ mod tests {
             },
             browser::BrowserRuntime::in_memory(),
         )
+    }
+
+    /// Mirrors the event loop's consumed-key check before page-key handling.
+    fn type_find_with_named_spaces(app: &mut App, text: &str) {
+        for c in text.chars() {
+            let key = if c == ' ' {
+                Key::Named(NamedKey::Space)
+            } else {
+                Key::Character(c.to_string().into())
+            };
+            if !app.find_key(&key) {
+                app.key_pressed(&key);
+                panic!("Find did not consume {key:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn find_named_space_types_phrases_with_real_counts_and_highlight_ranges() {
+        let page=browser::Page {url:"byui://test".into(),
+            html:"<body><p>Start Welcome <span>to</span> BYUI <b>Browser</b> end</p><button>Click <span>Me</span></button></body>".into(),
+            stylesheets:vec!["body {height:2000px}".into()],scripts:vec![]};
+        for query in [
+            "Welcome to",
+            "BYUI Browser",
+            "Click Me",
+            "Welcome  to",
+            " Welcome  to ",
+        ] {
+            let mut app = app();
+            app.page_loaded("byui://test", page.clone());
+            app.open_find();
+            let layout = crate::content::PageLayout::new(&page, 600, 150);
+            assert!(layout.max_scroll() > 100.0);
+            app.find.as_mut().unwrap().replace_runs(layout.find_text());
+            app.page_layout = Some(layout);
+            app.scroll_y = 100.0;
+            let history = app.browser_state.clone();
+            let address = app.address.clone();
+            type_find_with_named_spaces(&mut app, query);
+            let find = app.find.as_ref().unwrap();
+            assert_eq!(find.query, query);
+            assert_eq!(find.count(), "1/1", "{query}");
+            assert!(
+                find.highlight_ranges(false).len() >= 2,
+                "phrase crosses fragments: {query}"
+            );
+            assert_eq!(app.scroll_y, 100.0, "Space must not invoke page scrolling");
+            assert_eq!(app.address, address);
+            assert_eq!(app.browser_state, history);
+        }
+    }
+
+    #[test]
+    fn find_spaces_preserve_editing_and_shift_space_does_not_page_scroll() {
+        let mut app = app();
+        app.open_find();
+        type_find_with_named_spaces(&mut app, "  Welcome  to  ");
+        assert_eq!(app.find.as_ref().unwrap().query, "  Welcome  to  ");
+        assert!(app.find_key(&Key::Named(NamedKey::Backspace)));
+        assert_eq!(app.find.as_ref().unwrap().query, "  Welcome  to ");
+        app.find_key(&Key::Named(NamedKey::Home));
+        app.find_key(&Key::Named(NamedKey::Delete));
+        assert_eq!(app.find.as_ref().unwrap().query, " Welcome  to ");
+        app.find_key(&Key::Named(NamedKey::End));
+        app.modifiers = ModifiersState::SHIFT;
+        assert!(app.find_key(&Key::Named(NamedKey::Space)));
+        assert_eq!(app.find.as_ref().unwrap().query, " Welcome  to  ");
+        app.modifiers = ModifiersState::empty();
+        assert!(app.find_key(&Key::Character(" ".into())));
+        assert_eq!(app.find.as_ref().unwrap().query, " Welcome  to   ");
+        app.find.as_mut().unwrap().select_all();
+        type_find_with_named_spaces(&mut app, "   ");
+        assert_eq!(app.find.as_ref().unwrap().count(), "0/0");
+        assert!(
+            app.find
+                .as_ref()
+                .unwrap()
+                .highlight_ranges(false)
+                .is_empty()
+        );
+        app.begin_address_edit();
+        assert!(
+            !app.find_key(&Key::Named(NamedKey::Space)),
+            "Find must not intercept address input"
+        );
+    }
+
+    #[test]
+    fn find_shortcut_and_focus_keep_query_separate_from_address() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let history = app.browser_state.clone();
+        let address = app.address.clone();
+        app.modifiers = ModifiersState::CONTROL;
+        assert!(app.find_key(&Key::Character("f".into())));
+        assert!(app.chrome.find_open);
+        assert!(!app.chrome.address_focused);
+        app.modifiers = ModifiersState::empty();
+        assert!(app.find_key(&Key::Character("Welcome".into())));
+        assert_eq!(app.find.as_ref().unwrap().query, "Welcome");
+        assert_eq!(app.address, address);
+        assert_eq!(app.browser_state, history);
+        app.begin_address_edit();
+        assert!(!app.find.as_ref().unwrap().focused);
+        assert!(!app.find_key(&Key::Character("x".into())));
+        #[cfg(target_os = "macos")]
+        {
+            app.modifiers = ModifiersState::SUPER;
+            assert!(app.find_key(&Key::Character("f".into())));
+        }
+    }
+
+    #[test]
+    fn find_enter_shift_enter_escape_and_close_button() {
+        let mut app = app();
+        app.open_find();
+        let page = browser::welcome_page();
+        let layout = crate::content::PageLayout::new(&page, 600, 200);
+        let find = app.find.as_mut().unwrap();
+        find.replace_runs(layout.find_text());
+        find.insert("o");
+        let initial = find.count();
+        app.find_key(&Key::Named(NamedKey::Enter));
+        assert_ne!(app.find.as_ref().unwrap().count(), initial);
+        app.modifiers = ModifiersState::SHIFT;
+        app.find_key(&Key::Named(NamedKey::Enter));
+        assert_eq!(app.find.as_ref().unwrap().count(), initial);
+        app.modifiers = ModifiersState::empty();
+        assert!(app.find_key(&Key::Named(NamedKey::Escape)));
+        assert!(app.find.is_none());
+        app.open_find();
+        let rect = FindInPage::regions(420.0)
+            .into_iter()
+            .find(|(a, _)| *a == FindAction::Close)
+            .unwrap()
+            .1;
+        app.cursor = Some(((rect.x() + 1.0) as f64, (rect.y() + 1.0) as f64));
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        assert!(app.find.is_none());
+        assert!(!app.chrome.find_open);
+    }
+
+    #[test]
+    fn find_remains_independent_of_panels_navigation_and_zoom() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.open_find();
+        app.find.as_mut().unwrap().insert("welcome");
+        app.show_elements();
+        assert!(!app.find.as_ref().unwrap().focused);
+        app.key_pressed(&Key::Named(NamedKey::Escape));
+        assert!(app.elements.is_none());
+        app.show_page_source();
+        assert!(app.page_source.is_some());
+        assert!(app.find.is_some());
+        app.close_page_source();
+        app.page_loaded("byui://welcome", browser::welcome_page());
+        assert!(app.find_reveal);
+        assert!(app.page_layout.is_none());
+        assert_eq!(app.find.as_ref().unwrap().query, "welcome");
+        app.set_page_zoom(1.25);
+        assert!(app.find_reveal);
+        assert!(app.find.is_some());
+        let history = app.browser_state.clone();
+        app.refresh = None;
+        app.activate(Control::Reload);
+        assert_eq!(app.browser_state, history);
+        assert!(app.find.is_some());
     }
 
     #[test]
