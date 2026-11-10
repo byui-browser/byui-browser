@@ -756,6 +756,14 @@ impl PageSession {
     pub fn run_timers(&self) -> JsResult<usize> {
         webapis::run_window_timers(&self.window)
     }
+
+    /// Runs this page's pending `window.requestAnimationFrame()` callbacks.
+    ///
+    /// Call this from the page/event-loop thread immediately before presenting
+    /// a frame. The return value is the number of callbacks delivered.
+    pub fn run_animation_frames(&self) -> JsResult<usize> {
+        webapis::run_window_animation_frames(&self.window)
+    }
 }
 
 struct BootedPage {
