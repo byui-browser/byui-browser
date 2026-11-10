@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod compat;
+
 /// Severity of a console entry, mirroring `console.log` / `warn` / `error`.
 // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
 // types, names, and module layout however your crate's public API needs.

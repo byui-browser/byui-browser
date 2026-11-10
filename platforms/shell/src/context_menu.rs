@@ -1,4 +1,5 @@
-//! Shared page popup: disabled navigation, Reload, View Page Source, and Inspect.
+//! Shared page popup: disabled navigation, Reload, View Page Source, Inspect,
+//! and Audit Compatibility.
 
 use ab_glyph::FontVec;
 use tiny_skia::{Color, PathBuilder, Pixmap, Rect, Transform};
@@ -11,20 +12,23 @@ pub(crate) enum MenuAction {
     Reload,
     PageSource,
     Inspect,
+    /// Opens the DevTools dock on its Compatibility tab.
+    Compatibility,
 }
 
 // Disabled rows deliberately have no executable action. Navigation wiring is
 // outside this feature even when BrowserState has previous/next entries.
-const MENU_ITEMS: [(&str, Option<MenuAction>); 5] = [
+const MENU_ITEMS: [(&str, Option<MenuAction>); 6] = [
     ("Back", None),
     ("Forward", None),
     ("Reload", Some(MenuAction::Reload)),
     ("View Page Source", Some(MenuAction::PageSource)),
     ("Inspect", Some(MenuAction::Inspect)),
+    ("Audit Compatibility", Some(MenuAction::Compatibility)),
 ];
 
 /// Index of the first item after the separator that splits navigation
-/// (Back, Forward, Reload) from developer tools (Source, Inspect).
+/// (Back, Forward, Reload) from developer tools (Source, Inspect, Audit).
 const SECOND_GROUP: usize = 3;
 /// Menu width in logical pixels.
 const WIDTH: f64 = 208.0;
@@ -49,7 +53,7 @@ pub(crate) struct ContextMenu {
 }
 
 impl ContextMenu {
-    /// Anchors a five-item popup at the pointer, clamped to the window.
+    /// Anchors the popup at the pointer, clamped to the window.
     pub(crate) fn new(x: f64, y: f64, width: f64, height: f64) -> Self {
         let menu_width = WIDTH.min(width);
         let menu_height = HEIGHT.min(height);
@@ -218,10 +222,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn five_rows_have_the_requested_order_and_disabled_rows_have_no_actions() {
+    fn rows_have_the_requested_order_and_disabled_rows_have_no_actions() {
         assert_eq!(
             MENU_ITEMS.map(|(label, _)| label),
-            ["Back", "Forward", "Reload", "View Page Source", "Inspect"]
+            [
+                "Back",
+                "Forward",
+                "Reload",
+                "View Page Source",
+                "Inspect",
+                "Audit Compatibility"
+            ]
         );
         let menu = ContextMenu::new(100.0, 100.0, 800.0, 600.0);
         for (row, (_, expected)) in MENU_ITEMS.into_iter().enumerate() {

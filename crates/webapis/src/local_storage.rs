@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
+use common::ipc::StorageRequest;
 use js::{HostFunction, JsError, JsResult, Realm, Value};
-use security::RendererSecurityContext;
+use security::{RendererSecurityContext, StorageAuthorizationError};
 use storage::SharedStorage;
 
 /// JavaScript-facing storage for one renderer context.
@@ -26,15 +27,11 @@ impl LocalStorage {
     /// Stores a value in this binding's origin area.
     pub fn set_item(&self, key: &str, value: &str) -> JsResult<()> {
         let origin = self.security_context.origin();
-        if !self.security_context.can_write_storage() {
-            log::debug!(
-                "localStorage write denied for {}://{}:{} (key {key:?}): storage permission denied",
-                origin.scheme(),
-                origin.host(),
-                origin.port()
-            );
-            return Err(JsError::new("localStorage write access denied"));
-        }
+        let request = StorageRequest::SetItem {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        };
+        let authorized = self.authorize_request(&request, "write")?;
 
         log::debug!(
             "localStorage.setItem key {key:?} ({} bytes) for {}://{}:{}",
@@ -49,7 +46,7 @@ impl LocalStorage {
                 log::error!("localStorage backend lock is poisoned");
                 JsError::new("localStorage is unavailable")
             })?
-            .write_item(self.security_context.storage_key(), key, value)
+            .write_item(&authorized.storage_key(), key, value)
             .map_err(|error| {
                 log::debug!("localStorage.setItem key {key:?} failed: {error}");
                 JsError::new(error.to_string())
@@ -59,15 +56,10 @@ impl LocalStorage {
     /// Reads a value from this binding's origin area.
     pub fn get_item(&self, key: &str) -> JsResult<Option<String>> {
         let origin = self.security_context.origin();
-        if !self.security_context.can_read_storage() {
-            log::debug!(
-                "localStorage read denied for {}://{}:{} (key {key:?}): storage permission denied",
-                origin.scheme(),
-                origin.host(),
-                origin.port()
-            );
-            return Err(JsError::new("localStorage read access denied"));
-        }
+        let request = StorageRequest::GetItem {
+            key: key.to_owned(),
+        };
+        let authorized = self.authorize_request(&request, "read")?;
 
         let value = self
             .storage
@@ -76,7 +68,7 @@ impl LocalStorage {
                 log::error!("localStorage backend lock is poisoned");
                 JsError::new("localStorage is unavailable")
             })?
-            .read_item(self.security_context.storage_key(), key)
+            .read_item(&authorized.storage_key(), key)
             .map_err(|error| {
                 log::debug!("localStorage.getItem key {key:?} failed: {error}");
                 JsError::new(error.to_string())
@@ -90,6 +82,27 @@ impl LocalStorage {
             value.as_ref().map_or(0, String::len)
         );
         Ok(value)
+    }
+
+    fn authorize_request(
+        &self,
+        request: &StorageRequest,
+        operation: &str,
+    ) -> JsResult<security::AuthorizedStorageRequest<'_>> {
+        self.security_context
+            .authorize_storage_request(request, self.security_context.storage_key())
+            .map_err(|error| {
+                log::debug!("localStorage {operation} denied: {error}");
+                match error {
+                    StorageAuthorizationError::PermissionDenied
+                    | StorageAuthorizationError::StorageKeyMismatch => {
+                        JsError::new(format!("localStorage {operation} access denied"))
+                    }
+                    StorageAuthorizationError::InvalidRequest => {
+                        JsError::new("localStorage request is invalid")
+                    }
+                }
+            })
     }
 }
 
@@ -147,7 +160,10 @@ mod tests {
 
     use js::{Realm, Value};
     use security::{Origin, RendererSecurityContext, StoragePermission};
-    use storage::{OriginStorage, PersistentOriginStorage, SharedStorage, shared_storage};
+    use storage::{
+        OriginStorage, PersistentOriginStorage, SharedStorage, StorageBackend, StorageError,
+        shared_storage,
+    };
 
     use super::{LocalStorage, get_item, register_local_storage, set_item};
 
@@ -301,6 +317,39 @@ mod tests {
 
         assert!(binding.set_item("name", "Nestor").is_err());
         assert!(binding.get_item("name").is_err());
+    }
+
+    #[derive(Debug)]
+    struct PanicBackend;
+
+    impl StorageBackend for PanicBackend {
+        fn read_item(
+            &mut self,
+            _storage_key: &security::TrustedStorageKey<'_>,
+            _key: &str,
+        ) -> Result<Option<String>, StorageError> {
+            panic!("denied request reached storage backend");
+        }
+
+        fn write_item(
+            &mut self,
+            _storage_key: &security::TrustedStorageKey<'_>,
+            _key: &str,
+            _value: &str,
+        ) -> Result<(), StorageError> {
+            panic!("denied request reached storage backend");
+        }
+    }
+
+    #[test]
+    fn denied_requests_are_rejected_before_backend_access() {
+        let binding = LocalStorage::new(
+            shared_storage(PanicBackend),
+            context("example.com", StoragePermission::Denied),
+        );
+
+        assert!(binding.get_item("name").is_err());
+        assert!(binding.set_item("name", "Nestor").is_err());
     }
 
     #[test]

@@ -17,6 +17,7 @@ mod element;
 mod event;
 mod fetch;
 pub mod local_storage;
+mod location;
 mod selector;
 mod timer;
 mod window;
@@ -24,7 +25,10 @@ mod window;
 pub use alert::{AlertSink, alert, register_alert};
 pub use console::{ConsoleSink, print, register_print};
 pub use custom_elements::CustomElementRegistry;
-pub use document::{Document, get_element_by_id, register_document, register_document_on_window};
+pub use document::{
+    Document, get_element_by_id, register_document, register_document_on_window,
+    register_document_with_location,
+};
 pub use dom_exception::DomException;
 pub use element::{Element, get_attribute};
 pub use event::{
@@ -32,11 +36,15 @@ pub use event::{
     dispatch_event, event_constructor, remove_event_listener,
 };
 pub use fetch::{fetch, register_fetch};
+pub use location::{
+    LocationNavigate, NavigationBehavior, register_location, register_location_with_navigation,
+};
 pub use selector::SelectorError;
 pub use timer::{TimerId, TimerQueue};
 pub use window::{
-    TimerDispatcher, clear_window_timers, dispatch_window_timer, register_window,
-    register_window_with_security_context, register_window_with_url,
+    ViewportSize, register_window, register_window_with_security_context,
+    register_window_with_security_context_and_viewport, register_window_with_url,
     register_window_with_url_and_device_pixel_ratio,
-    register_window_with_url_and_device_pixel_ratio_and_timer_dispatcher,
+    register_window_with_url_device_pixel_ratio_and_viewport, run_window_animation_frames,
+    run_window_timers,
 };

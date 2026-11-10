@@ -79,6 +79,10 @@ pub(crate) struct ChromeState {
     pub pressed: Option<Control>,
     /// Whether to use the dark palette.
     pub dark: bool,
+    /// Whether the newest navigation or Refresh fetch is still pending.
+    pub loading: bool,
+    /// Reserve space below the toolbar for Find in Page.
+    pub find_open: bool,
     /// Logical width at the toolbar's left reserved for the operating
     /// system's own window buttons when they overlap the toolbar, as macOS's
     /// traffic lights do on a transparent titlebar. Zero when the system draws
@@ -123,6 +127,22 @@ pub(crate) fn page_rect(width: u32, height: u32, scale_factor: f64) -> Option<Pi
         width: page_width,
         height: page_height,
     })
+}
+
+/// Page viewport with the Find bar's row reserved, in device pixels.
+pub(crate) fn page_rect_with_find(
+    width: u32,
+    height: u32,
+    scale: f64,
+    find: bool,
+) -> Option<PixelRect> {
+    let mut rect = page_rect(width, height, scale)?;
+    if find {
+        let extra = (crate::find_in_page::HEIGHT as f64 * scale).round() as u32;
+        rect.y += extra;
+        rect.height = rect.height.checked_sub(extra).filter(|h| *h > 0)?;
+    }
+    Some(rect)
 }
 
 /// Returns the enabled or disabled control at a point given in logical
@@ -180,7 +200,7 @@ pub(crate) fn compose(
     let palette = &if state.dark { dark() } else { light() };
     let scale = scale_factor as f32;
     fill_frame(&mut pixmap, height, palette);
-    if let Some(card) = page_rect(width, height, scale_factor) {
+    if let Some(card) = page_rect_with_find(width, height, scale_factor, state.find_open) {
         draw_page_card(&mut pixmap, card, scale, height, palette, page);
     }
     draw_toolbar(
@@ -237,7 +257,7 @@ fn fill_frame(pixmap: &mut Pixmap, window_height: u32, palette: &Palette) {
     let width = pixmap.width() as usize;
     for (y, row) in pixmap.data_mut().chunks_exact_mut(width * 4).enumerate() {
         let color = frame_color(y as u32, window_height, palette);
-        for pixel in row.chunks_exact_mut(4) {
+        for pixel in row.as_chunks_mut::<4>().0.iter_mut() {
             pixel.copy_from_slice(&color);
         }
     }
@@ -346,10 +366,10 @@ fn draw_toolbar(
             (_, Some(hovered)) if hovered == control && active => Some(palette.hover),
             _ => None,
         };
-        if let Some(color) = background {
-            if let Some(path) = rounded_rect(rect.x(), rect.y(), rect.width(), rect.height(), 7.0) {
-                fill(pixmap, &path, color, transform);
-            }
+        if let Some(color) = background
+            && let Some(path) = rounded_rect(rect.x(), rect.y(), rect.width(), rect.height(), 7.0)
+        {
+            fill(pixmap, &path, color, transform);
         }
         let color = if active {
             palette.icon
@@ -509,7 +529,30 @@ fn draw_address_field(
     }
 
     let text_x = rect.x() + 30.0;
-    let clip_x = star_x - 12.0;
+    let mut clip_x = star_x - 12.0;
+    if state.loading
+        && let Some(font) = font
+    {
+        // Reserve a separate text lane; URL, selection and caret stop before it.
+        // At unusually narrow widths shrink the label rather than cover controls.
+        let unit_width = text_advance(font, scale, "Loading...") / scale;
+        let size = 11.0_f32.min((rect.width() - 74.0).max(1.0) / unit_width.max(1.0));
+        let advance = text_advance(font, size * scale, "Loading...") / scale;
+        let x = rect.right() - 30.0 - advance;
+        clip_x = x - 6.0;
+        let scaled = font.as_scaled(PxScale::from(size * scale));
+        let baseline = cy * scale + (scaled.ascent() + scaled.descent()) / 2.0;
+        draw_text(
+            pixmap,
+            font,
+            size * scale,
+            x * scale,
+            baseline,
+            (rect.right() - 28.0) * scale,
+            palette.accent,
+            "Loading...",
+        );
+    }
     // Logical x of the caret, before the glyph at `address_caret`.
     let mut caret_x = text_x;
     if let Some(font) = font {
@@ -548,7 +591,7 @@ fn draw_address_field(
         );
     }
     if state.address_focused && !state.address_selected {
-        let x = caret_x.min(clip_x) + 1.0;
+        let x = caret_x.min(clip_x - 2.0) + 1.0;
         if let Some(caret) = Rect::from_xywh(x, cy - 8.0, 1.5, 16.0) {
             fill(
                 pixmap,
@@ -795,6 +838,60 @@ mod tests {
         [p.red(), p.green(), p.blue(), p.alpha()]
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn loading_label_changes_only_address_field_and_matches_partial_paint() {
+        let font = load_ui_font([
+            "/System/Library/Fonts/SFNS.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+        ])
+        .expect("macOS UI font");
+        for width in [420, 640, 1120] {
+            for scale in [1.0, 1.5, 2.0] {
+                for dark in [false, true] {
+                    let width_px = (width as f64 * scale) as u32;
+                    let height = (300.0 * scale) as u32;
+                    let idle = ChromeState {
+                        dark,
+                        window_controls_inset: 72.0,
+                        address_focused: true,
+                        address_caret: usize::MAX,
+                        ..ChromeState::default()
+                    };
+                    let busy = ChromeState {
+                        loading: true,
+                        ..idle
+                    };
+                    let address =
+                        "https://example.com/a/very/long/address/that/must/not/cover/loading";
+                    let before =
+                        compose(width_px, height, scale, &idle, address, None, Some(&font))
+                            .unwrap();
+                    let after = compose(width_px, height, scale, &busy, address, None, Some(&font))
+                        .unwrap();
+                    assert_ne!(before.data(), after.data());
+                    let strip =
+                        compose_controls(width_px, height, scale, &busy, address, Some(&font))
+                            .unwrap();
+                    assert_eq!(strip.data(), &after.data()[..strip.data().len()]);
+                    let rect = control_rect(Control::Address, width as f32, 72.0).unwrap();
+                    for y in 0..height {
+                        for x in 0..width_px {
+                            if (x as f64 / scale) < rect.left() as f64 - 1.0
+                                || (x as f64 / scale) > rect.right() as f64 + 1.0
+                                || (y as f64 / scale) < rect.top() as f64 - 1.0
+                                || (y as f64 / scale) > rect.bottom() as f64 + 1.0
+                            {
+                                let i = ((y * width_px + x) * 4) as usize;
+                                assert_eq!(&before.data()[i..i + 4], &after.data()[i..i + 4]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn page_card_is_inset_below_toolbar() {
         assert_eq!(
@@ -912,6 +1009,8 @@ mod tests {
                         hovered,
                         pressed: hovered,
                         dark,
+                        loading: false,
+                        find_open: false,
                         address_focused: false,
                         address_selected: false,
                         address_caret: 0,

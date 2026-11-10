@@ -21,9 +21,10 @@ use storage::{
 };
 use webapis::local_storage::register_local_storage;
 use webapis::{
-    AlertSink, ConsoleSink, Document, TimerDispatcher, register_alert, register_document_on_window,
-    register_fetch, register_print, register_window_with_security_context,
-    register_window_with_url_and_device_pixel_ratio_and_timer_dispatcher,
+    AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, register_alert,
+    register_document_with_location, register_fetch, register_location_with_navigation,
+    register_print, register_window_with_security_context,
+    register_window_with_url_device_pixel_ratio_and_viewport,
 };
 
 pub mod byui_provider;
@@ -415,9 +416,12 @@ impl BrowserRuntime {
         security_context: RendererSecurityContext,
     ) -> JsResult<Vec<Value>> {
         self.boot_page(
-            html_source,
-            None,
-            None,
+            PageInput {
+                html_source,
+                scripts: None,
+                url: None,
+            },
+            Arc::new(|_, _| {}),
             console,
             alert_sink,
             controller,
@@ -443,9 +447,12 @@ impl BrowserRuntime {
         security_context: RendererSecurityContext,
     ) -> JsResult<PageSession> {
         self.boot_page(
-            html_source,
-            None,
-            None,
+            PageInput {
+                html_source,
+                scripts: None,
+                url: None,
+            },
+            Arc::new(|_, _| {}),
             console,
             alert_sink,
             controller,
@@ -481,6 +488,68 @@ impl BrowserRuntime {
         )
     }
 
+    /// Opens a loaded page and routes its `Location` navigation requests to
+    /// `navigate`. The callback runs on the page script thread and should
+    /// enqueue work for the browser's navigation loop rather than load
+    /// synchronously.
+    pub fn open_page_with_navigation(
+        &self,
+        page: &Page,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+        navigate: LocationNavigate,
+    ) -> JsResult<PageSession> {
+        self.open_page_with_viewport_and_navigation(
+            page,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+            1.0,
+            None,
+            navigate,
+        )
+    }
+
+    /// Opens a loaded page with the output device scale, optional viewport,
+    /// and `Location` navigation handler exposed to its scripts.
+    ///
+    /// `device_pixel_ratio` is device pixels per CSS pixel and must be finite
+    /// and greater than zero. `viewport` is in CSS pixels; without one,
+    /// `window.innerWidth` and `window.innerHeight` are zero. `navigate` runs
+    /// on the page script thread and should enqueue work for the browser's
+    /// navigation loop rather than load synchronously.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_page_with_viewport_and_navigation(
+        &self,
+        page: &Page,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+        device_pixel_ratio: f64,
+        viewport: Option<ViewportSize>,
+        navigate: LocationNavigate,
+    ) -> JsResult<PageSession> {
+        self.boot_page(
+            PageInput {
+                html_source: &page.html,
+                scripts: Some(&page.scripts),
+                url: Some(&page.url),
+            },
+            navigate,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+            device_pixel_ratio,
+            viewport,
+        )
+        .map(|booted| booted.session)
+    }
+
     /// Opens a loaded page with the current output device scale exposed to
     /// its scripts as `window.devicePixelRatio`.
     ///
@@ -497,7 +566,7 @@ impl BrowserRuntime {
         security_context: RendererSecurityContext,
         device_pixel_ratio: f64,
     ) -> JsResult<PageSession> {
-        self.open_page_with_device_pixel_ratio_and_timer_dispatcher(
+        self.open_page_with_viewport_and_navigation(
             page,
             console,
             alert_sink,
@@ -505,16 +574,19 @@ impl BrowserRuntime {
             security_context,
             device_pixel_ratio,
             None,
+            Arc::new(|_, _| {}),
         )
     }
 
-    /// Opens a page whose timers are enqueued through `timer_dispatcher`.
+    /// Opens a loaded page with the output device scale and viewport
+    /// dimensions exposed to its scripts.
     ///
-    /// The host sends each dispatched ID to [`PageSession::dispatch_timer`]
-    /// from its page task loop. `device_pixel_ratio` must be finite and
-    /// greater than zero.
+    /// `device_pixel_ratio` is device pixels per CSS pixel and must be finite
+    /// and greater than zero. `viewport` is expressed in CSS pixels and is the
+    /// values used for `window.innerWidth` and `window.innerHeight` by the
+    /// CSSOM View API.
     #[allow(clippy::too_many_arguments)]
-    pub fn open_page_with_device_pixel_ratio_and_timer_dispatcher(
+    pub fn open_page_with_viewport(
         &self,
         page: &Page,
         console: Arc<dyn ConsoleSink>,
@@ -522,20 +594,18 @@ impl BrowserRuntime {
         controller: Arc<RequestController>,
         security_context: RendererSecurityContext,
         device_pixel_ratio: f64,
-        timer_dispatcher: Option<TimerDispatcher>,
+        viewport: ViewportSize,
     ) -> JsResult<PageSession> {
-        self.boot_page(
-            &page.html,
-            Some(&page.scripts),
-            Some(&page.url),
+        self.open_page_with_viewport_and_navigation(
+            page,
             console,
             alert_sink,
             controller,
             security_context,
             device_pixel_ratio,
-            timer_dispatcher,
+            Some(viewport),
+            Arc::new(|_, _| {}),
         )
-        .map(|booted| booted.session)
     }
 
     // Keep the existing boot pipeline explicit: each argument is a distinct
@@ -544,18 +614,17 @@ impl BrowserRuntime {
     #[allow(clippy::too_many_arguments)]
     fn boot_page(
         &self,
-        html_source: &str,
-        scripts: Option<&[String]>,
-        initial_url: Option<&str>,
+        input: PageInput<'_>,
+        navigate: LocationNavigate,
         console: Arc<dyn ConsoleSink>,
         alert_sink: Arc<dyn AlertSink>,
         controller: Arc<RequestController>,
         security_context: RendererSecurityContext,
         device_pixel_ratio: f64,
-        timer_dispatcher: Option<TimerDispatcher>,
+        viewport: Option<ViewportSize>,
     ) -> JsResult<BootedPage> {
-        log::trace!("booting page: {} bytes of html", html_source.len());
-        let html_document = html::parse_raw_html(html_source.to_owned());
+        log::trace!("booting page: {} bytes of html", input.html_source.len());
+        let html_document = html::parse_raw_html(input.html_source.to_owned());
         let document = Document::from_html_document(&html_document);
         let retained = document.clone();
         let mut realm = Realm::new();
@@ -563,20 +632,25 @@ impl BrowserRuntime {
         register_print(&mut realm, console)?;
         register_alert(&mut realm, alert_sink)?;
         register_fetch(&mut realm, controller)?;
-        let initial_url = initial_url
+        let initial_url = input
+            .url
             .filter(|url| !url.is_empty())
             .unwrap_or("about:blank");
-        let window = register_window_with_url_and_device_pixel_ratio_and_timer_dispatcher(
+        let window = register_window_with_url_device_pixel_ratio_and_viewport(
             &mut realm,
             initial_url,
             device_pixel_ratio,
-            timer_dispatcher,
+            viewport,
         )?;
-        register_document_on_window(&mut realm, document, window.clone())?;
+        let document_url = net::Url::parse(initial_url)
+            .unwrap_or_else(|_| net::Url::parse("about:blank").expect("valid about:blank URL"));
+        // Installs the live `Location` accessor on the window registered above.
+        let location = register_location_with_navigation(&mut realm, document_url, navigate)?;
+        register_document_with_location(&mut realm, document, location)?;
         register_local_storage(&mut realm, Arc::clone(&self.storage), security_context)?;
 
         // Without caller-supplied sources only inline script text is available.
-        let sources = match scripts {
+        let sources = match input.scripts {
             Some(scripts) => scripts.to_vec(),
             None => html_document.script_sources(),
         };
@@ -616,12 +690,30 @@ pub struct PageSession {
 }
 
 impl PageSession {
-    /// Runs a timer callback that has reached its deadline.
+    /// Updates the viewport's vertical scroll offset exposed as
+    /// `window.scrollY` and `window.pageYOffset`.
     ///
-    /// Hosts using a timer dispatcher call this on the page task loop. An
-    /// unknown or cancelled ID has no effect.
-    pub fn dispatch_timer(&self, id: u32) -> JsResult<()> {
-        webapis::dispatch_window_timer(&self.window, id)
+    /// The value is in CSS pixels and is maintained by the browser shell.
+    /// Script assignment remains ineffective because both properties are
+    /// non-replaceable read-only host attributes.
+    pub fn set_scroll_y(&mut self, scroll_y: f64) {
+        let value = Value::Number(scroll_y.max(0.0));
+        self.window.update_read_only("scrollY", value.clone());
+        self.window.update_read_only("pageYOffset", value);
+    }
+
+    /// Updates the viewport dimensions exposed to this live page session.
+    ///
+    /// Dimensions are CSS pixels. This keeps `window.innerWidth`,
+    /// `window.innerHeight`, and their global aliases synchronized with the
+    /// current viewport.
+    pub fn set_viewport(&mut self, viewport: ViewportSize) {
+        let width = Value::Number(viewport.width as f64);
+        let height = Value::Number(viewport.height as f64);
+        self.window.set("innerWidth", width.clone());
+        self.window.set("innerHeight", height.clone());
+        let _ = self.realm.register_global_value("innerWidth", width);
+        let _ = self.realm.register_global_value("innerHeight", height);
     }
 
     /// Updates the output device scale visible as `window.devicePixelRatio`.
@@ -656,17 +748,33 @@ impl PageSession {
     pub fn dispatch_click_at(&self, node: html::NodeID) -> JsResult<Value> {
         webapis::dispatch_click_at(&self.document, node)
     }
-}
 
-impl Drop for PageSession {
-    fn drop(&mut self) {
-        webapis::clear_window_timers(&self.window);
+    /// Runs this page's elapsed `window.setInterval()` callbacks.
+    ///
+    /// Call this from the page/event-loop thread. The return value is the
+    /// number of interval callbacks delivered during this pump.
+    pub fn run_timers(&self) -> JsResult<usize> {
+        webapis::run_window_timers(&self.window)
+    }
+
+    /// Runs this page's pending `window.requestAnimationFrame()` callbacks.
+    ///
+    /// Call this from the page/event-loop thread immediately before presenting
+    /// a frame. The return value is the number of callbacks delivered.
+    pub fn run_animation_frames(&self) -> JsResult<usize> {
+        webapis::run_window_animation_frames(&self.window)
     }
 }
 
 struct BootedPage {
     session: PageSession,
     results: Vec<Value>,
+}
+
+struct PageInput<'a> {
+    html_source: &'a str,
+    scripts: Option<&'a [String]>,
+    url: Option<&'a str>,
 }
 
 /// Loads the welcome page and resolves its local stylesheet and script links.
@@ -690,6 +798,18 @@ fn attribute<'a>(attributes: &'a [html::Attribute], name: &str) -> Option<&'a st
 mod tests {
     use super::*;
     use security::{Origin, RendererSecurityContext, StoragePermission};
+
+    struct TestConsole;
+
+    impl ConsoleSink for TestConsole {
+        fn log(&self, _message: &str) {}
+    }
+
+    struct TestAlert;
+
+    impl AlertSink for TestAlert {
+        fn alert(&self, _message: &str) {}
+    }
 
     #[test]
     fn default_log_file_lives_in_the_data_directory() {
@@ -765,6 +885,52 @@ mod tests {
         );
         assert!(response.body.is_null());
         assert!(runtime.block_on(response.body.bytes()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn page_session_scroll_y_tracks_the_live_window_offset() {
+        let page = Page {
+            url: "https://example.com/scroll".into(),
+            html: "<main>content</main>".into(),
+            stylesheets: Vec::new(),
+            scripts: Vec::new(),
+        };
+        let runtime = BrowserRuntime::in_memory();
+        let controller = request_controller(None);
+        let mut session = runtime
+            .open_page_with_viewport(
+                &page,
+                Arc::new(TestConsole),
+                Arc::new(TestAlert),
+                controller,
+                storage_context(),
+                1.0,
+                ViewportSize {
+                    width: 800,
+                    height: 600,
+                },
+            )
+            .expect("page session should open");
+
+        assert_eq!(
+            session
+                .realm
+                .evaluate_script("window.scrollY === 0 && window.pageYOffset === 0"),
+            Ok(Value::Boolean(true))
+        );
+        session.set_scroll_y(123.5);
+        assert_eq!(
+            session
+                .realm
+                .evaluate_script("window.scrollY === 123.5 && window.pageYOffset === 123.5"),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            session.realm.evaluate_script(
+                "window.scrollY = 1; window.pageYOffset = 1; window.scrollY === 123.5 && window.pageYOffset === 123.5",
+            ),
+            Ok(Value::Boolean(true))
+        );
     }
 
     #[test]

@@ -1,6 +1,12 @@
 //! Integration tests for JavaScript fixtures under `crates/js/tests/js`.
 
-use js::{Object, Realm, Value, eval};
+use js::{Object, Realm, Value, Vm, eval, parse};
+
+fn execute_bytecode(source: &str) -> Result<Value, js::JsError> {
+    let program = parse(source).expect("fixture should parse");
+    let chunk = js::bytecode::compile(&program).expect("Sprint 4 fixture should compile");
+    Vm::new().execute(&chunk)
+}
 
 fn fixture(name: &str) -> &'static str {
     match name {
@@ -82,13 +88,31 @@ fn arrow_functions_fixture_evaluates() {
 }
 
 #[test]
+fn sprint_four_fixtures_compile_and_execute_through_the_vm() {
+    for (name, expected) in [
+        ("arrays.js", Value::Number(1.0)),
+        ("arrow-functions.js", Value::Number(3.0)),
+        ("for-loop.js", Value::Number(4.0)),
+        ("classes.js", Value::Number(1.0)),
+    ] {
+        assert_eq!(execute_bytecode(fixture(name)), Ok(expected), "{name}");
+    }
+
+    let thrown =
+        execute_bytecode(fixture("try-catch.js")).expect("try/catch fixture should run in the VM");
+    let Value::Object(error) = thrown else {
+        panic!("expected the caught error object, got {thrown:?}");
+    };
+    assert_eq!(error.get("name"), Some(Value::String("Error".into())));
+}
+
+#[test]
 #[ignore = "Classes run only on the bytecode VM; see tests/bytecode_classes.rs"]
 fn classes_fixture_will_evaluate_when_classes_are_supported() {
     assert!(eval(fixture("classes.js")).is_ok());
 }
 
 #[test]
-#[ignore = "For statements are not implemented yet"]
 fn for_loop_fixture_will_evaluate_when_for_is_supported() {
     assert!(eval(fixture("for-loop.js")).is_ok());
 }

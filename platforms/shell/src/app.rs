@@ -9,9 +9,10 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use ab_glyph::FontVec;
+use net::Url;
 use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use tiny_skia::Pixmap;
-use webapis::AlertSink;
+use webapis::{AlertSink, NavigationBehavior};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -21,8 +22,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
+use crate::compat_panel::{CompatState, ShellAuditor, ShellScriptEngine};
 use crate::context_menu::{ContextMenu, MenuAction};
-use crate::elements_panel::ElementsPanel;
+use crate::elements_panel::{DockTab, ElementsPanel};
+use crate::find_in_page::{Action as FindAction, FindInPage};
 use crate::page_source::PageSource;
 use crate::toolbar::{self, ChromeState, Control};
 
@@ -125,6 +128,9 @@ struct App {
     /// The pointer went down on the page and has not been released yet.
     page_press: bool,
     scripts_evaluated: bool,
+    find: Option<FindInPage>,
+    find_pressed: Option<FindAction>,
+    find_reveal: bool,
     context_menu: Option<ContextMenu>,
     menu_pressed: Option<MenuAction>,
     page_source: Option<PageSource>,
@@ -132,12 +138,22 @@ struct App {
     source_close_pressed: bool,
     elements: Option<ElementsPanel>,
     elements_close_pressed: bool,
+    /// Compatibility auditor, created on first use and kept for the session
+    /// so later audits reuse its engine probes.
+    auditor: Option<Arc<ShellAuditor>>,
+    /// Id of the newest audit; results for older ids are ignored.
+    audit_id: u64,
     /// Background page loader; `None` when its runtime failed to start.
     loader: Option<browser::PageLoader>,
     /// Wakes the event loop from loader threads; set by [`run`].
     proxy: Option<EventLoopProxy<UserEvent>>,
     /// Id of the newest navigation; results for older ids are ignored.
     navigation_id: u64,
+    /// Independent sequence for the most recently started loading operation.
+    loading_id: u64,
+    navigation_loading: Option<(u64, u64)>,
+    /// A completion probe owns Reload's existing task handle; dropping it detaches.
+    reload_completion: Option<(u64, Box<dyn Fn() -> bool>)>,
 }
 
 /// Messages that background threads post to the UI thread's event loop.
@@ -150,6 +166,19 @@ enum UserEvent {
         id: u64,
         /// The loaded page or the reason it failed.
         navigation: browser::Navigation,
+        /// History behavior selected by the initiating navigation.
+        behavior: NavigationBehavior,
+    },
+    /// A page script requested navigation through its `Location` object.
+    LocationNavigate {
+        url: Url,
+        behavior: NavigationBehavior,
+    },
+    /// A background compatibility audit finished.
+    AuditFinished {
+        /// The audit this result belongs to; stale ones are dropped.
+        id: u64,
+        report: Box<devtools::compat::AuditReport>,
     },
 }
 
@@ -252,6 +281,9 @@ impl App {
             page_events: crate::content::PageEvents::new(),
             page_press: false,
             scripts_evaluated: false,
+            find: None,
+            find_pressed: None,
+            find_reveal: false,
             context_menu: None,
             menu_pressed: None,
             page_source: None,
@@ -259,12 +291,150 @@ impl App {
             source_close_pressed: false,
             elements: None,
             elements_close_pressed: false,
+            auditor: None,
+            audit_id: 0,
             loader: browser::PageLoader::new()
                 .map_err(|error| log::error!("page loader initialization failed: {error}"))
                 .ok(),
             proxy: None,
             navigation_id: 0,
+            loading_id: 0,
+            navigation_loading: None,
+            reload_completion: None,
         }
+    }
+
+    fn begin_loading(&mut self) -> u64 {
+        self.loading_id += 1;
+        self.chrome.loading = true;
+        self.redraw();
+        self.loading_id
+    }
+
+    fn finish_loading(&mut self, id: u64) {
+        if id == self.loading_id {
+            self.chrome.loading = false;
+            self.redraw();
+        }
+    }
+
+    fn poll_reload(&mut self) {
+        if self
+            .reload_completion
+            .as_ref()
+            .is_some_and(|(_, done)| done())
+        {
+            let (id, _) = self.reload_completion.take().expect("completed reload");
+            self.finish_loading(id);
+        }
+    }
+
+    fn open_find(&mut self) {
+        self.dismiss_context_menu();
+        self.close_page_source();
+        self.chrome.address_focused = false;
+        let find = self.find.get_or_insert_with(FindInPage::default);
+        find.focus();
+        self.chrome.find_open = true;
+        self.find_reveal = true;
+        self.page = None;
+        self.page_layout = None;
+        self.frame_key = None;
+        self.redraw();
+    }
+
+    fn close_find(&mut self) {
+        self.find = None;
+        self.find_pressed = None;
+        self.chrome.find_open = false;
+        self.find_reveal = false;
+        self.page = None;
+        self.page_layout = None;
+        self.frame_key = None;
+        self.redraw();
+    }
+
+    fn find_step(&mut self, previous: bool) {
+        if let Some(find) = &mut self.find {
+            find.step(previous);
+            find.focused = true;
+            self.chrome.address_focused = false;
+        }
+        self.find_reveal = true;
+        self.page = None;
+        self.redraw();
+    }
+
+    /// Consumes Find input before either address editing or page shortcuts.
+    fn find_key(&mut self, key: &Key) -> bool {
+        let shortcut = self.modifiers.control_key()
+            || (cfg!(target_os = "macos") && self.modifiers.super_key());
+        if shortcut && matches!(key,Key::Character(c) if c.eq_ignore_ascii_case("f")) {
+            self.open_find();
+            return true;
+        }
+        if self.page_source.is_some() || self.context_menu.is_some() {
+            return false;
+        }
+        if self.elements.is_some()
+            && self.find.as_ref().is_some_and(|f| !f.focused)
+            && *key == Key::Named(NamedKey::Escape)
+        {
+            return false;
+        }
+        if self.find.is_some() && *key == Key::Named(NamedKey::Escape) {
+            self.close_find();
+            return true;
+        }
+        let Some(find) = &mut self.find else {
+            return false;
+        };
+        if !find.focused {
+            return false;
+        }
+        if shortcut {
+            match key {
+                Key::Character(c) if c.eq_ignore_ascii_case("a") => find.select_all(),
+                Key::Character(c) if c.eq_ignore_ascii_case("v") => {
+                    match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                        Ok(text) => find.insert(&text),
+                        Err(error) => log::warn!("Find paste failed: {error}"),
+                    }
+                }
+                // Let existing browser-level shortcuts (address, zoom, Reload) run.
+                Key::Character(c)
+                    if ["l", "r", "+", "=", "-", "_", "0"]
+                        .contains(&c.to_ascii_lowercase().as_str()) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        } else {
+            match key {
+                Key::Named(NamedKey::Enter) => {
+                    self.find_step(self.modifiers.shift_key());
+                    return true;
+                }
+                // Winit reports Space as a named key on macOS, not character text.
+                Key::Named(NamedKey::Space) if !self.modifiers.alt_key() => find.insert(" "),
+                Key::Named(NamedKey::Backspace) => find.delete(false),
+                Key::Named(NamedKey::Delete) => find.delete(true),
+                Key::Named(NamedKey::ArrowLeft) => find.move_caret(-1),
+                Key::Named(NamedKey::ArrowRight) => find.move_caret(1),
+                Key::Named(NamedKey::Home) => find.end(false),
+                Key::Named(NamedKey::End) => find.end(true),
+                Key::Named(NamedKey::Tab) => {
+                    find.focused = false;
+                }
+                Key::Character(c) if !self.modifiers.alt_key() => find.insert(c),
+                _ => {}
+            }
+        }
+        self.find_reveal = true;
+        self.page = None;
+        self.redraw();
+        true
     }
 
     fn redraw(&self) {
@@ -278,14 +448,28 @@ impl App {
     /// Navigation calls this only after loading succeeds. Repaints, Reload,
     /// and the error page for a failed load must not call it.
     fn page_loaded(&mut self, url: &str, page: browser::Page) {
+        self.page_loaded_with_behavior(url, page, NavigationBehavior::Auto);
+    }
+
+    fn page_loaded_with_behavior(
+        &mut self,
+        url: &str,
+        page: browser::Page,
+        behavior: NavigationBehavior,
+    ) {
         log::debug!("page displayed: {url}");
         // Elements is a document snapshot; never retain it across navigation.
         self.close_elements();
         self.loaded_page = Some(page);
+        self.find_reveal = self.find.is_some();
         // Scripts of the new document run after its first frame is presented.
         self.scripts_evaluated = false;
         self.frame_key = None;
-        self.browser_state.record_visit(url);
+        match behavior {
+            NavigationBehavior::Auto => self.browser_state.record_visit(url),
+            NavigationBehavior::Replace => self.browser_state.replace_current(url),
+            NavigationBehavior::Reload => {}
+        }
         self.address = url.to_owned();
         self.address_before_edit = self.address.clone();
         self.chrome.address_caret = self.address.len();
@@ -298,6 +482,9 @@ impl App {
     }
 
     fn begin_address_edit(&mut self) {
+        if let Some(find) = &mut self.find {
+            find.focused = false;
+        }
         self.address_before_edit = self.address.clone();
         self.chrome.address_caret = self.address.len();
         self.chrome.address_selected = true;
@@ -324,6 +511,9 @@ impl App {
             log::debug!("address submitted: {address}");
             log::debug!("navigating to {address}");
             self.navigation_id += 1;
+            let id = self.begin_loading();
+            self.finish_loading(id);
+            self.navigation_loading = None;
             self.page_loaded(&address, browser::welcome_page());
         } else {
             log::debug!("address submitted: {address}");
@@ -336,24 +526,47 @@ impl App {
     /// [`UserEvent::Navigated`]; the UI keeps showing the current page until
     /// then.
     fn start_navigation(&mut self, address: &str) {
+        self.start_navigation_with_behavior(address, NavigationBehavior::Auto);
+    }
+
+    fn start_navigation_with_behavior(&mut self, address: &str, behavior: NavigationBehavior) {
         self.navigation_id += 1;
         let id = self.navigation_id;
+        let loading = self.begin_loading();
         let (Some(loader), Some(proxy)) = (&self.loader, self.proxy.clone()) else {
             log::warn!("navigation to {address} unavailable: page loader is not running");
+            self.finish_loading(loading);
+            self.navigation_loading = None;
             return;
         };
+        self.navigation_loading = Some((id, loading));
         log::debug!("navigating to {address}");
         loader.load(address, move |navigation| {
             // A closed event loop means the app is exiting; nothing to do.
-            let _ = proxy.send_event(UserEvent::Navigated { id, navigation });
+            let _ = proxy.send_event(UserEvent::Navigated {
+                id,
+                navigation,
+                behavior,
+            });
         });
     }
 
     /// Applies a finished load. A failure shows the built-in error page and
     /// leaves the typed address in the bar; it is not recorded as a visit.
-    fn navigation_finished(&mut self, id: u64, navigation: browser::Navigation) {
+    fn navigation_finished(
+        &mut self,
+        id: u64,
+        navigation: browser::Navigation,
+        behavior: NavigationBehavior,
+    ) {
         if id != self.navigation_id {
             return;
+        }
+        if let Some((navigation_id, loading)) = self.navigation_loading
+            && navigation_id == id
+        {
+            self.navigation_loading = None;
+            self.finish_loading(loading);
         }
         match navigation.result {
             Ok(page) => {
@@ -362,13 +575,14 @@ impl App {
                     navigation.address,
                     page.html.len()
                 );
-                self.page_loaded(&navigation.address, page)
+                self.page_loaded_with_behavior(&navigation.address, page, behavior)
             }
             Err(error) => {
                 // `browser::load` already logged the failure at error level.
                 log::debug!("showing error page for {}: {error}", navigation.address);
                 self.close_elements();
                 self.loaded_page = Some(browser::error_page(&navigation.address, &error));
+                self.find_reveal = self.find.is_some();
                 self.scripts_evaluated = false;
                 self.frame_key = None;
                 self.page = None;
@@ -388,53 +602,49 @@ impl App {
         // Command is the shortcut modifier on macOS; Control works everywhere.
         let shortcut =
             modifiers.control_key() || (cfg!(target_os = "macos") && modifiers.super_key());
-        if shortcut {
-            if let Key::Character(character) = key {
-                match character.to_ascii_lowercase().as_str() {
-                    "+" | "=" => {
-                        self.set_page_zoom(self.page_zoom + PAGE_ZOOM_STEP);
-                        return;
-                    }
-                    "-" | "_" => {
-                        self.set_page_zoom(self.page_zoom - PAGE_ZOOM_STEP);
-                        return;
-                    }
-                    "0" => {
-                        self.set_page_zoom(1.0);
-                        return;
-                    }
-                    "l" => {
-                        self.begin_address_edit();
-                        return;
-                    }
-                    "r" => {
-                        self.activate(Control::Reload);
-                        return;
-                    }
-                    "a" if self.chrome.address_focused => {
-                        self.chrome.address_selected = true;
-                        self.redraw();
-                        return;
-                    }
-                    "c" if self.chrome.address_focused => {
-                        if let Err(error) = arboard::Clipboard::new()
-                            .and_then(|mut clipboard| clipboard.set_text(self.address.clone()))
-                        {
-                            log::warn!("failed to copy the address: {error}");
-                        }
-                        return;
-                    }
-                    "v" if self.chrome.address_focused => {
-                        match arboard::Clipboard::new()
-                            .and_then(|mut clipboard| clipboard.get_text())
-                        {
-                            Ok(text) => self.insert_address_text(&text),
-                            Err(error) => log::warn!("failed to paste into the address: {error}"),
-                        }
-                        return;
-                    }
-                    _ => {}
+        if shortcut && let Key::Character(character) = key {
+            match character.to_ascii_lowercase().as_str() {
+                "+" | "=" => {
+                    self.set_page_zoom(self.page_zoom + PAGE_ZOOM_STEP);
+                    return;
                 }
+                "-" | "_" => {
+                    self.set_page_zoom(self.page_zoom - PAGE_ZOOM_STEP);
+                    return;
+                }
+                "0" => {
+                    self.set_page_zoom(1.0);
+                    return;
+                }
+                "l" => {
+                    self.begin_address_edit();
+                    return;
+                }
+                "r" => {
+                    self.activate(Control::Reload);
+                    return;
+                }
+                "a" if self.chrome.address_focused => {
+                    self.chrome.address_selected = true;
+                    self.redraw();
+                    return;
+                }
+                "c" if self.chrome.address_focused => {
+                    if let Err(error) = arboard::Clipboard::new()
+                        .and_then(|mut clipboard| clipboard.set_text(self.address.clone()))
+                    {
+                        log::warn!("failed to copy the address: {error}");
+                    }
+                    return;
+                }
+                "v" if self.chrome.address_focused => {
+                    match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+                        Ok(text) => self.insert_address_text(&text),
+                        Err(error) => log::warn!("failed to paste into the address: {error}"),
+                    }
+                    return;
+                }
+                _ => {}
             }
         }
         if !self.chrome.address_focused {
@@ -604,6 +814,9 @@ impl App {
     }
 
     fn show_page_source(&mut self) {
+        if let Some(find) = &mut self.find {
+            find.focused = false;
+        }
         if let Some(page) = &self.loaded_page {
             log::debug!("page source view opened ({} bytes)", page.html.len());
             self.page_source = Some(PageSource::new(&page.html));
@@ -636,6 +849,9 @@ impl App {
     }
 
     fn show_elements(&mut self) {
+        if let Some(find) = &mut self.find {
+            find.focused = false;
+        }
         self.elements = Some(ElementsPanel::new(
             self.loaded_page.as_ref().map(|page| page.html.as_str()),
         ));
@@ -646,7 +862,87 @@ impl App {
         self.redraw();
     }
 
+    /// Opens the dock (if needed) on the Compatibility tab and audits the
+    /// loaded page once per dock.
+    fn show_compatibility(&mut self) {
+        if self.elements.is_none() {
+            self.show_elements();
+        }
+        self.select_dock_tab(DockTab::Compatibility);
+    }
+
+    fn select_dock_tab(&mut self, tab: DockTab) {
+        let Some(panel) = &mut self.elements else {
+            return;
+        };
+        panel.set_tab(tab);
+        if tab == DockTab::Compatibility && *panel.compat.state() == CompatState::Idle {
+            self.start_audit();
+        }
+        self.redraw();
+    }
+
+    /// Audits the loaded page off the UI thread; the result arrives as
+    /// [`UserEvent::AuditFinished`]. Without an event loop (tests) the audit
+    /// runs inline.
+    fn start_audit(&mut self) {
+        let Some(panel) = &mut self.elements else {
+            return;
+        };
+        let Some(page) = self.loaded_page.clone() else {
+            panel
+                .compat
+                .set_state(CompatState::Unavailable("No loaded page to audit"));
+            return;
+        };
+        panel.compat.set_state(CompatState::Auditing);
+        self.audit_id += 1;
+        let id = self.audit_id;
+        let auditor = Arc::clone(
+            self.auditor
+                .get_or_insert_with(|| Arc::new(ShellAuditor::new(ShellScriptEngine::new()))),
+        );
+        let script_error = self.page_events.script_error();
+        log::debug!("compatibility audit {id} started for {}", page.url);
+        let run = move || {
+            Box::new(crate::compat_panel::audit_page(
+                &auditor,
+                &page,
+                script_error.as_deref(),
+            ))
+        };
+        match self.proxy.clone() {
+            Some(proxy) => {
+                std::thread::spawn(move || {
+                    let report = run();
+                    let _ = proxy.send_event(UserEvent::AuditFinished { id, report });
+                });
+            }
+            None => {
+                let report = run();
+                self.audit_finished(id, *report);
+            }
+        }
+    }
+
+    fn audit_finished(&mut self, id: u64, report: devtools::compat::AuditReport) {
+        if id != self.audit_id {
+            log::debug!("dropping stale compatibility audit {id}");
+            return;
+        }
+        log::debug!(
+            "compatibility audit {id} finished: {} findings",
+            report.findings.len()
+        );
+        if let Some(panel) = &mut self.elements {
+            panel.compat.set_state(CompatState::Ready(report));
+            self.redraw();
+        }
+    }
+
     fn close_elements(&mut self) {
+        // Any audit still running belongs to the closed dock.
+        self.audit_id += 1;
         if self.elements.take().is_some() {
             self.frame_key = None;
             self.redraw();
@@ -727,6 +1023,7 @@ impl App {
         log::trace!("page scrolled to {target:.1} of {max_scroll:.1}");
         self.dismiss_context_menu();
         self.scroll_y = target;
+        self.page_events.set_scroll_y(self.scroll_y);
         // Only the page pixmap changes; the layout is reused.
         self.page = None;
         self.redraw();
@@ -740,9 +1037,11 @@ impl App {
             return;
         }
         self.page_zoom = zoom;
+        self.find_reveal = self.find.is_some();
         self.page = None;
         self.page_layout = None;
         self.scroll_y = 0.0;
+        self.page_events.set_scroll_y(self.scroll_y);
         let device_pixel_ratio = self
             .window
             .as_ref()
@@ -767,7 +1066,8 @@ impl App {
         let Some((x, y)) = self.cursor else {
             return;
         };
-        let Some(card) = toolbar::page_rect(width, height, scale) else {
+        let Some(card) = toolbar::page_rect_with_find(width, height, scale, self.find.is_some())
+        else {
             return;
         };
         if x < f64::from(card.x) / scale
@@ -813,6 +1113,7 @@ impl App {
                         Some(MenuAction::Reload) => self.activate(Control::Reload),
                         Some(MenuAction::PageSource) => self.show_page_source(),
                         Some(MenuAction::Inspect) => self.show_elements(),
+                        Some(MenuAction::Compatibility) => self.show_compatibility(),
                         None => {}
                     }
                 }
@@ -841,15 +1142,60 @@ impl App {
             }
             return;
         }
+        if let Some(find) = &mut self.find {
+            let width = self
+                .window
+                .as_ref()
+                .map_or(420.0, |w| w.inner_size().width as f64 / w.scale_factor())
+                as f32;
+            let on_bar = self.cursor.is_some_and(|(_, y)| {
+                y >= toolbar::TOOLBAR_HEIGHT
+                    && y < toolbar::TOOLBAR_HEIGHT + crate::find_in_page::HEIGHT as f64
+            });
+            if on_bar || self.find_pressed.is_some() {
+                let action = FindInPage::action_at(width, self.cursor);
+                match state {
+                    ElementState::Pressed => {
+                        self.find_pressed = action;
+                        self.page_press = false;
+                    }
+                    ElementState::Released => {
+                        let selected = self.find_pressed.take().filter(|a| Some(*a) == action);
+                        match selected {
+                            Some(FindAction::Close) => self.close_find(),
+                            Some(FindAction::Next) => self.find_step(false),
+                            Some(FindAction::Previous) => self.find_step(true),
+                            Some(FindAction::Field) => {
+                                if let Some(find) = &mut self.find {
+                                    find.focus();
+                                }
+                                self.chrome.address_focused = false;
+                                self.redraw();
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                return;
+            }
+            if state == ElementState::Pressed {
+                find.focused = false;
+                self.redraw();
+            }
+        }
         if let Some(panel) = &self.elements {
             let inside = panel.contains(self.cursor);
             let close = panel.close_at(self.cursor);
             if inside || self.elements_close_pressed {
+                let tab = panel.tab_at(self.cursor);
                 match state {
                     ElementState::Pressed => {
                         self.elements_close_pressed = close;
                         self.page_press = false;
                         self.chrome.address_focused = false;
+                        if let Some(tab) = tab {
+                            self.select_dock_tab(tab);
+                        }
                     }
                     ElementState::Released => {
                         if self.elements_close_pressed && close {
@@ -889,8 +1235,10 @@ impl App {
                 log::debug!("reload requested");
                 log::debug!("toolbar action: reload");
                 if let Some(refresh) = &self.refresh {
-                    // Dropping the handle detaches the task; fetching stays off the UI thread.
-                    drop(refresh.refresh(&self.browser_state));
+                    if let Some(task) = refresh.refresh(&self.browser_state) {
+                        let id = self.begin_loading();
+                        self.reload_completion = Some((id, Box::new(move || task.is_finished())));
+                    }
                 } else {
                     log::error!("refresh unavailable: initialization failed");
                 }
@@ -932,19 +1280,24 @@ impl App {
         let page_scale = scale * self.page_zoom;
         let dark = window.theme() == Some(Theme::Dark);
         self.chrome.dark = dark;
-        let card = toolbar::page_rect(size.width, size.height, scale);
+        let card =
+            toolbar::page_rect_with_find(size.width, size.height, scale, self.find.is_some());
         let card_size = card.map(|card| (card.width, card.height));
-        let mut full = self.page.is_none()
+        let mut full = self.find.is_some()
+            || self.page.is_none()
             || self.context_menu.is_some()
             || self.page_source.is_some()
             || self.elements.is_some();
-        if self.page.as_ref().map(|(size, _)| *size) != card_size {
+        let page_size_changed = self.page.as_ref().map(|(size, _)| *size) != card_size;
+        if page_size_changed {
             // Painting never runs the page script: evaluation joins the JS
             // engine thread, and doing that inside this draw leaves `alert`
             // unable to finish. `about_to_wait` starts it after this frame.
             self.page = card.and_then(|card| {
                 let css_size = crate::content::css_viewport(card.width, card.height, page_scale);
-                if self.page_layout.as_ref().map(|layout| layout.css_size()) != Some(css_size) {
+                let layout_changed =
+                    self.page_layout.as_ref().map(|layout| layout.css_size()) != Some(css_size);
+                if layout_changed {
                     self.page_layout = Some(crate::content::PageLayout::new(
                         self.loaded_page.as_ref().expect("page was loaded"),
                         css_size.0,
@@ -952,18 +1305,38 @@ impl App {
                     ));
                 }
                 let layout = self.page_layout.as_ref()?;
+                if let Some(find) = &mut self.find {
+                    if layout_changed {
+                        find.replace_runs(layout.find_text());
+                    }
+                    if self.find_reveal || layout_changed {
+                        if let Some(target) = find.scroll_target(layout.max_scroll()) {
+                            self.scroll_y = target;
+                            self.page_events.set_scroll_y(self.scroll_y);
+                        }
+                        self.find_reveal = false;
+                    }
+                }
                 // A resize or reload can leave less to scroll than before.
                 self.scroll_y = self.scroll_y.clamp(0.0, layout.max_scroll());
-                crate::content::render_page(
+                self.page_events.set_scroll_y(self.scroll_y);
+                crate::content::render_page_with_find(
                     layout,
                     card.width,
                     card.height,
                     page_scale,
                     self.scroll_y,
+                    self.find.as_ref(),
+                    self.chrome.dark,
                 )
                 .map(|page| ((card.width, card.height), page))
             });
             full = true;
+            if let Some(layout) = &self.page_layout {
+                let (width, height) = layout.css_size();
+                self.page_events
+                    .resize(webapis::ViewportSize { width, height });
+            }
         }
         let key = (size.width, size.height, scale.to_bits(), self.chrome.dark);
         if self.frame_key != Some(key) {
@@ -994,6 +1367,9 @@ impl App {
         let Some(mut composed) = composed else {
             return;
         };
+        if let Some(find) = &self.find {
+            find.draw(&mut composed, scale, self.chrome.dark, self.font.as_ref());
+        }
         if let Some(panel) = &mut self.elements {
             panel.draw(
                 &mut composed,
@@ -1133,7 +1509,8 @@ impl App {
         let layout = self.page_layout.as_ref()?;
         let size = window.inner_size();
         let scale = window.scale_factor();
-        let card = toolbar::page_rect(size.width, size.height, scale)?;
+        let card =
+            toolbar::page_rect_with_find(size.width, size.height, scale, self.find.is_some())?;
         let page_scale = scale * self.page_zoom;
         layout.hit_test(
             ((x * scale - card.x as f64) / page_scale) as f32,
@@ -1155,6 +1532,11 @@ impl App {
             .to_logical::<f64>(window.scale_factor())
             .width;
         y >= toolbar::TOOLBAR_HEIGHT
+            + if self.find.is_some() {
+                crate::find_in_page::HEIGHT as f64
+            } else {
+                0.0
+            }
             && toolbar::hit_test(x, y, width, self.platform.window_controls_inset).is_none()
     }
 }
@@ -1219,6 +1601,9 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 log::trace!("key event: {:?}", event.state);
+                if event.state == ElementState::Pressed && self.find_key(&event.logical_key) {
+                    return;
+                }
                 // Address editing and the context menu share one key event.
                 if event.state == ElementState::Pressed {
                     self.key_pressed(&event.logical_key);
@@ -1247,6 +1632,9 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     self.page_events
                         .set_device_pixel_ratio(window.scale_factor() * self.page_zoom);
+                }
+                if matches!(event, WindowEvent::ThemeChanged(_)) && self.find.is_some() {
+                    self.page = None;
                 }
                 self.dismiss_context_menu();
                 self.resize_elements();
@@ -1328,11 +1716,26 @@ impl ApplicationHandler<UserEvent> for App {
                     self.alerts.present(&window);
                 }
             }
-            UserEvent::Navigated { id, navigation } => self.navigation_finished(id, navigation),
+            UserEvent::Navigated {
+                id,
+                navigation,
+                behavior,
+            } => self.navigation_finished(id, navigation, behavior),
+            UserEvent::LocationNavigate { url, behavior } => {
+                self.start_navigation_with_behavior(url.as_str(), behavior)
+            }
+            UserEvent::AuditFinished { id, report } => self.audit_finished(id, *report),
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.poll_reload();
+        event_loop.set_control_flow(if self.reload_completion.is_some() {
+            ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(40))
+        } else {
+            ControlFlow::Wait
+        });
+
         // `frame_key` is set only after a frame has been presented, so the
         // window is on screen before the page script can request an alert.
         if self.scripts_evaluated || self.frame_key.is_none() {
@@ -1351,8 +1754,24 @@ impl ApplicationHandler<UserEvent> for App {
         let device_pixel_ratio = self.window.as_ref().map_or(self.page_zoom, |window| {
             window.scale_factor() * self.page_zoom
         });
-        self.page_events
-            .load(&page, alerts, self.runtime.clone(), device_pixel_ratio);
+        let viewport = self.page_layout.as_ref().map(|layout| {
+            let (width, height) = layout.css_size();
+            webapis::ViewportSize { width, height }
+        });
+        let proxy = self.proxy.clone();
+        let navigate = Arc::new(move |url, behavior| {
+            if let Some(proxy) = &proxy {
+                let _ = proxy.send_event(UserEvent::LocationNavigate { url, behavior });
+            }
+        });
+        self.page_events.load_with_viewport(
+            &page,
+            alerts,
+            self.runtime.clone(),
+            device_pixel_ratio,
+            viewport,
+            navigate,
+        );
     }
 }
 
@@ -1414,6 +1833,294 @@ mod tests {
         )
     }
 
+    /// Mirrors the event loop's consumed-key check before page-key handling.
+    fn type_find_with_named_spaces(app: &mut App, text: &str) {
+        for c in text.chars() {
+            let key = if c == ' ' {
+                Key::Named(NamedKey::Space)
+            } else {
+                Key::Character(c.to_string().into())
+            };
+            if !app.find_key(&key) {
+                app.key_pressed(&key);
+                panic!("Find did not consume {key:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn find_named_space_types_phrases_with_real_counts_and_highlight_ranges() {
+        let page=browser::Page {url:"byui://test".into(),
+            html:"<body><p>Start Welcome <span>to</span> BYUI <b>Browser</b> end</p><button>Click <span>Me</span></button></body>".into(),
+            stylesheets:vec!["body {height:2000px}".into()],scripts:vec![]};
+        for query in [
+            "Welcome to",
+            "BYUI Browser",
+            "Click Me",
+            "Welcome  to",
+            " Welcome  to ",
+        ] {
+            let mut app = app();
+            app.page_loaded("byui://test", page.clone());
+            app.open_find();
+            let layout = crate::content::PageLayout::new(&page, 600, 150);
+            assert!(layout.max_scroll() > 100.0);
+            app.find.as_mut().unwrap().replace_runs(layout.find_text());
+            app.page_layout = Some(layout);
+            app.scroll_y = 100.0;
+            let history = app.browser_state.clone();
+            let address = app.address.clone();
+            type_find_with_named_spaces(&mut app, query);
+            let find = app.find.as_ref().unwrap();
+            assert_eq!(find.query, query);
+            assert_eq!(find.count(), "1/1", "{query}");
+            assert!(
+                find.highlight_ranges(false).len() >= 2,
+                "phrase crosses fragments: {query}"
+            );
+            assert_eq!(app.scroll_y, 100.0, "Space must not invoke page scrolling");
+            assert_eq!(app.address, address);
+            assert_eq!(app.browser_state, history);
+        }
+    }
+
+    #[test]
+    fn find_spaces_preserve_editing_and_shift_space_does_not_page_scroll() {
+        let mut app = app();
+        app.open_find();
+        type_find_with_named_spaces(&mut app, "  Welcome  to  ");
+        assert_eq!(app.find.as_ref().unwrap().query, "  Welcome  to  ");
+        assert!(app.find_key(&Key::Named(NamedKey::Backspace)));
+        assert_eq!(app.find.as_ref().unwrap().query, "  Welcome  to ");
+        app.find_key(&Key::Named(NamedKey::Home));
+        app.find_key(&Key::Named(NamedKey::Delete));
+        assert_eq!(app.find.as_ref().unwrap().query, " Welcome  to ");
+        app.find_key(&Key::Named(NamedKey::End));
+        app.modifiers = ModifiersState::SHIFT;
+        assert!(app.find_key(&Key::Named(NamedKey::Space)));
+        assert_eq!(app.find.as_ref().unwrap().query, " Welcome  to  ");
+        app.modifiers = ModifiersState::empty();
+        assert!(app.find_key(&Key::Character(" ".into())));
+        assert_eq!(app.find.as_ref().unwrap().query, " Welcome  to   ");
+        app.find.as_mut().unwrap().select_all();
+        type_find_with_named_spaces(&mut app, "   ");
+        assert_eq!(app.find.as_ref().unwrap().count(), "0/0");
+        assert!(
+            app.find
+                .as_ref()
+                .unwrap()
+                .highlight_ranges(false)
+                .is_empty()
+        );
+        app.begin_address_edit();
+        assert!(
+            !app.find_key(&Key::Named(NamedKey::Space)),
+            "Find must not intercept address input"
+        );
+    }
+
+    #[test]
+    fn find_shortcut_and_focus_keep_query_separate_from_address() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let history = app.browser_state.clone();
+        let address = app.address.clone();
+        app.modifiers = ModifiersState::CONTROL;
+        assert!(app.find_key(&Key::Character("f".into())));
+        assert!(app.chrome.find_open);
+        assert!(!app.chrome.address_focused);
+        app.modifiers = ModifiersState::empty();
+        assert!(app.find_key(&Key::Character("Welcome".into())));
+        assert_eq!(app.find.as_ref().unwrap().query, "Welcome");
+        assert_eq!(app.address, address);
+        assert_eq!(app.browser_state, history);
+        app.begin_address_edit();
+        assert!(!app.find.as_ref().unwrap().focused);
+        assert!(!app.find_key(&Key::Character("x".into())));
+        #[cfg(target_os = "macos")]
+        {
+            app.modifiers = ModifiersState::SUPER;
+            assert!(app.find_key(&Key::Character("f".into())));
+        }
+    }
+
+    #[test]
+    fn find_enter_shift_enter_escape_and_close_button() {
+        let mut app = app();
+        app.open_find();
+        let page = browser::welcome_page();
+        let layout = crate::content::PageLayout::new(&page, 600, 200);
+        let find = app.find.as_mut().unwrap();
+        find.replace_runs(layout.find_text());
+        find.insert("o");
+        let initial = find.count();
+        app.find_key(&Key::Named(NamedKey::Enter));
+        assert_ne!(app.find.as_ref().unwrap().count(), initial);
+        app.modifiers = ModifiersState::SHIFT;
+        app.find_key(&Key::Named(NamedKey::Enter));
+        assert_eq!(app.find.as_ref().unwrap().count(), initial);
+        app.modifiers = ModifiersState::empty();
+        assert!(app.find_key(&Key::Named(NamedKey::Escape)));
+        assert!(app.find.is_none());
+        app.open_find();
+        let rect = FindInPage::regions(420.0)
+            .into_iter()
+            .find(|(a, _)| *a == FindAction::Close)
+            .unwrap()
+            .1;
+        app.cursor = Some(((rect.x() + 1.0) as f64, (rect.y() + 1.0) as f64));
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        assert!(app.find.is_none());
+        assert!(!app.chrome.find_open);
+    }
+
+    #[test]
+    fn find_remains_independent_of_panels_navigation_and_zoom() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.open_find();
+        app.find.as_mut().unwrap().insert("welcome");
+        app.show_elements();
+        assert!(!app.find.as_ref().unwrap().focused);
+        app.key_pressed(&Key::Named(NamedKey::Escape));
+        assert!(app.elements.is_none());
+        app.show_page_source();
+        assert!(app.page_source.is_some());
+        assert!(app.find.is_some());
+        app.close_page_source();
+        app.page_loaded("byui://welcome", browser::welcome_page());
+        assert!(app.find_reveal);
+        assert!(app.page_layout.is_none());
+        assert_eq!(app.find.as_ref().unwrap().query, "welcome");
+        app.set_page_zoom(1.25);
+        assert!(app.find_reveal);
+        assert!(app.find.is_some());
+        let history = app.browser_state.clone();
+        app.refresh = None;
+        app.activate(Control::Reload);
+        assert_eq!(app.browser_state, history);
+        assert!(app.find.is_some());
+    }
+
+    #[test]
+    fn loading_completions_only_clear_the_latest_operation() {
+        let mut app = app();
+        let old = app.begin_loading();
+        let current = app.begin_loading();
+        app.finish_loading(old);
+        assert!(app.chrome.loading);
+        app.finish_loading(current);
+        assert!(!app.chrome.loading);
+    }
+
+    #[test]
+    fn navigation_success_failure_and_stale_completion_update_loading_safely() {
+        let mut app = app();
+        for failed in [false, true] {
+            app.navigation_id += 1;
+            let id = app.navigation_id;
+            let loading = app.begin_loading();
+            app.navigation_loading = Some((id, loading));
+            app.navigation_finished(
+                id - 1,
+                navigation("old", Ok(browser::welcome_page())),
+                NavigationBehavior::Auto,
+            );
+            assert!(app.chrome.loading);
+            let result = if failed {
+                Err(browser::LoadError::Status {
+                    status: 500,
+                    status_text: "Error".into(),
+                })
+            } else {
+                Ok(browser::welcome_page())
+            };
+            app.navigation_finished(
+                id,
+                navigation("byui://welcome", result),
+                NavigationBehavior::Auto,
+            );
+            assert!(!app.chrome.loading);
+        }
+    }
+
+    #[test]
+    fn reload_completion_preserves_newer_navigation_and_history() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let history = app.browser_state.clone();
+        let id = app.begin_loading();
+        let done = Rc::new(std::cell::Cell::new(false));
+        let probe = done.clone();
+        app.reload_completion = Some((id, Box::new(move || probe.get())));
+        app.poll_reload();
+        assert!(app.chrome.loading);
+        let newer = app.begin_loading();
+        done.set(true);
+        app.poll_reload();
+        assert!(app.chrome.loading);
+        assert!(app.reload_completion.is_none());
+        app.finish_loading(newer);
+        assert!(!app.chrome.loading);
+        assert_eq!(app.browser_state, history);
+    }
+
+    #[test]
+    fn real_reload_success_and_failure_clear_loading_without_changing_history() {
+        let mut app = app();
+        for url in ["byui://welcome", "unsupported://invalid"] {
+            app.browser_state.record_visit(url);
+            let history = app.browser_state.clone();
+            let page = app.loaded_page.clone();
+            app.activate(Control::Reload);
+            assert!(app.chrome.loading);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.chrome.loading {
+                assert!(
+                    Instant::now() < deadline,
+                    "Reload completion was not observed"
+                );
+                app.poll_reload();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(app.reload_completion.is_none());
+            assert_eq!(app.browser_state, history);
+            assert_eq!(app.loaded_page, page);
+        }
+    }
+
+    #[test]
+    fn navigation_completion_does_not_clear_a_newer_reload_indicator() {
+        let mut app = app();
+        let navigation_loading = app.begin_loading();
+        app.navigation_id = 1;
+        app.navigation_loading = Some((1, navigation_loading));
+        let reload_loading = app.begin_loading();
+        app.navigation_finished(
+            1,
+            navigation("byui://welcome", Ok(browser::welcome_page())),
+            NavigationBehavior::Auto,
+        );
+        assert!(app.chrome.loading);
+        app.finish_loading(reload_loading);
+        assert!(!app.chrome.loading);
+    }
+
+    #[test]
+    fn missing_loader_or_reload_url_never_leaves_loading_active() {
+        let mut app = app();
+        app.loader = None;
+        app.start_navigation("https://example.com");
+        assert!(!app.chrome.loading);
+        app.activate(Control::Reload);
+        assert!(!app.chrome.loading);
+        app.begin_loading();
+        app.address = "byui://welcome".into();
+        app.submit_address();
+        assert!(!app.chrome.loading);
+    }
+
     #[test]
     fn official_page_loading_closes_the_previous_elements_snapshot() {
         let mut app = app();
@@ -1466,6 +2173,78 @@ mod tests {
         assert_eq!(app.browser_state, before);
         assert_eq!(app.loaded_page, page);
         assert!(app.scripts_evaluated);
+    }
+
+    #[test]
+    fn audit_compatibility_opens_the_dock_on_its_tab_with_a_report() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.scripts_evaluated = true;
+        app.cursor = Some((100.0, 100.0));
+        app.open_context_menu(800, 600, 1.0);
+        app.cursor = Some(app.context_menu.unwrap().item_center(5));
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        let panel = app.elements.as_ref().expect("the dock opens");
+        assert_eq!(panel.tab(), DockTab::Compatibility);
+        // Without an event loop the audit runs inline.
+        let CompatState::Ready(report) = panel.compat.state() else {
+            panic!("audit should have finished: {:?}", panel.compat.state());
+        };
+        assert!(report.features_checked > 0);
+        assert!(app.page_source.is_none());
+    }
+
+    #[test]
+    fn dock_tabs_switch_on_click_and_audit_only_once() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.show_elements();
+        let panel = app.elements.as_mut().unwrap();
+        panel.resize(800.0, 600.0);
+        assert_eq!(panel.tab(), DockTab::Elements);
+        assert_eq!(*panel.compat.state(), CompatState::Idle);
+        // The second header tab starts after the 84px Elements tab.
+        app.cursor = Some((8.0 + 6.0 + 84.0 + 40.0, 340.0));
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        assert!(app.elements.is_some(), "tab clicks never close the dock");
+        assert_eq!(app.elements.as_ref().unwrap().tab(), DockTab::Compatibility);
+        let first = app.audit_id;
+        app.cursor = Some((8.0 + 6.0 + 20.0, 340.0));
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        assert_eq!(app.elements.as_ref().unwrap().tab(), DockTab::Elements);
+        app.select_dock_tab(DockTab::Compatibility);
+        assert_eq!(app.audit_id, first, "a finished audit is reused");
+        app.key_pressed(&Key::Named(NamedKey::Escape));
+        assert!(app.elements.is_none());
+    }
+
+    #[test]
+    fn stale_audit_results_are_dropped() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.show_compatibility();
+        let id = app.audit_id;
+        let report = devtools::compat::AuditReport::default();
+        app.close_elements();
+        app.show_elements();
+        app.audit_finished(id, report);
+        assert_eq!(
+            *app.elements.as_ref().unwrap().compat.state(),
+            CompatState::Idle
+        );
+    }
+
+    #[test]
+    fn compatibility_without_a_page_explains_itself() {
+        let mut app = app();
+        app.show_compatibility();
+        assert_eq!(
+            *app.elements.as_ref().unwrap().compat.state(),
+            CompatState::Unavailable("No loaded page to audit")
+        );
     }
 
     #[test]
@@ -1909,6 +2688,7 @@ mod tests {
         app.navigation_finished(
             app.navigation_id,
             navigation("https://example.com/", Ok(page.clone())),
+            NavigationBehavior::Auto,
         );
 
         assert_eq!(app.loaded_page, Some(page));
@@ -1933,6 +2713,7 @@ mod tests {
         app.navigation_finished(
             app.navigation_id,
             navigation("https://example.com/gone", Err(error)),
+            NavigationBehavior::Auto,
         );
 
         let page = app.loaded_page.as_ref().unwrap();
@@ -1959,7 +2740,11 @@ mod tests {
             scripts: Vec::new(),
         };
 
-        app.navigation_finished(stale, navigation("https://example.com/", Ok(page)));
+        app.navigation_finished(
+            stale,
+            navigation("https://example.com/", Ok(page)),
+            NavigationBehavior::Auto,
+        );
 
         assert_eq!(app.loaded_page, original_page);
         assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);

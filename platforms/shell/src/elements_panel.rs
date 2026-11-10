@@ -1,11 +1,35 @@
-//! Small read-only Elements panel derived from loaded HTML, not the live JS DOM.
+//! The bottom DevTools dock with two tabs: a small read-only Elements tree
+//! derived from loaded HTML (not the live JS DOM), and the Compatibility
+//! audit from [`crate::compat_panel`].
 
 use ab_glyph::FontVec;
 use tiny_skia::{Color, Path, PathBuilder, Pixmap, Rect, Transform};
 
+use crate::compat_panel::CompatView;
 use crate::toolbar;
 
-/// Parsed element hierarchy and independent docked-panel scrolling state.
+/// The dock's tabs, in header order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DockTab {
+    Elements,
+    Compatibility,
+}
+
+impl DockTab {
+    const ALL: [Self; 2] = [Self::Elements, Self::Compatibility];
+
+    /// Tab width in logical pixels; the Compatibility tab leaves room for
+    /// its issue count.
+    fn width(self) -> f32 {
+        match self {
+            Self::Elements => 84.0,
+            Self::Compatibility => 146.0,
+        }
+    }
+}
+
+/// Parsed element hierarchy, the Compatibility view, and docked-panel
+/// scrolling state. Each tab keeps its own scroll position.
 pub(crate) struct ElementsPanel {
     rows: Vec<(usize, String)>,
     message: Option<&'static str>,
@@ -13,6 +37,9 @@ pub(crate) struct ElementsPanel {
     visible: usize,
     wheel_remainder: f64,
     bounds: Option<Rect>,
+    tab: DockTab,
+    /// The Compatibility tab's content. The app fills it with audit results.
+    pub(crate) compat: CompatView,
 }
 
 impl ElementsPanel {
@@ -25,6 +52,8 @@ impl ElementsPanel {
             visible: 0,
             wheel_remainder: 0.0,
             bounds: None,
+            tab: DockTab::Elements,
+            compat: CompatView::new(),
         };
         let Some(html) = html else {
             panel.message = Some("No loaded HTML available");
@@ -83,14 +112,60 @@ impl ElementsPanel {
         let tree = dock_height - f64::from(HEADER + 2.0 * TREE_PAD + footer);
         self.visible = (tree / f64::from(ROW)).max(0.0) as usize;
         self.offset = self.offset.min(self.max_offset());
+        let body = dock_height - f64::from(HEADER + 2.0 * TREE_PAD);
+        self.compat
+            .set_visible((body / f64::from(ROW)).max(0.0) as usize);
+    }
+
+    /// The tab currently shown.
+    #[cfg(test)]
+    pub(crate) fn tab(&self) -> DockTab {
+        self.tab
+    }
+
+    /// Shows `tab`.
+    pub(crate) fn set_tab(&mut self, tab: DockTab) {
+        self.tab = tab;
+    }
+
+    /// Header tab rectangles in logical pixels.
+    fn tab_rects(&self) -> impl Iterator<Item = (DockTab, Rect)> + '_ {
+        let mut left = self.bounds.map_or(0.0, |bounds| bounds.left() + 6.0);
+        DockTab::ALL.into_iter().filter_map(move |tab| {
+            let bounds = self.bounds?;
+            let rect =
+                Rect::from_xywh(left, bounds.top(), tab.width(), HEADER.min(bounds.height()))?;
+            left += tab.width();
+            (rect.right() <= bounds.right()).then_some((tab, rect))
+        })
+    }
+
+    /// The header tab under `cursor`, if any.
+    pub(crate) fn tab_at(&self, cursor: Option<(f64, f64)>) -> Option<DockTab> {
+        self.tab_rects()
+            .find(|(_, rect)| Self::in_rect(Some(*rect), cursor))
+            .map(|(tab, _)| tab)
+    }
+
+    fn tab_label(&self, tab: DockTab) -> String {
+        match (tab, self.compat.issue_count()) {
+            (DockTab::Elements, _) => "Elements".to_owned(),
+            (DockTab::Compatibility, Some(count)) => format!("Compatibility ({count})"),
+            (DockTab::Compatibility, None) => "Compatibility".to_owned(),
+        }
     }
 
     fn max_offset(&self) -> usize {
         self.rows.len().saturating_sub(self.visible.max(1))
     }
 
-    /// Scrolls by source-tree rows (fractional wheel deltas are accumulated).
+    /// Scrolls the active tab by rows (fractional wheel deltas are
+    /// accumulated).
     pub(crate) fn scroll(&mut self, rows: f64) {
+        if self.tab == DockTab::Compatibility {
+            self.compat.scroll(rows);
+            return;
+        }
         self.wheel_remainder += rows;
         let whole = self.wheel_remainder.trunc() as isize;
         self.wheel_remainder -= whole as f64;
@@ -103,6 +178,10 @@ impl ElementsPanel {
     /// Handles navigation keys while the inspector has keyboard focus.
     pub(crate) fn key(&mut self, key: &winit::keyboard::NamedKey) {
         use winit::keyboard::NamedKey;
+        if self.tab == DockTab::Compatibility {
+            self.compat.key(key);
+            return;
+        }
         self.wheel_remainder = 0.0;
         match key {
             NamedKey::ArrowDown => self.scroll(1.0),
@@ -253,6 +332,22 @@ impl ElementsPanel {
             }
         }
 
+        if self.tab == DockTab::Compatibility {
+            if let Some(body) = Rect::from_ltrb(
+                bounds.left(),
+                bounds.top() + HEADER + TREE_PAD,
+                bounds.right(),
+                bounds.bottom() - TREE_PAD,
+            ) {
+                self.compat
+                    .draw(frame, body, scale, dark, cursor, ui_font, mono_font);
+            }
+            if let Some(ui_font) = ui_font.or(mono_font) {
+                self.draw_header(frame, s, dark, cursor, ui_font);
+            }
+            return;
+        }
+
         let tree_top = bounds.top() + HEADER + TREE_PAD;
         let footer = if self.message.is_some() { FOOTER } else { 0.0 };
         let tree_bottom = bounds.bottom() - footer;
@@ -338,75 +433,7 @@ impl ElementsPanel {
         let mono_font = mono_font.unwrap_or(ui_font);
         let device = |value: f32| value * s;
 
-        // Header: a DevTools-style "Elements" tab with an accent underline,
-        // a muted description, and a keyboard hint beside the close button.
-        if bounds.height() >= HEADER {
-            let baseline = bounds.top() + HEADER / 2.0 + 4.5;
-            let title = "Elements";
-            let title_left = bounds.left() + 14.0;
-            let title_width = toolbar::text_advance(ui_font, device(TITLE_SIZE), title) / s;
-            let content_right = self
-                .close_rect()
-                .map_or(bounds.right() - 8.0, |close| close.left() - 8.0);
-            toolbar::draw_text(
-                frame,
-                ui_font,
-                device(TITLE_SIZE),
-                device(title_left),
-                device(baseline),
-                device(content_right),
-                palette.text,
-                title,
-            );
-            if let Some(underline) = Rect::from_xywh(
-                title_left - 4.0,
-                bounds.top() + HEADER - 2.0,
-                title_width + 8.0,
-                2.0,
-            ) {
-                toolbar::fill(
-                    frame,
-                    &PathBuilder::from_rect(underline),
-                    palette.accent,
-                    transform,
-                );
-            }
-            let hint = "Esc to close";
-            let hint_width = toolbar::text_advance(ui_font, device(SMALL_SIZE), hint) / s;
-            let hint_left = content_right - 4.0 - hint_width;
-            let subtitle_left = title_left + title_width + 18.0;
-            let subtitle = "HTML snapshot · read-only";
-            let subtitle_width = toolbar::text_advance(ui_font, device(SMALL_SIZE), subtitle) / s;
-            let show_hint = hint_left > subtitle_left + subtitle_width + 16.0;
-            if subtitle_left < content_right {
-                toolbar::draw_text(
-                    frame,
-                    ui_font,
-                    device(SMALL_SIZE),
-                    device(subtitle_left),
-                    device(baseline),
-                    device(if show_hint {
-                        hint_left - 16.0
-                    } else {
-                        content_right
-                    }),
-                    palette.text_muted,
-                    subtitle,
-                );
-            }
-            if show_hint {
-                toolbar::draw_text(
-                    frame,
-                    ui_font,
-                    device(SMALL_SIZE),
-                    device(hint_left),
-                    device(baseline),
-                    device(content_right),
-                    palette.text_muted,
-                    hint,
-                );
-            }
-        }
+        self.draw_header(frame, s, dark, cursor, ui_font);
 
         if let Some(message) = self.message
             && bounds.height() >= HEADER + footer
@@ -451,6 +478,114 @@ impl ElementsPanel {
                     part,
                 );
             }
+        }
+    }
+
+    /// Draws the header text: the tabs (active one underlined), a muted
+    /// description of the active tab, and a keyboard hint beside the close
+    /// button. `s` is the device scale.
+    fn draw_header(
+        &self,
+        frame: &mut Pixmap,
+        s: f32,
+        dark: bool,
+        cursor: Option<(f64, f64)>,
+        ui_font: &FontVec,
+    ) {
+        let Some(bounds) = self.bounds else {
+            return;
+        };
+        if bounds.height() < HEADER {
+            return;
+        }
+        let palette = toolbar::palette(dark);
+        let transform = Transform::from_scale(s, s);
+        let device = |value: f32| value * s;
+        let baseline = bounds.top() + HEADER / 2.0 + 4.5;
+        let content_right = self
+            .close_rect()
+            .map_or(bounds.right() - 8.0, |close| close.left() - 8.0);
+        let mut subtitle_left = bounds.left() + 14.0;
+        for (tab, rect) in self.tab_rects() {
+            let label = self.tab_label(tab);
+            let active = tab == self.tab;
+            if !active
+                && Self::in_rect(Some(rect), cursor)
+                && let Some(path) = toolbar::rounded_rect(
+                    rect.x() + 2.0,
+                    rect.y() + 5.0,
+                    rect.width() - 4.0,
+                    rect.height() - 10.0,
+                    6.0,
+                )
+            {
+                toolbar::fill(frame, &path, palette.hover, transform);
+            }
+            let width = toolbar::text_advance(ui_font, device(TITLE_SIZE), &label) / s;
+            let left = rect.left() + ((rect.width() - width) / 2.0).max(4.0);
+            toolbar::draw_text(
+                frame,
+                ui_font,
+                device(TITLE_SIZE),
+                device(left),
+                device(baseline),
+                device(rect.right().min(content_right)),
+                if active {
+                    palette.text
+                } else {
+                    palette.text_muted
+                },
+                &label,
+            );
+            if active
+                && let Some(underline) =
+                    Rect::from_xywh(left - 4.0, bounds.top() + HEADER - 2.0, width + 8.0, 2.0)
+            {
+                toolbar::fill(
+                    frame,
+                    &PathBuilder::from_rect(underline),
+                    palette.accent,
+                    transform,
+                );
+            }
+            subtitle_left = rect.right() + 12.0;
+        }
+        let hint = "Esc to close";
+        let hint_width = toolbar::text_advance(ui_font, device(SMALL_SIZE), hint) / s;
+        let hint_left = content_right - 4.0 - hint_width;
+        let subtitle = match self.tab {
+            DockTab::Elements => "HTML snapshot · read-only".to_owned(),
+            DockTab::Compatibility => self.compat.summary(),
+        };
+        let subtitle_width = toolbar::text_advance(ui_font, device(SMALL_SIZE), &subtitle) / s;
+        let show_hint = hint_left > subtitle_left + subtitle_width + 16.0;
+        if subtitle_left < content_right {
+            toolbar::draw_text(
+                frame,
+                ui_font,
+                device(SMALL_SIZE),
+                device(subtitle_left),
+                device(baseline),
+                device(if show_hint {
+                    hint_left - 16.0
+                } else {
+                    content_right
+                }),
+                palette.text_muted,
+                &subtitle,
+            );
+        }
+        if show_hint {
+            toolbar::draw_text(
+                frame,
+                ui_font,
+                device(SMALL_SIZE),
+                device(hint_left),
+                device(baseline),
+                device(content_right),
+                palette.text_muted,
+                hint,
+            );
         }
     }
 }

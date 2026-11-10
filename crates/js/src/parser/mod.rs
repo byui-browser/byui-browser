@@ -60,7 +60,7 @@ type ParseResult<T> = Result<T, ParseError>;
 /// parentheses: `({ a: 1 })`.
 /// `throw` must have its operand on the same line. `try` needs a `catch`
 /// clause (with an optional identifier binding) or a `finally` block.
-/// `break` and `continue` must sit in a `while` loop of the same function and
+/// `break` and `continue` must sit in a loop of the same function and
 /// take no label. Returns outside functions, constants without initializers, duplicate
 /// parameter names, and `let`/`const`/`function` declarations used directly as
 /// an `if`, `else`, or `while` body are rejected.

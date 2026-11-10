@@ -12,6 +12,8 @@ pub mod permissions;
 
 use std::fmt;
 
+use common::ipc::{StorageError as IpcStorageError, StorageRequest};
+
 /// Formats an origin as `scheme://host:port` for log messages.
 fn origin_label(origin: &Origin) -> String {
     format!("{}://{}:{}", origin.scheme(), origin.host(), origin.port())
@@ -124,6 +126,117 @@ impl StorageKey {
     }
 }
 
+/// A storage key that a renderer context has authorized for use.
+///
+/// The token borrows the key owned by its [`RendererSecurityContext`]. It can
+/// only be created by validating a request or by asking the context for its
+/// own key, so storage backends do not have to trust renderer-supplied keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedStorageKey<'context> {
+    storage_key: &'context StorageKey,
+}
+
+impl<'context> TrustedStorageKey<'context> {
+    /// Returns the storage key authorized by the renderer context.
+    #[must_use]
+    pub fn storage_key(self) -> &'context StorageKey {
+        self.storage_key
+    }
+}
+
+/// Why a storage-key authorization request was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageKeyValidationError {
+    /// The requested key does not match the context's trusted key.
+    Mismatch,
+}
+
+impl fmt::Display for StorageKeyValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mismatch => formatter.write_str("storage key does not match renderer context"),
+        }
+    }
+}
+
+impl std::error::Error for StorageKeyValidationError {}
+
+/// The access class requested by a storage IPC message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageOperation {
+    /// Read data without changing the storage area.
+    Read,
+    /// Add, remove, or clear data in the storage area.
+    Write,
+}
+
+/// Why a storage IPC request was rejected before reaching a backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageAuthorizationError {
+    /// The request is not a valid storage operation.
+    InvalidRequest,
+    /// The renderer does not have permission for the requested operation.
+    PermissionDenied,
+    /// The requested storage key is not the context's trusted key.
+    StorageKeyMismatch,
+}
+
+impl fmt::Display for StorageAuthorizationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest => formatter.write_str("invalid storage request"),
+            Self::PermissionDenied => formatter.write_str("storage permission denied"),
+            Self::StorageKeyMismatch => {
+                formatter.write_str("storage key does not match renderer context")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StorageAuthorizationError {}
+
+impl From<StorageKeyValidationError> for StorageAuthorizationError {
+    fn from(error: StorageKeyValidationError) -> Self {
+        match error {
+            StorageKeyValidationError::Mismatch => Self::StorageKeyMismatch,
+        }
+    }
+}
+
+impl From<StorageAuthorizationError> for IpcStorageError {
+    fn from(error: StorageAuthorizationError) -> Self {
+        match error {
+            StorageAuthorizationError::InvalidRequest => Self::InvalidRequest,
+            StorageAuthorizationError::PermissionDenied
+            | StorageAuthorizationError::StorageKeyMismatch => Self::AccessDenied,
+        }
+    }
+}
+
+/// A storage request that passed renderer identity and permission checks.
+///
+/// The authorized key borrows the renderer context, so it cannot outlive the
+/// context that approved the request or be replaced with a renderer-supplied key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorizedStorageRequest<'context> {
+    operation: StorageOperation,
+    storage_key: TrustedStorageKey<'context>,
+}
+
+impl<'context> AuthorizedStorageRequest<'context> {
+    /// Returns whether the request is a read or write operation.
+    #[must_use]
+    pub const fn operation(self) -> StorageOperation {
+        self.operation
+    }
+
+    /// Returns the storage key approved by the renderer context.
+    #[must_use]
+    pub const fn storage_key(self) -> TrustedStorageKey<'context> {
+        self.storage_key
+    }
+}
+
 /// The renderer's permission to access browser storage.
 ///
 /// This initial policy is all-or-nothing: allowing storage permits both reads
@@ -187,6 +300,81 @@ impl RendererSecurityContext {
     /// Returns the storage key associated with the renderer's origin.
     pub fn storage_key(&self) -> &StorageKey {
         &self.storage_key
+    }
+
+    /// Returns this context's trusted storage key.
+    ///
+    /// Browser code uses this when it creates a request for the renderer's
+    /// own storage area. The returned token borrows the context and cannot be
+    /// constructed from an arbitrary [`StorageKey`].
+    #[must_use]
+    pub fn trusted_storage_key(&self) -> TrustedStorageKey<'_> {
+        TrustedStorageKey {
+            storage_key: &self.storage_key,
+        }
+    }
+
+    /// Authorizes a requested storage key against this renderer context.
+    ///
+    /// Call this at a storage or IPC boundary before using a key supplied by a
+    /// renderer. A key for another origin, including a manually constructed
+    /// key, is rejected.
+    pub fn authorize_storage_key(
+        &self,
+        requested: &StorageKey,
+    ) -> Result<TrustedStorageKey<'_>, StorageKeyValidationError> {
+        if requested != &self.storage_key {
+            log::warn!(
+                "rejected storage key for {}: key does not match renderer context",
+                origin_label(&self.origin)
+            );
+            return Err(StorageKeyValidationError::Mismatch);
+        }
+
+        Ok(self.trusted_storage_key())
+    }
+
+    /// Authorizes a storage IPC request before a backend is accessed.
+    ///
+    /// `requested_storage_key` is transport metadata supplied alongside the
+    /// request. A successful result contains the only key token accepted by
+    /// storage backends.
+    pub fn authorize_storage_request(
+        &self,
+        request: &StorageRequest,
+        requested_storage_key: &StorageKey,
+    ) -> Result<AuthorizedStorageRequest<'_>, StorageAuthorizationError> {
+        let operation = match request {
+            StorageRequest::Invalid => {
+                log::warn!("rejected invalid storage request");
+                return Err(StorageAuthorizationError::InvalidRequest);
+            }
+            StorageRequest::GetItem { .. } | StorageRequest::Length => StorageOperation::Read,
+            StorageRequest::SetItem { .. }
+            | StorageRequest::RemoveItem { .. }
+            | StorageRequest::Clear => StorageOperation::Write,
+        };
+
+        let storage_key = self
+            .authorize_storage_key(requested_storage_key)
+            .map_err(StorageAuthorizationError::from)?;
+        let allowed = match operation {
+            StorageOperation::Read => self.can_read_storage(),
+            StorageOperation::Write => self.can_write_storage(),
+        };
+
+        if !allowed {
+            log::warn!(
+                "rejected {operation:?} storage request for {}: permission denied",
+                origin_label(&self.origin)
+            );
+            return Err(StorageAuthorizationError::PermissionDenied);
+        }
+
+        Ok(AuthorizedStorageRequest {
+            operation,
+            storage_key,
+        })
     }
 
     /// Whether the renderer is allowed to read storage.
@@ -428,6 +616,145 @@ mod tests {
         assert_eq!(context.storage_key().get(), &origin);
         assert!(!context.can_read_storage());
         assert!(!context.can_write_storage());
+    }
+
+    #[test]
+    fn renderer_context_authorizes_its_own_storage_key() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+
+        let authorized = context
+            .authorize_storage_key(context.storage_key())
+            .expect("context key should be authorized");
+
+        assert_eq!(authorized.storage_key(), context.storage_key());
+    }
+
+    #[test]
+    fn renderer_context_rejects_another_origins_storage_key() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+        let forged = StorageKey::new(origin("https", "example.com", 443));
+
+        assert_eq!(
+            context.authorize_storage_key(&forged),
+            Err(StorageKeyValidationError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn trusted_storage_key_comes_from_context() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+
+        assert_eq!(
+            context.trusted_storage_key().storage_key(),
+            context.storage_key()
+        );
+    }
+
+    #[test]
+    fn allowed_reads_and_writes_are_authorized() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+
+        let read = context
+            .authorize_storage_request(
+                &StorageRequest::GetItem { key: "name".into() },
+                context.storage_key(),
+            )
+            .expect("allowed read should be authorized");
+        let write = context
+            .authorize_storage_request(
+                &StorageRequest::SetItem {
+                    key: "name".into(),
+                    value: "Nestor".into(),
+                },
+                context.storage_key(),
+            )
+            .expect("allowed write should be authorized");
+
+        assert_eq!(read.operation(), StorageOperation::Read);
+        assert_eq!(write.operation(), StorageOperation::Write);
+        assert_eq!(read.storage_key().storage_key(), context.storage_key());
+    }
+
+    #[test]
+    fn denied_reads_and_writes_are_rejected() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Denied,
+        );
+
+        for request in [
+            StorageRequest::GetItem { key: "name".into() },
+            StorageRequest::SetItem {
+                key: "name".into(),
+                value: "Nestor".into(),
+            },
+        ] {
+            assert_eq!(
+                context.authorize_storage_request(&request, context.storage_key()),
+                Err(StorageAuthorizationError::PermissionDenied)
+            );
+        }
+    }
+
+    #[test]
+    fn mismatched_keys_are_rejected_before_permission_is_checked() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+        let forged = StorageKey::new(origin("https", "example.com", 443));
+
+        assert_eq!(
+            context.authorize_storage_request(
+                &StorageRequest::SetItem {
+                    key: "name".into(),
+                    value: "Nestor".into(),
+                },
+                &forged,
+            ),
+            Err(StorageAuthorizationError::StorageKeyMismatch)
+        );
+    }
+
+    #[test]
+    fn invalid_requests_are_rejected_without_panicking() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+
+        assert_eq!(
+            context.authorize_storage_request(&StorageRequest::Invalid, context.storage_key()),
+            Err(StorageAuthorizationError::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn authorization_errors_map_to_consistent_ipc_errors() {
+        assert_eq!(
+            IpcStorageError::from(StorageAuthorizationError::PermissionDenied),
+            IpcStorageError::AccessDenied
+        );
+        assert_eq!(
+            IpcStorageError::from(StorageAuthorizationError::StorageKeyMismatch),
+            IpcStorageError::AccessDenied
+        );
+        assert_eq!(
+            IpcStorageError::from(StorageAuthorizationError::InvalidRequest),
+            IpcStorageError::InvalidRequest
+        );
     }
 
     #[test]

@@ -73,8 +73,10 @@ impl Compiler {
         self.control.push(Control::Loop {
             live: self.live,
             scopes: self.scopes.len(),
-            start: loop_start,
+            continue_scopes: self.scopes.len(),
+            continue_target: loop_start,
             breaks: Vec::new(),
+            continues: Vec::new(),
         });
         self.compile_expression(condition)?;
         let exit = self.emit_placeholder(Instruction::JumpIfFalse(usize::MAX))?;
@@ -99,6 +101,100 @@ impl Compiler {
             self.chunk.emit(Instruction::Pop);
         }
         Ok(is_completion)
+    }
+
+    pub(super) fn compile_for(
+        &mut self,
+        init: Option<&Statement>,
+        condition: Option<&Expr>,
+        update: Option<&Expr>,
+        body: &Statement,
+        is_completion: bool,
+    ) -> Result<bool, super::CompileError> {
+        let outer_scope = self.scopes.len();
+        let loop_scope = self.enter_block()?;
+        if let Some(Statement::VariableDeclaration { kind, name, .. }) = init
+            && *kind != VarKind::Var
+        {
+            self.add_binding(loop_scope, name, *kind)?;
+        }
+        let enter = self.chunk.emit(Instruction::EnterScope(0));
+        self.emit_scope_declarations(loop_scope)?;
+        if let Some(init) = init {
+            self.compile_statement(init, false)?;
+        }
+        self.constant(crate::Value::Undefined)?;
+        self.live += 1;
+        let loop_start = self.chunk.current_offset();
+        self.control.push(Control::Loop {
+            live: self.live,
+            scopes: outer_scope,
+            continue_scopes: loop_scope + 1,
+            continue_target: usize::MAX,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+        });
+        let exit = if let Some(condition) = condition {
+            self.compile_expression(condition)?;
+            let exit = self.emit_placeholder(Instruction::JumpIfFalse(usize::MAX))?;
+            self.chunk.emit(Instruction::Pop);
+            Some(exit)
+        } else {
+            None
+        };
+        let body_produced = self.compile_statement(body, true)?;
+        if body_produced {
+            self.chunk.emit(Instruction::Swap);
+            self.chunk.emit(Instruction::Pop);
+        }
+        let update_target = self.chunk.current_offset();
+        let continues = match self.control.last_mut() {
+            Some(Control::Loop {
+                continue_target,
+                continues,
+                ..
+            }) => {
+                *continue_target = update_target;
+                std::mem::take(continues)
+            }
+            _ => return Err(internal("loop control entry is missing")),
+        };
+        for jump in continues {
+            self.patch_to(jump, update_target)?;
+        }
+        if let Some(update) = update {
+            self.compile_expression(update)?;
+            self.chunk.emit(Instruction::Pop);
+        }
+        self.chunk.emit(Instruction::Jump(loop_start));
+        if let Some(exit) = exit {
+            self.patch(exit)?;
+            self.chunk.emit(Instruction::Pop);
+        }
+        self.chunk.emit(Instruction::ExitScope);
+        let Some(Control::Loop { breaks, .. }) = self.control.pop() else {
+            return Err(internal("loop control entry is missing"));
+        };
+        for jump in breaks {
+            self.patch(jump)?;
+        }
+        self.chunk.code[enter] = Instruction::EnterScope(self.scopes[loop_scope].slots);
+        self.scopes.pop();
+        self.live -= 1;
+        if !is_completion {
+            self.chunk.emit(Instruction::Pop);
+        }
+        Ok(is_completion)
+    }
+
+    fn patch_to(&mut self, jump: usize, target: usize) -> Result<(), super::CompileError> {
+        self.chunk
+            .patch_jump(jump, target)
+            .map_err(|message| super::CompileError {
+                message: message.into(),
+                unsupported: false,
+                location: None,
+            })
     }
 }
 
@@ -133,20 +229,29 @@ impl Compiler {
         let Control::Loop {
             live,
             scopes,
-            start,
+            continue_scopes,
+            continue_target,
             ..
         } = self.control[index]
         else {
             return Err(internal("loop control entry is missing"));
         };
-        self.unwind(index + 1, Some(live), Some(scopes))?;
+        let end_scopes = if is_break { scopes } else { continue_scopes };
+        self.unwind(index + 1, Some(live), Some(end_scopes))?;
         if is_break {
             let jump = self.emit_placeholder(Instruction::Jump(usize::MAX))?;
             if let Control::Loop { breaks, .. } = &mut self.control[index] {
                 breaks.push(jump);
             }
         } else {
-            self.chunk.emit(Instruction::Jump(start));
+            if continue_target == usize::MAX {
+                let jump = self.emit_placeholder(Instruction::Jump(usize::MAX))?;
+                if let Control::Loop { continues, .. } = &mut self.control[index] {
+                    continues.push(jump);
+                }
+            } else {
+                self.chunk.emit(Instruction::Jump(continue_target));
+            }
         }
         // Unreachable, but keeps the stack shape that callers expect.
         if is_completion {

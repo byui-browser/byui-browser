@@ -92,15 +92,13 @@ impl InternalResponse {
                 .or_insert_with(|| content_type.clone());
         }
         let response_forbids_body = matches!(status.as_u16(), 101 | 204 | 205 | 304);
-        if !response_forbids_body {
-            if let Some(length) = resource.body.known_length() {
-                headers
-                    .entry(http::header::CONTENT_LENGTH)
-                    .or_insert_with(|| {
-                        http::HeaderValue::from_str(&length.to_string())
-                            .expect("a byte length is a valid header value")
-                    });
-            }
+        if !response_forbids_body && let Some(length) = resource.body.known_length() {
+            headers
+                .entry(http::header::CONTENT_LENGTH)
+                .or_insert_with(|| {
+                    http::HeaderValue::from_str(&length.to_string())
+                        .expect("a byte length is a valid header value")
+                });
         }
         let force_null = has_null_body(request.method(), status) || response_forbids_body;
         let mut body = resource
@@ -202,18 +200,17 @@ fn validate_scheme_resource(
         .iter()
         .find(|(name, _)| name == http::header::CONTENT_TYPE)
         .map(|(_, value)| value);
-    if let Some(media_type) = &resource.media_type {
-        if !is_valid_media_type(media_type)
-            || header_media_type.is_some_and(|header| header != media_type)
-        {
-            log::warn!(
-                "{expected} provider returned a media type that is invalid or differs from its content-type header"
-            );
-            return Err(provider_error(
-                expected,
-                crate::ProviderErrorKind::MalformedMetadata,
-            ));
-        }
+    if let Some(media_type) = &resource.media_type
+        && (!is_valid_media_type(media_type)
+            || header_media_type.is_some_and(|header| header != media_type))
+    {
+        log::warn!(
+            "{expected} provider returned a media type that is invalid or differs from its content-type header"
+        );
+        return Err(provider_error(
+            expected,
+            crate::ProviderErrorKind::MalformedMetadata,
+        ));
     }
     if header_media_type.is_some_and(|value| !is_valid_media_type(value)) {
         log::warn!("{expected} provider returned an invalid content-type header");

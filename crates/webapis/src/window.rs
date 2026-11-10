@@ -1,137 +1,170 @@
 //! The script-visible `Window`, `History`, and `Location` objects.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::atomic::{AtomicU32, Ordering},
+    sync::{Arc, Mutex, PoisonError},
+    time::Instant,
+};
 
 use crate::custom_elements::CustomElementRegistry;
 use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
 use security::RendererSecurityContext;
 
+use crate::timer::{TimerId, TimerQueue};
+
+#[derive(Clone)]
 enum TimerHandler {
     Callback(Function),
     Source(String),
 }
 
-struct PendingTimer {
-    cancelled: Arc<AtomicBool>,
+#[derive(Clone)]
+struct TimerCallback {
     handler: TimerHandler,
     arguments: Vec<Value>,
+    repeat: bool,
     nesting_level: u32,
-    nesting_context: Arc<AtomicU32>,
-    evaluator: js::ScriptEvaluator,
-    receiver: Value,
 }
 
-struct TimerJob {
-    deadline: Instant,
-    id: u32,
-    cancelled: Arc<AtomicBool>,
-    dispatcher: TimerDispatcher,
+struct AnimationFrameCallbacks {
+    next_id: u32,
+    callbacks: Vec<(u32, Function)>,
+    time_origin: Instant,
 }
 
-/// Callback used by a host to enqueue a timer on its page task loop.
-pub type TimerDispatcher = Arc<dyn Fn(u32) + Send + Sync>;
-
-fn fire_pending_timer(timers: &Mutex<HashMap<u32, PendingTimer>>, id: u32) {
-    let timer = timers
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(&id);
-    let Some(timer) = timer else { return };
-    if timer.cancelled.load(Ordering::Acquire) {
-        return;
-    }
-    let previous_level = timer
-        .nesting_context
-        .swap(timer.nesting_level, Ordering::AcqRel);
-    let result = match timer.handler {
-        TimerHandler::Callback(callback) => {
-            timer
-                .evaluator
-                .call_with_this(&callback, timer.receiver, &timer.arguments)
+impl AnimationFrameCallbacks {
+    fn new() -> Self {
+        Self {
+            next_id: 0,
+            callbacks: Vec::new(),
+            time_origin: Instant::now(),
         }
-        TimerHandler::Source(source) => timer
-            .evaluator
-            .evaluate_script_with_this(&source, timer.receiver),
-    };
-    timer
-        .nesting_context
-        .store(previous_level, Ordering::Release);
-    if let Err(error) = result {
-        log::warn!("setTimeout callback threw: {error}");
+    }
+
+    fn request(&mut self, function: Function) -> u32 {
+        self.next_id = self.next_id.wrapping_add(1);
+        let id = self.next_id;
+        self.callbacks.push((id, function));
+        id
+    }
+
+    fn cancel(&mut self, id: u32) {
+        self.callbacks.retain(|(callback_id, _)| *callback_id != id);
+    }
+
+    fn take_for_frame(&mut self, now: Instant) -> (f64, Vec<u32>) {
+        let timestamp = now
+            .saturating_duration_since(self.time_origin)
+            .as_secs_f64()
+            * 1000.0;
+        let handles = self.callbacks.iter().map(|(id, _)| *id).collect();
+        (timestamp, handles)
+    }
+
+    fn take_callback(&mut self, id: u32) -> Option<Function> {
+        let index = self
+            .callbacks
+            .iter()
+            .position(|(callback_id, _)| *callback_id == id)?;
+        Some(self.callbacks.remove(index).1)
     }
 }
 
-fn timer_scheduler() -> &'static mpsc::Sender<TimerJob> {
-    static SCHEDULER: OnceLock<mpsc::Sender<TimerJob>> = OnceLock::new();
-    SCHEDULER.get_or_init(|| {
-        let (sender, receiver) = mpsc::channel::<TimerJob>();
-        thread::spawn(move || {
-            let mut jobs = Vec::new();
-            loop {
-                if jobs.is_empty() {
-                    match receiver.recv() {
-                        Ok(job) => jobs.push(job),
-                        Err(_) => break,
-                    }
-                    continue;
-                }
-                let next = jobs
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, job)| job.deadline)
-                    .map(|(index, job)| (index, job.deadline));
-                let Some((index, deadline)) = next else {
-                    continue;
-                };
-                match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(job) => jobs.push(job),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        let job = jobs.remove(index);
-                        if !job.cancelled.load(Ordering::Acquire) {
-                            (job.dispatcher)(job.id);
-                        }
-                    }
-                }
-            }
-        });
-        sender
-    })
+struct WindowTimers {
+    queue: TimerQueue,
+    callbacks: HashMap<TimerId, TimerCallback>,
 }
 
-fn webidl_long(value: &Value) -> JsResult<i32> {
+impl WindowTimers {
+    fn new() -> Self {
+        Self {
+            queue: TimerQueue::new(),
+            callbacks: HashMap::new(),
+        }
+    }
+
+    fn set_interval(
+        &mut self,
+        function: Function,
+        delay_ms: u64,
+        arguments: Vec<Value>,
+    ) -> TimerId {
+        let id = self.queue.schedule_interval(delay_ms);
+        self.callbacks.insert(
+            id,
+            TimerCallback {
+                handler: TimerHandler::Callback(function),
+                arguments,
+                repeat: true,
+                nesting_level: 1,
+            },
+        );
+        id
+    }
+
+    fn clear_interval(&mut self, id: TimerId) -> bool {
+        self.callbacks.remove(&id);
+        self.queue.cancel(id)
+    }
+
+    fn set_timeout(
+        &mut self,
+        handler: TimerHandler,
+        delay_ms: u64,
+        arguments: Vec<Value>,
+        nesting_level: u32,
+    ) -> TimerId {
+        let id = self.queue.schedule(delay_ms);
+        self.callbacks.insert(
+            id,
+            TimerCallback {
+                handler,
+                arguments,
+                repeat: false,
+                nesting_level,
+            },
+        );
+        id
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<(TimerId, TimerCallback)> {
+        let id = self.queue.pop_due(now)?;
+        let callback = self.callbacks.get(&id)?.clone();
+        if !callback.repeat {
+            self.callbacks.remove(&id);
+        }
+        Some((id, callback))
+    }
+}
+
+fn timer_delay(value: Option<&Value>) -> JsResult<u64> {
     let number = match value {
-        Value::Undefined => 0.0,
-        Value::Null => 0.0,
-        Value::Boolean(value) => f64::from(u8::from(*value)),
-        Value::Number(value) => *value,
-        Value::String(value) => {
-            if value.trim().is_empty() {
-                0.0
-            } else {
-                value.trim().parse::<f64>().unwrap_or(f64::NAN)
-            }
-        }
-        Value::Array(_) | Value::Object(_) => {
-            value.to_string().trim().parse::<f64>().unwrap_or(f64::NAN)
-        }
-        Value::Function(_) => f64::NAN,
+        None | Some(Value::Undefined) | Some(Value::Null) => 0.0,
+        Some(Value::Number(value)) => *value,
+        Some(Value::Boolean(value)) => f64::from(*value),
+        Some(Value::String(value)) => value.trim().parse::<f64>().unwrap_or(f64::NAN),
+        Some(_) => return Err(JsError::runtime("timer delay must be a number")),
     };
-    if !number.is_finite() || number == 0.0 {
+    if number.is_nan() || number <= 0.0 {
         return Ok(0);
     }
-    let integer = number.trunc();
-    let wrapped = integer.rem_euclid(4_294_967_296.0);
-    Ok(if wrapped >= 2_147_483_648.0 {
-        (wrapped - 4_294_967_296.0) as i32
-    } else {
-        wrapped as i32
-    })
+    Ok(number.min(u64::MAX as f64).trunc() as u64)
+}
+
+fn timer_id(value: Option<&Value>) -> Option<TimerId> {
+    let number = match value? {
+        Value::Undefined | Value::Null => 0.0,
+        Value::Boolean(value) => f64::from(*value),
+        Value::Number(value) => *value,
+        Value::String(value) => value.trim().parse::<f64>().unwrap_or(f64::NAN),
+        Value::Function(_) | Value::Object(_) | Value::Array(_) => return None,
+    };
+    if !number.is_finite() || number <= 0.0 {
+        return None;
+    }
+    Some(TimerId(number.trunc().min(u32::MAX as f64) as u32))
 }
 
 #[derive(Clone, Debug)]
@@ -241,19 +274,32 @@ fn invoke_popstate(window: &Object, state: &Value) {
         callbacks.push(Value::Function(callback));
     }
     for callback in callbacks {
-        if let Value::Function(callback) = callback {
-            if let Err(error) = callback.call(&[Value::Object(event.clone())]) {
-                log::warn!("popstate listener threw: {error}");
-            }
+        if let Value::Function(callback) = callback
+            && let Err(error) = callback.call(&[Value::Object(event.clone())])
+        {
+            log::warn!("popstate listener threw: {error}");
         }
     }
+}
+
+/// The viewport dimensions exposed to a script-visible Window.
+///
+/// Dimensions are CSS pixels, matching CSSOM View. A viewport is optional
+/// because a Window without an associated viewport must report zero for
+/// `innerWidth` and `innerHeight`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewportSize {
+    /// The viewport width in CSS pixels.
+    pub width: u32,
+    /// The viewport height in CSS pixels.
+    pub height: u32,
 }
 
 fn register_window_object(
     realm: &mut Realm,
     initial_url: &str,
     device_pixel_ratio: f64,
-    timer_dispatcher: Option<TimerDispatcher>,
+    viewport: Option<ViewportSize>,
 ) -> JsResult<Object> {
     let window = match realm.registered_global_value("window") {
         Some(Value::Object(window)) => window,
@@ -269,6 +315,11 @@ fn register_window_object(
         Some(Value::Object(registry)) => registry,
         _ => CustomElementRegistry::new().object(),
     };
+    let timers = Arc::new(Mutex::new(WindowTimers::new()));
+    let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
+    let evaluator = realm.script_evaluator();
+    let timer_this = Value::Object(window.clone());
+    let nesting_context = Arc::new(AtomicU32::new(0));
 
     window.set_method(
         "self",
@@ -282,125 +333,186 @@ fn register_window_object(
     // CSSOM View exposes scrollX as a readonly number. The renderer does not
     // yet have document horizontal scrolling, so the initial offset is zero.
     window.set_read_only("scrollX", Value::Number(0.0));
+    // CSSOM View exposes scrollY and pageYOffset as readonly numbers. The
+    // browser shell updates these host properties as the viewport scrolls.
+    window.set_read_only("scrollY", Value::Number(0.0));
+    window.set_read_only("pageYOffset", Value::Number(0.0));
     // The desktop shell supplies the output device scale; non-windowed
     // callers use the specification's fallback value of 1.0.
     window.set_replaceable_read_only("devicePixelRatio", Value::Number(device_pixel_ratio));
+    // CSSOM View: innerWidth is the viewport width in CSS pixels, or zero
+    // when the Window has no associated viewport. It is replaceable.
+    let inner_width = Value::Number(viewport.map_or(0, |size| size.width) as f64);
+    window.set("innerWidth", inner_width.clone());
+    // CSSOM View: innerHeight is the viewport height in CSS pixels, including
+    // any rendered scrollbar, or zero when the Window has no viewport. It is
+    // replaceable.
+    let inner_height = Value::Number(viewport.map_or(0, |size| size.height) as f64);
+    window.set("innerHeight", inner_height.clone());
     window.set("onpopstate", Value::Null);
-    let timers: Arc<Mutex<HashMap<u32, PendingTimer>>> = Arc::new(Mutex::new(HashMap::new()));
-    let timers_for_set = Arc::clone(&timers);
-    let next_timer_id = Arc::new(AtomicU32::new(0));
-    let next_timer_id_for_set = Arc::clone(&next_timer_id);
-    let nesting_context = Arc::new(AtomicU32::new(0));
-    let nesting_context_for_set = Arc::clone(&nesting_context);
-    let evaluator = realm.script_evaluator();
-    let timer_receiver = Value::Object(window.clone());
-    let timer_dispatcher = timer_dispatcher.unwrap_or_else(|| {
-        let timers = Arc::clone(&timers);
-        Arc::new(move |id| fire_pending_timer(&timers, id))
-    });
-    let dispatch_timers = Arc::clone(&timers);
-    window.set_method(
-        "__dispatchTimer",
-        Arc::new(move |arguments| {
-            if let Some(Value::Number(id)) = arguments.first()
-                && id.is_finite()
-                && *id >= 1.0
-                && *id <= i32::MAX as f64
-            {
-                fire_pending_timer(&dispatch_timers, *id as u32);
-            }
-            Ok(Value::Undefined)
-        }),
-    );
-    let clear_all_timers = Arc::clone(&timers);
-    window.set_method(
-        "__clearTimers",
-        Arc::new(move |_| {
-            let mut timers = clear_all_timers
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            for (_, timer) in timers.drain() {
-                timer.cancelled.store(true, Ordering::Release);
-            }
-            Ok(Value::Undefined)
-        }),
-    );
+    history.set("scrollRestoration", Value::String("auto".into()));
+    window.set("__popstateListeners", Value::Object(Object::new()));
+
+    let timers_for_timeout = Arc::clone(&timers);
+    let nesting_for_timeout = Arc::clone(&nesting_context);
     window.set_method(
         "setTimeout",
         Arc::new(move |arguments| {
             let handler = match arguments.first() {
-                Some(Value::Function(callback)) => TimerHandler::Callback(callback.clone()),
-                Some(handler) => TimerHandler::Source(handler.to_string()),
+                Some(Value::Function(function)) => TimerHandler::Callback(function.clone()),
+                Some(value) => TimerHandler::Source(value.to_string()),
                 None => return Err(JsError::runtime("setTimeout() requires a handler")),
             };
-            let delay = webidl_long(arguments.get(1).unwrap_or(&Value::Undefined))?.max(0);
-            let nesting_level = nesting_context_for_set.load(Ordering::Acquire);
-            let delay = if nesting_level > 5 && delay < 4 {
+            let nesting = nesting_for_timeout.load(Ordering::Acquire);
+            let requested_delay = timer_delay(arguments.get(1))?;
+            let delay = if nesting > 5 && requested_delay < 4 {
                 4
             } else {
-                delay
+                requested_delay
             };
-            let delay_ms = delay as u64;
             let callback_arguments = arguments.get(2..).unwrap_or_default().to_vec();
-            let mut active_timers = timers_for_set
+            let id = timers_for_timeout
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let id = loop {
-                let candidate =
-                    next_timer_id_for_set.fetch_add(1, Ordering::Relaxed) % i32::MAX as u32 + 1;
-                if !active_timers.contains_key(&candidate) {
-                    break candidate;
-                }
-            };
-            let cancelled = Arc::new(AtomicBool::new(false));
-            active_timers.insert(
-                id,
-                PendingTimer {
-                    cancelled: Arc::clone(&cancelled),
-                    handler,
-                    arguments: callback_arguments,
-                    nesting_level: nesting_level + 1,
-                    nesting_context: Arc::clone(&nesting_context_for_set),
-                    evaluator: evaluator.clone(),
-                    receiver: timer_receiver.clone(),
-                },
-            );
-            drop(active_timers);
-            let job = TimerJob {
-                deadline: Instant::now() + Duration::from_millis(delay_ms),
-                id,
-                cancelled,
-                dispatcher: Arc::clone(&timer_dispatcher),
-            };
-            if timer_scheduler().send(job).is_err() {
-                timers_for_set
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&id);
-                return Err(JsError::runtime("window timer scheduler is unavailable"));
-            }
-            Ok(Value::Number(f64::from(id)))
+                .unwrap_or_else(PoisonError::into_inner)
+                .set_timeout(handler, delay, callback_arguments, nesting + 1);
+            Ok(Value::Number(f64::from(id.0)))
         }),
     );
-    let timers_for_clear = Arc::clone(&timers);
+    if let Some(timeout) = window.get("setTimeout") {
+        realm.register_global_value("setTimeout", timeout)?;
+    }
+
+    let timers_for_interval = Arc::clone(&timers);
     window.set_method(
-        "clearTimeout",
+        "setInterval",
         Arc::new(move |arguments| {
-            let id = webidl_long(arguments.first().unwrap_or(&Value::Undefined))?;
-            if id > 0 {
-                if let Some(timer) = timers_for_clear
+            let Some(Value::Function(function)) = arguments.first() else {
+                return Err(JsError::runtime(
+                    "setInterval() requires a function callback",
+                ));
+            };
+            let delay = timer_delay(arguments.get(1))?;
+            let callback_arguments = arguments.iter().skip(2).cloned().collect();
+            let mut timers = timers_for_interval
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(Value::Number(
+                timers
+                    .set_interval(function.clone(), delay, callback_arguments)
+                    .0 as f64,
+            ))
+        }),
+    );
+
+    let timers_for_clear = Arc::clone(&timers);
+    let clear_interval: js::HostFunction = Arc::new(move |arguments: &[Value]| {
+        if let Some(id) = timer_id(arguments.first()) {
+            timers_for_clear
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear_interval(id);
+        }
+        Ok(Value::Undefined)
+    });
+    window.set_method("clearInterval", Arc::clone(&clear_interval));
+    window.set_method("clearTimeout", clear_interval);
+
+    let animation_frames_for_request = Arc::clone(&animation_frames);
+    window.set_method(
+        "requestAnimationFrame",
+        Arc::new(move |arguments| {
+            let Some(Value::Function(function)) = arguments.first() else {
+                return Err(JsError::runtime(
+                    "requestAnimationFrame() requires a function callback",
+                ));
+            };
+            let id = animation_frames_for_request
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .request(function.clone());
+            Ok(Value::Number(id as f64))
+        }),
+    );
+
+    let animation_frames_for_cancel = Arc::clone(&animation_frames);
+    window.set_method(
+        "cancelAnimationFrame",
+        Arc::new(move |arguments| {
+            if let Some(Value::Number(id)) = arguments.first()
+                && id.is_finite()
+                && *id >= 0.0
+            {
+                animation_frames_for_cancel
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&(id as u32))
-                {
-                    timer.cancelled.store(true, Ordering::Release);
-                }
+                    .cancel(id.trunc().min(u32::MAX as f64) as u32);
             }
             Ok(Value::Undefined)
         }),
     );
-    history.set("scrollRestoration", Value::String("auto".into()));
-    window.set("__popstateListeners", Value::Object(Object::new()));
+
+    let animation_frames_for_pump = Arc::clone(&animation_frames);
+    window.set_method(
+        "__runAnimationFrames",
+        Arc::new(move |_| {
+            let (timestamp, handles) = animation_frames_for_pump
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take_for_frame(Instant::now());
+            let mut fired = 0;
+            for handle in handles {
+                let callback = animation_frames_for_pump
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take_callback(handle);
+                let Some(callback) = callback else {
+                    continue;
+                };
+                if let Err(error) = callback.call(&[Value::Number(timestamp)]) {
+                    log::warn!("requestAnimationFrame callback threw: {error}");
+                }
+                fired += 1;
+            }
+            Ok(Value::Number(fired as f64))
+        }),
+    );
+
+    let timers_for_pump = Arc::clone(&timers);
+    window.set_method(
+        "__runTimers",
+        Arc::new(move |_| {
+            let mut fired = 0;
+            let mut delivered = HashSet::new();
+            loop {
+                let callback = timers_for_pump
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take_due(Instant::now());
+                let Some((id, callback)) = callback else {
+                    break;
+                };
+                if !delivered.insert(id) {
+                    break;
+                }
+                let previous_nesting =
+                    nesting_context.swap(callback.nesting_level, Ordering::AcqRel);
+                let result = match callback.handler {
+                    TimerHandler::Callback(function) => {
+                        evaluator.call_with_this(&function, timer_this.clone(), &callback.arguments)
+                    }
+                    TimerHandler::Source(source) => {
+                        evaluator.evaluate_script_with_this(&source, timer_this.clone())
+                    }
+                };
+                nesting_context.store(previous_nesting, Ordering::Release);
+                if let Err(error) = result {
+                    log::warn!("window timer callback threw: {error}");
+                }
+                fired += 1;
+            }
+            Ok(Value::Number(fired as f64))
+        }),
+    );
 
     let listeners_window = window.clone();
     window.set_method(
@@ -570,17 +682,82 @@ fn register_window_object(
         }),
     );
 
-    if let Some(timeout) = window.get("setTimeout") {
-        realm.register_global_value("setTimeout", timeout)?;
-    }
-    if let Some(clear_timeout) = window.get("clearTimeout") {
-        realm.register_global_value("clearTimeout", clear_timeout)?;
-    }
     realm.register_global_value("window", Value::Object(window.clone()))?;
     realm.register_global_value("self", Value::Object(window.clone()))?;
     realm.register_global_value("customElements", Value::Object(custom_elements))?;
     realm.register_global_value("navigator", Value::Object(navigator))?;
+    realm.register_global_value("innerWidth", inner_width)?;
+    realm.register_global_value("innerHeight", inner_height)?;
+    realm.register_global_value(
+        "setInterval",
+        window
+            .get("setInterval")
+            .expect("setInterval should be installed on Window"),
+    )?;
+    realm.register_global_value(
+        "clearInterval",
+        window
+            .get("clearInterval")
+            .expect("clearInterval should be installed on Window"),
+    )?;
+    realm.register_global_value(
+        "clearTimeout",
+        window
+            .get("clearTimeout")
+            .expect("clearTimeout should be installed on Window"),
+    )?;
+    realm.register_global_value(
+        "requestAnimationFrame",
+        window
+            .get("requestAnimationFrame")
+            .expect("requestAnimationFrame should be installed on Window"),
+    )?;
+    realm.register_global_value(
+        "cancelAnimationFrame",
+        window
+            .get("cancelAnimationFrame")
+            .expect("cancelAnimationFrame should be installed on Window"),
+    )?;
     Ok(window)
+}
+
+/// Runs callbacks whose `setInterval()` deadlines have elapsed.
+///
+/// Browser integrations call this from the owning page/event-loop thread.
+/// The timer API queues work and never invokes JavaScript from a background
+/// thread. The return value is the number of callbacks delivered.
+/// String handlers are intentionally unsupported because dynamic script
+/// compilation is not yet exposed by this engine.
+pub fn run_window_timers(window: &Object) -> JsResult<usize> {
+    let Some(Value::Function(pump)) = window.get("__runTimers") else {
+        return Err(JsError::runtime("window timer pump is not installed"));
+    };
+    match pump.call(&[]) {
+        Ok(Value::Number(fired)) => Ok(fired as usize),
+        Ok(_) => Err(JsError::runtime("window timer pump returned a non-number")),
+        Err(error) => Err(error),
+    }
+}
+
+/// Runs the pending `window.requestAnimationFrame()` callbacks for one frame.
+///
+/// Browser integrations call this from the owning page/event-loop thread
+/// immediately before presenting a frame. The callbacks receive the same
+/// monotonic timestamp for the frame and callbacks registered during a frame
+/// are deferred until the next frame.
+pub fn run_window_animation_frames(window: &Object) -> JsResult<usize> {
+    let Some(Value::Function(pump)) = window.get("__runAnimationFrames") else {
+        return Err(JsError::runtime(
+            "window animation frame pump is not installed",
+        ));
+    };
+    match pump.call(&[]) {
+        Ok(Value::Number(fired)) => Ok(fired as usize),
+        Ok(_) => Err(JsError::runtime(
+            "window animation frame pump returned a non-number",
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 /// Registers the script-visible window globals using `about:blank` as its URL.
@@ -625,52 +802,39 @@ pub fn register_window_with_url_and_device_pixel_ratio(
     url: &str,
     device_pixel_ratio: f64,
 ) -> JsResult<Object> {
-    register_window_with_url_and_device_pixel_ratio_and_timer_dispatcher(
-        realm,
-        url,
-        device_pixel_ratio,
-        None,
-    )
+    register_window_with_url_device_pixel_ratio_and_viewport(realm, url, device_pixel_ratio, None)
 }
 
-/// Registers window globals with a host timer-task dispatcher.
+/// Registers Window globals with a renderer security context and viewport.
 ///
-/// `dispatcher` receives each timer ID after its delay so the host can enqueue
-/// it on the owning page event loop. Pass `None` to execute timers on the
-/// built-in serialized timer task thread.
-pub fn register_window_with_url_and_device_pixel_ratio_and_timer_dispatcher(
+/// `viewport` is in CSS pixels; its dimensions are exposed as
+/// `window.innerWidth`, `window.innerHeight`, and their global aliases.
+pub fn register_window_with_security_context_and_viewport(
+    realm: &mut Realm,
+    security_context: RendererSecurityContext,
+    viewport: ViewportSize,
+) -> JsResult<()> {
+    register_window_with_security_context(realm, security_context)?;
+    register_window_object(realm, "about:blank", 1.0, Some(viewport)).map(|_| ())
+}
+
+/// Registers the script-visible window globals for `url` with the output
+/// device scale and, optionally, the viewport exposed to scripts.
+///
+/// `device_pixel_ratio` is the number of device pixels per CSS pixel and must
+/// be finite and greater than zero. `viewport` is in CSS pixels; without one,
+/// `window.innerWidth` and `window.innerHeight` are zero. Call this before
+/// evaluating page scripts.
+pub fn register_window_with_url_device_pixel_ratio_and_viewport(
     realm: &mut Realm,
     url: &str,
     device_pixel_ratio: f64,
-    dispatcher: Option<TimerDispatcher>,
+    viewport: Option<ViewportSize>,
 ) -> JsResult<Object> {
     if !device_pixel_ratio.is_finite() || device_pixel_ratio <= 0.0 {
         return Err(JsError::runtime(
             "window.devicePixelRatio must be finite and greater than zero",
         ));
     }
-    register_window_object(realm, url, device_pixel_ratio, dispatcher)
-}
-
-/// Runs the timer associated with `id` in `window`, if it is still active.
-///
-/// Hosts call this from their page task loop after the timer dispatcher
-/// reports `id`. Cancelled or already-fired IDs are ignored.
-pub fn dispatch_window_timer(window: &Object, id: u32) -> JsResult<()> {
-    if let Some(Value::Function(dispatch)) = window.get("__dispatchTimer") {
-        dispatch.call(&[Value::Number(f64::from(id))])?;
-    }
-    Ok(())
-}
-
-/// Cancels all active timers associated with `window`.
-///
-/// Browser hosts call this when a document session is discarded so callbacks
-/// cannot keep the old document alive or run after navigation.
-pub fn clear_window_timers(window: &Object) {
-    if let Some(Value::Function(clear)) = window.get("__clearTimers")
-        && let Err(error) = clear.call(&[])
-    {
-        log::warn!("could not clear timers while discarding a window: {error}");
-    }
+    register_window_object(realm, url, device_pixel_ratio, viewport)
 }

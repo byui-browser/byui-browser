@@ -1,7 +1,5 @@
 //! Public-contract tests for `webapis`.
 //!
-//! Focused public-contract tests for `webapis`.
-
 use webapis::TimerQueue;
 
 #[test]

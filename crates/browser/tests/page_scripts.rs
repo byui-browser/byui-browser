@@ -135,6 +135,84 @@ fn html_script_reads_dom_attributes_through_document() {
 }
 
 #[test]
+fn linked_page_script_reads_its_navigation_url_from_window_location() {
+    let console = Arc::new(TestConsole::default());
+    let navigations = Arc::new(Mutex::new(Vec::new()));
+    let captured_navigations = navigations.clone();
+    let page = browser::Page {
+        url: "https://example.com/path?q=term#section".into(),
+        html: String::new(),
+        stylesheets: Vec::new(),
+        scripts: vec!["if (document.location === window.location && window.location.href === 'https://example.com/path?q=term#section') window.location.href = window.location.href".into()],
+    };
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+
+    BrowserRuntime::in_memory()
+        .open_page_with_navigation(
+            &page,
+            console.clone(),
+            Arc::new(TestAlert::default()),
+            controller,
+            security_context(),
+            Arc::new(move |url, _behavior| {
+                captured_navigations.lock().unwrap().push(url.to_string());
+            }),
+        )
+        .expect("page script should evaluate");
+
+    assert_eq!(navigations.lock().unwrap().as_slice(), [page.url]);
+}
+
+#[test]
+fn window_location_shares_the_window_with_viewport_and_device_scale() {
+    let navigations = Arc::new(Mutex::new(Vec::new()));
+    let captured_navigations = navigations.clone();
+    let page = browser::Page {
+        url: "https://example.com/start".into(),
+        html: String::new(),
+        stylesheets: Vec::new(),
+        scripts: vec![
+            "if (window.devicePixelRatio === 2 && window.innerWidth === 800 \
+             && window.innerHeight === 600 \
+             && window.location.href === 'https://example.com/start') location.assign('/next')"
+                .into(),
+        ],
+    };
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+
+    BrowserRuntime::in_memory()
+        .open_page_with_viewport_and_navigation(
+            &page,
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            security_context(),
+            2.0,
+            Some(webapis::ViewportSize {
+                width: 800,
+                height: 600,
+            }),
+            Arc::new(move |url, _behavior| {
+                captured_navigations.lock().unwrap().push(url.to_string());
+            }),
+        )
+        .expect("page script should evaluate");
+
+    assert_eq!(
+        navigations.lock().unwrap().as_slice(),
+        ["https://example.com/next"]
+    );
+}
+
+#[test]
 fn document_click_listener_runs_after_the_page_loads() {
     let console = Arc::new(TestConsole::default());
     let alert = Arc::new(TestAlert::default());

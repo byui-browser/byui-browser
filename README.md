@@ -58,7 +58,7 @@ downloaded binary; clear that with
 
 ## Prerequisites
 
-- Rust stable (1.85+, edition 2024)
+- Rust stable (1.88+, edition 2024)
 
 ```bash
 rustup update stable

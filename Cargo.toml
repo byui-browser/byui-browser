@@ -28,7 +28,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/byui-cse/byui-browser"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 common = { path = "crates/common" }
@@ -44,6 +44,8 @@ storage = { path = "crates/storage" }
 security = { path = "crates/security" }
 chrome = { path = "crates/chrome" }
 devtools = { path = "crates/devtools" }
+tao = "0.30"
+wry = "0.47"
 # Logging facade used by every crate; `common::logging` installs the logger.
 log = { version = "0.4", features = ["std"] }
 

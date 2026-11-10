@@ -46,7 +46,10 @@ fn parses_lays_out_paints_and_writes_a_simple_element_image() {
     assert!(
         frame
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
             .any(|pixel| pixel == [0, 0, 0, 255])
     );
 
