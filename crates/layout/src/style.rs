@@ -171,6 +171,62 @@ impl Dimension {
     }
 }
 
+/// The `text-transform` property: how an element's text is cased before
+/// it is measured and painted.
+///
+/// Only the case keywords are supported; `full-width` and
+/// `full-size-kana` are ignored and treated as `none`. `capitalize`
+/// works per text node, so a word split across elements (`a<b>b</b>`)
+/// gets a capital at the start of each piece.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TextTransform {
+    /// Text is left as written.
+    #[default]
+    None,
+    /// Every character is upper-cased.
+    Uppercase,
+    /// Every character is lower-cased.
+    Lowercase,
+    /// The first letter of each word is upper-cased.
+    Capitalize,
+}
+
+impl TextTransform {
+    /// Parses a `text-transform` value, returning `None` for unsupported
+    /// or invalid values.
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "uppercase" => Some(Self::Uppercase),
+            "lowercase" => Some(Self::Lowercase),
+            "capitalize" => Some(Self::Capitalize),
+            _ => None,
+        }
+    }
+
+    /// Returns `text` with this transform applied.
+    pub(crate) fn apply(self, text: &str) -> String {
+        match self {
+            Self::None => text.to_owned(),
+            Self::Uppercase => text.to_uppercase(),
+            Self::Lowercase => text.to_lowercase(),
+            Self::Capitalize => {
+                let mut out = String::with_capacity(text.len());
+                let mut at_word_start = true;
+                for character in text.chars() {
+                    if at_word_start && character.is_alphanumeric() {
+                        out.extend(character.to_uppercase());
+                    } else {
+                        out.push(character);
+                    }
+                    at_word_start = character.is_whitespace();
+                }
+                out
+            }
+        }
+    }
+}
+
 /// The values layout reads from one element's computed style.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ComputedStyle {
@@ -181,6 +237,7 @@ pub(crate) struct ComputedStyle {
     pub height: Dimension,
     pub font_size: f32,
     pub color: CssColor,
+    pub text_transform: TextTransform,
     pub background_color: Option<CssColor>,
     pub flex_column: bool,
     pub flex_grow: f32,
@@ -189,7 +246,7 @@ pub(crate) struct ComputedStyle {
 
 impl ComputedStyle {
     /// The style of a box with no element: initial values for every property,
-    /// with inherited properties (`color` and `font-size`) taken from
+    /// with inherited properties (`color`, `font-size`, and `text-transform`) taken from
     /// `parent` when given.
     ///
     /// Anonymous boxes use this (CSS 2.2 §9.2.1.1), as does the initial
@@ -213,6 +270,7 @@ impl ComputedStyle {
                 },
                 |parent| parent.color,
             ),
+            text_transform: parent.map_or(TextTransform::None, |parent| parent.text_transform),
             background_color: None,
             flex_column: false,
             flex_grow: 0.0,
@@ -256,6 +314,12 @@ impl ComputedStyle {
                 Some(color) => style.color = color,
                 None if is_no_color_keyword(value) => {}
                 None => log::debug!("ignoring invalid color value {value:?}; using the default"),
+            }
+        }
+        if let Some(value) = get("text-transform") {
+            match TextTransform::parse(value) {
+                Some(transform) => style.text_transform = transform,
+                None => log::debug!("ignoring unsupported text-transform value {value:?}"),
             }
         }
         if let Some(value) = get("background-color") {
