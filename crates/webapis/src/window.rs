@@ -18,6 +18,50 @@ struct IntervalCallback {
     arguments: Vec<Value>,
 }
 
+struct AnimationFrameCallbacks {
+    next_id: u32,
+    callbacks: Vec<(u32, Function)>,
+    time_origin: Instant,
+}
+
+impl AnimationFrameCallbacks {
+    fn new() -> Self {
+        Self {
+            next_id: 0,
+            callbacks: Vec::new(),
+            time_origin: Instant::now(),
+        }
+    }
+
+    fn request(&mut self, function: Function) -> u32 {
+        self.next_id = self.next_id.wrapping_add(1);
+        let id = self.next_id;
+        self.callbacks.push((id, function));
+        id
+    }
+
+    fn cancel(&mut self, id: u32) {
+        self.callbacks.retain(|(callback_id, _)| *callback_id != id);
+    }
+
+    fn take_for_frame(&mut self, now: Instant) -> (f64, Vec<u32>) {
+        let timestamp = now
+            .saturating_duration_since(self.time_origin)
+            .as_secs_f64()
+            * 1000.0;
+        let handles = self.callbacks.iter().map(|(id, _)| *id).collect();
+        (timestamp, handles)
+    }
+
+    fn take_callback(&mut self, id: u32) -> Option<Function> {
+        let index = self
+            .callbacks
+            .iter()
+            .position(|(callback_id, _)| *callback_id == id)?;
+        Some(self.callbacks.remove(index).1)
+    }
+}
+
 struct WindowTimers {
     queue: TimerQueue,
     callbacks: HashMap<TimerId, IntervalCallback>,
@@ -237,6 +281,7 @@ fn register_window_object(
         _ => CustomElementRegistry::new().object(),
     };
     let timers = Arc::new(Mutex::new(WindowTimers::new()));
+    let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
 
     window.set_method(
         "self",
@@ -304,6 +349,66 @@ fn register_window_object(
     });
     window.set_method("clearInterval", Arc::clone(&clear_interval));
     window.set_method("clearTimeout", clear_interval);
+
+    let animation_frames_for_request = Arc::clone(&animation_frames);
+    window.set_method(
+        "requestAnimationFrame",
+        Arc::new(move |arguments| {
+            let Some(Value::Function(function)) = arguments.first() else {
+                return Err(JsError::runtime(
+                    "requestAnimationFrame() requires a function callback",
+                ));
+            };
+            let id = animation_frames_for_request
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .request(function.clone());
+            Ok(Value::Number(id as f64))
+        }),
+    );
+
+    let animation_frames_for_cancel = Arc::clone(&animation_frames);
+    window.set_method(
+        "cancelAnimationFrame",
+        Arc::new(move |arguments| {
+            if let Some(Value::Number(id)) = arguments.first()
+                && id.is_finite()
+                && *id >= 0.0
+            {
+                animation_frames_for_cancel
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .cancel(id.trunc().min(u32::MAX as f64) as u32);
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+
+    let animation_frames_for_pump = Arc::clone(&animation_frames);
+    window.set_method(
+        "__runAnimationFrames",
+        Arc::new(move |_| {
+            let (timestamp, handles) = animation_frames_for_pump
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take_for_frame(Instant::now());
+            let mut fired = 0;
+            for handle in handles {
+                let callback = animation_frames_for_pump
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take_callback(handle);
+                let Some(callback) = callback else {
+                    continue;
+                };
+                if let Err(error) = callback.call(&[Value::Number(timestamp)]) {
+                    log::warn!("requestAnimationFrame callback threw: {error}");
+                }
+                fired += 1;
+            }
+            Ok(Value::Number(fired as f64))
+        }),
+    );
 
     let timers_for_pump = Arc::clone(&timers);
     window.set_method(
@@ -523,6 +628,18 @@ fn register_window_object(
             .get("clearTimeout")
             .expect("clearTimeout should be installed on Window"),
     )?;
+    realm.register_global_value(
+        "requestAnimationFrame",
+        window
+            .get("requestAnimationFrame")
+            .expect("requestAnimationFrame should be installed on Window"),
+    )?;
+    realm.register_global_value(
+        "cancelAnimationFrame",
+        window
+            .get("cancelAnimationFrame")
+            .expect("cancelAnimationFrame should be installed on Window"),
+    )?;
     Ok(window)
 }
 
@@ -540,6 +657,27 @@ pub fn run_window_timers(window: &Object) -> JsResult<usize> {
     match pump.call(&[]) {
         Ok(Value::Number(fired)) => Ok(fired as usize),
         Ok(_) => Err(JsError::runtime("window timer pump returned a non-number")),
+        Err(error) => Err(error),
+    }
+}
+
+/// Runs the pending `window.requestAnimationFrame()` callbacks for one frame.
+///
+/// Browser integrations call this from the owning page/event-loop thread
+/// immediately before presenting a frame. The callbacks receive the same
+/// monotonic timestamp for the frame and callbacks registered during a frame
+/// are deferred until the next frame.
+pub fn run_window_animation_frames(window: &Object) -> JsResult<usize> {
+    let Some(Value::Function(pump)) = window.get("__runAnimationFrames") else {
+        return Err(JsError::runtime(
+            "window animation frame pump is not installed",
+        ));
+    };
+    match pump.call(&[]) {
+        Ok(Value::Number(fired)) => Ok(fired as usize),
+        Ok(_) => Err(JsError::runtime(
+            "window animation frame pump returned a non-number",
+        )),
         Err(error) => Err(error),
     }
 }

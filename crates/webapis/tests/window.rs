@@ -430,3 +430,75 @@ fn clear_interval_uses_shared_timer_handles_and_returns_undefined() {
         Ok(Value::Undefined)
     );
 }
+
+#[test]
+fn request_animation_frame_invokes_callback_once_with_timestamp() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var calls = 0; var timestamp = -1; \
+             function tick(now) { calls = calls + 1; timestamp = now; } \
+             var id = requestAnimationFrame(tick); \
+             id > 0 && requestAnimationFrame === window.requestAnimationFrame",
+        )
+        .unwrap();
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+
+    assert_eq!(webapis::run_window_animation_frames(&window).unwrap(), 1);
+    assert_eq!(webapis::run_window_animation_frames(&window).unwrap(), 0);
+    assert_eq!(realm.evaluate_script("calls"), Ok(Value::Number(1.0)));
+    let timestamp = realm.evaluate_script("timestamp").unwrap();
+    assert!(matches!(timestamp, Value::Number(value) if value.is_finite() && value >= 0.0));
+}
+
+#[test]
+fn request_animation_frame_callbacks_are_ordered_and_defer_new_callbacks() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var order = ''; \
+             function first(now) { order = order + 'a'; requestAnimationFrame(third); } \
+             function second(now) { order = order + 'b'; } \
+             function third() { order = order + 'c'; } \
+             requestAnimationFrame(first); requestAnimationFrame(second);",
+        )
+        .unwrap();
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+
+    assert_eq!(webapis::run_window_animation_frames(&window).unwrap(), 2);
+    assert_eq!(
+        realm.evaluate_script("order"),
+        Ok(Value::String("ab".into()))
+    );
+    assert_eq!(webapis::run_window_animation_frames(&window).unwrap(), 1);
+    assert_eq!(
+        realm.evaluate_script("order"),
+        Ok(Value::String("abc".into()))
+    );
+}
+
+#[test]
+fn cancel_animation_frame_prevents_callback() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var calls = 0; \
+             function tick() { calls = calls + 1; } \
+             var id = requestAnimationFrame(tick); \
+             cancelAnimationFrame(id);",
+        )
+        .unwrap();
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+
+    assert_eq!(webapis::run_window_animation_frames(&window).unwrap(), 0);
+    assert_eq!(realm.evaluate_script("calls"), Ok(Value::Number(0.0)));
+}
