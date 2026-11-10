@@ -112,6 +112,32 @@ fn window_scroll_x_is_read_only() {
 }
 
 #[test]
+fn window_scroll_y_exposes_the_initial_vertical_offset() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "window.scrollY === 0 && window.pageYOffset === 0 && window.scrollY === window.scrollY",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_scroll_y_is_read_only() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "window.scrollY = 12; window.pageYOffset = 12; window.scrollY === 0 && window.pageYOffset === 0",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
 fn device_pixel_ratio_exposes_the_output_scale_and_is_replaceable() {
     let mut realm = Realm::new();
     register_window_with_url_and_device_pixel_ratio(&mut realm, "https://example.test/", 1.5)

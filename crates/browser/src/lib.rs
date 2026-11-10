@@ -689,6 +689,18 @@ pub struct PageSession {
 }
 
 impl PageSession {
+    /// Updates the viewport's vertical scroll offset exposed as
+    /// `window.scrollY` and `window.pageYOffset`.
+    ///
+    /// The value is in CSS pixels and is maintained by the browser shell.
+    /// Script assignment remains ineffective because both properties are
+    /// non-replaceable read-only host attributes.
+    pub fn set_scroll_y(&mut self, scroll_y: f64) {
+        let value = Value::Number(scroll_y.max(0.0));
+        self.window.update_read_only("scrollY", value.clone());
+        self.window.update_read_only("pageYOffset", value);
+    }
+
     /// Updates the viewport dimensions exposed to this live page session.
     ///
     /// Dimensions are CSS pixels. This keeps `window.innerWidth` and the
@@ -766,6 +778,18 @@ mod tests {
     use super::*;
     use security::{Origin, RendererSecurityContext, StoragePermission};
 
+    struct TestConsole;
+
+    impl ConsoleSink for TestConsole {
+        fn log(&self, _message: &str) {}
+    }
+
+    struct TestAlert;
+
+    impl AlertSink for TestAlert {
+        fn alert(&self, _message: &str) {}
+    }
+
     #[test]
     fn default_log_file_lives_in_the_data_directory() {
         // Both resolve from the same environment, so they agree whenever the
@@ -840,6 +864,52 @@ mod tests {
         );
         assert!(response.body.is_null());
         assert!(runtime.block_on(response.body.bytes()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn page_session_scroll_y_tracks_the_live_window_offset() {
+        let page = Page {
+            url: "https://example.com/scroll".into(),
+            html: "<main>content</main>".into(),
+            stylesheets: Vec::new(),
+            scripts: Vec::new(),
+        };
+        let runtime = BrowserRuntime::in_memory();
+        let controller = request_controller(None);
+        let mut session = runtime
+            .open_page_with_viewport(
+                &page,
+                Arc::new(TestConsole),
+                Arc::new(TestAlert),
+                controller,
+                storage_context(),
+                1.0,
+                ViewportSize {
+                    width: 800,
+                    height: 600,
+                },
+            )
+            .expect("page session should open");
+
+        assert_eq!(
+            session
+                .realm
+                .evaluate_script("window.scrollY === 0 && window.pageYOffset === 0"),
+            Ok(Value::Boolean(true))
+        );
+        session.set_scroll_y(123.5);
+        assert_eq!(
+            session
+                .realm
+                .evaluate_script("window.scrollY === 123.5 && window.pageYOffset === 123.5"),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            session.realm.evaluate_script(
+                "window.scrollY = 1; window.pageYOffset = 1; window.scrollY === 123.5 && window.pageYOffset === 123.5",
+            ),
+            Ok(Value::Boolean(true))
+        );
     }
 
     #[test]
