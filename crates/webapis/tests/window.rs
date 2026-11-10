@@ -1,5 +1,6 @@
 use js::{Realm, Value};
 use security::{Origin, RendererSecurityContext, StoragePermission};
+use std::{thread, time::Duration};
 use webapis::{
     register_window, register_window_with_security_context, register_window_with_url,
     register_window_with_url_and_device_pixel_ratio,
@@ -359,4 +360,48 @@ fn inner_height_is_replaceable_like_the_cssom_view_attribute() {
         realm.evaluate_script("window.innerHeight = 42; window.innerHeight"),
         Ok(Value::Number(42.0))
     );
+}
+
+#[test]
+fn set_interval_returns_positive_id_passes_arguments_and_repeats() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var calls = 0; var total = 0; \
+             function tick(value) { calls = calls + 1; total = total + value; } \
+             var id = window.setInterval(tick, 1, 3); \
+             id > 0 && setInterval === window.setInterval",
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(3));
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    assert!(webapis::run_window_timers(&window).unwrap() >= 1);
+    assert_eq!(
+        realm.evaluate_script("calls >= 1 && total === calls * 3"),
+        Ok(Value::Boolean(true))
+    );
+    realm.evaluate_script("clearInterval(id)").unwrap();
+    thread::sleep(Duration::from_millis(3));
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 0);
+}
+
+#[test]
+fn clear_interval_can_be_called_inside_its_callback() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var calls = 0; var id; function tick() { calls = calls + 1; clearInterval(id); } id = setInterval(tick, 1);",
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(3));
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 1);
+    assert_eq!(realm.evaluate_script("calls"), Ok(Value::Number(1.0)));
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 0);
 }
