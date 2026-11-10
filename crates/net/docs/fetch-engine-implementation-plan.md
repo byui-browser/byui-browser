@@ -23,19 +23,18 @@ focused regression coverage before changing each area. The body ownership
 slice explicitly replaces implicit `Body` and `Request` cloning with fallible
 operations, so Rust callers must migrate those calls.
 
-| Priority | Issue                                                                                                                                                                                                                                                                                                                                                                                         | Potential solution                                                                                                                                                                                                                                                                                                                                                    |
-| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Done     | `Body` previously mixed implicit cloning of replayable and one-shot sources with lifecycle observation.                                                                                                                                                                                                                                                                                      | Each body view owns its lifecycle state. `Body::fork` duplicates buffered sources or creates bounded live-stream branches, and the shared upstream tee retains its one-chunk backpressure and permit.                                                                                                                                                                  |
-| Done     | `Body::into_parts` could turn a previously transferred source into an empty stream.                                                                                                                                                                                                                                                                                                           | `Body::try_into_parts` rejects used or transferred sources with `BodyAlreadyConsumed`; cache capture propagates the error and cannot insert a fabricated empty response.                                                                                                                                                                                                  |
-| Done     | The HTTP fetch path previously processed policy and cookies only for the final response, bypassed common response approval for manual redirects, and carried the original cacheability decision across method-rewriting redirects.                                                                            | The controller now validates HTTP(S)-only targets, repeats request/response policy and cookie processing per hop, finalizes manual redirects through common approval, applies redirect-taint/referrer transitions, disables service-worker reinterception, and recomputes cache matching from the current method and URL. Integration tests preserve ordering. |
-| High     | `FetchServices` is a broad capability interface combining request/response authorization, cookies, service workers, cache partitioning, and diagnostics. Most current browser implementations are no-op adapters, so ownership and failure behavior are difficult to see at call sites.                                                                                                       | Split the interface into focused capability boundaries or an explicit services aggregate. Document which decisions are per request, per redirect hop, or per response, and define fail-closed behavior for every absent or unsupported capability.                                                                                                                    |
-| Medium   | Provider-backed scheme handlers repeat the same method gate, provider lookup, cancellation wait, and response-finalization sequence across `blob:`, `file:`, and `byui:`.                                                                                                                                                                                                                     | Retain one common provider execution path and move scheme metadata, provider selection, and read-method policy into a declarative dispatch layer. Keep provider-specific ownership and error categories explicit.                                                                                                                                                     |
-| Medium   | `Headers` mixes ordered storage, public mutations, guards, forbidden-header policy, CORS safelisting, exposure parsing, and transport conversion. Its public iteration repeatedly scans and allocates.                                                                                                                                                                                        | Split storage/API from guard and CORS policy; implement combined iteration in one pass and avoid temporary allocations in ordinary `get` calls.                                                                                                                                                                                                                       |
-| Medium   | `Request` and `InternalResponse` expose broadly mutable internal field bags. Request configuration, redirect state, cache partitioning, and transport state are intermixed.                                                                                                                                                                                                                   | Introduce caller-facing request initialization plus prepared/redirect execution state, and use narrow constructors and transition methods for internal responses.                                                                                                                                                                                                     |
-| Medium   | Request and response rules are distributed across setters, preparation, scheme handlers, the HTTP redirect loop, and response finalization. The same request service hook is invoked once during preparation and again for HTTP hops, while service-worker checks are only performed initially.                                                                                               | Introduce explicit request-preparation and per-hop validation states. Keep defense-in-depth checks, but centralize shared predicates and document which checks repeat after redirects so policy cannot drift between schemes.                                                                                                                                         |
-| Medium   | The process-local cache has an unbounded entry map, a narrow method/URL/partition key, and only partial `Cache-Control` support. It does not model `Vary`, authorization/credential state, validators, or revalidation.                                                                                                                                                                       | Define the cache contract as an intentionally bounded adapter, add eviction and complete cache-key inputs, and either implement standards-aware freshness/revalidation or delegate those decisions to the browser cache owner.                                                                                                                                        |
-| Low      | `CachedResponse` mirrors `StoredResponse` and copies every field in both directions.                                                                                                                                                                                                                                                                                                          | Store a `StoredResponse` with expiration metadata inside `CachedResponse`.                                                                                                                                                                                                                                                                                            |
-| Low      | Crate-wide `allow(dead_code)`, production lock `expect` calls, and stale references to implementation-contract documentation hide unfinished work and can obscure the supported boundary.                                                                                                                                                                                                     | Replace the allowance with narrow tracked exceptions; map poisoned locks to typed errors or explicitly document the intended failure policy. Keep the implementation plan, contract, and gap audit synchronized and verify all referenced documents exist.                                                                                                            |
+| Priority | Issue                                                                                                                                                                                                                                                                                           | Potential solution                                                                                                                                                                                                                                         |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| High     | `FetchServices` is a broad capability interface combining request/response authorization, cookies, service workers, cache partitioning, and diagnostics. Most current browser implementations are no-op adapters, so ownership and failure behavior are difficult to see at call sites.         | Split the interface into focused capability boundaries or an explicit services aggregate. Document which decisions are per request, per redirect hop, or per response, and define fail-closed behavior for every absent or unsupported capability.         |
+| Medium   | Provider-backed scheme handlers repeat the same method gate, provider lookup, cancellation wait, and response-finalization sequence across `blob:`, `file:`, and `byui:`.                                                                                                                       | Retain one common provider execution path and move scheme metadata, provider selection, and read-method policy into a declarative dispatch layer. Keep provider-specific ownership and error categories explicit.                                          |
+| Medium   | `Headers` mixes ordered storage, public mutations, guards, forbidden-header policy, CORS safelisting, exposure parsing, and transport conversion. Its public iteration and lookup repeatedly scan and allocate, including an effectively O(n²) combination path.                                | Split storage/API from guard and CORS policy; implement combined iteration in one pass and avoid temporary allocations in ordinary `get` calls.                                                                                                            |
+| Medium   | `Request` and `InternalResponse` expose broadly mutable internal field bags. Request configuration, redirect state, cache partitioning, and transport state are intermixed.                                                                                                                     | Introduce caller-facing request initialization plus prepared/redirect execution state, and use narrow constructors and transition methods for internal responses.                                                                                          |
+| Medium   | Request and response rules are distributed across setters, preparation, scheme handlers, the HTTP redirect loop, and response finalization. The same request service hook is invoked once during preparation and again for HTTP hops, while service-worker checks are only performed initially. | Introduce explicit request-preparation and per-hop validation states. Keep defense-in-depth checks, but centralize shared predicates and document which checks repeat after redirects so policy cannot drift between schemes.                              |
+| Medium   | The process-local cache has an unbounded entry map, a narrow method/URL/partition key, and only partial `Cache-Control` support. It does not model `Vary`, authorization/credential state, validators, or revalidation.                                                                         | Define the cache contract as an intentionally bounded adapter, add eviction and complete cache-key inputs, and either implement standards-aware freshness/revalidation or delegate those decisions to the browser cache owner.                             |
+| Low      | `CachedResponse` mirrors `StoredResponse` and copies every field in both directions. Cache insertion and cache hits also clone complete response bodies, which can create avoidable memory bandwidth and peak allocations for large entries.                                                    | Store a `StoredResponse` with expiration metadata inside `CachedResponse`, and use shared or move-based body ownership where the cache contract permits without exposing mutable state.                                                                    |
+| Low      | Production lock `expect` calls and stale references to implementation-contract documentation hide unfinished work and can obscure the supported boundary.                                                                                                                                       | Replace the allowance with narrow tracked exceptions; map poisoned locks to typed errors or explicitly document the intended failure policy. Keep the implementation plan, contract, and gap audit synchronized and verify all referenced documents exist. |
+| Medium   | Trace/debug paths can log raw response URLs and transport error strings. Transport diagnostics may contain full URLs, credentials, or other sensitive URL components, bypassing the crate's redaction helpers.                                                                                  | Route every URL and transport error through the existing redaction helpers, add regression coverage for logging-safe formatting, and keep public diagnostic strings explicitly non-sensitive where possible.                                               |
+| Low      | Several implementation files are disproportionately large (`api/headers.rs`, `api/request/definition.rs`, `api/response/view.rs`, and `policy/request.rs`), mixing public API, policy, execution state, and tests.                                                                              | Split cohesive policy/state helpers and test modules while preserving the current public boundary; keep each resulting module focused and add targeted regression tests during the refactor.                                                               |
 
 Do not reintroduce per-scheme response-finalization duplication that the shared
 provider helper already removed.
@@ -59,23 +58,10 @@ Browser-owned `blob:` lifecycle work remains deferred.
 
 ## Remaining work
 
-### 1. Complete body semantics
+### 1. Complete remaining body integrations
 
-The Rust engine slice is implemented. `Body` has one authoritative lifecycle,
-nullness is represented by the body itself, and helper reads, direct stream
-reads, transport handoff, cache capture, failure, abort, cancellation, and drop
-have focused transition tests. Declared lengths survive live HTTP, cache, and
-provider paths. `Body::fork` and `Response::try_clone`
-provide fallible cloning with a bounded one-chunk tee, branch cancellation,
-and shared scheduler-permit ownership. Cache capture has a configured size
-bound and stores only cleanly completed bodies.
-
-Multipart handling is binary-safe and supports RFC 5987 filenames. Rust
-ArrayBuffer/typed-array constructors, half-duplex stream validation, UTF-8 JSON
-decoding, response helpers, and a null-body network-error constructor are
-implemented. `CONNECT` remains forbidden at request construction. The
-JavaScript typed-array, `Request`, `Response`, promise, and stream conversion
-surface remains in `webapis`; aggregate keepalive lifetime accounting remains
+Complete the JavaScript typed-array, `Request`, `Response`, promise, and stream
+conversion surface in `webapis`. Add aggregate keepalive lifetime accounting
 with the browser-lifecycle work in step 3.
 
 ### 2. Finish CORS, response, and request algorithms
@@ -126,13 +112,6 @@ responses.
 
 ### 5. Harden redirects and transport
 
-The supported redirect boundary now applies per-hop origin, referrer,
-credentials, simple CORS, cache, and browser-service decisions while disabling
-service-worker reinterception for network redirects.
-Keep Reqwest redirects disabled and retain controller ownership of URL-list
-state and method/body rewriting as future security and storage policies are
-plugged into that boundary.
-
 Add explicit transport configuration and tests for decoded-body limits,
 decompression ratios, malformed compressed bodies, range requests,
 `Accept-Encoding`, connection failures, connection timing, per-origin limits,
@@ -140,31 +119,12 @@ offline mode, and future HTTP/3 support.
 
 ### 6. Scheme-provider/browser integration
 
-#### Completed in the current slice
+#### Browser-owned composition
 
-The engine-owned `data:` and exact `about:blank` paths, plus the browser-owned
-`byui:` and authorized `file:` providers, now have end-to-end composition and
-focused tests. The current coverage includes provider selection, method
-boundaries, response metadata validation, readable/null bodies, streaming,
-abort and drop cleanup, missing/revoked capabilities, file size and session
-budgets, media-type policy, and fail-closed behavior. Browser page loading now
-resolves its HTML, CSS, and JavaScript resources through the `byui:` provider.
-
-Do not add browser blob URL creation, registry, revocation, or lifetime
-behavior until the browser-owned blob lifecycle is designed.
-
-#### Browser-owned composition and follow-up
-
-Keep browser-side ownership and composition out of `net`:
-
-- keep `byui:` page registration, lookup, replacement, and origin policy in
-  `crates/browser`;
-- retain the security-owned capability and the browser adapter for authorized
-  `file:` access, sandboxing, path resolution, and origin policy; extend them
-  only when navigation/subresource policy or origin parsing is ready.
-
-Browser-owned providers must never fall back to HTTP or direct filesystem
-access when lookup fails.
+Extend the security-owned capability and browser adapter for authorized `file:`
+access only when navigation/subresource policy or origin parsing is ready.
+Preserve the rule that browser-owned providers fail closed rather than falling
+back to HTTP or direct filesystem access when lookup fails.
 
 #### Deferred `blob:` provider
 
@@ -175,10 +135,8 @@ engine tests remain in place, but browser composition must not claim to provide
 
 #### `byui-provider` follow-up
 
-The current provider has exact declarative route lookup, compile-time embedded
-assets, aliases, unknown-route rejection, opaque origins, and the engine's
-`GET`/`HEAD` boundary. The remaining optimization is to avoid a fresh `Vec`
-copy of embedded resource bytes for every request while retaining those
+Avoid a fresh `Vec` copy of embedded resource bytes for every request while
+retaining the provider's current route, alias, origin, and `GET`/`HEAD`
 semantics.
 
 Add focused browser tests for method rejection, `GET`/`HEAD` bodies, query and
@@ -187,9 +145,8 @@ routes, and origin policy.
 
 #### Provider conformance and isolation
 
-Keep the existing browser-composition and `net` integration tests for the
-implemented `data:`, `byui:`, `file:`, and `about:blank` paths, and extend them
-only for newly discovered regressions:
+Extend the existing browser-composition and `net` integration tests for newly
+discovered regressions, including:
 
 - builder-based service/provider composition and request-context propagation;
 - exact-once selection of the matching provider;
@@ -200,17 +157,13 @@ only for newly discovered regressions:
 - no HTTP transport, cookie, cache, or unrelated-provider calls; and
 - repeated resolution of the same resource without accidental HTTP caching.
 
-Keep the existing generic `blob:` provider contract tests as regression
-coverage, but defer browser registry, creation, revocation, and lifetime tests
-until the `blob:` provider slice is resumed.
+Add browser registry, creation, revocation, and lifetime tests when the
+deferred `blob:` provider slice is resumed.
 
-Keep `data:` parsing engine-owned and retain the exact `about:blank`
-allowlist. Unsupported schemes must fail before service, provider, cache, or
-transport side effects. Any new local scheme must define its provider owner,
-origin policy, method policy, body/null-body behavior, response filtering, and
-cache/cookie behavior before implementation. Keep local schemes out of HTTP
-transport, cookies, and cache unless a later contract explicitly changes that
-boundary.
+Any new local scheme must define its provider owner, origin policy, method
+policy, body/null-body behavior, response filtering, and cache/cookie behavior
+before implementation. Keep local schemes out of HTTP transport, cookies, and
+cache unless a later contract explicitly changes that boundary.
 
 #### Verification and documentation
 
@@ -222,26 +175,10 @@ workspace tests, `cargo fmt --all`, and
 
 ### 7. Public API and downstream migration
 
-Controller construction is now a single Fetch-oriented interface rather than
-a four-constructor capability matrix. It is implemented by
-`RequestController::builder(config)`, which provides optional `FetchServices`
-and `SchemeProviders` setters and a fallible `build()` method. The former
-specialized constructors have been removed, so callers use the builder and its
-`with_fetch_services` and `with_scheme_providers` setters directly.
-
-The current builder preserves these capability rules: standalone requests
-may omit services, local schemes require matching scheme providers, and
-requests carrying browser client context require `FetchServices`. It should
-also make the ownership distinction explicit without exposing controller
-internals. The existing constructor/builder tests cover all capability
-combinations and verify failures before transport or provider side effects.
-
-The builder migration and capability-combination tests are complete. Body
-forking, response cloning, public body status, and response helpers are also
-implemented. Remaining work includes request initialization APIs. Add a
-Rust-consumer guide and document IPC-safe versus
-process-local types. Update the browser architecture documentation and record
-the ownership decision in an ADR. Keep raw Reqwest types private.
+Add request initialization APIs, a Rust-consumer guide, and documentation of
+IPC-safe versus process-local types. Update the browser architecture
+documentation and record the ownership decision in an ADR. Keep raw Reqwest
+types private.
 
 ### 8. Conformance and verification
 
