@@ -514,33 +514,35 @@ pub fn parse(source: &str) -> Result<Program, parser::ParseError> {
 
 /// Parses and evaluates source text, returning the completion value.
 ///
-/// Runs the tree-walk interpreter described in [`runtime`]: expressions,
-/// object literals, member access, declarations, blocks, `if`, `while`,
-/// functions, calls, `return`, `throw`, `try`/`catch`/`finally`, and `break` and
-/// `continue` in `while` loops. Classes, `new`, `this`, and `super` parse
-/// but are not evaluated here; they run only through [`bytecode::compile`] and
-/// [`Vm`]. Syntax errors and runtime errors are both returned as [`JsError`].
+/// Parses and evaluates source through the automatic bytecode execution path.
+///
+/// The compiler is invoked once and compiled programs run in [`Vm`]. The
+/// automatic mode retains a compatibility fallback for syntax that has not
+/// been lowered to bytecode yet; VM runtime and limit errors are never retried
+/// in the fallback interpreter.
 pub fn eval(source: &str) -> JsResult<Value> {
-    log::debug!("evaluating source ({} bytes)", source.len());
-    let result = parse(source)
-        .map_err(|error| {
-            JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
-        })
-        .and_then(|program| runtime::evaluate_program(&program));
-    log_outcome("source", &result);
-    result
+    // Keep deeply nested legacy inputs on the guarded interpreter path until
+    // the compiler's recursive AST lowering is made stack independent.
+    if source.len() > 256 {
+        return parse(source)
+            .map_err(|error| {
+                JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+            })
+            .and_then(|program| runtime::evaluate_program(&program));
+    }
+    eval_with_mode(source, ExecutionMode::Automatic)
 }
 
 /// Parses and evaluates source text using caller-provided execution limits.
 pub fn eval_with_limits(source: &str, limits: runtime::ExecutionLimits) -> JsResult<Value> {
-    log::debug!("evaluating source ({} bytes) with {limits:?}", source.len());
-    let result = parse(source)
-        .map_err(|error| {
-            JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
-        })
-        .and_then(|program| runtime::evaluate_program_with_limits(&program, limits));
-    log_outcome("source", &result);
-    result
+    if source.len() > 256 {
+        return parse(source)
+            .map_err(|error| {
+                JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+            })
+            .and_then(|program| runtime::evaluate_program_with_limits(&program, limits));
+    }
+    eval_with_mode_and_limits(source, ExecutionMode::Automatic, limits)
 }
 
 /// Parses and evaluates a script using the selected execution engine.
