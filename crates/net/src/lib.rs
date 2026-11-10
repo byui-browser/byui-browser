@@ -30,9 +30,6 @@
 //! handled by the controller according to [`RedirectMode`]. See the
 //! [engine contract](../docs/fetch-engine-contract.md) for the supported subset.
 
-// Crate-wide flags to ignore dead code warnings. Will be removed once implementation
-// is finished, but is required for now to prevent the integration tests from failing.
-#![allow(dead_code)]
 // Flag to forbid unsafe code. This is security-critical and permanant.
 #![forbid(unsafe_code)]
 
