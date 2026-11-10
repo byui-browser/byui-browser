@@ -87,6 +87,48 @@ impl FetchServices for CookieServices {
     }
 }
 
+/// Services that record whether a cross-origin request reaches cookie policy.
+struct RecordingCookieServices {
+    reads: Arc<AtomicUsize>,
+    writes: Arc<AtomicUsize>,
+}
+
+impl FetchServices for RecordingCookieServices {
+    fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
+        Ok(())
+    }
+
+    fn check_response(
+        &self,
+        _request: &Request,
+        _response: &ResponseInfo,
+    ) -> Result<(), RequestError> {
+        Ok(())
+    }
+
+    fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(Some("session=must-not-leak".into()))
+    }
+
+    fn store_set_cookie(
+        &self,
+        _request: &Request,
+        _values: &[HeaderValue],
+    ) -> Result<(), RequestError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
+        Ok(ServiceWorkerDecision::Network)
+    }
+
+    fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
+        Ok("cross-origin-cookie-tests".into())
+    }
+}
+
 /// Builds a cross-origin browser request whose method and headers need preflight.
 fn request(url: String) -> Request {
     let mut request = Request::new(url, "PUT").unwrap();
@@ -240,6 +282,95 @@ fn credentialed_preflight_requires_credential_approval_but_sends_no_cookie() {
 }
 
 #[test]
+fn opaque_origins_preflight_and_fetch_with_a_null_origin() {
+    let server = TestServer::start(2, |request| {
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("origin: null"))
+        );
+        if request.starts_with("OPTIONS ") {
+            b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: null\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nConnection: close\r\n\r\n".to_vec()
+        } else {
+            b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: null\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+        }
+    });
+    let mut request = request(server.url());
+    request.set_environment(FetchEnvironment {
+        origin: Some(net::Origin::opaque()),
+        ..FetchEnvironment::default()
+    });
+
+    let response = runtime().block_on(controller().fetch(request)).unwrap();
+    assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
+    server.join();
+}
+
+#[test]
+fn noncredentialed_wildcards_authorize_unsafe_preflight_permissions() {
+    let server = TestServer::start(2, |request| {
+        if request.starts_with("OPTIONS ") {
+            b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: *\r\nAccess-Control-Allow-Headers: *\r\nConnection: close\r\n\r\n".to_vec()
+        } else {
+            b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+        }
+    });
+
+    let response = runtime()
+        .block_on(controller().fetch(request(server.url())))
+        .unwrap();
+    assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
+    server.join();
+}
+
+#[test]
+fn authorization_cannot_be_approved_by_a_preflight_wildcard() {
+    let server = TestServer::start(1, |_| {
+        b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: *\r\nAccess-Control-Allow-Headers: *\r\nConnection: close\r\n\r\n".to_vec()
+    });
+    let mut request = request(server.url());
+    request
+        .set_header(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer test"),
+        )
+        .unwrap();
+
+    let error = runtime().block_on(controller().fetch(request)).unwrap_err();
+    server.join();
+    assert!(matches!(error, RequestError::CorsDenied));
+}
+
+#[test]
+fn cross_origin_same_origin_credentials_never_reach_cookie_services() {
+    let server = TestServer::start(2, |request| {
+        assert!(!request.to_ascii_lowercase().contains("cookie:"));
+        if request.starts_with("OPTIONS ") {
+            b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: https://client.test\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nSet-Cookie: ignored=preflight\r\nConnection: close\r\n\r\n".to_vec()
+        } else {
+            b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: https://client.test\r\nSet-Cookie: ignored=actual\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+        }
+    });
+    let reads = Arc::new(AtomicUsize::new(0));
+    let writes = Arc::new(AtomicUsize::new(0));
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(Arc::new(RecordingCookieServices {
+            reads: Arc::clone(&reads),
+            writes: Arc::clone(&writes),
+        }))
+        .build()
+        .unwrap();
+
+    let response = runtime()
+        .block_on(controller.fetch(request(server.url())))
+        .unwrap();
+    assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
+    server.join();
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn unsafe_redirect_target_receives_its_own_preflight() {
     let target = TestServer::start(2, |request| {
         if request.starts_with("OPTIONS ") {
@@ -268,4 +399,60 @@ fn unsafe_redirect_target_receives_its_own_preflight() {
     assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
     source.join();
     target.join();
+}
+
+#[test]
+fn a_tainted_redirect_chain_preflights_each_target_with_null_origin() {
+    let final_target = TestServer::start(2, |request| {
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("origin: null"))
+        );
+        if request.starts_with("OPTIONS ") {
+            b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: null\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nConnection: close\r\n\r\n".to_vec()
+        } else {
+            b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: null\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+        }
+    });
+    let final_url = final_target.url();
+    let middle = TestServer::start(2, move |request| {
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("origin: null"))
+        );
+        if request.starts_with("OPTIONS ") {
+            b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: null\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nConnection: close\r\n\r\n".to_vec()
+        } else {
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {final_url}\r\nAccess-Control-Allow-Origin: null\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        }
+    });
+    let middle_url = middle.url();
+    let source = TestServer::start(2, move |request| {
+        if request.starts_with("OPTIONS ") {
+            assert!(
+                request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("origin: https://client.test"))
+            );
+            b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: https://client.test\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nConnection: close\r\n\r\n".to_vec()
+        } else {
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {middle_url}\r\nAccess-Control-Allow-Origin: https://client.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        }
+    });
+
+    let response = runtime()
+        .block_on(controller().fetch(request(source.url())))
+        .unwrap();
+    assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
+    source.join();
+    middle.join();
+    final_target.join();
 }

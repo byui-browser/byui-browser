@@ -110,11 +110,38 @@ coverage, without adding browser composition requirements to this slice.
 ### 3. CORS and response filtering
 
 Preflight request construction, permission denial, cache reuse and clearing,
-credentialed preflight, and redirect-hop preflight are covered. Complete tests
-for the remaining request-tainting states and network-error response
-construction. Redirect-time simple CORS, redirect-tainted origin serialization,
-and opaque-redirect approval are covered. Retain explicit coverage proving
-that forbidden response headers never reach public responses.
+credentialed preflight, opaque-origin serialization, wildcard restrictions,
+cookie suppression, and multi-hop redirect preflight are covered. This includes
+the non-credentialed wildcard success case, the `Authorization` wildcard
+exception, and the rule that a credentialed preflight never carries cookies
+while its eventual request may. Opaque local `data:` origins are rejected for
+tuple-origin CORS clients. Header unit tests also cover CORS-safelisted request
+headers, unsafe-name sorting/deduplication and the aggregate limit, response
+header exposure, credential-sensitive exposure wildcards, malformed exposure
+values, and forbidden response-header filtering. Redirect-time simple CORS,
+redirect-tainted origin serialization, and opaque-redirect approval are
+covered.
+
+The remaining CORS conformance coverage is deliberately narrower and should
+be added as the corresponding behavior is finalized:
+
+- Preflight failures caused by a non-success status, a redirect response, a
+  malformed or duplicated allow field, and a missing
+  `Access-Control-Allow-Credentials` value for `credentials: include`.
+- End-to-end cache expiry and max-age behavior: omitted, malformed, zero, and
+  capped `Access-Control-Max-Age` values; permission-key isolation across
+  origins, URL paths, network partitions, and credential modes.
+- Exact allow-list token behavior at the HTTP boundary, including method-token
+  casing, duplicate request-header names, and a method or header that is
+  permitted by a cached entry but not by a differently keyed entry.
+- An approved preflight followed by an ordinary response that fails its CORS
+  check, proving that no response is exposed after the actual request.
+- Redirect edge cases: a later-hop preflight denial stops the chain, and a
+  301/302/303 rewrite to a safelisted method does not retain an unnecessary
+  preflight requirement.
+- The remaining request-tainting states and their network-error response
+  construction, including assertions that public responses never expose
+  forbidden headers on every error path.
 
 ### 4. Redirects and request context
 
