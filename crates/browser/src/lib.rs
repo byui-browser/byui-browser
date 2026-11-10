@@ -748,6 +748,14 @@ impl PageSession {
     pub fn dispatch_click_at(&self, node: html::NodeID) -> JsResult<Value> {
         webapis::dispatch_click_at(&self.document, node)
     }
+
+    /// Runs this page's elapsed `window.setInterval()` callbacks.
+    ///
+    /// Call this from the page/event-loop thread. The return value is the
+    /// number of interval callbacks delivered during this pump.
+    pub fn run_timers(&self) -> JsResult<usize> {
+        webapis::run_window_timers(&self.window)
+    }
 }
 
 struct BootedPage {

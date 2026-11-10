@@ -1,11 +1,88 @@
 //! The script-visible `Window`, `History`, and `Location` objects.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, PoisonError},
+    time::Instant,
+};
 
 use crate::custom_elements::CustomElementRegistry;
-use js::{JsError, JsResult, Object, Realm, Value};
+use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
 use security::RendererSecurityContext;
+
+use crate::timer::{TimerId, TimerQueue};
+
+struct IntervalCallback {
+    function: Function,
+    arguments: Vec<Value>,
+}
+
+struct WindowTimers {
+    queue: TimerQueue,
+    callbacks: HashMap<TimerId, IntervalCallback>,
+}
+
+impl WindowTimers {
+    fn new() -> Self {
+        Self {
+            queue: TimerQueue::new(),
+            callbacks: HashMap::new(),
+        }
+    }
+
+    fn set_interval(
+        &mut self,
+        function: Function,
+        delay_ms: u64,
+        arguments: Vec<Value>,
+    ) -> TimerId {
+        let id = self.queue.schedule_interval(delay_ms);
+        self.callbacks.insert(
+            id,
+            IntervalCallback {
+                function,
+                arguments,
+            },
+        );
+        id
+    }
+
+    fn clear(&mut self, id: TimerId) -> bool {
+        self.callbacks.remove(&id);
+        self.queue.cancel(id)
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<(TimerId, Function, Vec<Value>)> {
+        let id = self.queue.pop_due(now)?;
+        let callback = self.callbacks.get(&id)?;
+        Some((id, callback.function.clone(), callback.arguments.clone()))
+    }
+}
+
+fn timer_delay(value: Option<&Value>) -> JsResult<u64> {
+    let number = match value {
+        None | Some(Value::Undefined) | Some(Value::Null) => 0.0,
+        Some(Value::Number(value)) => *value,
+        Some(Value::Boolean(value)) => f64::from(*value),
+        Some(Value::String(value)) => value.trim().parse::<f64>().unwrap_or(f64::NAN),
+        Some(_) => return Err(JsError::runtime("timer delay must be a number")),
+    };
+    if number.is_nan() || number <= 0.0 {
+        return Ok(0);
+    }
+    Ok(number.min(u64::MAX as f64).trunc() as u64)
+}
+
+fn timer_id(value: Option<&Value>) -> Option<TimerId> {
+    let Value::Number(value) = value? else {
+        return None;
+    };
+    if !value.is_finite() || *value <= 0.0 {
+        return None;
+    }
+    Some(TimerId(value.trunc().min(u32::MAX as f64) as u32))
+}
 
 #[derive(Clone, Debug)]
 struct HistoryEntry {
@@ -155,6 +232,7 @@ fn register_window_object(
         Some(Value::Object(registry)) => registry,
         _ => CustomElementRegistry::new().object(),
     };
+    let timers = Arc::new(Mutex::new(WindowTimers::new()));
 
     window.set_method(
         "self",
@@ -187,6 +265,67 @@ fn register_window_object(
     window.set("onpopstate", Value::Null);
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__popstateListeners", Value::Object(Object::new()));
+
+    let timers_for_interval = Arc::clone(&timers);
+    window.set_method(
+        "setInterval",
+        Arc::new(move |arguments| {
+            let Some(Value::Function(function)) = arguments.first() else {
+                return Err(JsError::runtime(
+                    "setInterval() requires a function callback",
+                ));
+            };
+            let delay = timer_delay(arguments.get(1))?;
+            let callback_arguments = arguments.iter().skip(2).cloned().collect();
+            let mut timers = timers_for_interval
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(Value::Number(
+                timers
+                    .set_interval(function.clone(), delay, callback_arguments)
+                    .0 as f64,
+            ))
+        }),
+    );
+
+    let timers_for_clear = Arc::clone(&timers);
+    let clear_interval: js::HostFunction = Arc::new(move |arguments: &[Value]| {
+        if let Some(id) = timer_id(arguments.first()) {
+            timers_for_clear
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear(id);
+        }
+        Ok(Value::Undefined)
+    });
+    window.set_method("clearInterval", Arc::clone(&clear_interval));
+    window.set_method("clearTimeout", clear_interval);
+
+    let timers_for_pump = Arc::clone(&timers);
+    window.set_method(
+        "__runTimers",
+        Arc::new(move |_| {
+            let mut fired = 0;
+            let mut delivered = HashSet::new();
+            loop {
+                let callback = timers_for_pump
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take_due(Instant::now());
+                let Some((id, function, arguments)) = callback else {
+                    break;
+                };
+                if !delivered.insert(id) {
+                    break;
+                }
+                if let Err(error) = function.call(&arguments) {
+                    log::warn!("setInterval callback threw: {error}");
+                }
+                fired += 1;
+            }
+            Ok(Value::Number(fired as f64))
+        }),
+    );
 
     let listeners_window = window.clone();
     window.set_method(
@@ -362,7 +501,43 @@ fn register_window_object(
     realm.register_global_value("navigator", Value::Object(navigator))?;
     realm.register_global_value("innerWidth", inner_width)?;
     realm.register_global_value("innerHeight", inner_height)?;
+    realm.register_global_value(
+        "setInterval",
+        window
+            .get("setInterval")
+            .expect("setInterval should be installed on Window"),
+    )?;
+    realm.register_global_value(
+        "clearInterval",
+        window
+            .get("clearInterval")
+            .expect("clearInterval should be installed on Window"),
+    )?;
+    realm.register_global_value(
+        "clearTimeout",
+        window
+            .get("clearTimeout")
+            .expect("clearTimeout should be installed on Window"),
+    )?;
     Ok(window)
+}
+
+/// Runs callbacks whose `setInterval()` deadlines have elapsed.
+///
+/// Browser integrations call this from the owning page/event-loop thread.
+/// The timer API queues work and never invokes JavaScript from a background
+/// thread. The return value is the number of callbacks delivered.
+/// String handlers are intentionally unsupported because dynamic script
+/// compilation is not yet exposed by this engine.
+pub fn run_window_timers(window: &Object) -> JsResult<usize> {
+    let Some(Value::Function(pump)) = window.get("__runTimers") else {
+        return Err(JsError::runtime("window timer pump is not installed"));
+    };
+    match pump.call(&[]) {
+        Ok(Value::Number(fired)) => Ok(fired as usize),
+        Ok(_) => Err(JsError::runtime("window timer pump returned a non-number")),
+        Err(error) => Err(error),
+    }
 }
 
 /// Registers the script-visible window globals using `about:blank` as its URL.
