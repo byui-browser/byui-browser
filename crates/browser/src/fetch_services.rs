@@ -16,7 +16,7 @@ pub struct BrowserFetchServices {
 
 impl BrowserFetchServices {
     /// Creates browser services using `cache_partition` for process-local HTTP
-    /// cache isolation.
+    /// response and CORS-preflight cache isolation.
     pub fn new(cache_partition: impl Into<String>) -> Self {
         Self {
             cache_partition: cache_partition.into(),

@@ -483,27 +483,30 @@ fn is_forbidden_request_header(name: &HeaderName) -> bool {
 /// Reports whether a request header/value pair is CORS-safelisted.
 pub(crate) fn is_cors_safelisted_header(name: &HeaderName, value: &HeaderValue) -> bool {
     let raw = value.as_bytes();
-    if raw.len() > 128
-        || raw
-            .iter()
-            .any(|byte| matches!(*byte, 0x00..=0x08 | 0x0a..=0x1f | 0x7f))
-    {
+    if raw.len() > 128 {
         return false;
     }
     match name.as_str() {
-        "accept" | "accept-language" | "content-language" => true,
-        "content-type" => value.to_str().is_ok_and(|value| {
-            let media_type = value
-                .split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase();
-            matches!(
-                media_type.as_str(),
-                "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
-            )
+        "accept" => !raw.iter().copied().any(is_cors_unsafe_request_header_byte),
+        "accept-language" | "content-language" => raw.iter().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(*byte, b' ' | b'*' | b',' | b'-' | b'.' | b';' | b'=')
         }),
+        "content-type" => {
+            !raw.iter().copied().any(is_cors_unsafe_request_header_byte)
+                && value.to_str().is_ok_and(|value| {
+                    let media_type = value
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    matches!(
+                        media_type.as_str(),
+                        "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
+                    )
+                })
+        }
         "range" => value.to_str().is_ok_and(|value| {
             value.strip_prefix("bytes=").is_some_and(|range| {
                 let mut parts = range.split('-');
@@ -517,6 +520,52 @@ pub(crate) fn is_cors_safelisted_header(name: &HeaderName, value: &HeaderValue) 
         }),
         _ => false,
     }
+}
+
+/// Returns the sorted lowercase names that require CORS preflight approval.
+///
+/// Individually safelisted fields become unsafe when their combined value size
+/// exceeds Fetch's 1024-byte aggregate limit.
+pub(crate) fn cors_unsafe_request_header_names(headers: &Headers) -> Vec<HeaderName> {
+    let mut unsafe_names = Vec::new();
+    let mut potentially_unsafe_names = Vec::new();
+    let mut safelist_value_size = 0usize;
+
+    for (name, value) in headers.iter_raw() {
+        if is_cors_safelisted_header(name, value) {
+            potentially_unsafe_names.push(name.clone());
+            safelist_value_size = safelist_value_size.saturating_add(value.as_bytes().len());
+        } else {
+            unsafe_names.push(name.clone());
+        }
+    }
+    if safelist_value_size > 1024 {
+        unsafe_names.extend(potentially_unsafe_names);
+    }
+    unsafe_names.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+    unsafe_names.dedup();
+    unsafe_names
+}
+
+/// Reports whether a byte is forbidden in relevant CORS-safelisted values.
+fn is_cors_unsafe_request_header_byte(byte: u8) -> bool {
+    (byte < 0x20 && byte != b'\t')
+        || matches!(
+            byte,
+            b'"' | b'('
+                | b')'
+                | b':'
+                | b'<'
+                | b'>'
+                | b'?'
+                | b'@'
+                | b'['
+                | b'\\'
+                | b']'
+                | b'{'
+                | b'}'
+                | 0x7f
+        )
 }
 
 #[cfg(test)]
@@ -805,5 +854,49 @@ mod tests {
             request.append(HeaderName::from_static("sec-fetch-site"), value("same-origin")),
             Err(RequestError::ForbiddenHeader(name)) if name == "sec-fetch-site"
         ));
+    }
+
+    #[test]
+    fn cors_unsafe_names_are_sorted_deduplicated_and_apply_the_aggregate_limit() {
+        let mut headers = Headers::new();
+        headers
+            .append(
+                HeaderName::from_static("x-zed"),
+                HeaderValue::from_static("one"),
+            )
+            .unwrap();
+        headers
+            .append(
+                HeaderName::from_static("x-alpha"),
+                HeaderValue::from_static("two"),
+            )
+            .unwrap();
+        headers
+            .append(
+                HeaderName::from_static("x-zed"),
+                HeaderValue::from_static("three"),
+            )
+            .unwrap();
+        assert_eq!(
+            cors_unsafe_request_header_names(&headers)
+                .iter()
+                .map(HeaderName::as_str)
+                .collect::<Vec<_>>(),
+            ["x-alpha", "x-zed"]
+        );
+
+        let mut aggregate = Headers::new();
+        for _ in 0..9 {
+            aggregate
+                .append(
+                    HeaderName::from_static("accept-language"),
+                    HeaderValue::from_bytes(&[b'a'; 128]).unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            cors_unsafe_request_header_names(&aggregate),
+            [HeaderName::from_static("accept-language")]
+        );
     }
 }

@@ -187,18 +187,6 @@ impl RequestPolicy {
             );
             return Err(RequestError::SameOriginViolation);
         }
-        if request.context.mode == crate::RequestMode::Cors
-            && request.effective_origin().is_some_and(|origin| {
-                crate::Origin::from_url(url).is_ok_and(|target| !origin.is_same_origin(&target))
-            })
-            && request.requires_cors_preflight()
-        {
-            log::warn!(
-                "cors preflight is unsupported, blocking request to {}",
-                crate::log_url::loggable(url.as_str())
-            );
-            return Err(RequestError::UnsupportedFeature("CORS preflight"));
-        }
         Ok(())
     }
 }
@@ -353,18 +341,12 @@ mod tests {
     }
 
     #[test]
-    /// Verifies unsupported cross-origin preflight fails before transport.
-    fn preflight_required_cross_origin_request_is_rejected_before_transport() {
+    /// Verifies cross-origin requests requiring preflight reach HTTP execution.
+    fn preflight_required_cross_origin_request_passes_request_validation() {
         let mut request = Request::new("https://remote.test/data", "PUT").unwrap();
         request.context.environment.origin =
             Some(crate::Origin::parse("https://client.test").unwrap());
-        let error = RequestPolicy
-            .validate_request(&request, 65_536)
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            RequestError::UnsupportedFeature("CORS preflight")
-        ));
+        assert!(RequestPolicy.validate_request(&request, 65_536).is_ok());
     }
 
     #[test]

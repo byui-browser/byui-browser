@@ -344,18 +344,12 @@ fn unsupported_request_features_fail_before_browser_service_or_network_side_effe
     let mut navigation = Request::get("http://127.0.0.1:9/");
     navigation.set_mode(net::RequestMode::Navigate).unwrap();
 
-    let mut preflight = Request::new("http://127.0.0.1:9/", "PUT").unwrap();
-    preflight.set_environment(
-        FetchEnvironment::from_url(reqwest::Url::parse("https://client.test/").unwrap()).unwrap(),
-    );
-
     for (request, feature) in [
         (integrity, "subresource integrity"),
         (revalidation, "HTTP cache revalidation"),
         (priority, "priority scheduling"),
         (keepalive, "keepalive lifetime"),
         (navigation, "navigation fetch"),
-        (preflight, "CORS preflight"),
     ] {
         let services = Arc::new(RecordingServices::new(false));
         let controller = RequestController::builder(Config::default())

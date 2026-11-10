@@ -6,7 +6,7 @@ use crate::{
     api::{
         config::Config, error::RequestError, providers::SchemeProviders, services::FetchServices,
     },
-    cache::ResponseCache,
+    cache::{PreflightCache, ResponseCache},
     policy::{CorsChecker, RequestPolicy},
     scheduling::RequestScheduler,
     transport::reqwest_transport,
@@ -46,6 +46,10 @@ pub(crate) struct ControllerInner {
     pub(crate) max_cache_body_size: usize,
     /// Process-local response cache shared by controller clones.
     pub(crate) cache: ResponseCache,
+    /// Process-local CORS-preflight permission cache.
+    pub(crate) preflight_cache: PreflightCache,
+    /// Maximum lifetime accepted for one preflight permission.
+    pub(crate) max_preflight_cache_age: std::time::Duration,
     /// Browser-owned policy, credential, cache-partition, and worker decisions.
     pub(crate) services: Option<Arc<dyn FetchServices>>,
     /// Browser-owned scheme providers selected by the dispatcher.
@@ -106,6 +110,7 @@ impl RequestControllerBuilder {
         let max_in_flight = config.max_in_flight;
         let max_keepalive_body_size = config.max_keepalive_body_size;
         let max_cache_body_size = config.max_cache_body_size;
+        let max_preflight_cache_age = config.max_preflight_cache_age;
         let transport = reqwest_transport(config.clone()).map_err(|error| {
             log::error!("http transport initialization failed: {error}");
             RequestError::Initialization(error.to_string())
@@ -120,6 +125,8 @@ impl RequestControllerBuilder {
                 max_keepalive_body_size,
                 max_cache_body_size,
                 cache: ResponseCache::default(),
+                preflight_cache: PreflightCache::default(),
+                max_preflight_cache_age,
                 services,
                 providers,
                 cors: CorsChecker,
@@ -131,8 +138,9 @@ impl RequestControllerBuilder {
 }
 
 impl RequestController {
-    /// Removes all currently stored responses from this controller's cache.
+    /// Removes all stored HTTP responses and CORS-preflight permissions.
     pub fn clear_cache(&self) {
         self.inner.cache.clear();
+        self.inner.preflight_cache.clear();
     }
 }

@@ -13,7 +13,7 @@ use super::{
     CacheMode, CredentialsMode, FetchContext, FetchEnvironment, InitiatorType, Origin,
     RedirectMode, Referrer, ReferrerPolicy, RequestDestination, RequestMode, ServiceWorkersMode,
 };
-use crate::api::headers::is_cors_safelisted_header;
+use crate::api::headers::{cors_unsafe_request_header_names, is_cors_safelisted_header};
 
 /// A browser request before conversion to a transport request.
 #[derive(Debug)]
@@ -84,7 +84,7 @@ impl Request {
     }
 
     /// Copies request configuration without transferring or duplicating its body.
-    fn clone_without_body(&self) -> Self {
+    pub(crate) fn clone_without_body(&self) -> Self {
         Self {
             id: self.id,
             url: self.url.clone(),
@@ -384,13 +384,27 @@ impl Request {
             }
         })
     }
-    /// Reports whether method or headers require a CORS preflight.
-    pub(crate) fn requires_cors_preflight(&self) -> bool {
-        !matches!(self.method, Method::GET | Method::HEAD | Method::POST)
-            || self
-                .headers
-                .iter_raw()
-                .any(|(name, value)| !is_cors_safelisted_header(name, value))
+    /// Returns the effective request-header names requiring CORS approval.
+    ///
+    /// Body-derived content type participates, while user-agent-generated
+    /// content length and `Origin` fields do not.
+    pub(crate) fn cors_unsafe_header_names(&self) -> Result<Vec<HeaderName>, RequestError> {
+        let mut headers = self.headers.clone();
+        if let Some(body) = &self.body
+            && let Some(content_type) = body.content_type()
+            && !headers.has(CONTENT_TYPE.as_str())
+        {
+            headers.insert_internal_header(CONTENT_TYPE, content_type)?;
+        }
+        Ok(cors_unsafe_request_header_names(&headers))
+    }
+
+    /// Reports whether method or effective headers require a CORS preflight.
+    pub(crate) fn requires_cors_preflight(&self) -> Result<bool, RequestError> {
+        Ok(
+            !matches!(self.method, Method::GET | Method::HEAD | Method::POST)
+                || !self.cors_unsafe_header_names()?.is_empty(),
+        )
     }
     /// Returns the transport priority corresponding to the Fetch priority.
     pub(crate) fn transport_priority(&self) -> crate::scheduling::RequestPriority {

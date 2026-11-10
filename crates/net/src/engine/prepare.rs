@@ -4,8 +4,7 @@ use crate::{
     api::{
         error::RequestError,
         request::{
-            CacheMode, CredentialsMode, InitiatorType, Request, RequestDestination,
-            ServiceWorkersMode,
+            CredentialsMode, InitiatorType, Request, RequestDestination, ServiceWorkersMode,
         },
         services::ServiceWorkerDecision,
     },
@@ -66,7 +65,6 @@ impl RequestController {
         }
 
         if validated_url.scheme.is_http()
-            && request.cache_mode != CacheMode::NoStore
             && let Some(services) = &self.inner.services
         {
             request.cache_partition = Some(services.cache_partition(&request)?);

@@ -30,6 +30,7 @@ impl RequestController {
             if request.redirect_count > 0 {
                 self.authorize_redirect_hop(&request)?;
             }
+            self.ensure_cors_preflight(&request, &url).await?;
 
             let cacheable = request.is_cacheable_method();
             let cache_lookup = match request.cache_mode {

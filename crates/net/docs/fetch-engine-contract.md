@@ -120,7 +120,7 @@ work.
   and a response-header observation hook. `Set-Cookie` reaches only that
   trusted interface. Credential mode still decides whether the engine calls
   its credential methods.
-- CORS preflight, integrity, navigation fetch, keepalive lifetime, nondefault
+- Integrity, navigation fetch, keepalive lifetime, nondefault
   priority scheduling, and cache revalidation fail with `UnsupportedFeature`.
   Manual/error redirect modes are handled by the controller. A service-worker
   `Intercept` decision also

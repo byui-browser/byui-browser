@@ -44,8 +44,8 @@ provider helper already removed.
 With the current browser/provider slice complete, the next work should be
 sequenced as follows:
 
-1. Implement the missing CORS preflight/cache and complete per-hop redirect
-   policy before expanding browser credentials.
+1. Complete the remaining request-tainting and user-agent header algorithms
+   around the implemented per-hop CORS preflight boundary.
 2. Replace the browser's no-op `FetchServices` defaults with origin-aware
    cookies, service-worker decisions, and security-policy checks.
 3. Expand the process-local cache into a standards-aware, partitioned cache
@@ -66,10 +66,11 @@ with the browser-lifecycle work in step 3.
 
 ### 2. Finish CORS, response, and request algorithms
 
-- Implement preflight requests and the preflight cache.
-- Complete `Access-Control-Allow-*` parsing, credentialed preflight, and the
-  remaining request-tainting states. Simple CORS and origin transitions run at
-  each redirect hop.
+- CORS preflight `OPTIONS` requests, credential validation, redirect-hop
+  reevaluation, and a partitioned expiring permission cache are implemented.
+  Complete the remaining request-tainting states and broader user-agent-owned
+  header generation. Simple CORS and origin transitions run at each redirect
+  hop.
 - Finish network-error response construction and response-derived helpers such
   as `ok` and explicit body-presence checks.
 - Complete user-agent-owned header generation and redirect-time header rules.

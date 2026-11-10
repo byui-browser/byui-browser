@@ -73,10 +73,10 @@ pub trait FetchServices: Send + Sync {
     /// is implemented in a later plan step.
     fn service_worker(&self, request: &Request) -> Result<ServiceWorkerDecision, RequestError>;
 
-    /// Returns an owned cache partition key for this browser request.
+    /// Returns an owned HTTP and CORS-preflight cache partition key for this request.
     ///
-    /// The process-local cache uses the key only within this controller. It is
-    /// not a durable HTTP cache or a substitute for the storage owner.
+    /// The process-local caches use the key only within this controller. It is
+    /// not a durable cache or a substitute for the storage owner.
     fn cache_partition(&self, request: &Request) -> Result<String, RequestError>;
 
     /// Observes approved response headers for diagnostics and timing clients.

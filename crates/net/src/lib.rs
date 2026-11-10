@@ -23,8 +23,9 @@
 //! observe request cancellation, and provider metadata is validated before
 //! public response exposure. Provider-backed local resources accept only `GET`
 //! and `HEAD`; other methods fail before provider lookup.
-//! This first engine slice supports basic same-origin responses, simple CORS
-//! checks, opaque no-CORS views, and forbidden response-header filtering.
+//! This engine slice supports basic same-origin responses, simple and
+//! preflighted CORS checks with a process-local permission cache, opaque
+//! no-CORS views, and forbidden response-header filtering.
 //! Requests requiring absent providers or algorithms fail with a typed
 //! [`RequestError::UnsupportedFeature`] before transport. HTTP redirects are
 //! handled by the controller according to [`RedirectMode`]. See the
@@ -33,7 +34,7 @@
 // Flag to forbid unsafe code. This is security-critical and permanant.
 #![forbid(unsafe_code)]
 
-// TODO(net): Add persistent cookie storage, strict CORS, and HTTP/3 transport.
+// TODO(net): Add persistent cookie storage, remaining CORS algorithms, and HTTP/3 transport.
 
 mod api;
 mod cache;

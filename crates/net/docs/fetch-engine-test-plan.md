@@ -109,11 +109,12 @@ coverage, without adding browser composition requirements to this slice.
 
 ### 3. CORS and response filtering
 
-Complete tests for preflight requests, preflight caching, credentialed
-preflight, the remaining request-tainting states, and network-error response
-construction. Redirect-time simple CORS, redirect-tainted origin serialization, and
-opaque-redirect approval are covered. Retain explicit coverage proving that
-forbidden response headers never reach public responses.
+Preflight request construction, permission denial, cache reuse and clearing,
+credentialed preflight, and redirect-hop preflight are covered. Complete tests
+for the remaining request-tainting states and network-error response
+construction. Redirect-time simple CORS, redirect-tainted origin serialization,
+and opaque-redirect approval are covered. Retain explicit coverage proving
+that forbidden response headers never reach public responses.
 
 ### 4. Redirects and request context
 
@@ -124,7 +125,7 @@ credential-free targets, per-hop browser policy, service-worker bypass, intermed
 cookie processing, simple CORS checks, redirect-taint serialization, referrer-policy
 updates, redirect-aware cache lookup, and representative credential decisions.
 
-Add conformance cases alongside future preflight, same-site cookie, full-cache,
+Add conformance cases alongside future same-site cookie, full-cache,
 mixed-content, and timing integrations. Public final-URL and redirect-count
 behavior is covered; expand internal URL-list assertions if that state becomes
 observable through diagnostics.
@@ -140,7 +141,7 @@ Fetch cache modes.
 ### 6. Policy, transport, and scheduling
 
 The current tests prove integrity, cache-revalidation, priority, keepalive,
-navigation, and preflight requests fail before browser-service or network
+navigation requests fail before browser-service or network
 side effects. They also prove service-worker interception fails before cache,
 cookie, response, or transport work, and that canceling a scheduler-queued
 request releases admission for the next request.
