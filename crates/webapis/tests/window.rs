@@ -389,6 +389,48 @@ fn set_interval_returns_positive_id_passes_arguments_and_repeats() {
 }
 
 #[test]
+fn set_timeout_fires_once_with_arguments_and_window_receiver() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var calls = 0; var passed = false; \
+             function tick(value) { calls = calls + 1; passed = this === window && value === 7; } \
+             var id = setTimeout(tick, 1, 7); id > 0",
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(3));
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 1);
+    assert_eq!(
+        realm.evaluate_script("calls === 1 && passed"),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 0);
+}
+
+#[test]
+fn clear_timeout_cancels_callback_and_string_handler_runs() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var calls = 0; function cancelled_callback() { calls = 99; } \
+             var cancelled = setTimeout(cancelled_callback, 1); \
+             clearTimeout(cancelled); setTimeout('calls = calls + 1', 1)",
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(3));
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 1);
+    assert_eq!(realm.evaluate_script("calls"), Ok(Value::Number(1.0)));
+}
+
+#[test]
 fn clear_interval_can_be_called_inside_its_callback() {
     let mut realm = Realm::new();
     register_window(&mut realm).unwrap();

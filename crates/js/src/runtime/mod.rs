@@ -423,7 +423,11 @@ impl Function {
         if self.template().is_some() {
             crate::Vm::call_function(self.clone(), receiver, arguments)
         } else {
-            self.call(arguments)
+            with_engine_stack(|| {
+                let mut interpreter = Interpreter::new(ExecutionLimits::default());
+                interpreter.this_enabled = true;
+                interpreter.call_with_this(self, receiver, arguments)
+            })
         }
     }
 
@@ -540,6 +544,7 @@ pub fn evaluate_program_with_limits(program: &Program, limits: ExecutionLimits) 
 /// `object` holds host globals plus `var` and function declarations, and
 /// `lexical` (a child of `object`) holds top-level `let` and `const`. Lookups
 /// check `lexical` first, so a `let` shadows a host global of the same name.
+#[derive(Clone)]
 pub(crate) struct GlobalState {
     object: ScopeRef,
     lexical: ScopeRef,
@@ -588,11 +593,33 @@ impl GlobalState {
     /// error leaves the globals untouched. Errors thrown while running keep
     /// the effects that happened before them, as in JavaScript.
     pub(crate) fn evaluate(&self, program: &Program, limits: ExecutionLimits) -> JsResult<Value> {
+        self.evaluate_with_this_enabled(program, limits, Value::Undefined, false)
+    }
+
+    /// Evaluates `program` with a host-specified global `this` value.
+    pub(crate) fn evaluate_with_this(
+        &self,
+        program: &Program,
+        limits: ExecutionLimits,
+        this_value: Value,
+    ) -> JsResult<Value> {
+        self.evaluate_with_this_enabled(program, limits, this_value, true)
+    }
+
+    fn evaluate_with_this_enabled(
+        &self,
+        program: &Program,
+        limits: ExecutionLimits,
+        this_value: Value,
+        this_enabled: bool,
+    ) -> JsResult<Value> {
         log::trace!("evaluating {} top-level statements", program.body.len());
         with_engine_stack(|| {
             self.declare_globals(&program.body)?;
-            let completion =
-                Interpreter::new(limits).execute_statements(&self.lexical, &program.body)?;
+            let mut interpreter = Interpreter::new(limits);
+            interpreter.this_value = this_value;
+            interpreter.this_enabled = this_enabled;
+            let completion = interpreter.execute_statements(&self.lexical, &program.body)?;
             Ok(match completion {
                 Completion::Normal(value) => value.unwrap_or(Value::Undefined),
                 Completion::Return(value) => value,
@@ -696,6 +723,8 @@ struct Interpreter {
     call_depth: u64,
     loop_iterations_remaining: u64,
     call_depth_limit: u64,
+    this_value: Value,
+    this_enabled: bool,
 }
 
 impl Interpreter {
@@ -708,6 +737,8 @@ impl Interpreter {
             call_depth: 0,
             loop_iterations_remaining: limits.loop_iteration_limit,
             call_depth_limit: limits.call_depth_limit,
+            this_value: Value::Undefined,
+            this_enabled: false,
         }
     }
 
@@ -980,6 +1011,7 @@ impl Interpreter {
         match expression {
             // Methods never receive `this` in this evaluator, so it reads like
             // any other undeclared name.
+            Expr::This if self.this_enabled => Ok(self.this_value.clone()),
             Expr::This => Err(JsError::new("`this` is not defined")),
             Expr::New { .. } => Err(unsupported_here("`new`")),
             Expr::SuperCall { .. } | Expr::SuperMember { .. } => Err(unsupported_here("`super`")),
@@ -1118,6 +1150,15 @@ impl Interpreter {
     }
 
     fn call(&mut self, function: &Function, arguments: &[Value]) -> JsResult<Value> {
+        self.call_with_this(function, Value::Undefined, arguments)
+    }
+
+    fn call_with_this(
+        &mut self,
+        function: &Function,
+        receiver: Value,
+        arguments: &[Value],
+    ) -> JsResult<Value> {
         match &*function.0 {
             FunctionKind::Host { function, .. } => {
                 log::trace!("calling host function with {} arguments", arguments.len());
@@ -1153,6 +1194,7 @@ impl Interpreter {
                     interpreter.call_depth
                 );
                 let scope = child_scope(closure);
+                let previous_this = std::mem::replace(&mut interpreter.this_value, receiver);
                 for (index, param) in params.iter().enumerate() {
                     declare_var(&scope, param)?;
                     initialize(
@@ -1164,6 +1206,7 @@ impl Interpreter {
                 // The depth must be restored on errors too, because a script
                 // `catch` can resume execution in the caller.
                 let result = interpreter.run_body(&scope, body);
+                interpreter.this_value = previous_this;
                 interpreter.call_depth -= 1;
                 Ok(match result? {
                     Completion::Return(value) => value,

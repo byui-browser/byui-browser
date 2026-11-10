@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    sync::atomic::{AtomicU32, Ordering},
     sync::{Arc, Mutex, PoisonError},
     time::Instant,
 };
@@ -13,9 +14,18 @@ use security::RendererSecurityContext;
 
 use crate::timer::{TimerId, TimerQueue};
 
-struct IntervalCallback {
-    function: Function,
+#[derive(Clone)]
+enum TimerHandler {
+    Callback(Function),
+    Source(String),
+}
+
+#[derive(Clone)]
+struct TimerCallback {
+    handler: TimerHandler,
     arguments: Vec<Value>,
+    repeat: bool,
+    nesting_level: u32,
 }
 
 struct AnimationFrameCallbacks {
@@ -64,7 +74,7 @@ impl AnimationFrameCallbacks {
 
 struct WindowTimers {
     queue: TimerQueue,
-    callbacks: HashMap<TimerId, IntervalCallback>,
+    callbacks: HashMap<TimerId, TimerCallback>,
 }
 
 impl WindowTimers {
@@ -84,9 +94,11 @@ impl WindowTimers {
         let id = self.queue.schedule_interval(delay_ms);
         self.callbacks.insert(
             id,
-            IntervalCallback {
-                function,
+            TimerCallback {
+                handler: TimerHandler::Callback(function),
                 arguments,
+                repeat: true,
+                nesting_level: 1,
             },
         );
         id
@@ -97,10 +109,33 @@ impl WindowTimers {
         self.queue.cancel(id)
     }
 
-    fn take_due(&mut self, now: Instant) -> Option<(TimerId, Function, Vec<Value>)> {
+    fn set_timeout(
+        &mut self,
+        handler: TimerHandler,
+        delay_ms: u64,
+        arguments: Vec<Value>,
+        nesting_level: u32,
+    ) -> TimerId {
+        let id = self.queue.schedule(delay_ms);
+        self.callbacks.insert(
+            id,
+            TimerCallback {
+                handler,
+                arguments,
+                repeat: false,
+                nesting_level,
+            },
+        );
+        id
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<(TimerId, TimerCallback)> {
         let id = self.queue.pop_due(now)?;
-        let callback = self.callbacks.get(&id)?;
-        Some((id, callback.function.clone(), callback.arguments.clone()))
+        let callback = self.callbacks.get(&id)?.clone();
+        if !callback.repeat {
+            self.callbacks.remove(&id);
+        }
+        Some((id, callback))
     }
 }
 
@@ -282,6 +317,9 @@ fn register_window_object(
     };
     let timers = Arc::new(Mutex::new(WindowTimers::new()));
     let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
+    let evaluator = realm.script_evaluator();
+    let timer_this = Value::Object(window.clone());
+    let nesting_context = Arc::new(AtomicU32::new(0));
 
     window.set_method(
         "self",
@@ -314,6 +352,35 @@ fn register_window_object(
     window.set("onpopstate", Value::Null);
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__popstateListeners", Value::Object(Object::new()));
+
+    let timers_for_timeout = Arc::clone(&timers);
+    let nesting_for_timeout = Arc::clone(&nesting_context);
+    window.set_method(
+        "setTimeout",
+        Arc::new(move |arguments| {
+            let handler = match arguments.first() {
+                Some(Value::Function(function)) => TimerHandler::Callback(function.clone()),
+                Some(value) => TimerHandler::Source(value.to_string()),
+                None => return Err(JsError::runtime("setTimeout() requires a handler")),
+            };
+            let nesting = nesting_for_timeout.load(Ordering::Acquire);
+            let requested_delay = timer_delay(arguments.get(1))?;
+            let delay = if nesting > 5 && requested_delay < 4 {
+                4
+            } else {
+                requested_delay
+            };
+            let callback_arguments = arguments.get(2..).unwrap_or_default().to_vec();
+            let id = timers_for_timeout
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .set_timeout(handler, delay, callback_arguments, nesting + 1);
+            Ok(Value::Number(f64::from(id.0)))
+        }),
+    );
+    if let Some(timeout) = window.get("setTimeout") {
+        realm.register_global_value("setTimeout", timeout)?;
+    }
 
     let timers_for_interval = Arc::clone(&timers);
     window.set_method(
@@ -421,14 +488,25 @@ fn register_window_object(
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .take_due(Instant::now());
-                let Some((id, function, arguments)) = callback else {
+                let Some((id, callback)) = callback else {
                     break;
                 };
                 if !delivered.insert(id) {
                     break;
                 }
-                if let Err(error) = function.call(&arguments) {
-                    log::warn!("setInterval callback threw: {error}");
+                let previous_nesting =
+                    nesting_context.swap(callback.nesting_level, Ordering::AcqRel);
+                let result = match callback.handler {
+                    TimerHandler::Callback(function) => {
+                        evaluator.call_with_this(&function, timer_this.clone(), &callback.arguments)
+                    }
+                    TimerHandler::Source(source) => {
+                        evaluator.evaluate_script_with_this(&source, timer_this.clone())
+                    }
+                };
+                nesting_context.store(previous_nesting, Ordering::Release);
+                if let Err(error) = result {
+                    log::warn!("window timer callback threw: {error}");
                 }
                 fired += 1;
             }
