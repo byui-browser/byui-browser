@@ -590,25 +590,21 @@ fn stray_semicolons_between_members_are_allowed() {
     );
 }
 
-// Tree-walk evaluator (documented limitation) -------------------------------------------------
+// Public evaluation uses the bytecode path -----------------------------------------------------
 
 #[test]
-fn the_tree_walk_evaluator_reports_classes_as_unsupported() {
+fn public_evaluation_runs_classes_on_the_vm() {
     for source in [
         "class A { }",
-        "new A()",
-        "class P { } class D extends P { constructor() { super(); } }",
+        "class A { value() { return 3; } } new A().value()",
+        "class P { value() { return 2; } } class D extends P { constructor() { super(); } } new D().value()",
     ] {
-        let error = eval(source).expect_err(source);
-        assert!(
-            error
-                .message
-                .contains("only supported by the bytecode compiler"),
-            "{source}: {}",
-            error.message
-        );
+        assert!(eval(source).is_ok(), "{source}");
     }
-    assert_eq!(eval("this").unwrap_err().message, "`this` is not defined");
+    assert_eq!(
+        eval("class A { } new A().constructor === A"),
+        Ok(Value::Boolean(true))
+    );
 }
 
 // Malformed bytecode --------------------------------------------------------------------------
