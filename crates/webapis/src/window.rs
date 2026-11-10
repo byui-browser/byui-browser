@@ -48,7 +48,7 @@ impl WindowTimers {
         id
     }
 
-    fn clear(&mut self, id: TimerId) -> bool {
+    fn clear_interval(&mut self, id: TimerId) -> bool {
         self.callbacks.remove(&id);
         self.queue.cancel(id)
     }
@@ -75,13 +75,17 @@ fn timer_delay(value: Option<&Value>) -> JsResult<u64> {
 }
 
 fn timer_id(value: Option<&Value>) -> Option<TimerId> {
-    let Value::Number(value) = value? else {
-        return None;
+    let number = match value? {
+        Value::Undefined | Value::Null => 0.0,
+        Value::Boolean(value) => f64::from(*value),
+        Value::Number(value) => *value,
+        Value::String(value) => value.trim().parse::<f64>().unwrap_or(f64::NAN),
+        Value::Function(_) | Value::Object(_) | Value::Array(_) => return None,
     };
-    if !value.is_finite() || *value <= 0.0 {
+    if !number.is_finite() || number <= 0.0 {
         return None;
     }
-    Some(TimerId(value.trunc().min(u32::MAX as f64) as u32))
+    Some(TimerId(number.trunc().min(u32::MAX as f64) as u32))
 }
 
 #[derive(Clone, Debug)]
@@ -294,7 +298,7 @@ fn register_window_object(
             timers_for_clear
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .clear(id);
+                .clear_interval(id);
         }
         Ok(Value::Undefined)
     });

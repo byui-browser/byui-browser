@@ -405,3 +405,28 @@ fn clear_interval_can_be_called_inside_its_callback() {
     assert_eq!(realm.evaluate_script("calls"), Ok(Value::Number(1.0)));
     assert_eq!(webapis::run_window_timers(&window).unwrap(), 0);
 }
+
+#[test]
+fn clear_interval_uses_shared_timer_handles_and_returns_undefined() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var calls = 0; function tick() { calls = calls + 1; } \
+             var id = setInterval(tick, 1); \
+             clearInterval('1') === undefined && clearTimeout === clearInterval",
+        )
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(3));
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 0);
+    assert_eq!(realm.evaluate_script("calls"), Ok(Value::Number(0.0)));
+
+    assert_eq!(
+        realm.evaluate_script("clearInterval(undefined)"),
+        Ok(Value::Undefined)
+    );
+}
