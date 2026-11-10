@@ -225,6 +225,30 @@ fn control_flow_keeps_short_circuit_evaluation_order() {
 }
 
 #[test]
+fn for_loops_compile_all_clauses_and_abrupt_exits() {
+    assert_eq!(
+        execute("let total = 0; for (let i = 0; i < 4; i = i + 1) total = total + i; total"),
+        Value::Number(6.0)
+    );
+    assert_eq!(
+        execute("let i = 0; for (;;) { i = i + 1; if (i == 3) break; } i"),
+        Value::Number(3.0)
+    );
+    assert_eq!(
+        execute(
+            "let total = 0; for (let i = 0; i < 4; i = i + 1) { if (i == 1) continue; total = total + i; } total"
+        ),
+        Value::Number(5.0)
+    );
+    assert_eq!(
+        execute(
+            "let total = 0; for (let i = 0; i < 3; i = i + 1) { for (let j = 0; j < 3; j = j + 1) { if (j == 1) break; total = total + 1; } } total"
+        ),
+        Value::Number(3.0)
+    );
+}
+
+#[test]
 fn vm_limits_bound_bytecode_execution() {
     let program = parse("while (true) { }").expect("source should parse");
     let chunk = compile(&program).expect("source should compile");

@@ -206,6 +206,18 @@ pub enum Statement {
         /// Owned statement executed on each iteration.
         body: Box<Statement>,
     },
+    /// Loop with optional initialization, condition, and update clauses.
+    For {
+        /// Optional expression or variable declaration evaluated once before
+        /// the first condition check.
+        init: Option<Box<Statement>>,
+        /// Optional expression tested before each iteration; absent means true.
+        condition: Option<Expr>,
+        /// Optional expression evaluated after each body iteration.
+        update: Option<Expr>,
+        /// Owned statement executed on each iteration.
+        body: Box<Statement>,
+    },
     /// Named function declaration with an owned body.
     FunctionDeclaration {
         /// Owned identifier spelling.
@@ -236,10 +248,10 @@ pub enum Statement {
         /// `continue`, and a thrown exception.
         finalizer: Option<Vec<Statement>>,
     },
-    /// `break;`: leaves the innermost enclosing `while` loop.
+    /// `break;`: leaves the innermost enclosing loop.
     Break,
     /// `continue;`: starts the next iteration of the innermost enclosing
-    /// `while` loop. Labels are unsupported.
+    /// loop. Labels are unsupported.
     Continue,
 }
 

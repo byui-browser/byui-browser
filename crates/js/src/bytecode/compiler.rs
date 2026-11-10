@@ -94,10 +94,15 @@ enum Control {
         live: usize,
         /// Number of compile-time scopes outside the loop body.
         scopes: usize,
-        /// Offset of the condition, the target of `continue`.
-        start: usize,
+        /// Scope depth retained by `continue` for a lexical `for` loop.
+        continue_scopes: usize,
+        /// Jump target for `continue`; `usize::MAX` means the update target
+        /// is not known yet and jumps are kept in `continues`.
+        continue_target: usize,
         /// `break` jumps, patched to the loop exit.
         breaks: Vec<usize>,
+        /// `continue` jumps waiting for the update target.
+        continues: Vec<usize>,
     },
     /// An active runtime exception handler.
     Handler {
@@ -336,6 +341,12 @@ impl Compiler {
                 }
             }
             Statement::While { body, .. } => self.collect_vars(body)?,
+            Statement::For { init, body, .. } => {
+                if let Some(init) = init {
+                    self.collect_vars(init)?;
+                }
+                self.collect_vars(body)?;
+            }
             Statement::Try {
                 block,
                 handler,
@@ -544,6 +555,18 @@ impl Compiler {
             Statement::While { condition, body } => {
                 self.compile_while(condition, body, is_completion)
             }
+            Statement::For {
+                init,
+                condition,
+                update,
+                body,
+            } => self.compile_for(
+                init.as_deref(),
+                condition.as_ref(),
+                update.as_ref(),
+                body,
+                is_completion,
+            ),
             Statement::FunctionDeclaration { .. }
                 if self.function.is_none() && self.scopes.len() == 1 =>
             {
