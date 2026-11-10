@@ -34,7 +34,7 @@
 // Flag to forbid unsafe code. This is security-critical and permanant.
 #![forbid(unsafe_code)]
 
-// TODO(net): Add persistent cookie storage, remaining CORS algorithms, and HTTP/3 transport.
+// TODO(net): Add persistent cookie storage, browser security integrations, and HTTP/3 transport.
 
 mod api;
 mod cache;

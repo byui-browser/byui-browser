@@ -2,15 +2,18 @@
 
 mod common;
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 use common::{TestServer, runtime};
 use net::{
-    Body, Config, FetchEnvironment, FetchServices, HeaderName, HeaderValue, Request,
-    RequestController, RequestError, ResponseInfo, ServiceWorkerDecision,
+    Body, Config, CredentialsMode, FetchEnvironment, FetchServices, HeaderName, HeaderValue,
+    Request, RequestController, RequestError, ResponseInfo, ServiceWorkerDecision,
 };
 
 /// Browser services used to supply an isolated cache partition without credentials.
@@ -511,4 +514,144 @@ fn returning_to_the_request_origin_remains_tainted_and_preflighted() {
     assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
     source.join();
     middle.join();
+}
+
+#[test]
+fn malformed_status_redirect_token_and_credential_preflights_fail_closed() {
+    let cases = [
+        b"HTTP/1.1 403 Forbidden\r\nAccess-Control-Allow-Origin: https://client.test\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nConnection: close\r\n\r\n".to_vec(),
+        b"HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nAccess-Control-Allow-Origin: https://client.test\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nConnection: close\r\n\r\n".to_vec(),
+        b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: https://client.test\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nConnection: close\r\n\r\n".to_vec(),
+        b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: https://client.test\r\nAccess-Control-Allow-Methods: put\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nConnection: close\r\n\r\n".to_vec(),
+    ];
+    for response in cases {
+        let server = TestServer::start(1, move |_| response.clone());
+        let error = runtime()
+            .block_on(controller().fetch(request(server.url())))
+            .unwrap_err();
+        server.join();
+        assert!(matches!(error, RequestError::CorsDenied));
+    }
+
+    let server = TestServer::start(1, |_| {
+        b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: https://client.test\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nConnection: close\r\n\r\n".to_vec()
+    });
+    let mut credentialed = request(server.url());
+    credentialed.set_credentials_mode(CredentialsMode::Include);
+    let error = runtime()
+        .block_on(controller().fetch(credentialed))
+        .unwrap_err();
+    server.join();
+    assert!(matches!(error, RequestError::CorsDenied));
+}
+
+#[test]
+fn failed_actual_cors_response_clears_only_its_preflight_permissions() {
+    let sequence = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&sequence);
+    let server = TestServer::start(5, move |request| {
+        let index = observed.fetch_add(1, Ordering::SeqCst);
+        match index {
+            0 | 3 => {
+                assert!(request.starts_with("OPTIONS "));
+                b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: https://client.test\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nAccess-Control-Max-Age: 60\r\nConnection: close\r\n\r\n".to_vec()
+            }
+            2 => {
+                assert!(request.starts_with("PUT "));
+                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndenied".to_vec()
+            }
+            _ => {
+                assert!(request.starts_with("PUT "));
+                b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: https://client.test\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+            }
+        }
+    });
+    let controller = controller();
+
+    let first = runtime()
+        .block_on(controller.fetch(request(server.url())))
+        .unwrap();
+    assert_eq!(runtime().block_on(first.body.bytes()).unwrap(), b"ok");
+    let error = runtime()
+        .block_on(controller.fetch(request(server.url())))
+        .unwrap_err();
+    assert!(matches!(error, RequestError::CorsDenied));
+    let third = runtime()
+        .block_on(controller.fetch(request(server.url())))
+        .unwrap();
+    assert_eq!(runtime().block_on(third.body.bytes()).unwrap(), b"ok");
+    server.join();
+    assert_eq!(sequence.load(Ordering::SeqCst), 5);
+}
+
+#[test]
+fn configured_max_age_cap_forces_expired_permissions_to_preflight_again() {
+    let preflights = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&preflights);
+    let server = TestServer::start(4, move |request| {
+        if request.starts_with("OPTIONS ") {
+            observed.fetch_add(1, Ordering::SeqCst);
+            b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: https://client.test\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nAccess-Control-Max-Age: 600\r\nConnection: close\r\n\r\n".to_vec()
+        } else {
+            b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: https://client.test\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+        }
+    });
+    let controller = RequestController::builder(Config {
+        max_preflight_cache_age: Duration::ZERO,
+        ..Config::default()
+    })
+    .with_fetch_services(Arc::new(TestServices))
+    .build()
+    .unwrap();
+
+    for _ in 0..2 {
+        let response = runtime()
+            .block_on(controller.fetch(request(server.url())))
+            .unwrap();
+        assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
+    }
+    server.join();
+    assert_eq!(preflights.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn post_redirect_rewrite_removes_the_target_preflight_requirement() {
+    let target = TestServer::start(1, |request| {
+        assert!(request.starts_with("GET "));
+        assert!(!request.starts_with("OPTIONS "));
+        assert!(!request.to_ascii_lowercase().contains("content-type:"));
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("origin: null"))
+        );
+        b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: null\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+    });
+    let target_url = target.url();
+    let source = TestServer::start(2, move |request| {
+        if request.starts_with("OPTIONS ") {
+            b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: https://client.test\r\nAccess-Control-Allow-Methods: POST\r\nAccess-Control-Allow-Headers: content-type\r\nConnection: close\r\n\r\n".to_vec()
+        } else {
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nAccess-Control-Allow-Origin: https://client.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        }
+    });
+    let mut request = Request::new(source.url(), "POST").unwrap();
+    request.set_environment(
+        FetchEnvironment::from_url(reqwest::Url::parse("https://client.test/page").unwrap())
+            .unwrap(),
+    );
+    request
+        .set_body(Some(Body::from_bytes_with_content_type(
+            br#"{"value":1}"#.to_vec(),
+            Some(HeaderValue::from_static("application/json")),
+        )))
+        .unwrap();
+
+    let response = runtime().block_on(controller().fetch(request)).unwrap();
+    assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
+    source.join();
+    target.join();
 }

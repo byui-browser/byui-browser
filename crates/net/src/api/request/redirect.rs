@@ -1,4 +1,4 @@
-use http::header::{CONTENT_TYPE, HeaderName};
+use http::header::HeaderName;
 use url::Url;
 
 use crate::api::error::RequestError;
@@ -31,9 +31,16 @@ impl Request {
     pub(crate) fn rewrite_for_redirect(&mut self) -> Result<(), RequestError> {
         self.set_method("GET")?;
         self.body = None;
-        self.headers.remove_internal_header(CONTENT_TYPE);
-        self.headers
-            .remove_internal_header(HeaderName::from_static("content-length"));
+        for name in [
+            "content-encoding",
+            "content-language",
+            "content-location",
+            "content-type",
+            "content-length",
+        ] {
+            self.headers
+                .remove_internal_header(HeaderName::from_static(name));
+        }
         Ok(())
     }
 

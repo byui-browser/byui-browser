@@ -127,6 +127,61 @@ fn referrer_policies_reduce_same_origin_cross_origin_and_downgrade_targets() {
 }
 
 #[test]
+fn origin_header_generation_respects_target_mode_method_and_referrer_policy() {
+    let same = Url::parse("https://client.test/resource").unwrap();
+    let cross = Url::parse("https://remote.test/resource").unwrap();
+    let downgrade = Url::parse("http://remote.test/resource").unwrap();
+    let mut request = Request::get(same.as_str());
+    request.context.environment.origin = Some(Origin::parse("https://client.test").unwrap());
+
+    assert!(!request.fetch_headers(&same).unwrap().has("origin"));
+    assert_eq!(
+        request
+            .fetch_headers(&cross)
+            .unwrap()
+            .get("origin")
+            .unwrap(),
+        "https://client.test"
+    );
+
+    request.set_mode(RequestMode::NoCors).unwrap();
+    request.set_method("POST").unwrap();
+    request.set_referrer(Referrer::Client, ReferrerPolicy::NoReferrer);
+    assert_eq!(
+        request
+            .fetch_headers(&cross)
+            .unwrap()
+            .get("origin")
+            .unwrap(),
+        "null"
+    );
+
+    request.set_referrer(Referrer::Client, ReferrerPolicy::SameOrigin);
+    assert_eq!(
+        request.fetch_headers(&same).unwrap().get("origin").unwrap(),
+        "https://client.test"
+    );
+    assert_eq!(
+        request
+            .fetch_headers(&cross)
+            .unwrap()
+            .get("origin")
+            .unwrap(),
+        "null"
+    );
+
+    request.set_referrer(Referrer::Client, ReferrerPolicy::StrictOrigin);
+    assert_eq!(
+        request
+            .fetch_headers(&downgrade)
+            .unwrap()
+            .get("origin")
+            .unwrap(),
+        "null"
+    );
+}
+
+#[test]
 fn request_mutators_enforce_method_body_and_no_cors_boundaries() {
     for method in ["CONNECT", "TRACE", "TRACK"] {
         assert!(matches!(

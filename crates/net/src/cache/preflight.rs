@@ -99,6 +99,15 @@ impl PreflightCache {
         }
     }
 
+    /// Removes permissions for one partition, serialized origin, and URL.
+    pub(crate) fn clear_for_request(&self, request: &Request, url: &Url) {
+        let key = PreflightKey::new(request, url);
+        self.entries
+            .write()
+            .expect("preflight cache lock poisoned")
+            .retain(|entry| entry.key != key);
+    }
+
     /// Removes every cached preflight permission.
     pub(crate) fn clear(&self) {
         self.entries
@@ -240,5 +249,24 @@ mod tests {
         other_origin.context.environment.origin =
             Some(Origin::parse("https://other-client.test").unwrap());
         assert!(!cache.allows(&other_origin, &url, &[]));
+    }
+
+    #[test]
+    fn clearing_one_request_identity_preserves_other_permissions() {
+        let cache = PreflightCache::default();
+        let first_url = Url::parse("https://remote.test/first").unwrap();
+        let second_url = Url::parse("https://remote.test/second").unwrap();
+        let request = request("PUT");
+        let permissions = PreflightPermissions {
+            methods: vec!["PUT".into()],
+            header_names: Vec::new(),
+        };
+        cache.insert(&request, &first_url, &permissions, Duration::from_secs(60));
+        cache.insert(&request, &second_url, &permissions, Duration::from_secs(60));
+
+        cache.clear_for_request(&request, &first_url);
+
+        assert!(!cache.allows(&request, &first_url, &[]));
+        assert!(cache.allows(&request, &second_url, &[]));
     }
 }

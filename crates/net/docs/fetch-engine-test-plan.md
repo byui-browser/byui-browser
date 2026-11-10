@@ -125,25 +125,24 @@ coverage. A redirect chain that leaves and returns to its request origin proves
 that `null` origin serialization, credential suppression, CORS filtering, and
 preflight remain active at the returning hop.
 
-The remaining CORS conformance coverage is deliberately narrower and should
-be added as the corresponding behavior is finalized:
+Preflight failure coverage now includes non-success and redirect statuses,
+duplicated allow-origin fields, case-sensitive method tokens, and missing
+credential approval. An approved preflight followed by a denied actual
+response proves that no response is exposed and that only its matching cache
+identity is evicted. Max-age parsing/default/capping and zero-lifetime expiry
+have unit coverage, while a configured zero cap is also exercised end to end.
+A 302 POST-to-GET rewrite proves that removed body metadata does not cause an
+unnecessary target preflight.
 
-- Preflight failures caused by a non-success status, a redirect response, a
-  malformed or duplicated allow field, and a missing
-  `Access-Control-Allow-Credentials` value for `credentials: include`.
-- End-to-end cache expiry and max-age behavior: omitted, malformed, zero, and
-  capped `Access-Control-Max-Age` values; permission-key isolation across
-  origins, URL paths, network partitions, and credential modes.
-- Exact allow-list token behavior at the HTTP boundary, including method-token
-  casing, duplicate request-header names, and a method or header that is
-  permitted by a cached entry but not by a differently keyed entry.
-- An approved preflight followed by an ordinary response that fails its CORS
-  check, proving that no response is exposed after the actual request.
-- Redirect edge cases: a later-hop preflight denial stops the chain, and a
-  301/302/303 rewrite to a safelisted method does not retain an unnecessary
-  preflight requirement.
-- Network-error response construction, including assertions that public
-  responses never expose forbidden headers on every error path.
+Remaining CORS tests are defense-in-depth rather than missing algorithms:
+
+- End-to-end permission-key isolation across origins, URL paths, network
+  partitions, and credential modes (the cache has direct unit coverage).
+- A later redirect-hop preflight denial proving that the target's actual
+  request and every subsequent hop remain unsent.
+- Network/body-stream error paths asserting that public responses never expose
+  forbidden headers and matching preflight permissions are invalidated where
+  the architecture can still observe the failure.
 
 ### 4. Redirects and request context
 

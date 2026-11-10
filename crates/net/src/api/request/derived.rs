@@ -107,19 +107,53 @@ impl Request {
         }
     }
     /// Builds the internal transport header channel without changing caller headers.
-    pub(crate) fn fetch_headers(&self) -> Result<Headers, RequestError> {
+    pub(crate) fn fetch_headers(&self, target: &Url) -> Result<Headers, RequestError> {
         let mut headers = self.headers.clone();
         if let Some(body) = &self.body {
             body.apply_metadata(&mut headers)?;
         }
-        let needs_origin = self.context.mode == RequestMode::Cors
-            || !matches!(self.method, Method::GET | Method::HEAD);
-        if needs_origin && let Some(origin) = self.serialized_origin() {
+        if let Some(origin) = self.origin_header_value(target) {
             let value = HeaderValue::try_from(&origin)
                 .map_err(|_| RequestError::InvalidOrigin(origin.clone()))?;
             headers.insert_internal_header(HeaderName::from_static("origin"), value)?;
         }
         Ok(headers)
+    }
+
+    /// Computes the user-agent-owned `Origin` value for one HTTP target.
+    fn origin_header_value(&self, target: &Url) -> Option<String> {
+        let mut serialized = self.serialized_origin()?;
+        let cors_tainted =
+            self.context.mode == RequestMode::Cors && !self.has_same_origin_target(target);
+        if cors_tainted {
+            return Some(serialized);
+        }
+        if matches!(self.method, Method::GET | Method::HEAD) {
+            return None;
+        }
+        if self.context.mode != RequestMode::Cors {
+            let policy = match self.referrer_policy {
+                ReferrerPolicy::Empty => ReferrerPolicy::StrictOriginWhenCrossOrigin,
+                policy => policy,
+            };
+            let downgrade = self
+                .effective_origin()
+                .is_some_and(|origin| origin.scheme() == Some("https"))
+                && target.scheme() != "https";
+            let cross_origin = !self.has_same_origin_target(target);
+            if policy == ReferrerPolicy::NoReferrer
+                || (matches!(
+                    policy,
+                    ReferrerPolicy::NoReferrerWhenDowngrade
+                        | ReferrerPolicy::StrictOrigin
+                        | ReferrerPolicy::StrictOriginWhenCrossOrigin
+                ) && downgrade)
+                || (policy == ReferrerPolicy::SameOrigin && cross_origin)
+            {
+                serialized = "null".to_owned();
+            }
+        }
+        Some(serialized)
     }
     /// Computes the `Referer` value for a request target.
     pub(crate) fn referrer_value(&self, target: &Url) -> Option<String> {
@@ -153,6 +187,15 @@ impl Request {
             ReferrerPolicy::StrictOriginWhenCrossOrigin => Some(source_origin),
             ReferrerPolicy::Empty => Some(source_origin),
         }
+    }
+
+    /// Applies the active policy so later redirects cannot regain referrer detail.
+    pub(crate) fn reduce_referrer_for_target(&mut self, target: &Url) {
+        self.referrer = self
+            .referrer_value(target)
+            .and_then(|value| Url::parse(&value).ok())
+            .map(Referrer::Url)
+            .unwrap_or(Referrer::NoReferrer);
     }
     /// Validates method, no-CORS, and keepalive constraints for the body.
     pub(crate) fn validate_body_state(

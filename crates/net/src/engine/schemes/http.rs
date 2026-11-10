@@ -30,6 +30,7 @@ impl RequestController {
             if request.redirect_count > 0 {
                 self.authorize_redirect_hop(&request)?;
             }
+            request.reduce_referrer_for_target(&url);
             self.ensure_cors_preflight(&request, &url).await?;
 
             let cacheable = request.is_cacheable_method();
@@ -68,7 +69,10 @@ impl RequestController {
                         cached.cookie_headers_processed,
                     );
                     Self::set_response_redirect_state(&request, &mut internal);
-                    self.finalize_response(&request, &mut internal)?;
+                    self.finalize_response(&request, &mut internal)
+                        .inspect_err(|_| {
+                            self.clear_preflight_cache_after_failure(&request, &url);
+                        })?;
                     return Ok(internal.expose());
                 }
                 if cache_lookup.is_some() {
@@ -87,7 +91,7 @@ impl RequestController {
                 }
             }
 
-            let mut transport_headers = request.fetch_headers()?;
+            let mut transport_headers = request.fetch_headers(&url)?;
             if request.credentials_allowed(&url)
                 && let Some(services) = &self.inner.services
                 && let Some(cookie) = services.cookie_header(&request)?
@@ -118,7 +122,10 @@ impl RequestController {
                     },
                     request.transport_priority(),
                 )
-                .await?;
+                .await
+                .inspect_err(|_| {
+                    self.clear_preflight_cache_after_failure(&request, &url);
+                })?;
             Self::set_response_redirect_state(&request, &mut candidate);
             let status = candidate.status.as_u16();
             log::debug!(
@@ -183,7 +190,10 @@ impl RequestController {
                     );
                 })?;
 
-            self.finalize_response(&request, &mut candidate)?;
+            self.finalize_response(&request, &mut candidate)
+                .inspect_err(|_| {
+                    self.clear_preflight_cache_after_failure(&request, &url);
+                })?;
             self.process_response_cookies(&request, &url, &mut candidate)?;
             if request.redirect_count >= 20 {
                 log::warn!(
@@ -228,7 +238,10 @@ impl RequestController {
             url = next_url;
         }
 
-        self.finalize_response(&request, &mut response)?;
+        self.finalize_response(&request, &mut response)
+            .inspect_err(|_| {
+                self.clear_preflight_cache_after_failure(&request, &url);
+            })?;
         self.process_response_cookies(&request, &url, &mut response)?;
 
         if request.is_cacheable_method() && request.cache_mode != CacheMode::NoStore {

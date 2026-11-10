@@ -70,14 +70,17 @@ with the browser-lifecycle work in step 3.
   Redirect taint is derived from the complete URL list as same-origin,
   same-site, or cross-site; it controls origin serialization, credentials,
   preflight, and response filtering when a chain returns to its initial origin.
-  Complete broader user-agent-owned header generation. Simple CORS and origin
-  transitions run at each redirect hop.
-- Finish network-error response construction and response-derived helpers such
-  as `ok` and explicit body-presence checks.
-- Complete user-agent-owned header generation and redirect-time header rules.
-- Complete remaining referrer and credentials behavior across redirects and
-  local schemes using the implemented structured-origin and schemeful-site
-  checks.
+  Failed preflighted fetches clear only matching permission entries. The
+  target-aware `Origin` algorithm applies redirect taint and referrer-policy
+  reduction for CORS and non-CORS unsafe methods.
+- Network-error response construction and response-derived helpers such as
+  `ok` and explicit body-presence checks are implemented.
+- Redirect rewrites remove the complete request-body header set, and referrer
+  reduction is monotonic so a later policy cannot restore previously removed
+  URL detail.
+- Destination-specific browser identity/language and Fetch Metadata headers,
+  plus provider-owned cookie and authentication behavior, remain browser
+  integrations in step 3 rather than CORS algorithm gaps in `net`.
 
 ### 3. Implement browser credentials and policy integrations
 

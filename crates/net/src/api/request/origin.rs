@@ -111,6 +111,11 @@ impl Origin {
         self.scheme.is_none()
     }
 
+    /// Returns the tuple-origin scheme, or `None` for an opaque origin.
+    pub(crate) fn scheme(&self) -> Option<&str> {
+        self.scheme.as_deref()
+    }
+
     /// Tests tuple-origin equality; opaque origins never match, including themselves.
     pub fn is_same_origin(&self, other: &Self) -> bool {
         !self.is_opaque() && !other.is_opaque() && self == other

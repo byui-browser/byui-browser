@@ -73,7 +73,10 @@ impl RequestController {
                 },
                 request.transport_priority(),
             )
-            .await?;
+            .await
+            .inspect_err(|_| {
+                self.inner.preflight_cache.clear_for_request(request, url);
+            })?;
 
         if !response.status.is_success()
             || !self
@@ -86,16 +89,36 @@ impl RequestController {
                 crate::log_url::loggable(url.as_str()),
                 response.status
             );
+            self.inner.preflight_cache.clear_for_request(request, url);
             return Err(RequestError::CorsDenied);
         }
 
-        let permissions = parse_permissions(&response.headers)?;
-        validate_permissions(request, &unsafe_names, &permissions)?;
+        let permissions = parse_permissions(&response.headers).inspect_err(|_| {
+            self.inner.preflight_cache.clear_for_request(request, url);
+        })?;
+        validate_permissions(request, &unsafe_names, &permissions).inspect_err(|_| {
+            self.inner.preflight_cache.clear_for_request(request, url);
+        })?;
         let ttl = preflight_ttl(&response.headers, self.inner.max_preflight_cache_age);
         self.inner
             .preflight_cache
             .insert(request, url, &permissions, ttl);
         Ok(())
+    }
+
+    /// Clears this request's preflight permissions after a failed preflighted fetch.
+    pub(crate) fn clear_preflight_cache_after_failure(
+        &self,
+        request: &Request,
+        url: &reqwest::Url,
+    ) {
+        if request.context.mode == RequestMode::Cors
+            && request.effective_origin().is_some()
+            && !request.has_same_origin_target(url)
+            && request.requires_cors_preflight().unwrap_or(false)
+        {
+            self.inner.preflight_cache.clear_for_request(request, url);
+        }
     }
 }
 

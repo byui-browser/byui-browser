@@ -9,8 +9,9 @@ use std::sync::{
 
 use common::{TestServer, collect_body, runtime};
 use net::{
-    Body, Config, CredentialsMode, FetchEnvironment, FetchServices, RedirectMode, Request,
-    RequestController, RequestError, ResponseInfo, ResponseType, ServiceWorkerDecision,
+    Body, Config, CredentialsMode, FetchEnvironment, FetchServices, HeaderName, HeaderValue,
+    RedirectMode, Request, RequestController, RequestError, ResponseInfo, ResponseType,
+    ServiceWorkerDecision,
 };
 
 #[derive(Default)]
@@ -194,6 +195,18 @@ fn post_redirect_rewrites_to_get_and_removes_body_headers() {
         .unwrap();
     let mut request = Request::new(format!("{}/start", server.url()), "POST").unwrap();
     request.set_body(Some(Body::from_text("payload"))).unwrap();
+    for (name, value) in [
+        ("content-encoding", "gzip"),
+        ("content-language", "en"),
+        ("content-location", "/payload"),
+    ] {
+        request
+            .set_header(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            )
+            .unwrap();
+    }
 
     let response = runtime().block_on(controller.fetch(request)).unwrap();
     assert_eq!(runtime().block_on(collect_body(response)).unwrap(), b"ok");
@@ -207,6 +220,9 @@ fn post_redirect_rewrites_to_get_and_removes_body_headers() {
     assert!(requests[1].starts_with("GET /next HTTP"));
     assert!(!request_has_header(&requests[1], "content-type"));
     assert!(!request_has_header(&requests[1], "content-length"));
+    assert!(!request_has_header(&requests[1], "content-encoding"));
+    assert!(!request_has_header(&requests[1], "content-language"));
+    assert!(!request_has_header(&requests[1], "content-location"));
     assert!(request_body(&requests[1]).is_empty());
 }
 
@@ -660,6 +676,45 @@ fn redirect_response_referrer_policy_applies_to_the_next_hop() {
     let requests = requests.lock().unwrap();
     assert!(request_has_header(&requests[0], "referer"));
     assert!(!request_has_header(&requests[1], "referer"));
+}
+
+#[test]
+fn redirect_policy_cannot_restore_referrer_detail_removed_on_an_earlier_hop() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&requests);
+    let server = TestServer::start(2, move |request| {
+        observed.lock().unwrap().push(request.to_owned());
+        if request.starts_with("GET /start HTTP") {
+            b"HTTP/1.1 302 Found\r\nLocation: /next\r\nReferrer-Policy: unsafe-url\r\nAccess-Control-Allow-Origin: http://client.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        } else {
+            b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: http://client.test\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+        }
+    });
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(Arc::new(RedirectServices::default()))
+        .build()
+        .unwrap();
+    let mut request = Request::get(format!("{}/start", server.url()));
+    request.set_environment(
+        FetchEnvironment::from_url(
+            reqwest::Url::parse("http://client.test/private/path?secret=yes").unwrap(),
+        )
+        .unwrap(),
+    );
+
+    let response = runtime().block_on(controller.fetch(request)).unwrap();
+    assert_eq!(runtime().block_on(collect_body(response)).unwrap(), b"ok");
+    server.join();
+
+    let requests = requests.lock().unwrap();
+    for request in requests.iter() {
+        assert!(request.lines().any(|line| {
+            line.eq_ignore_ascii_case("referer: http://client.test/")
+                || line.eq_ignore_ascii_case("referer: http://client.test")
+        }));
+        assert!(!request.contains("private/path"));
+        assert!(!request.contains("secret=yes"));
+    }
 }
 
 #[test]

@@ -133,9 +133,11 @@ capability. Preflight is re-evaluated at each redirect hop, including a
 redirect-tainted `null` origin. Redirect taint is derived from the complete URL
 list as same-origin, same-site, or cross-site using schemeful registrable-domain
 comparison. A tainted chain cannot regain same-origin credentials or skip CORS
-preflight/response filtering by returning to its initial origin. `SameOrigin`
-fails closed before following a cross-origin redirect, and `NoCors` produces an
-opaque view.
+preflight/response filtering by returning to its initial origin. Failed
+preflighted fetches invalidate only matching cache entries. Target-aware
+`Origin` generation applies request mode, method, redirect taint, downgrade,
+and referrer policy. `SameOrigin` fails closed before following a cross-origin
+redirect, and `NoCors` produces an opaque view.
 
 Basic, CORS, and opaque views now filter headers and metadata. CORS exposure
 parsing covers safelisted names, explicit lists, wildcard credentials rules,
@@ -148,10 +150,11 @@ cookie/cache exclusion, and response filtering. The current local-scheme
 handlers all have focused response and lifecycle coverage; browser-owned file
 access remains deliberately restricted to authorized top-level navigation.
 
-**Required work:** implement broader user-agent-owned header rules and add
-further conformance tests for local-origin and unusual redirecting cross-origin
-requests. Shared response finalization and fail-closed provider-origin
-validation are implemented.
+**Required work:** add defense-in-depth conformance tests for local-origin,
+stream-failure, and unusual redirecting cross-origin requests. Shared response
+finalization, fail-closed provider-origin validation, and the net-owned CORS
+algorithms are implemented. Browser identity/language, Fetch Metadata, cookies,
+and authentication remain browser integrations rather than CORS gaps.
 
 ### 6. Redirect handling
 
