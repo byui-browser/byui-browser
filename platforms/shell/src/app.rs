@@ -1023,6 +1023,7 @@ impl App {
         log::trace!("page scrolled to {target:.1} of {max_scroll:.1}");
         self.dismiss_context_menu();
         self.scroll_y = target;
+        self.page_events.set_scroll_y(self.scroll_y);
         // Only the page pixmap changes; the layout is reused.
         self.page = None;
         self.redraw();
@@ -1040,6 +1041,7 @@ impl App {
         self.page = None;
         self.page_layout = None;
         self.scroll_y = 0.0;
+        self.page_events.set_scroll_y(self.scroll_y);
         let device_pixel_ratio = self
             .window
             .as_ref()
@@ -1310,12 +1312,14 @@ impl App {
                     if self.find_reveal || layout_changed {
                         if let Some(target) = find.scroll_target(layout.max_scroll()) {
                             self.scroll_y = target;
+                            self.page_events.set_scroll_y(self.scroll_y);
                         }
                         self.find_reveal = false;
                     }
                 }
                 // A resize or reload can leave less to scroll than before.
                 self.scroll_y = self.scroll_y.clamp(0.0, layout.max_scroll());
+                self.page_events.set_scroll_y(self.scroll_y);
                 crate::content::render_page_with_find(
                     layout,
                     card.width,

@@ -168,6 +168,10 @@ fn register_window_object(
     // CSSOM View exposes scrollX as a readonly number. The renderer does not
     // yet have document horizontal scrolling, so the initial offset is zero.
     window.set_read_only("scrollX", Value::Number(0.0));
+    // CSSOM View exposes scrollY and pageYOffset as readonly numbers. The
+    // browser shell updates these host properties as the viewport scrolls.
+    window.set_read_only("scrollY", Value::Number(0.0));
+    window.set_read_only("pageYOffset", Value::Number(0.0));
     // The desktop shell supplies the output device scale; non-windowed
     // callers use the specification's fallback value of 1.0.
     window.set_replaceable_read_only("devicePixelRatio", Value::Number(device_pixel_ratio));

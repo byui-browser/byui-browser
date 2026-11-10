@@ -307,6 +307,26 @@ impl Object {
             .insert(key);
     }
 
+    /// Updates a non-replaceable read-only host property without making it
+    /// writable to scripts. Returns `false` when `key` is not a read-only
+    /// property or when it has been replaced by script-visible state.
+    pub fn update_read_only(&self, key: &str, value: Value) -> bool {
+        if self
+            .0
+            .read_only_properties
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(key)
+        {
+            let mut properties = self.properties();
+            if let Some((_, current)) = properties.iter_mut().find(|(name, _)| name == key) {
+                *current = value;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Defines a read-only host attribute that scripts may replace by
     /// assigning an own property with the same name.
     ///
