@@ -1,6 +1,6 @@
 # Net crate test plan
 
-Status as of 2026-11-03: the current body, request, header, response, cache, redirect,
+Status as of 2026-11-10: the current body, request, header, response, cache, redirect,
 streaming, scheduler, and scheme-handler regression suites pass. The first
 body API/lifecycle test slice is now covered, including constructor metadata,
 URL-encoded and ArrayBuffer consumption, equality/debug state, one-shot
@@ -160,11 +160,13 @@ observable through diagnostics.
 
 ### 5. Credentials, cookies, and cache
 
-When browser providers exist, test partitioned cookie matching, persistence,
+The cache unit suite now covers `Vary` header normalization, matching request
+header values, multiple variants, `Vary: *` rejection, and replacement when
+the response's `Vary` field set changes. When browser providers exist, test
+partitioned cookie matching, persistence,
 expiry, SameSite/secure behavior, credentials modes, `Set-Cookie` handling,
-and CORS credential checks. Expand cache tests for `Vary`, freshness,
-validators, 304 merging, unsafe-method invalidation, partitioning, and all
-Fetch cache modes.
+and CORS credential checks. Expand cache tests for freshness, validators, 304
+merging, unsafe-method invalidation, partitioning, and all Fetch cache modes.
 
 ### 6. Policy, transport, and scheduling
 

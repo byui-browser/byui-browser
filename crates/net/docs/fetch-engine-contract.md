@@ -134,7 +134,11 @@ work.
 - `Default`, `NoStore`, `Reload`, `ForceCache`, and `OnlyIfCached` retain their
   documented process-local cache subset; `NoCache` fails until revalidation
   exists. Browser service providers choose the partition key. This cache is
-  neither durable nor a full Fetch HTTP cache.
+  neither durable nor a full Fetch HTTP cache. Successful responses with a
+  positive `Cache-Control: max-age` are stored by method, normalized URL,
+  and partition; response `Vary` fields select among request-header variants,
+  and `Vary: *` responses are not stored. Cache hits still pass through the
+  normal response finalization and filtering path.
 - Cache-only misses surface as Fetch network errors. Body stream transport
   errors and aborts retain separate typed errors.
 
