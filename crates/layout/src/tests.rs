@@ -471,3 +471,38 @@ fn scroll_height_covers_tall_content_and_never_undercuts_the_viewport() {
     // The body's bottom margin is part of the scrollable area.
     assert_eq!(tall.scroll_height(), 2016.0);
 }
+
+#[test]
+fn text_transform_changes_case_before_measurement() {
+    let (document, tree) = lay_out(
+        "<body><p id='u'>Hello world</p><p id='l'>Hello World</p><p id='c'>hello big-world</p></body>",
+        "body { margin: 0 } #u { text-transform: uppercase } \
+         #l { text-transform: lowercase } #c { text-transform: capitalize }",
+        800.0,
+    );
+    assert_eq!(texts(box_for(&tree, &document, "u")), ["HELLO WORLD"]);
+    assert_eq!(texts(box_for(&tree, &document, "l")), ["hello world"]);
+    assert_eq!(texts(box_for(&tree, &document, "c")), ["Hello Big-world"]);
+}
+
+#[test]
+fn text_transform_is_inherited_and_none_resets_it() {
+    let (document, tree) = lay_out(
+        "<body><div style='text-transform: uppercase'><p id='a'>shout</p>\
+         <p id='b' style='text-transform: none'>calm</p></div></body>",
+        "body { margin: 0 }",
+        800.0,
+    );
+    assert_eq!(texts(box_for(&tree, &document, "a")), ["SHOUT"]);
+    assert_eq!(texts(box_for(&tree, &document, "b")), ["calm"]);
+}
+
+#[test]
+fn unsupported_text_transform_values_leave_text_unchanged() {
+    let (document, tree) = lay_out(
+        "<body><p id='p' style='text-transform: full-width'>abc</p></body>",
+        "body { margin: 0 }",
+        800.0,
+    );
+    assert_eq!(texts(box_for(&tree, &document, "p")), ["abc"]);
+}

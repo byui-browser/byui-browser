@@ -153,6 +153,22 @@ fn array_literals_compile_and_preserve_order_and_identity() {
 }
 
 #[test]
+fn arrows_compile_expression_and_block_bodies_and_cannot_be_constructed() {
+    assert_eq!(
+        execute("const add = (a, b) => a + b; add(2, 3)"),
+        Value::Number(5.0)
+    );
+    assert_eq!(
+        execute("const choose = value => { if (value) return 'yes'; return 'no'; }; choose(true)"),
+        Value::String("yes".into())
+    );
+
+    let program = parse("const f = () => 1; new f()").unwrap();
+    let chunk = compile(&program).expect("arrow should compile");
+    assert!(Vm::new().execute(&chunk).is_err());
+}
+
+#[test]
 fn binding_errors_are_reported() {
     let program = parse("{ value; let value = 1; }").expect("source should parse");
     let chunk = compile(&program).expect("source should compile");

@@ -177,6 +177,7 @@ fn window_location_shares_the_window_with_viewport_and_device_scale() {
         stylesheets: Vec::new(),
         scripts: vec![
             "if (window.devicePixelRatio === 2 && window.innerWidth === 800 \
+             && window.innerHeight === 600 \
              && window.location.href === 'https://example.com/start') location.assign('/next')"
                 .into(),
         ],

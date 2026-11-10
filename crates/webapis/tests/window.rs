@@ -1,5 +1,6 @@
 use js::{Realm, Value};
 use security::{Origin, RendererSecurityContext, StoragePermission};
+use std::{thread, time::Duration};
 use webapis::{
     register_window, register_window_with_security_context, register_window_with_url,
     register_window_with_url_and_device_pixel_ratio,
@@ -107,6 +108,32 @@ fn window_scroll_x_is_read_only() {
 
     assert_eq!(
         realm.evaluate_script("window.scrollX = 12; window.scrollX === 0"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_scroll_y_exposes_the_initial_vertical_offset() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "window.scrollY === 0 && window.pageYOffset === 0 && window.scrollY === window.scrollY",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_scroll_y_is_read_only() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "window.scrollY = 12; window.pageYOffset = 12; window.scrollY === 0 && window.pageYOffset === 0",
+        ),
         Ok(Value::Boolean(true))
     );
 }
@@ -265,6 +292,17 @@ fn inner_width_is_zero_without_a_viewport() {
 }
 
 #[test]
+fn inner_height_is_zero_without_a_viewport() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.innerHeight"),
+        Ok(Value::Number(0.0))
+    );
+}
+
+#[test]
 fn inner_width_reports_the_viewport_width_in_css_pixels() {
     let mut realm = Realm::new();
     webapis::register_window_with_security_context_and_viewport(
@@ -289,6 +327,14 @@ fn inner_width_reports_the_viewport_width_in_css_pixels() {
         Ok(Value::Number(800.0))
     );
     assert_eq!(
+        realm.evaluate_script("window.innerHeight"),
+        Ok(Value::Number(600.0))
+    );
+    assert_eq!(
+        realm.evaluate_script("innerHeight"),
+        Ok(Value::Number(600.0))
+    );
+    assert_eq!(
         realm.evaluate_script("window.origin"),
         Ok(Value::String("https://example.com".into()))
     );
@@ -303,4 +349,198 @@ fn inner_width_is_replaceable_like_the_cssom_view_attribute() {
         realm.evaluate_script("window.innerWidth = 42; window.innerWidth"),
         Ok(Value::Number(42.0))
     );
+}
+
+#[test]
+fn inner_height_is_replaceable_like_the_cssom_view_attribute() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.innerHeight = 42; window.innerHeight"),
+        Ok(Value::Number(42.0))
+    );
+}
+
+#[test]
+fn set_interval_returns_positive_id_passes_arguments_and_repeats() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var calls = 0; var total = 0; \
+             function tick(value) { calls = calls + 1; total = total + value; } \
+             var id = window.setInterval(tick, 1, 3); \
+             id > 0 && setInterval === window.setInterval",
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(3));
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    assert!(webapis::run_window_timers(&window).unwrap() >= 1);
+    assert_eq!(
+        realm.evaluate_script("calls >= 1 && total === calls * 3"),
+        Ok(Value::Boolean(true))
+    );
+    realm.evaluate_script("clearInterval(id)").unwrap();
+    thread::sleep(Duration::from_millis(3));
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 0);
+}
+
+#[test]
+fn set_timeout_fires_once_with_arguments_and_window_receiver() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var calls = 0; var passed = false; \
+             function tick(value) { calls = calls + 1; passed = this === window && value === 7; } \
+             var id = setTimeout(tick, 1, 7); id > 0",
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(3));
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 1);
+    assert_eq!(
+        realm.evaluate_script("calls === 1 && passed"),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 0);
+}
+
+#[test]
+fn clear_timeout_cancels_callback_and_string_handler_runs() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var calls = 0; function cancelled_callback() { calls = 99; } \
+             var cancelled = setTimeout(cancelled_callback, 1); \
+             clearTimeout(cancelled); setTimeout('calls = calls + 1', 1)",
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(3));
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 1);
+    assert_eq!(realm.evaluate_script("calls"), Ok(Value::Number(1.0)));
+}
+
+#[test]
+fn clear_interval_can_be_called_inside_its_callback() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var calls = 0; var id; function tick() { calls = calls + 1; clearInterval(id); } id = setInterval(tick, 1);",
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(3));
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 1);
+    assert_eq!(realm.evaluate_script("calls"), Ok(Value::Number(1.0)));
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 0);
+}
+
+#[test]
+fn clear_interval_uses_shared_timer_handles_and_returns_undefined() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var calls = 0; function tick() { calls = calls + 1; } \
+             var id = setInterval(tick, 1); \
+             clearInterval('1') === undefined && clearTimeout === clearInterval",
+        )
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(3));
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 0);
+    assert_eq!(realm.evaluate_script("calls"), Ok(Value::Number(0.0)));
+
+    assert_eq!(
+        realm.evaluate_script("clearInterval(undefined)"),
+        Ok(Value::Undefined)
+    );
+}
+
+#[test]
+fn request_animation_frame_invokes_callback_once_with_timestamp() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var calls = 0; var timestamp = -1; \
+             function tick(now) { calls = calls + 1; timestamp = now; } \
+             var id = requestAnimationFrame(tick); \
+             id > 0 && requestAnimationFrame === window.requestAnimationFrame",
+        )
+        .unwrap();
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+
+    assert_eq!(webapis::run_window_animation_frames(&window).unwrap(), 1);
+    assert_eq!(webapis::run_window_animation_frames(&window).unwrap(), 0);
+    assert_eq!(realm.evaluate_script("calls"), Ok(Value::Number(1.0)));
+    let timestamp = realm.evaluate_script("timestamp").unwrap();
+    assert!(matches!(timestamp, Value::Number(value) if value.is_finite() && value >= 0.0));
+}
+
+#[test]
+fn request_animation_frame_callbacks_are_ordered_and_defer_new_callbacks() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var order = ''; \
+             function first(now) { order = order + 'a'; requestAnimationFrame(third); } \
+             function second(now) { order = order + 'b'; } \
+             function third() { order = order + 'c'; } \
+             requestAnimationFrame(first); requestAnimationFrame(second);",
+        )
+        .unwrap();
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+
+    assert_eq!(webapis::run_window_animation_frames(&window).unwrap(), 2);
+    assert_eq!(
+        realm.evaluate_script("order"),
+        Ok(Value::String("ab".into()))
+    );
+    assert_eq!(webapis::run_window_animation_frames(&window).unwrap(), 1);
+    assert_eq!(
+        realm.evaluate_script("order"),
+        Ok(Value::String("abc".into()))
+    );
+}
+
+#[test]
+fn cancel_animation_frame_prevents_callback() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var calls = 0; \
+             function tick() { calls = calls + 1; } \
+             var id = requestAnimationFrame(tick); \
+             cancelAnimationFrame(id);",
+        )
+        .unwrap();
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+
+    assert_eq!(webapis::run_window_animation_frames(&window).unwrap(), 0);
+    assert_eq!(realm.evaluate_script("calls"), Ok(Value::Number(0.0)));
 }
