@@ -45,6 +45,8 @@ pub enum Token {
     Else,
     /// `while` keyword.
     While,
+    /// `for` keyword.
+    For,
     /// `function` keyword.
     Function,
     /// `return` keyword.
@@ -573,6 +575,7 @@ fn keyword(name: &str) -> Option<Token> {
         "if" => Token::If,
         "else" => Token::Else,
         "while" => Token::While,
+        "for" => Token::For,
         "function" => Token::Function,
         "return" => Token::Return,
         "throw" => Token::Throw,

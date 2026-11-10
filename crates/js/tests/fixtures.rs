@@ -88,7 +88,6 @@ fn classes_fixture_will_evaluate_when_classes_are_supported() {
 }
 
 #[test]
-#[ignore = "For statements are not implemented yet"]
 fn for_loop_fixture_will_evaluate_when_for_is_supported() {
     assert!(eval(fixture("for-loop.js")).is_ok());
 }
