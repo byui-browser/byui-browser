@@ -126,7 +126,7 @@ fn invoke_popstate(window: &Object, state: &Value) {
 ///
 /// Dimensions are CSS pixels, matching CSSOM View. A viewport is optional
 /// because a Window without an associated viewport must report zero for
-/// `innerWidth`.
+/// `innerWidth` and `innerHeight`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ViewportSize {
     /// The viewport width in CSS pixels.
@@ -168,6 +168,10 @@ fn register_window_object(
     // CSSOM View exposes scrollX as a readonly number. The renderer does not
     // yet have document horizontal scrolling, so the initial offset is zero.
     window.set_read_only("scrollX", Value::Number(0.0));
+    // CSSOM View exposes scrollY and pageYOffset as readonly numbers. The
+    // browser shell updates these host properties as the viewport scrolls.
+    window.set_read_only("scrollY", Value::Number(0.0));
+    window.set_read_only("pageYOffset", Value::Number(0.0));
     // The desktop shell supplies the output device scale; non-windowed
     // callers use the specification's fallback value of 1.0.
     window.set_replaceable_read_only("devicePixelRatio", Value::Number(device_pixel_ratio));
@@ -175,6 +179,11 @@ fn register_window_object(
     // when the Window has no associated viewport. It is replaceable.
     let inner_width = Value::Number(viewport.map_or(0, |size| size.width) as f64);
     window.set("innerWidth", inner_width.clone());
+    // CSSOM View: innerHeight is the viewport height in CSS pixels, including
+    // any rendered scrollbar, or zero when the Window has no viewport. It is
+    // replaceable.
+    let inner_height = Value::Number(viewport.map_or(0, |size| size.height) as f64);
+    window.set("innerHeight", inner_height.clone());
     window.set("onpopstate", Value::Null);
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__popstateListeners", Value::Object(Object::new()));
@@ -352,6 +361,7 @@ fn register_window_object(
     realm.register_global_value("customElements", Value::Object(custom_elements))?;
     realm.register_global_value("navigator", Value::Object(navigator))?;
     realm.register_global_value("innerWidth", inner_width)?;
+    realm.register_global_value("innerHeight", inner_height)?;
     Ok(window)
 }
 
@@ -402,8 +412,8 @@ pub fn register_window_with_url_and_device_pixel_ratio(
 
 /// Registers Window globals with a renderer security context and viewport.
 ///
-/// `viewport` is in CSS pixels; its width is exposed as `window.innerWidth`
-/// and the global `innerWidth`.
+/// `viewport` is in CSS pixels; its dimensions are exposed as
+/// `window.innerWidth`, `window.innerHeight`, and their global aliases.
 pub fn register_window_with_security_context_and_viewport(
     realm: &mut Realm,
     security_context: RendererSecurityContext,
@@ -418,7 +428,8 @@ pub fn register_window_with_security_context_and_viewport(
 ///
 /// `device_pixel_ratio` is the number of device pixels per CSS pixel and must
 /// be finite and greater than zero. `viewport` is in CSS pixels; without one,
-/// `window.innerWidth` is zero. Call this before evaluating page scripts.
+/// `window.innerWidth` and `window.innerHeight` are zero. Call this before
+/// evaluating page scripts.
 pub fn register_window_with_url_device_pixel_ratio_and_viewport(
     realm: &mut Realm,
     url: &str,

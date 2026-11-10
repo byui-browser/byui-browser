@@ -112,6 +112,32 @@ fn window_scroll_x_is_read_only() {
 }
 
 #[test]
+fn window_scroll_y_exposes_the_initial_vertical_offset() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "window.scrollY === 0 && window.pageYOffset === 0 && window.scrollY === window.scrollY",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_scroll_y_is_read_only() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "window.scrollY = 12; window.pageYOffset = 12; window.scrollY === 0 && window.pageYOffset === 0",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
 fn device_pixel_ratio_exposes_the_output_scale_and_is_replaceable() {
     let mut realm = Realm::new();
     register_window_with_url_and_device_pixel_ratio(&mut realm, "https://example.test/", 1.5)
@@ -265,6 +291,17 @@ fn inner_width_is_zero_without_a_viewport() {
 }
 
 #[test]
+fn inner_height_is_zero_without_a_viewport() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.innerHeight"),
+        Ok(Value::Number(0.0))
+    );
+}
+
+#[test]
 fn inner_width_reports_the_viewport_width_in_css_pixels() {
     let mut realm = Realm::new();
     webapis::register_window_with_security_context_and_viewport(
@@ -289,6 +326,14 @@ fn inner_width_reports_the_viewport_width_in_css_pixels() {
         Ok(Value::Number(800.0))
     );
     assert_eq!(
+        realm.evaluate_script("window.innerHeight"),
+        Ok(Value::Number(600.0))
+    );
+    assert_eq!(
+        realm.evaluate_script("innerHeight"),
+        Ok(Value::Number(600.0))
+    );
+    assert_eq!(
         realm.evaluate_script("window.origin"),
         Ok(Value::String("https://example.com".into()))
     );
@@ -301,6 +346,17 @@ fn inner_width_is_replaceable_like_the_cssom_view_attribute() {
 
     assert_eq!(
         realm.evaluate_script("window.innerWidth = 42; window.innerWidth"),
+        Ok(Value::Number(42.0))
+    );
+}
+
+#[test]
+fn inner_height_is_replaceable_like_the_cssom_view_attribute() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.innerHeight = 42; window.innerHeight"),
         Ok(Value::Number(42.0))
     );
 }
