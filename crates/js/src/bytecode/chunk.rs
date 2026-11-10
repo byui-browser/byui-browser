@@ -36,6 +36,8 @@ pub struct Chunk {
 pub enum CallableKind {
     /// A `function` declaration: callable, and constructible with `new`.
     Function,
+    /// An arrow function: callable but not constructible with `new`.
+    Arrow,
     /// A class method: callable with a receiver, never constructible.
     Method,
     /// A class constructor with no superclass. It must be run with `new`.
@@ -51,7 +53,7 @@ pub enum CallableKind {
 impl CallableKind {
     /// Whether `new` may run a function of this kind.
     pub fn is_constructor(self) -> bool {
-        !matches!(self, Self::Method)
+        !matches!(self, Self::Method | Self::Arrow)
     }
 
     /// Whether this kind is a class constructor.
