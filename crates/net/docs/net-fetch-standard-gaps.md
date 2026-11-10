@@ -32,7 +32,7 @@ implemented while other `about:` URLs remain unsupported.
 | Request headers and methods | Method validation, request/no-CORS guards, internal generated-header channels, and response filtering exist; later redirect/header rules remain                                                                                                  | Medium       |
 | Request and response bodies | Authoritative buffered/streaming `Body`, helpers, metadata, fallible cloning, bounded teeing, and null-body handling exist in the committed slice; JavaScript conversion, keepalive lifetime, and the in-progress body ownership refactor remain | Medium       |
 | Credentials and cookies     | `FetchServices` exposes cookie selection/storage hooks, but the current browser service selects no cookies and stores none; matching, persistence, and policy remain provider work                                                               | Critical     |
-| CORS and response tainting  | Simple and preflighted CORS checks, a partitioned preflight cache, and basic/opaque views exist on every HTTP redirect hop; remaining request-tainting states are partial                                                                      | High         |
+| CORS and response tainting  | Simple and preflighted CORS checks, URL-list-derived redirect taint, a partitioned preflight cache, and filtered views exist on every HTTP redirect hop; broader generated-header and network-error algorithms remain partial                       | High         |
 | Redirects                   | Controller follows validated HTTP(S) redirects with per-hop policy, credentials, origin/referrer transitions, cache lookup, and `follow`, `error`, and `manual` modes; broader browser subsystems remain partial                                  | Medium       |
 | HTTP cache                  | TTL-only in-memory cache with provider-supplied partition keys; full matching/revalidation is absent                                                                                                                                             | High         |
 | Fetch policy integrations   | Browser-context requests require `FetchServices`; CSP, mixed content, CORP, SRI, and worker interception remain provider/later-step work                                                                                                         | Critical     |
@@ -130,9 +130,12 @@ validates credentialed grants against the original request, parses method,
 header-name, and max-age permissions, and stores them in a controller-owned
 cache partitioned by browser cache key, serialized origin, URL, and credential
 capability. Preflight is re-evaluated at each redirect hop, including a
-redirect-tainted `null` origin. `SameOrigin` fails closed before following a
-cross-origin redirect, and `NoCors` produces an opaque view, but the complete
-Fetch request-tainting algorithms remain unfinished.
+redirect-tainted `null` origin. Redirect taint is derived from the complete URL
+list as same-origin, same-site, or cross-site using schemeful registrable-domain
+comparison. A tainted chain cannot regain same-origin credentials or skip CORS
+preflight/response filtering by returning to its initial origin. `SameOrigin`
+fails closed before following a cross-origin redirect, and `NoCors` produces an
+opaque view.
 
 Basic, CORS, and opaque views now filter headers and metadata. CORS exposure
 parsing covers safelisted names, explicit lists, wildcard credentials rules,
@@ -145,10 +148,10 @@ cookie/cache exclusion, and response filtering. The current local-scheme
 handlers all have focused response and lifecycle coverage; browser-owned file
 access remains deliberately restricted to authorized top-level navigation.
 
-**Required work:** implement the remaining request-tainting states and broader
-user-agent-owned header rules, and add further conformance tests for local-origin
-and unusual redirecting cross-origin requests. Shared response
-finalization and fail-closed provider-origin validation are implemented.
+**Required work:** implement broader user-agent-owned header rules and add
+further conformance tests for local-origin and unusual redirecting cross-origin
+requests. Shared response finalization and fail-closed provider-origin
+validation are implemented.
 
 ### 6. Redirect handling
 
@@ -172,9 +175,9 @@ The Fetch HTTP-network-or-cache algorithm relies on an HTTP cache, cache partiti
 
 **Evidence:** [`Referrer::Client`](../src/api/request/definition.rs) now resolves through `FetchEnvironment.referrer`, and [`referrer_value`](../src/api/request/definition.rs) applies the configured reduction policy. [`Origin`](../src/api/request/origin.rs) is structured and can parse/serialize HTTP(S) tuple origins or represent opaque origins; [`Request::fetch_headers`](../src/api/request/definition.rs) derives an internal `Origin` header when required.
 
-The referrer-policy enum and explicit/client referrer reduction logic are present, and same-origin comparison is available for structured origins. HTTP redirects preserve the request origin, track whether the URL list taints its serialization to `null`, enforce strict same-origin targets before transport, and use the structured origin for credentials and simple CORS decisions. The crate still does not distinguish same-site from cross-site redirect taint or implement the provider-owned SameSite cookie rules.
+The referrer-policy enum and explicit/client referrer reduction logic are present, and same-origin comparison is available for structured origins. HTTP redirects preserve the request origin, derive same-origin, same-site, or cross-site redirect taint from the URL list, serialize tainted origins to `null`, enforce strict same-origin targets before transport, and use the structured origin and taint for credentials and CORS decisions. The crate does not yet connect cross-site redirect taint to provider-owned SameSite cookie rules.
 
-**Required work:** add site computation and connect it to provider-owned cookie policy and future security integrations, then centralize the remaining origin/referrer derivation before request headers are finalized.
+**Required work:** connect schemeful-site computation to provider-owned cookie policy and future security integrations, then centralize the remaining origin/referrer derivation before request headers are finalized.
 
 ### 9. Security and browser integration hooks
 

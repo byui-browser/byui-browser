@@ -3,7 +3,7 @@
 mod common;
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -455,4 +455,60 @@ fn a_tainted_redirect_chain_preflights_each_target_with_null_origin() {
     source.join();
     middle.join();
     final_target.join();
+}
+
+#[test]
+fn returning_to_the_request_origin_remains_tainted_and_preflighted() {
+    let source_state = Arc::new(Mutex::new(None::<(String, String)>));
+    let middle_state = Arc::clone(&source_state);
+    let middle = TestServer::start(2, move |request| {
+        let (source_origin, final_url) = middle_state.lock().unwrap().clone().unwrap();
+        assert!(
+            request
+                .lines()
+                .any(|line| { line.eq_ignore_ascii_case(&format!("origin: {source_origin}")) })
+        );
+        if request.starts_with("OPTIONS ") {
+            format!(
+                "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: {source_origin}\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        } else {
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {final_url}\r\nAccess-Control-Allow-Origin: {source_origin}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        }
+    });
+    let middle_url = middle.url();
+    let source = TestServer::start(3, move |request| {
+        if request.starts_with("PUT /start ") {
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {middle_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        } else {
+            assert!(
+                request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("origin: null"))
+            );
+            if request.starts_with("OPTIONS ") {
+                b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: null\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nConnection: close\r\n\r\n".to_vec()
+            } else {
+                b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: null\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+            }
+        }
+    });
+    let source_origin = source.url();
+    *source_state.lock().unwrap() = Some((source_origin.clone(), format!("{source_origin}/final")));
+    let mut request = request(format!("{source_origin}/start"));
+    request.set_environment(
+        net::FetchEnvironment::from_url(reqwest::Url::parse(&source_origin).unwrap()).unwrap(),
+    );
+
+    let response = runtime().block_on(controller().fetch(request)).unwrap();
+    assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
+    source.join();
+    middle.join();
 }

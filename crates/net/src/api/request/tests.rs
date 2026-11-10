@@ -1,7 +1,9 @@
 use http::HeaderValue;
 use url::Url;
 
-use super::{CredentialsMode, Origin, Referrer, ReferrerPolicy, Request, RequestMode};
+use super::{
+    CredentialsMode, Origin, RedirectTaint, Referrer, ReferrerPolicy, Request, RequestMode,
+};
 use crate::api::{body::Body, error::RequestError};
 
 #[test]
@@ -22,6 +24,59 @@ fn credentials_mode_respects_tuple_and_opaque_origins() {
 
     request.context.credentials = CredentialsMode::Include;
     assert!(request.credentials_allowed(&Url::parse("https://remote.test/other").unwrap()));
+}
+
+#[test]
+fn redirect_taint_is_derived_from_the_complete_url_list() {
+    let mut request = Request::get("https://app.example.test/start");
+    request.request_origin = Some(Origin::parse("https://app.example.test").unwrap());
+    request.url_list = vec![Url::parse("https://app.example.test/start").unwrap()];
+
+    assert_eq!(request.redirect_taint(), RedirectTaint::SameOrigin);
+    assert_eq!(
+        request.serialized_origin().as_deref(),
+        Some("https://app.example.test")
+    );
+
+    request
+        .url_list
+        .push(Url::parse("https://api.example.test/next").unwrap());
+    assert_eq!(request.redirect_taint(), RedirectTaint::SameOrigin);
+
+    request
+        .url_list
+        .push(Url::parse("https://cdn.example.test/asset").unwrap());
+    assert_eq!(request.redirect_taint(), RedirectTaint::SameSite);
+    assert_eq!(request.serialized_origin().as_deref(), Some("null"));
+
+    request
+        .url_list
+        .push(Url::parse("https://remote.test/final").unwrap());
+    assert_eq!(request.redirect_taint(), RedirectTaint::SameSite);
+
+    request
+        .url_list
+        .push(Url::parse("https://other.test/final").unwrap());
+    assert_eq!(request.redirect_taint(), RedirectTaint::CrossSite);
+    assert_eq!(request.serialized_origin().as_deref(), Some("null"));
+}
+
+#[test]
+fn redirect_taint_does_not_reset_when_a_chain_returns_to_its_origin() {
+    let mut request = Request::get("https://app.example.test/start");
+    request.request_origin = Some(Origin::parse("https://app.example.test").unwrap());
+    request.url_list = [
+        "https://app.example.test/start",
+        "https://remote.test/middle",
+        "https://app.example.test/final",
+    ]
+    .into_iter()
+    .map(|url| Url::parse(url).unwrap())
+    .collect();
+
+    assert_eq!(request.redirect_taint(), RedirectTaint::CrossSite);
+    assert_eq!(request.serialized_origin().as_deref(), Some("null"));
+    assert!(!request.credentials_allowed(&Url::parse("https://app.example.test/final").unwrap()));
 }
 
 #[test]

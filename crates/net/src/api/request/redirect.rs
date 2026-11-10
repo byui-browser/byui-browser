@@ -3,7 +3,7 @@ use url::Url;
 
 use crate::api::error::RequestError;
 
-use super::{Origin, ReferrerPolicy, Request, ServiceWorkersMode};
+use super::{ReferrerPolicy, Request, ServiceWorkersMode};
 
 impl Request {
     /// Records the validated URL as the current and initial request URL.
@@ -61,14 +61,6 @@ impl Request {
         });
         if crosses_origin {
             self.strip_sensitive_redirect_headers();
-            if self.current_url.as_ref().is_some_and(|current| {
-                Origin::from_url(current).is_ok_and(|current_origin| {
-                    self.effective_origin()
-                        .is_some_and(|origin| !origin.is_same_origin(&current_origin))
-                })
-            }) {
-                self.redirect_tainted = true;
-            }
         }
         self.service_workers = ServiceWorkersMode::None;
     }

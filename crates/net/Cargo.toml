@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 log = { workspace = true }
+psl = { workspace = true }
 base64 = "0.22"
 common = { workspace = true }
 bytes = "1"

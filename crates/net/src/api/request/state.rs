@@ -29,7 +29,6 @@ pub struct Request {
     pub(crate) duplex: Option<RequestDuplex>,
     pub(crate) context: FetchContext,
     pub(crate) request_origin: Option<Origin>,
-    pub(crate) redirect_tainted: bool,
     pub(crate) signal: AbortSignal,
     pub(crate) url_list: Vec<Url>,
     pub(crate) current_url: Option<Url>,

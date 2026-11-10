@@ -24,9 +24,8 @@ impl RequestController {
         url: &reqwest::Url,
     ) -> Result<(), RequestError> {
         if request.context.mode != RequestMode::Cors
-            || !request.effective_origin().is_some_and(|origin| {
-                crate::Origin::from_url(url).is_ok_and(|target| !origin.is_same_origin(&target))
-            })
+            || request.effective_origin().is_none()
+            || request.has_same_origin_target(url)
             || !request.requires_cors_preflight()?
         {
             return Ok(());

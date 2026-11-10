@@ -48,6 +48,7 @@ tao = "0.30"
 wry = "0.47"
 # Logging facade used by every crate; `common::logging` installs the logger.
 log = { version = "0.4", features = ["std"] }
+psl = "2"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

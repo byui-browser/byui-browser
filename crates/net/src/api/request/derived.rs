@@ -12,8 +12,8 @@ use crate::api::{
 };
 
 use super::{
-    CredentialsMode, Origin, Referrer, ReferrerPolicy, Request, RequestDuplex, RequestMode,
-    RequestPriority,
+    CredentialsMode, Origin, RedirectTaint, Referrer, ReferrerPolicy, Request, RequestDuplex,
+    RequestMode, RequestPriority, urls_are_same_origin, urls_are_same_site,
 };
 
 impl Request {
@@ -26,10 +26,16 @@ impl Request {
         match self.context.credentials {
             CredentialsMode::Omit => false,
             CredentialsMode::Include => true,
-            CredentialsMode::SameOrigin => self.effective_origin().is_some_and(|origin| {
-                Origin::from_url(url).is_ok_and(|target| origin.is_same_origin(&target))
-            }),
+            CredentialsMode::SameOrigin => self.has_same_origin_target(url),
         }
+    }
+
+    /// Reports whether the current target remains in a same-origin request chain.
+    pub(crate) fn has_same_origin_target(&self, url: &Url) -> bool {
+        self.redirect_taint() == RedirectTaint::SameOrigin
+            && self.effective_origin().is_some_and(|origin| {
+                Origin::from_url(url).is_ok_and(|target| origin.is_same_origin(&target))
+            })
     }
 
     /// Returns the request origin after any redirect-time origin transitions.
@@ -39,10 +45,31 @@ impl Request {
             .or(self.context.environment.origin.as_ref())
     }
 
+    /// Computes the redirect taint from the complete request URL list.
+    pub(crate) fn redirect_taint(&self) -> RedirectTaint {
+        let Some(origin) = self.effective_origin() else {
+            return RedirectTaint::SameOrigin;
+        };
+        let mut taint = RedirectTaint::SameOrigin;
+        for pair in self.url_list.windows(2) {
+            let previous = &pair[0];
+            let current = &pair[1];
+            if !urls_are_same_site(current, previous) && !origin.is_same_site_url(previous) {
+                return RedirectTaint::CrossSite;
+            }
+            let origin_matches_previous = Origin::from_url(previous)
+                .is_ok_and(|previous_origin| origin.is_same_origin(&previous_origin));
+            if !urls_are_same_origin(current, previous) && !origin_matches_previous {
+                taint = RedirectTaint::SameSite;
+            }
+        }
+        taint
+    }
+
     /// Serializes the request origin, accounting for redirect taint.
     pub(crate) fn serialized_origin(&self) -> Option<String> {
         self.effective_origin().map(|origin| {
-            if self.redirect_tainted {
+            if self.redirect_taint() != RedirectTaint::SameOrigin {
                 "null".to_owned()
             } else {
                 origin.as_str()

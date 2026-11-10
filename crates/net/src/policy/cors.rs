@@ -2,7 +2,7 @@
 
 use crate::api::{
     error::RequestError,
-    request::{CredentialsMode, Origin, Request, RequestMode},
+    request::{CredentialsMode, Origin, RedirectTaint, Request, RequestMode},
     response::{InternalResponse, ResponseType},
 };
 
@@ -23,16 +23,17 @@ impl CorsChecker {
     ) -> Result<ResponseType, RequestError> {
         let final_url = response.url_list.last().ok_or(RequestError::NetworkError)?;
         let origin = request.effective_origin();
-        let same_origin = origin.is_some_and(|origin| {
-            response
-                .origin
-                .as_ref()
-                .is_some_and(|target| origin.is_same_origin(target))
-                || reqwest::Url::parse(final_url)
-                    .ok()
-                    .and_then(|url| Origin::from_url(&url).ok())
-                    .is_some_and(|target| origin.is_same_origin(&target))
-        });
+        let same_origin = request.redirect_taint() == RedirectTaint::SameOrigin
+            && origin.is_some_and(|origin| {
+                response
+                    .origin
+                    .as_ref()
+                    .is_some_and(|target| origin.is_same_origin(target))
+                    || reqwest::Url::parse(final_url)
+                        .ok()
+                        .and_then(|url| Origin::from_url(&url).ok())
+                        .is_some_and(|target| origin.is_same_origin(&target))
+            });
         if same_origin || (origin.is_none() && request.context.mode != RequestMode::NoCors) {
             return Ok(ResponseType::Basic);
         }
@@ -178,6 +179,38 @@ mod tests {
             checker.response_type(&request(RequestMode::Cors), &response(headers)),
             Err(RequestError::CorsDenied)
         ));
+    }
+
+    #[test]
+    /// Verifies a redirect-tainted return to the request origin remains CORS filtered.
+    fn tainted_same_origin_return_still_requires_cors_approval() {
+        let checker = CorsChecker;
+        let mut request = request(RequestMode::Cors);
+        request.request_origin = Some(Origin::parse("https://client.test").unwrap());
+        request.url_list = [
+            "https://client.test/start",
+            "https://remote.test/middle",
+            "https://client.test/final",
+        ]
+        .into_iter()
+        .map(|url| reqwest::Url::parse(url).unwrap())
+        .collect();
+
+        let mut final_response = response(reqwest::header::HeaderMap::new());
+        final_response.url_list = vec!["https://client.test/final".into()];
+        final_response.origin = Some(Origin::parse("https://client.test").unwrap());
+        assert!(matches!(
+            checker.response_type(&request, &final_response),
+            Err(RequestError::CorsDenied)
+        ));
+
+        final_response
+            .headers
+            .insert("access-control-allow-origin", "null".parse().unwrap());
+        assert_eq!(
+            checker.response_type(&request, &final_response).unwrap(),
+            ResponseType::Cors
+        );
     }
 
     #[test]

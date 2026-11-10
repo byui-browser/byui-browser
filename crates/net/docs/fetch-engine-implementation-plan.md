@@ -44,8 +44,8 @@ provider helper already removed.
 With the current browser/provider slice complete, the next work should be
 sequenced as follows:
 
-1. Complete the remaining request-tainting and user-agent header algorithms
-   around the implemented per-hop CORS preflight boundary.
+1. Complete the remaining user-agent header algorithms around the implemented
+   request-tainting and per-hop CORS preflight boundaries.
 2. Replace the browser's no-op `FetchServices` defaults with origin-aware
    cookies, service-worker decisions, and security-policy checks.
 3. Expand the process-local cache into a standards-aware, partitioned cache
@@ -68,14 +68,17 @@ with the browser-lifecycle work in step 3.
 
 - CORS preflight `OPTIONS` requests, credential validation, redirect-hop
   reevaluation, and a partitioned expiring permission cache are implemented.
-  Complete the remaining request-tainting states and broader user-agent-owned
-  header generation. Simple CORS and origin transitions run at each redirect
-  hop.
+  Redirect taint is derived from the complete URL list as same-origin,
+  same-site, or cross-site; it controls origin serialization, credentials,
+  preflight, and response filtering when a chain returns to its initial origin.
+  Complete broader user-agent-owned header generation. Simple CORS and origin
+  transitions run at each redirect hop.
 - Finish network-error response construction and response-derived helpers such
   as `ok` and explicit body-presence checks.
 - Complete user-agent-owned header generation and redirect-time header rules.
-- Integrate structured origins, same-site checks, referrer changes, and
-  credentials behavior across redirects and local schemes.
+- Complete remaining referrer and credentials behavior across redirects and
+  local schemes using the implemented structured-origin and schemeful-site
+  checks.
 
 ### 3. Implement browser credentials and policy integrations
 

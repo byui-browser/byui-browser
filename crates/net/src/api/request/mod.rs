@@ -15,6 +15,7 @@ pub use context::{
     Referrer, ReferrerPolicy, RequestDestination, RequestMode, ServiceWorkersMode,
 };
 pub use origin::{NetworkPartitionKey, Origin};
+pub(crate) use origin::{RedirectTaint, urls_are_same_origin, urls_are_same_site};
 pub(crate) use prepared::PreparedRequest;
 pub use state::{Request, RequestDuplex, RequestPriority};
 

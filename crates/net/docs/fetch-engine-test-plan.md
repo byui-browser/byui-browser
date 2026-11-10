@@ -120,7 +120,10 @@ headers, unsafe-name sorting/deduplication and the aggregate limit, response
 header exposure, credential-sensitive exposure wildcards, malformed exposure
 values, and forbidden response-header filtering. Redirect-time simple CORS,
 redirect-tainted origin serialization, and opaque-redirect approval are
-covered.
+covered. URL-list-derived same-origin, same-site, and cross-site taint have unit
+coverage. A redirect chain that leaves and returns to its request origin proves
+that `null` origin serialization, credential suppression, CORS filtering, and
+preflight remain active at the returning hop.
 
 The remaining CORS conformance coverage is deliberately narrower and should
 be added as the corresponding behavior is finalized:
@@ -139,9 +142,8 @@ be added as the corresponding behavior is finalized:
 - Redirect edge cases: a later-hop preflight denial stops the chain, and a
   301/302/303 rewrite to a safelisted method does not retain an unnecessary
   preflight requirement.
-- The remaining request-tainting states and their network-error response
-  construction, including assertions that public responses never expose
-  forbidden headers on every error path.
+- Network-error response construction, including assertions that public
+  responses never expose forbidden headers on every error path.
 
 ### 4. Redirects and request context
 
