@@ -518,9 +518,9 @@ impl BrowserRuntime {
     ///
     /// `device_pixel_ratio` is device pixels per CSS pixel and must be finite
     /// and greater than zero. `viewport` is in CSS pixels; without one,
-    /// `window.innerWidth` is zero. `navigate` runs on the page script thread
-    /// and should enqueue work for the browser's navigation loop rather than
-    /// load synchronously.
+    /// `window.innerWidth` and `window.innerHeight` are zero. `navigate` runs
+    /// on the page script thread and should enqueue work for the browser's
+    /// navigation loop rather than load synchronously.
     #[allow(clippy::too_many_arguments)]
     pub fn open_page_with_viewport_and_navigation(
         &self,
@@ -583,7 +583,8 @@ impl BrowserRuntime {
     ///
     /// `device_pixel_ratio` is device pixels per CSS pixel and must be finite
     /// and greater than zero. `viewport` is expressed in CSS pixels and is the
-    /// value used for `window.innerWidth` by the CSSOM View API.
+    /// values used for `window.innerWidth` and `window.innerHeight` by the
+    /// CSSOM View API.
     #[allow(clippy::too_many_arguments)]
     pub fn open_page_with_viewport(
         &self,
@@ -691,12 +692,16 @@ pub struct PageSession {
 impl PageSession {
     /// Updates the viewport dimensions exposed to this live page session.
     ///
-    /// Dimensions are CSS pixels. This keeps `window.innerWidth` and the
-    /// global `innerWidth` value synchronized with the current viewport.
+    /// Dimensions are CSS pixels. This keeps `window.innerWidth`,
+    /// `window.innerHeight`, and their global aliases synchronized with the
+    /// current viewport.
     pub fn set_viewport(&mut self, viewport: ViewportSize) {
         let width = Value::Number(viewport.width as f64);
+        let height = Value::Number(viewport.height as f64);
         self.window.set("innerWidth", width.clone());
+        self.window.set("innerHeight", height.clone());
         let _ = self.realm.register_global_value("innerWidth", width);
+        let _ = self.realm.register_global_value("innerHeight", height);
     }
 
     /// Updates the output device scale visible as `window.devicePixelRatio`.
