@@ -518,9 +518,9 @@ impl BrowserRuntime {
     ///
     /// `device_pixel_ratio` is device pixels per CSS pixel and must be finite
     /// and greater than zero. `viewport` is in CSS pixels; without one,
-    /// `window.innerWidth` is zero. `navigate` runs on the page script thread
-    /// and should enqueue work for the browser's navigation loop rather than
-    /// load synchronously.
+    /// `window.innerWidth` and `window.innerHeight` are zero. `navigate` runs
+    /// on the page script thread and should enqueue work for the browser's
+    /// navigation loop rather than load synchronously.
     #[allow(clippy::too_many_arguments)]
     pub fn open_page_with_viewport_and_navigation(
         &self,
@@ -583,7 +583,8 @@ impl BrowserRuntime {
     ///
     /// `device_pixel_ratio` is device pixels per CSS pixel and must be finite
     /// and greater than zero. `viewport` is expressed in CSS pixels and is the
-    /// value used for `window.innerWidth` by the CSSOM View API.
+    /// values used for `window.innerWidth` and `window.innerHeight` by the
+    /// CSSOM View API.
     #[allow(clippy::too_many_arguments)]
     pub fn open_page_with_viewport(
         &self,
@@ -689,14 +690,30 @@ pub struct PageSession {
 }
 
 impl PageSession {
+    /// Updates the viewport's vertical scroll offset exposed as
+    /// `window.scrollY` and `window.pageYOffset`.
+    ///
+    /// The value is in CSS pixels and is maintained by the browser shell.
+    /// Script assignment remains ineffective because both properties are
+    /// non-replaceable read-only host attributes.
+    pub fn set_scroll_y(&mut self, scroll_y: f64) {
+        let value = Value::Number(scroll_y.max(0.0));
+        self.window.update_read_only("scrollY", value.clone());
+        self.window.update_read_only("pageYOffset", value);
+    }
+
     /// Updates the viewport dimensions exposed to this live page session.
     ///
-    /// Dimensions are CSS pixels. This keeps `window.innerWidth` and the
-    /// global `innerWidth` value synchronized with the current viewport.
+    /// Dimensions are CSS pixels. This keeps `window.innerWidth`,
+    /// `window.innerHeight`, and their global aliases synchronized with the
+    /// current viewport.
     pub fn set_viewport(&mut self, viewport: ViewportSize) {
         let width = Value::Number(viewport.width as f64);
+        let height = Value::Number(viewport.height as f64);
         self.window.set("innerWidth", width.clone());
+        self.window.set("innerHeight", height.clone());
         let _ = self.realm.register_global_value("innerWidth", width);
+        let _ = self.realm.register_global_value("innerHeight", height);
     }
 
     /// Updates the output device scale visible as `window.devicePixelRatio`.
@@ -730,6 +747,22 @@ impl PageSession {
     /// `document` listeners run.
     pub fn dispatch_click_at(&self, node: html::NodeID) -> JsResult<Value> {
         webapis::dispatch_click_at(&self.document, node)
+    }
+
+    /// Runs this page's elapsed `window.setInterval()` callbacks.
+    ///
+    /// Call this from the page/event-loop thread. The return value is the
+    /// number of interval callbacks delivered during this pump.
+    pub fn run_timers(&self) -> JsResult<usize> {
+        webapis::run_window_timers(&self.window)
+    }
+
+    /// Runs this page's pending `window.requestAnimationFrame()` callbacks.
+    ///
+    /// Call this from the page/event-loop thread immediately before presenting
+    /// a frame. The return value is the number of callbacks delivered.
+    pub fn run_animation_frames(&self) -> JsResult<usize> {
+        webapis::run_window_animation_frames(&self.window)
     }
 }
 
@@ -765,6 +798,18 @@ fn attribute<'a>(attributes: &'a [html::Attribute], name: &str) -> Option<&'a st
 mod tests {
     use super::*;
     use security::{Origin, RendererSecurityContext, StoragePermission};
+
+    struct TestConsole;
+
+    impl ConsoleSink for TestConsole {
+        fn log(&self, _message: &str) {}
+    }
+
+    struct TestAlert;
+
+    impl AlertSink for TestAlert {
+        fn alert(&self, _message: &str) {}
+    }
 
     #[test]
     fn default_log_file_lives_in_the_data_directory() {
@@ -840,6 +885,52 @@ mod tests {
         );
         assert!(response.body.is_null());
         assert!(runtime.block_on(response.body.bytes()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn page_session_scroll_y_tracks_the_live_window_offset() {
+        let page = Page {
+            url: "https://example.com/scroll".into(),
+            html: "<main>content</main>".into(),
+            stylesheets: Vec::new(),
+            scripts: Vec::new(),
+        };
+        let runtime = BrowserRuntime::in_memory();
+        let controller = request_controller(None);
+        let mut session = runtime
+            .open_page_with_viewport(
+                &page,
+                Arc::new(TestConsole),
+                Arc::new(TestAlert),
+                controller,
+                storage_context(),
+                1.0,
+                ViewportSize {
+                    width: 800,
+                    height: 600,
+                },
+            )
+            .expect("page session should open");
+
+        assert_eq!(
+            session
+                .realm
+                .evaluate_script("window.scrollY === 0 && window.pageYOffset === 0"),
+            Ok(Value::Boolean(true))
+        );
+        session.set_scroll_y(123.5);
+        assert_eq!(
+            session
+                .realm
+                .evaluate_script("window.scrollY === 123.5 && window.pageYOffset === 123.5"),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            session.realm.evaluate_script(
+                "window.scrollY = 1; window.pageYOffset = 1; window.scrollY === 123.5 && window.pageYOffset === 123.5",
+            ),
+            Ok(Value::Boolean(true))
+        );
     }
 
     #[test]

@@ -3,8 +3,8 @@
 use super::{CallableKind, Chunk, FunctionTemplate, Instruction};
 use crate::Value;
 use crate::ast::{
-    ClassDefinition, Expr, LogicalOperator, MemberProperty, Program, PropertyKey, Statement,
-    VarKind,
+    ArrowBody, ClassDefinition, Expr, LogicalOperator, MemberProperty, Program, PropertyKey,
+    Statement, VarKind,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -94,10 +94,15 @@ enum Control {
         live: usize,
         /// Number of compile-time scopes outside the loop body.
         scopes: usize,
-        /// Offset of the condition, the target of `continue`.
-        start: usize,
+        /// Scope depth retained by `continue` for a lexical `for` loop.
+        continue_scopes: usize,
+        /// Jump target for `continue`; `usize::MAX` means the update target
+        /// is not known yet and jumps are kept in `continues`.
+        continue_target: usize,
         /// `break` jumps, patched to the loop exit.
         breaks: Vec<usize>,
+        /// `continue` jumps waiting for the update target.
+        continues: Vec<usize>,
     },
     /// An active runtime exception handler.
     Handler {
@@ -210,6 +215,39 @@ impl Compiler {
         Ok(FunctionTemplate {
             name: name.to_owned(),
             kind,
+            param_count,
+            chunk: Arc::new(compiler.chunk),
+        })
+    }
+
+    /// Compiles an expression-bodied arrow, whose final expression is its return value.
+    fn compile_arrow_expression(
+        &self,
+        params: &[String],
+        expression: &Expr,
+    ) -> Result<FunctionTemplate, CompileError> {
+        let too_many = || CompileError {
+            message: "function has too many parameters".into(),
+            unsupported: false,
+            location: None,
+        };
+        let param_count = u16::try_from(params.len()).map_err(|_| too_many())?;
+        let mut compiler = self.child(CallableKind::Arrow);
+        for param in params {
+            compiler.add_binding(0, param, VarKind::Var)?;
+        }
+        let enter = compiler.chunk.emit(Instruction::EnterScope(0));
+        for (position, param) in params.iter().enumerate() {
+            let argument = u16::try_from(position).map_err(|_| too_many())?;
+            compiler.chunk.emit(Instruction::LoadArgument(argument));
+            compiler.emit_initialize(param)?;
+        }
+        compiler.compile_expression(expression)?;
+        compiler.chunk.emit(Instruction::Return);
+        compiler.chunk.code[enter] = Instruction::EnterScope(compiler.scopes[0].slots);
+        Ok(FunctionTemplate {
+            name: "<arrow>".into(),
+            kind: CallableKind::Arrow,
             param_count,
             chunk: Arc::new(compiler.chunk),
         })
@@ -336,6 +374,12 @@ impl Compiler {
                 }
             }
             Statement::While { body, .. } => self.collect_vars(body)?,
+            Statement::For { init, body, .. } => {
+                if let Some(init) = init {
+                    self.collect_vars(init)?;
+                }
+                self.collect_vars(body)?;
+            }
             Statement::Try {
                 block,
                 handler,
@@ -544,6 +588,18 @@ impl Compiler {
             Statement::While { condition, body } => {
                 self.compile_while(condition, body, is_completion)
             }
+            Statement::For {
+                init,
+                condition,
+                update,
+                body,
+            } => self.compile_for(
+                init.as_deref(),
+                condition.as_ref(),
+                update.as_ref(),
+                body,
+                is_completion,
+            ),
             Statement::FunctionDeclaration { .. }
                 if self.function.is_none() && self.scopes.len() == 1 =>
             {
@@ -619,7 +675,19 @@ impl Compiler {
 
     fn compile_expression(&mut self, expression: &Expr) -> Result<(), CompileError> {
         match expression {
-            Expr::ArrowFunction { .. } => Err(CompileError::unsupported("arrow functions")),
+            Expr::ArrowFunction { params, body } => {
+                let template = match body {
+                    ArrowBody::Block(statements) => {
+                        self.compile_function("<arrow>", CallableKind::Arrow, params, statements)?
+                    }
+                    ArrowBody::Expression(expression) => {
+                        self.compile_arrow_expression(params, expression)?
+                    }
+                };
+                let index = self.add_function(template)?;
+                self.chunk.emit(Instruction::MakeFunction(index));
+                Ok(())
+            }
             Expr::Number(value) => self.constant(Value::Number(*value)),
             Expr::String(value) => self.constant(Value::String(value.clone())),
             Expr::Boolean(value) => self.constant(Value::Boolean(*value)),

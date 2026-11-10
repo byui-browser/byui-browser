@@ -840,6 +840,12 @@ impl Interpreter {
                 }
                 Ok(Completion::Normal(Some(last)))
             }
+            Statement::For {
+                init,
+                condition,
+                update,
+                body,
+            } => self.execute_for_statement(scope, init, condition, update, body),
             // Bound when the enclosing body or block was entered.
             Statement::FunctionDeclaration { .. } => Ok(Completion::Normal(None)),
             Statement::ClassDeclaration(_) => Err(unsupported_here("class declarations")),
@@ -859,6 +865,51 @@ impl Interpreter {
                 finalizer,
             } => self.execute_try(scope, block, handler.as_ref(), finalizer.as_deref()),
         }
+    }
+
+    fn execute_for_statement(
+        &mut self,
+        scope: &ScopeRef,
+        init: &Option<Box<Statement>>,
+        condition: &Option<Expr>,
+        update: &Option<Expr>,
+        body: &Statement,
+    ) -> JsResult<Completion> {
+        let loop_scope = match init.as_deref() {
+            Some(Statement::VariableDeclaration {
+                kind: VarKind::Let | VarKind::Const,
+                ..
+            }) => child_scope(scope),
+            _ => Arc::clone(scope),
+        };
+        if let Some(init) = init {
+            if !Arc::ptr_eq(&loop_scope, scope) {
+                hoist_lexical_declarations(&loop_scope, std::slice::from_ref(init), false)?;
+            }
+            self.execute_statement(&loop_scope, init)?;
+        }
+        let mut last = Value::Undefined;
+        while condition
+            .as_ref()
+            .map(|condition| {
+                self.evaluate(condition, &loop_scope)
+                    .map(|value| is_truthy(&value))
+            })
+            .transpose()?
+            .unwrap_or(true)
+        {
+            self.next_loop_iteration()?;
+            match self.execute_statement(&loop_scope, body)? {
+                Completion::Normal(Some(value)) => last = value,
+                Completion::Normal(None) | Completion::Continue => {}
+                Completion::Break => break,
+                completion @ Completion::Return(_) => return Ok(completion),
+            }
+            if let Some(update) = update {
+                self.evaluate(update, &loop_scope)?;
+            }
+        }
+        Ok(Completion::Normal(Some(last)))
     }
 
     /// Runs a block in its own lexical scope.
@@ -1187,6 +1238,12 @@ fn hoist_var_declarations(scope: &ScopeRef, statements: &[Statement]) -> JsResul
                 }
             }
             Statement::While { body, .. } => {
+                hoist_var_declarations(scope, std::slice::from_ref(body))?;
+            }
+            Statement::For { init, body, .. } => {
+                if let Some(init) = init {
+                    hoist_var_declarations(scope, std::slice::from_ref(init))?;
+                }
                 hoist_var_declarations(scope, std::slice::from_ref(body))?;
             }
             Statement::Try {

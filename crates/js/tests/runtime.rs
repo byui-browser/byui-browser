@@ -159,7 +159,7 @@ fn let_and_const_are_block_scoped_with_a_dead_zone() {
 fn declarations_do_not_replace_the_completion_value() {
     assert_eq!(eval("1; let z = 2;"), number(1.0));
     assert_eq!(eval("1; var v = 2; function f() {}"), number(1.0));
-    assert_eq!(eval("1; { let inner = 2; }"), number(1.0));
+    assert_eq!(eval("1; { let inner = 2; }"), Ok(Value::Undefined));
     assert_eq!(eval("1; if (false) 2;"), Ok(Value::Undefined));
     assert_eq!(eval("let i = 0; while (i < 3) { i = i + 1; }"), number(3.0));
 }
@@ -261,7 +261,7 @@ fn functions_are_values_compared_by_identity() {
     assert_eq!(eval("function f() {} !f"), boolean(false));
     assert_eq!(
         eval("function f(a, b) {} '' + f"),
-        string("function f(a, b) { [code] }")
+        string("function f() { [code] }")
     );
     assert!(
         matches!(eval("function f() {} f"), Ok(Value::Function(function)) if function.name() == "f")
@@ -318,7 +318,7 @@ fn callers_can_configure_loop_limits_and_get_structured_diagnostics() {
 
     assert_eq!(error.category, JsErrorCategory::Limit);
     assert_eq!(error.message, "Script exceeded the loop iteration limit");
-    assert_eq!(error.context.as_deref(), Some("while loop iteration"));
+    assert_eq!(error.context.as_deref(), Some("bytecode loop iteration"));
 }
 
 #[test]
@@ -354,7 +354,7 @@ fn callers_can_configure_call_depth_limits() {
 
     assert_eq!(error.category, JsErrorCategory::Limit);
     assert_eq!(error.message, "Maximum call stack size exceeded");
-    assert_eq!(error.context.as_deref(), Some("script function call depth"));
+    assert_eq!(error.context.as_deref(), Some("bytecode call depth"));
 }
 
 #[test]

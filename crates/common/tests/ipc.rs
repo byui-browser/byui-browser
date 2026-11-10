@@ -22,3 +22,8 @@ fn storage_errors_are_part_of_the_response_contract() {
         StorageResponse::Error(StorageError::QuotaExceeded)
     );
 }
+
+#[test]
+fn invalid_storage_requests_are_represented_without_panicking() {
+    assert_eq!(StorageRequest::Invalid, StorageRequest::Invalid);
+}

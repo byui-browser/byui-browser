@@ -356,6 +356,7 @@ enum PageCommand {
         navigate: LocationNavigate,
     },
     Resize(ViewportSize),
+    ScrollY(f64),
     DevicePixelRatio(f64),
     Click(Option<NodeID>),
 }
@@ -467,6 +468,17 @@ impl PageEvents {
             log::warn!("page session is not running; dropped resize");
         }
     }
+
+    /// Updates the vertical scroll offset exposed to the live page session.
+    pub(crate) fn set_scroll_y(&self, scroll_y: f32) {
+        if self
+            .commands
+            .send(PageCommand::ScrollY(scroll_y as f64))
+            .is_err()
+        {
+            log::warn!("page session is not running; dropped scroll position update");
+        }
+    }
 }
 
 fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<Option<String>>) {
@@ -508,6 +520,11 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
             PageCommand::Resize(viewport) => {
                 if let Some(session) = &mut session {
                     session.set_viewport(viewport);
+                }
+            }
+            PageCommand::ScrollY(scroll_y) => {
+                if let Some(session) = &mut session {
+                    session.set_scroll_y(scroll_y);
                 }
             }
             PageCommand::DevicePixelRatio(device_pixel_ratio) => {

@@ -153,6 +153,22 @@ fn array_literals_compile_and_preserve_order_and_identity() {
 }
 
 #[test]
+fn arrows_compile_expression_and_block_bodies_and_cannot_be_constructed() {
+    assert_eq!(
+        execute("const add = (a, b) => a + b; add(2, 3)"),
+        Value::Number(5.0)
+    );
+    assert_eq!(
+        execute("const choose = value => { if (value) return 'yes'; return 'no'; }; choose(true)"),
+        Value::String("yes".into())
+    );
+
+    let program = parse("const f = () => 1; new f()").unwrap();
+    let chunk = compile(&program).expect("arrow should compile");
+    assert!(Vm::new().execute(&chunk).is_err());
+}
+
+#[test]
 fn binding_errors_are_reported() {
     let program = parse("{ value; let value = 1; }").expect("source should parse");
     let chunk = compile(&program).expect("source should compile");
@@ -221,6 +237,30 @@ fn control_flow_keeps_short_circuit_evaluation_order() {
     assert_eq!(
         execute("let i = 0; while (i < 2) { i = i + 1; if (i == 1) 10; else 20 }"),
         Value::Number(20.0)
+    );
+}
+
+#[test]
+fn for_loops_compile_all_clauses_and_abrupt_exits() {
+    assert_eq!(
+        execute("let total = 0; for (let i = 0; i < 4; i = i + 1) total = total + i; total"),
+        Value::Number(6.0)
+    );
+    assert_eq!(
+        execute("let i = 0; for (;;) { i = i + 1; if (i == 3) break; } i"),
+        Value::Number(3.0)
+    );
+    assert_eq!(
+        execute(
+            "let total = 0; for (let i = 0; i < 4; i = i + 1) { if (i == 1) continue; total = total + i; } total"
+        ),
+        Value::Number(5.0)
+    );
+    assert_eq!(
+        execute(
+            "let total = 0; for (let i = 0; i < 3; i = i + 1) { for (let j = 0; j < 3; j = j + 1) { if (j == 1) break; total = total + 1; } } total"
+        ),
+        Value::Number(3.0)
     );
 }
 

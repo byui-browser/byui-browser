@@ -330,6 +330,7 @@ fn is_inherited_property(property: &str) -> bool {
             | "font-weight"
             | "line-height"
             | "text-align"
+            | "text-transform"
             | "visibility"
     )
 }

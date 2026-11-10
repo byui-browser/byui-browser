@@ -317,13 +317,14 @@ impl Builder<'_> {
         match dom_node.get_kind() {
             NodeKind::Text(text) => {
                 BuildStats::bump(&self.stats.text_runs);
+                let style = self.styles.for_text_parent(dom_node.get_parent());
                 levels.push(Level::Inline(InlineItem::Text {
                     node,
                     element: dom_node
                         .get_parent()
                         .filter(|parent| self.styles.get(*parent).is_some()),
-                    text: text.clone(),
-                    style: self.styles.for_text_parent(dom_node.get_parent()),
+                    text: style.text_transform.apply(text),
+                    style,
                 }));
             }
             NodeKind::Element(element) => {
