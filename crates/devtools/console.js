@@ -1,16 +1,22 @@
 import { DevTools } from "./devtools-base.js";
 
-const originalConsole = {
-    log: console.log.bind(console),
-    error: console.error.bind(console),
-    warn: console.warn.bind(console),
-};
+const MIRRORED_CONSOLE_METHODS = [
+    "log", "info", "debug", "error", "warn", "dir", "table", "trace",
+];
+const originalConsole = Object.fromEntries(
+    [
+        ...MIRRORED_CONSOLE_METHODS,
+        "assert", "clear", "group", "groupCollapsed", "groupEnd",
+    ].map((method) => [
+        method,
+        typeof console[method] === "function" ? console[method].bind(console) : null,
+    ]),
+);
 
 export class DevConsole extends DevTools {
     constructor() {
         super("#console-panel");
 
-        this.console_div = this.require("#dev-console-div");
         this.input = this.require("#dev-console-input");
         this.output = this.require("#dev-console-output");
 
@@ -43,7 +49,7 @@ export class DevConsole extends DevTools {
                     this.history.push(code);
                 }
                 this.historyIndex = this.history.length;
-                this.print("> " + code, "command");
+                this.print(`> ${code}`, "command");
                 this.execute(code);
             }
             this.input.value = "";
@@ -72,10 +78,20 @@ export class DevConsole extends DevTools {
         if (value === undefined) return "undefined";
         if (value instanceof Map) return `Map(${value.size}) ` + this.format([...value]);
         if (value instanceof Set) return `Set(${value.size}) ` + this.format([...value]);
+        if (value && typeof value === "object" && typeof value.nodeType === "number") {
+            return value.outerHTML || value.textContent || value.nodeName;
+        }
 
         if (typeof value === "object" && value !== null) {
+            const seen = new WeakSet();
             try {
-                return JSON.stringify(value, null, 2);
+                return JSON.stringify(value, (_key, nestedValue) => {
+                    if (nestedValue && typeof nestedValue === "object") {
+                        if (seen.has(nestedValue)) return "[Circular]";
+                        seen.add(nestedValue);
+                    }
+                    return nestedValue;
+                }, 2);
             } catch {
                 return String(value);
             }
@@ -95,7 +111,16 @@ export class DevConsole extends DevTools {
         try {
             const source = this.persistSimpleDeclarations(code);
             const result = this.evaluateInPageContext(source);
-            if (result !== undefined) this.print(result, "result");
+            if (result && typeof result.then === "function") {
+                result.then(
+                    (resolved) => {
+                        if (resolved !== undefined) this.print(resolved, "result");
+                    },
+                    (error) => this.print(error, "error"),
+                );
+            } else if (result !== undefined) {
+                this.print(result, "result");
+            }
         } catch (error) {
             this.print(error, "error");
         }
@@ -158,30 +183,49 @@ export class DevConsole extends DevTools {
     // Overrides of the parent's hooks
 
     onActivate() {
-        console.log = (...args) => this.write("log", args);
-        console.error = (...args) => this.write("error", args);
-        console.warn = (...args) => this.write("warn", args);
+        for (const method of MIRRORED_CONSOLE_METHODS) {
+            console[method] = (...args) => this.write(method, args);
+        }
+        console.assert = (condition, ...args) => {
+            originalConsole.assert?.(condition, ...args);
+            if (!condition) {
+                this.print(["Assertion failed:", ...args].map((value) => this.format(value)).join(" "), "error");
+            }
+        };
+        console.clear = () => {
+            originalConsole.clear?.();
+            this.clear();
+        };
+        for (const method of ["group", "groupCollapsed"]) {
+            console[method] = (...args) => {
+                originalConsole[method]?.(...args);
+                if (args.length) this.write("log", args);
+            };
+        }
+        console.groupEnd = () => originalConsole.groupEnd?.();
 
-        this.onError = (e) => this.print(`Uncaught ${e.message}`, "error");
-        this.onRejection = (e) =>
-            this.print(`Uncaught (in promise) ${this.format(e.reason)}`, "error");
+        this.onError = (event) => {
+            const detail = event.error || event.message || "Unknown application error";
+            this.print(`Uncaught ${this.format(detail)}`, "error");
+        };
+        this.onRejection = (event) =>
+            this.print(`Uncaught (in promise) ${this.format(event.reason)}`, "error");
         window.addEventListener("error", this.onError);
         window.addEventListener("unhandledrejection", this.onRejection);
     }
 
     onDeactivate() {
-        console.log = originalConsole.log;
-        console.error = originalConsole.error;
-        console.warn = originalConsole.warn;
+        for (const [method, original] of Object.entries(originalConsole)) {
+            if (original) console[method] = original;
+        }
 
         window.removeEventListener("error", this.onError);
         window.removeEventListener("unhandledrejection", this.onRejection);
     }
 
-    // Replaces the three near-identical consoleLog/Error/Warn methods
     write(level, args) {
-        originalConsole[level](...args);
-        this.print(args.map((a) => this.format(a)).join(" "), level);
+        originalConsole[level]?.(...args);
+        this.print(args.map((value) => this.format(value)).join(" "), level);
     }
 
      onOpen() {

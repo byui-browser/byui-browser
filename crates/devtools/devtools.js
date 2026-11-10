@@ -47,7 +47,8 @@ export class Devtools {
         if (!selectedTool) throw new Error(`Devtools: unknown tool "${name}"`);
 
         if (this.activeTool && this.activeTool !== selectedTool) {
-            this.activeTool.deactivate();
+            // Keep console capture running while other Devtools panels are selected.
+            if (this.activeTool !== this.tools.console) this.activeTool.deactivate();
             this.activeTool.close();
         }
 
