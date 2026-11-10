@@ -21,9 +21,9 @@ use storage::{
 };
 use webapis::local_storage::register_local_storage;
 use webapis::{
-    AlertSink, ConsoleSink, Document, register_alert, register_document_on_window, register_fetch,
-    register_print, register_window_with_security_context,
-    register_window_with_url_and_device_pixel_ratio,
+    AlertSink, ConsoleSink, Document, TimerDispatcher, register_alert, register_document_on_window,
+    register_fetch, register_print, register_window_with_security_context,
+    register_window_with_url_and_device_pixel_ratio_and_timer_dispatcher,
 };
 
 pub mod byui_provider;
@@ -423,6 +423,7 @@ impl BrowserRuntime {
             controller,
             security_context,
             1.0,
+            None,
         )
         .map(|booted| booted.results)
     }
@@ -450,6 +451,7 @@ impl BrowserRuntime {
             controller,
             security_context,
             1.0,
+            None,
         )
         .map(|booted| booted.session)
     }
@@ -495,6 +497,33 @@ impl BrowserRuntime {
         security_context: RendererSecurityContext,
         device_pixel_ratio: f64,
     ) -> JsResult<PageSession> {
+        self.open_page_with_device_pixel_ratio_and_timer_dispatcher(
+            page,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+            device_pixel_ratio,
+            None,
+        )
+    }
+
+    /// Opens a page whose timers are enqueued through `timer_dispatcher`.
+    ///
+    /// The host sends each dispatched ID to [`PageSession::dispatch_timer`]
+    /// from its page task loop. `device_pixel_ratio` must be finite and
+    /// greater than zero.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_page_with_device_pixel_ratio_and_timer_dispatcher(
+        &self,
+        page: &Page,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+        device_pixel_ratio: f64,
+        timer_dispatcher: Option<TimerDispatcher>,
+    ) -> JsResult<PageSession> {
         self.boot_page(
             &page.html,
             Some(&page.scripts),
@@ -504,6 +533,7 @@ impl BrowserRuntime {
             controller,
             security_context,
             device_pixel_ratio,
+            timer_dispatcher,
         )
         .map(|booted| booted.session)
     }
@@ -522,6 +552,7 @@ impl BrowserRuntime {
         controller: Arc<RequestController>,
         security_context: RendererSecurityContext,
         device_pixel_ratio: f64,
+        timer_dispatcher: Option<TimerDispatcher>,
     ) -> JsResult<BootedPage> {
         log::trace!("booting page: {} bytes of html", html_source.len());
         let html_document = html::parse_raw_html(html_source.to_owned());
@@ -535,10 +566,11 @@ impl BrowserRuntime {
         let initial_url = initial_url
             .filter(|url| !url.is_empty())
             .unwrap_or("about:blank");
-        let window = register_window_with_url_and_device_pixel_ratio(
+        let window = register_window_with_url_and_device_pixel_ratio_and_timer_dispatcher(
             &mut realm,
             initial_url,
             device_pixel_ratio,
+            timer_dispatcher,
         )?;
         register_document_on_window(&mut realm, document, window.clone())?;
         register_local_storage(&mut realm, Arc::clone(&self.storage), security_context)?;
@@ -584,6 +616,14 @@ pub struct PageSession {
 }
 
 impl PageSession {
+    /// Runs a timer callback that has reached its deadline.
+    ///
+    /// Hosts using a timer dispatcher call this on the page task loop. An
+    /// unknown or cancelled ID has no effect.
+    pub fn dispatch_timer(&self, id: u32) -> JsResult<()> {
+        webapis::dispatch_window_timer(&self.window, id)
+    }
+
     /// Updates the output device scale visible as `window.devicePixelRatio`.
     ///
     /// `device_pixel_ratio` is device pixels per CSS pixel and must be finite
@@ -615,6 +655,12 @@ impl PageSession {
     /// `document` listeners run.
     pub fn dispatch_click_at(&self, node: html::NodeID) -> JsResult<Value> {
         webapis::dispatch_click_at(&self.document, node)
+    }
+}
+
+impl Drop for PageSession {
+    fn drop(&mut self) {
+        webapis::clear_window_timers(&self.window);
     }
 }
 

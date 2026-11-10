@@ -271,6 +271,15 @@ pub struct Realm {
     values: HashMap<String, Value>,
     limits: runtime::ExecutionLimits,
     globals: runtime::GlobalState,
+    execution_lock: Arc<std::sync::Mutex<()>>,
+}
+
+/// A cloneable handle that evaluates scripts in the same persistent globals
+/// as its originating realm. It is used by asynchronous host callbacks.
+#[derive(Clone)]
+pub struct ScriptEvaluator {
+    globals: runtime::GlobalState,
+    execution_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl Default for Realm {
@@ -287,6 +296,7 @@ impl Realm {
             values: HashMap::new(),
             limits: runtime::ExecutionLimits::default(),
             globals: runtime::GlobalState::new(),
+            execution_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -419,6 +429,10 @@ impl Realm {
     /// the realm's globals for later calls; see [`Realm`] for the
     /// redeclaration rules and [`Realm::reset_script_state`] to clear them.
     pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
+        let _execution = self
+            .execution_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         log::debug!("evaluating script ({} bytes)", source.len());
         let result = parse(source)
             .map_err(|error| {
@@ -427,6 +441,94 @@ impl Realm {
             .and_then(|program| self.globals.evaluate(&program, self.limits));
         log_outcome("script", &result);
         result
+    }
+
+    /// Parses and evaluates source with the supplied global `this` value.
+    pub fn evaluate_script_with_this(&self, source: &str, this_value: Value) -> JsResult<Value> {
+        let _execution = self
+            .execution_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        log::debug!("evaluating script ({} bytes)", source.len());
+        let result = parse(source)
+            .map_err(|error| {
+                JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+            })
+            .and_then(|program| {
+                self.globals
+                    .evaluate_with_this(&program, self.limits, this_value)
+            });
+        log_outcome("script", &result);
+        result
+    }
+
+    /// Returns an evaluator sharing this realm's globals for delayed scripts.
+    pub fn script_evaluator(&self) -> ScriptEvaluator {
+        ScriptEvaluator {
+            globals: self.globals.clone(),
+            execution_lock: Arc::clone(&self.execution_lock),
+        }
+    }
+}
+
+impl ScriptEvaluator {
+    /// Parses and evaluates source in the originating realm's global scope.
+    pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
+        let _execution = self
+            .execution_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = parse(source)
+            .map_err(|error| {
+                JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+            })
+            .and_then(|program| {
+                self.globals
+                    .evaluate(&program, runtime::ExecutionLimits::default())
+            });
+        log_outcome("delayed script", &result);
+        result
+    }
+
+    /// Parses and evaluates source with the supplied global `this` value.
+    pub fn evaluate_script_with_this(&self, source: &str, this_value: Value) -> JsResult<Value> {
+        let _execution = self
+            .execution_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = parse(source)
+            .map_err(|error| {
+                JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+            })
+            .and_then(|program| {
+                self.globals.evaluate_with_this(
+                    &program,
+                    runtime::ExecutionLimits::default(),
+                    this_value,
+                )
+            });
+        log_outcome("delayed script", &result);
+        result
+    }
+
+    /// Invokes a callback while excluding concurrent script evaluation in the
+    /// same realm.
+    pub fn call(&self, function: &Function, arguments: &[Value]) -> JsResult<Value> {
+        self.call_with_this(function, Value::Undefined, arguments)
+    }
+
+    /// Invokes a callback with an explicit `this` value in this realm.
+    pub fn call_with_this(
+        &self,
+        function: &Function,
+        this_value: Value,
+        arguments: &[Value],
+    ) -> JsResult<Value> {
+        let _execution = self
+            .execution_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        function.call_with_this(this_value, arguments)
     }
 }
 

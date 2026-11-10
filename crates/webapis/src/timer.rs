@@ -1,15 +1,18 @@
 //! Timer handles for `setTimeout` and `setInterval`.
 
-/// Handle returned by `setTimeout`.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+/// Positive integer handle returned by `setTimeout`, in the ID space shared
+/// by timers within a queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TimerId(pub u32);
+pub struct TimerId(
+    /// Numeric timer handle, suitable for equality checks and cancellation.
+    pub u32,
+);
 
-/// Pending `setTimeout` / `setInterval` callbacks, ordered by due time.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+/// Timer handles ordered by their scheduled delay.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TimerQueue {
     pending: Vec<(TimerId, u64)>,
+    next_id: u32,
 }
 
 impl TimerQueue {
@@ -23,25 +26,23 @@ impl TimerQueue {
         self.pending.len()
     }
 
-    /// `setTimeout(callback, delay_ms)`: schedules a callback.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
-    // signature however your crate's public API needs.
+    /// Adds a timer with a delay in milliseconds and returns its handle.
     pub fn schedule(&mut self, delay_ms: u64) -> TimerId {
-        todo!("TODO(webapis): schedule timer at +{delay_ms}ms")
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let id = TimerId(self.next_id);
+        self.pending.push((id, delay_ms));
+        id
     }
 
-    /// Removes and returns the timer due soonest, if any.
-    ///
-    /// Currently only handles the empty queue.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+    /// Removes and returns the timer with the smallest scheduled delay.
     pub fn pop_next_due(&mut self) -> Option<TimerId> {
-        if self.pending.is_empty() {
-            return None;
-        }
-        todo!(
-            "TODO(webapis): pop earliest of {} timers",
-            self.pending.len()
-        )
+        let index = self
+            .pending
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, due))| *due)
+            .map(|(index, _)| index)?;
+        Some(self.pending.remove(index).0)
     }
 }
 

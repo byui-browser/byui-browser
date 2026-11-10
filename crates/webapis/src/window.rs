@@ -1,11 +1,138 @@
 //! The script-visible `Window`, `History`, and `Location` objects.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::custom_elements::CustomElementRegistry;
-use js::{JsError, JsResult, Object, Realm, Value};
+use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
 use security::RendererSecurityContext;
+
+enum TimerHandler {
+    Callback(Function),
+    Source(String),
+}
+
+struct PendingTimer {
+    cancelled: Arc<AtomicBool>,
+    handler: TimerHandler,
+    arguments: Vec<Value>,
+    nesting_level: u32,
+    nesting_context: Arc<AtomicU32>,
+    evaluator: js::ScriptEvaluator,
+    receiver: Value,
+}
+
+struct TimerJob {
+    deadline: Instant,
+    id: u32,
+    cancelled: Arc<AtomicBool>,
+    dispatcher: TimerDispatcher,
+}
+
+/// Callback used by a host to enqueue a timer on its page task loop.
+pub type TimerDispatcher = Arc<dyn Fn(u32) + Send + Sync>;
+
+fn fire_pending_timer(timers: &Mutex<HashMap<u32, PendingTimer>>, id: u32) {
+    let timer = timers
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&id);
+    let Some(timer) = timer else { return };
+    if timer.cancelled.load(Ordering::Acquire) {
+        return;
+    }
+    let previous_level = timer
+        .nesting_context
+        .swap(timer.nesting_level, Ordering::AcqRel);
+    let result = match timer.handler {
+        TimerHandler::Callback(callback) => {
+            timer
+                .evaluator
+                .call_with_this(&callback, timer.receiver, &timer.arguments)
+        }
+        TimerHandler::Source(source) => timer
+            .evaluator
+            .evaluate_script_with_this(&source, timer.receiver),
+    };
+    timer
+        .nesting_context
+        .store(previous_level, Ordering::Release);
+    if let Err(error) = result {
+        log::warn!("setTimeout callback threw: {error}");
+    }
+}
+
+fn timer_scheduler() -> &'static mpsc::Sender<TimerJob> {
+    static SCHEDULER: OnceLock<mpsc::Sender<TimerJob>> = OnceLock::new();
+    SCHEDULER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<TimerJob>();
+        thread::spawn(move || {
+            let mut jobs = Vec::new();
+            loop {
+                if jobs.is_empty() {
+                    match receiver.recv() {
+                        Ok(job) => jobs.push(job),
+                        Err(_) => break,
+                    }
+                    continue;
+                }
+                let next = jobs
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, job)| job.deadline)
+                    .map(|(index, job)| (index, job.deadline));
+                let Some((index, deadline)) = next else {
+                    continue;
+                };
+                match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(job) => jobs.push(job),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let job = jobs.remove(index);
+                        if !job.cancelled.load(Ordering::Acquire) {
+                            (job.dispatcher)(job.id);
+                        }
+                    }
+                }
+            }
+        });
+        sender
+    })
+}
+
+fn webidl_long(value: &Value) -> JsResult<i32> {
+    let number = match value {
+        Value::Undefined => 0.0,
+        Value::Null => 0.0,
+        Value::Boolean(value) => f64::from(u8::from(*value)),
+        Value::Number(value) => *value,
+        Value::String(value) => {
+            if value.trim().is_empty() {
+                0.0
+            } else {
+                value.trim().parse::<f64>().unwrap_or(f64::NAN)
+            }
+        }
+        Value::Array(_) | Value::Object(_) => {
+            value.to_string().trim().parse::<f64>().unwrap_or(f64::NAN)
+        }
+        Value::Function(_) => f64::NAN,
+    };
+    if !number.is_finite() || number == 0.0 {
+        return Ok(0);
+    }
+    let integer = number.trunc();
+    let wrapped = integer.rem_euclid(4_294_967_296.0);
+    Ok(if wrapped >= 2_147_483_648.0 {
+        (wrapped - 4_294_967_296.0) as i32
+    } else {
+        wrapped as i32
+    })
+}
 
 #[derive(Clone, Debug)]
 struct HistoryEntry {
@@ -126,6 +253,7 @@ fn register_window_object(
     realm: &mut Realm,
     initial_url: &str,
     device_pixel_ratio: f64,
+    timer_dispatcher: Option<TimerDispatcher>,
 ) -> JsResult<Object> {
     let window = match realm.registered_global_value("window") {
         Some(Value::Object(window)) => window,
@@ -158,6 +286,119 @@ fn register_window_object(
     // callers use the specification's fallback value of 1.0.
     window.set_replaceable_read_only("devicePixelRatio", Value::Number(device_pixel_ratio));
     window.set("onpopstate", Value::Null);
+    let timers: Arc<Mutex<HashMap<u32, PendingTimer>>> = Arc::new(Mutex::new(HashMap::new()));
+    let timers_for_set = Arc::clone(&timers);
+    let next_timer_id = Arc::new(AtomicU32::new(0));
+    let next_timer_id_for_set = Arc::clone(&next_timer_id);
+    let nesting_context = Arc::new(AtomicU32::new(0));
+    let nesting_context_for_set = Arc::clone(&nesting_context);
+    let evaluator = realm.script_evaluator();
+    let timer_receiver = Value::Object(window.clone());
+    let timer_dispatcher = timer_dispatcher.unwrap_or_else(|| {
+        let timers = Arc::clone(&timers);
+        Arc::new(move |id| fire_pending_timer(&timers, id))
+    });
+    let dispatch_timers = Arc::clone(&timers);
+    window.set_method(
+        "__dispatchTimer",
+        Arc::new(move |arguments| {
+            if let Some(Value::Number(id)) = arguments.first()
+                && id.is_finite()
+                && *id >= 1.0
+                && *id <= i32::MAX as f64
+            {
+                fire_pending_timer(&dispatch_timers, *id as u32);
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+    let clear_all_timers = Arc::clone(&timers);
+    window.set_method(
+        "__clearTimers",
+        Arc::new(move |_| {
+            let mut timers = clear_all_timers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (_, timer) in timers.drain() {
+                timer.cancelled.store(true, Ordering::Release);
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+    window.set_method(
+        "setTimeout",
+        Arc::new(move |arguments| {
+            let handler = match arguments.first() {
+                Some(Value::Function(callback)) => TimerHandler::Callback(callback.clone()),
+                Some(handler) => TimerHandler::Source(handler.to_string()),
+                None => return Err(JsError::runtime("setTimeout() requires a handler")),
+            };
+            let delay = webidl_long(arguments.get(1).unwrap_or(&Value::Undefined))?.max(0);
+            let nesting_level = nesting_context_for_set.load(Ordering::Acquire);
+            let delay = if nesting_level > 5 && delay < 4 {
+                4
+            } else {
+                delay
+            };
+            let delay_ms = delay as u64;
+            let callback_arguments = arguments.get(2..).unwrap_or_default().to_vec();
+            let mut active_timers = timers_for_set
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let id = loop {
+                let candidate =
+                    next_timer_id_for_set.fetch_add(1, Ordering::Relaxed) % i32::MAX as u32 + 1;
+                if !active_timers.contains_key(&candidate) {
+                    break candidate;
+                }
+            };
+            let cancelled = Arc::new(AtomicBool::new(false));
+            active_timers.insert(
+                id,
+                PendingTimer {
+                    cancelled: Arc::clone(&cancelled),
+                    handler,
+                    arguments: callback_arguments,
+                    nesting_level: nesting_level + 1,
+                    nesting_context: Arc::clone(&nesting_context_for_set),
+                    evaluator: evaluator.clone(),
+                    receiver: timer_receiver.clone(),
+                },
+            );
+            drop(active_timers);
+            let job = TimerJob {
+                deadline: Instant::now() + Duration::from_millis(delay_ms),
+                id,
+                cancelled,
+                dispatcher: Arc::clone(&timer_dispatcher),
+            };
+            if timer_scheduler().send(job).is_err() {
+                timers_for_set
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&id);
+                return Err(JsError::runtime("window timer scheduler is unavailable"));
+            }
+            Ok(Value::Number(f64::from(id)))
+        }),
+    );
+    let timers_for_clear = Arc::clone(&timers);
+    window.set_method(
+        "clearTimeout",
+        Arc::new(move |arguments| {
+            let id = webidl_long(arguments.first().unwrap_or(&Value::Undefined))?;
+            if id > 0 {
+                if let Some(timer) = timers_for_clear
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&(id as u32))
+                {
+                    timer.cancelled.store(true, Ordering::Release);
+                }
+            }
+            Ok(Value::Undefined)
+        }),
+    );
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__popstateListeners", Value::Object(Object::new()));
 
@@ -329,6 +570,12 @@ fn register_window_object(
         }),
     );
 
+    if let Some(timeout) = window.get("setTimeout") {
+        realm.register_global_value("setTimeout", timeout)?;
+    }
+    if let Some(clear_timeout) = window.get("clearTimeout") {
+        realm.register_global_value("clearTimeout", clear_timeout)?;
+    }
     realm.register_global_value("window", Value::Object(window.clone()))?;
     realm.register_global_value("self", Value::Object(window.clone()))?;
     realm.register_global_value("customElements", Value::Object(custom_elements))?;
@@ -338,7 +585,7 @@ fn register_window_object(
 
 /// Registers the script-visible window globals using `about:blank` as its URL.
 pub fn register_window(realm: &mut Realm) -> JsResult<()> {
-    register_window_object(realm, "about:blank", 1.0).map(|_| ())
+    register_window_object(realm, "about:blank", 1.0, None).map(|_| ())
 }
 
 /// Registers Window globals with the immutable renderer security context's
@@ -351,7 +598,7 @@ pub fn register_window_with_security_context(
     realm: &mut Realm,
     security_context: RendererSecurityContext,
 ) -> JsResult<()> {
-    let window = register_window_object(realm, "about:blank", 1.0)?;
+    let window = register_window_object(realm, "about:blank", 1.0, None)?;
     let serialized_origin = security_context.origin().ascii_serialization();
     window.set("origin", Value::String(serialized_origin.clone()));
     realm.register_global_value("origin", Value::String(serialized_origin))?;
@@ -365,7 +612,7 @@ pub fn register_window_with_security_context(
 /// browser shell still owns cross-document navigation, so traversing an entry
 /// created by a separate loaded document is not routed back to that shell.
 pub fn register_window_with_url(realm: &mut Realm, url: &str) -> JsResult<Object> {
-    register_window_object(realm, url, 1.0)
+    register_window_object(realm, url, 1.0, None)
 }
 
 /// Registers the script-visible window globals for `url` with the output
@@ -378,10 +625,52 @@ pub fn register_window_with_url_and_device_pixel_ratio(
     url: &str,
     device_pixel_ratio: f64,
 ) -> JsResult<Object> {
+    register_window_with_url_and_device_pixel_ratio_and_timer_dispatcher(
+        realm,
+        url,
+        device_pixel_ratio,
+        None,
+    )
+}
+
+/// Registers window globals with a host timer-task dispatcher.
+///
+/// `dispatcher` receives each timer ID after its delay so the host can enqueue
+/// it on the owning page event loop. Pass `None` to execute timers on the
+/// built-in serialized timer task thread.
+pub fn register_window_with_url_and_device_pixel_ratio_and_timer_dispatcher(
+    realm: &mut Realm,
+    url: &str,
+    device_pixel_ratio: f64,
+    dispatcher: Option<TimerDispatcher>,
+) -> JsResult<Object> {
     if !device_pixel_ratio.is_finite() || device_pixel_ratio <= 0.0 {
         return Err(JsError::runtime(
             "window.devicePixelRatio must be finite and greater than zero",
         ));
     }
-    register_window_object(realm, url, device_pixel_ratio)
+    register_window_object(realm, url, device_pixel_ratio, dispatcher)
+}
+
+/// Runs the timer associated with `id` in `window`, if it is still active.
+///
+/// Hosts call this from their page task loop after the timer dispatcher
+/// reports `id`. Cancelled or already-fired IDs are ignored.
+pub fn dispatch_window_timer(window: &Object, id: u32) -> JsResult<()> {
+    if let Some(Value::Function(dispatch)) = window.get("__dispatchTimer") {
+        dispatch.call(&[Value::Number(f64::from(id))])?;
+    }
+    Ok(())
+}
+
+/// Cancels all active timers associated with `window`.
+///
+/// Browser hosts call this when a document session is discarded so callbacks
+/// cannot keep the old document alive or run after navigation.
+pub fn clear_window_timers(window: &Object) {
+    if let Some(Value::Function(clear)) = window.get("__clearTimers")
+        && let Err(error) = clear.call(&[])
+    {
+        log::warn!("could not clear timers while discarding a window: {error}");
+    }
 }

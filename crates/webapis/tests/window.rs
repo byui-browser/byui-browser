@@ -1,9 +1,129 @@
 use js::{Realm, Value};
 use security::{Origin, RendererSecurityContext, StoragePermission};
+use std::thread;
+use std::time::{Duration, Instant};
+use std::{sync::Arc, sync::mpsc};
 use webapis::{
-    register_window, register_window_with_security_context, register_window_with_url,
-    register_window_with_url_and_device_pixel_ratio,
+    TimerDispatcher, dispatch_window_timer, register_window, register_window_with_security_context,
+    register_window_with_url, register_window_with_url_and_device_pixel_ratio,
+    register_window_with_url_and_device_pixel_ratio_and_timer_dispatcher,
 };
+
+#[test]
+fn set_timeout_runs_function_with_extra_arguments_and_can_be_cancelled() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "function complete(value) { window.completed = value; window.callbackThis = this === window; } \
+             function cancelMe() { window.cancelled = true; } \
+             window.setTimeout(complete, 0, 37); \
+             const cancelled = window.setTimeout(cancelMe, 100); \
+             window.clearTimeout(cancelled);",
+        )
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        realm.evaluate_script("window.completed"),
+        Ok(Value::Number(37.0))
+    );
+    assert_eq!(
+        realm.evaluate_script("window.callbackThis"),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(
+        realm.evaluate_script("window.cancelled === undefined"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn set_timeout_accepts_string_handlers_and_webidl_delay_conversion() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "function delayAsFunction() {} \
+             setTimeout('this.stringCompleted = true', '0'); \
+             setTimeout('this.functionDelayCompleted = true', delayAsFunction);",
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        realm.evaluate_script("window.stringCompleted"),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(
+        realm.evaluate_script("window.functionDelayCompleted"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn set_timeout_waits_for_host_page_task_dispatch() {
+    let mut realm = Realm::new();
+    let (sender, receiver) = mpsc::channel();
+    let dispatcher: TimerDispatcher = Arc::new(move |id| {
+        sender.send(id).unwrap();
+    });
+    let window = register_window_with_url_and_device_pixel_ratio_and_timer_dispatcher(
+        &mut realm,
+        "about:blank",
+        1.0,
+        Some(dispatcher),
+    )
+    .unwrap();
+    realm
+        .evaluate_script("setTimeout('this.dispatched = true', 0);")
+        .unwrap();
+
+    let id = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        realm.evaluate_script("window.dispatched"),
+        Ok(Value::Undefined)
+    );
+    dispatch_window_timer(&window, id).unwrap();
+    assert_eq!(
+        realm.evaluate_script("window.dispatched"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn nested_set_timeout_clamps_short_delays_after_five_levels() {
+    let mut realm = Realm::new();
+    let (sender, receiver) = mpsc::channel();
+    let dispatcher: TimerDispatcher = Arc::new(move |id| {
+        sender.send(id).unwrap();
+    });
+    let window = register_window_with_url_and_device_pixel_ratio_and_timer_dispatcher(
+        &mut realm,
+        "about:blank",
+        1.0,
+        Some(dispatcher),
+    )
+    .unwrap();
+    realm
+        .evaluate_script(
+            "function repeatTimer(remaining) { \
+                 if (remaining > 0) setTimeout(repeatTimer, 0, remaining - 1); \
+                 else window.done = true; \
+             } \
+             setTimeout(repeatTimer, 0, 6);",
+        )
+        .unwrap();
+
+    let mut id = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    for _ in 0..5 {
+        dispatch_window_timer(&window, id).unwrap();
+        id = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+    let started = Instant::now();
+    dispatch_window_timer(&window, id).unwrap();
+    receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(3));
+}
 
 #[test]
 fn window_self_returns_the_current_window_object() {

@@ -10,7 +10,7 @@ use html::NodeID;
 use layout::{FontMetrics, LayoutTree, Size, layout_document};
 use render::{BitmapFont, Compositor, Frame, OutlineFont};
 use tiny_skia::Pixmap;
-use webapis::{AlertSink, ConsoleSink};
+use webapis::{AlertSink, ConsoleSink, TimerDispatcher};
 
 struct NoopConsole;
 
@@ -239,9 +239,11 @@ enum PageCommand {
         alert_sink: Arc<dyn AlertSink>,
         runtime: BrowserRuntime,
         device_pixel_ratio: f64,
+        timer_dispatcher: TimerDispatcher,
     },
     DevicePixelRatio(f64),
     Click(Option<NodeID>),
+    Timer(u32),
 }
 
 /// Owns the page's JavaScript session on a thread that is not the UI thread.
@@ -270,6 +272,12 @@ impl PageEvents {
         runtime: BrowserRuntime,
         device_pixel_ratio: f64,
     ) {
+        let commands = self.commands.clone();
+        let timer_dispatcher: TimerDispatcher = Arc::new(move |id| {
+            if commands.send(PageCommand::Timer(id)).is_err() {
+                log::warn!("page session is not running; dropped timer {id}");
+            }
+        });
         if self
             .commands
             .send(PageCommand::Load {
@@ -277,6 +285,7 @@ impl PageEvents {
                 alert_sink,
                 runtime,
                 device_pixel_ratio,
+                timer_dispatcher,
             })
             .is_err()
         {
@@ -316,16 +325,18 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                 alert_sink,
                 runtime,
                 device_pixel_ratio,
+                timer_dispatcher,
             } => {
                 log::debug!("page session loading {}", page.url);
                 let controller = browser::request_controller(None);
-                match runtime.open_page_with_device_pixel_ratio(
+                match runtime.open_page_with_device_pixel_ratio_and_timer_dispatcher(
                     &page,
                     Arc::new(NoopConsole),
                     alert_sink,
                     controller,
                     browser::security_context_for_url(&page.url),
                     device_pixel_ratio,
+                    Some(timer_dispatcher),
                 ) {
                     Ok(loaded) => session = Some(loaded),
                     Err(error) => log::debug!("page script failed: {error}"),
@@ -349,6 +360,14 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>) {
                 };
                 if let Err(error) = result {
                     log::warn!("page click failed: {error}");
+                }
+            }
+            PageCommand::Timer(id) => {
+                let Some(session) = &session else {
+                    continue;
+                };
+                if let Err(error) = session.dispatch_timer(id) {
+                    log::warn!("page timer {id} failed: {error}");
                 }
             }
         }
