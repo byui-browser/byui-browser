@@ -278,6 +278,96 @@ fn text_wraps_at_spaces_and_trailing_spaces_are_removed() {
     );
 }
 
+/// The x of every text fragment on each line of `layout_box`.
+fn text_xs(layout_box: &LayoutBox) -> Vec<Vec<f32>> {
+    layout_box
+        .lines
+        .iter()
+        .map(|line| {
+            line.fragments
+                .iter()
+                .filter_map(|fragment| match fragment {
+                    LineFragment::Text(text) => Some(text.rect.x),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn text_align_places_each_line_in_the_line_box() {
+    // "aaaa bbbb" is 72px and "cccc" 32px in a 100px line box.
+    for (align, first, second) in [
+        ("left", 0.0, 0.0),
+        ("start", 0.0, 0.0),
+        ("center", 14.0, 34.0),
+        ("right", 28.0, 68.0),
+        ("end", 28.0, 68.0),
+    ] {
+        let (document, tree) = lay_out(
+            "<body><p id='p'>aaaa bbbb cccc</p></body>",
+            &format!("body {{ margin: 0 }} p {{ text-align: {align} }}"),
+            100.0,
+        );
+        let paragraph = box_for(&tree, &document, "p");
+        assert_eq!(texts(paragraph), ["aaaa bbbb", "cccc"], "{align}");
+        assert_eq!(text_xs(paragraph), [[first], [second]], "{align}");
+    }
+}
+
+#[test]
+fn text_align_is_inherited_and_moves_inline_boxes_and_atomics() {
+    let (document, tree) = lay_out(
+        "<body><div><p id='p'><span id='s'>ab</span><b id='b'>x</b></p></div></body>",
+        "body { margin: 0 } div { text-align: center } \
+         b { display: inline-block; width: 20px }",
+        100.0,
+    );
+    let paragraph = box_for(&tree, &document, "p");
+    // 16px of text plus a 20px inline-block leaves 64px, 32px per side.
+    let line = &paragraph.lines[0];
+    let LineFragment::InlineBox(span) = &line.fragments[0] else {
+        panic!("expected the span first, got {:?}", line.fragments[0]);
+    };
+    assert_close(span.rect.x, 32.0);
+    assert_close(box_for(&tree, &document, "b").rect.x, 48.0);
+}
+
+#[test]
+fn text_align_start_aligns_lines_wider_than_the_line_box() {
+    let (document, tree) = lay_out(
+        "<body><p id='p'>abcdefghijklmnop</p></body>",
+        "body { margin: 0 } p { text-align: right }",
+        40.0,
+    );
+    assert_eq!(text_xs(box_for(&tree, &document, "p")), [[0.0]]);
+}
+
+#[test]
+fn justify_widens_spaces_except_on_the_last_line() {
+    let (document, tree) = lay_out(
+        "<body><p id='p'>aa bb cc dddddddd</p></body>",
+        "body { margin: 0 } p { text-align: justify }",
+        100.0,
+    );
+    let paragraph = box_for(&tree, &document, "p");
+    // "aa bb cc" is 64px wide; its two spaces share the other 36px, so each
+    // widened space splits the run and the last word ends at the right edge.
+    assert_eq!(texts(paragraph), ["aa bb cc", "dddddddd"]);
+    assert_eq!(text_xs(paragraph), [vec![0.0, 42.0, 84.0], vec![0.0]]);
+}
+
+#[test]
+fn match_parent_takes_the_parents_alignment() {
+    let (document, tree) = lay_out(
+        "<body><ul style='text-align: right'><li id='li'>ab</li></ul></body>",
+        "body { margin: 0 } ul { padding: 0; margin: 0 }",
+        100.0,
+    );
+    assert_eq!(text_xs(box_for(&tree, &document, "li")), [[84.0]]);
+}
+
 #[test]
 fn an_overlong_word_overflows_rather_than_breaking() {
     let (document, tree) = lay_out(

@@ -67,6 +67,38 @@ pub(crate) struct StyleMap {
     initial: Rc<ComputedStyle>,
 }
 
+/// The computed `text-align` of `node`'s nearest element ancestor, for
+/// `match-parent`. Ancestors whose own value is `match-parent` defer to
+/// theirs in turn; the root falls back to `start`.
+fn parent_text_align(
+    document: &HTMLDocument,
+    styles: &css::ComputedStyles,
+    node: NodeID,
+) -> crate::style::TextAlign {
+    let mut current = document
+        .nodes
+        .get(node.get())
+        .and_then(|node| node.get_parent());
+    while let Some(ancestor) = current {
+        if let Some(declarations) = styles.declarations_for(ancestor) {
+            let value = declarations
+                .iter()
+                .find(|declaration| declaration.property == "text-align")
+                .map(|declaration| declaration.value.as_str());
+            let align =
+                crate::style::TextAlign::compute(value, || crate::style::TextAlign::MatchParent);
+            if align != crate::style::TextAlign::MatchParent {
+                return align;
+            }
+        }
+        current = document
+            .nodes
+            .get(ancestor.get())
+            .and_then(|node| node.get_parent());
+    }
+    crate::style::TextAlign::Start
+}
+
 impl StyleMap {
     /// Resolves every element's computed style. The root element's display is
     /// blockified (CSS Display 3 §2.8).
@@ -90,8 +122,13 @@ impl StyleMap {
             .map(|index| {
                 let node = NodeID::new(index);
                 let declarations = styles.declarations_for(node)?;
-                let mut style =
-                    ComputedStyle::from_declarations(declarations, root_font_size, viewport);
+                let parent_text_align = || parent_text_align(document, styles, node);
+                let mut style = ComputedStyle::from_declarations(
+                    declarations,
+                    root_font_size,
+                    viewport,
+                    parent_text_align,
+                );
                 if Some(node) == root {
                     style.display = style.display.blockified();
                 }

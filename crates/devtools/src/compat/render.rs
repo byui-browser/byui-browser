@@ -73,6 +73,11 @@ impl Rendered {
             DisplayItem::FillRect {
                 rect: painted,
                 color,
+            }
+            | DisplayItem::FillRoundedRect {
+                rect: painted,
+                color,
+                ..
             } if *painted == rect => Some(*color),
             _ => None,
         })

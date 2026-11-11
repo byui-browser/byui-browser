@@ -4,9 +4,11 @@
 //! Supported today: `white-space: normal` collapsing, soft wrap
 //! opportunities at spaces and around atomic inlines, forced breaks from
 //! `<br>`, inline boxes split across lines, `line-height: normal`,
-//! `vertical-align: baseline`, and left-aligned left-to-right text. Other
-//! `white-space`, `text-align`, `line-height`, and `vertical-align` values, as
-//! well as bidirectional text and hyphenation, are not implemented.
+//! `vertical-align: baseline`, and left-to-right text aligned by every
+//! `text-align` keyword (`justify` widens the spaces between words). Other
+//! `white-space`, `line-height`, and `vertical-align` values, as well as
+//! bidirectional text, `text-align-last`, and hyphenation, are not
+//! implemented.
 
 use std::ops::Range;
 
@@ -16,7 +18,7 @@ use crate::Rect;
 use crate::block::BlockResult;
 use crate::box_tree::{BlockBox, InlineItem, is_document_white_space};
 use crate::layout::Context;
-use crate::style::ComputedStyle;
+use crate::style::{ComputedStyle, TextAlign};
 use crate::tree::{InlineBoxFragment, LayoutBox, LineBox, LineFragment, TextFragment};
 
 /// Tolerance for floating-point error when testing whether content fits.
@@ -121,13 +123,27 @@ impl Context<'_> {
         let mut lines = Vec::new();
         let mut open = Vec::new();
         let mut y = 0.0;
-        for range in break_lines(&chunks, available_width) {
+        let ranges = break_lines(&chunks, available_width);
+        let count = ranges.len();
+        for (number, range) in ranges.into_iter().enumerate() {
             log::trace!("line break: pieces {}..{}", range.start, range.end);
+            // `justify` leaves the last line and lines ended by a forced
+            // break start-aligned (CSS Text 3 §7.2, `text-align-last: auto`).
+            let ends_paragraph = number + 1 == count
+                || range
+                    .clone()
+                    .rev()
+                    .any(|index| matches!(prepared.pieces[index], Piece::ForcedBreak));
+            let align = match container.text_align {
+                TextAlign::Justify if ends_paragraph => TextAlign::Start,
+                align => align,
+            };
             if let Some(line) = self.build_line(
                 range,
                 &mut prepared,
                 &mut open,
                 container,
+                align,
                 available_width,
                 y,
             ) {
@@ -305,12 +321,19 @@ impl Context<'_> {
     ///
     /// `open` holds the inline boxes still open from earlier lines; they
     /// continue on this line without their start edge.
+    ///
+    /// `align` places the content horizontally (CSS Text 3 §7.1). Content
+    /// wider than the line is start-aligned. For `justify`, the free space is
+    /// shared equally by the line's spaces; a text run is split after each
+    /// widened space so its glyphs stay where layout put them.
+    #[allow(clippy::too_many_arguments)]
     fn build_line(
         &self,
         range: Range<usize>,
         prepared: &mut Prepared<'_>,
         open: &mut Vec<usize>,
         container: &ComputedStyle,
+        align: TextAlign,
         available_width: f32,
         y: f32,
     ) -> Option<LineBox> {
@@ -330,6 +353,39 @@ impl Context<'_> {
         let kept = |index: usize| {
             !matches!(prepared.pieces[index], Piece::Space { .. })
                 || (first_content..last_content).contains(&index)
+        };
+
+        // The width of the line's content before alignment, and how many
+        // spaces `justify` can widen.
+        let (natural_width, spaces) = range.clone().filter(|index| kept(*index)).fold(
+            (0.0_f32, 0_u32),
+            |(width, spaces), index| match &prepared.pieces[index] {
+                Piece::Start(box_index) => {
+                    let info = &prepared.boxes[*box_index];
+                    (width + info.margin_start + info.padding_start, spaces)
+                }
+                Piece::End(box_index) => {
+                    let info = &prepared.boxes[*box_index];
+                    (width + info.padding_end + info.margin_end, spaces)
+                }
+                Piece::Word { width: word, .. } => (width + word, spaces),
+                Piece::Space { width: space, .. } => (width + space, spaces + 1),
+                Piece::Atomic(atomic_index) => {
+                    (width + prepared.atomics[*atomic_index].width, spaces)
+                }
+                Piece::ForcedBreak => (width, spaces),
+            },
+        );
+        let free_space = (available_width - natural_width).max(0.0);
+        let space_extra = if align == TextAlign::Justify && spaces > 0 {
+            free_space / spaces as f32
+        } else {
+            0.0
+        };
+        let offset = if align == TextAlign::Justify {
+            0.0
+        } else {
+            free_space * align.offset_fraction()
         };
 
         let mut fragments = Vec::new();
@@ -379,7 +435,9 @@ impl Context<'_> {
                 }
                 Piece::Space { source, width } => {
                     self.push_text(&mut fragments, &prepared.sources[*source], " ", x, *width);
-                    x += width;
+                    // The gap after a widened space keeps the next word out
+                    // of this text run.
+                    x += width + space_extra;
                 }
                 Piece::Atomic(atomic_index) => {
                     has_content = true;
@@ -402,6 +460,15 @@ impl Context<'_> {
         }
         if !has_content {
             return None;
+        }
+        if offset > 0.0 {
+            for fragment in &mut fragments {
+                match fragment {
+                    LineFragment::InlineBox(inline) => inline.rect.x += offset,
+                    LineFragment::Text(text) => text.rect.x += offset,
+                    LineFragment::Atomic(atomic) => atomic.translate(offset, 0.0),
+                }
+            }
         }
 
         // Baseline alignment: each inline box and the strut contribute their

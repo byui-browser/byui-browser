@@ -22,8 +22,10 @@ pub const CANVAS_COLOR: Color = Color {
 /// The canvas covers the viewport with the propagated root background, or
 /// [`CANVAS_COLOR`]. Text is drawn at its layout baseline and font size.
 ///
-/// Only backgrounds and text are painted; borders, outlines, and other
-/// decorations are not supported yet.
+/// Backgrounds are clipped to the rounded border box when `border-radius` is
+/// set, producing [`DisplayItem::FillRoundedRect`]. An inline box split across
+/// lines rounds every fragment's corners, as if each fragment were a whole
+/// box. Borders, outlines, and other decorations are not supported yet.
 pub fn paint_document(tree: &LayoutTree) -> DisplayList {
     paint(tree, 0.0, false, |_| Vec::new())
 }
@@ -75,30 +77,36 @@ fn paint(
     let mut items = Vec::new();
     for item in tree.paint_order() {
         match item {
-            PaintItem::BoxDecorations(layout_box) => {
-                let (rect, color) = match (layout_box.kind, layout_box.style.background_color) {
-                    (BoxKind::Viewport, background) => {
-                        (viewport, Some(background.map_or(CANVAS_COLOR, Color::from)))
+            PaintItem::BoxDecorations(layout_box) => match layout_box.kind {
+                // The canvas is infinite, so it is never rounded.
+                BoxKind::Viewport => items.push(DisplayItem::FillRect {
+                    rect: viewport,
+                    color: layout_box
+                        .style
+                        .background_color
+                        .map_or(CANVAS_COLOR, Color::from),
+                }),
+                _ => {
+                    if let Some(color) = layout_box.style.background_color
+                        && visible(&layout_box.rect)
+                    {
+                        items.push(background(
+                            scrolled(layout_box.rect),
+                            &layout_box.style,
+                            color.into(),
+                        ));
                     }
-                    (_, background) => (
-                        scrolled(layout_box.rect),
-                        background
-                            .filter(|_| visible(&layout_box.rect))
-                            .map(Color::from),
-                    ),
-                };
-                if let Some(color) = color {
-                    items.push(DisplayItem::FillRect { rect, color });
                 }
-            }
+            },
             PaintItem::InlineBox(inline) => {
                 if let Some(color) = inline.style.background_color
                     && visible(&inline.rect)
                 {
-                    items.push(DisplayItem::FillRect {
-                        rect: scrolled(inline.rect),
-                        color: color.into(),
-                    });
+                    items.push(background(
+                        scrolled(inline.rect),
+                        &inline.style,
+                        color.into(),
+                    ));
                 }
             }
             PaintItem::Text(text) => {
@@ -131,6 +139,17 @@ fn paint(
         }
     }
     DisplayList { items }
+}
+
+/// The background fill for a box's border box `rect`, rounded by its
+/// `border-radius` when that is non-zero.
+fn background(rect: layout::Rect, style: &layout::BoxStyle, color: Color) -> DisplayItem {
+    let radii = style.border_radius.resolve(rect);
+    if radii.is_zero() {
+        DisplayItem::FillRect { rect, color }
+    } else {
+        DisplayItem::FillRoundedRect { rect, radii, color }
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +216,7 @@ mod tests {
             .iter()
             .map(|item| match item {
                 DisplayItem::FillRect { color, .. } => format!("fill {}", color.b),
+                DisplayItem::FillRoundedRect { color, .. } => format!("round {}", color.b),
                 DisplayItem::Text { text, baseline, .. } => format!("text {text} {baseline:.1}"),
             })
             .collect::<Vec<_>>();
@@ -212,6 +232,24 @@ mod tests {
                 "text World 33.6"
             ]
         );
+    }
+
+    #[test]
+    fn border_radius_rounds_the_background_and_fits_the_box() {
+        let list = paint(
+            "<body><div>Hi</div><p>Square</p></body>",
+            "body { margin: 0 } div { height: 30px; background-color: red; border-radius: 3px 40px } \
+             p { margin: 0; background-color: blue; border-radius: 0 }",
+        );
+        let DisplayItem::FillRoundedRect { rect, radii, color } = list.items[1] else {
+            panic!("expected a rounded background, got {:?}", list.items[1]);
+        };
+        assert_eq!((rect.width, rect.height, color.r), (160.0, 30.0, 255));
+        // 40px + 40px exceeds the 30px height, so radii scale by 30 / 43.
+        let scale = 30.0 / 43.0;
+        assert!((radii.top_left.horizontal - 3.0 * scale).abs() < 1e-4);
+        assert!((radii.top_right.vertical - 40.0 * scale).abs() < 1e-4);
+        assert!(matches!(list.items[2], DisplayItem::FillRect { .. }));
     }
 
     #[test]

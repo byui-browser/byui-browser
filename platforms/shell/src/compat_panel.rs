@@ -589,7 +589,7 @@ mod tests {
         let page = browser::Page {
             url: "https://example.test/".into(),
             html: "<html><body><ul><li>x</li></ul><script>a</script></body></html>".into(),
-            stylesheets: vec![".x { border-radius: 4px; cursor: pointer }".into()],
+            stylesheets: vec![".x { box-shadow: 1px 1px #000; cursor: pointer }".into()],
             scripts: vec!["var t = typeof 1; var o = new IntersectionObserver(f);".into()],
         };
         audit_page(&Auditor::new(ShellScriptEngine::new()), &page, None)
@@ -602,7 +602,7 @@ mod tests {
         for expected in [
             "typeof operator",
             "IntersectionObserver",
-            "border-radius",
+            "box-shadow",
             "List markers",
         ] {
             assert!(

@@ -108,21 +108,21 @@ fn reports_script_loading_problems_seen_in_the_page() {
 fn css_findings_come_from_render_probes() {
     let css = "@media (min-width: 600px) { .a { color: #ff0000; } }\n\
                .grid { display: grid; }\n\
-               .box { width: 100px; margin: 10px; color: #00ff00; border-radius: 4px; }\n\
+               .box { width: 100px; margin: 10px; color: #00ff00; box-shadow: 1px 1px #000; border-radius: 4px; }\n\
                a:hover { color: #0000ff; }\n\
                .sib + .sib { height: 10px; }";
     let report = audit("<div class=\"box\"></div>", &[css], &[], None);
     assert!(has(&report, Area::CssAtRule, "@media"));
     assert!(has(&report, Area::CssValue, "display: grid"));
-    assert!(has(&report, Area::CssProperty, "border-radius"));
+    assert!(has(&report, Area::CssProperty, "box-shadow"));
     assert!(has(&report, Area::CssSelector, ":hover"));
-    let radius = report
+    let shadow = report
         .in_area(Area::CssProperty)
-        .find(|finding| finding.feature == "border-radius")
+        .find(|finding| finding.feature == "box-shadow")
         .unwrap();
-    assert_eq!(radius.location.as_deref(), Some("stylesheet #1:3"));
+    assert_eq!(shadow.location.as_deref(), Some("stylesheet #1:3"));
     // Implemented features are checked but not reported.
-    for working in ["width", "margin", "color"] {
+    for working in ["width", "margin", "color", "border-radius"] {
         assert!(!has(&report, Area::CssProperty, working), "{working} works");
     }
     assert!(!has(
@@ -167,7 +167,7 @@ fn unobservable_properties_are_listed_as_unverified() {
 #[test]
 fn repeated_audits_reuse_probe_results() {
     let auditor = Auditor::new(BareRealm);
-    let sheets = [".a { border-radius: 2px; display: grid }".to_owned()];
+    let sheets = [".a { box-shadow: 1px 1px #000; display: grid }".to_owned()];
     let scripts = ["var x = typeof 1;".to_owned()];
     let page = PageSources {
         html: "<script>x</script>",
@@ -186,7 +186,7 @@ fn findings_are_sorted_by_area_then_frequency() {
     let script = "var a = typeof 1; var b = typeof 2; var c = 1 ? 2 : 3;";
     let report = audit(
         "<script>x</script>",
-        &[".a{border-radius:1px}"],
+        &[".a{box-shadow:1px 1px #000}"],
         &[script],
         None,
     );

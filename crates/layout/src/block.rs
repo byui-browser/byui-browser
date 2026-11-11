@@ -553,5 +553,6 @@ pub(crate) fn box_style(style: &ComputedStyle) -> BoxStyle {
     BoxStyle {
         background_color: style.background_color,
         text_color: style.color,
+        border_radius: style.border_radius,
     }
 }
