@@ -8,6 +8,7 @@ use tiny_skia::{Color, Path, PathBuilder, Pixmap, Rect, Transform};
 use crate::compat_panel::CompatView;
 use crate::toolbar;
 use devtools::network::{NetworkLog, ResourceType};
+use devtools::{Console, Level};
 
 /// The dock's tabs, in header order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,10 +16,16 @@ pub(crate) enum DockTab {
     Elements,
     Compatibility,
     Network,
+    Console,
 }
 
 impl DockTab {
-    const ALL: [Self; 3] = [Self::Elements, Self::Compatibility, Self::Network];
+    const ALL: [Self; 4] = [
+        Self::Elements,
+        Self::Compatibility,
+        Self::Network,
+        Self::Console,
+    ];
 
     /// Tab width in logical pixels; the Compatibility tab leaves room for
     /// its issue count.
@@ -27,6 +34,7 @@ impl DockTab {
             Self::Elements => 84.0,
             Self::Compatibility => 146.0,
             Self::Network => 92.0,
+            Self::Console => 92.0,
         }
     }
 }
@@ -44,6 +52,7 @@ pub(crate) struct ElementsPanel {
     /// The Compatibility tab's content. The app fills it with audit results.
     pub(crate) compat: CompatView,
     pub(crate) network: NetworkLog,
+    pub(crate) console: Console,
 }
 
 impl ElementsPanel {
@@ -59,6 +68,7 @@ impl ElementsPanel {
             tab: DockTab::Elements,
             compat: CompatView::new(),
             network: NetworkLog::new(),
+            console: Console::new(),
         };
         let Some(html) = html else {
             panel.message = Some("No loaded HTML available");
@@ -123,7 +133,6 @@ impl ElementsPanel {
     }
 
     /// The tab currently shown.
-    #[cfg(test)]
     pub(crate) fn tab(&self) -> DockTab {
         self.tab
     }
@@ -136,6 +145,20 @@ impl ElementsPanel {
     pub(crate) fn set_network(&mut self, network: NetworkLog) {
         self.network = network;
         self.offset = self.offset.min(self.max_offset());
+    }
+
+    pub(crate) fn set_console(&mut self, console: Console) {
+        self.console = console;
+        self.offset = self.offset.min(self.max_offset());
+    }
+
+    pub(crate) fn clear_active(&mut self) {
+        match self.tab {
+            DockTab::Network => self.network.clear(),
+            DockTab::Console => self.console.clear(),
+            DockTab::Elements | DockTab::Compatibility => {}
+        }
+        self.offset = 0;
     }
 
     /// Header tab rectangles in logical pixels.
@@ -163,6 +186,7 @@ impl ElementsPanel {
             (DockTab::Compatibility, Some(count)) => format!("Compatibility ({count})"),
             (DockTab::Compatibility, None) => "Compatibility".to_owned(),
             (DockTab::Network, _) => format!("Network ({})", self.network.entries().len()),
+            (DockTab::Console, _) => format!("Console ({})", self.console.entries().len()),
         }
     }
 
@@ -175,6 +199,7 @@ impl ElementsPanel {
             DockTab::Elements => self.rows.len(),
             DockTab::Compatibility => 0,
             DockTab::Network => self.network.entries().len(),
+            DockTab::Console => self.console.entries().len(),
         }
     }
 
@@ -398,22 +423,37 @@ impl ElementsPanel {
             );
         }
 
-        if self.tab == DockTab::Network {
+        if matches!(self.tab, DockTab::Network | DockTab::Console) {
             let Some(network_font) = mono_font.or(ui_font) else {
                 return;
             };
-            self.draw_network(
-                frame,
-                s,
-                dark,
-                palette,
-                colors,
-                bounds,
-                tree_top,
-                tree_bottom,
-                rows_shown,
-                network_font,
-            );
+            if self.tab == DockTab::Network {
+                self.draw_network(
+                    frame,
+                    s,
+                    dark,
+                    palette,
+                    colors,
+                    bounds,
+                    tree_top,
+                    tree_bottom,
+                    rows_shown,
+                    network_font,
+                );
+            } else {
+                self.draw_console(
+                    frame,
+                    s,
+                    dark,
+                    palette,
+                    colors,
+                    bounds,
+                    tree_top,
+                    tree_bottom,
+                    rows_shown,
+                    network_font,
+                );
+            }
             return;
         }
 
@@ -615,6 +655,72 @@ impl ElementsPanel {
         self.draw_header(frame, s, dark, None, font);
     }
 
+    fn draw_console(
+        &self,
+        frame: &mut Pixmap,
+        s: f32,
+        dark: bool,
+        palette: toolbar::Palette,
+        colors: Colors,
+        bounds: Rect,
+        top: f32,
+        bottom: f32,
+        rows_shown: usize,
+        font: &FontVec,
+    ) {
+        let device = |value: f32| value * s;
+        let clip = device(bounds.right() - SCROLLBAR_GUTTER);
+        for (index, entry) in self
+            .console
+            .entries()
+            .iter()
+            .skip(self.offset)
+            .take(rows_shown)
+            .enumerate()
+        {
+            let row_top = top + index as f32 * ROW + 13.0;
+            let color = match entry.level {
+                Level::Log => palette.text,
+                Level::Warn => toolbar::rgba(0xd9, 0x77, 0x06, 255),
+                Level::Error => toolbar::rgba(0xdc, 0x26, 0x26, 255),
+            };
+            let prefix = match entry.level {
+                Level::Log => "log",
+                Level::Warn => "warn",
+                Level::Error => "error",
+            };
+            let text = format!("[{prefix}] {}", entry.message);
+            toolbar::draw_text(
+                frame,
+                font,
+                device(TREE_SIZE),
+                device(bounds.left() + 14.0),
+                device(row_top),
+                clip,
+                color,
+                &text,
+            );
+        }
+        if self.console.entries().len() > self.visible && self.visible > 0 {
+            let track_height = (bottom - TREE_PAD - top).max(0.0);
+            let thumb_height = (track_height * self.visible as f32
+                / self.console.entries().len() as f32)
+                .max(24.0);
+            let progress = self.offset as f32 / self.max_offset().max(1) as f32;
+            let thumb_top = top + (track_height - thumb_height).max(0.0) * progress;
+            if let Some(path) = toolbar::rounded_rect(
+                bounds.right() - 9.0,
+                thumb_top,
+                5.0,
+                thumb_height.min(track_height),
+                2.5,
+            ) {
+                toolbar::fill(frame, &path, colors.scrollbar, Transform::from_scale(s, s));
+            }
+        }
+        self.draw_header(frame, s, dark, None, font);
+    }
+
     /// Draws the header text: the tabs (active one underlined), a muted
     /// description of the active tab, and a keyboard hint beside the close
     /// button. `s` is the device scale.
@@ -691,6 +797,7 @@ impl ElementsPanel {
             DockTab::Elements => "HTML snapshot · read-only".to_owned(),
             DockTab::Compatibility => self.compat.summary(),
             DockTab::Network => "Completed resource requests · session log".to_owned(),
+            DockTab::Console => "JavaScript messages · session log".to_owned(),
         };
         let subtitle_width = toolbar::text_advance(ui_font, device(SMALL_SIZE), &subtitle) / s;
         let show_hint = hint_left > subtitle_left + subtitle_width + 16.0;

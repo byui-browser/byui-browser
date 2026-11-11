@@ -47,9 +47,9 @@ on Windows to check that the existing welcome page and toolbar still work.
 
 Right-click inside the page card to open the shared desktop context menu.
 The menu lists **Back**, **Forward**, **Reload**, **View Page Source**, and **Inspect**.
-Back and Forward are visibly disabled placeholders: they do not highlight,
-respond to clicks, or navigate, even when history entries exist. Clicking them
-leaves the popup open. Navigation controls are not connected yet.
+Back and Forward are enabled when session history allows the action. They
+traverse successful visits without adding a new history entry, and stay
+disabled at the ends of the history list.
 Choose **Reload** to use the same asynchronous saved-URL fetch as the toolbar.
 The URL, status, and body appear in the launching terminal. History is unchanged.
 Click outside the popup or press Escape to dismiss it. Resize and focus loss also
@@ -88,13 +88,16 @@ navigation or startup-URL support.
 
 The fifth right-click action, **Inspect**, opens a rectangular bottom panel
 inside the window. The upper webpage stays visible. **Elements — Basic
-inspector** displays an indented tree of element tags from a fresh parse of the
-loaded HTML snapshot, using only nodes the parser supplies. It is not a live
-JavaScript DOM, an element picker, or full Chrome DevTools. Text, comments, and
-attributes are not currently shown. The panel closes when navigation replaces
-the displayed document, so its snapshot cannot describe a previous page. No
-network requests or script evaluation
-are performed by opening the panel.
+inspector** displays an indented tree from the current live document when the
+page session is available, with a loaded-HTML fallback. It remains read-only:
+text, comments, attributes, editing, and element picking are not currently
+shown. The panel closes when navigation replaces the displayed document.
+
+The panel also includes session-local **Network** and **Console** tabs. Network
+shows the document and linked stylesheet/script resources discovered for the
+page; Console receives `console.log`, `console.warn`, `console.error`, and the
+legacy `print()` bridge. Delete clears the active log, and the native DevTools
+window opened with Ctrl+Shift+H can be closed with Escape.
 
 Scroll over the panel, or use Up/Down, Page Up/Down, Home/End while the address
 field is not focused. Click **×** or press Escape to close it. Resize the window

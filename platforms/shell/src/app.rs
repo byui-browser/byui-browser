@@ -95,6 +95,7 @@ struct App {
     devtools_panel: Option<ElementsPanel>,
     devtools_cursor: Option<(f64, f64)>,
     network_log: devtools::network::NetworkLog,
+    console: Arc<Mutex<devtools::Console>>,
     font: Option<FontVec>,
     chrome: ChromeState,
     /// Session history shared by all desktop platforms.
@@ -272,6 +273,7 @@ impl App {
             devtools_panel: None,
             devtools_cursor: None,
             network_log: devtools::network::NetworkLog::new(),
+            console: Arc::new(Mutex::new(devtools::Console::new())),
             font: None,
             chrome: ChromeState {
                 window_controls_inset: platform.window_controls_inset,
@@ -491,9 +493,16 @@ impl App {
             log::error!("failed to create DevTools window surface: {error}");
             panic!("failed to create DevTools window surface: {error}");
         });
-        let html = self.loaded_page.as_ref().map(|page| page.html.as_str());
+        let live_html = self.page_events.snapshot_html();
+        let html = live_html
+            .as_deref()
+            .filter(|html| !html.is_empty())
+            .or_else(|| self.loaded_page.as_ref().map(|page| page.html.as_str()));
         let mut panel = ElementsPanel::new(html);
         panel.set_network(self.network_log.clone());
+        if let Ok(console) = self.console.lock() {
+            panel.set_console(console.clone());
+        }
         self.devtools_panel = Some(panel);
         self.devtools_cursor = None;
         self.devtools_surface = Some(surface);
@@ -528,6 +537,10 @@ impl App {
         };
         pixmap.fill(background);
         if let Some(panel) = &mut self.devtools_panel {
+            panel.set_network(self.network_log.clone());
+            if let Ok(console) = self.console.lock() {
+                panel.set_console(console.clone());
+            }
             panel.draw(
                 &mut pixmap,
                 scale,
@@ -561,6 +574,101 @@ impl App {
         self.page_loaded_with_behavior(url, page, NavigationBehavior::Auto);
     }
 
+    fn record_page_resources(&mut self, url: &str, page: &browser::Page) {
+        let Ok(base) = Url::parse(url) else {
+            return;
+        };
+        let document = html::parse_raw_html(page.html.clone());
+        let mut stylesheet_index = 0;
+        let mut script_index = 0;
+        let nodes = (0..)
+            .map(html::NodeID::new)
+            .map_while(|id| document.node(id).map(|node| (id, node)));
+        for (_id, node) in nodes {
+            let html::NodeKind::Element(element) = node.get_kind() else {
+                continue;
+            };
+            let attributes = element.get_attributes();
+            let resource = match element.get_name().as_str() {
+                "link"
+                    if attributes.iter().any(|attribute| {
+                        attribute.get_name().eq_ignore_ascii_case("rel")
+                            && attribute
+                                .get_value()
+                                .split_ascii_whitespace()
+                                .any(|value| value.eq_ignore_ascii_case("stylesheet"))
+                    }) =>
+                {
+                    let reference = attributes
+                        .iter()
+                        .find(|attribute| attribute.get_name().eq_ignore_ascii_case("href"))
+                        .map(|attribute| attribute.get_value().as_str());
+                    let loaded = stylesheet_index < page.stylesheets.len();
+                    stylesheet_index += 1;
+                    reference.map(|reference| {
+                        (
+                            reference,
+                            devtools::network::ResourceType::Stylesheet,
+                            loaded,
+                        )
+                    })
+                }
+                "style" => {
+                    let inline = format!("{url}#inline-style-{stylesheet_index}");
+                    stylesheet_index += 1;
+                    self.network_log
+                        .record(devtools::network::RequestEntry::new(
+                            inline,
+                            Some(200),
+                            devtools::network::ResourceType::Stylesheet,
+                            0,
+                        ));
+                    None
+                }
+                "script" => {
+                    let reference = attributes
+                        .iter()
+                        .find(|attribute| attribute.get_name().eq_ignore_ascii_case("src"))
+                        .map(|attribute| attribute.get_value().as_str());
+                    let loaded = script_index < page.scripts.len();
+                    script_index += 1;
+                    reference.map(|reference| {
+                        (reference, devtools::network::ResourceType::Script, loaded)
+                    })
+                }
+                _ => None,
+            };
+            let Some((reference, kind, loaded)) = resource else {
+                if element.get_name().as_str() == "script"
+                    && !attributes
+                        .iter()
+                        .any(|attribute| attribute.get_name().eq_ignore_ascii_case("src"))
+                {
+                    let inline = format!("{url}#inline-script-{}", script_index.saturating_sub(1));
+                    self.network_log
+                        .record(devtools::network::RequestEntry::new(
+                            inline,
+                            Some(200),
+                            devtools::network::ResourceType::Script,
+                            0,
+                        ));
+                }
+                continue;
+            };
+            let resolved = base
+                .join(reference)
+                .map(|resolved| resolved.to_string())
+                .unwrap_or_else(|_| reference.to_owned());
+            self.network_log
+                .record(devtools::network::RequestEntry::new(
+                    resolved,
+                    loaded.then_some(200),
+                    kind,
+                    0,
+                ));
+        }
+    }
+
     fn page_loaded_with_behavior(
         &mut self,
         url: &str,
@@ -571,6 +679,9 @@ impl App {
         // Elements is a document snapshot; never retain it across navigation.
         self.close_elements();
         self.loaded_page = Some(page);
+        if let Ok(mut console) = self.console.lock() {
+            console.clear();
+        }
         self.network_log
             .record(devtools::network::RequestEntry::new(
                 url,
@@ -578,8 +689,14 @@ impl App {
                 devtools::network::ResourceType::Document,
                 0,
             ));
+        if let Some(page) = self.loaded_page.clone() {
+            self.record_page_resources(url, &page);
+        }
         if let Some(panel) = &mut self.devtools_panel {
             panel.set_network(self.network_log.clone());
+            if let Ok(console) = self.console.lock() {
+                panel.set_console(console.clone());
+            }
         }
         self.find_reveal = self.find.is_some();
         // Scripts of the new document run after its first frame is presented.
@@ -722,6 +839,9 @@ impl App {
                     ));
                 if let Some(panel) = &mut self.devtools_panel {
                     panel.set_network(self.network_log.clone());
+                    if let Ok(console) = self.console.lock() {
+                        panel.set_console(console.clone());
+                    }
                 }
                 self.find_reveal = self.find.is_some();
                 self.scripts_evaluated = false;
@@ -998,11 +1118,17 @@ impl App {
         if let Some(find) = &mut self.find {
             find.focused = false;
         }
-        self.elements = Some(ElementsPanel::new(
-            self.loaded_page.as_ref().map(|page| page.html.as_str()),
-        ));
+        let live_html = self.page_events.snapshot_html();
+        let html = live_html
+            .as_deref()
+            .filter(|html| !html.is_empty())
+            .or_else(|| self.loaded_page.as_ref().map(|page| page.html.as_str()));
+        self.elements = Some(ElementsPanel::new(html));
         if let Some(panel) = &mut self.elements {
             panel.set_network(self.network_log.clone());
+            if let Ok(console) = self.console.lock() {
+                panel.set_console(console.clone());
+            }
         }
         self.resize_elements();
         self.chrome.address_focused = false;
@@ -1772,6 +1898,40 @@ impl ApplicationHandler<UserEvent> for App {
         {
             match event {
                 WindowEvent::CloseRequested => self.close_devtools_window(),
+                WindowEvent::KeyboardInput { event, .. }
+                    if event.state == ElementState::Pressed =>
+                {
+                    match event.logical_key {
+                        Key::Named(NamedKey::Escape) => self.close_devtools_window(),
+                        Key::Named(NamedKey::Delete) => {
+                            let tab = self.devtools_panel.as_ref().map(ElementsPanel::tab);
+                            match tab {
+                                Some(DockTab::Network) => self.network_log.clear(),
+                                Some(DockTab::Console) => {
+                                    if let Ok(mut console) = self.console.lock() {
+                                        console.clear();
+                                    }
+                                }
+                                _ => {}
+                            }
+                            if let Some(panel) = &mut self.devtools_panel {
+                                panel.clear_active();
+                            }
+                            if let Some(window) = &self.devtools_window {
+                                window.request_redraw();
+                            }
+                        }
+                        Key::Named(key) => {
+                            if let Some(panel) = &mut self.devtools_panel {
+                                panel.key(&key);
+                            }
+                            if let Some(window) = &self.devtools_window {
+                                window.request_redraw();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 WindowEvent::CursorMoved { position, .. } => {
                     if let Some(window) = &self.devtools_window {
                         let position = position.to_logical::<f64>(window.scale_factor());
@@ -2013,6 +2173,7 @@ impl ApplicationHandler<UserEvent> for App {
         });
         self.page_events.load_with_viewport(
             &page,
+            Arc::new(crate::content::DevtoolsConsole(Arc::clone(&self.console))),
             alerts,
             self.runtime.clone(),
             device_pixel_ratio,

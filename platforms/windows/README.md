@@ -27,3 +27,16 @@ session history without adding visits; tabs and the menu are still staged.
 Windows supplies the native titlebar, resize borders, and system window
 buttons. The normal window uses Windows' rounded frame, while a maximized
 window uses the system's square maximized frame.
+
+## Windows verification checklist
+
+- Resize the normal window and confirm the system frame remains rounded.
+- Maximize and restore it; maximized corners should be square and restored
+  corners should be rounded.
+- Visit two addresses, then verify Back and Forward enable and traverse them.
+- Use `Ctrl+R` and confirm Reload does not add another history visit.
+- Press `Ctrl+Shift+H`; switch Elements, Network, and Console, scroll each
+  view, press Delete to clear the active log, and press Escape to close.
+- Open DevTools again after navigation and confirm the live document and new
+  request/console entries are shown.
+- Repeat the checks at Windows display scaling above 100%.

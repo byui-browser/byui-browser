@@ -22,8 +22,8 @@ use storage::{
 use webapis::local_storage::register_local_storage;
 use webapis::{
     AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, register_alert,
-    register_document_with_location, register_fetch, register_location_with_navigation,
-    register_print, register_window_with_security_context,
+    register_console, register_document_with_location, register_fetch,
+    register_location_with_navigation, register_print, register_window_with_security_context,
     register_window_with_url_device_pixel_ratio_and_viewport,
 };
 
@@ -629,7 +629,8 @@ impl BrowserRuntime {
         let retained = document.clone();
         let mut realm = Realm::new();
         register_window_with_security_context(&mut realm, security_context.clone())?;
-        register_print(&mut realm, console)?;
+        register_print(&mut realm, Arc::clone(&console))?;
+        register_console(&mut realm, console)?;
         register_alert(&mut realm, alert_sink)?;
         register_fetch(&mut realm, controller)?;
         let initial_url = input
@@ -690,6 +691,11 @@ pub struct PageSession {
 }
 
 impl PageSession {
+    /// Returns the current live document serialization after script mutations.
+    pub fn document_html(&self) -> String {
+        self.document.inner_html()
+    }
+
     /// Updates the viewport's vertical scroll offset exposed as
     /// `window.scrollY` and `window.pageYOffset`.
     ///
