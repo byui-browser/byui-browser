@@ -149,6 +149,8 @@ struct App {
     proxy: Option<EventLoopProxy<UserEvent>>,
     /// Id of the newest navigation; results for older ids are ignored.
     navigation_id: u64,
+    /// Previous history state while a Back/Forward load is pending.
+    history_rollback: Option<chrome::BrowserState>,
     /// Independent sequence for the most recently started loading operation.
     loading_id: u64,
     navigation_loading: Option<(u64, u64)>,
@@ -298,6 +300,7 @@ impl App {
                 .ok(),
             proxy: None,
             navigation_id: 0,
+            history_rollback: None,
             loading_id: 0,
             navigation_loading: None,
             reload_completion: None,
@@ -468,7 +471,10 @@ impl App {
         match behavior {
             NavigationBehavior::Auto => self.browser_state.record_visit(url),
             NavigationBehavior::Replace => self.browser_state.replace_current(url),
-            NavigationBehavior::Reload => {}
+            NavigationBehavior::Reload | NavigationBehavior::History => {}
+        }
+        if behavior == NavigationBehavior::History {
+            self.history_rollback = None;
         }
         self.address = url.to_owned();
         self.address_before_edit = self.address.clone();
@@ -530,6 +536,9 @@ impl App {
     }
 
     fn start_navigation_with_behavior(&mut self, address: &str, behavior: NavigationBehavior) {
+        if behavior != NavigationBehavior::History {
+            self.history_rollback = None;
+        }
         self.navigation_id += 1;
         let id = self.navigation_id;
         let loading = self.begin_loading();
@@ -537,6 +546,11 @@ impl App {
             log::warn!("navigation to {address} unavailable: page loader is not running");
             self.finish_loading(loading);
             self.navigation_loading = None;
+            if behavior == NavigationBehavior::History {
+                if let Some(previous) = self.history_rollback.take() {
+                    self.browser_state = previous;
+                }
+            }
             return;
         };
         self.navigation_loading = Some((id, loading));
@@ -588,6 +602,11 @@ impl App {
                 self.page = None;
                 self.page_layout = None;
                 self.scroll_y = 0.0;
+                if behavior == NavigationBehavior::History {
+                    if let Some(previous) = self.history_rollback.take() {
+                        self.browser_state = previous;
+                    }
+                }
                 self.redraw();
             }
         }
@@ -763,7 +782,7 @@ impl App {
     }
 
     fn set_hovered(&mut self, hovered: Option<Control>) {
-        let hovered = hovered.filter(|control| control.is_enabled());
+        let hovered = hovered.filter(|control| control.is_enabled(&self.chrome));
         if self.chrome.hovered != hovered {
             log::trace!("hover changed: {hovered:?}");
             self.chrome.hovered = hovered;
@@ -1231,6 +1250,26 @@ impl App {
 
     fn activate(&mut self, control: Control) {
         match control {
+            Control::Back | Control::Forward => {
+                let can_move = match control {
+                    Control::Back => self.browser_state.can_go_back(),
+                    Control::Forward => self.browser_state.can_go_forward(),
+                    _ => false,
+                };
+                if !can_move {
+                    return;
+                }
+                let previous = self.browser_state.clone();
+                let address = match control {
+                    Control::Back => self.browser_state.go_back(),
+                    Control::Forward => self.browser_state.go_forward(),
+                    _ => None,
+                };
+                if let Some(address) = address {
+                    self.history_rollback = Some(previous);
+                    self.start_navigation_with_behavior(&address, NavigationBehavior::History);
+                }
+            }
             Control::Reload => {
                 log::debug!("reload requested");
                 log::debug!("toolbar action: reload");
@@ -1252,9 +1291,9 @@ impl App {
                 log::debug!("toolbar action: address");
                 self.begin_address_edit()
             }
-            // Navigation, tabs, and the menu are not
-            // implemented yet; these controls only give visual feedback.
-            Control::Back | Control::Forward | Control::NewTab | Control::Menu => {
+            // Tabs and the menu are not implemented yet; these controls only
+            // give visual feedback.
+            Control::NewTab | Control::Menu => {
                 log::debug!("toolbar action: {control:?} (not implemented)");
             }
         }
@@ -1265,6 +1304,8 @@ impl App {
             return;
         }
         self.ensure_welcome_loaded();
+        self.chrome.can_go_back = self.browser_state.can_go_back();
+        self.chrome.can_go_forward = self.browser_state.can_go_forward();
         let address = self.address.clone();
         let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
             return;

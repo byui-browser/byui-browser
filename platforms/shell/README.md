@@ -17,8 +17,9 @@ its drawing tests, so workspace checks pass everywhere.
 The shared app owns `chrome::BrowserState` and records a successful navigation
 after its document and resources load. The loaded document is retained
 separately from its rendered pixmap, so repainting, resizing, and Reload do not
-add visits. History lives in memory for this app session; Back and Forward are
-still disabled until the history controls are wired to navigation.
+add visits. History lives in memory for this app session; the toolbar Back and
+Forward controls traverse it without adding new visits. The context-menu rows
+remain disabled until they are wired to the same history service.
 
 The address field accepts the built-in `byui://welcome` page and HTTP/HTTPS
 addresses. Navigation runs through the browser loader on a background task,

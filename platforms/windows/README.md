@@ -21,8 +21,8 @@ interactive: click it or press `Ctrl+L`, edit text, press `Enter` to navigate,
 or `Escape` to cancel. HTTP and HTTPS addresses are loaded asynchronously
 through the browser loader, with a loading indicator and a built-in error page
 for failed requests. `Ctrl+R` reloads the current address without adding a
-history visit. Back and Forward remain disabled until the history controls are
-wired up; tabs and the menu are still staged.
+history visit. The toolbar Back and Forward buttons traverse successful
+session history without adding visits; tabs and the menu are still staged.
 
 Windows supplies the native titlebar, resize borders, and system window
 buttons. The normal window uses Windows' rounded frame, while a maximized
