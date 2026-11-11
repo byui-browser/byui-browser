@@ -18,6 +18,7 @@ mod fonts;
 mod geometry;
 mod inline;
 mod layout;
+mod radius;
 mod rectangle;
 mod style;
 mod tree;
@@ -25,6 +26,7 @@ mod tree;
 pub use fonts::{FontMetrics, VerticalMetrics};
 pub use geometry::{Edges, Rect, Sides, Size};
 pub use layout::layout_document;
+pub use radius::{BorderRadius, CornerRadii, CornerRadius, Corners, LengthPercentage};
 pub use rectangle::create_rectangle;
 pub use tree::{
     BoxKind, BoxStyle, InlineBoxFragment, LayoutBox, LayoutTree, LineBox, LineFragment, PaintItem,

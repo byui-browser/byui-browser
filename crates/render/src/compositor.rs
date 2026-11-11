@@ -56,6 +56,19 @@ impl Compositor {
                         }
                     }
                 }
+                DisplayItem::FillRoundedRect {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    radii,
+                    rgba,
+                } => self.fill_rounded_rect(
+                    &mut frame,
+                    [*left, *top, *right, *bottom],
+                    *radii,
+                    *rgba,
+                ),
                 DisplayItem::Text {
                     x,
                     baseline,
@@ -66,6 +79,132 @@ impl Compositor {
             }
         }
         frame
+    }
+
+    /// Fills the rectangle `[left, top, right, bottom]` (device pixels) with
+    /// elliptical corners. Pixels on a curve are blended by the fraction of
+    /// a 4x4 grid of samples that falls inside the shape.
+    fn fill_rounded_rect(
+        &self,
+        frame: &mut Frame,
+        [left, top, right, bottom]: [f32; 4],
+        radii: [[f32; 2]; 4],
+        rgba: [u8; 4],
+    ) {
+        log::trace!("fill rounded rect ({left}, {top})-({right}, {bottom}) radii {radii:?}");
+        if right <= left || bottom <= top {
+            return;
+        }
+        // Each corner as (center x, center y, radius x, radius y, which
+        // side of the center the curve is on).
+        let [tl, tr, br, bl] = radii;
+        let corners = [
+            (left + tl[0], top + tl[1], tl, -1.0, -1.0),
+            (right - tr[0], top + tr[1], tr, 1.0, -1.0),
+            (right - br[0], bottom - br[1], br, 1.0, 1.0),
+            (left + bl[0], bottom - bl[1], bl, -1.0, 1.0),
+        ];
+        let inside = |x: f32, y: f32| {
+            corners.iter().all(|&(cx, cy, [rx, ry], sx, sy)| {
+                let (dx, dy) = ((x - cx) * sx, (y - cy) * sy);
+                if rx <= 0.0 || ry <= 0.0 || dx <= 0.0 || dy <= 0.0 {
+                    return true;
+                }
+                (dx / rx).powi(2) + (dy / ry).powi(2) <= 1.0
+            })
+        };
+        let in_corner = |px: f32, py: f32| {
+            corners.iter().any(|&(cx, cy, [rx, ry], sx, sy)| {
+                rx > 0.0
+                    && ry > 0.0
+                    && (if sx < 0.0 { px < cx } else { px + 1.0 > cx })
+                    && (if sy < 0.0 { py < cy } else { py + 1.0 > cy })
+            })
+        };
+        let range = |start: f32, end: f32, limit: u32| {
+            start.floor().clamp(0.0, limit as f32) as u32
+                ..end.ceil().clamp(0.0, limit as f32) as u32
+        };
+        const SAMPLES: u32 = 4;
+        for py in range(top, bottom, self.height) {
+            for px in range(left, right, self.width) {
+                let (x, y) = (px as f32, py as f32);
+                let coverage = if in_corner(x, y) {
+                    let mut hits = 0;
+                    for sy in 0..SAMPLES {
+                        for sx in 0..SAMPLES {
+                            let sample_x = x + (sx as f32 + 0.5) / SAMPLES as f32;
+                            let sample_y = y + (sy as f32 + 0.5) / SAMPLES as f32;
+                            if (left..right).contains(&sample_x)
+                                && (top..bottom).contains(&sample_y)
+                                && inside(sample_x, sample_y)
+                            {
+                                hits += 1;
+                            }
+                        }
+                    }
+                    hits as f32 / (SAMPLES * SAMPLES) as f32
+                } else {
+                    let center = (x + 0.5, y + 0.5);
+                    if (left..right).contains(&center.0) && (top..bottom).contains(&center.1) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                };
+                let alpha = (coverage * f32::from(rgba[3])).round() as u8;
+                if alpha > 0 {
+                    self.put_pixel(frame, px, py, [rgba[0], rgba[1], rgba[2], alpha]);
+                }
+            }
+        }
+    }
+
+    /// Converts a paint rounded rectangle to a device-pixel
+    /// [`DisplayItem::FillRoundedRect`] at `scale` device pixels per CSS
+    /// pixel. Edges snap to device pixel boundaries like
+    /// [`DisplayItem::FillRect`] edges; radii shrink again if snapping made
+    /// the rectangle too small for them.
+    fn rounded_rect_item(
+        rect: &paint::Rect,
+        radii: &paint::CornerRadii,
+        color: &paint::Color,
+        scale: f32,
+    ) -> DisplayItem {
+        let edge = |value: f32| (value * scale).round();
+        let (left, top, right, bottom) = (
+            edge(rect.x),
+            edge(rect.y),
+            edge(rect.right()),
+            edge(rect.bottom()),
+        );
+        let mut radii = radii
+            .scaled(scale)
+            .into_array()
+            .map(|radius| [radius.horizontal, radius.vertical]);
+        let (width, height) = ((right - left).max(0.0), (bottom - top).max(0.0));
+        let fit = |length: f32, a: f32, b: f32| {
+            if a + b > length {
+                length / (a + b)
+            } else {
+                1.0
+            }
+        };
+        let factor = fit(width, radii[0][0], radii[1][0])
+            .min(fit(width, radii[3][0], radii[2][0]))
+            .min(fit(height, radii[0][1], radii[3][1]))
+            .min(fit(height, radii[1][1], radii[2][1]));
+        for radius in radii.iter_mut().flatten() {
+            *radius *= factor;
+        }
+        DisplayItem::FillRoundedRect {
+            left,
+            top,
+            right,
+            bottom,
+            radii,
+            rgba: [color.r, color.g, color.b, color.a],
+        }
     }
 
     /// Draws text by sampling each scaled glyph bitmap at device-pixel
@@ -173,6 +312,9 @@ impl Compositor {
                         rgba: [color.r, color.g, color.b, color.a],
                     })
                 }
+                paint::DisplayItem::FillRoundedRect { rect, radii, color } => {
+                    Some(Self::rounded_rect_item(rect, radii, color, 1.0))
+                }
                 paint::DisplayItem::Text {
                     x,
                     baseline,
@@ -235,6 +377,19 @@ impl Compositor {
                         for px in edge(rect.x, self.width)..edge(rect.right(), self.width) {
                             self.put_pixel(&mut frame, px, py, rgba);
                         }
+                    }
+                }
+                paint::DisplayItem::FillRoundedRect { rect, radii, color } => {
+                    if let DisplayItem::FillRoundedRect {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                        radii,
+                        rgba,
+                    } = Self::rounded_rect_item(rect, radii, color, scale)
+                    {
+                        self.fill_rounded_rect(&mut frame, [left, top, right, bottom], radii, rgba);
                     }
                 }
                 paint::DisplayItem::Text {
@@ -327,6 +482,60 @@ mod tests {
                 .chunks(4)
                 .all(|px| px == Compositor::CLEAR_COLOR)
         );
+    }
+
+    #[test]
+    fn rounded_rects_leave_corners_clear_and_fill_the_middle() {
+        let radius = paint::CornerRadius {
+            horizontal: 4.0,
+            vertical: 4.0,
+        };
+        let list = paint::DisplayList {
+            items: vec![paint::DisplayItem::FillRoundedRect {
+                rect: paint::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                },
+                radii: paint::CornerRadii::from_array([radius; 4]),
+                color: paint::Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+            }],
+        };
+        for scale in [1.0, 2.0] {
+            let size = (10.0 * scale) as u32;
+            let compositor = Compositor::new(size, size);
+            // `compose_paint_with_font` draws through the same helper, but
+            // needs a font file, so the scaled case calls it directly.
+            let frame = if scale == 1.0 {
+                compositor.compose_paint(&list)
+            } else {
+                let paint::DisplayItem::FillRoundedRect { rect, radii, color } = &list.items[0]
+                else {
+                    unreachable!()
+                };
+                compositor.compose(&[Compositor::rounded_rect_item(rect, radii, color, scale)])
+            };
+            let pixel = |x: u32, y: u32| {
+                let offset = ((y * size + x) * 4) as usize;
+                frame.pixels[offset..offset + 4].to_vec()
+            };
+            let last = size - 1;
+            for (x, y) in [(0, 0), (last, 0), (0, last), (last, last)] {
+                assert_eq!(pixel(x, y), Compositor::CLEAR_COLOR, "corner at {scale}x");
+            }
+            assert_eq!(pixel(size / 2, 0), [0, 0, 0, 255]);
+            assert_eq!(pixel(0, size / 2), [0, 0, 0, 255]);
+            assert_eq!(pixel(size / 2, size / 2), [0, 0, 0, 255]);
+            // A pixel the curve crosses is blended rather than hard-edged.
+            let edge = pixel(scale as u32, scale as u32);
+            assert!(edge[0] > 0 && edge[0] < 255, "anti-aliased edge {edge:?}");
+        }
     }
 
     #[test]

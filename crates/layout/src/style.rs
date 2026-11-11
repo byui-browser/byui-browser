@@ -2,7 +2,7 @@
 //!
 //! [`css::style_document`] produces cascaded, inherited declarations as text.
 //! This module parses `display`, box dimensions and edges, text colors, and
-//! the initial flex subset (`flex-direction`, `flex-grow`, and `gap`). Other
+//! `text-align`, `border-*-radius`, and the initial flex subset (`flex-direction`, `flex-grow`, and `gap`). Other
 //! properties use their initial values. A missing or unparsable value falls back to the initial
 //! value. Lengths are resolved to CSS pixels here; percentages are kept
 //! because they resolve against the containing block during layout.
@@ -10,7 +10,7 @@
 use css::values::{LengthContext, parse_length, parse_percentage};
 use css::{CssColor, Declaration};
 
-use crate::Sides;
+use crate::{BorderRadius, CornerRadius, Corners, LengthPercentage, Sides};
 
 /// The outer display type: how a box participates in its parent's formatting
 /// context (CSS Display 3 §2.1).
@@ -54,6 +54,44 @@ fn is_no_color_keyword(value: &str) -> bool {
     ["transparent", "inherit", "initial", "unset", "currentcolor"]
         .iter()
         .any(|keyword| value.eq_ignore_ascii_case(keyword))
+}
+
+/// Whether `value` is a CSS-wide keyword, which resolves to the initial value
+/// for non-inherited properties.
+fn is_css_wide_keyword(value: &str) -> bool {
+    ["inherit", "initial", "unset", "revert", "revert-layer"]
+        .iter()
+        .any(|keyword| value.eq_ignore_ascii_case(keyword))
+}
+
+/// Parses a `border-*-radius` longhand: one or two non-negative
+/// `<length-percentage>` values, horizontal then vertical. One value sets both.
+fn parse_corner_radius(
+    value: &str,
+    context: &LengthContext,
+) -> Option<CornerRadius<LengthPercentage>> {
+    let component = |part: &str| {
+        let parsed = match parse_percentage(part) {
+            Some(percent) => LengthPercentage::Percent(percent),
+            None => LengthPercentage::Px(parse_length(part)?.to_px(context)),
+        };
+        let (LengthPercentage::Px(amount) | LengthPercentage::Percent(amount)) = parsed;
+        (amount.is_finite() && amount >= 0.0).then_some(parsed)
+    };
+    match *value.split_ascii_whitespace().collect::<Vec<_>>() {
+        [both] => {
+            let radius = component(both)?;
+            Some(CornerRadius {
+                horizontal: radius,
+                vertical: radius,
+            })
+        }
+        [horizontal, vertical] => Some(CornerRadius {
+            horizontal: component(horizontal)?,
+            vertical: component(vertical)?,
+        }),
+        _ => None,
+    }
 }
 
 impl Display {
@@ -227,6 +265,74 @@ impl TextTransform {
     }
 }
 
+/// The `text-align` property: how inline content is placed within each line
+/// box (CSS Text 3 §7.1).
+///
+/// Text is always left-to-right today, so `start` behaves as `left` and `end`
+/// as `right`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TextAlign {
+    /// Aligned to the start edge of the line box.
+    #[default]
+    Start,
+    /// Aligned to the end edge of the line box.
+    End,
+    /// Aligned to the left edge.
+    Left,
+    /// Aligned to the right edge.
+    Right,
+    /// Centered in the line box.
+    Center,
+    /// Stretched to both edges by widening spaces, except on the last line
+    /// and lines ending in a forced break, which are start-aligned.
+    Justify,
+    /// Like `start` or `end`, but resolved against the parent's direction;
+    /// replaced with the parent's value when styles are resolved.
+    MatchParent,
+}
+
+impl TextAlign {
+    /// Parses a `text-align` value, returning `None` for invalid values.
+    /// The legacy `-webkit-` keywords map to their plain equivalents.
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "start" | "initial" | "unset" => Some(Self::Start),
+            "end" => Some(Self::End),
+            "left" | "-webkit-left" => Some(Self::Left),
+            "right" | "-webkit-right" => Some(Self::Right),
+            "center" | "-webkit-center" => Some(Self::Center),
+            "justify" => Some(Self::Justify),
+            "match-parent" | "inherit" => Some(Self::MatchParent),
+            _ => None,
+        }
+    }
+
+    /// The text-align computed for an element whose cascaded value is
+    /// `value`, falling back to `parent` for `match-parent` and to `start`
+    /// for invalid values.
+    pub(crate) fn compute(value: Option<&str>, parent: impl FnOnce() -> Self) -> Self {
+        match value.map(|value| (value, Self::parse(value.trim()))) {
+            None => Self::Start,
+            Some((_, Some(Self::MatchParent))) => parent(),
+            Some((_, Some(align))) => align,
+            Some((value, None)) => {
+                log::debug!("ignoring invalid text-align value {value:?}; using start");
+                Self::Start
+            }
+        }
+    }
+
+    /// The fraction of a line's free space placed before its content in a
+    /// left-to-right line: 0 for left, 0.5 for center, 1 for right.
+    pub(crate) fn offset_fraction(self) -> f32 {
+        match self {
+            Self::Start | Self::Left | Self::Justify | Self::MatchParent => 0.0,
+            Self::Center => 0.5,
+            Self::End | Self::Right => 1.0,
+        }
+    }
+}
+
 /// The values layout reads from one element's computed style.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ComputedStyle {
@@ -238,7 +344,9 @@ pub(crate) struct ComputedStyle {
     pub font_size: f32,
     pub color: CssColor,
     pub text_transform: TextTransform,
+    pub text_align: TextAlign,
     pub background_color: Option<CssColor>,
+    pub border_radius: BorderRadius,
     pub flex_column: bool,
     pub flex_grow: f32,
     pub gap: f32,
@@ -246,7 +354,8 @@ pub(crate) struct ComputedStyle {
 
 impl ComputedStyle {
     /// The style of a box with no element: initial values for every property,
-    /// with inherited properties (`color`, `font-size`, and `text-transform`) taken from
+    /// with inherited properties (`color`, `font-size`, `text-transform`, and
+    /// `text-align`) taken from
     /// `parent` when given.
     ///
     /// Anonymous boxes use this (CSS 2.2 §9.2.1.1), as does the initial
@@ -271,7 +380,9 @@ impl ComputedStyle {
                 |parent| parent.color,
             ),
             text_transform: parent.map_or(TextTransform::None, |parent| parent.text_transform),
+            text_align: parent.map_or(TextAlign::Start, |parent| parent.text_align),
             background_color: None,
+            border_radius: BorderRadius::default(),
             flex_column: false,
             flex_grow: 0.0,
             gap: 0.0,
@@ -281,10 +392,13 @@ impl ComputedStyle {
     /// Builds the style of an element from its computed declarations.
     ///
     /// `root_font_size` resolves `rem`; `viewport` resolves viewport units.
+    /// `parent_text_align` supplies the parent's computed `text-align` for
+    /// `match-parent`; it is only called when needed.
     pub(crate) fn from_declarations(
         declarations: &[Declaration],
         root_font_size: f32,
         viewport: crate::Size,
+        parent_text_align: impl FnOnce() -> TextAlign,
     ) -> Self {
         let get = |property: &str| {
             declarations
@@ -322,6 +436,7 @@ impl ComputedStyle {
                 None => log::debug!("ignoring unsupported text-transform value {value:?}"),
             }
         }
+        style.text_align = TextAlign::compute(get("text-align"), parent_text_align);
         if let Some(value) = get("background-color") {
             style.background_color = css::parse_color(value);
             if style.background_color.is_none() && !is_no_color_keyword(value) {
@@ -380,6 +495,20 @@ impl ComputedStyle {
         style.padding = side("padding", false, false);
         style.width = dimension("width", true, false).unwrap_or(Dimension::Auto);
         style.height = dimension("height", true, false).unwrap_or(Dimension::Auto);
+        style.border_radius = Corners::from_array(
+            ["top-left", "top-right", "bottom-right", "bottom-left"].map(|corner| {
+                let property = format!("border-{corner}-radius");
+                get(&property)
+                    .and_then(|value| {
+                        let radius = parse_corner_radius(value, &context);
+                        if radius.is_none() && !is_css_wide_keyword(value) {
+                            log::debug!("ignoring invalid {property} value {value:?}; using 0");
+                        }
+                        radius
+                    })
+                    .unwrap_or_default()
+            }),
+        );
         style.gap = get("gap")
             .and_then(|value| parse_length(value).map(|length| length.to_px(&context)))
             .filter(|value| value.is_finite() && *value >= 0.0)
@@ -408,7 +537,33 @@ mod tests {
                 width: 800.0,
                 height: 600.0,
             },
+            || TextAlign::Right,
         )
+    }
+
+    #[test]
+    fn text_align_parses_keywords_and_match_parent() {
+        assert_eq!(style(&[]).text_align, TextAlign::Start);
+        assert_eq!(
+            style(&[("text-align", "CENTER")]).text_align,
+            TextAlign::Center
+        );
+        assert_eq!(
+            style(&[("text-align", "-webkit-right")]).text_align,
+            TextAlign::Right
+        );
+        assert_eq!(
+            style(&[("text-align", "justify")]).text_align,
+            TextAlign::Justify
+        );
+        assert_eq!(
+            style(&[("text-align", "match-parent")]).text_align,
+            TextAlign::Right
+        );
+        assert_eq!(
+            style(&[("text-align", "middle")]).text_align,
+            TextAlign::Start
+        );
     }
 
     #[test]
@@ -454,6 +609,34 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn border_radius_longhands_parse_lengths_and_percentages() {
+        let style = style(&[
+            ("font-size", "10px"),
+            ("border-top-left-radius", "3px"),
+            ("border-top-right-radius", "1em 50%"),
+            ("border-bottom-right-radius", "-2px"),
+            ("border-bottom-left-radius", "inherit"),
+        ]);
+        let radius = style.border_radius;
+        assert_eq!(
+            radius.top_left,
+            CornerRadius {
+                horizontal: LengthPercentage::Px(3.0),
+                vertical: LengthPercentage::Px(3.0)
+            }
+        );
+        assert_eq!(
+            radius.top_right,
+            CornerRadius {
+                horizontal: LengthPercentage::Px(10.0),
+                vertical: LengthPercentage::Percent(50.0)
+            }
+        );
+        assert_eq!(radius.bottom_right, CornerRadius::default());
+        assert_eq!(radius.bottom_left, CornerRadius::default());
     }
 
     #[test]

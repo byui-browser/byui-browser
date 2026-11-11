@@ -84,7 +84,7 @@ fn nested_element_text_is_painted_once() {
         .into_iter()
         .filter_map(|item| match item {
             paint::DisplayItem::Text { text, .. } => Some(text),
-            paint::DisplayItem::FillRect { .. } => None,
+            _ => None,
         })
         .collect::<Vec<_>>();
 

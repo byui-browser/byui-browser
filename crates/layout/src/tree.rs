@@ -6,18 +6,21 @@
 use css::CssColor;
 use html::NodeID;
 
-use crate::{Edges, Rect};
+use crate::{BorderRadius, Edges, Rect};
 
 /// Paint-relevant computed values for a box or inline box fragment.
 ///
-/// Only colors are painted today; borders and other decorations are not
-/// supported yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Colors and corner radii are painted today; borders and other decorations
+/// are not supported yet.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BoxStyle {
     /// The background color, or `None` when it is transparent or unsupported.
     pub background_color: Option<CssColor>,
     /// The computed `color`, used for text.
     pub text_color: CssColor,
+    /// The computed `border-*-radius` values. The background is clipped to
+    /// the rounded border box; resolve them with [`BorderRadius::resolve`].
+    pub border_radius: BorderRadius,
 }
 
 impl Default for BoxStyle {
@@ -26,6 +29,7 @@ impl Default for BoxStyle {
             background_color: None,
             text_color: css::user_agent_default_color("color")
                 .expect("user-agent stylesheet must define html color"),
+            border_radius: BorderRadius::default(),
         }
     }
 }

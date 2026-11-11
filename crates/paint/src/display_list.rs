@@ -1,6 +1,6 @@
 //! Display-list commands.
 
-use crate::{Color, PaintBox, Rect};
+use crate::{Color, CornerRadii, PaintBox, Rect};
 
 /// One ordered drawing command. Coordinates are CSS pixels.
 #[derive(Debug, Clone, PartialEq)]
@@ -9,6 +9,17 @@ pub enum DisplayItem {
     FillRect {
         /// Rectangle to fill.
         rect: Rect,
+        /// Opaque or translucent fill color.
+        color: Color,
+    },
+    /// Fills a rectangle with elliptical corners with an RGBA color.
+    ///
+    /// Painted for backgrounds of boxes with a non-zero `border-radius`.
+    FillRoundedRect {
+        /// Bounding rectangle to fill.
+        rect: Rect,
+        /// Corner radii in CSS pixels, already reduced to fit `rect`.
+        radii: CornerRadii,
         /// Opaque or translucent fill color.
         color: Color,
     },
