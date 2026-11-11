@@ -57,16 +57,19 @@ pub trait FetchServices: Send + Sync {
 
     /// Returns browser-owned request headers for one validated transport hop.
     ///
-    /// These values are merged into an internal transport-only channel after
-    /// Fetch-owned headers are derived. The default is empty for standalone
-    /// consumers; browser implementations can provide destination, language,
-    /// identity, and Fetch Metadata headers here.
+    /// These values are merged into an internal transport-only channel before
+    /// CORS-preflight calculation and after Fetch-owned headers are derived.
+    /// The default is empty for standalone consumers; browser implementations
+    /// can provide destination, language, identity, and Fetch Metadata headers
+    /// here. Use [`Headers::generated_request_headers`] for forbidden
+    /// browser-owned names such as `Sec-Fetch-*`; Fetch-owned `Origin`,
+    /// referrer, body, cookie, and preflight fields are rejected.
     fn generated_request_headers(
         &self,
         _request: &Request,
         _target: &Url,
     ) -> Result<Headers, RequestError> {
-        Ok(Headers::new())
+        Ok(Headers::generated_request_headers())
     }
 
     /// Returns the cookie header selected by storage and security policy.

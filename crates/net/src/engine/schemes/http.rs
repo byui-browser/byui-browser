@@ -31,7 +31,10 @@ impl RequestController {
                 self.authorize_redirect_hop(&request)?;
             }
             request.reduce_referrer_for_target(&url);
-            self.ensure_cors_preflight(&request, &url).await?;
+            let (mut transport_headers, generated_headers) =
+                self.transport_headers(&request, &url)?;
+            self.ensure_cors_preflight(&request, &url, &generated_headers)
+                .await?;
 
             let cacheable = request.is_cacheable_method();
             let cache_lookup = match request.cache_mode {
@@ -91,11 +94,6 @@ impl RequestController {
                 }
             }
 
-            let mut transport_headers = request.fetch_headers(&url)?;
-            if let Some(services) = &self.inner.services {
-                let generated = services.generated_request_headers(&request, &url)?;
-                transport_headers.merge_internal_headers(&generated)?;
-            }
             if request.credentials_allowed(&url)
                 && let Some(services) = &self.inner.services
                 && let Some(cookie) = services.cookie_header(&request)?
@@ -284,6 +282,23 @@ impl RequestController {
             services.check_request(request)?;
         }
         Ok(())
+    }
+
+    /// Builds all non-credential request headers once for a validated hop.
+    fn transport_headers(
+        &self,
+        request: &Request,
+        url: &reqwest::Url,
+    ) -> Result<(crate::Headers, crate::Headers), RequestError> {
+        let mut headers = request.fetch_headers(url)?;
+        let generated = if let Some(services) = &self.inner.services {
+            let generated = services.generated_request_headers(request, url)?;
+            headers.merge_generated_request_headers(&generated)?;
+            generated
+        } else {
+            crate::Headers::generated_request_headers()
+        };
+        Ok((headers, generated))
     }
 
     /// Copies controller redirect state into a transport or cached response.

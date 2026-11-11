@@ -8,6 +8,7 @@ use crate::{
     HeaderGuard, Headers,
     api::{
         error::RequestError,
+        headers::cors_unsafe_request_header_names,
         request::{
             CacheMode, CredentialsMode, PreparedRequest, RedirectMode, Request, RequestMode,
         },
@@ -22,16 +23,23 @@ impl RequestController {
         &self,
         request: &Request,
         url: &reqwest::Url,
+        generated_headers: &Headers,
     ) -> Result<(), RequestError> {
+        let mut unsafe_names = request.cors_unsafe_header_names()?;
+        for name in cors_unsafe_request_header_names(generated_headers) {
+            if !unsafe_names.contains(&name) {
+                unsafe_names.push(name);
+            }
+        }
+        unsafe_names.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         if request.context.mode != RequestMode::Cors
             || request.effective_origin().is_none()
             || request.has_same_origin_target(url)
-            || !request.requires_cors_preflight()?
+            || (!request.requires_cors_preflight()? && unsafe_names.is_empty())
         {
             return Ok(());
         }
 
-        let unsafe_names = request.cors_unsafe_header_names()?;
         if self
             .inner
             .preflight_cache
@@ -115,7 +123,6 @@ impl RequestController {
         if request.context.mode == RequestMode::Cors
             && request.effective_origin().is_some()
             && !request.has_same_origin_target(url)
-            && request.requires_cors_preflight().unwrap_or(false)
         {
             self.inner.preflight_cache.clear_for_request(request, url);
         }

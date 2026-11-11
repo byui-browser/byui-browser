@@ -53,6 +53,53 @@ impl FetchServices for TestServices {
     }
 }
 
+/// Browser services that add a forbidden Fetch Metadata field per HTTP hop.
+struct MetadataServices;
+
+impl FetchServices for MetadataServices {
+    fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
+        Ok(())
+    }
+
+    fn check_response(
+        &self,
+        _request: &Request,
+        _response: &ResponseInfo,
+    ) -> Result<(), RequestError> {
+        Ok(())
+    }
+
+    fn generated_request_headers(
+        &self,
+        _request: &Request,
+        _target: &net::Url,
+    ) -> Result<net::Headers, RequestError> {
+        let mut headers = net::Headers::generated_request_headers();
+        headers.set_str("sec-fetch-mode", "cors")?;
+        Ok(headers)
+    }
+
+    fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
+        Ok(None)
+    }
+
+    fn store_set_cookie(
+        &self,
+        _request: &Request,
+        _values: &[HeaderValue],
+    ) -> Result<(), RequestError> {
+        Ok(())
+    }
+
+    fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
+        Ok(ServiceWorkerDecision::Network)
+    }
+
+    fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
+        Ok("metadata-preflight".into())
+    }
+}
+
 /// Services that prove cookies are reserved for the original credentialed request.
 struct CookieServices;
 
@@ -197,6 +244,45 @@ fn unsafe_request_sends_preflight_before_the_original_request() {
     let response = runtime()
         .block_on(controller().fetch(request(server.url())))
         .unwrap();
+    assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
+    server.join();
+    assert_eq!(sequence.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn browser_generated_headers_participate_in_cors_preflight() {
+    let sequence = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&sequence);
+    let server = TestServer::start(2, move |request| {
+        let index = observed.fetch_add(1, Ordering::SeqCst);
+        if index == 0 {
+            assert!(request.starts_with("OPTIONS / HTTP"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("access-control-request-headers: sec-fetch-mode")
+            );
+            b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: https://client.test\r\nAccess-Control-Allow-Headers: sec-fetch-mode\r\nConnection: close\r\n\r\n".to_vec()
+        } else {
+            assert!(request.starts_with("GET / HTTP"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("sec-fetch-mode: cors")
+            );
+            b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: https://client.test\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+        }
+    });
+    let mut request = Request::get(server.url());
+    request.set_environment(
+        FetchEnvironment::from_url(reqwest::Url::parse("https://client.test/").unwrap()).unwrap(),
+    );
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(Arc::new(MetadataServices))
+        .build()
+        .unwrap();
+
+    let response = runtime().block_on(controller.fetch(request)).unwrap();
     assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
     server.join();
     assert_eq!(sequence.load(Ordering::SeqCst), 2);

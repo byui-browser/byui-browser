@@ -83,6 +83,17 @@ impl Headers {
         }
     }
 
+    /// Creates a header collection for browser-owned generated request fields.
+    ///
+    /// This constructor is intended for [`crate::FetchServices`] implementations
+    /// that generate headers such as Fetch Metadata fields, which ordinary
+    /// callers are forbidden from setting. The controller accepts this list
+    /// only through its internal transport channel and protects Fetch-owned
+    /// `Origin`, referrer, body, cookie, and preflight fields from replacement.
+    pub fn generated_request_headers() -> Self {
+        Self::with_guard(HeaderGuard::None)
+    }
+
     /// Returns the current mutation guard.
     pub fn guard(&self) -> HeaderGuard {
         self.guard
@@ -287,9 +298,16 @@ impl Headers {
         Ok(())
     }
 
-    /// Merges engine-owned headers into the internal transport channel.
-    pub(crate) fn merge_internal_headers(&mut self, headers: &Self) -> Result<(), RequestError> {
+    /// Merges browser-generated fields while retaining Fetch ownership of
+    /// request metadata and preflight fields.
+    pub(crate) fn merge_generated_request_headers(
+        &mut self,
+        headers: &Self,
+    ) -> Result<(), RequestError> {
         for (name, value) in headers.iter_raw() {
+            if is_fetch_owned_generated_header(name) {
+                return Err(RequestError::ForbiddenHeader(name.as_str().to_owned()));
+            }
             self.insert_internal_header(name.clone(), value.clone())?;
         }
         Ok(())
@@ -324,4 +342,18 @@ impl Headers {
         }
         combined
     }
+}
+
+/// Reports whether Fetch, rather than browser identity policy, owns a field.
+fn is_fetch_owned_generated_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "origin"
+            | "referer"
+            | "cookie"
+            | "content-type"
+            | "content-length"
+            | "access-control-request-headers"
+            | "access-control-request-method"
+    )
 }

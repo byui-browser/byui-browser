@@ -43,8 +43,8 @@ provider helper already removed.
 With the current browser/provider slice complete, the next work should be
 sequenced as follows:
 
-1. Complete the remaining user-agent header algorithms around the implemented
-   request-tainting and per-hop CORS preflight boundaries.
+1. Wire browser identity, language, and Fetch Metadata policy into the
+   completed per-hop generated-header and CORS-preflight boundary.
 2. Replace the browser's no-op `FetchServices` defaults with origin-aware
    cookies, service-worker decisions, and security-policy checks.
 3. Expand the process-local cache into a standards-aware, partitioned cache
@@ -78,6 +78,11 @@ with the browser-lifecycle work in step 3.
 - Redirect rewrites remove the complete request-body header set, and referrer
   reduction is monotonic so a later policy cannot restore previously removed
   URL detail.
+- Browser-generated request headers are assembled once per validated HTTP hop,
+  cannot replace Fetch-owned origin, referrer, body, cookie, or preflight
+  fields, and contribute CORS-unsafe names to the preflight request. This
+  keeps redirect tainting and per-hop CORS approval aligned with the headers
+  that reach transport.
 - Destination-specific browser identity/language and Fetch Metadata headers,
   plus provider-owned cookie and authentication behavior, remain browser
   integrations in step 3 rather than CORS algorithm gaps in `net`.

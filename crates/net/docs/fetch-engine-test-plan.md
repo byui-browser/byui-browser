@@ -134,8 +134,10 @@ have unit coverage, while a configured zero cap is also exercised end to end.
 A 302 POST-to-GET rewrite proves that removed body metadata does not cause an
 unnecessary target preflight.
 
-Generated request-header coverage now includes the service-owned per-hop hook;
-remaining browser tests should verify destination, language, identity, and
+Generated request-header coverage now includes the service-owned per-hop hook
+and verifies that a forbidden Fetch Metadata field is named in
+`Access-Control-Request-Headers` before it reaches a cross-origin target.
+Remaining browser tests should verify destination, language, identity, and
 Fetch Metadata values plus their redirect-time regeneration or removal.
 `fetch` retains typed Rust errors for diagnostics, while `fetch_response`
 provides the response-shaped network-error boundary.
