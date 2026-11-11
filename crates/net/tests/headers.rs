@@ -108,7 +108,7 @@ fn generated_request_header_channels_do_not_mutate_caller_headers() {
             _request: &Request,
             _target: &net::Url,
         ) -> Result<net::Headers, RequestError> {
-            net::Headers::try_from_strings([("x-generated", "per-hop")])
+            net::Headers::try_from_strings([("accept-language", "en-US")])
         }
 
         fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
@@ -140,7 +140,7 @@ fn generated_request_header_channels_do_not_mutate_caller_headers() {
         assert!(wire_request.contains("referer: http://client.test/source"));
         assert!(wire_request.contains("cookie: sid=internal"));
         assert!(wire_request.contains("content-type: text/plain;charset=UTF-8"));
-        assert!(wire_request.contains("x-generated: per-hop"));
+        assert!(wire_request.contains("accept-language: en-US"));
         b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: http://client.test\r\nAccess-Control-Allow-Credentials: true\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
     });
     let mut request = Request::new(server.url(), "POST").unwrap();
