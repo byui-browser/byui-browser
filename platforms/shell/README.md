@@ -14,27 +14,25 @@ much of the toolbar's left edge the system's window buttons cover) and calls
 On operating systems without a supported shell the crate still builds and runs
 its drawing tests, so workspace checks pass everywhere.
 
-The shared app owns `chrome::BrowserState` and records `byui://welcome` once
-its document and resources load successfully. The loaded document is retained
-separately from its rendered pixmap, so repainting, resizing, and the current
-Reload action do not add visits. History lives in memory for this app session;
-there is no history UI or persistence yet.
+The shared app owns `chrome::BrowserState` and records a successful navigation
+after its document and resources load. The loaded document is retained
+separately from its rendered pixmap, so repainting, resizing, and Reload do not
+add visits. History lives in memory for this app session; Back and Forward are
+still disabled until the history controls are wired to navigation.
 
-Future successful navigation should pass its loaded document and URL through
-`App::page_loaded`. Navigation itself is not implemented, and the current
-renderer still supports only the welcome demo. Reload fetches the saved current URL on a background task and prints its URL,
-status, and response body (or an error) to the launching terminal. It bypasses
-the HTTP response cache and leaves the displayed document and history unchanged.
-Internal `byui://welcome` uses the embedded page provider, not HTTP or disk.
-HTTP and HTTPS use the Networking team's transport; address editing and navigation
-remain staged, so the current UI refreshes the welcome page.
+The address field accepts the built-in `byui://welcome` page and HTTP/HTTPS
+addresses. Navigation runs through the browser loader on a background task,
+shows a loading indicator, and replaces the page with the loaded document or a
+built-in error page. Reload fetches the current address again, bypasses the
+response cache, and preserves history. Internal `byui://welcome` uses the
+embedded page provider, not HTTP or disk.
 
 The address field is an editable shell surface: click it or press `Ctrl+L`,
-use normal text editing plus Backspace, press Enter to submit, or Escape to
-restore the previous value. `Ctrl+R` triggers the existing repaint-only Reload
-action. Submitted HTTP and HTTPS URLs stay visible but do not claim a
-successful navigation until the renderer can load them. Tabs, Back, Forward,
-and the menu remain staged until the corresponding browser services exist.
+use normal text editing plus Backspace, press Enter to navigate, or Escape to
+restore the previous value. `Ctrl+R` triggers Reload. Submitted HTTP and HTTPS
+URLs remain in the address field while loading and are replaced by the loaded
+page or an error page when the request completes. Tabs, Back, Forward, and the
+menu remain staged until their browser services exist.
 
 Run `cargo test -p browser refresh::tests` to verify fresh HTTP requests,
 internal pages, saved URLs, error reporting, and unchanged history.

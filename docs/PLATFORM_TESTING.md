@@ -12,5 +12,7 @@ For every shell, confirm the welcome page renders, Reload responds, disabled
 Back and Forward do not drag or maximize the window, and the address field
 shows the text cursor when hovered. Click the address field or press `Ctrl+L`
 to focus and select it, type replacement text, verify Backspace and Escape,
-and confirm Enter submits the built-in `byui://welcome` URL. Unsupported URLs
-must remain visible without claiming a successful navigation.
+and confirm Enter navigates to the built-in `byui://welcome` URL. Submit an
+HTTP or HTTPS URL and verify the loading indicator, successful page display,
+and built-in error page behavior for a failed request. The submitted address
+must remain visible while loading and after a failed navigation.
