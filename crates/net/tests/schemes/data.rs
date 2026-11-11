@@ -190,7 +190,7 @@ fn data_no_cors_responses_use_the_existing_opaque_filter() {
 }
 
 #[test]
-fn cors_mode_rejects_an_opaque_data_origin_for_a_tuple_client() {
+fn cors_mode_rejects_an_opaque_data_origin_before_response_policy_or_exposure() {
     let (controller, services) = controller_with_services_and_providers();
     let mut request = Request::get("data:text/plain,private");
     request.set_environment(
@@ -204,6 +204,12 @@ fn cors_mode_rejects_an_opaque_data_origin_for_a_tuple_client() {
     assert_eq!(
         services
             .cookie_lookups
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        services
+            .response_checks
             .load(std::sync::atomic::Ordering::SeqCst),
         0
     );

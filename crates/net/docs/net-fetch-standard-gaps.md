@@ -149,11 +149,13 @@ cookie/cache exclusion, and response filtering. The current local-scheme
 handlers all have focused response and lifecycle coverage; browser-owned file
 access remains deliberately restricted to authorized top-level navigation.
 
-**Required work:** add defense-in-depth conformance tests for local-origin,
-stream-failure, and unusual redirecting cross-origin requests. Shared response
-finalization, fail-closed provider-origin validation, and the net-owned CORS
-algorithms are implemented. Browser identity/language, Fetch Metadata, cookies,
-and authentication remain browser integrations rather than CORS gaps.
+Focused conformance coverage now verifies that an opaque local `data:` origin
+is rejected before response policy or exposure, a CORS-approved response keeps
+a later body-stream failure typed, and a redirect target that denies preflight
+never receives the actual request. Shared response finalization, fail-closed
+provider-origin validation, and the net-owned CORS algorithms are implemented.
+Browser identity/language, Fetch Metadata, cookies, and authentication remain
+browser integrations rather than CORS gaps.
 
 ### 6. Redirect handling
 

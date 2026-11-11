@@ -491,6 +491,33 @@ fn unsafe_redirect_target_receives_its_own_preflight() {
 }
 
 #[test]
+fn denied_later_redirect_preflight_never_sends_the_target_request() {
+    let target = TestServer::start(1, |request| {
+        assert!(request.starts_with("OPTIONS / HTTP"));
+        b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: null\r\nAccess-Control-Allow-Methods: DELETE\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nConnection: close\r\n\r\n".to_vec()
+    });
+    let target_url = target.url();
+    let source = TestServer::start(2, move |request| {
+        if request.starts_with("OPTIONS ") {
+            b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: https://client.test\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: content-type, x-example\r\nConnection: close\r\n\r\n".to_vec()
+        } else {
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target_url}\r\nAccess-Control-Allow-Origin: https://client.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        }
+    });
+
+    let error = runtime()
+        .block_on(controller().fetch(request(source.url())))
+        .unwrap_err();
+
+    source.join();
+    target.join();
+    assert!(matches!(error, RequestError::CorsDenied));
+}
+
+#[test]
 fn a_tainted_redirect_chain_preflights_each_target_with_null_origin() {
     let final_target = TestServer::start(2, |request| {
         assert!(

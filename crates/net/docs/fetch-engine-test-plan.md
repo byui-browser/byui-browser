@@ -134,6 +134,11 @@ have unit coverage, while a configured zero cap is also exercised end to end.
 A 302 POST-to-GET rewrite proves that removed body metadata does not cause an
 unnecessary target preflight.
 
+The CORS suite also verifies that an opaque local `data:` origin is rejected
+before response policy or exposure, a CORS-approved response keeps a later
+body-stream failure typed, and a later redirect target that denies preflight
+never receives its actual request.
+
 Generated request-header coverage now includes the service-owned per-hop hook
 and verifies that a forbidden Fetch Metadata field is named in
 `Access-Control-Request-Headers` before it reaches a cross-origin target.
@@ -146,11 +151,6 @@ Remaining CORS tests are defense-in-depth rather than missing algorithms:
 
 - End-to-end permission-key isolation across origins, URL paths, network
   partitions, and credential modes (the cache has direct unit coverage).
-- A later redirect-hop preflight denial proving that the target's actual
-  request and every subsequent hop remain unsent.
-- Network/body-stream error paths asserting that public responses never expose
-  forbidden headers and matching preflight permissions are invalidated where
-  the architecture can still observe the failure.
 - Response-shaped network errors for transport, CORS, redirect, provider, and
   cache-only failures, with abort remaining distinguishable and body-stream
   failures remaining errors on the delivered body.
