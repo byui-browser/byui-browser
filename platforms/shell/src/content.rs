@@ -440,6 +440,7 @@ impl PageEvents {
     /// Replaces the live document and exposes `device_pixel_ratio` and
     /// `viewport` (CSS pixels) to page scripts. `Location` navigation
     /// requests from the page are passed to `navigate` on the session thread.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn load_with_viewport(
         &self,
         page: &Page,

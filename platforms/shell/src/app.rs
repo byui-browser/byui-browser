@@ -780,10 +780,10 @@ impl App {
             log::warn!("navigation to {address} unavailable: page loader is not running");
             self.finish_loading(loading);
             self.navigation_loading = None;
-            if behavior == NavigationBehavior::History {
-                if let Some(previous) = self.history_rollback.take() {
-                    self.browser_state = previous;
-                }
+            if behavior == NavigationBehavior::History
+                && let Some(previous) = self.history_rollback.take()
+            {
+                self.browser_state = previous;
             }
             return;
         };
@@ -849,10 +849,10 @@ impl App {
                 self.page = None;
                 self.page_layout = None;
                 self.scroll_y = 0.0;
-                if behavior == NavigationBehavior::History {
-                    if let Some(previous) = self.history_rollback.take() {
-                        self.browser_state = previous;
-                    }
+                if behavior == NavigationBehavior::History
+                    && let Some(previous) = self.history_rollback.take()
+                {
+                    self.browser_state = previous;
                 }
                 self.redraw();
             }

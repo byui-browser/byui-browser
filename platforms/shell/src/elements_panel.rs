@@ -563,6 +563,7 @@ impl ElementsPanel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_network(
         &self,
         frame: &mut Pixmap,
@@ -655,6 +656,7 @@ impl ElementsPanel {
         self.draw_header(frame, s, dark, None, font);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_console(
         &self,
         frame: &mut Pixmap,
