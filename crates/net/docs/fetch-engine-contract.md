@@ -120,7 +120,7 @@ work.
   and a response-header observation hook. `Set-Cookie` reaches only that
   trusted interface. Credential mode still decides whether the engine calls
   its credential methods.
-- CORS preflight, integrity, navigation fetch, keepalive lifetime, nondefault
+- Integrity, navigation fetch, keepalive lifetime, nondefault
   priority scheduling, and cache revalidation fail with `UnsupportedFeature`.
   Manual/error redirect modes are handled by the controller. A service-worker
   `Intercept` decision also
@@ -134,9 +134,15 @@ work.
 - `Default`, `NoStore`, `Reload`, `ForceCache`, and `OnlyIfCached` retain their
   documented process-local cache subset; `NoCache` fails until revalidation
   exists. Browser service providers choose the partition key. This cache is
-  neither durable nor a full Fetch HTTP cache.
-- Cache-only misses surface as Fetch network errors. Body stream transport
-  errors and aborts retain separate typed errors.
+  neither durable nor a full Fetch HTTP cache. Successful responses with a
+  positive `Cache-Control: max-age` are stored by method, normalized URL,
+  and partition; response `Vary` fields select among request-header variants,
+  and `Vary: *` responses are not stored. Cache hits still pass through the
+  normal response finalization and filtering path.
+- Cache-only misses and other pre-exposure failures can surface through
+  `RequestController::fetch_response` as Fetch network errors. Body stream
+  transport errors and aborts retain separate typed errors; `fetch` preserves
+  all typed Rust failures for callers that need diagnostics.
 
 `storage` owns durable cookie and cache data and network partition state.
 `security` owns cookie, CSP, mixed-content, CORP, MIME, authentication, and

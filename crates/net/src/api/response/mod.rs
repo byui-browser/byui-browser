@@ -1,10 +1,12 @@
 //! Response types returned by the networking client.
 
+mod exposure;
+mod internal;
+mod providers;
 mod types;
-mod view;
 
+pub(crate) use internal::InternalResponse;
 pub use types::{Response, ResponseType};
-pub(crate) use view::InternalResponse;
 
 /// Returns whether Fetch requires a response body to be null for this exchange.
 pub(crate) fn has_null_body(method: &http::Method, status: reqwest::StatusCode) -> bool {
@@ -255,3 +257,6 @@ mod tests {
         assert!(!response.has_body());
     }
 }
+
+#[cfg(test)]
+mod provider_tests;

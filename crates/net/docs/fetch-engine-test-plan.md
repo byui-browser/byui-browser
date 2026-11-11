@@ -1,6 +1,6 @@
 # Net crate test plan
 
-Status as of 2026-11-03: the current body, request, header, response, cache, redirect,
+Status as of 2026-11-10: the current body, request, header, response, cache, redirect,
 streaming, scheduler, and scheme-handler regression suites pass. The first
 body API/lifecycle test slice is now covered, including constructor metadata,
 URL-encoded and ArrayBuffer consumption, equality/debug state, one-shot
@@ -109,11 +109,51 @@ coverage, without adding browser composition requirements to this slice.
 
 ### 3. CORS and response filtering
 
-Complete tests for preflight requests, preflight caching, credentialed
-preflight, the remaining request-tainting states, and network-error response
-construction. Redirect-time simple CORS, redirect-tainted origin serialization, and
-opaque-redirect approval are covered. Retain explicit coverage proving that
-forbidden response headers never reach public responses.
+Preflight request construction, permission denial, cache reuse and clearing,
+credentialed preflight, opaque-origin serialization, wildcard restrictions,
+cookie suppression, and multi-hop redirect preflight are covered. This includes
+the non-credentialed wildcard success case, the `Authorization` wildcard
+exception, and the rule that a credentialed preflight never carries cookies
+while its eventual request may. Opaque local `data:` origins are rejected for
+tuple-origin CORS clients. Header unit tests also cover CORS-safelisted request
+headers, unsafe-name sorting/deduplication and the aggregate limit, response
+header exposure, credential-sensitive exposure wildcards, malformed exposure
+values, and forbidden response-header filtering. Redirect-time simple CORS,
+redirect-tainted origin serialization, and opaque-redirect approval are
+covered. URL-list-derived same-origin, same-site, and cross-site taint have unit
+coverage. A redirect chain that leaves and returns to its request origin proves
+that `null` origin serialization, credential suppression, CORS filtering, and
+preflight remain active at the returning hop.
+
+Preflight failure coverage now includes non-success and redirect statuses,
+duplicated allow-origin fields, case-sensitive method tokens, and missing
+credential approval. An approved preflight followed by a denied actual
+response proves that no response is exposed and that only its matching cache
+identity is evicted. Max-age parsing/default/capping and zero-lifetime expiry
+have unit coverage, while a configured zero cap is also exercised end to end.
+A 302 POST-to-GET rewrite proves that removed body metadata does not cause an
+unnecessary target preflight.
+
+The CORS suite also verifies that an opaque local `data:` origin is rejected
+before response policy or exposure, a CORS-approved response keeps a later
+body-stream failure typed, and a later redirect target that denies preflight
+never receives its actual request.
+
+Generated request-header coverage now includes the service-owned per-hop hook
+and verifies that a forbidden Fetch Metadata field is named in
+`Access-Control-Request-Headers` before it reaches a cross-origin target.
+Remaining browser tests should verify destination, language, identity, and
+Fetch Metadata values plus their redirect-time regeneration or removal.
+`fetch` retains typed Rust errors for diagnostics, while `fetch_response`
+provides the response-shaped network-error boundary.
+
+Remaining CORS tests are defense-in-depth rather than missing algorithms:
+
+- End-to-end permission-key isolation across origins, URL paths, network
+  partitions, and credential modes (the cache has direct unit coverage).
+- Response-shaped network errors for transport, CORS, redirect, provider, and
+  cache-only failures, with abort remaining distinguishable and body-stream
+  failures remaining errors on the delivered body.
 
 ### 4. Redirects and request context
 
@@ -124,23 +164,25 @@ credential-free targets, per-hop browser policy, service-worker bypass, intermed
 cookie processing, simple CORS checks, redirect-taint serialization, referrer-policy
 updates, redirect-aware cache lookup, and representative credential decisions.
 
-Add conformance cases alongside future preflight, same-site cookie, full-cache,
+Add conformance cases alongside future same-site cookie, full-cache,
 mixed-content, and timing integrations. Public final-URL and redirect-count
 behavior is covered; expand internal URL-list assertions if that state becomes
 observable through diagnostics.
 
 ### 5. Credentials, cookies, and cache
 
-When browser providers exist, test partitioned cookie matching, persistence,
+The cache unit suite now covers `Vary` header normalization, matching request
+header values, multiple variants, `Vary: *` rejection, and replacement when
+the response's `Vary` field set changes. When browser providers exist, test
+partitioned cookie matching, persistence,
 expiry, SameSite/secure behavior, credentials modes, `Set-Cookie` handling,
-and CORS credential checks. Expand cache tests for `Vary`, freshness,
-validators, 304 merging, unsafe-method invalidation, partitioning, and all
-Fetch cache modes.
+and CORS credential checks. Expand cache tests for freshness, validators, 304
+merging, unsafe-method invalidation, partitioning, and all Fetch cache modes.
 
 ### 6. Policy, transport, and scheduling
 
 The current tests prove integrity, cache-revalidation, priority, keepalive,
-navigation, and preflight requests fail before browser-service or network
+navigation requests fail before browser-service or network
 side effects. They also prove service-worker interception fails before cache,
 cookie, response, or transport work, and that canceling a scheduler-queued
 request releases admission for the next request.

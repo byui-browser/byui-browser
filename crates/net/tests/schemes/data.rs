@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use net::{Config, Request, RequestController, RequestError, RequestMode};
+use net::{Config, FetchEnvironment, Request, RequestController, RequestError, RequestMode};
 
 use super::support::{
     FailingServices, FailurePoint, ResponseType, controller_with_services_and_providers, runtime,
@@ -187,6 +187,32 @@ fn data_no_cors_responses_use_the_existing_opaque_filter() {
     assert_eq!(response.status, 0);
     assert!(response.url.is_empty());
     assert!(response.body.is_null());
+}
+
+#[test]
+fn cors_mode_rejects_an_opaque_data_origin_before_response_policy_or_exposure() {
+    let (controller, services) = controller_with_services_and_providers();
+    let mut request = Request::get("data:text/plain,private");
+    request.set_environment(
+        FetchEnvironment::from_url(reqwest::Url::parse("https://client.test/page").unwrap())
+            .unwrap(),
+    );
+
+    let error = runtime().block_on(controller.fetch(request)).unwrap_err();
+
+    assert!(matches!(error, RequestError::CorsDenied));
+    assert_eq!(
+        services
+            .cookie_lookups
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        services
+            .response_checks
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
 }
 
 #[test]

@@ -51,4 +51,23 @@ impl RequestController {
         }
         result
     }
+
+    /// Executes a request with a response-shaped Fetch network-error boundary.
+    ///
+    /// Pre-exposure failures become [`Response::network_error`]. Abort remains
+    /// a typed error because cancellation rejects the Rust future, while body
+    /// stream failures remain attached to an already delivered response body.
+    pub async fn fetch_response(&self, request: Request) -> Result<Response, RequestError> {
+        match self.fetch(request).await {
+            Ok(response) => Ok(response),
+            Err(RequestError::Aborted) => Err(RequestError::Aborted),
+            Err(error) => {
+                log::debug!(
+                    "normalizing fetch failure to network error: {}",
+                    crate::log_url::loggable_error(&error)
+                );
+                Ok(Response::network_error())
+            }
+        }
+    }
 }
