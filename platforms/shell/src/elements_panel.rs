@@ -7,16 +7,18 @@ use tiny_skia::{Color, Path, PathBuilder, Pixmap, Rect, Transform};
 
 use crate::compat_panel::CompatView;
 use crate::toolbar;
+use devtools::network::{NetworkLog, ResourceType};
 
 /// The dock's tabs, in header order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DockTab {
     Elements,
     Compatibility,
+    Network,
 }
 
 impl DockTab {
-    const ALL: [Self; 2] = [Self::Elements, Self::Compatibility];
+    const ALL: [Self; 3] = [Self::Elements, Self::Compatibility, Self::Network];
 
     /// Tab width in logical pixels; the Compatibility tab leaves room for
     /// its issue count.
@@ -24,6 +26,7 @@ impl DockTab {
         match self {
             Self::Elements => 84.0,
             Self::Compatibility => 146.0,
+            Self::Network => 92.0,
         }
     }
 }
@@ -40,6 +43,7 @@ pub(crate) struct ElementsPanel {
     tab: DockTab,
     /// The Compatibility tab's content. The app fills it with audit results.
     pub(crate) compat: CompatView,
+    pub(crate) network: NetworkLog,
 }
 
 impl ElementsPanel {
@@ -54,6 +58,7 @@ impl ElementsPanel {
             bounds: None,
             tab: DockTab::Elements,
             compat: CompatView::new(),
+            network: NetworkLog::new(),
         };
         let Some(html) = html else {
             panel.message = Some("No loaded HTML available");
@@ -128,6 +133,11 @@ impl ElementsPanel {
         self.tab = tab;
     }
 
+    pub(crate) fn set_network(&mut self, network: NetworkLog) {
+        self.network = network;
+        self.offset = self.offset.min(self.max_offset());
+    }
+
     /// Header tab rectangles in logical pixels.
     fn tab_rects(&self) -> impl Iterator<Item = (DockTab, Rect)> + '_ {
         let mut left = self.bounds.map_or(0.0, |bounds| bounds.left() + 6.0);
@@ -152,11 +162,20 @@ impl ElementsPanel {
             (DockTab::Elements, _) => "Elements".to_owned(),
             (DockTab::Compatibility, Some(count)) => format!("Compatibility ({count})"),
             (DockTab::Compatibility, None) => "Compatibility".to_owned(),
+            (DockTab::Network, _) => format!("Network ({})", self.network.entries().len()),
         }
     }
 
     fn max_offset(&self) -> usize {
-        self.rows.len().saturating_sub(self.visible.max(1))
+        self.active_row_count().saturating_sub(self.visible.max(1))
+    }
+
+    fn active_row_count(&self) -> usize {
+        match self.tab {
+            DockTab::Elements => self.rows.len(),
+            DockTab::Compatibility => 0,
+            DockTab::Network => self.network.entries().len(),
+        }
     }
 
     /// Scrolls the active tab by rows (fractional wheel deltas are
@@ -349,12 +368,16 @@ impl ElementsPanel {
         }
 
         let tree_top = bounds.top() + HEADER + TREE_PAD;
-        let footer = if self.message.is_some() { FOOTER } else { 0.0 };
+        let footer = if self.message.is_some() && self.tab == DockTab::Elements {
+            FOOTER
+        } else {
+            0.0
+        };
         let tree_bottom = bounds.bottom() - footer;
         let hovered_row = self.row_at(cursor);
         let rows_shown = self
             .visible
-            .min(self.rows.len().saturating_sub(self.offset));
+            .min(self.active_row_count().saturating_sub(self.offset));
         let indent_x = |depth: usize| {
             bounds.left() + 14.0 + (depth as f32 * INDENT).min((bounds.width() - 120.0).max(0.0))
         };
@@ -373,6 +396,25 @@ impl ElementsPanel {
                 colors.row_hover,
                 transform,
             );
+        }
+
+        if self.tab == DockTab::Network {
+            let Some(network_font) = mono_font.or(ui_font) else {
+                return;
+            };
+            self.draw_network(
+                frame,
+                s,
+                dark,
+                palette,
+                colors,
+                bounds,
+                tree_top,
+                tree_bottom,
+                rows_shown,
+                network_font,
+            );
+            return;
         }
 
         // Indent guides connect each element to its ancestors' columns.
@@ -481,6 +523,98 @@ impl ElementsPanel {
         }
     }
 
+    fn draw_network(
+        &self,
+        frame: &mut Pixmap,
+        s: f32,
+        dark: bool,
+        palette: toolbar::Palette,
+        colors: Colors,
+        bounds: Rect,
+        top: f32,
+        bottom: f32,
+        rows_shown: usize,
+        font: &FontVec,
+    ) {
+        let device = |value: f32| value * s;
+        let clip = device(bounds.right() - SCROLLBAR_GUTTER);
+        let header = "Name                                      Status  Type       Time";
+        toolbar::draw_text(
+            frame,
+            font,
+            device(TREE_SIZE),
+            device(bounds.left() + 14.0),
+            device(top + 13.0),
+            clip,
+            palette.text_muted,
+            header,
+        );
+        for (index, entry) in self
+            .network
+            .entries()
+            .iter()
+            .skip(self.offset)
+            .take(rows_shown)
+            .enumerate()
+        {
+            let row_top = top + 20.0 + index as f32 * ROW;
+            let Some(row) = Rect::from_xywh(bounds.left(), row_top - 15.0, bounds.width(), ROW)
+            else {
+                continue;
+            };
+            if index % 2 == 1 {
+                toolbar::fill(
+                    frame,
+                    &PathBuilder::from_rect(row),
+                    colors.row_hover,
+                    Transform::from_scale(s, s),
+                );
+            }
+            let status = entry
+                .status
+                .map_or("pending".to_owned(), |status| status.to_string());
+            let kind = match entry.resource_type {
+                ResourceType::Document => "document",
+                ResourceType::Stylesheet => "stylesheet",
+                ResourceType::Script => "script",
+                ResourceType::Image => "image",
+                ResourceType::Other => "other",
+            };
+            let text = format!(
+                "{:<42} {:>7}  {:<10} {:>4} ms",
+                entry.url, status, kind, entry.duration_ms
+            );
+            toolbar::draw_text(
+                frame,
+                font,
+                device(TREE_SIZE),
+                device(bounds.left() + 14.0),
+                device(row_top),
+                clip,
+                palette.text,
+                &text,
+            );
+        }
+        if self.network.entries().len() > self.visible && self.visible > 0 {
+            let track_height = (bottom - TREE_PAD - top).max(0.0);
+            let thumb_height = (track_height * self.visible as f32
+                / self.network.entries().len() as f32)
+                .max(24.0);
+            let progress = self.offset as f32 / self.max_offset().max(1) as f32;
+            let thumb_top = top + (track_height - thumb_height).max(0.0) * progress;
+            if let Some(path) = toolbar::rounded_rect(
+                bounds.right() - 9.0,
+                thumb_top,
+                5.0,
+                thumb_height.min(track_height),
+                2.5,
+            ) {
+                toolbar::fill(frame, &path, colors.scrollbar, Transform::from_scale(s, s));
+            }
+        }
+        self.draw_header(frame, s, dark, None, font);
+    }
+
     /// Draws the header text: the tabs (active one underlined), a muted
     /// description of the active tab, and a keyboard hint beside the close
     /// button. `s` is the device scale.
@@ -556,6 +690,7 @@ impl ElementsPanel {
         let subtitle = match self.tab {
             DockTab::Elements => "HTML snapshot · read-only".to_owned(),
             DockTab::Compatibility => self.compat.summary(),
+            DockTab::Network => "Completed resource requests · session log".to_owned(),
         };
         let subtitle_width = toolbar::text_advance(ui_font, device(SMALL_SIZE), &subtitle) / s;
         let show_hint = hint_left > subtitle_left + subtitle_width + 16.0;
