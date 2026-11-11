@@ -80,11 +80,11 @@ deferred.
 
 **Evidence:** [`Request::new` and `set_method`](../src/api/request/definition.rs) normalize and validate methods; [`Headers`](../src/api/headers.rs) has request, no-CORS request, response, immutable, and unrestricted guards; transport converts the permitted list in [`ReqwestTransport::send`](../src/transport/reqwest.rs).
 
-Fetch normalizes the standard methods, rejects forbidden methods such as `CONNECT`, `TRACE`, and `TRACK` at request construction, and applies request-header guards, forbidden request-header filtering, CORS-safelisted checks, and no-CORS restrictions. The implementation now covers these request-side checks and keeps generated `Origin`, body metadata, `Referer`, and cookie headers in an internal transport channel rather than mutating caller headers. It still does not provide the complete user-agent-owned header set or the redirect-time header rules.
+Fetch normalizes the standard methods, rejects forbidden methods such as `CONNECT`, `TRACE`, and `TRACK` at request construction, and applies request-header guards, forbidden request-header filtering, CORS-safelisted checks, and no-CORS restrictions. The implementation keeps generated `Origin`, body metadata, `Referer`, cookie, and browser-service headers in an internal transport channel rather than mutating caller headers. Browser services can generate destination- and client-context-dependent headers independently for every redirect hop; transport-owned headers remain with Reqwest.
 
 The ordered multimap shape and mutation guards now support immutable exposed response headers. The internal response retains `Set-Cookie`, while the public view removes it. Duplicate combination, ordering, cookie separation, guard transitions, and the supported CORS exposure rules are implemented.
 
-**Required work:** complete the remaining user-agent-owned header set and redirect-time header mutation rules. Header construction, mutation guards, duplicate combination, cookie separation, internal channels, and response filtering are no longer gaps in this audit.
+**Required work:** connect the browser service hook to the browser's complete user-agent identity/language and Fetch Metadata policy, and expand redirect-sensitive header policy as those integrations land. Header construction, mutation guards, duplicate combination, cookie separation, internal channels, and response filtering are no longer gaps in this audit.
 
 ### 3. Request bodies and body lifecycle
 
@@ -140,8 +140,9 @@ redirect, and `NoCors` produces an opaque view.
 Basic, CORS, and opaque views now filter headers and metadata. CORS exposure
 parsing covers safelisted names, explicit lists, wildcard credentials rules,
 duplicates, and malformed metadata. Opaque-redirect construction is now
-present for manual HTTP redirects, and network-error response construction
-remains outside the current response view. `data:`, `blob:`, `file:`, and
+present for manual HTTP redirects, and `fetch_response` normalizes pre-exposure
+failures to the immutable network-error response while preserving typed errors
+through `fetch`. `data:`, `blob:`, `file:`, and
 `byui:` use the shared
 finalization path, including provider-supplied origins, opaque-origin behavior,
 cookie/cache exclusion, and response filtering. The current local-scheme

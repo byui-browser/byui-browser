@@ -92,6 +92,10 @@ impl RequestController {
             }
 
             let mut transport_headers = request.fetch_headers(&url)?;
+            if let Some(services) = &self.inner.services {
+                let generated = services.generated_request_headers(&request, &url)?;
+                transport_headers.merge_internal_headers(&generated)?;
+            }
             if request.credentials_allowed(&url)
                 && let Some(services) = &self.inner.services
                 && let Some(cookie) = services.cookie_header(&request)?

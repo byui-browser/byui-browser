@@ -139,8 +139,10 @@ work.
   and partition; response `Vary` fields select among request-header variants,
   and `Vary: *` responses are not stored. Cache hits still pass through the
   normal response finalization and filtering path.
-- Cache-only misses surface as Fetch network errors. Body stream transport
-  errors and aborts retain separate typed errors.
+- Cache-only misses and other pre-exposure failures can surface through
+  `RequestController::fetch_response` as Fetch network errors. Body stream
+  transport errors and aborts retain separate typed errors; `fetch` preserves
+  all typed Rust failures for callers that need diagnostics.
 
 `storage` owns durable cookie and cache data and network partition state.
 `security` owns cookie, CSP, mixed-content, CORP, MIME, authentication, and

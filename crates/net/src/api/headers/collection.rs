@@ -287,6 +287,14 @@ impl Headers {
         Ok(())
     }
 
+    /// Merges engine-owned headers into the internal transport channel.
+    pub(crate) fn merge_internal_headers(&mut self, headers: &Self) -> Result<(), RequestError> {
+        for (name, value) in headers.iter_raw() {
+            self.insert_internal_header(name.clone(), value.clone())?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn remove_internal_header(&mut self, name: HeaderName) {
         self.entries.retain(|(existing, _)| existing != name);
     }

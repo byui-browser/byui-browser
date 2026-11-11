@@ -134,6 +134,12 @@ have unit coverage, while a configured zero cap is also exercised end to end.
 A 302 POST-to-GET rewrite proves that removed body metadata does not cause an
 unnecessary target preflight.
 
+Generated request-header coverage now includes the service-owned per-hop hook;
+remaining browser tests should verify destination, language, identity, and
+Fetch Metadata values plus their redirect-time regeneration or removal.
+`fetch` retains typed Rust errors for diagnostics, while `fetch_response`
+provides the response-shaped network-error boundary.
+
 Remaining CORS tests are defense-in-depth rather than missing algorithms:
 
 - End-to-end permission-key isolation across origins, URL paths, network
@@ -143,6 +149,9 @@ Remaining CORS tests are defense-in-depth rather than missing algorithms:
 - Network/body-stream error paths asserting that public responses never expose
   forbidden headers and matching preflight permissions are invalidated where
   the architecture can still observe the failure.
+- Response-shaped network errors for transport, CORS, redirect, provider, and
+  cache-only failures, with abort remaining distinguishable and body-stream
+  failures remaining errors on the delivered body.
 
 ### 4. Redirects and request context
 

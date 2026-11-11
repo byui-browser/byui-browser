@@ -1,6 +1,6 @@
 //! Browser-owned inputs to the process-local Fetch engine.
 
-use crate::{Headers, Origin, Request, RequestError, RequestMode, ResponseType};
+use crate::{Headers, Origin, Request, RequestError, RequestMode, ResponseType, Url};
 
 /// Decision made by the service-worker owner before network I/O.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +54,20 @@ pub trait FetchServices: Send + Sync {
 
     /// Authorizes complete internal response metadata before public exposure.
     fn check_response(&self, request: &Request, info: &ResponseInfo) -> Result<(), RequestError>;
+
+    /// Returns browser-owned request headers for one validated transport hop.
+    ///
+    /// These values are merged into an internal transport-only channel after
+    /// Fetch-owned headers are derived. The default is empty for standalone
+    /// consumers; browser implementations can provide destination, language,
+    /// identity, and Fetch Metadata headers here.
+    fn generated_request_headers(
+        &self,
+        _request: &Request,
+        _target: &Url,
+    ) -> Result<Headers, RequestError> {
+        Ok(Headers::new())
+    }
 
     /// Returns the cookie header selected by storage and security policy.
     ///
