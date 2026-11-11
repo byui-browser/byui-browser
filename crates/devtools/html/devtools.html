@@ -1,26 +1,86 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <!-- THIS FILE IS NOT THE DEVTOOLS! It is only for a quick reference to make sure it looks right visually -->
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BYUI Browser DevTools</title>
+  <style>
+    :root { color-scheme: dark; font: 13px/1.4 system-ui, sans-serif; }
+    body { margin: 0; min-width: 720px; background: #111827; color: #e5e7eb; }
+    header { display: flex; align-items: center; gap: 20px; padding: 14px 18px 10px; border-bottom: 1px solid #374151; }
+    h1 { margin: 0 auto 0 0; font-size: 16px; letter-spacing: .02em; }
+    .tabs { display: flex; gap: 4px; }
+    .tabs button { border: 0; border-radius: 6px 6px 0 0; padding: 8px 12px; color: #9ca3af; background: transparent; cursor: pointer; }
+    .tabs button[aria-selected="true"] { color: #fff; background: #1f2937; box-shadow: inset 0 -2px #60a5fa; }
+    main { padding: 18px; }
+    .panel { display: none; border: 1px solid #374151; border-radius: 8px; overflow: hidden; background: #1f2937; }
+    .panel.active { display: block; }
+    .panel-toolbar { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid #374151; background: #182232; }
+    .muted { color: #9ca3af; }
+    .toolbar-spacer { flex: 1; }
+    button.action { border: 1px solid #4b5563; border-radius: 5px; padding: 5px 9px; color: #e5e7eb; background: #273449; cursor: pointer; }
+    button.action:hover { background: #334155; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #374151; }
+    th { color: #9ca3af; font-weight: 600; }
+    td.url { max-width: 460px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tree { padding: 14px 18px 18px; font-family: ui-monospace, SFMono-Regular, monospace; }
+    .tree div { padding: 4px 0; }
+    .indent-1 { padding-left: 22px !important; }
+    .indent-2 { padding-left: 44px !important; }
+    .console { min-height: 210px; padding: 14px 18px; font-family: ui-monospace, SFMono-Regular, monospace; }
+    .log { padding: 5px 0; }
+    .log.warn { color: #fbbf24; }
+  </style>
 </head>
 <body>
-
-    <div>
-        <h1> Welcome to devtools!</h1>
-        <button id="console-btn">Console</button>
-        <button id="elements-btn">Elements</button>
-        <button id="network-btn">Network</button>
-        <button id="hover-btn">Hover</button>
-      <table id="network-options" hidden>
-        <th> <button id="net-name-btn">Name</button></th>
-        <th> <button id="net-status-btn">Status</button></th>
-        <th> <button id="net-type-btn">Type</button></th>
-        <th> <button id="net-time-btn">Time</button></th>
+  <header>
+    <h1>BYUI Browser DevTools</h1>
+    <nav class="tabs" aria-label="DevTools panels">
+      <button type="button" data-panel="elements" aria-selected="true">Elements</button>
+      <button type="button" data-panel="network" aria-selected="false">Network</button>
+      <button type="button" data-panel="console" aria-selected="false">Console</button>
+    </nav>
+  </header>
+  <main>
+    <section id="elements" class="panel active" aria-label="Elements panel">
+      <div class="panel-toolbar"><strong>Document</strong><span class="muted">HTML snapshot · read-only</span></div>
+      <div class="tree">
+        <div>&lt;html&gt;</div>
+        <div class="indent-1">&lt;head&gt;</div>
+        <div class="indent-2">&lt;title&gt;Welcome to BYUI Browser!&lt;/title&gt;</div>
+        <div class="indent-1">&lt;body&gt;</div>
+        <div class="indent-2">&lt;main&gt;</div>
+        <div class="indent-2">&lt;button id="btn"&gt;Click Me&lt;/button&gt;</div>
+      </div>
+    </section>
+    <section id="network" class="panel" aria-label="Network panel">
+      <div class="panel-toolbar"><strong>Network</strong><span id="network-count" class="muted">3 requests</span><span class="toolbar-spacer"></span><button id="clear-network" class="action" type="button">Clear</button></div>
+      <table>
+        <thead><tr><th>Name</th><th>Status</th><th>Type</th><th>Time</th></tr></thead>
+        <tbody id="network-rows">
+          <tr><td class="url">byui://welcome</td><td>200</td><td>document</td><td>1 ms</td></tr>
+          <tr><td class="url">byui://welcome/style.css</td><td>200</td><td>stylesheet</td><td>1 ms</td></tr>
+          <tr><td class="url">byui://welcome/script.js</td><td>200</td><td>script</td><td>2 ms</td></tr>
+        </tbody>
       </table>
-    </div>
-    
+    </section>
+    <section id="console" class="panel" aria-label="Console panel">
+      <div class="panel-toolbar"><strong>Console</strong><span class="toolbar-spacer"></span><button id="clear-console" class="action" type="button">Clear</button></div>
+      <div id="console-output" class="console"><div class="log">› DevTools ready</div><div class="log warn">⚠ Network entries are session-local</div></div>
+    </section>
+  </main>
+  <script>
+    const panels = [...document.querySelectorAll('[data-panel]')];
+    panels.forEach((tab) => tab.addEventListener('click', () => {
+      panels.forEach((item) => item.setAttribute('aria-selected', String(item === tab)));
+      document.querySelectorAll('.panel').forEach((panel) => panel.classList.toggle('active', panel.id === tab.dataset.panel));
+    }));
+    document.querySelector('#clear-network').addEventListener('click', () => {
+      document.querySelector('#network-rows').replaceChildren();
+      document.querySelector('#network-count').textContent = '0 requests';
+    });
+    document.querySelector('#clear-console').addEventListener('click', () => document.querySelector('#console-output').replaceChildren());
+  </script>
 </body>
 </html>

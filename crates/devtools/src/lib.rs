@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod compat;
+pub mod network;
 
 /// Severity of a console entry, mirroring `console.log` / `warn` / `error`.
 // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
@@ -61,16 +62,17 @@ impl Console {
 
     /// Entries at exactly `level`, in order.
     ///
-    /// Currently only handles the empty console.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+    /// Entries at exactly `level`, in their original order.
     pub fn entries_at(&self, level: Level) -> Vec<&LogEntry> {
-        if self.entries.is_empty() {
-            return Vec::new();
-        }
-        todo!(
-            "TODO(devtools): filter {} entries by {level:?}",
-            self.entries.len()
-        )
+        self.entries
+            .iter()
+            .filter(|entry| entry.level == level)
+            .collect()
+    }
+
+    /// Removes every recorded console entry.
+    pub fn clear(&mut self) {
+        self.entries.clear();
     }
 }
 

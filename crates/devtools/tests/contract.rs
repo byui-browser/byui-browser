@@ -1,11 +1,8 @@
 //! Public-contract tests for `devtools`.
 //!
-//! Run ignored tests with `cargo test -p devtools -- --ignored` to see the backlog.
-
 use devtools::{Console, Level};
 
 #[test]
-#[ignore = "TODO(devtools): level filtering not implemented"]
 fn filters_entries_by_level() {
     let mut console = Console::new();
     console.log(Level::Log, "a");
