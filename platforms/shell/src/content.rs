@@ -12,6 +12,28 @@ use render::{BitmapFont, Compositor, Frame, OutlineFont};
 use tiny_skia::Pixmap;
 use webapis::{AlertSink, ConsoleSink, LocationNavigate, ViewportSize};
 
+pub(crate) struct DevtoolsConsole(pub(crate) Arc<Mutex<devtools::Console>>);
+
+impl ConsoleSink for DevtoolsConsole {
+    fn log(&self, message: &str) {
+        if let Ok(mut console) = self.0.lock() {
+            console.log(devtools::Level::Log, message);
+        }
+    }
+
+    fn warn(&self, message: &str) {
+        if let Ok(mut console) = self.0.lock() {
+            console.log(devtools::Level::Warn, message);
+        }
+    }
+
+    fn error(&self, message: &str) {
+        if let Ok(mut console) = self.0.lock() {
+            console.log(devtools::Level::Error, message);
+        }
+    }
+}
+
 struct NoopConsole;
 
 impl ConsoleSink for NoopConsole {
@@ -349,6 +371,7 @@ fn evaluate_page_script(page: &Page, alert_sink: Arc<dyn AlertSink>, runtime: Br
 enum PageCommand {
     Load {
         page: Page,
+        console: Arc<dyn ConsoleSink>,
         alert_sink: Arc<dyn AlertSink>,
         runtime: BrowserRuntime,
         device_pixel_ratio: f64,
@@ -359,6 +382,7 @@ enum PageCommand {
     ScrollY(f64),
     DevicePixelRatio(f64),
     Click(Option<NodeID>),
+    Snapshot(mpsc::Sender<String>),
 }
 
 /// Owns the page's JavaScript session on a thread that is not the UI thread.
@@ -404,6 +428,7 @@ impl PageEvents {
     ) {
         self.load_with_viewport(
             page,
+            Arc::new(NoopConsole),
             alert_sink,
             runtime,
             device_pixel_ratio,
@@ -415,9 +440,11 @@ impl PageEvents {
     /// Replaces the live document and exposes `device_pixel_ratio` and
     /// `viewport` (CSS pixels) to page scripts. `Location` navigation
     /// requests from the page are passed to `navigate` on the session thread.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn load_with_viewport(
         &self,
         page: &Page,
+        console: Arc<dyn ConsoleSink>,
         alert_sink: Arc<dyn AlertSink>,
         runtime: BrowserRuntime,
         device_pixel_ratio: f64,
@@ -428,6 +455,7 @@ impl PageEvents {
             .commands
             .send(PageCommand::Load {
                 page: page.clone(),
+                console,
                 alert_sink,
                 runtime,
                 device_pixel_ratio,
@@ -479,6 +507,15 @@ impl PageEvents {
             log::warn!("page session is not running; dropped scroll position update");
         }
     }
+
+    /// Returns a serialization of the current live DOM after scripts mutate it.
+    pub(crate) fn snapshot_html(&self) -> Option<String> {
+        let (sender, receiver) = mpsc::channel();
+        self.commands.send(PageCommand::Snapshot(sender)).ok()?;
+        receiver
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .ok()
+    }
 }
 
 fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<Option<String>>) {
@@ -487,6 +524,7 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
         match command {
             PageCommand::Load {
                 page,
+                console,
                 alert_sink,
                 runtime,
                 device_pixel_ratio,
@@ -499,7 +537,7 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
                 let controller = browser::request_controller(None);
                 match runtime.open_page_with_viewport_and_navigation(
                     &page,
-                    Arc::new(NoopConsole),
+                    console,
                     alert_sink,
                     controller,
                     browser::security_context_for_url(&page.url),
@@ -546,6 +584,12 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
                 if let Err(error) = result {
                     log::warn!("page click failed: {error}");
                 }
+            }
+            PageCommand::Snapshot(sender) => {
+                let html = session
+                    .as_ref()
+                    .map_or_else(String::new, browser::PageSession::document_html);
+                let _ = sender.send(html);
             }
         }
     }
@@ -1000,6 +1044,7 @@ mod tests {
         };
         events.load_with_viewport(
             &page,
+            Arc::new(NoopConsole),
             test_alert_sink(),
             test_runtime(),
             1.0,

@@ -14,6 +14,8 @@ pub enum NavigationBehavior {
     Replace,
     /// Reload the current URL without adding a history visit.
     Reload,
+    /// Traverse an existing history entry without adding a visit.
+    History,
 }
 
 /// Thread-safe callback used to hand a script navigation request to the

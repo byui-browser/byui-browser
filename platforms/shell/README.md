@@ -14,27 +14,26 @@ much of the toolbar's left edge the system's window buttons cover) and calls
 On operating systems without a supported shell the crate still builds and runs
 its drawing tests, so workspace checks pass everywhere.
 
-The shared app owns `chrome::BrowserState` and records `byui://welcome` once
-its document and resources load successfully. The loaded document is retained
-separately from its rendered pixmap, so repainting, resizing, and the current
-Reload action do not add visits. History lives in memory for this app session;
-there is no history UI or persistence yet.
+The shared app owns `chrome::BrowserState` and records a successful navigation
+after its document and resources load. The loaded document is retained
+separately from its rendered pixmap, so repainting, resizing, and Reload do not
+add visits. History lives in memory for this app session; the toolbar Back and
+Forward controls traverse it without adding new visits. The context-menu rows
+remain disabled until they are wired to the same history service.
 
-Future successful navigation should pass its loaded document and URL through
-`App::page_loaded`. Navigation itself is not implemented, and the current
-renderer still supports only the welcome demo. Reload fetches the saved current URL on a background task and prints its URL,
-status, and response body (or an error) to the launching terminal. It bypasses
-the HTTP response cache and leaves the displayed document and history unchanged.
-Internal `byui://welcome` uses the embedded page provider, not HTTP or disk.
-HTTP and HTTPS use the Networking team's transport; address editing and navigation
-remain staged, so the current UI refreshes the welcome page.
+The address field accepts the built-in `byui://welcome` page and HTTP/HTTPS
+addresses. Navigation runs through the browser loader on a background task,
+shows a loading indicator, and replaces the page with the loaded document or a
+built-in error page. Reload fetches the current address again, bypasses the
+response cache, and preserves history. Internal `byui://welcome` uses the
+embedded page provider, not HTTP or disk.
 
 The address field is an editable shell surface: click it or press `Ctrl+L`,
-use normal text editing plus Backspace, press Enter to submit, or Escape to
-restore the previous value. `Ctrl+R` triggers the existing repaint-only Reload
-action. Submitted HTTP and HTTPS URLs stay visible but do not claim a
-successful navigation until the renderer can load them. Tabs, Back, Forward,
-and the menu remain staged until the corresponding browser services exist.
+use normal text editing plus Backspace, press Enter to navigate, or Escape to
+restore the previous value. `Ctrl+R` triggers Reload. Submitted HTTP and HTTPS
+URLs remain in the address field while loading and are replaced by the loaded
+page or an error page when the request completes. Tabs, Back, Forward, and the
+menu remain staged until their browser services exist.
 
 Run `cargo test -p browser refresh::tests` to verify fresh HTTP requests,
 internal pages, saved URLs, error reporting, and unchanged history.
@@ -48,9 +47,9 @@ on Windows to check that the existing welcome page and toolbar still work.
 
 Right-click inside the page card to open the shared desktop context menu.
 The menu lists **Back**, **Forward**, **Reload**, **View Page Source**, and **Inspect**.
-Back and Forward are visibly disabled placeholders: they do not highlight,
-respond to clicks, or navigate, even when history entries exist. Clicking them
-leaves the popup open. Navigation controls are not connected yet.
+Back and Forward are enabled when session history allows the action. They
+traverse successful visits without adding a new history entry, and stay
+disabled at the ends of the history list.
 Choose **Reload** to use the same asynchronous saved-URL fetch as the toolbar.
 The URL, status, and body appear in the launching terminal. History is unchanged.
 Click outside the popup or press Escape to dismiss it. Resize and focus loss also
@@ -89,13 +88,16 @@ navigation or startup-URL support.
 
 The fifth right-click action, **Inspect**, opens a rectangular bottom panel
 inside the window. The upper webpage stays visible. **Elements — Basic
-inspector** displays an indented tree of element tags from a fresh parse of the
-loaded HTML snapshot, using only nodes the parser supplies. It is not a live
-JavaScript DOM, an element picker, or full Chrome DevTools. Text, comments, and
-attributes are not currently shown. The panel closes when navigation replaces
-the displayed document, so its snapshot cannot describe a previous page. No
-network requests or script evaluation
-are performed by opening the panel.
+inspector** displays an indented tree from the current live document when the
+page session is available, with a loaded-HTML fallback. It remains read-only:
+text, comments, attributes, editing, and element picking are not currently
+shown. The panel closes when navigation replaces the displayed document.
+
+The panel also includes session-local **Network** and **Console** tabs. Network
+shows the document and linked stylesheet/script resources discovered for the
+page; Console receives `console.log`, `console.warn`, `console.error`, and the
+legacy `print()` bridge. Delete clears the active log, and the native DevTools
+window opened with Ctrl+Shift+H can be closed with Escape.
 
 Scroll over the panel, or use Up/Down, Page Up/Down, Home/End while the address
 field is not focused. Click **×** or press Escape to close it. Resize the window

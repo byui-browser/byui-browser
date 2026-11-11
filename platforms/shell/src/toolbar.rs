@@ -4,9 +4,8 @@
 //! Window controls come from the operating system: each shell keeps its native
 //! decorations, and where those overlap the toolbar (macOS's traffic lights on
 //! a transparent titlebar) the controls shift right by
-//! [`ChromeState::window_controls_inset`]. Navigation and tabs remain staged;
-//! the address field supports focus and editing, while only the built-in
-//! `byui://welcome` page can currently be submitted.
+//! [`ChromeState::window_controls_inset`]. Tabs remain staged; navigation and
+//! address editing are handled by the shared shell.
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform};
@@ -40,11 +39,11 @@ const TEXT_SIZE: f32 = 13.0;
 /// A clickable region of the chrome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Control {
-    /// Back navigation; disabled because there is no history yet.
+    /// Back navigation.
     Back,
-    /// Forward navigation; disabled because there is no history yet.
+    /// Forward navigation.
     Forward,
-    /// Reload; fetches the current URL to the terminal and repaints the loaded page.
+    /// Reload; fetches the current URL and repaints the loaded page.
     Reload,
     /// Address field; supports staged text editing.
     Address,
@@ -64,9 +63,13 @@ const CONTROLS: [Control; 6] = [
 ];
 
 impl Control {
-    /// Whether the control responds to hover and clicks.
-    pub(crate) fn is_enabled(self) -> bool {
-        !matches!(self, Control::Back | Control::Forward)
+    /// Whether the control responds to hover and clicks in the current state.
+    pub(crate) fn is_enabled(self, state: &ChromeState) -> bool {
+        match self {
+            Self::Back => state.can_go_back,
+            Self::Forward => state.can_go_forward,
+            _ => true,
+        }
     }
 }
 
@@ -81,6 +84,10 @@ pub(crate) struct ChromeState {
     pub dark: bool,
     /// Whether the newest navigation or Refresh fetch is still pending.
     pub loading: bool,
+    /// Whether a previous history entry is available.
+    pub can_go_back: bool,
+    /// Whether a forward history entry is available.
+    pub can_go_forward: bool,
     /// Reserve space below the toolbar for Find in Page.
     pub find_open: bool,
     /// Logical width at the toolbar's left reserved for the operating
@@ -360,7 +367,7 @@ fn draw_toolbar(
         let Some(rect) = control_rect(control, width, inset) else {
             continue;
         };
-        let active = control.is_enabled();
+        let active = control.is_enabled(state);
         let background = match (state.pressed, state.hovered) {
             (Some(pressed), _) if pressed == control && active => Some(palette.pressed),
             (_, Some(hovered)) if hovered == control && active => Some(palette.hover),
@@ -948,8 +955,9 @@ mod tests {
         );
         assert_eq!(hit_test(109.0, 26.0, 1000.0, 0.0), None);
         assert_eq!(hit_test(500.0, 200.0, 1000.0, 0.0), None);
-        assert!(!Control::Back.is_enabled());
-        assert!(Control::Reload.is_enabled());
+        let state = ChromeState::default();
+        assert!(!Control::Back.is_enabled(&state));
+        assert!(Control::Reload.is_enabled(&state));
     }
 
     #[test]
@@ -959,8 +967,9 @@ mod tests {
 
         assert_eq!(back, Some(Control::Back));
         assert_eq!(forward, Some(Control::Forward));
-        assert!(!back.is_some_and(Control::is_enabled));
-        assert!(!forward.is_some_and(Control::is_enabled));
+        let state = ChromeState::default();
+        assert!(!back.is_some_and(|control| control.is_enabled(&state)));
+        assert!(!forward.is_some_and(|control| control.is_enabled(&state)));
     }
 
     #[test]
@@ -1010,6 +1019,8 @@ mod tests {
                         pressed: hovered,
                         dark,
                         loading: false,
+                        can_go_back: false,
+                        can_go_forward: false,
                         find_open: false,
                         address_focused: false,
                         address_selected: false,

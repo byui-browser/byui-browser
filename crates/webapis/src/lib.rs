@@ -23,7 +23,7 @@ mod timer;
 mod window;
 
 pub use alert::{AlertSink, alert, register_alert};
-pub use console::{ConsoleSink, print, register_print};
+pub use console::{ConsoleSink, print, register_console, register_print};
 pub use custom_elements::CustomElementRegistry;
 pub use document::{
     Document, get_element_by_id, register_document, register_document_on_window,
