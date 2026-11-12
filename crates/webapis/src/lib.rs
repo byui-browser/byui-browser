@@ -36,7 +36,7 @@ pub use event::{
     abort_controller_constructor, add_event_listener, dispatch_click, dispatch_click_at,
     dispatch_event, event_constructor, remove_event_listener,
 };
-pub use fetch::{fetch, register_fetch};
+pub use fetch::{fetch, register_fetch, register_fetch_with_url};
 pub use location::{
     LocationNavigate, NavigationBehavior, register_location, register_location_with_navigation,
 };
