@@ -19,6 +19,7 @@ mod fetch;
 pub mod local_storage;
 mod location;
 mod selector;
+pub mod session_storage;
 mod timer;
 mod window;
 

@@ -20,6 +20,7 @@ use storage::{
     OriginStorage, PersistentOriginStorage, SharedStorage, StorageError, shared_storage,
 };
 use webapis::local_storage::register_local_storage;
+use webapis::session_storage::register_session_storage;
 use webapis::{
     AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, register_alert,
     register_console, register_document_with_location, register_fetch,
@@ -648,7 +649,12 @@ impl BrowserRuntime {
         // Installs the live `Location` accessor on the window registered above.
         let location = register_location_with_navigation(&mut realm, document_url, navigate)?;
         register_document_with_location(&mut realm, document, location)?;
-        register_local_storage(&mut realm, Arc::clone(&self.storage), security_context)?;
+        register_local_storage(
+            &mut realm,
+            Arc::clone(&self.storage),
+            security_context.clone(),
+        )?;
+        register_session_storage(&mut realm, security_context)?;
 
         // Without caller-supplied sources only inline script text is available.
         let sources = match input.scripts {
