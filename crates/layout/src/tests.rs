@@ -596,3 +596,67 @@ fn unsupported_text_transform_values_leave_text_unchanged() {
     );
     assert_eq!(texts(box_for(&tree, &document, "p")), ["abc"]);
 }
+
+#[test]
+fn ladder_l2_before_content_replaces_hidden_fail_text() {
+    let (document, tree) = lay_out(
+        "<body><h1 id='h' class='result'><span class='fail'>FAIL</span></h1></body>",
+        "body { margin: 0 } .fail { display: none } .result::before { content: \"SUCCESS\" }",
+        800.0,
+    );
+    assert_eq!(texts(box_for(&tree, &document, "h")), ["SUCCESS"]);
+}
+
+#[test]
+fn before_and_after_wrap_the_element_children_inline() {
+    let (document, tree) = lay_out(
+        "<body><p id='p'>middle</p></body>",
+        "body { margin: 0 } p::before { content: '[' } p:after { content: \"]\" }",
+        800.0,
+    );
+    assert_eq!(texts(box_for(&tree, &document, "p")), ["[middle]"]);
+}
+
+#[test]
+fn content_none_or_missing_generates_no_box() {
+    let (document, tree) = lay_out(
+        "<body><p id='a'>a</p><p id='b'>b</p><p id='c'>c</p></body>",
+        "body { margin: 0 } #a::before { content: none } #b::before { color: red } \
+         #c::before { content: 'x'; display: none }",
+        800.0,
+    );
+    assert_eq!(texts(box_for(&tree, &document, "a")), ["a"]);
+    assert_eq!(texts(box_for(&tree, &document, "b")), ["b"]);
+    assert_eq!(texts(box_for(&tree, &document, "c")), ["c"]);
+}
+
+#[test]
+fn block_after_content_gets_its_own_line_box() {
+    let (document, tree) = lay_out(
+        "<body><div id='d'>text</div></body>",
+        "body { margin: 0 } #d::after { content: 'below'; display: block }",
+        800.0,
+    );
+    let div = box_for(&tree, &document, "d");
+    assert_eq!(div.children.len(), 2);
+    assert_eq!(texts(&div.children[1]), ["below"]);
+    assert!(div.children[1].rect.y > div.children[0].rect.y);
+}
+
+#[test]
+fn generated_content_is_text_transformed() {
+    let (_, tree) = lay_out(
+        "<body><p>x</p></body>",
+        "body { margin: 0 } p::before { content: 'ok '; text-transform: uppercase }",
+        800.0,
+    );
+    let texts = tree
+        .paint_order()
+        .into_iter()
+        .filter_map(|item| match item {
+            PaintItem::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(texts.iter().any(|text| text.starts_with("OK")), "{texts:?}");
+}

@@ -7,7 +7,9 @@
 //!
 //! The engine has no interaction or history state, so dynamic pseudo-classes
 //! (`:hover`, `:focus`, `:visited`, ...) never match, and pseudo-elements
-//! (`::before`) never match the element itself. Unknown pseudo-classes never
+//! never match the element itself. The rule compiler splits a trailing
+//! `::before` / `::after` off before matching, so those rules match the
+//! originating element and are cascaded separately. Unknown pseudo-classes never
 //! match. Namespace prefixes other than `*` and the default match nothing,
 //! because `@namespace` is not supported.
 

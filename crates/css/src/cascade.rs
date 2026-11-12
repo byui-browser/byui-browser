@@ -3,7 +3,7 @@
 //! Selector matching lives in [`crate::matching`]; the rule hash that limits
 //! which rules an element is tested against lives in [`crate::rule_index`].
 
-use crate::computed::{ComputedStyles, computed_style};
+use crate::computed::{ComputedStyles, PseudoElement, computed_style};
 use crate::matching::{ElementTree, attribute};
 use crate::parser::parse_declarations;
 use crate::rule_index::{CompiledDeclaration, CompiledSheet, RuleIndex, compile_declarations};
@@ -67,8 +67,10 @@ pub(crate) struct CascadeStats {
 ///
 /// Selector support is described in [`crate::selector`] (syntax) and the
 /// matcher: combinators, attribute selectors, and structural and logical
-/// pseudo-classes match; dynamic pseudo-classes such as `:hover` and all
-/// pseudo-elements never match. Rules inside at-rules such as `@media` are
+/// pseudo-classes match; dynamic pseudo-classes such as `:hover` never match.
+/// `::before` and `::after` rules are cascaded separately and read through
+/// [`ComputedStyles::pseudo_declarations_for`]; other pseudo-elements never
+/// match. Rules inside at-rules such as `@media` are
 /// not applied yet.
 ///
 /// Cost: each stylesheet is compiled once per call, and each element is only
@@ -118,6 +120,7 @@ pub(crate) fn style_document_with_stats(
     };
 
     let mut computed: Vec<(NodeID, Vec<Declaration>)> = Vec::new();
+    let mut pseudo: Vec<((NodeID, PseudoElement), Vec<Declaration>)> = Vec::new();
     let mut root_font_size = None;
     let mut candidates = Vec::new();
     let initial_color = initial_color_value();
@@ -129,14 +132,6 @@ pub(crate) fn style_document_with_stats(
         let parent = node
             .get_parent()
             .and_then(|parent| computed_style(&computed, parent));
-        let parent_value = |property: &str| {
-            parent.and_then(|declarations| {
-                declarations
-                    .iter()
-                    .find(|declaration| declaration.property == property)
-                    .map(|declaration| declaration.value.as_str())
-            })
-        };
 
         // Inline declarations must outlive `cascaded`, which borrows them.
         let inline: Vec<CompiledDeclaration> = match attribute(element, "style") {
@@ -148,6 +143,8 @@ pub(crate) fn style_document_with_stats(
         };
 
         let mut cascaded = HashMap::<&str, (CascadePriority, &str)>::new();
+        let mut before = HashMap::<&str, (CascadePriority, &str)>::new();
+        let mut after = HashMap::<&str, (CascadePriority, &str)>::new();
         index.candidates(element, &mut candidates);
         for &candidate in &candidates {
             let indexed = &index.rules[candidate as usize];
@@ -157,10 +154,16 @@ pub(crate) fn style_document_with_stats(
             }
             stats.selectors_matched += 1;
             log::trace!(
-                "rule {} of sheet {} matches node {node_index}",
+                "rule {} of sheet {} matches node {node_index} (pseudo-element {:?})",
                 indexed.rule.rule_index,
-                indexed.sheet_index
+                indexed.sheet_index,
+                indexed.rule.pseudo
             );
+            let target = match indexed.rule.pseudo {
+                None => &mut cascaded,
+                Some(PseudoElement::Before) => &mut before,
+                Some(PseudoElement::After) => &mut after,
+            };
             for (position, declaration) in indexed.rule.declarations.iter().enumerate() {
                 let level = if declaration.important {
                     indexed.important_level
@@ -169,7 +172,7 @@ pub(crate) fn style_document_with_stats(
                 };
                 stats.declarations_applied += 1;
                 apply(
-                    &mut cascaded,
+                    target,
                     declaration,
                     CascadePriority {
                         level,
@@ -201,69 +204,30 @@ pub(crate) fn style_document_with_stats(
             );
         }
 
-        let mut properties = BTreeMap::<String, String>::new();
-        if let Some(parent) = parent {
-            for declaration in parent {
-                if is_inherited_property(&declaration.property) {
-                    properties.insert(declaration.property.clone(), declaration.value.clone());
-                }
-            }
-        }
-        properties
-            .entry("color".to_owned())
-            .or_insert_with(|| initial_color.clone());
-        for (property, (_, value)) in cascaded {
-            let keyword = value.trim();
-            let inherit = if keyword.eq_ignore_ascii_case("inherit") {
-                true
-            } else if ["unset", "revert", "revert-layer"]
-                .iter()
-                .any(|word| keyword.eq_ignore_ascii_case(word))
-            {
-                is_inherited_property(property)
-            } else if keyword.eq_ignore_ascii_case("initial") {
-                false
-            } else {
-                properties.insert(property.to_owned(), value.to_owned());
-                continue;
-            };
-            match parent_value(property).filter(|_| inherit) {
-                Some(inherited) => {
-                    properties.insert(property.to_owned(), inherited.to_owned());
-                }
-                None if property == "color" => {
-                    properties.insert(property.to_owned(), initial_color.clone());
-                }
-                None => {
-                    properties.remove(property);
-                }
-            }
-        }
-
-        let parent_font_size = parent_value("font-size")
-            .and_then(|value| {
-                values::compute_font_size(value, values::MEDIUM_FONT_SIZE, values::MEDIUM_FONT_SIZE)
-            })
-            .unwrap_or(values::MEDIUM_FONT_SIZE);
         let root_size = root_font_size.unwrap_or(values::MEDIUM_FONT_SIZE);
-        let font_size = properties
-            .get("font-size")
-            .and_then(|value| values::compute_font_size(value, parent_font_size, root_size))
-            .unwrap_or_else(|| {
-                log::trace!("font-size not computable for node {node_index}; using parent size");
-                parent_font_size
-            });
-        properties.insert("font-size".to_owned(), values::format_px(font_size));
+        let (declarations, font_size) = compute(
+            parent.map(Vec::as_slice),
+            cascaded,
+            &initial_color,
+            root_size,
+        );
         if root_font_size.is_none() {
             root_font_size = Some(font_size);
         }
-        computed.push((
-            NodeID::new(node_index),
-            properties
-                .into_iter()
-                .map(|(property, value)| Declaration { property, value })
-                .collect(),
-        ));
+        // A pseudo-element inherits from its originating element.
+        let root_size = root_font_size.unwrap_or(values::MEDIUM_FONT_SIZE);
+        for (which, declared) in [
+            (PseudoElement::Before, before),
+            (PseudoElement::After, after),
+        ] {
+            if declared.is_empty() {
+                continue;
+            }
+            let (pseudo_declarations, _) =
+                compute(Some(&declarations), declared, &initial_color, root_size);
+            pseudo.push(((NodeID::new(node_index), which), pseudo_declarations));
+        }
+        computed.push((NodeID::new(node_index), declarations));
     }
     log::debug!(
         "styled document: {} elements, {} indexed selectors, {} selector checks ({} matched), \
@@ -274,7 +238,88 @@ pub(crate) fn style_document_with_stats(
         stats.selectors_matched,
         stats.declarations_applied
     );
-    (ComputedStyles { styles: computed }, stats)
+    (ComputedStyles::new(computed, pseudo), stats)
+}
+
+/// Resolves one element's or pseudo-element's cascaded values against its
+/// parent's computed declarations.
+///
+/// Applies inheritance, the CSS-wide keywords, the initial `color`, and an
+/// absolute `font-size`. Returns the declarations sorted by property, and
+/// the computed font size in CSS pixels.
+fn compute(
+    parent: Option<&[Declaration]>,
+    cascaded: HashMap<&str, (CascadePriority, &str)>,
+    initial_color: &str,
+    root_font_size: f32,
+) -> (Vec<Declaration>, f32) {
+    let parent_value = |property: &str| {
+        parent.and_then(|declarations| {
+            declarations
+                .iter()
+                .find(|declaration| declaration.property == property)
+                .map(|declaration| declaration.value.as_str())
+        })
+    };
+    let mut properties = BTreeMap::<String, String>::new();
+    if let Some(parent) = parent {
+        for declaration in parent {
+            if is_inherited_property(&declaration.property) {
+                properties.insert(declaration.property.clone(), declaration.value.clone());
+            }
+        }
+    }
+    properties
+        .entry("color".to_owned())
+        .or_insert_with(|| initial_color.to_owned());
+    for (property, (_, value)) in cascaded {
+        let keyword = value.trim();
+        let inherit = if keyword.eq_ignore_ascii_case("inherit") {
+            true
+        } else if ["unset", "revert", "revert-layer"]
+            .iter()
+            .any(|word| keyword.eq_ignore_ascii_case(word))
+        {
+            is_inherited_property(property)
+        } else if keyword.eq_ignore_ascii_case("initial") {
+            false
+        } else {
+            properties.insert(property.to_owned(), value.to_owned());
+            continue;
+        };
+        match parent_value(property).filter(|_| inherit) {
+            Some(inherited) => {
+                properties.insert(property.to_owned(), inherited.to_owned());
+            }
+            None if property == "color" => {
+                properties.insert(property.to_owned(), initial_color.to_owned());
+            }
+            None => {
+                properties.remove(property);
+            }
+        }
+    }
+
+    let parent_font_size = parent_value("font-size")
+        .and_then(|value| {
+            values::compute_font_size(value, values::MEDIUM_FONT_SIZE, values::MEDIUM_FONT_SIZE)
+        })
+        .unwrap_or(values::MEDIUM_FONT_SIZE);
+    let font_size = properties
+        .get("font-size")
+        .and_then(|value| values::compute_font_size(value, parent_font_size, root_font_size))
+        .unwrap_or_else(|| {
+            log::trace!("font-size not computable; using parent size");
+            parent_font_size
+        });
+    properties.insert("font-size".to_owned(), values::format_px(font_size));
+    (
+        properties
+            .into_iter()
+            .map(|(property, value)| Declaration { property, value })
+            .collect(),
+        font_size,
+    )
 }
 
 /// Records `declaration` for its property if it beats the current winner.
@@ -522,6 +567,52 @@ mod tests {
         // User-agent rules that rely on attribute and pseudo-class selectors.
         assert_eq!(value("second", "display").as_deref(), Some("none"));
         assert_eq!(value("link", "color").as_deref(), Some("#0000ee"));
+    }
+
+    #[test]
+    fn before_and_after_get_their_own_inheriting_styles() {
+        let document = html::parse_raw_html(
+            "<div><h1 id='h' class='result'><span>FAIL</span></h1><p id='p'>x</p></div>".into(),
+        );
+        let sheet = parse_stylesheet(
+            "h1 { color: green; margin: 4px } \
+             .result::before { content: \"SUCCESS\" } \
+             h1:after { content: '!'; color: red; display: block }",
+        );
+        let styles = style_document(&document, &[sheet]);
+        let h1 = document.get_element_by_id("h").expect("h1");
+        let p = document.get_element_by_id("p").expect("p");
+        let value = |which, property: &str| {
+            styles
+                .pseudo_declarations_for(h1, which)?
+                .iter()
+                .find(|declaration| declaration.property == property)
+                .map(|declaration| declaration.value.clone())
+        };
+        assert_eq!(
+            value(PseudoElement::Before, "content").as_deref(),
+            Some("\"SUCCESS\"")
+        );
+        // Inherited from the h1; non-inherited margin is not.
+        assert_eq!(
+            value(PseudoElement::Before, "color").as_deref(),
+            Some("green")
+        );
+        assert_eq!(value(PseudoElement::Before, "margin-top"), None);
+        assert_eq!(value(PseudoElement::After, "color").as_deref(), Some("red"));
+        assert_eq!(
+            value(PseudoElement::After, "display").as_deref(),
+            Some("block")
+        );
+        // The element itself is not styled by its pseudo-element rules.
+        assert_eq!(styles.value_for(h1, "content"), None);
+        assert_eq!(styles.value_for(h1, "display"), Some("block"));
+        // Elements no rule targets have no pseudo-element styles.
+        assert!(
+            styles
+                .pseudo_declarations_for(p, PseudoElement::Before)
+                .is_none()
+        );
     }
 
     #[test]

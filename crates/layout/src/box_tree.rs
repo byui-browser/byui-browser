@@ -2,7 +2,10 @@
 //! (CSS Display 3 §2, CSS 2.2 §9.2).
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
+
+use css::PseudoElement;
 
 use html::{HTMLDocument, NodeID, NodeKind};
 
@@ -64,6 +67,8 @@ enum Level {
 /// Computed styles for every element, indexed by DOM arena index.
 pub(crate) struct StyleMap {
     styles: Vec<Option<Rc<ComputedStyle>>>,
+    /// `::before` / `::after` styles, keyed by originating element index.
+    pseudo: HashMap<(usize, PseudoElement), Rc<ComputedStyle>>,
     initial: Rc<ComputedStyle>,
 }
 
@@ -118,7 +123,7 @@ impl StyleMap {
                 )
             })
             .unwrap_or(css::values::MEDIUM_FONT_SIZE);
-        let resolved = (0..document.nodes.len())
+        let resolved: Vec<Option<Rc<ComputedStyle>>> = (0..document.nodes.len())
             .map(|index| {
                 let node = NodeID::new(index);
                 let declarations = styles.declarations_for(node)?;
@@ -135,14 +140,37 @@ impl StyleMap {
                 Some(Rc::new(style))
             })
             .collect();
+        let mut pseudo = HashMap::new();
+        for (index, owner) in resolved.iter().enumerate() {
+            let Some(owner) = owner else { continue };
+            for which in [PseudoElement::Before, PseudoElement::After] {
+                let Some(declarations) = styles.pseudo_declarations_for(NodeID::new(index), which)
+                else {
+                    continue;
+                };
+                let style = ComputedStyle::from_declarations(
+                    declarations,
+                    root_font_size,
+                    viewport,
+                    || owner.text_align,
+                );
+                pseudo.insert((index, which), Rc::new(style));
+            }
+        }
         Self {
             styles: resolved,
+            pseudo,
             initial: Rc::new(ComputedStyle::anonymous(None)),
         }
     }
 
     pub(crate) fn get(&self, node: NodeID) -> Option<&Rc<ComputedStyle>> {
         self.styles.get(node.get())?.as_ref()
+    }
+
+    /// The style of `owner`'s `::before` or `::after`, if a rule targets it.
+    fn pseudo(&self, owner: NodeID, which: PseudoElement) -> Option<&Rc<ComputedStyle>> {
+        self.pseudo.get(&(owner.get(), which))
     }
 
     /// The style text inherits: its parent element's style, or initial values
@@ -200,7 +228,7 @@ pub(crate) fn build_initial_containing_block(
         .unwrap_or_default();
     let block = BlockBox {
         node: None,
-        contents: builder.container_contents(children, &style),
+        contents: builder.container_contents(None, children, &style),
         style,
         establishes_bfc: true,
     };
@@ -277,7 +305,7 @@ impl Builder<'_> {
         );
         BlockBox {
             node: Some(node),
-            contents: self.container_contents(children, style),
+            contents: self.container_contents(Some(node), children, style),
             style: Rc::clone(style),
             establishes_bfc: is_root || flow_root,
         }
@@ -285,11 +313,24 @@ impl Builder<'_> {
 
     /// Boxes a block container's children, wrapping inline-level runs in
     /// anonymous block boxes when block-level siblings exist.
-    fn container_contents(&self, children: &[NodeID], style: &Rc<ComputedStyle>) -> BlockContents {
+    /// `owner` is the element whose children these are, which may also
+    /// generate `::before` / `::after` content around them.
+    fn container_contents(
+        &self,
+        owner: Option<NodeID>,
+        children: &[NodeID],
+        style: &Rc<ComputedStyle>,
+    ) -> BlockContents {
         let mut levels = Vec::new();
         let mut open_inlines = Vec::new();
+        if let Some(owner) = owner {
+            self.generated(owner, PseudoElement::Before, &mut levels, &open_inlines);
+        }
         for child in children {
             self.collect(*child, &mut levels, &mut open_inlines);
+        }
+        if let Some(owner) = owner {
+            self.generated(owner, PseudoElement::After, &mut levels, &open_inlines);
         }
         if !levels.iter().any(|level| matches!(level, Level::Block(_))) {
             return BlockContents::Inlines(
@@ -342,6 +383,71 @@ impl Builder<'_> {
         BlockContents::Blocks(blocks)
     }
 
+    /// Boxes `owner`'s `::before` or `::after`, if it has a style with
+    /// supported `content` (CSS Generated Content 3 §2).
+    ///
+    /// The generated text is attributed to `owner`, so hit tests and text
+    /// search treat it as part of the element. A block-level pseudo-element
+    /// becomes an anonymous-style block box holding the text; any other
+    /// display other than `none` is boxed as an inline box (inline-block,
+    /// flex, and grid pseudo-elements are not supported yet).
+    fn generated(
+        &self,
+        owner: NodeID,
+        which: PseudoElement,
+        levels: &mut Vec<Level>,
+        open_inlines: &[(NodeID, Rc<ComputedStyle>)],
+    ) {
+        let Some(style) = self.styles.pseudo(owner, which) else {
+            return;
+        };
+        let Some(content) = &style.content else {
+            return;
+        };
+        let text = InlineItem::Text {
+            node: owner,
+            element: Some(owner),
+            text: style.text_transform.apply(content),
+            style: Rc::clone(style),
+        };
+        match style.display {
+            Display::None => {}
+            Display::Box {
+                outside: DisplayOutside::Block,
+                ..
+            } => {
+                BuildStats::bump(&self.stats.boxes);
+                log::trace!("block {which:?} box for node {owner:?}");
+                for _ in open_inlines {
+                    levels.push(Level::Inline(InlineItem::End { end_edge: false }));
+                }
+                levels.push(Level::Block(BlockBox {
+                    node: None,
+                    style: Rc::clone(style),
+                    establishes_bfc: false,
+                    contents: BlockContents::Inlines(vec![text]),
+                }));
+                for (open, open_style) in open_inlines {
+                    levels.push(Level::Inline(InlineItem::Start {
+                        node: *open,
+                        style: Rc::clone(open_style),
+                        start_edge: false,
+                    }));
+                }
+            }
+            _ => {
+                log::trace!("inline {which:?} box for node {owner:?}");
+                levels.push(Level::Inline(InlineItem::Start {
+                    node: owner,
+                    style: Rc::clone(style),
+                    start_edge: true,
+                }));
+                levels.push(Level::Inline(text));
+                levels.push(Level::Inline(InlineItem::End { end_edge: true }));
+            }
+        }
+    }
+
     fn collect(
         &self,
         node: NodeID,
@@ -386,9 +492,11 @@ impl Builder<'_> {
                             "node {node:?} <{}>: display contents, boxing children in its place",
                             element.get_name()
                         );
+                        self.generated(node, PseudoElement::Before, levels, open_inlines);
                         for child in dom_node.get_children() {
                             self.collect(*child, levels, open_inlines);
                         }
+                        self.generated(node, PseudoElement::After, levels, open_inlines);
                     }
                     Display::Box {
                         outside: DisplayOutside::Inline,
@@ -404,9 +512,11 @@ impl Builder<'_> {
                             start_edge: true,
                         }));
                         open_inlines.push((node, Rc::clone(style)));
+                        self.generated(node, PseudoElement::Before, levels, open_inlines);
                         for child in dom_node.get_children() {
                             self.collect(*child, levels, open_inlines);
                         }
+                        self.generated(node, PseudoElement::After, levels, open_inlines);
                         open_inlines.pop();
                         levels.push(Level::Inline(InlineItem::End { end_edge: true }));
                     }

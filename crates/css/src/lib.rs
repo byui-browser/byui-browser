@@ -27,7 +27,7 @@ pub mod values;
 
 pub use cascade::style_document;
 pub use color::{CssColor, parse_color};
-pub use computed::ComputedStyles;
+pub use computed::{ComputedStyles, PseudoElement};
 pub use parser::{parse_stylesheet, parse_stylesheet_with_errors};
 pub use selector::{
     AttributeOperator, AttributeSelector, Combinator, ComplexSelector, CompoundSelector,
