@@ -406,6 +406,7 @@ fn evaluate_page_script(page: &Page, alert_sink: Arc<dyn AlertSink>, runtime: Br
 }
 
 enum PageCommand {
+    Unload,
     Load {
         page: Page,
         console: Arc<dyn ConsoleSink>,
@@ -439,6 +440,13 @@ pub(crate) struct PageEvents {
 }
 
 impl PageEvents {
+    /// Drops the old document session after navigation; switching tabs never unloads it.
+    pub(crate) fn unload(&self) {
+        if self.commands.send(PageCommand::Unload).is_err() {
+            log::debug!("page session already stopped");
+        }
+    }
+
     /// Starts the session thread. It exits when the last sender is dropped.
     pub(crate) fn new() -> Self {
         let (commands, incoming) = mpsc::channel();
@@ -591,6 +599,11 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
     };
     while let Ok(command) = commands.recv() {
         match command {
+            PageCommand::Unload => {
+                session = None;
+                performance = None;
+                set_script_error(script_error, None);
+            }
             PageCommand::Load {
                 page,
                 console,
@@ -814,6 +827,49 @@ mod tests {
             .expect("welcome color declaration");
         let color = css::parse_color(&value.value).expect("supported welcome color");
         [color.r, color.g, color.b, color.a]
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unloading_a_replaced_document_removes_old_click_listeners() {
+        struct Recording(std::sync::mpsc::Sender<String>);
+        impl AlertSink for Recording {
+            fn alert(&self, message: &str) {
+                let _ = self.0.send(message.into());
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let alerts = Arc::new(Recording(tx));
+        let events = PageEvents::new();
+        let old = Page {
+            url: "https://old.test/".into(),
+            html: "<script></script>".into(),
+            stylesheets: vec![],
+            scripts: vec![
+                "function click() { alert('old') } document.addEventListener('click', click)"
+                    .into(),
+            ],
+        };
+        events.load(&old, alerts.clone(), test_runtime(), 1.0);
+        events.click(None);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            "old"
+        );
+        events.unload();
+        events.click(None);
+        let new = Page {
+            url: "https://new.test/".into(),
+            html: "<script></script>".into(),
+            stylesheets: vec![],
+            scripts: vec!["alert('new')".into()],
+        };
+        events.load(&new, alerts, test_runtime(), 1.0);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            "new"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[cfg(target_os = "macos")]
