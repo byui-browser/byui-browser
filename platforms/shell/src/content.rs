@@ -7,7 +7,7 @@ use std::thread;
 
 use browser::{BrowserRuntime, Page};
 use devtools::performance::{EventCategory, PerformanceLog, TimelineEvent};
-use html::NodeID;
+use html::{NodeID, NodeKind};
 use layout::{FontMetrics, LayoutTree, Size, layout_document};
 use render::{BitmapFont, Compositor, Frame, OutlineFont};
 use tiny_skia::Pixmap;
@@ -199,6 +199,7 @@ pub(crate) struct PageLayout {
     /// The viewport width and height in CSS pixels.
     css_size: (u32, u32),
     tree: LayoutTree,
+    focusable: Vec<NodeID>,
     /// How long each stage of building this layout took, until the app moves
     /// them to the Performance panel with [`Self::take_timeline`].
     timeline: Vec<TimelineEvent>,
@@ -209,12 +210,49 @@ impl PageLayout {
     ///
     /// Times HTML parsing, each stylesheet's parse, style computation, and
     /// layout as Performance events; see [`Self::take_timeline`].
+    #[cfg(test)]
     pub(crate) fn new(page: &Page, width: u32, height: u32) -> Self {
+        Self::new_with_state(page, width, height, css::SelectorState::default())
+    }
+
+    /// Lays out `page` using the current CSS interaction state.
+    pub(crate) fn new_with_state(
+        page: &Page,
+        width: u32,
+        height: u32,
+        state: css::SelectorState,
+    ) -> Self {
         let mut timeline = Vec::new();
         let (document, event) = TimelineEvent::measure(EventCategory::Parse, "Parse HTML", || {
             html::parse_raw_html(page.html.to_owned())
         });
         timeline.push(event);
+        let focusable = document
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                let NodeKind::Element(element) = node.get_kind() else {
+                    return None;
+                };
+                let name = element.get_name();
+                let has_tabindex = element.get_attributes().iter().any(|attribute| {
+                    attribute.get_name().eq_ignore_ascii_case("tabindex")
+                        && attribute
+                            .get_value()
+                            .parse::<i32>()
+                            .is_ok_and(|value| value >= 0)
+                });
+                let naturally_focusable =
+                    matches!(name.as_str(), "button" | "input" | "select" | "textarea")
+                        || matches!(name.as_str(), "a" | "area")
+                            && element
+                                .get_attributes()
+                                .iter()
+                                .any(|attribute| attribute.get_name().eq_ignore_ascii_case("href"));
+                (has_tabindex || naturally_focusable).then(|| NodeID::new(index))
+            })
+            .collect();
         let stylesheets: Vec<_> = page
             .stylesheets
             .iter()
@@ -230,7 +268,7 @@ impl PageLayout {
             .collect();
         let (styles, event) =
             TimelineEvent::measure(EventCategory::Style, "Recalculate style", || {
-                css::style_document(&document, &stylesheets)
+                css::style_document_with_state(&document, &stylesheets, state)
             });
         timeline.push(event);
         let (tree, event) = TimelineEvent::measure(
@@ -252,6 +290,7 @@ impl PageLayout {
         Self {
             css_size: (width, height),
             tree,
+            focusable,
             timeline,
         }
     }
@@ -364,6 +403,10 @@ impl PageLayout {
     /// same page, because both parse `page.html` the same way.
     pub(crate) fn hit_test(&self, x: f32, y: f32, scroll_y: f32) -> Option<NodeID> {
         self.tree.hit_test(x, y + scroll_y)
+    }
+
+    pub(crate) fn is_focusable(&self, node: NodeID) -> bool {
+        self.focusable.contains(&node)
     }
 }
 

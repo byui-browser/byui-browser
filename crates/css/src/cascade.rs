@@ -4,7 +4,7 @@
 //! which rules an element is tested against lives in [`crate::rule_index`].
 
 use crate::computed::{ComputedStyles, computed_style};
-use crate::matching::{ElementTree, attribute};
+use crate::matching::{ElementTree, SelectorState, attribute};
 use crate::parser::parse_declarations;
 use crate::rule_index::{CompiledDeclaration, CompiledSheet, RuleIndex, compile_declarations};
 use crate::stylesheet::{Declaration, Dom, Specificity, Stylesheet};
@@ -67,20 +67,44 @@ pub(crate) struct CascadeStats {
 ///
 /// Selector support is described in [`crate::selector`] (syntax) and the
 /// matcher: combinators, attribute selectors, and structural and logical
-/// pseudo-classes match; dynamic pseudo-classes such as `:hover` and all
-/// pseudo-elements never match. Rules inside at-rules such as `@media` are
-/// not applied yet.
+/// pseudo-classes match. `style_document` uses empty interaction state;
+/// [`style_document_with_state`] accepts pointer and focus state. History
+/// pseudo-classes and pseudo-elements remain unsupported. Rules inside
+/// at-rules such as `@media` are not applied yet.
 ///
 /// Cost: each stylesheet is compiled once per call, and each element is only
 /// tested against rules filed under its ID, classes, attribute names, and tag
 /// (plus rules with no such key), not against every rule.
 pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
-    style_document_with_stats(dom, stylesheets).0
+    style_document_with_state(dom, stylesheets, SelectorState::default())
 }
 
+/// Applies CSS using the supplied pointer and focus state.
+///
+/// State node IDs must refer to `dom`. The default [`style_document`] entry
+/// point matches no dynamic pseudo-classes. This initial implementation
+/// supports `:hover`, `:active`, `:focus`, `:focus-within`, and keyboard-driven
+/// `:focus-visible`.
+pub fn style_document_with_state(
+    dom: &Dom,
+    stylesheets: &[Stylesheet],
+    state: SelectorState,
+) -> ComputedStyles {
+    style_document_with_stats_and_state(dom, stylesheets, state).0
+}
+
+#[cfg(test)]
 pub(crate) fn style_document_with_stats(
     dom: &Dom,
     stylesheets: &[Stylesheet],
+) -> (ComputedStyles, CascadeStats) {
+    style_document_with_stats_and_state(dom, stylesheets, SelectorState::default())
+}
+
+fn style_document_with_stats_and_state(
+    dom: &Dom,
+    stylesheets: &[Stylesheet],
+    state: SelectorState,
 ) -> (ComputedStyles, CascadeStats) {
     log::debug!(
         "styling document: {} nodes, {} author stylesheets",
@@ -111,7 +135,7 @@ pub(crate) fn style_document_with_stats(
     for (position, sheet) in author_sheets.iter().enumerate() {
         index.add_sheet(sheet, position + 1, AUTHOR_NORMAL, AUTHOR_IMPORTANT);
     }
-    let tree = ElementTree::new(dom);
+    let tree = ElementTree::new(dom, state);
     let mut stats = CascadeStats {
         indexed_selectors: index.rules.len(),
         ..CascadeStats::default()

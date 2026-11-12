@@ -5,38 +5,32 @@
 //! rescan child lists. Matching runs right to left with backtracking, the
 //! usual browser strategy (Selectors 4 §17).
 //!
-//! The engine has no interaction or history state, so dynamic pseudo-classes
-//! (`:hover`, `:focus`, `:visited`, ...) never match, and pseudo-elements
-//! (`::before`) never match the element itself. Unknown pseudo-classes never
-//! match. Namespace prefixes other than `*` and the default match nothing,
-//! because `@namespace` is not supported.
+//! Dynamic interaction pseudo-classes read [`SelectorState`]. History-dependent
+//! pseudo-classes such as `:visited` and pseudo-elements remain unsupported.
+//! Unknown pseudo-classes never match. Namespace prefixes other than `*` and
+//! the default match nothing, because `@namespace` is not supported.
 
 use crate::selector::{
     AttributeOperator, AttributeSelector, Combinator, ComplexSelector, CompoundSelector,
     PseudoSelector, SelectorList, SimpleSelector, TypeSelector,
 };
 use crate::specificity::is_legacy_pseudo_element;
-use html::{ElementData, HTMLDocument, Namespace, NodeKind};
+use html::{ElementData, HTMLDocument, Namespace, NodeID, NodeKind};
 use std::borrow::Cow;
 
-/// Pseudo-classes for state the engine does not track. They never match, so
-/// rules that require them can be skipped when the rule index is built.
+/// Unsupported pseudo-classes that never match, so rules requiring them can
+/// be skipped when the rule index is built.
 const NEVER_MATCHING_PSEUDO_CLASSES: &[&str] = &[
-    "active",
     "autofill",
     "-webkit-autofill",
     "blank",
     "buffering",
     "current",
     "default",
-    "focus",
-    "focus-visible",
-    "focus-within",
     "fullscreen",
     "future",
     "host",
     "host-context",
-    "hover",
     "in-range",
     "indeterminate",
     "invalid",
@@ -59,6 +53,23 @@ const NEVER_MATCHING_PSEUDO_CLASSES: &[&str] = &[
     "visited",
     "volume-locked",
 ];
+
+/// Interaction state used while matching dynamic pseudo-classes.
+///
+/// Node IDs must belong to the document passed to `style_document_with_state`.
+/// `keyboard_focus` marks focus established by keyboard navigation and controls
+/// the supported `:focus-visible` behavior.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SelectorState {
+    /// The element under the pointer, if any.
+    pub hovered: Option<NodeID>,
+    /// The element currently pressed by the primary pointer button, if any.
+    pub active: Option<NodeID>,
+    /// The element that currently owns page focus, if any.
+    pub focused: Option<NodeID>,
+    /// Whether focus was most recently established through keyboard input.
+    pub keyboard_focus: bool,
+}
 
 /// HTML attributes whose values selectors compare ASCII case-insensitively
 /// (HTML Standard §4.16.2, "Case-sensitivity of selectors"). Kept sorted for
@@ -158,11 +169,12 @@ pub(crate) struct ElementTree<'d> {
     next: Vec<Option<usize>>,
     /// Whether the node's parent is the document node.
     is_root: Vec<bool>,
+    state: SelectorState,
 }
 
 impl<'d> ElementTree<'d> {
     /// Builds the element links for `dom` in one pass over its nodes.
-    pub(crate) fn new(dom: &'d HTMLDocument) -> Self {
+    pub(crate) fn new(dom: &'d HTMLDocument, state: SelectorState) -> Self {
         let count = dom.nodes.len();
         let mut tree = Self {
             dom,
@@ -170,6 +182,7 @@ impl<'d> ElementTree<'d> {
             previous: vec![None; count],
             next: vec![None; count],
             is_root: vec![false; count],
+            state,
         };
         for (index, node) in dom.nodes.iter().enumerate() {
             let parent_is_element = matches!(node.get_kind(), NodeKind::Element(_));
@@ -244,6 +257,13 @@ impl<'d> ElementTree<'d> {
             return false;
         };
         self.match_from(selector, last, index, None)
+    }
+
+    fn state_matches(&self, node: usize, target: Option<NodeID>) -> bool {
+        let Some(target) = target.map(|target| target.get()) else {
+            return false;
+        };
+        node == target || self.ancestors(target).any(|ancestor| ancestor == node)
     }
 
     fn matches_any(&self, list: &SelectorList, index: usize) -> bool {
@@ -357,6 +377,13 @@ impl<'d> ElementTree<'d> {
         let nested = pseudo.nested_selectors.as_deref();
         let tag = element.get_name().as_str();
         match name.as_ref() {
+            "hover" => self.state_matches(index, self.state.hovered),
+            "active" => self.state_matches(index, self.state.active),
+            "focus" => self.state.focused.is_some_and(|id| id.get() == index),
+            "focus-within" => self.state_matches(index, self.state.focused),
+            "focus-visible" => {
+                self.state.keyboard_focus && self.state.focused.is_some_and(|id| id.get() == index)
+            }
             "root" | "scope" => self.is_root[index],
             "is" | "where" | "matches" | "-webkit-any" | "-moz-any" => {
                 nested.is_some_and(|list| self.matches_any(list, index))
@@ -676,7 +703,7 @@ mod tests {
 
     fn matching_ids(html: &str, selector: &str) -> Vec<String> {
         let dom = html::parse_raw_html(html.into());
-        let tree = ElementTree::new(&dom);
+        let tree = ElementTree::new(&dom, SelectorState::default());
         let list = parse_selector_list(selector).expect("valid selector");
         (0..dom.nodes.len())
             .filter(|index| tree.matches_any(&list, *index))
