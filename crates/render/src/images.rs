@@ -39,7 +39,7 @@ impl Bitmap {
             return self.clone();
         }
         let mut premultiplied = self.rgba.clone();
-        for pixel in premultiplied.chunks_exact_mut(4) {
+        for pixel in premultiplied.as_chunks_mut::<4>().0 {
             let alpha = u16::from(pixel[3]);
             for channel in &mut pixel[..3] {
                 *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8;
@@ -71,7 +71,7 @@ impl fmt::Debug for Bitmap {
 
 /// Converts premultiplied RGBA8 pixels to straight alpha in place.
 fn unpremultiply(rgba: &mut [u8]) {
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         let alpha = u16::from(pixel[3]);
         if alpha == 0 {
             pixel[..3].fill(0);
