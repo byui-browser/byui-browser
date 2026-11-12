@@ -72,6 +72,11 @@ pub struct Platform {
     /// for example to make the titlebar transparent so the toolbar extends
     /// under it. The title and sizes are already set when this runs.
     pub configure_window: fn(WindowAttributes) -> WindowAttributes,
+    /// Finishes setting up the main browser window once it exists, for
+    /// changes the window attributes cannot express. macOS uses it to give
+    /// the titlebar the toolbar's height so the traffic lights sit centered
+    /// beside the toolbar controls. Runs once, before the first redraw.
+    pub window_created: fn(&Window),
     /// Returns font files to try, in order, for toolbar text. The first one
     /// that loads is used; if none loads the toolbar omits its text.
     pub ui_font_files: fn() -> Vec<PathBuf>,
@@ -1915,6 +1920,7 @@ impl ApplicationHandler<UserEvent> for App {
                         panic!("failed to create window: {error}")
                     }),
             );
+            (self.platform.window_created)(&window);
             log::info!(
                 "window created: {}x{} physical pixels, scale factor {}",
                 window.inner_size().width,
@@ -2347,6 +2353,7 @@ mod tests {
         App::with_runtime(
             Platform {
                 configure_window: |attributes| attributes,
+                window_created: |_| {},
                 ui_font_files: Vec::new,
                 page_font_files: Vec::new,
                 window_controls_inset: 0.0,

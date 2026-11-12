@@ -26,8 +26,17 @@ const BUTTON_TOP: f32 = CENTER_Y - BUTTON_SIZE / 2.0;
 const ADDRESS_HEIGHT: f32 = 34.0;
 const ADDRESS_MAX_WIDTH: f32 = 640.0;
 /// Logical distance from the toolbar's left edge (after the window-controls
-/// inset) to the Back button.
+/// inset) to the Back button when it is furthest left: when the address field
+/// sits at [`ADDRESS_LEADING`] or the window is too narrow to show the field.
 const NAV_LEADING: f32 = 12.0;
+/// Logical horizontal distance between neighboring navigation buttons' left
+/// edges.
+const NAV_STRIDE: f32 = 32.0;
+/// Logical width of the Back, Forward, and Reload group.
+const NAV_WIDTH: f32 = 2.0 * NAV_STRIDE + BUTTON_SIZE;
+/// Logical gap between the Reload button and the address field; the
+/// navigation group stays this far left of the field wherever it sits.
+const NAV_ADDRESS_GAP: f32 = ADDRESS_LEADING - NAV_LEADING - NAV_WIDTH;
 /// Logical distance from the toolbar's left edge (after the window-controls
 /// inset) to the earliest position of the address field.
 const ADDRESS_LEADING: f32 = 116.0;
@@ -690,33 +699,45 @@ pub(crate) fn draw_text(
 /// Returns where `control` sits in a toolbar `width` logical pixels wide
 /// whose leading controls start `inset` pixels in, or `None` when the window
 /// is too narrow to show it.
+///
+/// Back, Forward, and Reload sit just left of the address field and move
+/// with it; when the field is hidden they sit at [`NAV_LEADING`].
 fn control_rect(control: Control, width: f32, inset: f32) -> Option<Rect> {
     let button = |x: f32| Rect::from_xywh(x, BUTTON_TOP, BUTTON_SIZE, BUTTON_SIZE);
     let trailing = width >= TRAILING_MIN_WIDTH;
+    let nav_x = || {
+        address_rect(width, inset, trailing).map_or(inset + NAV_LEADING, |field| {
+            field.x() - NAV_ADDRESS_GAP - NAV_WIDTH
+        })
+    };
     match control {
-        Control::Back => button(inset + NAV_LEADING),
-        Control::Forward => button(inset + NAV_LEADING + 32.0),
-        Control::Reload => button(inset + NAV_LEADING + 64.0),
+        Control::Back => button(nav_x()),
+        Control::Forward => button(nav_x() + NAV_STRIDE),
+        Control::Reload => button(nav_x() + 2.0 * NAV_STRIDE),
         Control::NewTab => button(width - 80.0).filter(|_| trailing),
         Control::Menu => button(width - 44.0).filter(|_| trailing),
-        Control::Address => {
-            let leading = inset + ADDRESS_LEADING;
-            let right = if trailing { width - 92.0 } else { width - 12.0 };
-            let available = right - leading;
-            if available < 80.0 {
-                return None;
-            }
-            let field_width = available.min(ADDRESS_MAX_WIDTH);
-            // Center in the window like Safari, but never under other controls.
-            let x = ((width - field_width) / 2.0).clamp(leading, right - field_width);
-            Rect::from_xywh(
-                x,
-                CENTER_Y - ADDRESS_HEIGHT / 2.0,
-                field_width,
-                ADDRESS_HEIGHT,
-            )
-        }
+        Control::Address => address_rect(width, inset, trailing),
     }
+}
+
+/// Returns where the address field sits, or `None` when the window is too
+/// narrow for it. `trailing` says whether New Tab and the menu are shown.
+fn address_rect(width: f32, inset: f32, trailing: bool) -> Option<Rect> {
+    let leading = inset + ADDRESS_LEADING;
+    let right = if trailing { width - 92.0 } else { width - 12.0 };
+    let available = right - leading;
+    if available < 80.0 {
+        return None;
+    }
+    let field_width = available.min(ADDRESS_MAX_WIDTH);
+    // Center in the window like Safari, but never under other controls.
+    let x = ((width - field_width) / 2.0).clamp(leading, right - field_width);
+    Rect::from_xywh(
+        x,
+        CENTER_Y - ADDRESS_HEIGHT / 2.0,
+        field_width,
+        ADDRESS_HEIGHT,
+    )
 }
 
 pub(crate) fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<Path> {
@@ -946,14 +967,17 @@ mod tests {
 
     #[test]
     fn hit_testing_finds_toolbar_controls() {
-        assert_eq!(hit_test(26.0, 26.0, 1000.0, 0.0), Some(Control::Back));
-        assert_eq!(hit_test(90.0, 26.0, 1000.0, 0.0), Some(Control::Reload));
+        // A 600-pixel window keeps the address field at its leftmost spot,
+        // so the navigation buttons sit at their leading position.
+        assert_eq!(hit_test(26.0, 26.0, 600.0, 0.0), Some(Control::Back));
+        assert_eq!(hit_test(90.0, 26.0, 600.0, 0.0), Some(Control::Reload));
         assert_eq!(hit_test(500.0, 26.0, 1000.0, 0.0), Some(Control::Address));
         assert_eq!(
             hit_test(1000.0 - 30.0, 26.0, 1000.0, 0.0),
             Some(Control::Menu)
         );
-        assert_eq!(hit_test(109.0, 26.0, 1000.0, 0.0), None);
+        assert_eq!(hit_test(109.0, 26.0, 600.0, 0.0), None);
+        assert_eq!(hit_test(26.0, 26.0, 1000.0, 0.0), None);
         assert_eq!(hit_test(500.0, 200.0, 1000.0, 0.0), None);
         let state = ChromeState::default();
         assert!(!Control::Back.is_enabled(&state));
@@ -962,8 +986,8 @@ mod tests {
 
     #[test]
     fn disabled_navigation_controls_still_occupy_hit_regions() {
-        let back = hit_test(26.0, 26.0, 1000.0, 0.0);
-        let forward = hit_test(58.0, 26.0, 1000.0, 0.0);
+        let back = hit_test(26.0, 26.0, 600.0, 0.0);
+        let forward = hit_test(58.0, 26.0, 600.0, 0.0);
 
         assert_eq!(back, Some(Control::Back));
         assert_eq!(forward, Some(Control::Forward));
@@ -977,14 +1001,32 @@ mod tests {
         // Space reserved for macOS's traffic lights holds no toolbar control.
         assert_eq!(hit_test(20.0, 26.0, 1000.0, 72.0), None);
         assert_eq!(hit_test(60.0, 26.0, 1000.0, 72.0), None);
-        assert_eq!(hit_test(98.0, 26.0, 1000.0, 72.0), Some(Control::Back));
-        assert_eq!(hit_test(162.0, 26.0, 1000.0, 72.0), Some(Control::Reload));
-        assert_eq!(hit_test(181.0, 26.0, 1000.0, 72.0), None);
+        assert_eq!(hit_test(98.0, 26.0, 600.0, 72.0), Some(Control::Back));
+        assert_eq!(hit_test(162.0, 26.0, 600.0, 72.0), Some(Control::Reload));
+        assert_eq!(hit_test(181.0, 26.0, 600.0, 72.0), None);
         // The address field never slides under the leading controls.
         let narrow = control_rect(Control::Address, 400.0, 72.0).unwrap();
         assert_eq!(narrow.x(), 72.0 + ADDRESS_LEADING);
         let centered = control_rect(Control::Address, 2000.0, 72.0).unwrap();
         assert_eq!(centered.x(), (2000.0 - ADDRESS_MAX_WIDTH) / 2.0);
+    }
+
+    #[test]
+    fn navigation_buttons_follow_the_centered_address_field() {
+        for (width, inset) in [(600.0, 72.0), (1120.0, 72.0), (2000.0, 0.0)] {
+            let field = control_rect(Control::Address, width, inset).unwrap();
+            let back = control_rect(Control::Back, width, inset).unwrap();
+            let forward = control_rect(Control::Forward, width, inset).unwrap();
+            let reload = control_rect(Control::Reload, width, inset).unwrap();
+            assert_eq!(field.x() - reload.right(), NAV_ADDRESS_GAP);
+            assert_eq!(forward.x() - back.x(), NAV_STRIDE);
+            assert_eq!(reload.x() - forward.x(), NAV_STRIDE);
+            assert!(back.x() >= inset + NAV_LEADING);
+        }
+        // Without an address field the buttons fall back to the leading edge.
+        assert!(control_rect(Control::Address, 200.0, 0.0).is_none());
+        let back = control_rect(Control::Back, 200.0, 0.0).unwrap();
+        assert_eq!(back.x(), NAV_LEADING);
     }
 
     #[test]
