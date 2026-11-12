@@ -12,6 +12,7 @@ fn main() {
         // Keep the native Windows titlebar and frame. Windows supplies the
         // rounded normal window and square maximized treatment.
         configure_window: |attributes| attributes,
+        window_created: |_| {},
         ui_font_files: windows::ui_font_files,
         page_font_files: windows::page_font_files,
         window_controls_inset: 0.0,

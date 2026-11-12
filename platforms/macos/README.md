@@ -24,7 +24,9 @@ from the window frame. The chrome follows the system light or dark appearance.
 
 The titlebar is transparent and the content extends under it, so the toolbar
 spans the full window width while macOS keeps its own traffic-light buttons at
-the top left; the toolbar leaves room for them. Close, minimize, and zoom
+the top left; the toolbar leaves room for them. An empty unified-style
+`NSToolbar` makes the titlebar as tall as the toolbar, so AppKit centers the
+traffic lights vertically with Back, Forward, and Reload. Close, minimize, and zoom
 behave as in any Mac app, and the window resizes from its edges as usual.
 Dragging empty toolbar space moves the window, and double-clicking it toggles
 the zoomed size.

@@ -15,6 +15,7 @@ fn main() -> Result<(), winit::error::EventLoopError> {
         // Adwaita-style client-side frame) provides the titlebar, its
         // buttons, and the resize borders above and around the toolbar.
         configure_window: |attributes| attributes,
+        window_created: |_| {},
         ui_font_files: linux::ui_font_files,
         page_font_files: linux::page_font_files,
         window_controls_inset: 0.0,

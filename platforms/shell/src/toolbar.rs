@@ -25,9 +25,21 @@ const BUTTON_SIZE: f32 = 28.0;
 const BUTTON_TOP: f32 = CENTER_Y - BUTTON_SIZE / 2.0;
 const ADDRESS_HEIGHT: f32 = 34.0;
 const ADDRESS_MAX_WIDTH: f32 = 640.0;
+/// Logical distance from the address field's left edge to its text, leaving
+/// room for the lock icon.
+const ADDRESS_TEXT_LEADING: f32 = 30.0;
 /// Logical distance from the toolbar's left edge (after the window-controls
-/// inset) to the Back button.
+/// inset) to the Back button when it is furthest left: when the address field
+/// sits at [`ADDRESS_LEADING`] or the window is too narrow to show the field.
 const NAV_LEADING: f32 = 12.0;
+/// Logical horizontal distance between neighboring navigation buttons' left
+/// edges.
+const NAV_STRIDE: f32 = 32.0;
+/// Logical width of the Back, Forward, and Reload group.
+const NAV_WIDTH: f32 = 2.0 * NAV_STRIDE + BUTTON_SIZE;
+/// Logical gap between the Reload button and the address field; the
+/// navigation group stays this far left of the field wherever it sits.
+const NAV_ADDRESS_GAP: f32 = ADDRESS_LEADING - NAV_LEADING - NAV_WIDTH;
 /// Logical distance from the toolbar's left edge (after the window-controls
 /// inset) to the earliest position of the address field.
 const ADDRESS_LEADING: f32 = 116.0;
@@ -97,15 +109,30 @@ pub(crate) struct ChromeState {
     pub window_controls_inset: f32,
     /// Whether the address field owns keyboard input.
     pub address_focused: bool,
-    /// Whether the whole address is selected, so the next edit replaces it.
-    /// Drawn as a highlight instead of a caret; meaningful only while
+    /// Fixed end of the address selection as a byte offset into the address
+    /// text; the selection runs between this and
+    /// [`ChromeState::address_caret`], which is the end that moves while
+    /// dragging. `None`, or the same offset as the caret, means nothing is
+    /// selected. A selection is drawn as a highlight instead of a caret and
+    /// the next edit replaces it; meaningful only while
     /// [`ChromeState::address_focused`] is set.
-    pub address_selected: bool,
+    pub address_anchor: Option<usize>,
     /// Caret position as a byte offset into the address text, drawn while the
     /// field is focused and nothing is selected. Offsets past the end, or
     /// inside a multi-byte character, are drawn at the nearest earlier
     /// character boundary.
     pub address_caret: usize,
+}
+
+impl ChromeState {
+    /// Returns the selected byte range of `address` as `(start, end)` with
+    /// `start < end`, snapped to character boundaries, or `None` when nothing
+    /// is selected.
+    pub(crate) fn address_selection(&self, address: &str) -> Option<(usize, usize)> {
+        let anchor = floor_char_boundary(address, self.address_anchor?);
+        let caret = floor_char_boundary(address, self.address_caret);
+        (anchor != caret).then(|| (anchor.min(caret), anchor.max(caret)))
+    }
 }
 
 /// A rectangle in device pixels.
@@ -535,7 +562,7 @@ fn draw_address_field(
         stroke(pixmap, &path, palette.text_muted, 1.3, transform);
     }
 
-    let text_x = rect.x() + 30.0;
+    let text_x = rect.x() + ADDRESS_TEXT_LEADING;
     let mut clip_x = star_x - 12.0;
     if state.loading
         && let Some(font) = font
@@ -560,17 +587,19 @@ fn draw_address_field(
             "Loading...",
         );
     }
+    let selection = state.address_selection(address);
     // Logical x of the caret, before the glyph at `address_caret`.
     let mut caret_x = text_x;
     if let Some(font) = font {
         let size = TEXT_SIZE * scale;
         let scaled = font.as_scaled(PxScale::from(size));
         let baseline = cy * scale + (scaled.ascent() + scaled.descent()) / 2.0;
-        if state.address_focused && state.address_selected && !address.is_empty() {
-            let width = text_advance(font, size, address) / scale;
-            let right = (text_x + width).min(clip_x);
-            if let Some(highlight) =
-                Rect::from_xywh(text_x - 1.0, cy - 9.0, right - text_x + 2.0, 18.0)
+        if state.address_focused
+            && let Some((start, end)) = selection
+        {
+            let left = (text_x + text_advance(font, size, &address[..start]) / scale).min(clip_x);
+            let right = (text_x + text_advance(font, size, &address[..end]) / scale).min(clip_x);
+            if let Some(highlight) = Rect::from_xywh(left - 1.0, cy - 9.0, right - left + 2.0, 18.0)
             {
                 fill(
                     pixmap,
@@ -597,7 +626,7 @@ fn draw_address_field(
             address,
         );
     }
-    if state.address_focused && !state.address_selected {
+    if state.address_focused && selection.is_none() {
         let x = caret_x.min(clip_x - 2.0) + 1.0;
         if let Some(caret) = Rect::from_xywh(x, cy - 8.0, 1.5, 16.0) {
             fill(
@@ -608,6 +637,39 @@ fn draw_address_field(
             );
         }
     }
+}
+
+/// Returns the byte offset in `address` of the character boundary nearest to
+/// logical x coordinate `x`, for placing the caret where the pointer presses
+/// or drags in the address field of a toolbar `width` logical pixels wide
+/// with leading inset `inset`. `scale` is the device scale factor the field
+/// is painted at. Points left of the text give 0 and points right of it give
+/// the address length; without a font every point maps to 0.
+pub(crate) fn address_offset_at(
+    x: f64,
+    width: f64,
+    inset: f32,
+    scale: f32,
+    font: Option<&FontVec>,
+    address: &str,
+) -> usize {
+    let (Some(font), Some(rect)) = (font, control_rect(Control::Address, width as f32, inset))
+    else {
+        return 0;
+    };
+    let size = TEXT_SIZE * scale;
+    let target = x as f32 - (rect.x() + ADDRESS_TEXT_LEADING);
+    address
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain([address.len()])
+        .min_by(|a, b| {
+            let distance = |index: &usize| {
+                (text_advance(font, size, &address[..*index]) / scale - target).abs()
+            };
+            distance(a).total_cmp(&distance(b))
+        })
+        .unwrap_or(0)
 }
 
 /// Returns the largest character boundary of `text` at or before `index`.
@@ -690,33 +752,45 @@ pub(crate) fn draw_text(
 /// Returns where `control` sits in a toolbar `width` logical pixels wide
 /// whose leading controls start `inset` pixels in, or `None` when the window
 /// is too narrow to show it.
+///
+/// Back, Forward, and Reload sit just left of the address field and move
+/// with it; when the field is hidden they sit at [`NAV_LEADING`].
 fn control_rect(control: Control, width: f32, inset: f32) -> Option<Rect> {
     let button = |x: f32| Rect::from_xywh(x, BUTTON_TOP, BUTTON_SIZE, BUTTON_SIZE);
     let trailing = width >= TRAILING_MIN_WIDTH;
+    let nav_x = || {
+        address_rect(width, inset, trailing).map_or(inset + NAV_LEADING, |field| {
+            field.x() - NAV_ADDRESS_GAP - NAV_WIDTH
+        })
+    };
     match control {
-        Control::Back => button(inset + NAV_LEADING),
-        Control::Forward => button(inset + NAV_LEADING + 32.0),
-        Control::Reload => button(inset + NAV_LEADING + 64.0),
+        Control::Back => button(nav_x()),
+        Control::Forward => button(nav_x() + NAV_STRIDE),
+        Control::Reload => button(nav_x() + 2.0 * NAV_STRIDE),
         Control::NewTab => button(width - 80.0).filter(|_| trailing),
         Control::Menu => button(width - 44.0).filter(|_| trailing),
-        Control::Address => {
-            let leading = inset + ADDRESS_LEADING;
-            let right = if trailing { width - 92.0 } else { width - 12.0 };
-            let available = right - leading;
-            if available < 80.0 {
-                return None;
-            }
-            let field_width = available.min(ADDRESS_MAX_WIDTH);
-            // Center in the window like Safari, but never under other controls.
-            let x = ((width - field_width) / 2.0).clamp(leading, right - field_width);
-            Rect::from_xywh(
-                x,
-                CENTER_Y - ADDRESS_HEIGHT / 2.0,
-                field_width,
-                ADDRESS_HEIGHT,
-            )
-        }
+        Control::Address => address_rect(width, inset, trailing),
     }
+}
+
+/// Returns where the address field sits, or `None` when the window is too
+/// narrow for it. `trailing` says whether New Tab and the menu are shown.
+fn address_rect(width: f32, inset: f32, trailing: bool) -> Option<Rect> {
+    let leading = inset + ADDRESS_LEADING;
+    let right = if trailing { width - 92.0 } else { width - 12.0 };
+    let available = right - leading;
+    if available < 80.0 {
+        return None;
+    }
+    let field_width = available.min(ADDRESS_MAX_WIDTH);
+    // Center in the window like Safari, but never under other controls.
+    let x = ((width - field_width) / 2.0).clamp(leading, right - field_width);
+    Rect::from_xywh(
+        x,
+        CENTER_Y - ADDRESS_HEIGHT / 2.0,
+        field_width,
+        ADDRESS_HEIGHT,
+    )
 }
 
 pub(crate) fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<Path> {
@@ -946,14 +1020,17 @@ mod tests {
 
     #[test]
     fn hit_testing_finds_toolbar_controls() {
-        assert_eq!(hit_test(26.0, 26.0, 1000.0, 0.0), Some(Control::Back));
-        assert_eq!(hit_test(90.0, 26.0, 1000.0, 0.0), Some(Control::Reload));
+        // A 600-pixel window keeps the address field at its leftmost spot,
+        // so the navigation buttons sit at their leading position.
+        assert_eq!(hit_test(26.0, 26.0, 600.0, 0.0), Some(Control::Back));
+        assert_eq!(hit_test(90.0, 26.0, 600.0, 0.0), Some(Control::Reload));
         assert_eq!(hit_test(500.0, 26.0, 1000.0, 0.0), Some(Control::Address));
         assert_eq!(
             hit_test(1000.0 - 30.0, 26.0, 1000.0, 0.0),
             Some(Control::Menu)
         );
-        assert_eq!(hit_test(109.0, 26.0, 1000.0, 0.0), None);
+        assert_eq!(hit_test(109.0, 26.0, 600.0, 0.0), None);
+        assert_eq!(hit_test(26.0, 26.0, 1000.0, 0.0), None);
         assert_eq!(hit_test(500.0, 200.0, 1000.0, 0.0), None);
         let state = ChromeState::default();
         assert!(!Control::Back.is_enabled(&state));
@@ -962,8 +1039,8 @@ mod tests {
 
     #[test]
     fn disabled_navigation_controls_still_occupy_hit_regions() {
-        let back = hit_test(26.0, 26.0, 1000.0, 0.0);
-        let forward = hit_test(58.0, 26.0, 1000.0, 0.0);
+        let back = hit_test(26.0, 26.0, 600.0, 0.0);
+        let forward = hit_test(58.0, 26.0, 600.0, 0.0);
 
         assert_eq!(back, Some(Control::Back));
         assert_eq!(forward, Some(Control::Forward));
@@ -977,14 +1054,62 @@ mod tests {
         // Space reserved for macOS's traffic lights holds no toolbar control.
         assert_eq!(hit_test(20.0, 26.0, 1000.0, 72.0), None);
         assert_eq!(hit_test(60.0, 26.0, 1000.0, 72.0), None);
-        assert_eq!(hit_test(98.0, 26.0, 1000.0, 72.0), Some(Control::Back));
-        assert_eq!(hit_test(162.0, 26.0, 1000.0, 72.0), Some(Control::Reload));
-        assert_eq!(hit_test(181.0, 26.0, 1000.0, 72.0), None);
+        assert_eq!(hit_test(98.0, 26.0, 600.0, 72.0), Some(Control::Back));
+        assert_eq!(hit_test(162.0, 26.0, 600.0, 72.0), Some(Control::Reload));
+        assert_eq!(hit_test(181.0, 26.0, 600.0, 72.0), None);
         // The address field never slides under the leading controls.
         let narrow = control_rect(Control::Address, 400.0, 72.0).unwrap();
         assert_eq!(narrow.x(), 72.0 + ADDRESS_LEADING);
         let centered = control_rect(Control::Address, 2000.0, 72.0).unwrap();
         assert_eq!(centered.x(), (2000.0 - ADDRESS_MAX_WIDTH) / 2.0);
+    }
+
+    #[test]
+    fn navigation_buttons_follow_the_centered_address_field() {
+        for (width, inset) in [(600.0, 72.0), (1120.0, 72.0), (2000.0, 0.0)] {
+            let field = control_rect(Control::Address, width, inset).unwrap();
+            let back = control_rect(Control::Back, width, inset).unwrap();
+            let forward = control_rect(Control::Forward, width, inset).unwrap();
+            let reload = control_rect(Control::Reload, width, inset).unwrap();
+            assert_eq!(field.x() - reload.right(), NAV_ADDRESS_GAP);
+            assert_eq!(forward.x() - back.x(), NAV_STRIDE);
+            assert_eq!(reload.x() - forward.x(), NAV_STRIDE);
+            assert!(back.x() >= inset + NAV_LEADING);
+        }
+        // Without an address field the buttons fall back to the leading edge.
+        assert!(control_rect(Control::Address, 200.0, 0.0).is_none());
+        let back = control_rect(Control::Back, 200.0, 0.0).unwrap();
+        assert_eq!(back.x(), NAV_LEADING);
+    }
+
+    #[test]
+    fn pointer_positions_map_to_address_character_boundaries() {
+        let font = load_ui_font([
+            "/System/Library/Fonts/SFNS.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "C:/Windows/Fonts/segoeui.ttf",
+        ]);
+        let Some(font) = font else {
+            eprintln!("skipping: system fonts unavailable");
+            return;
+        };
+        let address = "byui://welcome";
+        let field = control_rect(Control::Address, 1000.0, 0.0).unwrap();
+        let text_x = f64::from(field.x() + ADDRESS_TEXT_LEADING);
+        let at = |x: f64| address_offset_at(x, 1000.0, 0.0, 2.0, Some(&font), address);
+        assert_eq!(at(f64::from(field.x())), 0);
+        assert_eq!(at(f64::from(field.right())), address.len());
+        // The pen position after "byui" maps back to offset 4.
+        let after = f64::from(text_advance(&font, TEXT_SIZE * 2.0, "byui") / 2.0);
+        assert_eq!(at(text_x + after), 4);
+        // Positions increase monotonically across the text.
+        let offsets: Vec<_> = (0..200).map(|step| at(text_x + f64::from(step))).collect();
+        assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+        // Without a font every point maps to the start.
+        assert_eq!(
+            address_offset_at(text_x + 50.0, 1000.0, 0.0, 1.0, None, address),
+            0
+        );
     }
 
     #[test]
@@ -1023,7 +1148,7 @@ mod tests {
                         can_go_forward: false,
                         find_open: false,
                         address_focused: false,
-                        address_selected: false,
+                        address_anchor: None,
                         address_caret: 0,
                         window_controls_inset: if dark { 72.0 } else { 0.0 },
                     };
@@ -1113,11 +1238,12 @@ mod tests {
                 ..ChromeState::default()
             };
             let selected = ChromeState {
-                address_selected: true,
+                address_anchor: Some(0),
+                address_caret: 1,
                 ..focused
             };
-            let with_caret = compose(400, 200, 1.0, &focused, "", None, None).unwrap();
-            let without = compose(400, 200, 1.0, &selected, "", None, None).unwrap();
+            let with_caret = compose(400, 200, 1.0, &focused, "x", None, None).unwrap();
+            let without = compose(400, 200, 1.0, &selected, "x", None, None).unwrap();
             let rect = control_rect(Control::Address, 400.0, 0.0).unwrap();
             // With no font the caret sits at the text origin.
             let x = (rect.x() + 31.5) as u32;
