@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use css::{ComputedStyles, parse_stylesheet, style_document};
 use html::{DOMTokenList, HTMLDocument, NodeID, NodeKind};
 use js::{JsError, JsResult, Object, Realm, Value};
 
@@ -237,7 +238,7 @@ fn register_document_inner(
             remove_event_listener(&document, arguments)
         }),
     );
-    let dispatch_event_document = shared_document;
+    let dispatch_event_document = shared_document.clone();
     let dispatch_target = document_object.clone();
     document_object.set_method(
         "dispatchEvent",
@@ -253,12 +254,144 @@ fn register_document_inner(
         Some(Value::Object(window)) => window,
         _ => Object::new(),
     };
+    let computed_style_document = shared_document.clone();
+    window_object.set_method(
+        "getComputedStyle",
+        Arc::new(move |arguments| get_computed_style(&computed_style_document, arguments)),
+    );
     window_object.set_read_only("document", document_value.clone());
     realm.register_global_value("document", document_value)?;
     if realm.registered_global_value("window").is_none() {
         realm.register_global_value("window", Value::Object(window_object))?;
     }
     Ok(())
+}
+
+/// Implements the CSSOM `Window.getComputedStyle()` method.
+///
+/// The returned object exposes the cascaded declarations currently computed
+/// for the target element. Unsupported pseudo-elements are rejected as
+/// required by CSSOM; pseudo-element layout and generated content are not yet
+/// represented by this renderer.
+fn get_computed_style(document: &Arc<Mutex<Document>>, arguments: &[Value]) -> JsResult<Value> {
+    let Some(Value::Object(element)) = arguments.first() else {
+        return Err(JsError::new(
+            "TypeError: getComputedStyle() expects an Element",
+        ));
+    };
+    if let Some(value) = arguments.get(1) {
+        let pseudo = match value {
+            Value::String(pseudo) => pseudo.as_str(),
+            Value::Null => "",
+            _ => return Err(JsError::new("TypeError: pseudo-element must be a string")),
+        };
+        if !pseudo.is_empty() {
+            return Err(JsError::new(
+                "TypeError: pseudo-elements are not supported by this renderer",
+            ));
+        }
+    }
+    let Some(Value::Number(node)) = element.get("__nodeId") else {
+        return Err(JsError::new(
+            "TypeError: getComputedStyle() expects an Element",
+        ));
+    };
+    let node = NodeID::new(node as usize);
+    if document.lock().unwrap().element_snapshot(node).is_none() {
+        return Err(JsError::new("TypeError: element is not from this document"));
+    }
+    Ok(Value::Object(computed_style_object(document, node)))
+}
+
+fn computed_style_object(document: &Arc<Mutex<Document>>, node: NodeID) -> Object {
+    let styles = document.lock().unwrap().computed_styles();
+    let declarations = styles.declarations_for(node).unwrap_or_default();
+    let object = Object::new();
+    let node_id = node.get() as f64;
+    object.set_read_only("cssText", Value::String(String::new()));
+    object.set_read_only("length", Value::Number(declarations.len() as f64));
+    object.set_method(
+        "getPropertyValue",
+        Arc::new({
+            let document = document.clone();
+            move |arguments| {
+                let Some(Value::String(property)) = arguments.first() else {
+                    return Err(JsError::new("getPropertyValue() expects a property name"));
+                };
+                let styles = document.lock().unwrap().computed_styles();
+                let value = styles
+                    .value_for(node, &normalize_css_property(property))
+                    .unwrap_or("");
+                Ok(Value::String(value.to_owned()))
+            }
+        }),
+    );
+    object.set_method(
+        "setProperty",
+        Arc::new(|_| Err(JsError::new("NoModificationAllowedError"))),
+    );
+    for declaration in declarations {
+        let property = declaration.property.clone();
+        let javascript_name = css_property_to_js(&property);
+        let document_for_property = document.clone();
+        let property_for_getter = property.clone();
+        object.define_accessor(
+            &javascript_name,
+            Arc::new(move || {
+                let styles = document_for_property.lock().unwrap().computed_styles();
+                Ok(Value::String(
+                    styles
+                        .value_for(node, &property_for_getter)
+                        .unwrap_or("")
+                        .to_owned(),
+                ))
+            }),
+            None,
+        );
+        if property != javascript_name {
+            let document_for_property = document.clone();
+            let property_for_getter = property.clone();
+            object.define_accessor(
+                &property,
+                Arc::new(move || {
+                    let styles = document_for_property.lock().unwrap().computed_styles();
+                    Ok(Value::String(
+                        styles
+                            .value_for(node, &property_for_getter)
+                            .unwrap_or("")
+                            .to_owned(),
+                    ))
+                }),
+                None,
+            );
+        }
+    }
+    object.set_read_only("__nodeId", Value::Number(node_id));
+    object
+}
+
+fn normalize_css_property(property: &str) -> String {
+    if property.starts_with("--") {
+        property.to_owned()
+    } else {
+        property.to_ascii_lowercase()
+    }
+}
+
+fn css_property_to_js(property: &str) -> String {
+    let mut result = String::with_capacity(property.len());
+    let mut uppercase_next = false;
+    for character in property.chars() {
+        if character == '-' {
+            uppercase_next = true;
+        } else if uppercase_next {
+            result.extend(character.to_uppercase());
+            uppercase_next = false;
+        } else {
+            result.push(character);
+        }
+    }
+    result
 }
 
 /// Registers a document on an already-created window.
@@ -315,6 +448,26 @@ impl Document {
             custom_element_nodes: HashSet::new(),
             script_elements: HashMap::new(),
         }
+    }
+
+    fn computed_styles(&self) -> ComputedStyles {
+        let Some(source) = &self.source_document else {
+            return ComputedStyles::default();
+        };
+        let sheets = source
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                let NodeKind::Element(element) = node.get_kind() else {
+                    return None;
+                };
+                (element.get_name() == "style").then(|| {
+                    parse_stylesheet(&source.text_content(NodeID::new(index)).unwrap_or_default())
+                })
+            })
+            .collect::<Vec<_>>();
+        style_document(source, &sheets)
     }
 
     /// Creates a script-visible document from the HTML document tree.
@@ -823,6 +976,44 @@ mod tests {
         assert_eq!(
             realm.evaluate_script("window.document = null; window.document === document"),
             Ok(Value::Boolean(true))
+        );
+    }
+
+    #[test]
+    fn get_computed_style_exposes_cascaded_and_inline_values() {
+        let document = Document::from_html_document(&parse_raw_html(
+            "<style>#target { color: red; margin: 1px 2px; }</style><div id='target' style='color: blue; font-size: 2em'></div>"
+                .to_owned(),
+        ));
+        let mut realm = Realm::new();
+        register_document(&mut realm, document).unwrap();
+
+        assert_eq!(
+            realm.evaluate_script(
+                "(() => { const target = document.getElementById('target'); const style = window.getComputedStyle(target); const before = style.color === 'blue' && style.marginTop === '1px' && style.getPropertyValue('margin-left') === '2px' && style.fontSize === '32px' && style.cssText === ''; target.setAttribute('style', 'color: green'); return before && style.color === 'green'; })()",
+            ),
+            Ok(Value::Boolean(true))
+        );
+    }
+
+    #[test]
+    fn get_computed_style_rejects_invalid_elements_and_pseudo_elements() {
+        let document =
+            Document::from_html_document(&parse_raw_html("<div id='target'></div>".into()));
+        let mut realm = Realm::new();
+        register_document(&mut realm, document).unwrap();
+
+        assert!(
+            realm
+                .evaluate_script("window.getComputedStyle({})")
+                .is_err()
+        );
+        assert!(
+            realm
+                .evaluate_script(
+                    "window.getComputedStyle(document.getElementById('target'), '::before')"
+                )
+                .is_err()
         );
     }
 
