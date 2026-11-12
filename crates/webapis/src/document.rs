@@ -965,14 +965,11 @@ mod tests {
     #[test]
     fn document_append_child_adds_a_detached_element_and_returns_its_id() {
         let mut html_document = HTMLDocument::new();
-        let html_child = html_document.push_node(
-            NodeKind::Element(ElementData::new(
-                "main".into(),
-                Namespace::Html,
-                vec![Attribute::new("id".into(), "appended".into())],
-            )),
-            None,
-        );
+        let html_child = html_document.push_node(NodeKind::Element(ElementData::new(
+            "main".into(),
+            Namespace::Html,
+            vec![Attribute::new("id".into(), "appended".into())],
+        )));
         let mut document = Document::from_html_document(&html_document);
         let child = html_child;
 
@@ -988,11 +985,12 @@ mod tests {
     #[test]
     fn document_append_child_moves_a_child_from_its_old_parent() {
         let mut html_document = HTMLDocument::new();
-        let element = html_document.push_node(
-            NodeKind::Element(ElementData::new("main".into(), Namespace::Html, Vec::new())),
-            None,
-        );
-        let comment = html_document.push_node(NodeKind::Comment("move me".into()), None);
+        let element = html_document.push_node(NodeKind::Element(ElementData::new(
+            "main".into(),
+            Namespace::Html,
+            Vec::new(),
+        )));
+        let comment = html_document.push_node(NodeKind::Comment("move me".into()));
         html_document.append_child(html_document.root, element);
         html_document.append_child(element, comment);
         let mut document = Document::from_html_document(&html_document);
@@ -1014,18 +1012,16 @@ mod tests {
     #[test]
     fn document_append_child_rejects_invalid_hierarchy_without_mutating_the_tree() {
         let mut html_document = HTMLDocument::new();
-        let existing_element = html_document.push_node(
-            NodeKind::Element(ElementData::new("main".into(), Namespace::Html, Vec::new())),
-            None,
-        );
-        let second_element = html_document.push_node(
-            NodeKind::Element(ElementData::new(
-                "aside".into(),
-                Namespace::Html,
-                Vec::new(),
-            )),
-            None,
-        );
+        let existing_element = html_document.push_node(NodeKind::Element(ElementData::new(
+            "main".into(),
+            Namespace::Html,
+            Vec::new(),
+        )));
+        let second_element = html_document.push_node(NodeKind::Element(ElementData::new(
+            "aside".into(),
+            Namespace::Html,
+            Vec::new(),
+        )));
         html_document.append_child(html_document.root, existing_element);
         let mut document = Document::from_html_document(&html_document);
         let before = document.source_document.clone();
