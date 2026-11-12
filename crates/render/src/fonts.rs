@@ -64,6 +64,54 @@ pub struct OutlineFont {
     units_per_em: f32,
 }
 
+/// A page font plus named fallback fonts selected by CSS `font-family`.
+#[derive(Debug, Clone)]
+pub struct FontBook {
+    fallback: OutlineFont,
+    families: Vec<(String, OutlineFont)>,
+}
+
+impl FontBook {
+    /// Creates a font book with `fallback` as the final font choice.
+    pub fn new(fallback: OutlineFont) -> Self {
+        Self {
+            fallback,
+            families: Vec::new(),
+        }
+    }
+
+    /// Adds or replaces a case-insensitive CSS family name.
+    pub fn insert(&mut self, family: impl Into<String>, font: OutlineFont) {
+        let family = family.into().to_ascii_lowercase();
+        if let Some((_, existing)) = self.families.iter_mut().find(|(name, _)| *name == family) {
+            *existing = font;
+        } else {
+            self.families.push((family, font));
+        }
+    }
+
+    /// Selects the first loaded family in `families`, or the fallback font.
+    pub fn font_for(&self, families: &[String]) -> &OutlineFont {
+        families
+            .iter()
+            .find_map(|family| {
+                self.families
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(family))
+                    .map(|(_, font)| font)
+            })
+            .unwrap_or(&self.fallback)
+    }
+
+    /// Returns a named font only when it was explicitly loaded into the book.
+    pub fn named_font(&self, family: &str) -> Option<&OutlineFont> {
+        self.families
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(family))
+            .map(|(_, font)| font)
+    }
+}
+
 impl OutlineFont {
     /// Parses font file `data`, using the first face of a font collection.
     ///
@@ -151,6 +199,28 @@ impl layout::FontMetrics for OutlineFont {
             descent: -self.font.descent_unscaled() * scale,
             line_gap: self.font.line_gap_unscaled() * scale,
         }
+    }
+}
+
+impl layout::FontMetrics for FontBook {
+    fn advance(&self, character: char, font_size: f32) -> f32 {
+        self.fallback.advance(character, font_size)
+    }
+
+    fn vertical_metrics(&self, font_size: f32) -> layout::VerticalMetrics {
+        self.fallback.vertical_metrics(font_size)
+    }
+
+    fn advance_for_family(&self, character: char, font_size: f32, family: &[String]) -> f32 {
+        self.font_for(family).advance(character, font_size)
+    }
+
+    fn vertical_metrics_for_family(
+        &self,
+        font_size: f32,
+        family: &[String],
+    ) -> layout::VerticalMetrics {
+        self.font_for(family).vertical_metrics(font_size)
     }
 }
 

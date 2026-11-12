@@ -22,8 +22,9 @@ pub struct VerticalMetrics {
 /// will draw the text, so that line breaking and the painted glyphs agree.
 /// `render::BitmapFont` implements this for the software renderer.
 ///
-/// Font family, weight, and style are not modelled yet: one font is used for
-/// all text, and only `font-size` varies.
+/// Font family is carried through layout, but the current interface still uses
+/// one font for all text. A font provider can use the family on
+/// [`crate::TextFragment`] when selecting the font it passes to layout.
 pub trait FontMetrics {
     /// Horizontal advance of `character` at `font_size` CSS pixels.
     fn advance(&self, character: char, font_size: f32) -> f32;
@@ -31,10 +32,33 @@ pub trait FontMetrics {
     /// Vertical metrics at `font_size` CSS pixels.
     fn vertical_metrics(&self, font_size: f32) -> VerticalMetrics;
 
+    /// Horizontal advance using the requested CSS font-family fallback list.
+    ///
+    /// The default preserves compatibility with providers that expose one
+    /// font only.
+    fn advance_for_family(&self, character: char, font_size: f32, _family: &[String]) -> f32 {
+        self.advance(character, font_size)
+    }
+
+    /// Vertical metrics using the requested CSS font-family fallback list.
+    ///
+    /// The default preserves compatibility with providers that expose one
+    /// font only.
+    fn vertical_metrics_for_family(&self, font_size: f32, _family: &[String]) -> VerticalMetrics {
+        self.vertical_metrics(font_size)
+    }
+
     /// Width of `text` at `font_size` CSS pixels, as the sum of advances.
     fn text_width(&self, text: &str, font_size: f32) -> f32 {
         text.chars()
             .map(|character| self.advance(character, font_size))
+            .sum()
+    }
+
+    /// Width of `text` using the requested CSS font-family fallback list.
+    fn text_width_for_family(&self, text: &str, font_size: f32, family: &[String]) -> f32 {
+        text.chars()
+            .map(|character| self.advance_for_family(character, font_size, family))
             .sum()
     }
 }

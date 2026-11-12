@@ -591,6 +591,7 @@ mod tests {
             html: "<html><body><ul><li>x</li></ul><script>a</script></body></html>".into(),
             stylesheets: vec![".x { box-shadow: 1px 1px #000; cursor: pointer }".into()],
             scripts: vec!["var t = typeof 1; var o = new IntersectionObserver(f);".into()],
+            font_faces: Vec::new(),
         };
         audit_page(&Auditor::new(ShellScriptEngine::new()), &page, None)
     }

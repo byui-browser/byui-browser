@@ -31,6 +31,8 @@ pub enum DisplayItem {
         baseline: f32,
         /// Font size; the renderer scales its glyphs to it.
         font_size: f32,
+        /// CSS font-family fallback list, in source order.
+        font_family: Vec<String>,
         /// Text to draw.
         text: String,
         /// Text color.

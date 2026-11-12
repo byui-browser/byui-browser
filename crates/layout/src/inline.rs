@@ -228,7 +228,11 @@ impl Context<'_> {
                             if !after_space {
                                 prepared.pieces.push(Piece::Space {
                                     source,
-                                    width: self.fonts.text_width(" ", style.font_size),
+                                    width: self.fonts.text_width_for_family(
+                                        " ",
+                                        style.font_size,
+                                        &style.font_family,
+                                    ),
                                 });
                                 after_space = true;
                             }
@@ -236,7 +240,11 @@ impl Context<'_> {
                             prepared.pieces.push(Piece::Word {
                                 source,
                                 text: run.to_owned(),
-                                width: self.fonts.text_width(run, style.font_size),
+                                width: self.fonts.text_width_for_family(
+                                    run,
+                                    style.font_size,
+                                    &style.font_family,
+                                ),
                             });
                             after_space = false;
                         }
@@ -474,7 +482,9 @@ impl Context<'_> {
         // Baseline alignment: each inline box and the strut contribute their
         // half-leading-adjusted ascent and descent (CSS 2.2 §10.8.1).
         let leaded = |style: &ComputedStyle| {
-            let metrics = self.fonts.vertical_metrics(style.font_size);
+            let metrics = self
+                .fonts
+                .vertical_metrics_for_family(style.font_size, &style.font_family);
             let line_height = metrics.ascent + metrics.descent + metrics.line_gap;
             let half_leading = (line_height - metrics.ascent - metrics.descent) / 2.0;
             (
@@ -492,7 +502,9 @@ impl Context<'_> {
         }
         for fragment in &fragments {
             if let LineFragment::Text(text) = fragment {
-                let metrics = self.fonts.vertical_metrics(text.font_size);
+                let metrics = self
+                    .fonts
+                    .vertical_metrics_for_family(text.font_size, &text.font_family);
                 let half_leading = metrics.line_gap / 2.0;
                 include((
                     metrics.ascent + half_leading,
@@ -520,7 +532,9 @@ impl Context<'_> {
 
         for fragment in &mut fragments {
             if let LineFragment::Text(text) = fragment {
-                let metrics = self.fonts.vertical_metrics(text.font_size);
+                let metrics = self
+                    .fonts
+                    .vertical_metrics_for_family(text.font_size, &text.font_family);
                 text.baseline = baseline;
                 text.rect.y = baseline - metrics.ascent;
                 text.rect.height = metrics.ascent + metrics.descent;
@@ -528,7 +542,9 @@ impl Context<'_> {
         }
         for (box_index, fragment) in boxes_on_line {
             let info = &prepared.boxes[box_index];
-            let metrics = self.fonts.vertical_metrics(info.style.font_size);
+            let metrics = self
+                .fonts
+                .vertical_metrics_for_family(info.style.font_size, &info.style.font_family);
             if let LineFragment::InlineBox(inline) = &mut fragments[fragment] {
                 inline.rect.y = baseline - metrics.ascent - info.padding_top;
                 inline.rect.height =
@@ -591,6 +607,7 @@ impl Context<'_> {
             baseline: 0.0,
             text: text.to_owned(),
             font_size: source.style.font_size,
+            font_family: source.style.font_family.clone(),
             color: source.style.color,
         }));
     }

@@ -125,6 +125,7 @@ fn paint(
                         x: text.rect.x,
                         baseline: text.baseline - scroll_y,
                         font_size: text.font_size,
+                        font_family: text.font_family.clone(),
                         text: text.text.clone(),
                         color: text.color.into(),
                     });

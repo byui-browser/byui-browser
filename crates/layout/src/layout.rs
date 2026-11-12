@@ -35,8 +35,8 @@ pub(crate) struct Context<'a> {
 /// alignment, and anonymous flex items for mixed text are not implemented.
 /// Grid and table modes are preserved distinctly in computed display values,
 /// but still use ordinary flow layout. Other supported properties are
-/// margins, padding, `width`, `height`, `font-size`, `color`, and
-/// `background-color`; unsupported properties use their initial values.
+/// margins, padding, `width`, `height`, `font-size`, `font-family`, `color`,
+/// and `background-color`; unsupported properties use their initial values.
 /// Floats, positioning, borders, and min/max sizes are not implemented.
 /// Content may overflow the viewport; the root box's rect stays viewport-sized.
 pub fn layout_document(

@@ -2,7 +2,7 @@
 //!
 //! [`css::style_document`] produces cascaded, inherited declarations as text.
 //! This module parses `display`, box dimensions and edges, text colors, and
-//! `text-align`, `border-*-radius`, and the initial flex subset (`flex-direction`, `flex-grow`, and `gap`). Other
+//! `text-align`, `font-family`, `border-*-radius`, and the initial flex subset (`flex-direction`, `flex-grow`, and `gap`). Other
 //! properties use their initial values. A missing or unparsable value falls back to the initial
 //! value. Lengths are resolved to CSS pixels here; percentages are kept
 //! because they resolve against the containing block during layout.
@@ -265,6 +265,67 @@ impl TextTransform {
     }
 }
 
+/// Parses a `font-family` family list, retaining families in fallback order.
+fn parse_font_family(value: &str) -> Option<Vec<String>> {
+    let mut items = Vec::new();
+    let mut item = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            item.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if let Some(delimiter) = quote {
+            item.push(character);
+            if character == delimiter {
+                quote = None;
+            }
+        } else if matches!(character, '"' | '\'') {
+            item.push(character);
+            quote = Some(character);
+        } else if character == ',' {
+            items.push(std::mem::take(&mut item));
+        } else {
+            item.push(character);
+        }
+    }
+    if escaped || quote.is_some() {
+        return None;
+    }
+    items.push(item);
+
+    let families = items
+        .into_iter()
+        .map(|family| family.trim().to_owned())
+        .map(|family| {
+            let bytes = family.as_bytes();
+            if bytes.len() >= 2
+                && matches!(bytes.first(), Some(b'"' | b'\''))
+                && bytes.last() == bytes.first()
+            {
+                let name = &family[1..family.len() - 1];
+                (!name.is_empty()).then(|| name.to_owned())
+            } else if family.is_empty()
+                || family.chars().any(|character| {
+                    character.is_ascii_control() || character == '"' || character == '\''
+                })
+            {
+                None
+            } else {
+                Some(
+                    family
+                        .split_ascii_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!families.is_empty()).then_some(families)
+}
+
 /// The `text-align` property: how inline content is placed within each line
 /// box (CSS Text 3 §7.1).
 ///
@@ -342,6 +403,7 @@ pub(crate) struct ComputedStyle {
     pub width: Dimension,
     pub height: Dimension,
     pub font_size: f32,
+    pub font_family: Vec<String>,
     pub color: CssColor,
     pub text_transform: TextTransform,
     pub text_align: TextAlign,
@@ -354,7 +416,7 @@ pub(crate) struct ComputedStyle {
 
 impl ComputedStyle {
     /// The style of a box with no element: initial values for every property,
-    /// with inherited properties (`color`, `font-size`, `text-transform`, and
+    /// with inherited properties (`color`, `font-family`, `font-size`, `text-transform`, and
     /// `text-align`) taken from
     /// `parent` when given.
     ///
@@ -372,6 +434,9 @@ impl ComputedStyle {
             width: Dimension::Auto,
             height: Dimension::Auto,
             font_size: parent.map_or(css::values::MEDIUM_FONT_SIZE, |parent| parent.font_size),
+            font_family: parent
+                .map(|parent| parent.font_family.clone())
+                .unwrap_or_else(|| vec!["serif".to_owned()]),
             color: parent.map_or_else(
                 || {
                     css::user_agent_default_color("color")
@@ -420,6 +485,14 @@ impl ComputedStyle {
                 None => log::debug!(
                     "ignoring invalid font-size value {value:?}; using {}px",
                     style.font_size
+                ),
+            }
+        }
+        if let Some(value) = get("font-family") {
+            match parse_font_family(value) {
+                Some(families) => style.font_family = families,
+                None => log::debug!(
+                    "ignoring invalid font-family value {value:?}; using the initial value"
                 ),
             }
         }
@@ -564,6 +637,34 @@ mod tests {
             style(&[("text-align", "middle")]).text_align,
             TextAlign::Start
         );
+    }
+
+    #[test]
+    fn font_family_parses_quoted_and_unquoted_families() {
+        assert_eq!(
+            parse_font_family("\"Avenir Next\", Arial, sans-serif"),
+            Some(vec![
+                "Avenir Next".into(),
+                "Arial".into(),
+                "sans-serif".into()
+            ])
+        );
+        assert_eq!(
+            parse_font_family("\"Family, With Comma\", 'Escaped \\\' Quote', sans-serif"),
+            Some(vec![
+                "Family, With Comma".into(),
+                "Escaped ' Quote".into(),
+                "sans-serif".into()
+            ])
+        );
+        assert_eq!(parse_font_family("Arial,, sans-serif"), None);
+        assert_eq!(parse_font_family("\"Unclosed, Arial"), None);
+        assert_eq!(parse_font_family("Arial, 'broken"), None);
+        assert_eq!(
+            style(&[("font-family", "\"Avenir Next\", Arial")]).font_family,
+            vec!["Avenir Next", "Arial"]
+        );
+        assert_eq!(style(&[]).font_family, vec!["serif"]);
     }
 
     #[test]

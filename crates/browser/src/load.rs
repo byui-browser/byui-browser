@@ -94,7 +94,7 @@ pub fn normalize_address(input: &str) -> Result<Url, LoadError> {
 struct Fetched {
     /// Final URL after redirects; the base for resolving relative links.
     url: Url,
-    body: String,
+    body: Vec<u8>,
 }
 
 /// Fetches `url` as text, failing on a non-2xx status.
@@ -110,7 +110,7 @@ async fn fetch_document(controller: &RequestController, url: Url) -> Result<Fetc
     }
     // The response URL is empty for filtered responses; keep the request URL.
     let final_url = Url::parse(&response.url).unwrap_or(url);
-    let body = response.body.text().await?;
+    let body = response.body.bytes().await?;
     log::debug!("fetched {final_url}: {} bytes", body.len());
     Ok(Fetched {
         url: final_url,
@@ -132,8 +132,8 @@ async fn fetch_document(controller: &RequestController, url: Url) -> Result<Fetc
 /// A page served over a non-`byui:` scheme may not pull `byui:` or `file:`
 /// subresources.
 ///
-/// Limitation: CSS `@import` inside stylesheets is not followed, and fonts
-/// and images are not fetched.
+/// Limitation: images are not fetched, and only the first 16 nested import
+/// levels are followed.
 pub async fn load_page(controller: &RequestController, address: &str) -> Result<Page, LoadError> {
     load_page_timed(controller, address).await.0
 }
@@ -202,12 +202,14 @@ where
         log::error!("page load failed for {url}: {error}");
     })?;
     log::trace!("parsing document {}: {} bytes", main.url, main.body.len());
+    let html_source = String::from_utf8_lossy(&main.body).into_owned();
     let (document, parse) = TimelineEvent::measure(EventCategory::Parse, "Parse HTML", || {
-        html::parse_raw_html(main.body.clone())
+        html::parse_raw_html(html_source.clone())
     });
     push_event(timeline, parse);
 
     let mut sheet_slots = Vec::new();
+    let mut sheet_bases = Vec::new();
     let mut script_slots = Vec::new();
     let nodes = (0..)
         .map(html::NodeID::new)
@@ -225,10 +227,15 @@ where
                         .any(|token| token.eq_ignore_ascii_case("stylesheet"))
                 });
                 if let (true, Some(href)) = (is_stylesheet, attribute(attributes, "href")) {
-                    sheet_slots.push(Slot::Remote(subresource_url(&main.url, href)));
+                    let url = subresource_url(&main.url, href);
+                    sheet_bases.push(url.clone().unwrap_or_else(|_| main.url.clone()));
+                    sheet_slots.push(Slot::Remote(url));
                 }
             }
-            "style" => sheet_slots.push(Slot::Inline(inline())),
+            "style" => {
+                sheet_bases.push(main.url.clone());
+                sheet_slots.push(Slot::Inline(inline()));
+            }
             "script" => script_slots.push(match attribute(attributes, "src") {
                 Some(src) => Slot::Remote(subresource_url(&main.url, src)),
                 None => Slot::Inline(inline()),
@@ -243,11 +250,17 @@ where
         sheet_slots.len(),
         script_slots.len()
     );
-    let (stylesheets, scripts) = futures_util::future::join(
-        resolve_slots(&fetch, sheet_slots, "stylesheet", false, timeline),
+    let (stylesheet_sources, scripts) = futures_util::future::join(
+        resolve_stylesheets(&fetch, sheet_slots, sheet_bases, timeline),
         resolve_slots(&fetch, script_slots, "script", true, timeline),
     )
     .await;
+    let stylesheet_sources = expand_imports(&fetch, stylesheet_sources, timeline).await;
+    let stylesheets = stylesheet_sources
+        .iter()
+        .map(|(source, _)| source.clone())
+        .collect::<Vec<_>>();
+    let font_faces = resolve_font_faces(&fetch, &stylesheet_sources, timeline).await;
     log::debug!(
         "subresources loaded: {} stylesheets, {} scripts",
         stylesheets.len(),
@@ -260,10 +273,228 @@ where
     );
     Ok(Page {
         url: main.url.to_string(),
-        html: main.body,
+        html: html_source,
         stylesheets,
         scripts,
+        font_faces,
     })
+}
+
+/// Fetches the first usable `src: url(...)` from each top-level `@font-face`.
+/// Font failures are intentionally non-fatal; CSS fallback fonts remain valid.
+async fn resolve_font_faces<F, Fut>(
+    fetch: &F,
+    stylesheets: &[(String, Url)],
+    timeline: &Mutex<Vec<TimelineEvent>>,
+) -> Vec<crate::FontFace>
+where
+    F: Fn(Url) -> Fut,
+    Fut: Future<Output = Result<Fetched, LoadError>>,
+{
+    let requests = stylesheets.iter().flat_map(|(source, base)| {
+        let sheet = css::parse_stylesheet(source);
+        sheet
+            .at_rules
+            .into_iter()
+            .filter_map(move |rule| {
+                if rule.name != "font-face" {
+                    return None;
+                }
+                let family = rule
+                    .declarations
+                    .iter()
+                    .find(|declaration| declaration.property == "font-family")
+                    .map(|declaration| declaration.value.trim().trim_matches(['\'', '"']))
+                    .filter(|family| !family.is_empty())
+                    .map(str::to_owned)?;
+                let sources = rule
+                    .declarations
+                    .iter()
+                    .find(|declaration| declaration.property == "src")
+                    .map(|declaration| extract_font_sources(&declaration.value))?;
+                Some(sources.into_iter().map(move |source| match source {
+                    FontSource::Local(local_family) => (family.clone(), None, Some(local_family)),
+                    FontSource::Url(source) => {
+                        (family.clone(), subresource_url(base, &source).ok(), None)
+                    }
+                }))
+            })
+            .flatten()
+    });
+    join_all(requests.map(|(family, url, local_family)| async move {
+        if let Some(local_family) = local_family {
+            return Some(crate::FontFace {
+                family,
+                bytes: Vec::new(),
+                local_family: Some(local_family),
+            });
+        }
+        let url = url?;
+        let started = Instant::now();
+        let result = fetch(url.clone()).await;
+        push_event(
+            timeline,
+            TimelineEvent::since(EventCategory::Network, download_label(&url), started),
+        );
+        match result {
+            Ok(fetched) => Some(crate::FontFace {
+                family,
+                bytes: fetched.body,
+                local_family: None,
+            }),
+            Err(error) => {
+                log::warn!("skipping font {url}: {error}");
+                None
+            }
+        }
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Expands top-level `@import` rules before the importing stylesheet. A
+/// bounded depth prevents malformed or cyclic imports from hanging a load.
+async fn expand_imports<F, Fut>(
+    fetch: &F,
+    sources: Vec<(String, Url)>,
+    timeline: &Mutex<Vec<TimelineEvent>>,
+) -> Vec<(String, Url)>
+where
+    F: Fn(Url) -> Fut,
+    Fut: Future<Output = Result<Fetched, LoadError>>,
+{
+    let mut pending = sources
+        .into_iter()
+        .map(|source| (source, 0u8))
+        .collect::<std::collections::VecDeque<_>>();
+    let mut expanded = Vec::new();
+    while let Some(((source, base), depth)) = pending.pop_front() {
+        let imports = css::parse_stylesheet(&source)
+            .at_rules
+            .into_iter()
+            .filter(|rule| rule.name == "import")
+            .filter_map(|rule| extract_import_url(&rule.prelude))
+            .filter_map(|reference| subresource_url(&base, &reference).ok())
+            .collect::<Vec<_>>();
+        if depth < 16 && !imports.is_empty() {
+            pending.push_back(((source, base), 16));
+            for url in imports.into_iter().rev() {
+                let started = Instant::now();
+                let result = fetch(url.clone()).await;
+                push_event(
+                    timeline,
+                    TimelineEvent::since(EventCategory::Network, download_label(&url), started),
+                );
+                if let Ok(fetched) = result {
+                    pending.push_front((
+                        (String::from_utf8_lossy(&fetched.body).into_owned(), url),
+                        depth + 1,
+                    ));
+                }
+            }
+            continue;
+        }
+        expanded.push((source, base));
+    }
+    expanded
+}
+
+/// Loads stylesheets while retaining each stylesheet's URL for relative
+/// `@font-face` sources.
+async fn resolve_stylesheets<F, Fut>(
+    fetch: &F,
+    slots: Vec<Slot>,
+    bases: Vec<Url>,
+    timeline: &Mutex<Vec<TimelineEvent>>,
+) -> Vec<(String, Url)>
+where
+    F: Fn(Url) -> Fut,
+    Fut: Future<Output = Result<Fetched, LoadError>>,
+{
+    join_all(slots.into_iter().zip(bases).map(|(slot, base)| async move {
+        match slot {
+            Slot::Inline(text) => Some((text, base)),
+            Slot::Remote(Err(reason)) => {
+                log::warn!("skipping stylesheet: {reason}");
+                None
+            }
+            Slot::Remote(Ok(url)) => {
+                let started = Instant::now();
+                let fetched = fetch(url.clone()).await;
+                push_event(
+                    timeline,
+                    TimelineEvent::since(EventCategory::Network, download_label(&url), started),
+                );
+                match fetched {
+                    Ok(fetched) => Some((String::from_utf8_lossy(&fetched.body).into_owned(), url)),
+                    Err(error) => {
+                        log::warn!("skipping stylesheet {url}: {error}");
+                        None
+                    }
+                }
+            }
+        }
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Extracts the first CSS `url(...)` from a `src` descriptor.
+enum FontSource {
+    Url(String),
+    Local(String),
+}
+
+/// Extracts `url(...)` and `local(...)` candidates. `format(...)` descriptors
+/// are accepted and ignored; the font decoder remains the final capability
+/// check for each URL candidate.
+fn extract_font_sources(value: &str) -> Vec<FontSource> {
+    let lower = value.to_ascii_lowercase();
+    let mut sources = Vec::new();
+    let mut offset = 0;
+    while let Some((relative, kind)) = ["url(", "local("]
+        .into_iter()
+        .filter_map(|kind| lower[offset..].find(kind).map(|position| (position, kind)))
+        .min_by_key(|(position, _)| *position)
+    {
+        let start = offset + relative;
+        let value_start = start + kind.len();
+        let Some(relative_end) = value[value_start..].find(')') else {
+            break;
+        };
+        let end = value_start + relative_end;
+        let candidate = value[value_start..end].trim().trim_matches(['\'', '"']);
+        if !candidate.is_empty() {
+            sources.push(if kind == "url(" {
+                FontSource::Url(candidate.to_owned())
+            } else {
+                FontSource::Local(candidate.to_owned())
+            });
+        }
+        offset = end + 1;
+    }
+    sources
+}
+
+fn extract_import_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.to_ascii_lowercase().starts_with("url(") {
+        extract_font_sources(value)
+            .into_iter()
+            .find_map(|source| match source {
+                FontSource::Url(url) => Some(url),
+                FontSource::Local(_) => None,
+            })
+    } else {
+        value
+            .split_ascii_whitespace()
+            .next()
+            .map(|url| url.trim_matches(['\'', '"']).to_owned())
+    }
 }
 
 /// A stylesheet or script as found in the document, before fetching.
@@ -319,7 +550,7 @@ where
                 match fetched {
                     Ok(fetched) => {
                         log::debug!("fetched {kind} {url}: {} bytes", fetched.body.len());
-                        Some(fetched.body)
+                        Some(String::from_utf8_lossy(&fetched.body).into_owned())
                     }
                     Err(error) => {
                         log::warn!("skipping {kind} {url}: {error}");
@@ -351,6 +582,7 @@ pub fn error_page(address: &str, error: &LoadError) -> Page {
         ),
         stylesheets: vec!["main { padding: 16px; } h1 { color: #8a2d2d; }".into()],
         scripts: Vec::new(),
+        font_faces: Vec::new(),
     }
 }
 
@@ -456,7 +688,7 @@ mod tests {
         match pages.get(url.as_str()) {
             Some(body) => Ok(Fetched {
                 url,
-                body: (*body).to_owned(),
+                body: (*body).as_bytes().to_vec(),
             }),
             None => Err(LoadError::Status {
                 status: 404,
@@ -578,6 +810,56 @@ mod tests {
         assert_eq!(page.stylesheets, ["a{}", "b{}"]);
         assert_eq!(page.scripts, ["1+1"]);
         assert!(requested.contains(&"https://example.com/ladder/app.js".to_owned()));
+    }
+
+    #[test]
+    fn downloads_font_faces_and_keeps_the_declared_family() {
+        let (page, requested) = load(
+            &[
+                (
+                    "https://example.com/index.html",
+                    "<style>@font-face { font-family: Test Sans; src: url(fonts/test.ttf) }</style>",
+                ),
+                ("https://example.com/fonts/test.ttf", "font bytes"),
+            ],
+            "https://example.com/index.html",
+        );
+        let page = page.unwrap();
+        assert_eq!(page.font_faces.len(), 1);
+        assert_eq!(page.font_faces[0].family, "Test Sans");
+        assert_eq!(page.font_faces[0].bytes, b"font bytes");
+        assert!(requested.contains(&"https://example.com/fonts/test.ttf".to_owned()));
+    }
+
+    #[test]
+    fn expands_imports_and_accepts_font_source_fallback_descriptors() {
+        let (page, requested) = load(
+            &[
+                (
+                    "https://example.com/index.html",
+                    "<link rel=stylesheet href=css/main.css>",
+                ),
+                (
+                    "https://example.com/css/main.css",
+                    "@import \"fonts.css\"; body { color: red }",
+                ),
+                (
+                    "https://example.com/css/fonts.css",
+                    "@font-face { font-family: Imported; src: local(Unknown), url(../fonts/imported.ttf) format(\"truetype\") }",
+                ),
+                ("https://example.com/fonts/imported.ttf", "font bytes"),
+            ],
+            "https://example.com/index.html",
+        );
+        let page = page.unwrap();
+        assert_eq!(page.stylesheets.len(), 2);
+        assert_eq!(page.font_faces.len(), 2);
+        assert!(requested.contains(&"https://example.com/css/fonts.css".to_owned()));
+        assert!(requested.contains(&"https://example.com/fonts/imported.ttf".to_owned()));
+        assert_eq!(
+            extract_import_url("url(theme.css)"),
+            Some("theme.css".into())
+        );
     }
 
     #[test]

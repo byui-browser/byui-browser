@@ -1,7 +1,8 @@
 //! In-process rendering demo using the layout team's HTML -> paint -> frame API.
 //! The demo evaluates its page script once per document load before painting.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 
@@ -9,7 +10,7 @@ use browser::{BrowserRuntime, Page};
 use devtools::performance::{EventCategory, PerformanceLog, TimelineEvent};
 use html::NodeID;
 use layout::{FontMetrics, LayoutTree, Size, layout_document};
-use render::{BitmapFont, Compositor, Frame, OutlineFont};
+use render::{BitmapFont, Compositor, FontBook, Frame, OutlineFont};
 use tiny_skia::Pixmap;
 use webapis::{AlertSink, ConsoleSink, LocationNavigate, ViewportSize};
 
@@ -42,7 +43,7 @@ impl ConsoleSink for NoopConsole {
 }
 
 /// The system font all page text uses, set once by [`load_page_font`].
-static PAGE_FONT: OnceLock<Option<OutlineFont>> = OnceLock::new();
+static PAGE_FONTS: OnceLock<Option<FontBook>> = OnceLock::new();
 
 /// Loads the first of `files` that parses as a font as the page font.
 ///
@@ -51,25 +52,37 @@ static PAGE_FONT: OnceLock<Option<OutlineFont>> = OnceLock::new();
 /// an effect. If no file loads, or this is never called (as in unit tests),
 /// pages use the built-in bitmap font.
 pub(crate) fn load_page_font(files: Vec<PathBuf>) {
-    PAGE_FONT.get_or_init(|| {
+    PAGE_FONTS.get_or_init(|| {
         let candidates = files.len();
-        let font = OutlineFont::load_first(files);
-        if font.is_some() {
-            log::debug!("page font loaded (first loadable of {candidates} candidate files)");
-        } else {
+        let fallback = OutlineFont::load_first(files.iter());
+        let Some(fallback) = fallback else {
             log::warn!(
                 "no page font could be loaded from {candidates} candidate files; using the built-in bitmap font"
             );
+            return None;
+        };
+        let mut book = FontBook::new(fallback);
+        for path in &files {
+            if let Some(font) = OutlineFont::load_first([path]) {
+                if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    book.insert(stem.replace('-', " ").replace('_', " "), font);
+                }
+            }
         }
-        font
+        for family in ["serif", "sans-serif", "system-ui", "monospace"] {
+            // The platform's default page font is the best available fallback
+            // for generic families until a CSS family-specific file is loaded.
+            book.insert(family, book.font_for(&[]).clone());
+        }
+        log::debug!("page font loaded (first loadable of {candidates} candidate files)");
+        Some(book)
     });
 }
 
 /// The loaded page font, or `None` to use the built-in bitmap font.
 ///
-/// `font-family` is not supported yet, so every element shares this font.
-fn page_font() -> Option<&'static OutlineFont> {
-    PAGE_FONT.get().and_then(Option::as_ref)
+fn page_font() -> Option<&'static FontBook> {
+    PAGE_FONTS.get().and_then(Option::as_ref)
 }
 
 /// The metrics layout uses, matching the font [`render_document`] draws with.
@@ -78,6 +91,112 @@ fn page_metrics() -> &'static dyn FontMetrics {
         Some(font) => font,
         None => &BitmapFont,
     }
+}
+
+/// Builds the page font book, adding downloaded `@font-face` resources over
+/// the platform defaults.
+fn page_fonts(page: &Page) -> Option<FontBook> {
+    let mut book = page_font().cloned().or_else(|| {
+        page.font_faces
+            .iter()
+            .find_map(|face| OutlineFont::from_bytes(face.bytes.clone()))
+            .map(FontBook::new)
+    })?;
+    let mut resolved_families = std::collections::HashSet::new();
+    for face in &page.font_faces {
+        let font = if face.bytes.is_empty() {
+            face.local_family
+                .as_deref()
+                .and_then(|family| book.named_font(family))
+                .cloned()
+                .or_else(|| {
+                    face.local_family.as_deref().and_then(|family| {
+                        OutlineFont::load_first(discover_local_font_files(family))
+                    })
+                })
+        } else {
+            OutlineFont::from_bytes(face.bytes.clone())
+        };
+        if let Some(font) = font
+            && resolved_families.insert(face.family.to_ascii_lowercase())
+        {
+            book.insert(&face.family, font);
+        }
+    }
+    Some(book)
+}
+
+/// Finds installed font files for a CSS `local(...)` family name.
+///
+/// Linux uses fontconfig when available, while the directory scan covers the
+/// standard font locations on macOS, Windows, and minimal Linux systems.
+fn discover_local_font_files(family: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(output) = Command::new("fc-match")
+        .args(["--format=%{file}", family])
+        .output()
+        && output.status.success()
+        && let Ok(path) = String::from_utf8(output.stdout)
+        && !path.trim().is_empty()
+    {
+        files.push(PathBuf::from(path.trim()));
+    }
+
+    let normalized_family = normalize_font_name(family);
+    let mut roots = vec![
+        PathBuf::from("/System/Library/Fonts"),
+        PathBuf::from("/Library/Fonts"),
+        PathBuf::from("/usr/share/fonts"),
+        PathBuf::from("/usr/local/share/fonts"),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        roots.push(home.join("Library/Fonts"));
+        roots.push(home.join(".fonts"));
+        roots.push(home.join(".local/share/fonts"));
+    }
+    if let Ok(windir) = std::env::var("WINDIR") {
+        roots.push(PathBuf::from(windir).join("Fonts"));
+    }
+    for root in roots {
+        collect_font_candidates(&root, &normalized_family, &mut files, 0);
+    }
+    files
+}
+
+fn collect_font_candidates(directory: &Path, family: &str, files: &mut Vec<PathBuf>, depth: u8) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_font_candidates(&path, family, files, depth + 1);
+        } else if path.extension().is_some_and(|extension| {
+            matches!(
+                extension
+                    .to_str()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "ttf" | "otf" | "ttc"
+            )
+        }) && normalize_font_name(&path.to_string_lossy()).contains(family)
+        {
+            files.push(path);
+        }
+    }
+}
+
+fn normalize_font_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// Renders `page` into a `width` × `height` device-pixel frame, first
@@ -167,17 +286,19 @@ fn compose_frame_with_find(
             })
         }
     };
-    match page_font() {
-        Some(font) => {
-            let scale = scale_factor as f32;
-            let scroll_y = (scroll_y * scale).round() / scale;
-            let display_list = display_list(scroll_y);
-            Compositor::new(width, height).compose_paint_with_font(&display_list, font, scale)
-        }
-        None => {
-            let display_list = display_list(scroll_y.round());
-            Compositor::new(css_width, css_height).compose_paint(&display_list)
-        }
+    if let Some(fonts) = layout.fonts.as_ref() {
+        let scale = scale_factor as f32;
+        let scroll_y = (scroll_y * scale).round() / scale;
+        let display_list = display_list(scroll_y);
+        Compositor::new(width, height).compose_paint_with_fonts(&display_list, fonts, scale)
+    } else if let Some(fonts) = page_font() {
+        let scale = scale_factor as f32;
+        let scroll_y = (scroll_y * scale).round() / scale;
+        let display_list = display_list(scroll_y);
+        Compositor::new(width, height).compose_paint_with_fonts(&display_list, fonts, scale)
+    } else {
+        let display_list = display_list(scroll_y.round());
+        Compositor::new(css_width, css_height).compose_paint(&display_list)
     }
 }
 
@@ -199,6 +320,8 @@ pub(crate) struct PageLayout {
     /// The viewport width and height in CSS pixels.
     css_size: (u32, u32),
     tree: LayoutTree,
+    /// Fonts selected for this page, including downloaded web fonts.
+    fonts: Option<FontBook>,
     /// How long each stage of building this layout took, until the app moves
     /// them to the Performance panel with [`Self::take_timeline`].
     timeline: Vec<TimelineEvent>,
@@ -233,25 +356,33 @@ impl PageLayout {
                 css::style_document(&document, &stylesheets)
             });
         timeline.push(event);
-        let (tree, event) = TimelineEvent::measure(
-            EventCategory::Layout,
-            format!("Layout {width}×{height}"),
-            || {
-                layout_document(
-                    &document,
-                    &styles,
-                    Size {
-                        width: width as f32,
-                        height: height as f32,
-                    },
-                    page_metrics(),
-                )
-            },
-        );
+        let fonts = page_fonts(page);
+        let (tree, event) = {
+            let metrics: &dyn FontMetrics = match fonts.as_ref() {
+                Some(fonts) => fonts,
+                None => page_metrics(),
+            };
+            TimelineEvent::measure(
+                EventCategory::Layout,
+                format!("Layout {width}×{height}"),
+                || {
+                    layout_document(
+                        &document,
+                        &styles,
+                        Size {
+                            width: width as f32,
+                            height: height as f32,
+                        },
+                        metrics,
+                    )
+                },
+            )
+        };
         timeline.push(event);
         Self {
             css_size: (width, height),
             tree,
+            fonts,
             timeline,
         }
     }
@@ -950,6 +1081,7 @@ mod tests {
                 .into(),
             stylesheets: vec![],
             scripts: vec![],
+            font_faces: Vec::new(),
         };
         for width in [95, 300] {
             let layout = PageLayout::new(&page, width, 100);
@@ -1023,7 +1155,7 @@ mod tests {
         use crate::find_in_page::FindInPage;
         let page = browser::Page { url: "https://example.com/".into(),
             html: "<html><head><title>secret</title><script>secret</script><style>.gone {display:none}</style></head><body><p>Hello <span>world</span> again</p><p class='gone'>secret</p><p>world</p></body></html>".into(),
-            stylesheets: vec![".gone {display:none}".into()], scripts: vec![] };
+            stylesheets: vec![".gone {display:none}".into()], scripts: vec![], font_faces: Vec::new() };
         let mut find = FindInPage::default();
         let wide = PageLayout::new(&page, 600, 100);
         find.replace_runs(wide.find_text());
@@ -1125,6 +1257,7 @@ mod tests {
             html: "<script>location.assign('/next')</script>".into(),
             stylesheets: Vec::new(),
             scripts: vec!["location.assign('/next')".into()],
+            font_faces: Vec::new(),
         };
         events.load_with_viewport(
             &page,
@@ -1155,6 +1288,7 @@ mod tests {
             html: "<script>1 + 1</script>".into(),
             stylesheets: Vec::new(),
             scripts: vec!["1 + 1".into()],
+            font_faces: Vec::new(),
         };
         events.load_with_viewport(
             &page,
@@ -1193,6 +1327,7 @@ mod tests {
             html: "<p>Hello</p>".into(),
             stylesheets: vec!["p { color: red }".into(), "p { margin: 0 }".into()],
             scripts: Vec::new(),
+            font_faces: Vec::new(),
         };
         let mut layout = PageLayout::new(&page, 320, 200);
         let labels: Vec<_> = layout
@@ -1243,6 +1378,7 @@ mod tests {
                      document.addEventListener('click', callback)"
                         .into(),
                 ],
+                font_faces: Vec::new(),
             },
             alert.clone(),
             test_runtime(),
@@ -1339,6 +1475,7 @@ mod tests {
                     .into(),
             ],
             scripts: Vec::new(),
+            font_faces: Vec::new(),
         }
     }
 
@@ -1381,6 +1518,7 @@ mod tests {
             html: "<body>short</body>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            font_faces: Vec::new(),
         };
         let layout = PageLayout::new(&short, 160, 120);
         assert_eq!(layout.max_scroll(), 0.0);
@@ -1416,6 +1554,7 @@ mod tests {
             html: "<main><script src=\"script.js\"></script></main>".into(),
             stylesheets: Vec::new(),
             scripts: vec!["alert('rendered page')".into()],
+            font_faces: Vec::new(),
         };
 
         let runtime = test_runtime();
@@ -1450,6 +1589,7 @@ mod tests {
             html: welcome.html,
             stylesheets: welcome.stylesheets,
             scripts: vec!["alert('Hello from script.js')".into()],
+            font_faces: Vec::new(),
         };
         let alert = Arc::new(Recording::default());
         let runtime = test_runtime();
@@ -1483,6 +1623,7 @@ mod tests {
             html: "<main>Hello</main>".into(),
             stylesheets: vec!["main { background-color: #abc; color: red; }".into()],
             scripts: Vec::new(),
+            font_faces: Vec::new(),
         };
         let first = render_document(
             &page,
@@ -1547,6 +1688,7 @@ mod tests {
             html: "<html><body><main>Hi</main></body></html>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            font_faces: Vec::new(),
         };
         let frame = render_document(
             &page,

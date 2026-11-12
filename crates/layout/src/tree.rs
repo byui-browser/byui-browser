@@ -170,6 +170,8 @@ pub struct TextFragment {
     pub text: String,
     /// The computed font size in CSS pixels.
     pub font_size: f32,
+    /// The computed font-family fallback list, in CSS source order.
+    pub font_family: Vec<String>,
     /// The text color.
     pub color: CssColor,
 }
@@ -363,6 +365,7 @@ mod tests {
                 baseline: 8.0,
                 text: "a".into(),
                 font_size: 10.0,
+                font_family: vec!["serif".into()],
                 color: BoxStyle::default().text_color,
             })],
         });

@@ -45,6 +45,8 @@ pub enum DisplayItem {
         /// Font size in device pixels; glyphs scale by
         /// `font_size / BitmapFont::UNITS_PER_EM`.
         font_size: f32,
+        /// CSS font-family fallback list, in source order.
+        font_family: Vec<String>,
         /// Text to draw.
         text: String,
         /// RGBA8 color.

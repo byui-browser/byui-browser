@@ -89,10 +89,36 @@ fn texts(layout_box: &LayoutBox) -> Vec<String> {
         .collect()
 }
 
+fn text_fragments(layout_box: &LayoutBox) -> Vec<&crate::TextFragment> {
+    layout_box
+        .lines
+        .iter()
+        .flat_map(|line| line.fragments.iter())
+        .filter_map(|fragment| match fragment {
+            LineFragment::Text(text) => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
 fn assert_close(actual: f32, expected: f32) {
     assert!(
         (actual - expected).abs() < 0.01,
         "expected {expected}, got {actual}"
+    );
+}
+
+#[test]
+fn font_family_is_carried_to_text_fragments() {
+    let (_document, tree) = lay_out(
+        "<body><p id='text'>hello</p></body>",
+        "p { font-family: \"Avenir Next\", Arial, sans-serif }",
+        800.0,
+    );
+    let fragments = text_fragments(&tree.root.children[0].children[0]);
+    assert_eq!(
+        fragments[0].font_family,
+        ["Avenir Next", "Arial", "sans-serif"]
     );
 }
 

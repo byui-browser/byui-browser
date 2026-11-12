@@ -1,6 +1,6 @@
 //! Software compositor and rasterization.
 
-use crate::{BitmapFont, DisplayItem, Frame, OutlineFont, fonts::glyph};
+use crate::{BitmapFont, DisplayItem, FontBook, Frame, OutlineFont, fonts::glyph};
 
 /// A software compositor for a fixed device-pixel viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +75,7 @@ impl Compositor {
                     font_size,
                     text,
                     rgba,
+                    ..
                 } => self.draw_text(&mut frame, *x, *baseline, *font_size, text, *rgba),
             }
         }
@@ -320,11 +321,13 @@ impl Compositor {
                     baseline,
                     font_size,
                     text,
+                    font_family,
                     color,
                 } => Some(DisplayItem::Text {
                     x: x.round(),
                     baseline: baseline.round(),
                     font_size: *font_size,
+                    font_family: font_family.clone(),
                     text: text.clone(),
                     rgba: [color.r, color.g, color.b, color.a],
                 }),
@@ -346,6 +349,17 @@ impl Compositor {
         &self,
         list: &paint::DisplayList,
         font: &OutlineFont,
+        scale: f32,
+    ) -> Frame {
+        self.compose_paint_with_fonts(list, &FontBook::new(font.clone()), scale)
+    }
+
+    /// Rasterizes a paint display list using the first loaded font from each
+    /// text run's CSS `font-family` fallback list.
+    pub fn compose_paint_with_fonts(
+        &self,
+        list: &paint::DisplayList,
+        fonts: &FontBook,
         scale: f32,
     ) -> Frame {
         log::debug!(
@@ -397,10 +411,11 @@ impl Compositor {
                     baseline,
                     font_size,
                     text,
+                    font_family,
                     color,
                 } => self.draw_outline_text(
                     &mut frame,
-                    font,
+                    fonts.font_for(font_family),
                     *font_size * scale,
                     *x * scale,
                     (*baseline * scale).round(),
@@ -544,6 +559,7 @@ mod tests {
             x: 0.0,
             baseline: 8.0,
             font_size: BitmapFont::UNITS_PER_EM,
+            font_family: vec!["serif".into()],
             text: "I".into(),
             rgba: [0, 0, 0, 255],
         }]);
@@ -564,6 +580,7 @@ mod tests {
             x: 0.0,
             baseline: 14.0,
             font_size: BitmapFont::UNITS_PER_EM * 2.0,
+            font_family: vec!["serif".into()],
             text: "I".into(),
             rgba: [0, 0, 0, 255],
         }]);
@@ -597,6 +614,7 @@ mod tests {
                 x: 4.0,
                 baseline: 20.0,
                 font_size: 16.0,
+                font_family: vec!["serif".into()],
                 text: "Hi".into(),
                 color: black,
             }],

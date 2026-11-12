@@ -253,8 +253,8 @@ pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<R
 ///
 /// [`load_page`] fetches the resources through the request controller and
 /// resolves relative links against the document URL, so native shells do not
-/// depend on the process working directory. CSS `@import` inside a stylesheet
-/// is not followed.
+/// depend on the process working directory. CSS imports and downloadable
+/// `@font-face` resources are loaded as non-fatal subresources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page {
     /// Final URL the document was served from, after redirects. Empty when the
@@ -271,6 +271,20 @@ pub struct Page {
     /// holding its inline text or the fetched body of its `src`. A `src` that
     /// failed to load is an empty entry, so entries stay aligned with elements.
     pub scripts: Vec<String>,
+    /// Web fonts declared by loaded stylesheets. Failed font downloads are
+    /// omitted and do not prevent the page from loading.
+    pub font_faces: Vec<FontFace>,
+}
+
+/// A downloaded `@font-face` resource ready for the renderer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontFace {
+    /// CSS family name declared by the rule.
+    pub family: String,
+    /// Font file bytes, usually TrueType or OpenType data.
+    pub bytes: Vec<u8>,
+    /// Optional installed-font name from a `local(...)` source.
+    pub local_family: Option<String>,
 }
 
 /// Returns the browser's default log file: `logs/browser.log` inside
@@ -942,6 +956,7 @@ mod tests {
             html: "<main>content</main>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            font_faces: Vec::new(),
         };
         let runtime = BrowserRuntime::in_memory();
         let controller = request_controller(None);
