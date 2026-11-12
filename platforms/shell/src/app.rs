@@ -49,6 +49,10 @@ const PAGE_ZOOM_RANGE: (f64, f64) = (0.5, 3.0);
 /// Page zoom increment for each keyboard shortcut press.
 const PAGE_ZOOM_STEP: f64 = 0.1;
 
+/// Time between CSS animation frames: about 60 frames per second. Frames
+/// that take longer to style, lay out, and paint simply arrive later.
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
 /// A caret movement in the address field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaretMove {
@@ -136,6 +140,12 @@ struct App {
     /// Layout of `loaded_page` for the current viewport, kept so scrolling
     /// repaints without laying the document out again.
     page_layout: Option<crate::content::PageLayout>,
+    /// When `loaded_page`'s animation timeline started: its first layout.
+    /// `None` until then; cleared when another page is loaded. Rebuilding the
+    /// layout (on resize, zoom, or find) keeps the timeline running.
+    animation_clock: Option<Instant>,
+    /// When the next CSS animation frame is due, while animations run.
+    next_animation_frame: Option<Instant>,
     /// How far the page is scrolled down, in CSS pixels; kept within
     /// `0..=page_layout.max_scroll()`.
     scroll_y: f32,
@@ -312,6 +322,8 @@ impl App {
             loaded_page: None,
             page: None,
             page_layout: None,
+            animation_clock: None,
+            next_animation_frame: None,
             scroll_y: 0.0,
             page_zoom: 1.0,
             frame: Vec::new(),
@@ -702,6 +714,7 @@ impl App {
     ) {
         log::debug!("page displayed: {url}");
         self.loaded_page = Some(page);
+        self.animation_clock = None;
         self.refresh_devtools_document();
         if let Ok(mut console) = self.console.lock() {
             console.clear();
@@ -919,6 +932,7 @@ impl App {
                 // `browser::load` already logged the failure at error level.
                 log::debug!("showing error page for {}: {error}", navigation.address);
                 self.loaded_page = Some(browser::error_page(&navigation.address, &error));
+                self.animation_clock = None;
                 self.refresh_devtools_document();
                 self.clear_performance();
                 self.network_log
@@ -1515,6 +1529,51 @@ impl App {
             .map_or(0.0, |layout| layout.css_size().1 as f32)
     }
 
+    /// Advances running CSS animations when a frame is due: restyles and lays
+    /// out the page for the time since its animation clock started, and asks
+    /// the window to repaint it.
+    ///
+    /// Returns when the next frame is due, or `None` when no animation is
+    /// running (or the page has not been laid out yet), so the event loop
+    /// can sleep until the next input.
+    fn pump_animations(&mut self) -> Option<Instant> {
+        let (Some(layout), Some(clock)) = (&mut self.page_layout, self.animation_clock) else {
+            self.next_animation_frame = None;
+            return None;
+        };
+        if !layout.is_animating() {
+            self.next_animation_frame = None;
+            return None;
+        }
+        let now = Instant::now();
+        let due = *self.next_animation_frame.get_or_insert(now);
+        if now < due {
+            return Some(due);
+        }
+        layout.animate(clock.elapsed());
+        record_events(&self.performance, layout.take_timeline());
+        if let Some(find) = &mut self.find {
+            // Highlights follow text that the animation moved.
+            find.replace_runs(layout.find_text());
+        }
+        // An animation can shrink the page below the current scroll position.
+        let scroll_y = self.scroll_y.clamp(0.0, layout.max_scroll());
+        let still_running = layout.is_animating();
+        if scroll_y != self.scroll_y {
+            self.scroll_y = scroll_y;
+            self.page_events.set_scroll_y(scroll_y);
+        }
+        // Only the page pixmap changes. The DevTools window is not repainted
+        // every frame.
+        self.page = None;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        let next = now + ANIMATION_FRAME_INTERVAL;
+        self.next_animation_frame = still_running.then_some(next);
+        still_running.then_some(next)
+    }
+
     /// Scrolls the page down by `delta` CSS pixels (up when negative),
     /// stopping at the top and bottom of the document, and repaints when
     /// the position changed.
@@ -1831,6 +1890,7 @@ impl App {
             || self.elements.is_some();
         let page_size_changed = self.page.as_ref().map(|(size, _)| *size) != card_size;
         if page_size_changed {
+            let animation_clock = *self.animation_clock.get_or_insert_with(Instant::now);
             // Painting never runs the page script: evaluation joins the JS
             // engine thread, and doing that inside this draw leaves `alert`
             // unable to finish. `about_to_wait` starts it after this frame.
@@ -1839,10 +1899,11 @@ impl App {
                 let layout_changed =
                     self.page_layout.as_ref().map(|layout| layout.css_size()) != Some(css_size);
                 if layout_changed {
-                    let mut layout = crate::content::PageLayout::new(
+                    let mut layout = crate::content::PageLayout::new_at(
                         self.loaded_page.as_ref().expect("page was loaded"),
                         css_size.0,
                         css_size.1,
+                        animation_clock.elapsed(),
                     );
                     record_events(&self.performance, layout.take_timeline());
                     self.page_layout = Some(layout);
@@ -2418,11 +2479,17 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_reload();
-        event_loop.set_control_flow(if self.reload_completion.is_some() {
-            ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(40))
-        } else {
-            ControlFlow::Wait
-        });
+        let reload_poll = self
+            .reload_completion
+            .is_some()
+            .then(|| Instant::now() + Duration::from_millis(40));
+        let animation_frame = self.pump_animations();
+        event_loop.set_control_flow(
+            match [reload_poll, animation_frame].into_iter().flatten().min() {
+                Some(deadline) => ControlFlow::WaitUntil(deadline),
+                None => ControlFlow::Wait,
+            },
+        );
 
         // `frame_key` is set only after a frame has been presented, so the
         // window is on screen before the page script can request an alert.

@@ -1433,6 +1433,15 @@ mod tests {
     }
 
     #[test]
+    fn keyframes_probe_reports_animations_as_working() {
+        let probe = AT_RULES
+            .iter()
+            .find(|probe| probe.names.contains(&"keyframes"))
+            .expect("@keyframes probe");
+        assert!(matches!((probe.check)(), Outcome::Works));
+    }
+
+    #[test]
     fn value_detectors_respect_function_and_unit_boundaries() {
         assert!(calls("calc(1px + 2px)", "calc"));
         assert!(!calls("minmax(1fr, 2fr)", "min"));

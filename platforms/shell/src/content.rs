@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use browser::{BrowserRuntime, Page};
 use devtools::performance::{EventCategory, PerformanceLog, TimelineEvent};
@@ -195,21 +196,39 @@ pub(crate) fn css_viewport(width: u32, height: u32, scale_factor: f64) -> (u32, 
 /// The window keeps this between frames so scrolling only repaints; it is
 /// rebuilt when the page or the viewport size changes. Painting and hit
 /// testing share it so they agree on geometry.
+///
+/// While CSS animations run, [`Self::animate`] restyles and lays out the
+/// retained document again for a later moment of the document timeline.
 pub(crate) struct PageLayout {
     /// The viewport width and height in CSS pixels.
     css_size: (u32, u32),
     tree: LayoutTree,
+    /// The parsed document and stylesheets, kept so animation frames only
+    /// redo style and layout.
+    document: html::HTMLDocument,
+    stylesheets: Vec<css::Stylesheet>,
+    /// CSS animations that were delayed or playing when this layout was
+    /// last styled; see [`css::ComputedStyles::running_animations`].
+    running_animations: usize,
     /// How long each stage of building this layout took, until the app moves
     /// them to the Performance panel with [`Self::take_timeline`].
     timeline: Vec<TimelineEvent>,
 }
 
 impl PageLayout {
-    /// Lays out `page` for a `width` × `height` CSS-pixel viewport.
+    /// Lays out `page` for a `width` × `height` CSS-pixel viewport at the
+    /// start of its animation timeline.
     ///
     /// Times HTML parsing, each stylesheet's parse, style computation, and
     /// layout as Performance events; see [`Self::take_timeline`].
+    #[cfg(test)]
     pub(crate) fn new(page: &Page, width: u32, height: u32) -> Self {
+        Self::new_at(page, width, height, Duration::ZERO)
+    }
+
+    /// Lays out `page` like [`Self::new`], with CSS animations sampled
+    /// `elapsed` after the page was first shown.
+    pub(crate) fn new_at(page: &Page, width: u32, height: u32, elapsed: Duration) -> Self {
         let mut timeline = Vec::new();
         let (document, event) = TimelineEvent::measure(EventCategory::Parse, "Parse HTML", || {
             html::parse_raw_html(page.html.to_owned())
@@ -228,32 +247,43 @@ impl PageLayout {
                 sheet
             })
             .collect();
-        let (styles, event) =
-            TimelineEvent::measure(EventCategory::Style, "Recalculate style", || {
-                css::style_document(&document, &stylesheets)
-            });
-        timeline.push(event);
-        let (tree, event) = TimelineEvent::measure(
-            EventCategory::Layout,
-            format!("Layout {width}×{height}"),
-            || {
-                layout_document(
-                    &document,
-                    &styles,
-                    Size {
-                        width: width as f32,
-                        height: height as f32,
-                    },
-                    page_metrics(),
-                )
-            },
+        let (tree, running_animations, events) = style_and_layout(
+            &document,
+            &stylesheets,
+            (width, height),
+            elapsed,
+            "Recalculate style",
         );
-        timeline.push(event);
+        timeline.extend(events);
         Self {
             css_size: (width, height),
             tree,
+            document,
+            stylesheets,
+            running_animations,
             timeline,
         }
+    }
+
+    /// Whether CSS animations can still change this layout, so the window
+    /// should keep calling [`Self::animate`].
+    pub(crate) fn is_animating(&self) -> bool {
+        self.running_animations > 0
+    }
+
+    /// Restyles and lays out the page with CSS animations sampled `elapsed`
+    /// after the page was first shown. The viewport size is unchanged.
+    pub(crate) fn animate(&mut self, elapsed: Duration) {
+        let (tree, running_animations, events) = style_and_layout(
+            &self.document,
+            &self.stylesheets,
+            self.css_size,
+            elapsed,
+            "Animation frame: recalculate style",
+        );
+        self.tree = tree;
+        self.running_animations = running_animations;
+        self.timeline.extend(events);
     }
 
     /// Removes and returns the timings recorded while building this layout.
@@ -365,6 +395,39 @@ impl PageLayout {
     pub(crate) fn hit_test(&self, x: f32, y: f32, scroll_y: f32) -> Option<NodeID> {
         self.tree.hit_test(x, y + scroll_y)
     }
+}
+
+/// Styles `document` with CSS animations sampled at `elapsed` and lays it
+/// out for a `width` × `height` CSS-pixel viewport.
+///
+/// Returns the layout, the number of running animations, and Performance
+/// events for the style (named `style_label`) and layout stages.
+fn style_and_layout(
+    document: &html::HTMLDocument,
+    stylesheets: &[css::Stylesheet],
+    (width, height): (u32, u32),
+    elapsed: Duration,
+    style_label: &str,
+) -> (LayoutTree, usize, [TimelineEvent; 2]) {
+    let (styles, style_event) = TimelineEvent::measure(EventCategory::Style, style_label, || {
+        css::style_document_at(document, stylesheets, elapsed)
+    });
+    let (tree, layout_event) = TimelineEvent::measure(
+        EventCategory::Layout,
+        format!("Layout {width}×{height}"),
+        || {
+            layout_document(
+                document,
+                &styles,
+                Size {
+                    width: width as f32,
+                    height: height as f32,
+                },
+                page_metrics(),
+            )
+        },
+    );
+    (tree, styles.running_animations, [style_event, layout_event])
 }
 
 /// Advance-cell bounds measured with the exact font used by layout and rendering.
@@ -1211,6 +1274,46 @@ mod tests {
             ]
         );
         assert!(layout.take_timeline().is_empty());
+    }
+
+    #[test]
+    fn css_animations_relayout_the_page_until_they_finish() {
+        let page = Page {
+            url: "https://example.test/".into(),
+            html: "<div id='tall'></div>".into(),
+            stylesheets: vec![
+                "body { margin: 0 } \
+                 @keyframes grow { from { height: 0 } to { height: 1000px } } \
+                 #tall { animation: grow 1s linear forwards }"
+                    .into(),
+            ],
+            scripts: Vec::new(),
+        };
+        let mut layout = PageLayout::new(&page, 100, 200);
+        assert!(layout.is_animating());
+        assert_eq!(layout.max_scroll(), 0.0);
+
+        layout.take_timeline();
+        layout.animate(Duration::from_millis(500));
+        assert_eq!(layout.max_scroll(), 300.0);
+        assert!(layout.is_animating());
+        let labels: Vec<_> = layout
+            .take_timeline()
+            .into_iter()
+            .map(|event| event.label)
+            .collect();
+        assert_eq!(
+            labels,
+            ["Animation frame: recalculate style", "Layout 100×200"]
+        );
+
+        // A layout rebuilt mid-animation (after a resize) keeps the timeline.
+        let resized = PageLayout::new_at(&page, 100, 100, Duration::from_millis(500));
+        assert_eq!(resized.max_scroll(), 400.0);
+
+        layout.animate(Duration::from_secs(2));
+        assert_eq!(layout.max_scroll(), 800.0);
+        assert!(!layout.is_animating());
     }
 
     #[test]
