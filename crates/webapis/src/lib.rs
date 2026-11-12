@@ -8,107 +8,44 @@
 
 #![forbid(unsafe_code)]
 
-use common::ids::NodeId;
+mod alert;
+mod console;
+mod custom_elements;
+mod document;
+mod dom_exception;
+mod element;
+mod event;
+mod fetch;
+pub mod local_storage;
+mod location;
+mod selector;
+pub mod session_storage;
+mod timer;
+mod window;
 
-/// Script-visible view of a DOM element.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
-// types, names, and module layout however your crate's public API needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Element {
-    pub node: NodeId,
-    /// Value of the `id` attribute, if any.
-    pub id_attr: Option<String>,
-}
-
-/// Script-visible `document` object.
-///
-/// Wraps the HTML team's DOM; the real binding will hold a handle, not a copy.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Document {
-    elements: Vec<Element>,
-}
-
-impl Document {
-    /// An empty document.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// `document.getElementById(id)`.
-    ///
-    /// Currently only handles the empty document.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
-    // signature however your crate's public API needs.
-    pub fn get_element_by_id(&self, id: &str) -> Option<&Element> {
-        if self.elements.is_empty() {
-            return None;
-        }
-        todo!(
-            "TODO(webapis): look up #{id} among {} elements",
-            self.elements.len()
-        )
-    }
-}
-
-/// Handle returned by `setTimeout`.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TimerId(pub u32);
-
-/// Pending `setTimeout` / `setInterval` callbacks, ordered by due time.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct TimerQueue {
-    pending: Vec<(TimerId, u64)>,
-}
-
-impl TimerQueue {
-    /// An empty queue.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Number of timers not yet fired.
-    pub fn pending_count(&self) -> usize {
-        self.pending.len()
-    }
-
-    /// `setTimeout(callback, delay_ms)`: schedules a callback.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
-    // signature however your crate's public API needs.
-    pub fn schedule(&mut self, delay_ms: u64) -> TimerId {
-        todo!("TODO(webapis): schedule timer at +{delay_ms}ms")
-    }
-
-    /// Removes and returns the timer due soonest, if any.
-    ///
-    /// Currently only handles the empty queue.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
-    pub fn pop_next_due(&mut self) -> Option<TimerId> {
-        if self.pending.is_empty() {
-            return None;
-        }
-        todo!(
-            "TODO(webapis): pop earliest of {} timers",
-            self.pending.len()
-        )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_document_has_no_element_by_id() {
-        assert_eq!(Document::new().get_element_by_id("main"), None);
-    }
-
-    #[test]
-    fn new_timer_queue_is_empty() {
-        let mut queue = TimerQueue::new();
-        assert_eq!(queue.pending_count(), 0);
-        assert_eq!(queue.pop_next_due(), None);
-    }
-}
+pub use alert::{AlertSink, alert, register_alert};
+pub use console::{ConsoleSink, print, register_console, register_print};
+pub use custom_elements::CustomElementRegistry;
+pub use document::{
+    Document, get_element_by_id, register_document, register_document_on_window,
+    register_document_with_location,
+};
+pub use dom_exception::DomException;
+pub use element::{Element, get_attribute};
+pub use event::{
+    abort_controller_constructor, add_event_listener, dispatch_click, dispatch_click_at,
+    dispatch_event, event_constructor, remove_event_listener,
+};
+pub use fetch::{fetch, register_fetch};
+pub use location::{
+    LocationNavigate, NavigationBehavior, register_location, register_location_with_navigation,
+};
+pub use selector::SelectorError;
+pub use timer::{TimerId, TimerQueue};
+pub use window::{
+    ViewportSize, register_window, register_window_with_security_context,
+    register_window_with_security_context_and_viewport, register_window_with_url,
+    register_window_with_url_and_device_pixel_ratio,
+    register_window_with_url_device_pixel_ratio_and_viewport, run_window_animation_frames,
+    run_window_timers,
+};

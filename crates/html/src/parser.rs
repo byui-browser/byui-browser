@@ -1,0 +1,240 @@
+use crate::{
+    Attribute, ElementData, HTMLDocument, Namespace, NodeID, NodeKind, SourceSpan,
+    escape_characters::decode_html_entities,
+};
+
+/// Parses raw HTML into an arena-backed document tree.
+pub fn parse_raw_html(raw: String) -> HTMLDocument {
+    log::debug!("parsing html document: {} bytes", raw.len());
+    let mut document = HTMLDocument::new();
+    let root = document.root;
+    let mut stack = Vec::<NodeID>::new();
+    let mut cursor = 0;
+
+    while let Some(relative_open) = raw[cursor..].find('<') {
+        let open = cursor + relative_open;
+        append_text(
+            &mut document,
+            current_parent(&stack, root),
+            &raw[cursor..open],
+            cursor,
+            open,
+        );
+        let Some(relative_close) = raw[open..].find('>') else {
+            log::debug!("unterminated tag at byte {open}; treating rest as text");
+            append_text(
+                &mut document,
+                current_parent(&stack, root),
+                &raw[open..],
+                open,
+                raw.len(),
+            );
+            cursor = raw.len();
+            break;
+        };
+        let close = open + relative_close;
+        let tag = raw[open + 1..close].trim();
+        let span = Some(SourceSpan::new(open, close + 1));
+        cursor = close + 1;
+
+        // A '<' followed by whitespace is not the start of a tag. Preserve
+        // this malformed markup as text instead of dropping it as an element.
+        if raw[open + 1..close]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+        {
+            log::debug!("`<` followed by whitespace at byte {open}; treating as text");
+            append_text(
+                &mut document,
+                current_parent(&stack, root),
+                &raw[open..cursor],
+                open,
+                cursor,
+            );
+            continue;
+        }
+
+        if let Some(comment_body) = tag.strip_prefix("!--") {
+            let comment = comment_body.strip_suffix("--").unwrap_or(comment_body);
+            log::trace!("comment at byte {open} ({} bytes)", comment.len());
+            let id = document.push_node(NodeKind::Comment(comment.to_owned()), span);
+            document.append_child(current_parent(&stack, root), id);
+            continue;
+        }
+        if tag
+            .get(..8)
+            .is_some_and(|name| name.eq_ignore_ascii_case("!doctype"))
+        {
+            log::trace!("doctype at byte {open}");
+            let id = document.push_node(
+                NodeKind::Doctype {
+                    name: Some(tag[8..].trim().to_ascii_lowercase()),
+                    public_id: None,
+                    system_id: None,
+                },
+                span,
+            );
+            document.append_child(root, id);
+            continue;
+        }
+        if let Some(closing) = tag.strip_prefix('/') {
+            let name = closing
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if let Some(position) = stack
+                .iter()
+                .rposition(|id| element_name(&document, *id) == Some(name.as_str()))
+            {
+                log::trace!("end tag </{name}> closes element at depth {position}");
+                stack.truncate(position);
+            } else {
+                log::debug!("ignoring unmatched end tag </{name}> at byte {open}");
+            }
+            continue;
+        }
+        if tag.starts_with('!') || tag.starts_with('?') {
+            log::debug!("ignoring unsupported markup declaration at byte {open}");
+            continue;
+        }
+
+        let self_closing = tag.ends_with('/');
+        let (name, attributes) = parse_start_tag(tag.trim_end_matches('/').trim());
+        if name.is_empty() {
+            log::debug!("ignoring tag with empty name at byte {open}");
+            continue;
+        }
+        let namespace = match name.as_str() {
+            "svg" => Namespace::Svg,
+            "math" => Namespace::MathMl,
+            _ if stack.iter().any(|id| {
+                matches!(
+                    document.node(*id).map(|node| node.get_kind()),
+                    Some(NodeKind::Element(element))
+                        if *element.get_namespace() == Namespace::Svg
+                )
+            }) =>
+            {
+                Namespace::Svg
+            }
+            _ => Namespace::Html,
+        };
+        log::trace!(
+            "start tag <{name}> at byte {open} ({} attributes, self_closing={self_closing})",
+            attributes.len()
+        );
+        let id = document.push_node(
+            NodeKind::Element(ElementData::new(name.clone(), namespace, attributes)),
+            span,
+        );
+        document.append_child(current_parent(&stack, root), id);
+        if !self_closing && !is_void_element(&name) {
+            stack.push(id);
+        }
+    }
+    if cursor < raw.len() {
+        append_text(
+            &mut document,
+            current_parent(&stack, root),
+            &raw[cursor..],
+            cursor,
+            raw.len(),
+        );
+    }
+    log::debug!(
+        "parsed html document: {} nodes, {} elements left open at eof",
+        document.nodes.len(),
+        stack.len()
+    );
+    document
+}
+
+fn current_parent(stack: &[NodeID], root: NodeID) -> NodeID {
+    stack.last().copied().unwrap_or(root)
+}
+
+fn append_text(document: &mut HTMLDocument, parent: NodeID, text: &str, start: usize, end: usize) {
+    if text.is_empty() {
+        return;
+    }
+    log::trace!("text node at bytes {start}..{end}");
+    let id = document.push_node(
+        // Decode after tokenizing markup so a decoded `<` remains text and
+        // cannot introduce new elements into the tree.
+        NodeKind::Text(decode_html_entities(text, false)),
+        Some(SourceSpan::new(start, end)),
+    );
+    document.append_child(parent, id);
+}
+
+fn element_name(document: &HTMLDocument, id: NodeID) -> Option<&str> {
+    match document.node(id)?.get_kind() {
+        NodeKind::Element(element) => Some(element.get_name()),
+        _ => None,
+    }
+}
+
+fn parse_start_tag(tag: &str) -> (String, Vec<Attribute>) {
+    let mut parts = tag.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let mut attributes = Vec::new();
+    let mut rest = parts.next().unwrap_or_default().trim();
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        let end = rest
+            .find(|character: char| character.is_whitespace() || character == '=')
+            .unwrap_or(rest.len());
+        let attribute_name = rest[..end].to_ascii_lowercase();
+        rest = rest[end..].trim_start();
+        let mut value = String::new();
+        if let Some(after_equals) = rest.strip_prefix('=') {
+            rest = after_equals.trim_start();
+            if let Some(quote) = rest
+                .chars()
+                .next()
+                .filter(|quote| *quote == '\'' || *quote == '"')
+            {
+                rest = &rest[quote.len_utf8()..];
+                if let Some(end) = rest.find(quote) {
+                    value = decode_html_entities(&rest[..end], true);
+                    rest = &rest[end + quote.len_utf8()..];
+                } else {
+                    value = decode_html_entities(rest, true);
+                    rest = "";
+                }
+            } else if let Some(end) = rest.find(char::is_whitespace) {
+                value = decode_html_entities(&rest[..end], true);
+                rest = &rest[end..];
+            } else {
+                value = decode_html_entities(rest, true);
+                rest = "";
+            }
+        }
+        if !attribute_name.is_empty() {
+            attributes.push(Attribute::new(attribute_name, value));
+        }
+    }
+    (name, attributes)
+}
+
+fn is_void_element(name: &str) -> bool {
+    matches!(
+        name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}

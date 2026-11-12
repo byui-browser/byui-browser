@@ -1,0 +1,7 @@
+interface:
+  display_name: "open-PR"
+  short_description: "Validate changes and open a draft PR following byui-browser conventions"
+  default_prompt: "Use $open-pr to validate my changes and open a draft pull request against main."
+
+policy:
+  allow_implicit_invocation: true

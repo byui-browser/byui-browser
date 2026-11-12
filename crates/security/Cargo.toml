@@ -8,6 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+log = { workspace = true }
+cap-std = "4"
+cap-fs-ext = "4"
 common = { workspace = true }
 
 [lints]

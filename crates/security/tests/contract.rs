@@ -8,9 +8,9 @@ use security::{Cookie, CookieJar, Origin, same_origin};
 #[ignore = "TODO(security): origin parsing not implemented"]
 fn parses_origin_with_default_port() {
     let origin = Origin::parse("https://byui.instructure.com/courses/1").expect("origin");
-    assert_eq!(origin.scheme, "https");
-    assert_eq!(origin.host, "byui.instructure.com");
-    assert_eq!(origin.port, 443);
+    assert_eq!(origin.scheme(), "https");
+    assert_eq!(origin.host(), "byui.instructure.com");
+    assert_eq!(origin.port(), 443);
 }
 
 #[test]
@@ -22,10 +22,9 @@ fn path_does_not_affect_origin() {
 }
 
 #[test]
-#[ignore = "TODO(security): cookie jar not implemented"]
 fn secure_cookie_is_not_sent_over_http() {
-    let https = Origin::parse("https://example.test/").expect("origin");
-    let http = Origin::parse("http://example.test/").expect("origin");
+    let https = Origin::with_port("https", "example.test", 443);
+    let http = Origin::with_port("http", "example.test", 80);
     let mut jar = CookieJar::new();
     jar.store(
         &https,

@@ -7,6 +7,13 @@
 
 #![forbid(unsafe_code)]
 
+mod state;
+
+pub use state::BrowserState;
+
+/// Label for a newly opened tab before navigating to a page.
+pub const DEFAULT_TAB_TITLE: &str = "New Tab";
+
 /// Handle for an open tab.
 // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
 // types, names, and module layout however your crate's public API needs.
@@ -48,6 +55,7 @@ impl TabManager {
     // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
     pub fn close(&mut self, id: TabId) {
         if self.tabs.is_empty() {
+            log::debug!("close of tab {} ignored: no tabs are open", id.0);
             return;
         }
         todo!("TODO(chrome): close {id:?}")

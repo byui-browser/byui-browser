@@ -15,6 +15,11 @@ members = [
     "crates/chrome",
     "crates/devtools",
     "crates/browser",
+    "platforms/shell",
+    "platforms/macos",
+    "platforms/windows",
+    "platforms/linux",
+    "platforms/js",
 ]
 default-members = ["crates/browser"]
 
@@ -23,7 +28,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/byui-cse/byui-browser"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 common = { path = "crates/common" }
@@ -39,6 +44,39 @@ storage = { path = "crates/storage" }
 security = { path = "crates/security" }
 chrome = { path = "crates/chrome" }
 devtools = { path = "crates/devtools" }
+tao = "0.30"
+wry = "0.47"
+# Logging facade used by every crate; `common::logging` installs the logger.
+log = { version = "0.4", features = ["std"] }
+psl = "2"
 
 [workspace.lints.rust]
 unsafe_code = "warn"
+
+# The native shells paint every frame on the UI thread, so keep their drawing
+# code optimized in dev builds; unoptimized software rasterizing makes window
+# drags and hover feedback lag.
+[profile.dev.package.browser-shell]
+opt-level = 3
+
+# The page is rasterized again on every scroll step.
+[profile.dev.package.render]
+opt-level = 3
+
+[profile.dev.package.tiny-skia]
+opt-level = 3
+
+[profile.dev.package.tiny-skia-path]
+opt-level = 3
+
+[profile.dev.package.ab_glyph]
+opt-level = 3
+
+[profile.dev.package.ab_glyph_rasterizer]
+opt-level = 3
+
+[profile.dev.package.owned_ttf_parser]
+opt-level = 3
+
+[profile.dev.package.ttf-parser]
+opt-level = 3

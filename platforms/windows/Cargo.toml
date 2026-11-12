@@ -1,0 +1,18 @@
+[package]
+name = "byui-browser-windows"
+description = "Native Windows shell for the BYU-Idaho browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+browser-shell = { path = "../shell" }
+
+[[bin]]
+name = "byui-browser-windows"
+path = "src/main.rs"
+
+[lints]
+workspace = true

@@ -1,11 +1,8 @@
 //! Public-contract tests for `css`.
-//!
-//! Run ignored tests with `cargo test -p css -- --ignored` to see the backlog.
 
 use css::{Selector, Specificity, parse_stylesheet, specificity};
 
 #[test]
-#[ignore = "TODO(css): parser not implemented"]
 fn parses_one_rule() {
     let sheet = parse_stylesheet("p { color: red; }");
     assert_eq!(sheet.rules.len(), 1);
@@ -15,7 +12,6 @@ fn parses_one_rule() {
 }
 
 #[test]
-#[ignore = "TODO(css): specificity not implemented"]
 fn id_beats_class_beats_tag() {
     let id = specificity(&Selector("#main".into()));
     let class = specificity(&Selector(".card".into()));
