@@ -61,6 +61,17 @@ enum CaretMove {
     End,
 }
 
+/// A press in the address field that has not been released yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AddressPress {
+    /// Whether the field already had keyboard focus before the press. A
+    /// click without a drag on an unfocused field selects the whole address,
+    /// as in other browsers; on a focused field it places the caret.
+    was_focused: bool,
+    /// Whether the pointer has moved the caret away from where it went down.
+    dragged: bool,
+}
+
 /// How a native shell wants its window set up.
 ///
 /// Every shell keeps the operating system's own window decorations (title
@@ -142,6 +153,9 @@ struct App {
     page_events: crate::content::PageEvents,
     /// The pointer went down on the page and has not been released yet.
     page_press: bool,
+    /// The pointer went down in the address field and has not been released
+    /// yet; dragging extends the address selection.
+    address_press: Option<AddressPress>,
     scripts_evaluated: bool,
     find: Option<FindInPage>,
     find_pressed: Option<FindAction>,
@@ -306,6 +320,7 @@ impl App {
             alerts: Arc::new(PageAlerts::new()),
             page_events: crate::content::PageEvents::new(),
             page_press: false,
+            address_press: None,
             scripts_evaluated: false,
             find: None,
             find_pressed: None,
@@ -719,7 +734,7 @@ impl App {
         self.address = url.to_owned();
         self.address_before_edit = self.address.clone();
         self.chrome.address_caret = self.address.len();
-        self.chrome.address_selected = false;
+        self.chrome.address_anchor = None;
         self.chrome.address_focused = false;
         self.page = None;
         self.page_layout = None;
@@ -732,8 +747,7 @@ impl App {
             find.focused = false;
         }
         self.address_before_edit = self.address.clone();
-        self.chrome.address_caret = self.address.len();
-        self.chrome.address_selected = true;
+        self.select_all_address();
         self.chrome.address_focused = true;
         self.redraw();
     }
@@ -741,7 +755,7 @@ impl App {
     fn cancel_address_edit(&mut self) {
         self.address = self.address_before_edit.clone();
         self.chrome.address_caret = self.address.len();
-        self.chrome.address_selected = false;
+        self.chrome.address_anchor = None;
         self.chrome.address_focused = false;
         self.redraw();
     }
@@ -750,7 +764,7 @@ impl App {
         let address = self.address.trim().to_owned();
         self.address = address.clone();
         self.chrome.address_caret = self.address.len();
-        self.chrome.address_selected = false;
+        self.chrome.address_anchor = None;
         self.chrome.address_focused = false;
         if address == "byui://welcome" {
             // Bump the id so an older load still in flight cannot replace it.
@@ -909,13 +923,22 @@ impl App {
                     return;
                 }
                 "a" if self.chrome.address_focused => {
-                    self.chrome.address_selected = true;
+                    self.select_all_address();
                     self.redraw();
                     return;
                 }
                 "c" if self.chrome.address_focused => {
-                    if let Err(error) = arboard::Clipboard::new()
-                        .and_then(|mut clipboard| clipboard.set_text(self.address.clone()))
+                    // Copy the selection, or the whole address when nothing
+                    // is selected.
+                    let text = self
+                        .chrome
+                        .address_selection(&self.address)
+                        .map_or(self.address.as_str(), |(start, end)| {
+                            &self.address[start..end]
+                        })
+                        .to_owned();
+                    if let Err(error) =
+                        arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text))
                     {
                         log::warn!("failed to copy the address: {error}");
                     }
@@ -972,15 +995,31 @@ impl App {
         toolbar::floor_char_boundary(&self.address, self.chrome.address_caret)
     }
 
-    /// Types `text` at the caret, replacing the whole address when selected.
+    /// Selects the whole address, leaving the caret at its end.
+    fn select_all_address(&mut self) {
+        self.chrome.address_anchor = Some(0);
+        self.chrome.address_caret = self.address.len();
+    }
+
+    /// Deletes the selected address text, if any, leaving the caret where it
+    /// was, and clears the selection. Returns whether text was selected.
+    fn delete_address_selection(&mut self) -> bool {
+        let selection = self.chrome.address_selection(&self.address);
+        self.chrome.address_anchor = None;
+        let Some((start, end)) = selection else {
+            return false;
+        };
+        self.address.replace_range(start..end, "");
+        self.chrome.address_caret = start;
+        true
+    }
+
+    /// Types `text` at the caret, replacing the selection if there is one.
     ///
     /// Control characters such as the newlines of a multi-line paste are
     /// dropped, since an address is a single line.
     fn insert_address_text(&mut self, text: &str) {
-        if self.chrome.address_selected {
-            self.address.clear();
-            self.chrome.address_selected = false;
-        }
+        self.delete_address_selection();
         let text: String = text
             .chars()
             .filter(|character| !character.is_control())
@@ -992,13 +1031,9 @@ impl App {
     }
 
     /// Deletes the character after the caret when `forward`, else the one
-    /// before it; a selected address is cleared instead.
+    /// before it; selected text is deleted instead.
     fn delete_address_text(&mut self, forward: bool) {
-        if self.chrome.address_selected {
-            self.address.clear();
-            self.chrome.address_selected = false;
-            self.chrome.address_caret = 0;
-        } else {
+        if !self.delete_address_selection() {
             let caret = self.address_caret();
             if forward {
                 if caret < self.address.len() {
@@ -1019,22 +1054,90 @@ impl App {
     /// fields on every platform do.
     fn move_address_caret(&mut self, movement: CaretMove) {
         let caret = self.address_caret();
-        let selected = std::mem::take(&mut self.chrome.address_selected);
-        self.chrome.address_caret = match movement {
-            CaretMove::Start => 0,
-            CaretMove::End => self.address.len(),
-            CaretMove::Left if selected => 0,
-            CaretMove::Right if selected => self.address.len(),
-            CaretMove::Left => self.address[..caret]
+        let selection = self.chrome.address_selection(&self.address);
+        self.chrome.address_anchor = None;
+        self.chrome.address_caret = match (movement, selection) {
+            (CaretMove::Start, _) => 0,
+            (CaretMove::End, _) => self.address.len(),
+            (CaretMove::Left, Some((start, _))) => start,
+            (CaretMove::Right, Some((_, end))) => end,
+            (CaretMove::Left, None) => self.address[..caret]
                 .chars()
                 .next_back()
                 .map_or(caret, |previous| caret - previous.len_utf8()),
-            CaretMove::Right => self.address[caret..]
+            (CaretMove::Right, None) => self.address[caret..]
                 .chars()
                 .next()
                 .map_or(caret, |next| caret + next.len_utf8()),
         };
         log::trace!("address caret moved to {}", self.chrome.address_caret);
+        self.redraw();
+    }
+
+    /// Returns the address byte offset under the pointer, for placing the
+    /// caret where the user presses or drags in the address field.
+    fn address_offset_under_pointer(&self) -> Option<usize> {
+        let window = self.window.as_ref()?;
+        let (x, _) = self.cursor?;
+        let scale = window.scale_factor();
+        let width = window.inner_size().to_logical::<f64>(scale).width;
+        Some(toolbar::address_offset_at(
+            x,
+            width,
+            self.platform.window_controls_inset,
+            scale as f32,
+            self.font.as_ref(),
+            &self.address,
+        ))
+    }
+
+    /// Starts a press in the address field at byte `offset`: focuses the
+    /// field and puts the caret there, ready for a drag to extend the
+    /// selection.
+    fn press_address_at(&mut self, offset: usize) {
+        let was_focused = self.chrome.address_focused;
+        if !was_focused {
+            if let Some(find) = &mut self.find {
+                find.focused = false;
+            }
+            self.address_before_edit = self.address.clone();
+            self.chrome.address_focused = true;
+        }
+        let offset = toolbar::floor_char_boundary(&self.address, offset);
+        self.chrome.address_anchor = Some(offset);
+        self.chrome.address_caret = offset;
+        self.address_press = Some(AddressPress {
+            was_focused,
+            dragged: false,
+        });
+        self.redraw();
+    }
+
+    /// Moves the dragging end of the address selection to byte `offset`
+    /// while a press in the field is held.
+    fn drag_address_to(&mut self, offset: usize) {
+        let Some(press) = &mut self.address_press else {
+            return;
+        };
+        let offset = toolbar::floor_char_boundary(&self.address, offset);
+        if offset == self.chrome.address_caret {
+            return;
+        }
+        press.dragged = true;
+        self.chrome.address_caret = offset;
+        self.redraw();
+    }
+
+    /// Ends a press in the address field. A click that did not drag selects
+    /// the whole address if the field was not focused before, like other
+    /// browsers; otherwise the caret or dragged selection stays.
+    fn release_address(&mut self) {
+        let Some(press) = self.address_press.take() else {
+            return;
+        };
+        if !press.dragged && !press.was_focused {
+            self.select_all_address();
+        }
         self.redraw();
     }
 
@@ -1549,7 +1652,11 @@ impl App {
                 self.page_press = false;
                 if let Some(control) = self.chrome.pressed.take() {
                     self.redraw();
-                    if self.chrome.hovered == Some(control) {
+                    if control == Control::Address {
+                        // The press already focused the field; dragging
+                        // outside it still selects, so release anywhere.
+                        self.release_address();
+                    } else if self.chrome.hovered == Some(control) {
                         self.activate(control);
                     }
                 } else if page_press
@@ -1797,6 +1904,11 @@ impl App {
             .is_some_and(|panel| panel.contains(self.cursor) && !panel.contains(Some((x, y))));
         self.cursor = Some((x, y));
         log::trace!("cursor moved: ({x:.0}, {y:.0})");
+        if self.address_press.is_some()
+            && let Some(offset) = self.address_offset_under_pointer()
+        {
+            self.drag_address_to(offset);
+        }
         if left_elements {
             self.redraw();
         }
@@ -1820,7 +1932,11 @@ impl App {
             return;
         };
         if let Some(control) = self.chrome.hovered {
-            if control != Control::Address {
+            if control == Control::Address {
+                if let Some(offset) = self.address_offset_under_pointer() {
+                    self.press_address_at(offset);
+                }
+            } else {
                 self.chrome.address_focused = false;
             }
             self.chrome.pressed = Some(control);
@@ -3138,13 +3254,13 @@ mod tests {
         let mut app = app();
         app.ensure_welcome_loaded();
         app.begin_address_edit();
-        assert!(app.chrome.address_selected);
+        assert_eq!(app.chrome.address_selection(&app.address), Some((0, 14)));
         app.address.push_str("-draft");
 
         app.cancel_address_edit();
 
         assert_eq!(app.address, "byui://welcome");
-        assert!(!app.chrome.address_selected);
+        assert_eq!(app.chrome.address_selection(&app.address), None);
         assert!(!app.chrome.address_focused);
         assert_eq!(app.browser_state.visited_urls(), &["byui://welcome"]);
     }
@@ -3157,7 +3273,7 @@ mod tests {
 
         app.insert_address_text("example.com/\r\npath\t");
         assert_eq!(app.address, "example.com/path");
-        assert!(!app.chrome.address_selected);
+        assert_eq!(app.chrome.address_selection(&app.address), None);
 
         app.insert_address_text("?q=1");
         assert_eq!(app.address, "example.com/path?q=1");
@@ -3170,7 +3286,7 @@ mod tests {
         app.begin_address_edit();
 
         app.move_address_caret(CaretMove::Left);
-        assert!(!app.chrome.address_selected);
+        assert_eq!(app.chrome.address_selection(&app.address), None);
         assert_eq!(app.chrome.address_caret, 0);
 
         app.move_address_caret(CaretMove::Right);
@@ -3187,6 +3303,62 @@ mod tests {
         app.move_address_caret(CaretMove::End);
         app.move_address_caret(CaretMove::Right);
         assert_eq!(app.chrome.address_caret, app.address.len());
+    }
+
+    #[test]
+    fn dragging_in_the_address_selects_part_of_it() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+
+        // Press and drag across "ui://" in an unfocused field.
+        app.press_address_at(2);
+        assert!(app.chrome.address_focused);
+        app.drag_address_to(7);
+        app.release_address();
+        assert_eq!(app.chrome.address_selection(&app.address), Some((2, 7)));
+
+        // Typing replaces only the selection.
+        app.insert_address_text("-");
+        assert_eq!(app.address, "by-welcome");
+        assert_eq!(app.chrome.address_caret, 3);
+
+        // Dragging backwards selects the same way.
+        app.press_address_at(10);
+        app.drag_address_to(3);
+        app.release_address();
+        assert_eq!(app.chrome.address_selection(&app.address), Some((3, 10)));
+        app.delete_address_text(false);
+        assert_eq!(app.address, "by-");
+    }
+
+    #[test]
+    fn clicking_the_address_selects_all_then_places_the_caret() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+
+        // The first click into an unfocused field selects everything.
+        app.press_address_at(4);
+        app.release_address();
+        assert_eq!(app.chrome.address_selection(&app.address), Some((0, 14)));
+
+        // A second click in the focused field places the caret.
+        app.press_address_at(4);
+        app.release_address();
+        assert_eq!(app.chrome.address_selection(&app.address), None);
+        assert_eq!(app.chrome.address_caret, 4);
+    }
+
+    #[test]
+    fn arrow_keys_collapse_a_partial_selection_to_its_edge() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.press_address_at(9);
+        app.drag_address_to(2);
+        app.release_address();
+
+        app.move_address_caret(CaretMove::Right);
+        assert_eq!(app.chrome.address_caret, 9);
+        assert_eq!(app.chrome.address_selection(&app.address), None);
     }
 
     #[test]

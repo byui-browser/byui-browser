@@ -25,6 +25,9 @@ const BUTTON_SIZE: f32 = 28.0;
 const BUTTON_TOP: f32 = CENTER_Y - BUTTON_SIZE / 2.0;
 const ADDRESS_HEIGHT: f32 = 34.0;
 const ADDRESS_MAX_WIDTH: f32 = 640.0;
+/// Logical distance from the address field's left edge to its text, leaving
+/// room for the lock icon.
+const ADDRESS_TEXT_LEADING: f32 = 30.0;
 /// Logical distance from the toolbar's left edge (after the window-controls
 /// inset) to the Back button when it is furthest left: when the address field
 /// sits at [`ADDRESS_LEADING`] or the window is too narrow to show the field.
@@ -106,15 +109,30 @@ pub(crate) struct ChromeState {
     pub window_controls_inset: f32,
     /// Whether the address field owns keyboard input.
     pub address_focused: bool,
-    /// Whether the whole address is selected, so the next edit replaces it.
-    /// Drawn as a highlight instead of a caret; meaningful only while
+    /// Fixed end of the address selection as a byte offset into the address
+    /// text; the selection runs between this and
+    /// [`ChromeState::address_caret`], which is the end that moves while
+    /// dragging. `None`, or the same offset as the caret, means nothing is
+    /// selected. A selection is drawn as a highlight instead of a caret and
+    /// the next edit replaces it; meaningful only while
     /// [`ChromeState::address_focused`] is set.
-    pub address_selected: bool,
+    pub address_anchor: Option<usize>,
     /// Caret position as a byte offset into the address text, drawn while the
     /// field is focused and nothing is selected. Offsets past the end, or
     /// inside a multi-byte character, are drawn at the nearest earlier
     /// character boundary.
     pub address_caret: usize,
+}
+
+impl ChromeState {
+    /// Returns the selected byte range of `address` as `(start, end)` with
+    /// `start < end`, snapped to character boundaries, or `None` when nothing
+    /// is selected.
+    pub(crate) fn address_selection(&self, address: &str) -> Option<(usize, usize)> {
+        let anchor = floor_char_boundary(address, self.address_anchor?);
+        let caret = floor_char_boundary(address, self.address_caret);
+        (anchor != caret).then(|| (anchor.min(caret), anchor.max(caret)))
+    }
 }
 
 /// A rectangle in device pixels.
@@ -544,7 +562,7 @@ fn draw_address_field(
         stroke(pixmap, &path, palette.text_muted, 1.3, transform);
     }
 
-    let text_x = rect.x() + 30.0;
+    let text_x = rect.x() + ADDRESS_TEXT_LEADING;
     let mut clip_x = star_x - 12.0;
     if state.loading
         && let Some(font) = font
@@ -569,17 +587,19 @@ fn draw_address_field(
             "Loading...",
         );
     }
+    let selection = state.address_selection(address);
     // Logical x of the caret, before the glyph at `address_caret`.
     let mut caret_x = text_x;
     if let Some(font) = font {
         let size = TEXT_SIZE * scale;
         let scaled = font.as_scaled(PxScale::from(size));
         let baseline = cy * scale + (scaled.ascent() + scaled.descent()) / 2.0;
-        if state.address_focused && state.address_selected && !address.is_empty() {
-            let width = text_advance(font, size, address) / scale;
-            let right = (text_x + width).min(clip_x);
-            if let Some(highlight) =
-                Rect::from_xywh(text_x - 1.0, cy - 9.0, right - text_x + 2.0, 18.0)
+        if state.address_focused
+            && let Some((start, end)) = selection
+        {
+            let left = (text_x + text_advance(font, size, &address[..start]) / scale).min(clip_x);
+            let right = (text_x + text_advance(font, size, &address[..end]) / scale).min(clip_x);
+            if let Some(highlight) = Rect::from_xywh(left - 1.0, cy - 9.0, right - left + 2.0, 18.0)
             {
                 fill(
                     pixmap,
@@ -606,7 +626,7 @@ fn draw_address_field(
             address,
         );
     }
-    if state.address_focused && !state.address_selected {
+    if state.address_focused && selection.is_none() {
         let x = caret_x.min(clip_x - 2.0) + 1.0;
         if let Some(caret) = Rect::from_xywh(x, cy - 8.0, 1.5, 16.0) {
             fill(
@@ -617,6 +637,39 @@ fn draw_address_field(
             );
         }
     }
+}
+
+/// Returns the byte offset in `address` of the character boundary nearest to
+/// logical x coordinate `x`, for placing the caret where the pointer presses
+/// or drags in the address field of a toolbar `width` logical pixels wide
+/// with leading inset `inset`. `scale` is the device scale factor the field
+/// is painted at. Points left of the text give 0 and points right of it give
+/// the address length; without a font every point maps to 0.
+pub(crate) fn address_offset_at(
+    x: f64,
+    width: f64,
+    inset: f32,
+    scale: f32,
+    font: Option<&FontVec>,
+    address: &str,
+) -> usize {
+    let (Some(font), Some(rect)) = (font, control_rect(Control::Address, width as f32, inset))
+    else {
+        return 0;
+    };
+    let size = TEXT_SIZE * scale;
+    let target = x as f32 - (rect.x() + ADDRESS_TEXT_LEADING);
+    address
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain([address.len()])
+        .min_by(|a, b| {
+            let distance = |index: &usize| {
+                (text_advance(font, size, &address[..*index]) / scale - target).abs()
+            };
+            distance(a).total_cmp(&distance(b))
+        })
+        .unwrap_or(0)
 }
 
 /// Returns the largest character boundary of `text` at or before `index`.
@@ -1030,6 +1083,36 @@ mod tests {
     }
 
     #[test]
+    fn pointer_positions_map_to_address_character_boundaries() {
+        let font = load_ui_font([
+            "/System/Library/Fonts/SFNS.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "C:/Windows/Fonts/segoeui.ttf",
+        ]);
+        let Some(font) = font else {
+            eprintln!("skipping: system fonts unavailable");
+            return;
+        };
+        let address = "byui://welcome";
+        let field = control_rect(Control::Address, 1000.0, 0.0).unwrap();
+        let text_x = f64::from(field.x() + ADDRESS_TEXT_LEADING);
+        let at = |x: f64| address_offset_at(x, 1000.0, 0.0, 2.0, Some(&font), address);
+        assert_eq!(at(f64::from(field.x())), 0);
+        assert_eq!(at(f64::from(field.right())), address.len());
+        // The pen position after "byui" maps back to offset 4.
+        let after = f64::from(text_advance(&font, TEXT_SIZE * 2.0, "byui") / 2.0);
+        assert_eq!(at(text_x + after), 4);
+        // Positions increase monotonically across the text.
+        let offsets: Vec<_> = (0..200).map(|step| at(text_x + f64::from(step))).collect();
+        assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+        // Without a font every point maps to the start.
+        assert_eq!(
+            address_offset_at(text_x + 50.0, 1000.0, 0.0, 1.0, None, address),
+            0
+        );
+    }
+
+    #[test]
     fn narrow_windows_drop_trailing_controls_then_the_address_field() {
         assert!(control_rect(Control::Menu, 340.0, 0.0).is_none());
         assert!(control_rect(Control::Address, 340.0, 0.0).is_some());
@@ -1065,7 +1148,7 @@ mod tests {
                         can_go_forward: false,
                         find_open: false,
                         address_focused: false,
-                        address_selected: false,
+                        address_anchor: None,
                         address_caret: 0,
                         window_controls_inset: if dark { 72.0 } else { 0.0 },
                     };
@@ -1155,11 +1238,12 @@ mod tests {
                 ..ChromeState::default()
             };
             let selected = ChromeState {
-                address_selected: true,
+                address_anchor: Some(0),
+                address_caret: 1,
                 ..focused
             };
-            let with_caret = compose(400, 200, 1.0, &focused, "", None, None).unwrap();
-            let without = compose(400, 200, 1.0, &selected, "", None, None).unwrap();
+            let with_caret = compose(400, 200, 1.0, &focused, "x", None, None).unwrap();
+            let without = compose(400, 200, 1.0, &selected, "x", None, None).unwrap();
             let rect = control_rect(Control::Address, 400.0, 0.0).unwrap();
             // With no font the caret sits at the text origin.
             let x = (rect.x() + 31.5) as u32;

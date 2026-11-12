@@ -57,6 +57,9 @@ fn main() -> Result<(), winit::error::EventLoopError> {
 /// the Back, Forward, and Reload buttons. The toolbar holds no items; the
 /// transparent titlebar and hidden title keep it invisible, and the content
 /// view still extends under it.
+///
+/// The window is also made unmovable by AppKit's own titlebar dragging, so
+/// drags reach the toolbar controls; the shell starts window drags itself.
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 fn center_traffic_lights(window: &winit::window::Window) {
@@ -86,6 +89,12 @@ fn center_traffic_lights(window: &winit::window::Window) {
     let toolbar = NSToolbar::new(mtm);
     ns_window.setToolbar(Some(&toolbar));
     ns_window.setToolbarStyle(NSWindowToolbarStyle::Unified);
+    // AppKit would otherwise move the window for any drag in the now
+    // 52-point titlebar, because winit's content view reports that a mouse
+    // down there can move the window. That steals drags meant to select text
+    // in the address field. The shared shell still moves the window from
+    // empty toolbar space with `Window::drag_window`.
+    ns_window.setMovable(false);
 }
 
 #[cfg(not(target_os = "macos"))]
