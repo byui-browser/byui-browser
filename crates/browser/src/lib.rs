@@ -727,6 +727,17 @@ impl PageSession {
         self.window.set("innerHeight", height.clone());
         let _ = self.realm.register_global_value("innerWidth", width);
         let _ = self.realm.register_global_value("innerHeight", height);
+        let ratio = match self.window.get("devicePixelRatio") {
+            Some(Value::Number(ratio)) => ratio,
+            _ => 1.0,
+        };
+        if let Some(Value::Function(update)) = self.window.get("__updateMediaQueries") {
+            let _ = update.call(&[
+                Value::Number(viewport.width as f64),
+                Value::Number(viewport.height as f64),
+                Value::Number(ratio),
+            ]);
+        }
     }
 
     /// Updates the output device scale visible as `window.devicePixelRatio`.
@@ -742,6 +753,21 @@ impl PageSession {
         }
         self.window
             .update_replaceable_read_only("devicePixelRatio", Value::Number(device_pixel_ratio));
+        let width = match self.window.get("innerWidth") {
+            Some(Value::Number(width)) => width,
+            _ => 0.0,
+        };
+        let height = match self.window.get("innerHeight") {
+            Some(Value::Number(height)) => height,
+            _ => 0.0,
+        };
+        if let Some(Value::Function(update)) = self.window.get("__updateMediaQueries") {
+            let _ = update.call(&[
+                Value::Number(width),
+                Value::Number(height),
+                Value::Number(device_pixel_ratio),
+            ]);
+        }
         Ok(())
     }
 

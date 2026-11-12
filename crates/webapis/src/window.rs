@@ -295,6 +295,193 @@ pub struct ViewportSize {
     pub height: u32,
 }
 
+#[derive(Clone, Copy)]
+struct MediaState {
+    viewport: Option<ViewportSize>,
+    device_pixel_ratio: f64,
+    display_state: &'static str,
+    resizable: bool,
+}
+
+fn media_state(viewport: Option<ViewportSize>, device_pixel_ratio: f64) -> MediaState {
+    MediaState {
+        viewport,
+        device_pixel_ratio,
+        display_state: "normal",
+        resizable: true,
+    }
+}
+
+fn css_length(value: &str) -> Option<f64> {
+    value.trim().strip_suffix("px")?.trim().parse().ok()
+}
+
+fn css_resolution(value: &str) -> Option<f64> {
+    let value = value.trim();
+    if let Some(value) = value.strip_suffix("dppx") {
+        return value.trim().parse().ok();
+    }
+    if let Some(value) = value.strip_suffix("dpi") {
+        return value.trim().parse::<f64>().ok().map(|value| value / 96.0);
+    }
+    if let Some(value) = value.strip_suffix("dpcm") {
+        return value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| value * 2.54 / 96.0);
+    }
+    None
+}
+
+fn media_feature(feature: &str, state: MediaState) -> bool {
+    let Some((name, value)) = feature.split_once(':') else {
+        return feature.trim() == "resizable" && state.resizable;
+    };
+    let name = name.trim().to_ascii_lowercase();
+    let value = value.trim().to_ascii_lowercase();
+    let width = state.viewport.map_or(0.0, |viewport| viewport.width as f64);
+    let height = state
+        .viewport
+        .map_or(0.0, |viewport| viewport.height as f64);
+    match name.as_str() {
+        "width" => css_length(&value).is_some_and(|expected| width == expected),
+        "min-width" => css_length(&value).is_some_and(|expected| width >= expected),
+        "max-width" => css_length(&value).is_some_and(|expected| width <= expected),
+        "height" => css_length(&value).is_some_and(|expected| height == expected),
+        "min-height" => css_length(&value).is_some_and(|expected| height >= expected),
+        "max-height" => css_length(&value).is_some_and(|expected| height <= expected),
+        "resolution" => css_resolution(&value)
+            .is_some_and(|expected| (state.device_pixel_ratio - expected).abs() < f64::EPSILON),
+        "min-resolution" => {
+            css_resolution(&value).is_some_and(|expected| state.device_pixel_ratio >= expected)
+        }
+        "max-resolution" => {
+            css_resolution(&value).is_some_and(|expected| state.device_pixel_ratio <= expected)
+        }
+        "orientation" => match value.as_str() {
+            "portrait" => height >= width,
+            "landscape" => width > height,
+            _ => false,
+        },
+        "display-state" => value == state.display_state,
+        "resizable" => match value.as_str() {
+            "true" => state.resizable,
+            "false" => !state.resizable,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn media_query_matches(query: &str, state: MediaState) -> bool {
+    query.split(',').any(|query| {
+        let mut query = query.trim().to_ascii_lowercase();
+        let negated = query.strip_prefix("not ").is_some();
+        if negated {
+            query = query[4..].trim().to_owned();
+        }
+        if let Some(rest) = query.strip_prefix("only ") {
+            query = rest.trim().to_owned();
+        }
+        let mut parts = query.split(" and ");
+        let first = parts.next().unwrap_or_default().trim();
+        let (media_type, first_feature) = if first.starts_with('(') {
+            ("", Some(first))
+        } else {
+            (first, None)
+        };
+        let mut matches = media_type.is_empty() || media_type == "all" || media_type == "screen";
+        if media_type == "print" || (!media_type.is_empty() && !matches) {
+            matches = false;
+        }
+        for part in first_feature.into_iter().chain(parts) {
+            let feature = part
+                .trim()
+                .strip_prefix('(')
+                .and_then(|value| value.strip_suffix(')'));
+            matches &= feature.is_some_and(|feature| media_feature(feature.trim(), state));
+        }
+        if negated { !matches } else { matches }
+    })
+}
+
+fn media_query_list(query: &str, state: MediaState) -> Object {
+    let media = if query.trim().is_empty() {
+        "not all".to_owned()
+    } else {
+        query.trim().to_owned()
+    };
+    let list = Object::new();
+    list.set_read_only("media", Value::String(media.clone()));
+    list.set_read_only(
+        "matches",
+        Value::Boolean(media_query_matches(&media, state)),
+    );
+    list.set("__query", Value::String(media));
+    list.set("__listeners", Value::Object(Object::new()));
+    list.set("onchange", Value::Null);
+    list
+}
+
+fn dispatch_media_query_change(list: &Object, matches: bool) {
+    let media = list.get("media").unwrap_or(Value::String(String::new()));
+    let event = Object::new();
+    event.set("type", Value::String("change".into()));
+    event.set("media", media);
+    event.set("matches", Value::Boolean(matches));
+    event.set("bubbles", Value::Boolean(false));
+    event.set("cancelable", Value::Boolean(false));
+    event.set("target", Value::Object(list.clone()));
+    event.set("currentTarget", Value::Object(list.clone()));
+    let mut callbacks = Vec::new();
+    if let Some(Value::Object(listeners)) = list.get("__listeners") {
+        for index in 0..listeners.len() {
+            if let Some(callback) = listeners.get(&index.to_string()) {
+                callbacks.push(callback);
+            }
+        }
+    }
+    if let Some(callback) = list.get("onchange") {
+        callbacks.push(callback);
+    }
+    for callback in callbacks {
+        let result = match callback {
+            Value::Function(callback) => callback.call(&[Value::Object(event.clone())]),
+            Value::Object(callback) => match callback.get("handleEvent") {
+                Some(Value::Function(handle_event)) => {
+                    handle_event.call(&[Value::Object(event.clone())])
+                }
+                _ => Ok(Value::Undefined),
+            },
+            _ => Ok(Value::Undefined),
+        };
+        if let Err(error) = result {
+            log::warn!("MediaQueryList change listener threw: {error}");
+        }
+    }
+}
+
+fn update_media_query_lists(window: &Object, state: MediaState) {
+    let Some(Value::Object(lists)) = window.get("__mediaQueryLists") else {
+        return;
+    };
+    for index in 0..lists.len() {
+        let Some(Value::Object(list)) = lists.get(&index.to_string()) else {
+            continue;
+        };
+        let Some(Value::String(query)) = list.get("__query") else {
+            continue;
+        };
+        let matches = media_query_matches(&query, state);
+        let old_matches = matches!(list.get("matches"), Some(Value::Boolean(true)));
+        if matches != old_matches {
+            list.update_read_only("matches", Value::Boolean(matches));
+            dispatch_media_query_change(&list, matches);
+        }
+    }
+}
+
 fn register_window_object(
     realm: &mut Realm,
     initial_url: &str,
@@ -353,6 +540,148 @@ fn register_window_object(
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__popstateListeners", Value::Object(Object::new()));
     window.set("__storageListeners", Value::Object(Object::new()));
+    window.set("__mediaQueryLists", Value::Object(Object::new()));
+
+    let media_window = window.clone();
+    window.set_method(
+        "matchMedia",
+        Arc::new(move |arguments| {
+            let query = arguments.first().map_or_else(String::new, Value::to_string);
+            let current_viewport = match (
+                media_window.get("innerWidth"),
+                media_window.get("innerHeight"),
+            ) {
+                (Some(Value::Number(width)), Some(Value::Number(height))) => Some(ViewportSize {
+                    width: width.max(0.0) as u32,
+                    height: height.max(0.0) as u32,
+                }),
+                _ => None,
+            };
+            let current_ratio = match media_window.get("devicePixelRatio") {
+                Some(Value::Number(ratio)) => ratio,
+                _ => 1.0,
+            };
+            let list = media_query_list(&query, media_state(current_viewport, current_ratio));
+            let listeners = list
+                .get("__listeners")
+                .expect("MediaQueryList listeners should be installed");
+            list.set_method(
+                "addEventListener",
+                Arc::new({
+                    let list = list.clone();
+                    move |arguments| {
+                        let [Value::String(event_type), callback, ..] = arguments else {
+                            return Ok(Value::Undefined);
+                        };
+                        if event_type == "change"
+                            && matches!(callback, Value::Function(_) | Value::Object(_))
+                        {
+                            let listeners = list
+                                .get("__listeners")
+                                .and_then(|value| match value {
+                                    Value::Object(value) => Some(value),
+                                    _ => None,
+                                })
+                                .expect("MediaQueryList listeners should be installed");
+                            if !(0..listeners.len()).any(|index| {
+                                listeners
+                                    .get(&index.to_string())
+                                    .is_some_and(|value| value == *callback)
+                            }) {
+                                listeners.set(listeners.len().to_string(), callback.clone());
+                            }
+                        }
+                        Ok(Value::Undefined)
+                    }
+                }),
+            );
+            let list_for_remove = list.clone();
+            list.set_method(
+                "removeEventListener",
+                Arc::new(move |arguments| {
+                    let [Value::String(event_type), callback, ..] = arguments else {
+                        return Ok(Value::Undefined);
+                    };
+                    if event_type == "change"
+                        && let Some(Value::Object(listeners)) = list_for_remove.get("__listeners")
+                    {
+                        for index in 0..listeners.len() {
+                            if listeners
+                                .get(&index.to_string())
+                                .is_some_and(|value| value == *callback)
+                            {
+                                listeners.set(index.to_string(), Value::Undefined);
+                            }
+                        }
+                    }
+                    Ok(Value::Undefined)
+                }),
+            );
+            let list_for_add = list.clone();
+            list.set_method(
+                "addListener",
+                Arc::new(move |arguments| {
+                    if let Some(callback) = arguments.first()
+                        && let Some(Value::Function(add)) = list_for_add.get("addEventListener")
+                    {
+                        add.call(&[Value::String("change".into()), callback.clone()])?;
+                    }
+                    Ok(Value::Undefined)
+                }),
+            );
+            let list_for_remove_listener = list.clone();
+            list.set_method(
+                "removeListener",
+                Arc::new(move |arguments| {
+                    if let Some(callback) = arguments.first()
+                        && let Some(Value::Function(remove)) =
+                            list_for_remove_listener.get("removeEventListener")
+                    {
+                        remove.call(&[Value::String("change".into()), callback.clone()])?;
+                    }
+                    Ok(Value::Undefined)
+                }),
+            );
+            if let Value::Object(lists) =
+                media_window.get("__mediaQueryLists").expect("media lists")
+            {
+                lists.set(lists.len().to_string(), Value::Object(list.clone()));
+            }
+            drop(listeners);
+            Ok(Value::Object(list))
+        }),
+    );
+    let update_media_window = window.clone();
+    window.set_method(
+        "__updateMediaQueries",
+        Arc::new(move |arguments| {
+            let width = arguments.first().and_then(|value| match value {
+                Value::Number(value) => Some(*value as u32),
+                _ => None,
+            });
+            let height = arguments.get(1).and_then(|value| match value {
+                Value::Number(value) => Some(*value as u32),
+                _ => None,
+            });
+            let ratio = arguments
+                .get(2)
+                .and_then(|value| match value {
+                    Value::Number(value) => Some(*value),
+                    _ => None,
+                })
+                .unwrap_or(1.0);
+            update_media_query_lists(
+                &update_media_window,
+                media_state(
+                    width
+                        .zip(height)
+                        .map(|(width, height)| ViewportSize { width, height }),
+                    ratio,
+                ),
+            );
+            Ok(Value::Undefined)
+        }),
+    );
 
     let timers_for_timeout = Arc::clone(&timers);
     let nesting_for_timeout = Arc::clone(&nesting_context);
@@ -698,6 +1027,12 @@ fn register_window_object(
     realm.register_global_value("navigator", Value::Object(navigator))?;
     realm.register_global_value("innerWidth", inner_width)?;
     realm.register_global_value("innerHeight", inner_height)?;
+    realm.register_global_value(
+        "matchMedia",
+        window
+            .get("matchMedia")
+            .expect("matchMedia should be installed on Window"),
+    )?;
     realm.register_global_value(
         "setInterval",
         window
