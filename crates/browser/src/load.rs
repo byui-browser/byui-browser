@@ -12,10 +12,10 @@ use std::{
 use devtools::performance::{EventCategory, TimelineEvent};
 
 use futures_util::future::join_all;
-use net::{Request, RequestController, Url};
+use net::{NetworkEvent, NetworkObserver, Request, RequestController, Url};
 use security::{Origin, RendererSecurityContext, StoragePermission};
 
-use crate::{Page, attribute, request_controller};
+use crate::{Page, attribute};
 
 /// Why a page, or the main document of a page, could not be loaded.
 ///
@@ -394,6 +394,26 @@ pub struct Navigation {
     /// Downloads and parsing done during the load, for the DevTools
     /// Performance panel; see [`load_page_timed`].
     pub timeline: Vec<TimelineEvent>,
+    /// Fetch-engine lifecycle events captured while the navigation loaded.
+    pub network_events: Vec<NetworkEvent>,
+}
+
+/// Thread-safe, best-effort collection of one loader's diagnostic events.
+#[derive(Default)]
+struct NetworkEventCollector(Mutex<Vec<NetworkEvent>>);
+
+impl NetworkEventCollector {
+    fn take(&self) -> Vec<NetworkEvent> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|poison| poison.into_inner()))
+    }
+}
+
+impl NetworkObserver for NetworkEventCollector {
+    fn observe(&self, event: NetworkEvent) {
+        if let Ok(mut events) = self.0.lock() {
+            events.push(event);
+        }
+    }
 }
 
 /// Loads pages on a background Tokio runtime so a UI thread never blocks.
@@ -402,6 +422,7 @@ pub struct Navigation {
 pub struct PageLoader {
     runtime: tokio::runtime::Runtime,
     controller: Arc<RequestController>,
+    network_events: Arc<NetworkEventCollector>,
 }
 
 impl PageLoader {
@@ -409,9 +430,11 @@ impl PageLoader {
     ///
     /// Fails only if the operating system refuses to start the runtime.
     pub fn new() -> io::Result<Self> {
+        let network_events = Arc::new(NetworkEventCollector::default());
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            controller: request_controller(None),
+            controller: crate::request_controller_with_observer(None, Some(network_events.clone())),
+            network_events,
         })
     }
 
@@ -421,6 +444,7 @@ impl PageLoader {
     /// must not block; typically it forwards the result to the UI thread.
     pub fn load(&self, address: &str, on_done: impl FnOnce(Navigation) + Send + 'static) {
         let controller = Arc::clone(&self.controller);
+        let network_events = Arc::clone(&self.network_events);
         let typed = address.trim().to_owned();
         let address = address.to_owned();
         log::debug!("page load scheduled: {typed}");
@@ -435,6 +459,7 @@ impl PageLoader {
                 address: shown,
                 result,
                 timeline,
+                network_events: network_events.take(),
             });
         });
     }
@@ -443,6 +468,8 @@ impl PageLoader {
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Mutex};
+
+    use crate::request_controller;
 
     use super::*;
 

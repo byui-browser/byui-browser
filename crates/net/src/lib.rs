@@ -8,11 +8,18 @@
 //! The transport and its Reqwest header/status/stream types stay behind this
 //! response boundary. The `webapis` crate adapts these Rust values to
 //! JavaScript objects, promises, and streams; this crate owns no JS identity.
+//! Optional [`NetworkObserver`] implementations receive best-effort,
+//! non-blocking lifecycle diagnostics without affecting Fetch results. The
+//! Observer events cover request preparation, cache and preflight decisions,
+//! scheduler admission, transport, redirects, response finalization, and
+//! completion or failure; it does not expose bodies, credentials, or error
+//! strings.
 //!
 //! The engine coordinates process-local scheduling and a small in-memory cache.
 //! Durable storage, security policy, service workers, client context, and
-//! diagnostics belong to their browser services and enter through
-//! [`FetchServices`]. Renderer processes do not open sockets directly.
+//! diagnostics may be collected through [`NetworkObserver`], while browser
+//! policy and durable state enter through [`FetchServices`]. Renderer
+//! processes do not open sockets directly.
 //!
 //! The current transport executes HTTP(S) requests. Relative URLs require a
 //! [`FetchEnvironment`] with a base URL. Engine-owned `data:` and the exact
@@ -51,6 +58,7 @@ pub use api::{
     body::{Blob, Body, BodyStatus, FormData, FormDataEntry},
     cancellation::{AbortController, AbortSignal},
     config::Config,
+    diagnostics::{NetworkEvent, NetworkObserver, NetworkPhase},
     error::{ProviderErrorKind, RequestError},
     headers::{HeaderGuard, Headers},
     providers::{

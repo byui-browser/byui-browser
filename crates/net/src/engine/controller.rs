@@ -4,7 +4,11 @@ use std::sync::Arc;
 
 use crate::{
     api::{
-        config::Config, error::RequestError, providers::SchemeProviders, services::FetchServices,
+        config::Config,
+        diagnostics::{NetworkEvent, NetworkPhase, SharedNetworkObserver},
+        error::RequestError,
+        providers::SchemeProviders,
+        services::FetchServices,
     },
     cache::{PreflightCache, ResponseCache},
     policy::{CorsChecker, RequestPolicy},
@@ -36,6 +40,7 @@ pub struct RequestControllerBuilder {
     config: Config,
     services: Option<Arc<dyn FetchServices>>,
     providers: SchemeProviders,
+    observer: SharedNetworkObserver,
 }
 
 /// Shared controller state used by fetch execution and policy stages.
@@ -60,6 +65,8 @@ pub(crate) struct ControllerInner {
     pub(crate) policy: RequestPolicy,
     /// Shared transport admission and concurrency controller.
     pub(crate) scheduler: RequestScheduler,
+    /// Best-effort lifecycle observer, separate from browser policy services.
+    pub(crate) observer: SharedNetworkObserver,
 }
 
 impl std::fmt::Debug for RequestController {
@@ -76,6 +83,7 @@ impl RequestController {
             config,
             services: None,
             providers: SchemeProviders::default(),
+            observer: None,
         }
     }
 }
@@ -100,12 +108,22 @@ impl RequestControllerBuilder {
         self
     }
 
+    /// Installs a non-failing observer for request lifecycle diagnostics.
+    ///
+    /// The observer is shared by controller clones. It receives no bodies,
+    /// headers, credentials, or error strings.
+    pub fn with_network_observer(mut self, observer: Arc<dyn crate::NetworkObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
     /// Constructs shared state and initializes the reusable HTTP transport.
     pub fn build(self) -> Result<RequestController, RequestError> {
         let Self {
             config,
             services,
             providers,
+            observer,
         } = self;
         let max_in_flight = config.max_in_flight;
         let max_keepalive_body_size = config.max_keepalive_body_size;
@@ -131,13 +149,55 @@ impl RequestControllerBuilder {
                 providers,
                 cors: CorsChecker,
                 policy: RequestPolicy,
-                scheduler: RequestScheduler::new(transport, max_in_flight),
+                scheduler: RequestScheduler::new(transport, max_in_flight, observer.clone()),
+                observer,
             }),
         })
     }
 }
 
 impl RequestController {
+    /// Emits a diagnostic event without allowing an observer to affect Fetch.
+    pub(crate) fn observe(
+        &self,
+        request: &crate::Request,
+        phase: NetworkPhase,
+        url: &reqwest::Url,
+        status: Option<u16>,
+        from_cache: bool,
+    ) {
+        self.observe_parts(
+            request.id(),
+            phase,
+            url.as_str(),
+            status,
+            from_cache,
+            request.redirect_count,
+        );
+    }
+
+    /// Emits an event after ownership of the request has moved into a scheme handler.
+    pub(crate) fn observe_parts(
+        &self,
+        request_id: u64,
+        phase: NetworkPhase,
+        url: &str,
+        status: Option<u16>,
+        from_cache: bool,
+        redirect_count: usize,
+    ) {
+        if let Some(observer) = &self.inner.observer {
+            observer.observe(NetworkEvent::now(
+                request_id,
+                phase,
+                url,
+                status,
+                from_cache,
+                redirect_count,
+            ));
+        }
+    }
+
     /// Removes all stored HTTP responses and CORS-preflight permissions.
     pub fn clear_cache(&self) {
         self.inner.cache.clear();

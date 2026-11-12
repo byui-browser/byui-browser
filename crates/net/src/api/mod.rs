@@ -3,6 +3,7 @@
 pub(crate) mod body;
 pub(crate) mod cancellation;
 pub(crate) mod config;
+pub(crate) mod diagnostics;
 pub(crate) mod error;
 pub(crate) mod headers;
 pub(crate) mod media_type;

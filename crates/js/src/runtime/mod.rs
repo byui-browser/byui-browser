@@ -121,6 +121,13 @@ struct Binding {
     setter: Option<HostSetter>,
 }
 
+/// A shared bytecode binding cell retained by closures.
+#[derive(Clone, Debug)]
+pub(crate) struct BytecodeCapture {
+    pub(crate) value: Arc<Mutex<Option<Value>>>,
+    pub(crate) kind: Option<VarKind>,
+}
+
 #[derive(Default)]
 struct Scope {
     bindings: HashMap<String, Binding>,
@@ -332,6 +339,8 @@ enum FunctionKind {
     /// A function compiled to bytecode; only the VM can run it.
     Bytecode {
         template: Arc<FunctionTemplate>,
+        captures: Arc<Vec<BytecodeCapture>>,
+        lexical_this: Option<Value>,
         /// Own properties, such as a constructor's `prototype`.
         properties: Object,
         /// The prototype object that `super.name` is looked up from. It owns
@@ -369,9 +378,30 @@ impl Function {
         parent: Option<Function>,
         prototype: Option<Object>,
     ) -> Self {
+        Self::from_template_with_captures(
+            template,
+            home_object,
+            parent,
+            prototype,
+            Vec::new(),
+            None,
+        )
+    }
+
+    /// Creates a bytecode function with captured lexical bindings.
+    pub(crate) fn from_template_with_captures(
+        template: Arc<FunctionTemplate>,
+        home_object: Option<Object>,
+        parent: Option<Function>,
+        prototype: Option<Object>,
+        captures: Vec<BytecodeCapture>,
+        lexical_this: Option<Value>,
+    ) -> Self {
         let constructible = template.kind.is_constructor();
         let function = Self(Arc::new(FunctionKind::Bytecode {
             template,
+            captures: Arc::new(captures),
+            lexical_this,
             properties: Object::new(),
             home_object: home_object.as_ref().map(Object::downgrade),
             parent,
@@ -388,6 +418,20 @@ impl Function {
     pub(crate) fn template(&self) -> Option<&Arc<FunctionTemplate>> {
         match &*self.0 {
             FunctionKind::Bytecode { template, .. } => Some(template),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn captures(&self) -> Option<&Arc<Vec<BytecodeCapture>>> {
+        match &*self.0 {
+            FunctionKind::Bytecode { captures, .. } => Some(captures),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn lexical_this(&self) -> Option<Value> {
+        match &*self.0 {
+            FunctionKind::Bytecode { lexical_this, .. } => lexical_this.clone(),
             _ => None,
         }
     }
