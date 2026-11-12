@@ -47,6 +47,23 @@ const REGRESSIONS: &[&str] = &[
     "\u{FEFF}",
     "é",
     "😀 = 1",
+    "\\u",
+    "\\u{",
+    "a\\u{}",
+    "a\\u{110000}",
+    "a\\u{FFFFFFFFFFFF}",
+    "a\\u0020",
+    "\\u0031",
+    "\\uD835\\uDC00",
+    "\\u0069f",
+    "var \\u0069f = 1",
+    "a.\\u0069f",
+    "caf\\u00e9 = 1",
+    "e\u{301}",
+    "\u{301}",
+    "a\u{200C}b",
+    "\\x41",
+    "a\\",
     "f()()()",
     "function f() { return f; } f()()()",
     "function f() { return f(); } f()",
@@ -69,6 +86,7 @@ const SEEDS: &[&str] = &[
     "if (1 < 2) { 'yes'; } else { 'no'; }",
     "const s = '\\x41\\u0042\\u{43}\\n\\t\\0'; s",
     "/* block */ let a = 1; // line\n a",
+    "let café = 1; let 名前 = caf\\u00e9; function \\u{66}(π) { return π + 名前; } f(caf\\u{E9})",
 ];
 
 #[test]
@@ -259,7 +277,7 @@ impl Rng {
 
 const SPECIAL_CHARS: &[char] = &[
     '\\', '\'', '"', '\n', '\r', '\t', '\0', '\u{2028}', '\u{FEFF}', '\u{A0}', 'é', '😀', '{', '}',
-    '(', ')', '/', '*', '.', '[', ']',
+    '(', ')', '/', '*', '.', '[', ']', 'π', '名', '\u{301}', '\u{200C}',
 ];
 
 fn random_text(rng: &mut Rng) -> String {
@@ -341,6 +359,14 @@ const FRAGMENTS: &[&str] = &[
     "]",
     "a.b",
     "o[k]",
+    "café",
+    "名前",
+    "\\u0061",
+    "\\u{62}",
+    "\\u0069f",
+    "\\u0031",
+    "\\u{",
+    "\\",
     "//",
     "/*",
     "*/",

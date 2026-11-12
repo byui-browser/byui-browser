@@ -4,11 +4,12 @@
 ///
 /// The most recently recorded visit is the current URL. Repeated visits are
 /// retained. This in-memory state does not validate URLs, navigate, fetch pages,
-/// persist history, or implement Back/Forward navigation. Callers decide when
+/// persist history. Callers decide when
 /// a visit has completed and should be recorded.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BrowserState {
     visited_urls: Vec<String>,
+    current_index: Option<usize>,
 }
 
 impl BrowserState {
@@ -22,17 +23,68 @@ impl BrowserState {
     /// Stores the supplied text unchanged, including internal URLs such as
     /// `byui://welcome`. Every call records a visit, even for a repeated URL.
     pub fn record_visit(&mut self, url: &str) {
+        if let Some(index) = self.current_index {
+            self.visited_urls.truncate(index + 1);
+        }
         self.visited_urls.push(url.to_owned());
+        self.current_index = Some(self.visited_urls.len() - 1);
+        log::debug!(
+            "visit recorded: {url} ({} in history)",
+            self.visited_urls.len()
+        );
+    }
+
+    /// Replaces the current visit with `url`, or records it when history is
+    /// empty. Used by Location's `replace()` navigation behavior.
+    pub fn replace_current(&mut self, url: &str) {
+        if let Some(index) = self.current_index {
+            self.visited_urls[index] = url.to_owned();
+        } else if let Some(current) = self.visited_urls.last_mut() {
+            *current = url.to_owned();
+            self.current_index = Some(self.visited_urls.len() - 1);
+        } else {
+            self.visited_urls.push(url.to_owned());
+            self.current_index = Some(0);
+        }
     }
 
     /// Borrows the most recently visited URL, or `None` before the first visit.
     pub fn current_url(&self) -> Option<&str> {
-        self.visited_urls.last().map(String::as_str)
+        self.current_index
+            .and_then(|index| self.visited_urls.get(index))
+            .map(String::as_str)
     }
 
     /// Borrows all recorded URLs in visit order, including repeated visits.
     pub fn visited_urls(&self) -> &[String] {
         &self.visited_urls
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        self.current_index.is_some_and(|index| index > 0)
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.current_index
+            .is_some_and(|index| index + 1 < self.visited_urls.len())
+    }
+
+    pub fn go_back(&mut self) -> Option<String> {
+        let index = self.current_index?;
+        (index > 0).then(|| {
+            let index = index - 1;
+            self.current_index = Some(index);
+            self.visited_urls[index].clone()
+        })
+    }
+
+    pub fn go_forward(&mut self) -> Option<String> {
+        let index = self.current_index?;
+        (index + 1 < self.visited_urls.len()).then(|| {
+            let index = index + 1;
+            self.current_index = Some(index);
+            self.visited_urls[index].clone()
+        })
     }
 }
 
@@ -78,6 +130,19 @@ mod tests {
     }
 
     #[test]
+    fn replace_current_replaces_only_the_latest_visit() {
+        let mut state = BrowserState::new();
+        state.record_visit("https://first.example/");
+        state.record_visit("https://second.example/");
+        state.replace_current("https://replacement.example/");
+
+        assert_eq!(
+            state.visited_urls(),
+            ["https://first.example/", "https://replacement.example/"]
+        );
+    }
+
+    #[test]
     fn repeated_urls_are_kept_as_separate_visits() {
         let mut state = BrowserState::new();
         state.record_visit("https://example.com/");
@@ -95,5 +160,36 @@ mod tests {
                 "https://example.com/",
             ]
         );
+    }
+
+    #[test]
+    fn back_and_forward_move_without_losing_history() {
+        let mut state = BrowserState::new();
+        state.record_visit("https://a.example/");
+        state.record_visit("https://b.example/");
+        state.record_visit("https://c.example/");
+
+        assert_eq!(state.go_back().as_deref(), Some("https://b.example/"));
+        assert!(state.can_go_back());
+        assert!(state.can_go_forward());
+        assert_eq!(state.go_back().as_deref(), Some("https://a.example/"));
+        assert!(!state.can_go_back());
+        assert_eq!(state.go_forward().as_deref(), Some("https://b.example/"));
+        assert_eq!(state.current_url(), Some("https://b.example/"));
+    }
+
+    #[test]
+    fn new_navigation_truncates_forward_history() {
+        let mut state = BrowserState::new();
+        state.record_visit("https://a.example/");
+        state.record_visit("https://b.example/");
+        let _ = state.go_back();
+        state.record_visit("https://new.example/");
+
+        assert_eq!(
+            state.visited_urls(),
+            ["https://a.example/", "https://new.example/"]
+        );
+        assert!(!state.can_go_forward());
     }
 }

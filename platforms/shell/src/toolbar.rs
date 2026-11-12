@@ -4,10 +4,8 @@
 //! Window controls come from the operating system: each shell keeps its native
 //! decorations, and where those overlap the toolbar (macOS's traffic lights on
 //! a transparent titlebar) the controls shift right by
-//! [`ChromeState::window_controls_inset`]. Navigation is not implemented yet:
-//! Back and Forward are drawn disabled, and Reload, the address field, New
-//! Tab, and the menu only show hover and press feedback. The address text is a
-//! fixed label for the welcome page.
+//! [`ChromeState::window_controls_inset`]. Tabs remain staged; navigation and
+//! address editing are handled by the shared shell.
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform};
@@ -20,15 +18,28 @@ const CONTROLS_HEIGHT: f64 = 46.0;
 /// Gap in logical pixels between the page card and the window's side and
 /// bottom edges.
 const PAGE_INSET: f64 = 8.0;
-const PAGE_RADIUS: f32 = 10.0;
+/// Corner radius in logical pixels of the page card and overlays docked to it.
+pub(crate) const PAGE_RADIUS: f32 = 10.0;
 const CENTER_Y: f32 = 26.0;
 const BUTTON_SIZE: f32 = 28.0;
 const BUTTON_TOP: f32 = CENTER_Y - BUTTON_SIZE / 2.0;
 const ADDRESS_HEIGHT: f32 = 34.0;
 const ADDRESS_MAX_WIDTH: f32 = 640.0;
+/// Logical distance from the address field's left edge to its text, leaving
+/// room for the lock icon.
+const ADDRESS_TEXT_LEADING: f32 = 30.0;
 /// Logical distance from the toolbar's left edge (after the window-controls
-/// inset) to the Back button.
+/// inset) to the Back button when it is furthest left: when the address field
+/// sits at [`ADDRESS_LEADING`] or the window is too narrow to show the field.
 const NAV_LEADING: f32 = 12.0;
+/// Logical horizontal distance between neighboring navigation buttons' left
+/// edges.
+const NAV_STRIDE: f32 = 32.0;
+/// Logical width of the Back, Forward, and Reload group.
+const NAV_WIDTH: f32 = 2.0 * NAV_STRIDE + BUTTON_SIZE;
+/// Logical gap between the Reload button and the address field; the
+/// navigation group stays this far left of the field wherever it sits.
+const NAV_ADDRESS_GAP: f32 = ADDRESS_LEADING - NAV_LEADING - NAV_WIDTH;
 /// Logical distance from the toolbar's left edge (after the window-controls
 /// inset) to the earliest position of the address field.
 const ADDRESS_LEADING: f32 = 116.0;
@@ -36,19 +47,17 @@ const ADDRESS_LEADING: f32 = 116.0;
 /// field usable.
 const TRAILING_MIN_WIDTH: f32 = 360.0;
 const TEXT_SIZE: f32 = 13.0;
-const ADDRESS_SCHEME: &str = "byui://";
-const ADDRESS_PAGE: &str = "welcome";
 
 /// A clickable region of the chrome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Control {
-    /// Back navigation; disabled because there is no history yet.
+    /// Back navigation.
     Back,
-    /// Forward navigation; disabled because there is no history yet.
+    /// Forward navigation.
     Forward,
-    /// Reload; re-renders the welcome page.
+    /// Reload; fetches the current URL and repaints the loaded page.
     Reload,
-    /// Address field; text entry is not implemented yet.
+    /// Address field; supports staged text editing.
     Address,
     /// New tab placeholder; tabs are not implemented yet.
     NewTab,
@@ -66,9 +75,13 @@ const CONTROLS: [Control; 6] = [
 ];
 
 impl Control {
-    /// Whether the control responds to hover and clicks.
-    pub(crate) fn is_enabled(self) -> bool {
-        !matches!(self, Control::Back | Control::Forward)
+    /// Whether the control responds to hover and clicks in the current state.
+    pub(crate) fn is_enabled(self, state: &ChromeState) -> bool {
+        match self {
+            Self::Back => state.can_go_back,
+            Self::Forward => state.can_go_forward,
+            _ => true,
+        }
     }
 }
 
@@ -81,11 +94,45 @@ pub(crate) struct ChromeState {
     pub pressed: Option<Control>,
     /// Whether to use the dark palette.
     pub dark: bool,
+    /// Whether the newest navigation or Refresh fetch is still pending.
+    pub loading: bool,
+    /// Whether a previous history entry is available.
+    pub can_go_back: bool,
+    /// Whether a forward history entry is available.
+    pub can_go_forward: bool,
+    /// Reserve space below the toolbar for Find in Page.
+    pub find_open: bool,
     /// Logical width at the toolbar's left reserved for the operating
     /// system's own window buttons when they overlap the toolbar, as macOS's
     /// traffic lights do on a transparent titlebar. Zero when the system draws
     /// its buttons in a separate titlebar above the toolbar.
     pub window_controls_inset: f32,
+    /// Whether the address field owns keyboard input.
+    pub address_focused: bool,
+    /// Fixed end of the address selection as a byte offset into the address
+    /// text; the selection runs between this and
+    /// [`ChromeState::address_caret`], which is the end that moves while
+    /// dragging. `None`, or the same offset as the caret, means nothing is
+    /// selected. A selection is drawn as a highlight instead of a caret and
+    /// the next edit replaces it; meaningful only while
+    /// [`ChromeState::address_focused`] is set.
+    pub address_anchor: Option<usize>,
+    /// Caret position as a byte offset into the address text, drawn while the
+    /// field is focused and nothing is selected. Offsets past the end, or
+    /// inside a multi-byte character, are drawn at the nearest earlier
+    /// character boundary.
+    pub address_caret: usize,
+}
+
+impl ChromeState {
+    /// Returns the selected byte range of `address` as `(start, end)` with
+    /// `start < end`, snapped to character boundaries, or `None` when nothing
+    /// is selected.
+    pub(crate) fn address_selection(&self, address: &str) -> Option<(usize, usize)> {
+        let anchor = floor_char_boundary(address, self.address_anchor?);
+        let caret = floor_char_boundary(address, self.address_caret);
+        (anchor != caret).then(|| (anchor.min(caret), anchor.max(caret)))
+    }
 }
 
 /// A rectangle in device pixels.
@@ -116,6 +163,22 @@ pub(crate) fn page_rect(width: u32, height: u32, scale_factor: f64) -> Option<Pi
     })
 }
 
+/// Page viewport with the Find bar's row reserved, in device pixels.
+pub(crate) fn page_rect_with_find(
+    width: u32,
+    height: u32,
+    scale: f64,
+    find: bool,
+) -> Option<PixelRect> {
+    let mut rect = page_rect(width, height, scale)?;
+    if find {
+        let extra = (crate::find_in_page::HEIGHT as f64 * scale).round() as u32;
+        rect.y += extra;
+        rect.height = rect.height.checked_sub(extra).filter(|h| *h > 0)?;
+    }
+    Some(rect)
+}
+
 /// Returns the enabled or disabled control at a point given in logical
 /// pixels, for a window `width` logical pixels wide whose toolbar starts
 /// `inset` logical pixels in (see [`ChromeState::window_controls_inset`]).
@@ -139,13 +202,18 @@ pub(crate) fn load_ui_font<P: AsRef<std::path::Path>>(
 ) -> Option<FontVec> {
     use ab_glyph::VariableFont;
 
-    candidates.into_iter().find_map(|path| {
-        let mut font = FontVec::try_from_vec(std::fs::read(path).ok()?).ok()?;
+    let font = candidates.into_iter().find_map(|path| {
+        let mut font = FontVec::try_from_vec(std::fs::read(path.as_ref()).ok()?).ok()?;
         // SF and other variable UI fonts pick the optical size designed for
         // small text; fonts without an `opsz` axis ignore this.
         font.set_variation(b"opsz", TEXT_SIZE);
+        log::debug!("font file chosen: {}", path.as_ref().display());
         Some(font)
-    })
+    });
+    if font.is_none() {
+        log::warn!("no UI font could be loaded; text will not render");
+    }
+    font
 }
 
 /// Paints the whole window: frame, page card holding `page`, and toolbar.
@@ -158,6 +226,7 @@ pub(crate) fn compose(
     height: u32,
     scale_factor: f64,
     state: &ChromeState,
+    address: &str,
     page: Option<&Pixmap>,
     font: Option<&FontVec>,
 ) -> Option<Pixmap> {
@@ -165,7 +234,7 @@ pub(crate) fn compose(
     let palette = &if state.dark { dark() } else { light() };
     let scale = scale_factor as f32;
     fill_frame(&mut pixmap, height, palette);
-    if let Some(card) = page_rect(width, height, scale_factor) {
+    if let Some(card) = page_rect_with_find(width, height, scale_factor, state.find_open) {
         draw_page_card(&mut pixmap, card, scale, height, palette, page);
     }
     draw_toolbar(
@@ -175,6 +244,7 @@ pub(crate) fn compose(
         state,
         palette,
         font,
+        address,
     );
     Some(pixmap)
 }
@@ -190,6 +260,7 @@ pub(crate) fn compose_controls(
     height: u32,
     scale_factor: f64,
     state: &ChromeState,
+    address: &str,
     font: Option<&FontVec>,
 ) -> Option<Pixmap> {
     let strip = controls_height_in_pixels(scale_factor).min(height);
@@ -204,6 +275,7 @@ pub(crate) fn compose_controls(
         state,
         palette,
         font,
+        address,
     );
     Some(pixmap)
 }
@@ -219,7 +291,7 @@ fn fill_frame(pixmap: &mut Pixmap, window_height: u32, palette: &Palette) {
     let width = pixmap.width() as usize;
     for (y, row) in pixmap.data_mut().chunks_exact_mut(width * 4).enumerate() {
         let color = frame_color(y as u32, window_height, palette);
-        for pixel in row.chunks_exact_mut(4) {
+        for pixel in row.as_chunks_mut::<4>().0.iter_mut() {
             pixel.copy_from_slice(&color);
         }
     }
@@ -311,6 +383,7 @@ fn draw_toolbar(
     state: &ChromeState,
     palette: &Palette,
     font: Option<&FontVec>,
+    address: &str,
 ) {
     let transform = Transform::from_scale(scale, scale);
     let inset = state.window_controls_inset;
@@ -321,16 +394,16 @@ fn draw_toolbar(
         let Some(rect) = control_rect(control, width, inset) else {
             continue;
         };
-        let active = control.is_enabled();
+        let active = control.is_enabled(state);
         let background = match (state.pressed, state.hovered) {
             (Some(pressed), _) if pressed == control && active => Some(palette.pressed),
             (_, Some(hovered)) if hovered == control && active => Some(palette.hover),
             _ => None,
         };
-        if let Some(color) = background {
-            if let Some(path) = rounded_rect(rect.x(), rect.y(), rect.width(), rect.height(), 7.0) {
-                fill(pixmap, &path, color, transform);
-            }
+        if let Some(color) = background
+            && let Some(path) = rounded_rect(rect.x(), rect.y(), rect.width(), rect.height(), 7.0)
+        {
+            fill(pixmap, &path, color, transform);
         }
         let color = if active {
             palette.icon
@@ -341,7 +414,7 @@ fn draw_toolbar(
         draw_icon(pixmap, control, cx, cy, color, transform);
     }
     if let Some(rect) = control_rect(Control::Address, width, inset) {
-        draw_address_field(pixmap, rect, scale, state, palette, font);
+        draw_address_field(pixmap, rect, scale, state, palette, font, address);
     }
 }
 
@@ -420,6 +493,7 @@ fn draw_address_field(
     state: &ChromeState,
     palette: &Palette,
     font: Option<&FontVec>,
+    address: &str,
 ) {
     let transform = Transform::from_scale(scale, scale);
     let hovered = state.hovered == Some(Control::Address);
@@ -433,7 +507,21 @@ fn draw_address_field(
     };
     fill(pixmap, &shape, field, transform);
     // A device-pixel hairline stays crisp at every scale factor.
-    stroke(pixmap, &shape, palette.field_border, 1.0 / scale, transform);
+    stroke(
+        pixmap,
+        &shape,
+        if state.address_focused {
+            palette.accent
+        } else {
+            palette.field_border
+        },
+        if state.address_focused {
+            1.25 / scale
+        } else {
+            1.0 / scale
+        },
+        transform,
+    );
 
     let cy = CENTER_Y;
     let lock_x = rect.x() + 16.0;
@@ -474,38 +562,146 @@ fn draw_address_field(
         stroke(pixmap, &path, palette.text_muted, 1.3, transform);
     }
 
+    let text_x = rect.x() + ADDRESS_TEXT_LEADING;
+    let mut clip_x = star_x - 12.0;
+    if state.loading
+        && let Some(font) = font
+    {
+        // Reserve a separate text lane; URL, selection and caret stop before it.
+        // At unusually narrow widths shrink the label rather than cover controls.
+        let unit_width = text_advance(font, scale, "Loading...") / scale;
+        let size = 11.0_f32.min((rect.width() - 74.0).max(1.0) / unit_width.max(1.0));
+        let advance = text_advance(font, size * scale, "Loading...") / scale;
+        let x = rect.right() - 30.0 - advance;
+        clip_x = x - 6.0;
+        let scaled = font.as_scaled(PxScale::from(size * scale));
+        let baseline = cy * scale + (scaled.ascent() + scaled.descent()) / 2.0;
+        draw_text(
+            pixmap,
+            font,
+            size * scale,
+            x * scale,
+            baseline,
+            (rect.right() - 28.0) * scale,
+            palette.accent,
+            "Loading...",
+        );
+    }
+    let selection = state.address_selection(address);
+    // Logical x of the caret, before the glyph at `address_caret`.
+    let mut caret_x = text_x;
     if let Some(font) = font {
         let size = TEXT_SIZE * scale;
         let scaled = font.as_scaled(PxScale::from(size));
         let baseline = cy * scale + (scaled.ascent() + scaled.descent()) / 2.0;
-        let clip = (star_x - 12.0) * scale;
-        let x = draw_text(
-            pixmap,
-            font,
-            size,
-            (rect.x() + 30.0) * scale,
-            baseline,
-            clip,
-            palette.text_muted,
-            ADDRESS_SCHEME,
-        );
+        if state.address_focused
+            && let Some((start, end)) = selection
+        {
+            let left = (text_x + text_advance(font, size, &address[..start]) / scale).min(clip_x);
+            let right = (text_x + text_advance(font, size, &address[..end]) / scale).min(clip_x);
+            if let Some(highlight) = Rect::from_xywh(left - 1.0, cy - 9.0, right - left + 2.0, 18.0)
+            {
+                fill(
+                    pixmap,
+                    &PathBuilder::from_rect(highlight),
+                    palette.selection,
+                    transform,
+                );
+            }
+        }
+        let caret = floor_char_boundary(address, state.address_caret);
+        caret_x = text_x + text_advance(font, size, &address[..caret]) / scale;
         draw_text(
             pixmap,
             font,
             size,
-            x,
+            text_x * scale,
             baseline,
-            clip,
-            palette.text,
-            ADDRESS_PAGE,
+            clip_x * scale,
+            if state.address_focused {
+                palette.text
+            } else {
+                palette.text_muted
+            },
+            address,
         );
     }
+    if state.address_focused && selection.is_none() {
+        let x = caret_x.min(clip_x - 2.0) + 1.0;
+        if let Some(caret) = Rect::from_xywh(x, cy - 8.0, 1.5, 16.0) {
+            fill(
+                pixmap,
+                &PathBuilder::from_rect(caret),
+                palette.text,
+                transform,
+            );
+        }
+    }
+}
+
+/// Returns the byte offset in `address` of the character boundary nearest to
+/// logical x coordinate `x`, for placing the caret where the pointer presses
+/// or drags in the address field of a toolbar `width` logical pixels wide
+/// with leading inset `inset`. `scale` is the device scale factor the field
+/// is painted at. Points left of the text give 0 and points right of it give
+/// the address length; without a font every point maps to 0.
+pub(crate) fn address_offset_at(
+    x: f64,
+    width: f64,
+    inset: f32,
+    scale: f32,
+    font: Option<&FontVec>,
+    address: &str,
+) -> usize {
+    let (Some(font), Some(rect)) = (font, control_rect(Control::Address, width as f32, inset))
+    else {
+        return 0;
+    };
+    let size = TEXT_SIZE * scale;
+    let target = x as f32 - (rect.x() + ADDRESS_TEXT_LEADING);
+    address
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain([address.len()])
+        .min_by(|a, b| {
+            let distance = |index: &usize| {
+                (text_advance(font, size, &address[..*index]) / scale - target).abs()
+            };
+            distance(a).total_cmp(&distance(b))
+        })
+        .unwrap_or(0)
+}
+
+/// Returns the largest character boundary of `text` at or before `index`.
+pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Returns the pen advance in device pixels of `text` set at `size`, matching
+/// the position [`draw_text`] returns relative to its starting `x`.
+pub(crate) fn text_advance(font: &FontVec, size: f32, text: &str) -> f32 {
+    let scaled = font.as_scaled(PxScale::from(size));
+    let mut advance = 0.0;
+    let mut previous = None;
+    for character in text.chars() {
+        let id = scaled.glyph_id(character);
+        if let Some(previous) = previous {
+            advance += scaled.kern(previous, id);
+        }
+        previous = Some(id);
+        advance += scaled.h_advance(id);
+    }
+    advance
 }
 
 /// Draws `text` with its baseline at `baseline` (device pixels), clipping
 /// glyph pixels at `clip_x`. Returns the pen position after the last glyph.
 #[allow(clippy::too_many_arguments)]
-fn draw_text(
+pub(crate) fn draw_text(
     pixmap: &mut Pixmap,
     font: &FontVec,
     size: f32,
@@ -556,36 +752,48 @@ fn draw_text(
 /// Returns where `control` sits in a toolbar `width` logical pixels wide
 /// whose leading controls start `inset` pixels in, or `None` when the window
 /// is too narrow to show it.
+///
+/// Back, Forward, and Reload sit just left of the address field and move
+/// with it; when the field is hidden they sit at [`NAV_LEADING`].
 fn control_rect(control: Control, width: f32, inset: f32) -> Option<Rect> {
     let button = |x: f32| Rect::from_xywh(x, BUTTON_TOP, BUTTON_SIZE, BUTTON_SIZE);
     let trailing = width >= TRAILING_MIN_WIDTH;
+    let nav_x = || {
+        address_rect(width, inset, trailing).map_or(inset + NAV_LEADING, |field| {
+            field.x() - NAV_ADDRESS_GAP - NAV_WIDTH
+        })
+    };
     match control {
-        Control::Back => button(inset + NAV_LEADING),
-        Control::Forward => button(inset + NAV_LEADING + 32.0),
-        Control::Reload => button(inset + NAV_LEADING + 64.0),
+        Control::Back => button(nav_x()),
+        Control::Forward => button(nav_x() + NAV_STRIDE),
+        Control::Reload => button(nav_x() + 2.0 * NAV_STRIDE),
         Control::NewTab => button(width - 80.0).filter(|_| trailing),
         Control::Menu => button(width - 44.0).filter(|_| trailing),
-        Control::Address => {
-            let leading = inset + ADDRESS_LEADING;
-            let right = if trailing { width - 92.0 } else { width - 12.0 };
-            let available = right - leading;
-            if available < 80.0 {
-                return None;
-            }
-            let field_width = available.min(ADDRESS_MAX_WIDTH);
-            // Center in the window like Safari, but never under other controls.
-            let x = ((width - field_width) / 2.0).clamp(leading, right - field_width);
-            Rect::from_xywh(
-                x,
-                CENTER_Y - ADDRESS_HEIGHT / 2.0,
-                field_width,
-                ADDRESS_HEIGHT,
-            )
-        }
+        Control::Address => address_rect(width, inset, trailing),
     }
 }
 
-fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<Path> {
+/// Returns where the address field sits, or `None` when the window is too
+/// narrow for it. `trailing` says whether New Tab and the menu are shown.
+fn address_rect(width: f32, inset: f32, trailing: bool) -> Option<Rect> {
+    let leading = inset + ADDRESS_LEADING;
+    let right = if trailing { width - 92.0 } else { width - 12.0 };
+    let available = right - leading;
+    if available < 80.0 {
+        return None;
+    }
+    let field_width = available.min(ADDRESS_MAX_WIDTH);
+    // Center in the window like Safari, but never under other controls.
+    let x = ((width - field_width) / 2.0).clamp(leading, right - field_width);
+    Rect::from_xywh(
+        x,
+        CENTER_Y - ADDRESS_HEIGHT / 2.0,
+        field_width,
+        ADDRESS_HEIGHT,
+    )
+}
+
+pub(crate) fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<Path> {
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
@@ -607,13 +815,21 @@ fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<Path> {
     builder.finish()
 }
 
-fn fill(pixmap: &mut Pixmap, path: &Path, color: Color, transform: Transform) {
+/// Fills `path` with a solid `color`.
+pub(crate) fn fill(pixmap: &mut Pixmap, path: &Path, color: Color, transform: Transform) {
     let mut paint = Paint::default();
     paint.set_color(color);
     pixmap.fill_path(path, &paint, FillRule::Winding, transform, None);
 }
 
-fn stroke(pixmap: &mut Pixmap, path: &Path, color: Color, width: f32, transform: Transform) {
+/// Strokes `path` with round caps and joins, `width` in transformed units.
+pub(crate) fn stroke(
+    pixmap: &mut Pixmap,
+    path: &Path,
+    color: Color,
+    width: f32,
+    transform: Transform,
+) {
     let mut paint = Paint::default();
     paint.set_color(color);
     let stroke = Stroke {
@@ -625,25 +841,32 @@ fn stroke(pixmap: &mut Pixmap, path: &Path, color: Color, width: f32, transform:
     pixmap.stroke_path(path, &paint, &stroke, transform, None);
 }
 
-fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
+pub(crate) fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
     Color::from_rgba8(r, g, b, a)
 }
 
-struct Palette {
-    frame_top: Color,
-    frame_bottom: Color,
-    shadow: Color,
-    card_border: Color,
-    icon: Color,
-    icon_disabled: Color,
-    hover: Color,
-    pressed: Color,
-    field: Color,
-    field_hover: Color,
-    field_border: Color,
-    text: Color,
-    text_muted: Color,
-    accent: Color,
+/// Shared browser-chrome colors for one appearance.
+pub(crate) struct Palette {
+    pub(crate) frame_top: Color,
+    pub(crate) frame_bottom: Color,
+    pub(crate) shadow: Color,
+    pub(crate) card_border: Color,
+    pub(crate) icon: Color,
+    pub(crate) icon_disabled: Color,
+    pub(crate) hover: Color,
+    pub(crate) pressed: Color,
+    pub(crate) field: Color,
+    pub(crate) field_hover: Color,
+    pub(crate) field_border: Color,
+    pub(crate) text: Color,
+    pub(crate) text_muted: Color,
+    pub(crate) accent: Color,
+    pub(crate) selection: Color,
+}
+
+/// Returns the chrome palette for the dark or light appearance.
+pub(crate) fn palette(dark: bool) -> Palette {
+    if dark { self::dark() } else { light() }
 }
 
 fn light() -> Palette {
@@ -663,6 +886,7 @@ fn light() -> Palette {
         text_muted: rgba(0x6b, 0x72, 0x80, 255),
         // BYU–Idaho blue.
         accent: rgba(0x00, 0x6e, 0xb6, 255),
+        selection: rgba(0x00, 0x6e, 0xb6, 64),
     }
 }
 
@@ -682,6 +906,7 @@ fn dark() -> Palette {
         text: rgba(0xec, 0xee, 0xf2, 255),
         text_muted: rgba(0x96, 0x9c, 0xa8, 255),
         accent: rgba(0x4d, 0xa3, 0xff, 255),
+        selection: rgba(0x4d, 0xa3, 0xff, 96),
     }
 }
 
@@ -692,6 +917,60 @@ mod tests {
     fn pixel(pixmap: &Pixmap, x: u32, y: u32) -> [u8; 4] {
         let p = pixmap.pixel(x, y).expect("pixel in bounds");
         [p.red(), p.green(), p.blue(), p.alpha()]
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn loading_label_changes_only_address_field_and_matches_partial_paint() {
+        let font = load_ui_font([
+            "/System/Library/Fonts/SFNS.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+        ])
+        .expect("macOS UI font");
+        for width in [420, 640, 1120] {
+            for scale in [1.0, 1.5, 2.0] {
+                for dark in [false, true] {
+                    let width_px = (width as f64 * scale) as u32;
+                    let height = (300.0 * scale) as u32;
+                    let idle = ChromeState {
+                        dark,
+                        window_controls_inset: 72.0,
+                        address_focused: true,
+                        address_caret: usize::MAX,
+                        ..ChromeState::default()
+                    };
+                    let busy = ChromeState {
+                        loading: true,
+                        ..idle
+                    };
+                    let address =
+                        "https://example.com/a/very/long/address/that/must/not/cover/loading";
+                    let before =
+                        compose(width_px, height, scale, &idle, address, None, Some(&font))
+                            .unwrap();
+                    let after = compose(width_px, height, scale, &busy, address, None, Some(&font))
+                        .unwrap();
+                    assert_ne!(before.data(), after.data());
+                    let strip =
+                        compose_controls(width_px, height, scale, &busy, address, Some(&font))
+                            .unwrap();
+                    assert_eq!(strip.data(), &after.data()[..strip.data().len()]);
+                    let rect = control_rect(Control::Address, width as f32, 72.0).unwrap();
+                    for y in 0..height {
+                        for x in 0..width_px {
+                            if (x as f64 / scale) < rect.left() as f64 - 1.0
+                                || (x as f64 / scale) > rect.right() as f64 + 1.0
+                                || (y as f64 / scale) < rect.top() as f64 - 1.0
+                                || (y as f64 / scale) > rect.bottom() as f64 + 1.0
+                            {
+                                let i = ((y * width_px + x) * 4) as usize;
+                                assert_eq!(&before.data()[i..i + 4], &after.data()[i..i + 4]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -721,7 +1000,16 @@ mod tests {
             let mut page = Pixmap::new(card.width, card.height).unwrap();
             page.fill(Color::from_rgba8(255, 0, 0, 255));
             let state = ChromeState::default();
-            let out = compose(width, height, scale, &state, Some(&page), None).unwrap();
+            let out = compose(
+                width,
+                height,
+                scale,
+                &state,
+                "byui://welcome",
+                Some(&page),
+                None,
+            )
+            .unwrap();
             let middle = pixel(&out, card.x + card.width / 2, card.y + card.height / 2);
             assert_eq!(middle, [255, 0, 0, 255]);
             // The rounded corner leaves the frame showing at the card's corner.
@@ -732,28 +1020,33 @@ mod tests {
 
     #[test]
     fn hit_testing_finds_toolbar_controls() {
-        assert_eq!(hit_test(26.0, 26.0, 1000.0, 0.0), Some(Control::Back));
-        assert_eq!(hit_test(90.0, 26.0, 1000.0, 0.0), Some(Control::Reload));
+        // A 600-pixel window keeps the address field at its leftmost spot,
+        // so the navigation buttons sit at their leading position.
+        assert_eq!(hit_test(26.0, 26.0, 600.0, 0.0), Some(Control::Back));
+        assert_eq!(hit_test(90.0, 26.0, 600.0, 0.0), Some(Control::Reload));
         assert_eq!(hit_test(500.0, 26.0, 1000.0, 0.0), Some(Control::Address));
         assert_eq!(
             hit_test(1000.0 - 30.0, 26.0, 1000.0, 0.0),
             Some(Control::Menu)
         );
-        assert_eq!(hit_test(109.0, 26.0, 1000.0, 0.0), None);
+        assert_eq!(hit_test(109.0, 26.0, 600.0, 0.0), None);
+        assert_eq!(hit_test(26.0, 26.0, 1000.0, 0.0), None);
         assert_eq!(hit_test(500.0, 200.0, 1000.0, 0.0), None);
-        assert!(!Control::Back.is_enabled());
-        assert!(Control::Reload.is_enabled());
+        let state = ChromeState::default();
+        assert!(!Control::Back.is_enabled(&state));
+        assert!(Control::Reload.is_enabled(&state));
     }
 
     #[test]
     fn disabled_navigation_controls_still_occupy_hit_regions() {
-        let back = hit_test(26.0, 26.0, 1000.0, 0.0);
-        let forward = hit_test(58.0, 26.0, 1000.0, 0.0);
+        let back = hit_test(26.0, 26.0, 600.0, 0.0);
+        let forward = hit_test(58.0, 26.0, 600.0, 0.0);
 
         assert_eq!(back, Some(Control::Back));
         assert_eq!(forward, Some(Control::Forward));
-        assert!(!back.is_some_and(Control::is_enabled));
-        assert!(!forward.is_some_and(Control::is_enabled));
+        let state = ChromeState::default();
+        assert!(!back.is_some_and(|control| control.is_enabled(&state)));
+        assert!(!forward.is_some_and(|control| control.is_enabled(&state)));
     }
 
     #[test]
@@ -761,14 +1054,62 @@ mod tests {
         // Space reserved for macOS's traffic lights holds no toolbar control.
         assert_eq!(hit_test(20.0, 26.0, 1000.0, 72.0), None);
         assert_eq!(hit_test(60.0, 26.0, 1000.0, 72.0), None);
-        assert_eq!(hit_test(98.0, 26.0, 1000.0, 72.0), Some(Control::Back));
-        assert_eq!(hit_test(162.0, 26.0, 1000.0, 72.0), Some(Control::Reload));
-        assert_eq!(hit_test(181.0, 26.0, 1000.0, 72.0), None);
+        assert_eq!(hit_test(98.0, 26.0, 600.0, 72.0), Some(Control::Back));
+        assert_eq!(hit_test(162.0, 26.0, 600.0, 72.0), Some(Control::Reload));
+        assert_eq!(hit_test(181.0, 26.0, 600.0, 72.0), None);
         // The address field never slides under the leading controls.
         let narrow = control_rect(Control::Address, 400.0, 72.0).unwrap();
         assert_eq!(narrow.x(), 72.0 + ADDRESS_LEADING);
         let centered = control_rect(Control::Address, 2000.0, 72.0).unwrap();
         assert_eq!(centered.x(), (2000.0 - ADDRESS_MAX_WIDTH) / 2.0);
+    }
+
+    #[test]
+    fn navigation_buttons_follow_the_centered_address_field() {
+        for (width, inset) in [(600.0, 72.0), (1120.0, 72.0), (2000.0, 0.0)] {
+            let field = control_rect(Control::Address, width, inset).unwrap();
+            let back = control_rect(Control::Back, width, inset).unwrap();
+            let forward = control_rect(Control::Forward, width, inset).unwrap();
+            let reload = control_rect(Control::Reload, width, inset).unwrap();
+            assert_eq!(field.x() - reload.right(), NAV_ADDRESS_GAP);
+            assert_eq!(forward.x() - back.x(), NAV_STRIDE);
+            assert_eq!(reload.x() - forward.x(), NAV_STRIDE);
+            assert!(back.x() >= inset + NAV_LEADING);
+        }
+        // Without an address field the buttons fall back to the leading edge.
+        assert!(control_rect(Control::Address, 200.0, 0.0).is_none());
+        let back = control_rect(Control::Back, 200.0, 0.0).unwrap();
+        assert_eq!(back.x(), NAV_LEADING);
+    }
+
+    #[test]
+    fn pointer_positions_map_to_address_character_boundaries() {
+        let font = load_ui_font([
+            "/System/Library/Fonts/SFNS.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "C:/Windows/Fonts/segoeui.ttf",
+        ]);
+        let Some(font) = font else {
+            eprintln!("skipping: system fonts unavailable");
+            return;
+        };
+        let address = "byui://welcome";
+        let field = control_rect(Control::Address, 1000.0, 0.0).unwrap();
+        let text_x = f64::from(field.x() + ADDRESS_TEXT_LEADING);
+        let at = |x: f64| address_offset_at(x, 1000.0, 0.0, 2.0, Some(&font), address);
+        assert_eq!(at(f64::from(field.x())), 0);
+        assert_eq!(at(f64::from(field.right())), address.len());
+        // The pen position after "byui" maps back to offset 4.
+        let after = f64::from(text_advance(&font, TEXT_SIZE * 2.0, "byui") / 2.0);
+        assert_eq!(at(text_x + after), 4);
+        // Positions increase monotonically across the text.
+        let offsets: Vec<_> = (0..200).map(|step| at(text_x + f64::from(step))).collect();
+        assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+        // Without a font every point maps to the start.
+        assert_eq!(
+            address_offset_at(text_x + 50.0, 1000.0, 0.0, 1.0, None, address),
+            0
+        );
     }
 
     #[test]
@@ -783,7 +1124,18 @@ mod tests {
 
     #[test]
     fn every_state_and_size_composes_safely() {
-        assert!(compose(0, 0, 1.0, &ChromeState::default(), None, None).is_none());
+        assert!(
+            compose(
+                0,
+                0,
+                1.0,
+                &ChromeState::default(),
+                "byui://welcome",
+                None,
+                None
+            )
+            .is_none()
+        );
         for (width, height) in [(1, 1), (20, 60), (300, 120), (1200, 800)] {
             for dark in [false, true] {
                 for hovered in [None, Some(Control::Reload), Some(Control::Address)] {
@@ -791,9 +1143,17 @@ mod tests {
                         hovered,
                         pressed: hovered,
                         dark,
+                        loading: false,
+                        can_go_back: false,
+                        can_go_forward: false,
+                        find_open: false,
+                        address_focused: false,
+                        address_anchor: None,
+                        address_caret: 0,
                         window_controls_inset: if dark { 72.0 } else { 0.0 },
                     };
-                    let out = compose(width, height, 1.5, &state, None, None).unwrap();
+                    let out =
+                        compose(width, height, 1.5, &state, "byui://welcome", None, None).unwrap();
                     assert_eq!(out.width(), width);
                 }
             }
@@ -809,8 +1169,9 @@ mod tests {
                 dark,
                 ..ChromeState::default()
             };
-            let full = compose(width, height, scale, &state, None, None).unwrap();
-            let strip = compose_controls(width, height, scale, &state, None).unwrap();
+            let full = compose(width, height, scale, &state, "byui://welcome", None, None).unwrap();
+            let strip =
+                compose_controls(width, height, scale, &state, "byui://welcome", None).unwrap();
             assert_eq!(strip.height(), controls_height_in_pixels(scale));
             assert_eq!(strip.data(), &full.data()[..strip.data().len()]);
             // The strip ends above the card shadow.
@@ -821,13 +1182,86 @@ mod tests {
 
     #[test]
     fn dark_and_light_frames_differ() {
-        let light = compose(400, 200, 1.0, &ChromeState::default(), None, None).unwrap();
+        let light = compose(
+            400,
+            200,
+            1.0,
+            &ChromeState::default(),
+            "byui://welcome",
+            None,
+            None,
+        )
+        .unwrap();
         let dark_state = ChromeState {
             dark: true,
             ..ChromeState::default()
         };
-        let dark = compose(400, 200, 1.0, &dark_state, None, None).unwrap();
+        let dark = compose(400, 200, 1.0, &dark_state, "byui://welcome", None, None).unwrap();
         assert!(pixel(&light, 200, 4)[0] > 200);
         assert!(pixel(&dark, 200, 4)[0] < 60);
+    }
+
+    #[test]
+    fn focused_address_field_has_distinct_chrome() {
+        let normal = compose(
+            400,
+            200,
+            1.0,
+            &ChromeState::default(),
+            "byui://welcome",
+            None,
+            None,
+        )
+        .unwrap();
+        let focused = compose(
+            400,
+            200,
+            1.0,
+            &ChromeState {
+                address_focused: true,
+                ..ChromeState::default()
+            },
+            "byui://welcome",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_ne!(normal.data(), focused.data());
+    }
+
+    #[test]
+    fn focused_address_shows_a_caret_in_both_palettes() {
+        for dark in [false, true] {
+            let focused = ChromeState {
+                dark,
+                address_focused: true,
+                ..ChromeState::default()
+            };
+            let selected = ChromeState {
+                address_anchor: Some(0),
+                address_caret: 1,
+                ..focused
+            };
+            let with_caret = compose(400, 200, 1.0, &focused, "x", None, None).unwrap();
+            let without = compose(400, 200, 1.0, &selected, "x", None, None).unwrap();
+            let rect = control_rect(Control::Address, 400.0, 0.0).unwrap();
+            // With no font the caret sits at the text origin.
+            let x = (rect.x() + 31.5) as u32;
+            let caret = pixel(&with_caret, x, CENTER_Y as u32);
+            let field = pixel(&without, x, CENTER_Y as u32);
+            // The caret uses the text color, so it contrasts with the field.
+            let lightness = |p: [u8; 4]| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]);
+            if dark {
+                assert!(
+                    lightness(caret) > lightness(field) + 300,
+                    "{caret:?} {field:?}"
+                );
+            } else {
+                assert!(
+                    lightness(caret) + 300 < lightness(field),
+                    "{caret:?} {field:?}"
+                );
+            }
+        }
     }
 }

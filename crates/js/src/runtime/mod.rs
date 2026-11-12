@@ -1,8 +1,9 @@
 //! Tree-walk interpreter for parsed programs.
 //!
 //! Supports expressions, `var`/`let`/`const` declarations, blocks, `if`,
-//! `while`, function declarations with closures, calls, `return`, and member
-//! access (`object.name`, `object[key]`, and assignment to either).
+//! `while`, function declarations with closures, calls, `return`, object
+//! literals, and member access (`object.name`, `object[key]`, and assignment
+//! to either).
 //!
 //! Semantics follow ECMAScript where supported: `var` and function
 //! declarations are hoisted to the enclosing function or script, `let` and
@@ -12,9 +13,11 @@
 //! Limitations:
 //! - Assigning to an undeclared name is an error, as in strict mode.
 //! - Member access works only on [`Object`] values. Reading a property of any
-//!   other value, including strings and functions, is a runtime error, and so
-//!   is reading a property the object does not have (JavaScript would return
-//!   `undefined`). Methods are called without `this`.
+//!   other value, including strings and functions, is a runtime error.
+//!   Reading a property an object does not have returns `undefined`, as in
+//!   JavaScript. Methods are called without `this`.
+//! - Classes, `new`, and `super` parse but are not evaluated here; they run
+//!   only through the bytecode compiler and [`crate::vm::Vm`].
 //! - There is no garbage collector yet. A function stored in the scope it
 //!   closes over forms an `Arc` cycle, so its scope is never freed.
 //! - Evaluation runs on a dedicated engine thread with a large stack. Deep
@@ -24,25 +27,29 @@
 //! - Each evaluation has a step budget (see [`DEFAULT_STEP_LIMIT`]), so
 //!   endless loops fail with an error instead of running forever.
 
+mod array;
 mod conversions;
 mod object;
+mod operators;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::ast::{
-    BinaryOperator, Expr, LogicalOperator, MemberProperty, Program, Statement, UnaryOperator,
-    VarKind,
+    ArrowBody, Expr, LogicalOperator, MemberProperty, Program, PropertyKey, Statement, VarKind,
 };
+use crate::bytecode::FunctionTemplate;
 use crate::stack::{StackGuard, with_engine_stack};
 use crate::{HostFunction, JsError, JsResult, Value};
-pub(crate) use conversions::number_to_string;
-use conversions::{
-    is_truthy, less_than, loose_equals, strict_equals, to_int32, to_number, to_primitive,
-    to_property_key, to_uint32,
+pub use array::MAX_ARRAY_LENGTH;
+pub(crate) use array::{array_to_string, get_array_property, set_array_property};
+pub(crate) use conversions::{is_truthy, number_to_string, to_property_key};
+pub use object::{
+    HostGetter, HostPropertyGetter, HostPropertyKeys, HostPropertySetter, HostSetter, Object,
+    WeakObject,
 };
-pub use object::Object;
+pub(crate) use operators::{binary, unary};
 
 const STACK_OVERFLOW: &str = "Maximum call stack size exceeded";
 
@@ -93,7 +100,6 @@ impl LockScope for Mutex<Scope> {
     }
 }
 
-#[derive(Debug)]
 struct Binding {
     /// `None` while a `let` or `const` binding is before its declaration.
     value: Option<Value>,
@@ -104,6 +110,7 @@ struct Binding {
     /// since. A script-level `let`/`const` may shadow a host binding but not a
     /// script-declared one.
     host: bool,
+    setter: Option<HostSetter>,
 }
 
 #[derive(Default)]
@@ -154,6 +161,9 @@ fn assign(scope: &ScopeRef, name: &str, value: Value) -> JsResult<()> {
         if !binding.mutable {
             return Err(JsError::new(format!("Assignment to constant `{name}`")));
         }
+        if let Some(setter) = &binding.setter {
+            return setter(value);
+        }
         binding.value = Some(value);
         Ok(())
     })
@@ -185,6 +195,7 @@ fn declare_var(scope: &ScopeRef, name: &str) -> JsResult<()> {
                     mutable: true,
                     lexical: false,
                     host: false,
+                    setter: None,
                 },
             );
             Ok(())
@@ -210,6 +221,7 @@ fn declare_lexical(
             mutable,
             lexical: true,
             host: false,
+            setter: None,
         },
     );
     Ok(())
@@ -284,6 +296,17 @@ enum FunctionKind {
         name: String,
         function: HostFunction,
     },
+    /// A function compiled to bytecode; only the VM can run it.
+    Bytecode {
+        template: Arc<FunctionTemplate>,
+        /// Own properties, such as a constructor's `prototype`.
+        properties: Object,
+        /// The prototype object that `super.name` is looked up from. It owns
+        /// its methods, so the link back is weak.
+        home_object: Option<WeakObject>,
+        /// The parent class constructor of a derived class.
+        parent: Option<Function>,
+    },
 }
 
 impl Function {
@@ -299,7 +322,157 @@ impl Function {
     pub fn name(&self) -> &str {
         match &*self.0 {
             FunctionKind::Script { name, .. } | FunctionKind::Host { name, .. } => name,
+            FunctionKind::Bytecode { template, .. } => &template.name,
         }
+    }
+
+    /// Creates a bytecode function. Constructors (plain functions and
+    /// classes) get a `prototype` object, `prototype` itself when given and a
+    /// fresh one otherwise, whose `constructor` refers back to the function
+    /// without keeping it alive.
+    pub(crate) fn from_template(
+        template: Arc<FunctionTemplate>,
+        home_object: Option<Object>,
+        parent: Option<Function>,
+        prototype: Option<Object>,
+    ) -> Self {
+        let constructible = template.kind.is_constructor();
+        let function = Self(Arc::new(FunctionKind::Bytecode {
+            template,
+            properties: Object::new(),
+            home_object: home_object.as_ref().map(Object::downgrade),
+            parent,
+        }));
+        if constructible {
+            let prototype = prototype.unwrap_or_default();
+            prototype.set_constructor(&function);
+            function.set_own("prototype", Value::Object(prototype));
+        }
+        function
+    }
+
+    /// The compiled template, for bytecode functions.
+    pub(crate) fn template(&self) -> Option<&Arc<FunctionTemplate>> {
+        match &*self.0 {
+            FunctionKind::Bytecode { template, .. } => Some(template),
+            _ => None,
+        }
+    }
+
+    /// The prototype object `super.name` reads from, for bytecode methods.
+    pub(crate) fn home_object(&self) -> Option<Object> {
+        match &*self.0 {
+            FunctionKind::Bytecode { home_object, .. } => {
+                home_object.as_ref().and_then(WeakObject::upgrade)
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns a non-owning reference to this function.
+    pub(crate) fn downgrade(&self) -> WeakFunction {
+        WeakFunction(Arc::downgrade(&self.0))
+    }
+
+    /// The parent class constructor, for derived bytecode classes.
+    pub(crate) fn parent(&self) -> Option<&Function> {
+        match &*self.0 {
+            FunctionKind::Bytecode { parent, .. } => parent.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Reads an own property; only bytecode functions have any.
+    pub(crate) fn get_own(&self, key: &str) -> Option<Value> {
+        match &*self.0 {
+            FunctionKind::Bytecode { properties, .. } => properties.get_own(key),
+            _ => None,
+        }
+    }
+
+    /// Returns an own property of a function, such as a class's `prototype`.
+    ///
+    /// Functions created by the bytecode VM expose own properties. Functions
+    /// created by the tree-walk evaluator or host API currently do not.
+    pub fn get_own_property(&self, key: &str) -> Option<Value> {
+        self.get_own(key)
+    }
+
+    /// Sets an own property on a bytecode function.
+    ///
+    /// Returns `false` for host and tree-walk functions, whose properties are
+    /// not currently modeled.
+    pub fn set_own_property(&self, key: &str, value: Value) -> bool {
+        self.set_own(key, value)
+    }
+
+    /// Returns whether this function was compiled for the bytecode VM.
+    pub fn is_bytecode_function(&self) -> bool {
+        self.template().is_some()
+    }
+
+    /// Constructs an instance by running this bytecode function with `new`.
+    ///
+    /// Returns an error for host and tree-walk functions. A standalone
+    /// construction does not retain the VM's global environment, so a
+    /// constructor that reads global variables may also fail.
+    pub fn construct(&self, arguments: &[Value]) -> JsResult<Value> {
+        crate::Vm::construct_function(self.clone(), arguments)
+    }
+
+    /// Calls this function with an explicit receiver using a fresh bytecode
+    /// VM. Host and tree-walk functions use their existing call mechanism.
+    pub fn call_with_this(&self, receiver: Value, arguments: &[Value]) -> JsResult<Value> {
+        if self.template().is_some() {
+            crate::Vm::call_function(self.clone(), receiver, arguments)
+        } else {
+            with_engine_stack(|| {
+                let mut interpreter = Interpreter::new(ExecutionLimits::default());
+                interpreter.this_enabled = true;
+                interpreter.call_with_this(self, receiver, arguments)
+            })
+        }
+    }
+
+    /// Writes an own property, returning `false` for functions that cannot
+    /// hold properties (script and host functions).
+    pub(crate) fn set_own(&self, key: &str, value: Value) -> bool {
+        match &*self.0 {
+            FunctionKind::Bytecode { properties, .. } => {
+                properties.set(key, value);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Calls a host function directly. Returns `None` for any other kind.
+    pub(crate) fn call_host(&self, arguments: &[Value]) -> Option<JsResult<Value>> {
+        match &*self.0 {
+            FunctionKind::Host { function, .. } => Some(function(arguments)),
+            _ => None,
+        }
+    }
+
+    /// Invokes this function with `arguments`.
+    ///
+    /// Script functions execute with their captured lexical environment, and
+    /// host functions receive the supplied values directly. This is used by
+    /// host APIs that need to call a JavaScript callback, such as DOM events.
+    /// Bytecode functions are not run here; the VM executes those.
+    pub fn call(&self, arguments: &[Value]) -> JsResult<Value> {
+        with_engine_stack(|| Interpreter::new(ExecutionLimits::default()).call(self, arguments))
+    }
+}
+
+/// A non-owning reference to a [`Function`], used to break reference cycles.
+#[derive(Clone)]
+pub(crate) struct WeakFunction(std::sync::Weak<FunctionKind>);
+
+impl WeakFunction {
+    /// Returns the function if something else still keeps it alive.
+    pub(crate) fn upgrade(&self) -> Option<Function> {
+        self.0.upgrade().map(Function)
     }
 }
 
@@ -329,6 +502,12 @@ impl fmt::Display for Function {
             }
             FunctionKind::Host { name, .. } => {
                 write!(formatter, "function {name}() {{ [native code] }}")
+            }
+            FunctionKind::Bytecode { template, .. } if template.kind.is_class() => {
+                write!(formatter, "class {} {{ [code] }}", template.name)
+            }
+            FunctionKind::Bytecode { template, .. } => {
+                write!(formatter, "function {}() {{ [code] }}", template.name)
             }
         }
     }
@@ -368,6 +547,7 @@ pub fn evaluate_program_with_limits(program: &Program, limits: ExecutionLimits) 
 /// `object` holds host globals plus `var` and function declarations, and
 /// `lexical` (a child of `object`) holds top-level `let` and `const`. Lookups
 /// check `lexical` first, so a `let` shadows a host global of the same name.
+#[derive(Clone)]
 pub(crate) struct GlobalState {
     object: ScopeRef,
     lexical: ScopeRef,
@@ -391,8 +571,23 @@ impl GlobalState {
                 mutable: true,
                 lexical: false,
                 host: true,
+                setter: None,
             },
         );
+    }
+
+    /// Sets the host hook that handles assignment to a registered global.
+    pub(crate) fn set_host_setter(&self, name: &str, setter: HostSetter) -> JsResult<()> {
+        let mut object = self.object.lock_scope();
+        let binding = object
+            .bindings
+            .get_mut(name)
+            .ok_or_else(|| JsError::new(format!("host global `{name}` is not registered")))?;
+        if !binding.host {
+            return Err(JsError::new(format!("`{name}` is not a host global")));
+        }
+        binding.setter = Some(setter);
+        Ok(())
     }
 
     /// Evaluates `program` against the persistent globals.
@@ -401,13 +596,37 @@ impl GlobalState {
     /// error leaves the globals untouched. Errors thrown while running keep
     /// the effects that happened before them, as in JavaScript.
     pub(crate) fn evaluate(&self, program: &Program, limits: ExecutionLimits) -> JsResult<Value> {
+        self.evaluate_with_this_enabled(program, limits, Value::Undefined, false)
+    }
+
+    /// Evaluates `program` with a host-specified global `this` value.
+    pub(crate) fn evaluate_with_this(
+        &self,
+        program: &Program,
+        limits: ExecutionLimits,
+        this_value: Value,
+    ) -> JsResult<Value> {
+        self.evaluate_with_this_enabled(program, limits, this_value, true)
+    }
+
+    fn evaluate_with_this_enabled(
+        &self,
+        program: &Program,
+        limits: ExecutionLimits,
+        this_value: Value,
+        this_enabled: bool,
+    ) -> JsResult<Value> {
+        log::trace!("evaluating {} top-level statements", program.body.len());
         with_engine_stack(|| {
             self.declare_globals(&program.body)?;
-            let completion =
-                Interpreter::new(limits).execute_statements(&self.lexical, &program.body)?;
+            let mut interpreter = Interpreter::new(limits);
+            interpreter.this_value = this_value;
+            interpreter.this_enabled = this_enabled;
+            let completion = interpreter.execute_statements(&self.lexical, &program.body)?;
             Ok(match completion {
                 Completion::Normal(value) => value.unwrap_or(Value::Undefined),
                 Completion::Return(value) => value,
+                Completion::Break | Completion::Continue => Value::Undefined,
             })
         })
     }
@@ -495,6 +714,10 @@ pub fn evaluate(expression: &Expr) -> JsResult<Value> {
 enum Completion {
     Normal(Option<Value>),
     Return(Value),
+    /// `break` on its way to the innermost loop.
+    Break,
+    /// `continue` on its way to the innermost loop.
+    Continue,
 }
 
 struct Interpreter {
@@ -503,6 +726,8 @@ struct Interpreter {
     call_depth: u64,
     loop_iterations_remaining: u64,
     call_depth_limit: u64,
+    this_value: Value,
+    this_enabled: bool,
 }
 
 impl Interpreter {
@@ -515,6 +740,8 @@ impl Interpreter {
             call_depth: 0,
             loop_iterations_remaining: limits.loop_iteration_limit,
             call_depth_limit: limits.call_depth_limit,
+            this_value: Value::Undefined,
+            this_enabled: false,
         }
     }
 
@@ -522,6 +749,7 @@ impl Interpreter {
     /// expression.
     fn guarded<T>(&mut self, action: impl FnOnce(&mut Self) -> JsResult<T>) -> JsResult<T> {
         if self.steps_remaining == 0 {
+            log::warn!("evaluation step limit reached in the tree-walk interpreter");
             return Err(JsError::with_context(
                 crate::JsErrorCategory::Limit,
                 STEP_LIMIT_EXCEEDED,
@@ -530,6 +758,7 @@ impl Interpreter {
         }
         self.steps_remaining -= 1;
         if self.stack.exhausted() {
+            log::warn!("native stack budget exhausted in the tree-walk interpreter");
             return Err(JsError::with_context(
                 crate::JsErrorCategory::Limit,
                 STACK_OVERFLOW,
@@ -541,6 +770,7 @@ impl Interpreter {
 
     fn next_loop_iteration(&mut self) -> JsResult<()> {
         if self.loop_iterations_remaining == 0 {
+            log::warn!("loop iteration limit reached in the tree-walk interpreter");
             return Err(JsError::with_context(
                 crate::JsErrorCategory::Limit,
                 "Script exceeded the loop iteration limit",
@@ -568,7 +798,7 @@ impl Interpreter {
             match self.execute_statement(scope, statement)? {
                 Completion::Normal(Some(result)) => value = Some(result),
                 Completion::Normal(None) => {}
-                completion @ Completion::Return(_) => return Ok(completion),
+                completion => return Ok(completion),
             }
         }
         Ok(Completion::Normal(value))
@@ -637,19 +867,143 @@ impl Interpreter {
                     self.next_loop_iteration()?;
                     match self.execute_statement(scope, body)? {
                         Completion::Normal(Some(value)) => last = value,
-                        Completion::Normal(None) => {}
+                        Completion::Normal(None) | Completion::Continue => {}
+                        Completion::Break => break,
                         completion @ Completion::Return(_) => return Ok(completion),
                     }
                 }
                 Ok(Completion::Normal(Some(last)))
             }
+            Statement::For {
+                init,
+                condition,
+                update,
+                body,
+            } => self.execute_for_statement(scope, init, condition, update, body),
             // Bound when the enclosing body or block was entered.
             Statement::FunctionDeclaration { .. } => Ok(Completion::Normal(None)),
+            Statement::ClassDeclaration(_) => Err(unsupported_here("class declarations")),
             Statement::Return(expression) => Ok(Completion::Return(match expression {
                 Some(expression) => self.evaluate(expression, scope)?,
                 None => Value::Undefined,
             })),
+            Statement::Throw(expression) => {
+                let value = self.evaluate(expression, scope)?;
+                Err(JsError::rethrown(value))
+            }
+            Statement::Break => Ok(Completion::Break),
+            Statement::Continue => Ok(Completion::Continue),
+            Statement::Try {
+                block,
+                handler,
+                finalizer,
+            } => self.execute_try(scope, block, handler.as_ref(), finalizer.as_deref()),
         }
+    }
+
+    fn execute_for_statement(
+        &mut self,
+        scope: &ScopeRef,
+        init: &Option<Box<Statement>>,
+        condition: &Option<Expr>,
+        update: &Option<Expr>,
+        body: &Statement,
+    ) -> JsResult<Completion> {
+        let loop_scope = match init.as_deref() {
+            Some(Statement::VariableDeclaration {
+                kind: VarKind::Let | VarKind::Const,
+                ..
+            }) => child_scope(scope),
+            _ => Arc::clone(scope),
+        };
+        if let Some(init) = init {
+            if !Arc::ptr_eq(&loop_scope, scope) {
+                hoist_lexical_declarations(&loop_scope, std::slice::from_ref(init), false)?;
+            }
+            self.execute_statement(&loop_scope, init)?;
+        }
+        let mut last = Value::Undefined;
+        while condition
+            .as_ref()
+            .map(|condition| {
+                self.evaluate(condition, &loop_scope)
+                    .map(|value| is_truthy(&value))
+            })
+            .transpose()?
+            .unwrap_or(true)
+        {
+            self.next_loop_iteration()?;
+            match self.execute_statement(&loop_scope, body)? {
+                Completion::Normal(Some(value)) => last = value,
+                Completion::Normal(None) | Completion::Continue => {}
+                Completion::Break => break,
+                completion @ Completion::Return(_) => return Ok(completion),
+            }
+            if let Some(update) = update {
+                self.evaluate(update, &loop_scope)?;
+            }
+        }
+        Ok(Completion::Normal(Some(last)))
+    }
+
+    /// Runs a block in its own lexical scope.
+    fn execute_block(
+        &mut self,
+        scope: &ScopeRef,
+        statements: &[Statement],
+    ) -> JsResult<Completion> {
+        let block_scope = child_scope(scope);
+        hoist_lexical_declarations(&block_scope, statements, false)?;
+        self.execute_statements(&block_scope, statements)
+    }
+
+    /// Runs `try`, `catch`, and `finally` with the same semantics as the
+    /// bytecode VM: a catchable error from the `try` block goes to `catch`;
+    /// `finally` then runs on every exit, and completing abruptly (an error,
+    /// `return`, `break`, or `continue`) replaces the pending outcome. Limit
+    /// errors skip both clauses because they end the script.
+    fn execute_try(
+        &mut self,
+        scope: &ScopeRef,
+        block: &[Statement],
+        handler: Option<&crate::ast::CatchClause>,
+        finalizer: Option<&[Statement]>,
+    ) -> JsResult<Completion> {
+        let mut outcome = self.execute_block(scope, block);
+        if let (Some(clause), Err(error)) = (handler, &outcome)
+            && error.category.is_catchable()
+        {
+            let caught = error.clone().into_caught_value();
+            let catch_scope = child_scope(scope);
+            if let Some(param) = &clause.param {
+                catch_scope.lock_scope().bindings.insert(
+                    param.clone(),
+                    Binding {
+                        value: Some(caught),
+                        mutable: true,
+                        lexical: true,
+                        host: false,
+                        setter: None,
+                    },
+                );
+            }
+            outcome = self.execute_block(&catch_scope, &clause.body);
+        }
+        if let Some(statements) = finalizer {
+            if matches!(&outcome, Err(error) if !error.category.is_catchable()) {
+                return outcome;
+            }
+            match self.execute_block(scope, statements)? {
+                Completion::Normal(_) => {}
+                abrupt => return Ok(abrupt),
+            }
+        }
+        outcome.map(|completion| match completion {
+            Completion::Normal(value) => {
+                Completion::Normal(Some(value.unwrap_or(Value::Undefined)))
+            }
+            abrupt => abrupt,
+        })
     }
 
     fn evaluate(&mut self, expression: &Expr, scope: &ScopeRef) -> JsResult<Value> {
@@ -658,7 +1012,27 @@ impl Interpreter {
 
     fn evaluate_unguarded(&mut self, expression: &Expr, scope: &ScopeRef) -> JsResult<Value> {
         match expression {
+            // Methods never receive `this` in this evaluator, so it reads like
+            // any other undeclared name.
+            Expr::This if self.this_enabled => Ok(self.this_value.clone()),
+            Expr::This => Err(JsError::new("`this` is not defined")),
+            Expr::New { .. } => Err(unsupported_here("`new`")),
+            Expr::SuperCall { .. } | Expr::SuperMember { .. } => Err(unsupported_here("`super`")),
             Expr::Identifier(name) => read(scope, name),
+            Expr::ArrowFunction { params, body } => {
+                let body = match body {
+                    ArrowBody::Expression(expression) => {
+                        vec![Statement::Return(Some((**expression).clone()))]
+                    }
+                    ArrowBody::Block(statements) => statements.clone(),
+                };
+                Ok(Value::Function(Function(Arc::new(FunctionKind::Script {
+                    name: String::new(),
+                    params: params.clone(),
+                    body,
+                    closure: Arc::clone(scope),
+                }))))
+            }
             Expr::Assign { name, value } => {
                 let value = self.evaluate(value, scope)?;
                 assign(scope, name, value.clone())?;
@@ -671,11 +1045,7 @@ impl Interpreter {
             Expr::Undefined => Ok(Value::Undefined),
             Expr::Unary { operator, operand } => {
                 let value = self.evaluate(operand, scope)?;
-                Ok(match operator {
-                    UnaryOperator::Negate => Value::Number(-to_number(&value)),
-                    UnaryOperator::Not => Value::Boolean(!is_truthy(&value)),
-                    UnaryOperator::BitwiseNot => Value::Number(f64::from(!to_int32(&value))),
-                })
+                Ok(unary(*operator, &value))
             }
             Expr::Binary {
                 left,
@@ -724,20 +1094,13 @@ impl Interpreter {
             Expr::Member { object, property } => {
                 let target = self.evaluate(object, scope)?;
                 let key = self.property_key(property, scope)?;
-                let Value::Object(target) = target else {
-                    return Err(non_object(&target, "read", &key, "property access"));
-                };
-                target.get(&key).ok_or_else(|| {
-                    let description = match describe(expression) {
-                        Some(path) => format!("`{path}`"),
-                        None => format!("Property `{key}`"),
-                    };
-                    JsError::with_context(
-                        crate::JsErrorCategory::Runtime,
-                        format!("{description} is not defined"),
-                        "property access",
-                    )
-                })
+                match target {
+                    Value::Object(target) => {
+                        Ok(target.get_property(&key)?.unwrap_or(Value::Undefined))
+                    }
+                    Value::Array(target) => Ok(get_array_property(&target, &key)),
+                    target => Err(non_object(&target, "read", &key, "property access")),
+                }
             }
             Expr::MemberAssign {
                 object,
@@ -747,11 +1110,36 @@ impl Interpreter {
                 let target = self.evaluate(object, scope)?;
                 let key = self.property_key(property, scope)?;
                 let value = self.evaluate(value, scope)?;
-                let Value::Object(target) = target else {
-                    return Err(non_object(&target, "set", &key, "property assignment"));
-                };
-                target.set(key, value.clone());
+                match target {
+                    Value::Object(target) => target.set_property(key, value.clone())?,
+                    Value::Array(target) => set_array_property(&target, &key, value.clone())?,
+                    target => return Err(non_object(&target, "set", &key, "property assignment")),
+                }
                 Ok(value)
+            }
+            Expr::Object(properties) => {
+                let object = Object::new();
+                for property in properties {
+                    let key = match &property.key {
+                        PropertyKey::Named(name) => name.clone(),
+                        PropertyKey::Computed(key) => to_property_key(&self.evaluate(key, scope)?),
+                    };
+                    let value = self.evaluate(&property.value, scope)?;
+                    object.set(key, value);
+                }
+                Ok(Value::Object(object))
+            }
+            Expr::Array(elements) => {
+                let array = Object::new();
+                for (index, element) in elements.iter().enumerate() {
+                    let value = match element {
+                        Some(element) => self.evaluate(element, scope)?,
+                        None => Value::Undefined,
+                    };
+                    array.set(index.to_string(), value);
+                }
+                array.set("length", Value::Number(elements.len() as f64));
+                Ok(Value::Array(array))
             }
         }
     }
@@ -765,8 +1153,26 @@ impl Interpreter {
     }
 
     fn call(&mut self, function: &Function, arguments: &[Value]) -> JsResult<Value> {
+        self.call_with_this(function, Value::Undefined, arguments)
+    }
+
+    fn call_with_this(
+        &mut self,
+        function: &Function,
+        receiver: Value,
+        arguments: &[Value],
+    ) -> JsResult<Value> {
         match &*function.0 {
-            FunctionKind::Host { function, .. } => function(arguments),
+            FunctionKind::Host { function, .. } => {
+                log::trace!("calling host function with {} arguments", arguments.len());
+                function(arguments)
+            }
+            FunctionKind::Bytecode { .. } => {
+                log::debug!("tree-walk interpreter asked to call a bytecode function");
+                Err(JsError::runtime(
+                    "bytecode functions can only be called by the bytecode VM",
+                ))
+            }
             FunctionKind::Script {
                 params,
                 body,
@@ -774,6 +1180,10 @@ impl Interpreter {
                 ..
             } => self.guarded(|interpreter| {
                 if interpreter.call_depth >= interpreter.call_depth_limit {
+                    log::warn!(
+                        "call depth limit of {} reached in the tree-walk interpreter",
+                        interpreter.call_depth_limit
+                    );
                     return Err(JsError::with_context(
                         crate::JsErrorCategory::Limit,
                         STACK_OVERFLOW,
@@ -781,7 +1191,13 @@ impl Interpreter {
                     ));
                 }
                 interpreter.call_depth += 1;
+                log::trace!(
+                    "calling script function with {} arguments at depth {}",
+                    arguments.len(),
+                    interpreter.call_depth
+                );
                 let scope = child_scope(closure);
+                let previous_this = std::mem::replace(&mut interpreter.this_value, receiver);
                 for (index, param) in params.iter().enumerate() {
                     declare_var(&scope, param)?;
                     initialize(
@@ -790,15 +1206,28 @@ impl Interpreter {
                         arguments.get(index).cloned().unwrap_or(Value::Undefined),
                     );
                 }
-                let result = match interpreter.run_body(&scope, body)? {
-                    Completion::Return(value) => value,
-                    Completion::Normal(_) => Value::Undefined,
-                };
+                // The depth must be restored on errors too, because a script
+                // `catch` can resume execution in the caller.
+                let result = interpreter.run_body(&scope, body);
+                interpreter.this_value = previous_this;
                 interpreter.call_depth -= 1;
-                Ok(result)
+                Ok(match result? {
+                    Completion::Return(value) => value,
+                    _ => Value::Undefined,
+                })
             }),
         }
     }
+}
+
+/// The error for class syntax, which only the bytecode VM can run.
+fn unsupported_here(construct: &str) -> JsError {
+    log::warn!("tree-walk evaluator does not support {construct}");
+    JsError::with_context(
+        crate::JsErrorCategory::Runtime,
+        format!("{construct} is only supported by the bytecode compiler"),
+        "tree-walk evaluator",
+    )
 }
 
 /// Describes an identifier or a chain of `.name` accesses on one, such as
@@ -815,7 +1244,7 @@ fn describe(expression: &Expr) -> Option<String> {
 }
 
 /// The error for reading or setting property `key` of a non-object value.
-fn non_object(value: &Value, action: &str, key: &str, context: &str) -> JsError {
+pub(crate) fn non_object(value: &Value, action: &str, key: &str, context: &str) -> JsError {
     let kind = match value {
         Value::Undefined => "undefined",
         Value::Null => "null",
@@ -824,6 +1253,7 @@ fn non_object(value: &Value, action: &str, key: &str, context: &str) -> JsError 
         Value::String(_) => "a string",
         Value::Function(_) => "a function",
         Value::Object(_) => "an object",
+        Value::Array(_) => "an array",
     };
     JsError::with_context(
         crate::JsErrorCategory::Runtime,
@@ -855,6 +1285,25 @@ fn hoist_var_declarations(scope: &ScopeRef, statements: &[Statement]) -> JsResul
             }
             Statement::While { body, .. } => {
                 hoist_var_declarations(scope, std::slice::from_ref(body))?;
+            }
+            Statement::For { init, body, .. } => {
+                if let Some(init) = init {
+                    hoist_var_declarations(scope, std::slice::from_ref(init))?;
+                }
+                hoist_var_declarations(scope, std::slice::from_ref(body))?;
+            }
+            Statement::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                hoist_var_declarations(scope, block)?;
+                if let Some(clause) = handler {
+                    hoist_var_declarations(scope, &clause.body)?;
+                }
+                if let Some(statements) = finalizer {
+                    hoist_var_declarations(scope, statements)?;
+                }
             }
             _ => {}
         }
@@ -896,42 +1345,4 @@ fn hoist_lexical_declarations(
         }
     }
     Ok(())
-}
-
-fn binary(operator: BinaryOperator, left: &Value, right: &Value) -> Value {
-    let number = |operation: fn(f64, f64) -> f64| {
-        Value::Number(operation(to_number(left), to_number(right)))
-    };
-    let int32 = |operation: fn(i32, i32) -> i32| {
-        Value::Number(f64::from(operation(to_int32(left), to_int32(right))))
-    };
-    let shift = to_uint32(right) & 31;
-    match operator {
-        BinaryOperator::Add => {
-            let (left, right) = (to_primitive(left), to_primitive(right));
-            if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
-                Value::String(format!("{left}{right}"))
-            } else {
-                Value::Number(to_number(&left) + to_number(&right))
-            }
-        }
-        BinaryOperator::Subtract => number(|left, right| left - right),
-        BinaryOperator::Multiply => number(|left, right| left * right),
-        BinaryOperator::Divide => number(|left, right| left / right),
-        BinaryOperator::Remainder => number(|left, right| left % right),
-        BinaryOperator::BitwiseAnd => int32(|left, right| left & right),
-        BinaryOperator::BitwiseOr => int32(|left, right| left | right),
-        BinaryOperator::BitwiseXor => int32(|left, right| left ^ right),
-        BinaryOperator::LeftShift => Value::Number(f64::from(to_int32(left).wrapping_shl(shift))),
-        BinaryOperator::SignedRightShift => Value::Number(f64::from(to_int32(left) >> shift)),
-        BinaryOperator::UnsignedRightShift => Value::Number(f64::from(to_uint32(left) >> shift)),
-        BinaryOperator::Less => Value::Boolean(less_than(left, right) == Some(true)),
-        BinaryOperator::Greater => Value::Boolean(less_than(right, left) == Some(true)),
-        BinaryOperator::LessEqual => Value::Boolean(less_than(right, left) == Some(false)),
-        BinaryOperator::GreaterEqual => Value::Boolean(less_than(left, right) == Some(false)),
-        BinaryOperator::Equal => Value::Boolean(loose_equals(left, right)),
-        BinaryOperator::NotEqual => Value::Boolean(!loose_equals(left, right)),
-        BinaryOperator::StrictEqual => Value::Boolean(strict_equals(left, right)),
-        BinaryOperator::StrictNotEqual => Value::Boolean(!strict_equals(left, right)),
-    }
 }

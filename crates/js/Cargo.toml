@@ -8,7 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+log = { workspace = true }
 common = { workspace = true }
+unicode-ident = "1"
 
 [lints]
 workspace = true
