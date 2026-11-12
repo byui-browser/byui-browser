@@ -75,9 +75,29 @@ pub struct FunctionTemplate {
     /// Number of declared parameters. Extra arguments are ignored and
     /// missing ones are `undefined`.
     pub param_count: u16,
+    /// Captured environments required by this function, in creation order.
+    pub captures: Vec<CaptureSource>,
     /// The function body, shared by every function value made from this
     /// template. Its [`Chunk::functions`] hold nested templates.
     pub chunk: Arc<Chunk>,
+}
+
+/// Describes where a closure obtains one of its captured bindings when it is
+/// created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureSource {
+    /// A binding in the currently running function's lexical scope chain.
+    Local {
+        /// Scope depth in the current frame.
+        depth: u16,
+        /// Slot within that scope.
+        slot: u16,
+    },
+    /// A binding already captured by the currently running function.
+    Capture {
+        /// Index of the binding in the current function's captures.
+        index: u16,
+    },
 }
 
 impl Chunk {
