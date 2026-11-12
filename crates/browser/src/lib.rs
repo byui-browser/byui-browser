@@ -23,7 +23,7 @@ use webapis::local_storage::register_local_storage_with_url;
 use webapis::session_storage::register_session_storage;
 use webapis::{
     AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, register_alert,
-    register_console, register_document_with_location, register_fetch,
+    register_console, register_document_with_location, register_fetch_with_url,
     register_location_with_navigation, register_print, register_window_with_security_context,
     register_window_with_url_device_pixel_ratio_and_viewport,
 };
@@ -633,7 +633,6 @@ impl BrowserRuntime {
         register_print(&mut realm, Arc::clone(&console))?;
         register_console(&mut realm, console)?;
         register_alert(&mut realm, alert_sink)?;
-        register_fetch(&mut realm, controller)?;
         let initial_url = input
             .url
             .filter(|url| !url.is_empty())
@@ -644,6 +643,7 @@ impl BrowserRuntime {
             device_pixel_ratio,
             viewport,
         )?;
+        register_fetch_with_url(&mut realm, controller, Some(initial_url))?;
         let document_url = net::Url::parse(initial_url)
             .unwrap_or_else(|_| net::Url::parse("about:blank").expect("valid about:blank URL"));
         // Installs the live `Location` accessor on the window registered above.
