@@ -291,6 +291,77 @@ fn clone_for_storage(value: &Value) -> JsResult<Value> {
     }
 }
 
+fn data_clone_error(message: impl Into<String>) -> JsError {
+    let message = message.into();
+    let exception = Object::new();
+    exception.set("name", Value::String("DataCloneError".into()));
+    exception.set("message", Value::String(message));
+    exception.set("code", Value::Number(25.0));
+    JsError::thrown(Value::Object(exception))
+}
+
+fn type_error(message: impl Into<String>) -> JsError {
+    let exception = Object::new();
+    exception.set("name", Value::String("TypeError".into()));
+    exception.set("message", Value::String(message.into()));
+    JsError::thrown(Value::Object(exception))
+}
+
+fn structured_clone_value(value: &Value, memory: &mut Vec<(Object, Object)>) -> JsResult<Value> {
+    match value {
+        Value::Undefined
+        | Value::Null
+        | Value::Boolean(_)
+        | Value::Number(_)
+        | Value::String(_) => Ok(value.clone()),
+        Value::Function(_) => Err(data_clone_error("functions cannot be cloned")),
+        Value::Object(source) | Value::Array(source) => {
+            if let Some((_, cloned)) = memory.iter().find(|(original, _)| original == source) {
+                return Ok(if matches!(value, Value::Array(_)) {
+                    Value::Array(cloned.clone())
+                } else {
+                    Value::Object(cloned.clone())
+                });
+            }
+
+            let cloned = Object::new();
+            memory.push((source.clone(), cloned.clone()));
+            for key in source.keys() {
+                if let Some(property) = source.get_property(&key)? {
+                    cloned.set(key, structured_clone_value(&property, memory)?);
+                }
+            }
+            Ok(if matches!(value, Value::Array(_)) {
+                Value::Array(cloned)
+            } else {
+                Value::Object(cloned)
+            })
+        }
+    }
+}
+
+fn structured_clone(value: &Value, options: Option<&Value>) -> JsResult<Value> {
+    if let Some(Value::Object(options) | Value::Array(options)) = options
+        && let Some(transfer) = options.get_property("transfer")?
+    {
+        match transfer {
+            Value::Undefined | Value::Null => {}
+            Value::Array(transfer) => {
+                if transfer
+                    .get_own("length")
+                    .is_some_and(|length| matches!(length, Value::Number(number) if number > 0.0))
+                {
+                    return Err(data_clone_error(
+                        "transferring objects is not supported by this runtime",
+                    ));
+                }
+            }
+            _ => return Err(type_error("structuredClone transfer must be an array")),
+        }
+    }
+    structured_clone_value(value, &mut Vec::new())
+}
+
 fn resolve_history_url(base: &Url, requested: Option<&Value>) -> JsResult<Url> {
     let Some(requested) = requested else {
         return Ok(base.clone());
@@ -588,6 +659,21 @@ fn register_window_object(
         Arc::new(move |_| Ok(Value::Object(navigator_for_window.clone()))),
     );
     window.set("customElements", Value::Object(custom_elements.clone()));
+    // HTML's structured cloning API deep-copies primitives, plain objects,
+    // and arrays, preserving cycles and repeated references. This runtime
+    // does not represent the standard's built-in serializable types (such as
+    // Date, Map, Set, RegExp, or ArrayBuffer); functions and those values
+    // cannot be cloned. Empty transfer lists work, but transferring resources
+    // is unsupported because the runtime has no transferable value types.
+    window.set_method(
+        "structuredClone",
+        Arc::new(|arguments| {
+            let [value, options @ ..] = arguments else {
+                return Err(type_error("structuredClone() requires a value"));
+            };
+            structured_clone(value, options.first())
+        }),
+    );
     register_crypto(realm, &window)?;
     let performance_for_now = Arc::clone(&performance_clock);
     performance.set_method(
@@ -1140,6 +1226,12 @@ fn register_window_object(
 
     realm.register_global_value("window", Value::Object(window.clone()))?;
     realm.register_global_value("self", Value::Object(window.clone()))?;
+    realm.register_global_value(
+        "structuredClone",
+        window
+            .get("structuredClone")
+            .expect("structuredClone should be installed on Window"),
+    )?;
     realm.register_global_value("customElements", Value::Object(custom_elements))?;
     realm.register_global_value("navigator", Value::Object(navigator))?;
     realm.register_global_value("performance", Value::Object(performance))?;
