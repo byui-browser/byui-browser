@@ -48,9 +48,12 @@ becomes `NaN`.
 
 Operators themselves do not fail. Failures come from evaluating an operand
 (for example an undefined variable) and are returned as
-`JsError` values with category `Runtime`. Unsupported operator syntax
-(`typeof`, unary `+`, `**`, `??`, `++`/`--`, compound assignment) is rejected
-with a `Syntax` error.
+`JsError` values with category `Runtime`, as are `in` and `instanceof` with
+an invalid right-hand operand. Unsupported operator syntax (`-a ** b`, `??`
+mixed with `||` or `&&` without parentheses, `delete name`, regular-expression
+literals) is rejected with a `Syntax` error. `typeof`, unary `+`, `**`, `??`,
+`++`/`--`, and compound assignment are supported; see
+[expression-forms.md](expression-forms.md).
 
 ## Explicitly out of scope
 

@@ -590,7 +590,7 @@ mod tests {
             url: "https://example.test/".into(),
             html: "<html><body><ul><li>x</li></ul><script>a</script></body></html>".into(),
             stylesheets: vec![".x { box-shadow: 1px 1px #000; cursor: pointer }".into()],
-            scripts: vec!["var t = typeof 1; var o = new IntersectionObserver(f);".into()],
+            scripts: vec!["var t = /a+/.test('a'); var o = new IntersectionObserver(f);".into()],
             resources: Default::default(),
         };
         audit_page(&Auditor::new(ShellScriptEngine::new()), &page, None)
@@ -601,7 +601,7 @@ mod tests {
         let report = report();
         let features: Vec<&str> = report.findings.iter().map(|f| f.feature.as_str()).collect();
         for expected in [
-            "typeof operator",
+            "Regular expression literals",
             "IntersectionObserver",
             "box-shadow",
             "List markers",
@@ -633,7 +633,7 @@ mod tests {
             .filter(|line| line.kind == LineKind::Section)
             .map(|line| line.text.as_str())
             .collect();
-        // The script uses `typeof`, so the engine cannot parse it at all.
+        // The script uses a regular-expression literal, so the engine cannot parse it at all.
         assert_eq!(sections.first(), Some(&"Script execution"));
         assert!(sections.contains(&"JavaScript syntax"));
         assert!(sections.contains(&"CSS properties"));

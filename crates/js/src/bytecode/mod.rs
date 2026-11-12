@@ -7,6 +7,26 @@
 //! loops, top-level function declarations, calls, `return`, and classes
 //! (`class`, `extends`, `new`, `this`, `super`).
 //!
+//! # Expression forms
+//!
+//! Conditional, comma, update, compound and logical assignment, `??`,
+//! `typeof`/`void`/`delete`, `in`/`instanceof`, `**`, template literals,
+//! spread, and optional chaining all compile to bytecode; none falls back to
+//! the tree-walk evaluator. The forms, their evaluation order, and what is
+//! rejected are listed in `docs/js/expression-forms.md`.
+//!
+//! - Conditionals and `&&`/`||`/`??` branch with `JumpIfFalse`, `JumpIfTrue`,
+//!   and `JumpIfNullish`, which peek at the top value, so each branch pops it.
+//! - A compound assignment or update to a member evaluates the object (and
+//!   key) once. [`Instruction::Dup2`] and [`Instruction::MoveTop`] keep that
+//!   reference on the stack beside the value being read.
+//! - An optional chain emits one `JumpIfNullish` per `?.`. Each jumps to a
+//!   landing pad that pops the checked value and anything the chain kept
+//!   beneath it, then pushes `undefined`, so all paths leave one value.
+//! - A call, `new`, or array literal with spread builds an array with
+//!   `ArrayPush`/`ArrayExtend` and uses `CallSpread`, `CallMethodSpread`, or
+//!   `NewSpread`; object spread uses `SpreadProperties`.
+//!
 //! # Exceptions and abrupt completion
 //!
 //! `throw`, `try`/`catch`/`finally`, `break`, and `continue` are lowered to

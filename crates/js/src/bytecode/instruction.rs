@@ -57,6 +57,45 @@ pub enum Instruction {
     DefineComputedProperty,
     /// Duplicates the value at the top of the stack.
     Dup,
+    /// Duplicates the two values at the top of the stack, keeping their
+    /// order: `[a, b]` becomes `[a, b, a, b]`. Used by compound assignment and
+    /// update expressions, which read and write the same object and key.
+    Dup2,
+    /// Moves the top value beneath the `n` values below it: with `n = 2`,
+    /// `[a, b, c]` becomes `[c, a, b]`. The operand is the count of values
+    /// passed over and must not exceed the stack height minus one. Postfix
+    /// updates use it to leave the old value under the object and key.
+    MoveTop(u16),
+    /// Jumps when the top value is `null` or `undefined` without consuming
+    /// it. Optional chains and `??` use it.
+    JumpIfNullish(usize),
+    /// Removes a named property: pops the object and pushes the boolean
+    /// result of `delete`. The operand is the property name's constant-pool
+    /// index. Deleting from `null` or `undefined` is a runtime error.
+    DeleteProperty(u16),
+    /// Removes a computed property: pops the key, then the object, and pushes
+    /// the boolean result of `delete`.
+    DeleteComputedProperty,
+    /// Appends a value to the array beneath it: pops the value and leaves the
+    /// array on the stack. Used to build array literals that contain spread.
+    ArrayPush,
+    /// Appends every element of an iterable to the array beneath it: pops an
+    /// array or string and leaves the array on the stack. Any other value is
+    /// a runtime error.
+    ArrayExtend,
+    /// Copies the own enumerable properties of the popped value onto the
+    /// object beneath it, which stays on the stack. Object literal spread.
+    SpreadProperties,
+    /// Calls a function with `this` set to `undefined`, taking the arguments
+    /// from an array: pops the argument array, then the callee, and pushes
+    /// the result. Used when a call has a spread argument.
+    CallSpread,
+    /// Calls a method with arguments from an array: pops the argument array,
+    /// then the callee, then the receiver, and pushes the result.
+    CallMethodSpread,
+    /// Constructs an instance with arguments from an array: pops the argument
+    /// array, then the constructor, and pushes the new object.
+    NewSpread,
     /// Pushes the running function's `this` receiver.
     ///
     /// At the top level this is `undefined`. In a derived constructor it is
