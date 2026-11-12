@@ -352,6 +352,7 @@ fn register_window_object(
     window.set("onpopstate", Value::Null);
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__popstateListeners", Value::Object(Object::new()));
+    window.set("__storageListeners", Value::Object(Object::new()));
 
     let timers_for_timeout = Arc::clone(&timers);
     let nesting_for_timeout = Arc::clone(&nesting_context);
@@ -523,8 +524,13 @@ fn register_window_object(
                     "window.addEventListener() expects an event type and callback",
                 ));
             };
-            if event_type == "popstate" {
-                let list = match listeners_window.get("__popstateListeners") {
+            if event_type == "popstate" || event_type == "storage" {
+                let list_name = if event_type == "popstate" {
+                    "__popstateListeners"
+                } else {
+                    "__storageListeners"
+                };
+                let list = match listeners_window.get(list_name) {
                     Some(Value::Object(list)) => list,
                     _ => return Ok(Value::Undefined),
                 };
@@ -542,8 +548,12 @@ fn register_window_object(
             let [Value::String(event_type), Value::Function(callback), ..] = arguments else {
                 return Ok(Value::Undefined);
             };
-            if event_type == "popstate"
-                && let Some(Value::Object(list)) = remove_window.get("__popstateListeners")
+            if (event_type == "popstate" || event_type == "storage")
+                && let Some(Value::Object(list)) = remove_window.get(if event_type == "popstate" {
+                    "__popstateListeners"
+                } else {
+                    "__storageListeners"
+                })
             {
                 for index in 0..list.len() {
                     if list

@@ -268,6 +268,19 @@ pub trait StorageBackend: fmt::Debug + Send {
         key: &str,
         value: &str,
     ) -> Result<(), StorageError>;
+
+    /// Returns the names of all keys in the authorized origin area.
+    fn keys(&mut self, storage_key: &TrustedStorageKey<'_>) -> Result<Vec<String>, StorageError>;
+
+    /// Removes one key from the authorized origin area atomically.
+    fn remove_item(
+        &mut self,
+        storage_key: &TrustedStorageKey<'_>,
+        key: &str,
+    ) -> Result<(), StorageError>;
+
+    /// Clears the authorized origin area atomically.
+    fn clear(&mut self, storage_key: &TrustedStorageKey<'_>) -> Result<(), StorageError>;
 }
 
 /// Shared storage handle for renderer bindings.
@@ -298,6 +311,28 @@ impl StorageBackend for OriginStorage {
         value: &str,
     ) -> Result<(), StorageError> {
         self.set_item(storage_key, key, value);
+        Ok(())
+    }
+
+    fn keys(&mut self, storage_key: &TrustedStorageKey<'_>) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .areas
+            .get(storage_key.storage_key())
+            .map(|area| area.items.keys().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    fn remove_item(
+        &mut self,
+        storage_key: &TrustedStorageKey<'_>,
+        key: &str,
+    ) -> Result<(), StorageError> {
+        self.remove_item(storage_key, key);
+        Ok(())
+    }
+
+    fn clear(&mut self, storage_key: &TrustedStorageKey<'_>) -> Result<(), StorageError> {
+        self.clear(storage_key);
         Ok(())
     }
 }
@@ -626,6 +661,23 @@ impl PersistentOriginStorage {
             }
         }
     }
+
+    fn persist_current_area(&mut self, storage_key: &StorageKey) -> Result<(), StorageError> {
+        let empty = LocalStorage::new();
+        let area = self.memory.areas.get(storage_key).unwrap_or(&empty);
+        let record = encode_area(storage_key, area, self.limits)?;
+        let next_generation = self
+            .generations
+            .get(storage_key)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(1)
+            .ok_or_else(|| StorageError::CorruptRecord("snapshot generation overflow".into()))?;
+        let generation = self.write_snapshot(storage_key, next_generation, &record)?;
+        self.generations.insert(storage_key.clone(), generation);
+        self.remove_old_snapshots(storage_key, generation);
+        Ok(())
+    }
 }
 
 impl StorageBackend for PersistentOriginStorage {
@@ -644,6 +696,50 @@ impl StorageBackend for PersistentOriginStorage {
         value: &str,
     ) -> Result<(), StorageError> {
         Self::write_item(self, storage_key, key, value)
+    }
+
+    fn keys(&mut self, storage_key: &TrustedStorageKey<'_>) -> Result<Vec<String>, StorageError> {
+        let storage_key = storage_key.storage_key();
+        self.ensure_loaded(storage_key)?;
+        Ok(self
+            .memory
+            .areas
+            .get(storage_key)
+            .map(|area| area.items.keys().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    fn remove_item(
+        &mut self,
+        storage_key: &TrustedStorageKey<'_>,
+        key: &str,
+    ) -> Result<(), StorageError> {
+        let storage_key = storage_key.storage_key();
+        self.ensure_loaded(storage_key)?;
+        let previous = self.memory.areas.get(storage_key).cloned();
+        if self.memory.remove_item_for_key(storage_key, key).is_none() {
+            return Ok(());
+        }
+        if let Err(error) = self.persist_current_area(storage_key) {
+            self.restore_area(storage_key, previous);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self, storage_key: &TrustedStorageKey<'_>) -> Result<(), StorageError> {
+        let storage_key = storage_key.storage_key();
+        self.ensure_loaded(storage_key)?;
+        let previous = self.memory.areas.get(storage_key).cloned();
+        if previous.as_ref().is_none_or(LocalStorage::is_empty) {
+            return Ok(());
+        }
+        self.memory.clear_for_key(storage_key);
+        if let Err(error) = self.persist_current_area(storage_key) {
+            self.restore_area(storage_key, previous);
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
