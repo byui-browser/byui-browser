@@ -22,12 +22,14 @@ impl RequestController {
         url: Url,
     ) -> Result<Response, RequestError> {
         super::require_read_method(&request, "file scheme method")?;
-        let provider = self
-            .inner
-            .providers
-            .file()
-            .ok_or(RequestError::MissingProvider("file"))?;
-        let resource = super::await_provider(&request, provider.open(&request, &url)).await?;
-        self.finalize_scheme_resource(&request, resource, FetchScheme::File)
+        let provider = self.inner.providers.file().ok_or_else(|| {
+            log::debug!(
+                "no file provider installed for {}",
+                crate::log_url::loggable(url.as_str())
+            );
+            RequestError::MissingProvider("file")
+        })?;
+        self.finish_provider_request(&request, FetchScheme::File, provider.open(&request, &url))
+            .await
     }
 }

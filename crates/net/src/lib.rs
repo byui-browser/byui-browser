@@ -23,24 +23,23 @@
 //! observe request cancellation, and provider metadata is validated before
 //! public response exposure. Provider-backed local resources accept only `GET`
 //! and `HEAD`; other methods fail before provider lookup.
-//! This first engine slice supports basic same-origin responses, simple CORS
-//! checks, opaque no-CORS views, and forbidden response-header filtering.
+//! This engine slice supports basic same-origin responses, simple and
+//! preflighted CORS checks with a process-local permission cache, opaque
+//! no-CORS views, and forbidden response-header filtering.
 //! Requests requiring absent providers or algorithms fail with a typed
 //! [`RequestError::UnsupportedFeature`] before transport. HTTP redirects are
 //! handled by the controller according to [`RedirectMode`]. See the
 //! [engine contract](../docs/fetch-engine-contract.md) for the supported subset.
 
-// Crate-wide flags to ignore dead code warnings. Will be removed once implementation
-// is finished, but is required for now to prevent the integration tests from failing.
-#![allow(dead_code)]
 // Flag to forbid unsafe code. This is security-critical and permanant.
 #![forbid(unsafe_code)]
 
-// TODO(net): Add persistent cookie storage, strict CORS, and HTTP/3 transport.
+// TODO(net): Add persistent cookie storage, browser security integrations, and HTTP/3 transport.
 
 mod api;
 mod cache;
 mod engine;
+mod log_url;
 mod policy;
 mod scheduling;
 mod transport;
@@ -49,7 +48,7 @@ mod transport;
 mod tests;
 
 pub use api::{
-    body::{Blob, Body, FormData, FormDataEntry},
+    body::{Blob, Body, BodyStatus, FormData, FormDataEntry},
     cancellation::{AbortController, AbortSignal},
     config::Config,
     error::{ProviderErrorKind, RequestError},
@@ -61,7 +60,7 @@ pub use api::{
     request::{
         CacheMode, CredentialsMode, FetchContext, FetchEnvironment, InitiatorType,
         NetworkPartitionKey, Origin, RedirectMode, Referrer, ReferrerPolicy, Request,
-        RequestDestination, RequestMode, RequestPriority, ServiceWorkersMode,
+        RequestDestination, RequestDuplex, RequestMode, RequestPriority, ServiceWorkersMode,
     },
     response::{Response, ResponseType},
     services::{FetchServices, ResponseInfo, ServiceWorkerDecision},

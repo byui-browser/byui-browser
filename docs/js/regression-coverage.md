@@ -29,7 +29,7 @@ these features is implemented, update or remove the matching case in
 
 ### Rejected while parsing (`JsErrorCategory::Syntax`)
 
-- Object literals (`{}` in expressions) and array literals.
+- Array literals.
 - `++`/`--` and compound assignment (`+=` and similar).
 - Unary `+` and `typeof`.
 - Function expressions and arrow functions. Only function declarations are

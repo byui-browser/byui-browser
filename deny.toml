@@ -3,15 +3,36 @@
 #
 # Run locally with: cargo deny check
 
+[graph]
+# Only evaluate dependencies for the desktop platforms we ship. Without this,
+# cargo-deny also walks Android-only dependencies such as wry's kuchikiki,
+# which pulls in MPL-2.0 crates (cssparser, selectors) we never build.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+
 [advisories]
 version = 2
 yanked = "deny"
 ignore = [
     # ttf-parser is unmaintained and has no patched release. It reaches us
-    # through ab_glyph (toolbar text in platforms/macos) and only parses fonts
-    # shipped with the OS. Remove once ab_glyph moves off it or the shell
+    # through ab_glyph (toolbar text in platforms/shell and page text in
+    # crates/render) and only parses fonts shipped with the OS. Remove once ab_glyph moves off it or the shell
     # switches to a maintained parser such as skrifa.
     { id = "RUSTSEC-2026-0192", reason = "transitive via ab_glyph; no safe upgrade available" },
+    # instant is unmaintained with no patched release. It reaches us through
+    # tao 0.30 (the browser crate's native window). Remove once tao is upgraded
+    # to a release that drops it.
+    { id = "RUSTSEC-2024-0384", reason = "transitive via tao; no safe upgrade available" },
+    # proc-macro-error is unmaintained with no patched release. It reaches us
+    # through gtk 0.18 / glib-macros (tao and wry's Linux backend), which the
+    # Rust GTK3 ecosystem still depends on. Remove once tao/wry leave gtk 0.18.
+    { id = "RUSTSEC-2024-0370", reason = "transitive via gtk 0.18 (tao/wry on Linux); no safe upgrade available" },
 ]
 
 [licenses]
@@ -24,6 +45,9 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # Boost Software License: clipboard-win and error-code (via arboard, the
+    # shell's clipboard on Windows). Permissive, comparable to MIT.
+    "BSL-1.0",
     # Mozilla's root certificate data, shipped by webpki-roots (via reqwest).
     "CDLA-Permissive-2.0",
     "ISC",

@@ -27,8 +27,8 @@ jobs:
       - name: Show toolchain
         run: rustc --version && cargo --version
 
-      - name: Install Linux dialog dependencies
-        run: sudo apt-get update && sudo apt-get install --yes libgtk-3-dev
+      - name: Install Linux dialog and webview dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libgtk-3-dev libwebkit2gtk-4.1-dev
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -56,9 +56,9 @@ jobs:
       - name: Show toolchain
         run: rustc --version && cargo --version
 
-      - name: Install Linux dialog dependencies
+      - name: Install Linux dialog and webview dependencies
         if: matrix.os == 'ubuntu'
-        run: sudo apt-get update && sudo apt-get install --yes libgtk-3-dev
+        run: sudo apt-get update && sudo apt-get install --yes libgtk-3-dev libwebkit2gtk-4.1-dev
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

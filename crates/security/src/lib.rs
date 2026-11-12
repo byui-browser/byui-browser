@@ -12,6 +12,13 @@ pub mod permissions;
 
 use std::fmt;
 
+use common::ipc::{StorageError as IpcStorageError, StorageRequest};
+
+/// Formats an origin as `scheme://host:port` for log messages.
+fn origin_label(origin: &Origin) -> String {
+    format!("{}://{}:{}", origin.scheme(), origin.host(), origin.port())
+}
+
 /// A web origin: scheme, host, port. Two documents may touch each other's
 /// state only when their origins are equal.
 // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
@@ -37,6 +44,28 @@ impl Origin {
     /// Returns the effective port.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Returns the origin serialization exposed to web content.
+    ///
+    /// Opaque origins serialize as `null`. Tuple origins omit the default port
+    /// for HTTP and HTTPS, while non-default ports remain part of the result.
+    pub fn ascii_serialization(&self) -> String {
+        if self.scheme == "opaque" {
+            return "null".to_owned();
+        }
+
+        let default_port = match self.scheme.as_str() {
+            "http" => 80,
+            "https" => 443,
+            _ => 0,
+        };
+        let port = if self.port != 0 && self.port != default_port {
+            format!(":{}", self.port)
+        } else {
+            String::new()
+        };
+        format!("{}://{}{}", self.scheme, self.host, port)
     }
 
     /// Creates an origin, using the scheme's default port when omitted.
@@ -72,6 +101,7 @@ impl Origin {
     // Networking team provides scheme, host, and port extraction.
     pub fn parse(url: &str) -> Result<Self, SecurityError> {
         if url.is_empty() {
+            log::debug!("rejected empty url while parsing origin");
             return Err(SecurityError::InvalidOrigin(String::new()));
         }
         todo!("TODO(security): extract origin from: {url:?}")
@@ -93,6 +123,117 @@ impl StorageKey {
     /// Returns the origin associated with this key.
     pub fn get(&self) -> &Origin {
         &self.origin
+    }
+}
+
+/// A storage key that a renderer context has authorized for use.
+///
+/// The token borrows the key owned by its [`RendererSecurityContext`]. It can
+/// only be created by validating a request or by asking the context for its
+/// own key, so storage backends do not have to trust renderer-supplied keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedStorageKey<'context> {
+    storage_key: &'context StorageKey,
+}
+
+impl<'context> TrustedStorageKey<'context> {
+    /// Returns the storage key authorized by the renderer context.
+    #[must_use]
+    pub fn storage_key(self) -> &'context StorageKey {
+        self.storage_key
+    }
+}
+
+/// Why a storage-key authorization request was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageKeyValidationError {
+    /// The requested key does not match the context's trusted key.
+    Mismatch,
+}
+
+impl fmt::Display for StorageKeyValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mismatch => formatter.write_str("storage key does not match renderer context"),
+        }
+    }
+}
+
+impl std::error::Error for StorageKeyValidationError {}
+
+/// The access class requested by a storage IPC message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageOperation {
+    /// Read data without changing the storage area.
+    Read,
+    /// Add, remove, or clear data in the storage area.
+    Write,
+}
+
+/// Why a storage IPC request was rejected before reaching a backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageAuthorizationError {
+    /// The request is not a valid storage operation.
+    InvalidRequest,
+    /// The renderer does not have permission for the requested operation.
+    PermissionDenied,
+    /// The requested storage key is not the context's trusted key.
+    StorageKeyMismatch,
+}
+
+impl fmt::Display for StorageAuthorizationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest => formatter.write_str("invalid storage request"),
+            Self::PermissionDenied => formatter.write_str("storage permission denied"),
+            Self::StorageKeyMismatch => {
+                formatter.write_str("storage key does not match renderer context")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StorageAuthorizationError {}
+
+impl From<StorageKeyValidationError> for StorageAuthorizationError {
+    fn from(error: StorageKeyValidationError) -> Self {
+        match error {
+            StorageKeyValidationError::Mismatch => Self::StorageKeyMismatch,
+        }
+    }
+}
+
+impl From<StorageAuthorizationError> for IpcStorageError {
+    fn from(error: StorageAuthorizationError) -> Self {
+        match error {
+            StorageAuthorizationError::InvalidRequest => Self::InvalidRequest,
+            StorageAuthorizationError::PermissionDenied
+            | StorageAuthorizationError::StorageKeyMismatch => Self::AccessDenied,
+        }
+    }
+}
+
+/// A storage request that passed renderer identity and permission checks.
+///
+/// The authorized key borrows the renderer context, so it cannot outlive the
+/// context that approved the request or be replaced with a renderer-supplied key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorizedStorageRequest<'context> {
+    operation: StorageOperation,
+    storage_key: TrustedStorageKey<'context>,
+}
+
+impl<'context> AuthorizedStorageRequest<'context> {
+    /// Returns whether the request is a read or write operation.
+    #[must_use]
+    pub const fn operation(self) -> StorageOperation {
+        self.operation
+    }
+
+    /// Returns the storage key approved by the renderer context.
+    #[must_use]
+    pub const fn storage_key(self) -> TrustedStorageKey<'context> {
+        self.storage_key
     }
 }
 
@@ -139,6 +280,11 @@ impl RendererSecurityContext {
     ///
     /// The storage key is derived from the same origin stored by this context.
     pub fn new(origin: Origin, storage_permission: StoragePermission) -> Self {
+        log::debug!(
+            "security context created for {} (storage {:?})",
+            origin_label(&origin),
+            storage_permission
+        );
         Self {
             storage_key: StorageKey::new(origin.clone()),
             origin,
@@ -154,6 +300,81 @@ impl RendererSecurityContext {
     /// Returns the storage key associated with the renderer's origin.
     pub fn storage_key(&self) -> &StorageKey {
         &self.storage_key
+    }
+
+    /// Returns this context's trusted storage key.
+    ///
+    /// Browser code uses this when it creates a request for the renderer's
+    /// own storage area. The returned token borrows the context and cannot be
+    /// constructed from an arbitrary [`StorageKey`].
+    #[must_use]
+    pub fn trusted_storage_key(&self) -> TrustedStorageKey<'_> {
+        TrustedStorageKey {
+            storage_key: &self.storage_key,
+        }
+    }
+
+    /// Authorizes a requested storage key against this renderer context.
+    ///
+    /// Call this at a storage or IPC boundary before using a key supplied by a
+    /// renderer. A key for another origin, including a manually constructed
+    /// key, is rejected.
+    pub fn authorize_storage_key(
+        &self,
+        requested: &StorageKey,
+    ) -> Result<TrustedStorageKey<'_>, StorageKeyValidationError> {
+        if requested != &self.storage_key {
+            log::warn!(
+                "rejected storage key for {}: key does not match renderer context",
+                origin_label(&self.origin)
+            );
+            return Err(StorageKeyValidationError::Mismatch);
+        }
+
+        Ok(self.trusted_storage_key())
+    }
+
+    /// Authorizes a storage IPC request before a backend is accessed.
+    ///
+    /// `requested_storage_key` is transport metadata supplied alongside the
+    /// request. A successful result contains the only key token accepted by
+    /// storage backends.
+    pub fn authorize_storage_request(
+        &self,
+        request: &StorageRequest,
+        requested_storage_key: &StorageKey,
+    ) -> Result<AuthorizedStorageRequest<'_>, StorageAuthorizationError> {
+        let operation = match request {
+            StorageRequest::Invalid => {
+                log::warn!("rejected invalid storage request");
+                return Err(StorageAuthorizationError::InvalidRequest);
+            }
+            StorageRequest::GetItem { .. } | StorageRequest::Length => StorageOperation::Read,
+            StorageRequest::SetItem { .. }
+            | StorageRequest::RemoveItem { .. }
+            | StorageRequest::Clear => StorageOperation::Write,
+        };
+
+        let storage_key = self
+            .authorize_storage_key(requested_storage_key)
+            .map_err(StorageAuthorizationError::from)?;
+        let allowed = match operation {
+            StorageOperation::Read => self.can_read_storage(),
+            StorageOperation::Write => self.can_write_storage(),
+        };
+
+        if !allowed {
+            log::warn!(
+                "rejected {operation:?} storage request for {}: permission denied",
+                origin_label(&self.origin)
+            );
+            return Err(StorageAuthorizationError::PermissionDenied);
+        }
+
+        Ok(AuthorizedStorageRequest {
+            operation,
+            storage_key,
+        })
     }
 
     /// Whether the renderer is allowed to read storage.
@@ -173,49 +394,81 @@ pub fn same_origin(a: &Origin, b: &Origin) -> bool {
     a == b
 }
 
-/// A cookie as stored in the jar.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+/// A cookie stored in a [`CookieJar`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cookie {
+    /// The cookie name.
     pub name: String,
+    /// The value sent with the cookie name.
     pub value: String,
+    /// The host for which the cookie is visible.
+    ///
+    /// The current implementation compares this value literally with the
+    /// requesting origin's host. It does not yet implement subdomain,
+    /// leading-dot, or other full cookie-domain matching rules.
     pub domain: String,
+    /// Whether the cookie may be returned only for HTTPS origins.
     pub secure: bool,
 }
 
-/// Cookie storage with per-origin visibility rules. A Canvas session is a
-/// cookie, so this is on the critical path to the course goal.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+/// In-memory cookie storage with basic host and secure-transport filtering.
+///
+/// Cookies are replaced when a new cookie has the same name and domain. The
+/// jar does not yet persist cookies or implement expiration, paths, or the
+/// complete browser cookie-domain model.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CookieJar {
     cookies: Vec<Cookie>,
 }
 
 impl CookieJar {
-    /// An empty jar.
+    /// Creates an empty, in-memory cookie jar.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Stores a cookie received from `origin`, applying domain/secure rules.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
-    pub fn store(&mut self, origin: &Origin, cookie: Cookie) {
-        todo!("TODO(security): store {} for {}", cookie.name, origin.host)
+    /// Stores `cookie`, replacing an existing cookie with the same name and domain.
+    ///
+    /// The `origin` argument is reserved for future validation. It is not
+    /// currently used when storing a cookie; callers are responsible for
+    /// providing a cookie with the intended domain and secure attributes.
+    pub fn store(&mut self, _origin: &Origin, cookie: Cookie) {
+        log::debug!(
+            "storing cookie {:?} for domain {} (secure: {})",
+            cookie.name,
+            cookie.domain,
+            cookie.secure
+        );
+        self.cookies
+            .retain(|existing| existing.name != cookie.name || existing.domain != cookie.domain);
+
+        self.cookies.push(cookie);
     }
 
-    /// Cookies that may be sent to `origin`.
+    /// Returns cookies that may be sent to `origin`.
     ///
-    /// Currently only handles the empty jar.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
+    /// A cookie is returned when its domain exactly matches the origin host.
+    /// Secure cookies are returned only for HTTPS origins. The returned
+    /// references point into the jar and are ordered by insertion order.
     pub fn cookies_for(&self, origin: &Origin) -> Vec<&Cookie> {
-        if self.cookies.is_empty() {
-            return Vec::new();
+        let mut matching_cookies = Vec::new();
+
+        for cookie in &self.cookies {
+            let domain_matches = cookie.domain == origin.host();
+            let secure_connection = origin.scheme() == "https";
+
+            if domain_matches && (!cookie.secure || secure_connection) {
+                matching_cookies.push(cookie);
+            }
         }
-        todo!(
-            "TODO(security): filter {} cookies for {}",
+
+        log::debug!(
+            "{} of {} cookies match {}",
+            matching_cookies.len(),
             self.cookies.len(),
-            origin.host
-        )
+            origin_label(origin)
+        );
+        matching_cookies
     }
 }
 
@@ -366,11 +619,244 @@ mod tests {
     }
 
     #[test]
+    fn renderer_context_authorizes_its_own_storage_key() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+
+        let authorized = context
+            .authorize_storage_key(context.storage_key())
+            .expect("context key should be authorized");
+
+        assert_eq!(authorized.storage_key(), context.storage_key());
+    }
+
+    #[test]
+    fn renderer_context_rejects_another_origins_storage_key() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+        let forged = StorageKey::new(origin("https", "example.com", 443));
+
+        assert_eq!(
+            context.authorize_storage_key(&forged),
+            Err(StorageKeyValidationError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn trusted_storage_key_comes_from_context() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+
+        assert_eq!(
+            context.trusted_storage_key().storage_key(),
+            context.storage_key()
+        );
+    }
+
+    #[test]
+    fn allowed_reads_and_writes_are_authorized() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+
+        let read = context
+            .authorize_storage_request(
+                &StorageRequest::GetItem { key: "name".into() },
+                context.storage_key(),
+            )
+            .expect("allowed read should be authorized");
+        let write = context
+            .authorize_storage_request(
+                &StorageRequest::SetItem {
+                    key: "name".into(),
+                    value: "Nestor".into(),
+                },
+                context.storage_key(),
+            )
+            .expect("allowed write should be authorized");
+
+        assert_eq!(read.operation(), StorageOperation::Read);
+        assert_eq!(write.operation(), StorageOperation::Write);
+        assert_eq!(read.storage_key().storage_key(), context.storage_key());
+    }
+
+    #[test]
+    fn denied_reads_and_writes_are_rejected() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Denied,
+        );
+
+        for request in [
+            StorageRequest::GetItem { key: "name".into() },
+            StorageRequest::SetItem {
+                key: "name".into(),
+                value: "Nestor".into(),
+            },
+        ] {
+            assert_eq!(
+                context.authorize_storage_request(&request, context.storage_key()),
+                Err(StorageAuthorizationError::PermissionDenied)
+            );
+        }
+    }
+
+    #[test]
+    fn mismatched_keys_are_rejected_before_permission_is_checked() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+        let forged = StorageKey::new(origin("https", "example.com", 443));
+
+        assert_eq!(
+            context.authorize_storage_request(
+                &StorageRequest::SetItem {
+                    key: "name".into(),
+                    value: "Nestor".into(),
+                },
+                &forged,
+            ),
+            Err(StorageAuthorizationError::StorageKeyMismatch)
+        );
+    }
+
+    #[test]
+    fn invalid_requests_are_rejected_without_panicking() {
+        let context = RendererSecurityContext::new(
+            origin("https", "byui.edu", 443),
+            StoragePermission::Allowed,
+        );
+
+        assert_eq!(
+            context.authorize_storage_request(&StorageRequest::Invalid, context.storage_key()),
+            Err(StorageAuthorizationError::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn authorization_errors_map_to_consistent_ipc_errors() {
+        assert_eq!(
+            IpcStorageError::from(StorageAuthorizationError::PermissionDenied),
+            IpcStorageError::AccessDenied
+        );
+        assert_eq!(
+            IpcStorageError::from(StorageAuthorizationError::StorageKeyMismatch),
+            IpcStorageError::AccessDenied
+        );
+        assert_eq!(
+            IpcStorageError::from(StorageAuthorizationError::InvalidRequest),
+            IpcStorageError::InvalidRequest
+        );
+    }
+
+    #[test]
     fn empty_jar_sends_nothing() {
         let jar = CookieJar::new();
         assert!(
             jar.cookies_for(&origin("https", "byui.edu", 443))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn stores_and_returns_cookie_for_matching_origin() {
+        let site = origin("https", "byui.edu", 443);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "abc123".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        let cookies = jar.cookies_for(&site);
+
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].name, "session");
+        assert_eq!(cookies[0].value, "abc123");
+    }
+
+    #[test]
+    fn does_not_return_cookie_for_different_origin() {
+        let site = origin("https", "byui.edu", 443);
+        let other_site = origin("https", "example.com", 443);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "abc123".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        let cookies = jar.cookies_for(&other_site);
+
+        assert!(cookies.is_empty());
+    }
+
+    #[test]
+    fn secure_cookie_is_only_returned_for_https() {
+        let https_site = origin("https", "byui.edu", 443);
+        let http_site = origin("http", "byui.edu", 80);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &https_site,
+            Cookie {
+                name: "session".into(),
+                value: "abc123".into(),
+                domain: "byui.edu".into(),
+                secure: true,
+            },
+        );
+
+        assert_eq!(jar.cookies_for(&https_site).len(), 1);
+        assert!(jar.cookies_for(&http_site).is_empty());
+    }
+
+    #[test]
+    fn newer_cookie_replaces_old_cookie() {
+        let site = origin("https", "byui.edu", 443);
+        let mut jar = CookieJar::new();
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "old-value".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        jar.store(
+            &site,
+            Cookie {
+                name: "session".into(),
+                value: "new-value".into(),
+                domain: "byui.edu".into(),
+                secure: false,
+            },
+        );
+
+        let cookies = jar.cookies_for(&site);
+
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].value, "new-value");
     }
 }

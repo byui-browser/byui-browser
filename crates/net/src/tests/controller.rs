@@ -7,7 +7,10 @@ use std::{
     thread,
 };
 
-use crate::{AbortController, Body, CacheMode, Config, Request, RequestController, RequestError};
+use crate::{
+    AbortController, Body, CacheMode, Config, Request, RequestController, RequestError,
+    ResponseType,
+};
 use futures_util::StreamExt;
 use reqwest::{
     Method, StatusCode,
@@ -119,6 +122,26 @@ fn only_if_cached_reports_a_cache_miss_without_network_access() {
     let error = runtime.block_on(client.fetch(request)).unwrap_err();
 
     assert!(matches!(error, RequestError::NetworkError));
+}
+
+#[test]
+/// Verifies pre-exposure failures can be represented as Fetch network errors.
+fn fetch_response_normalizes_cache_misses_to_network_error_response() {
+    let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+    let client = RequestController::builder(Config::default())
+        .build()
+        .expect("controller should initialize");
+    let mut request = Request::get("http://127.0.0.1:1");
+    request.cache_mode = CacheMode::OnlyIfCached;
+
+    let response = runtime
+        .block_on(client.fetch_response(request))
+        .expect("network errors should be response-shaped");
+
+    assert_eq!(response.response_type, ResponseType::Error);
+    assert_eq!(response.status, 0);
+    assert!(response.headers.is_empty());
+    assert!(response.body.is_null());
 }
 
 #[test]

@@ -70,6 +70,9 @@ fn reads_match_the_evaluator() {
         "$['ne' + 'sted'].b",
         "$[0 + 1]",
         "$.nested['b']",
+        "$.missing",
+        "$['missing']",
+        "$.nested.missing",
     ] {
         let vm = run_vm(template, &fixture());
         let evaluator = run_evaluator(template, &fixture());
@@ -104,15 +107,7 @@ fn writes_match_the_evaluator() {
 
 #[test]
 fn property_errors_match_the_evaluator() {
-    for template in [
-        "$.missing",
-        "$['missing']",
-        "$.nested.missing",
-        "$.a.b",
-        "$.a['b']",
-        "$.a.b = 1",
-        "$.missing.deeper",
-    ] {
+    for template in ["$.a.b", "$.a['b']", "$.a.b = 1", "$.missing.deeper"] {
         let vm = run_vm(template, &fixture()).expect_err(template);
         let evaluator = run_evaluator(template, &fixture()).expect_err(template);
         assert_eq!(vm.category, JsErrorCategory::Runtime, "`{template}`");
@@ -122,9 +117,14 @@ fn property_errors_match_the_evaluator() {
 }
 
 #[test]
-fn missing_and_non_object_errors_describe_the_property() {
-    let missing = run_vm("$.missing", &fixture()).unwrap_err();
-    assert_eq!(missing.message, "Property `missing` is not defined");
+fn missing_properties_are_undefined_and_non_object_errors_describe_the_property() {
+    assert_eq!(run_vm("$.missing", &fixture()), Ok(Value::Undefined));
+
+    let missing = run_vm("$.missing.deeper", &fixture()).unwrap_err();
+    assert_eq!(
+        missing.message,
+        "Cannot read property `deeper` of undefined"
+    );
     assert_eq!(missing.context.as_deref(), Some("property access"));
 
     let read = run_vm("$.a.b", &fixture()).unwrap_err();
@@ -216,6 +216,9 @@ fn host_methods_load_as_the_registered_function() {
     let method = object.get("method").unwrap();
     assert!(matches!(method, Value::Function(_)));
     assert_eq!(run_vm("$.method", &object), Ok(method));
+    let vm = run_vm("$.method()", &object);
+    let evaluator = run_evaluator("$.method()", &object);
+    assert_eq!(vm, evaluator);
 }
 
 #[test]

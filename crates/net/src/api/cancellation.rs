@@ -62,6 +62,7 @@ impl AbortSignal {
     /// Marks this signal as aborted and wakes all waiters.
     pub(crate) fn abort(&self) {
         if !self.state.aborted.swap(true, Ordering::AcqRel) {
+            log::debug!("abort signal fired");
             self.state.notify.notify_waiters();
         }
     }

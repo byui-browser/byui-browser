@@ -7,7 +7,10 @@ use net::{
     Body, Config, FetchEnvironment, FetchServices, Request, RequestController, RequestError,
     ResponseInfo, SchemeProviders, ServiceWorkerDecision,
 };
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 struct NoopServices;
 
@@ -38,6 +41,84 @@ impl FetchServices for NoopServices {
 
     fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
         panic!("builder must not invoke services")
+    }
+}
+
+struct RecordingServices {
+    intercept: bool,
+    request_checks: AtomicUsize,
+    response_checks: AtomicUsize,
+    cookie_reads: AtomicUsize,
+    cookie_writes: AtomicUsize,
+    worker_checks: AtomicUsize,
+    cache_partitions: AtomicUsize,
+}
+
+impl RecordingServices {
+    fn new(intercept: bool) -> Self {
+        Self {
+            intercept,
+            request_checks: AtomicUsize::new(0),
+            response_checks: AtomicUsize::new(0),
+            cookie_reads: AtomicUsize::new(0),
+            cookie_writes: AtomicUsize::new(0),
+            worker_checks: AtomicUsize::new(0),
+            cache_partitions: AtomicUsize::new(0),
+        }
+    }
+
+    fn total_calls(&self) -> usize {
+        [
+            &self.request_checks,
+            &self.response_checks,
+            &self.cookie_reads,
+            &self.cookie_writes,
+            &self.worker_checks,
+            &self.cache_partitions,
+        ]
+        .into_iter()
+        .map(|counter| counter.load(Ordering::SeqCst))
+        .sum()
+    }
+}
+
+impl FetchServices for RecordingServices {
+    fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
+        self.request_checks.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn check_response(&self, _request: &Request, _info: &ResponseInfo) -> Result<(), RequestError> {
+        self.response_checks.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
+        self.cookie_reads.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
+    }
+
+    fn store_set_cookie(
+        &self,
+        _request: &Request,
+        _values: &[net::HeaderValue],
+    ) -> Result<(), RequestError> {
+        self.cookie_writes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
+        self.worker_checks.fetch_add(1, Ordering::SeqCst);
+        Ok(if self.intercept {
+            ServiceWorkerDecision::Intercept
+        } else {
+            ServiceWorkerDecision::Network
+        })
+    }
+
+    fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
+        self.cache_partitions.fetch_add(1, Ordering::SeqCst);
+        Ok("recording".into())
     }
 }
 
@@ -78,6 +159,34 @@ fn body_consumption_propagates_a_post_header_transport_error() {
 
     server.join();
     assert!(matches!(error, RequestError::Transport(_)));
+}
+
+#[test]
+fn cors_approved_response_keeps_a_later_body_stream_failure_typed() {
+    let server = TestServer::start(1, |_| {
+        b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: https://client.test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nshort\r\n"
+            .to_vec()
+    });
+    let services = Arc::new(RecordingServices::new(false));
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(services.clone())
+        .build()
+        .unwrap();
+    let mut request = Request::get(server.url());
+    request.set_environment(
+        FetchEnvironment::from_url(reqwest::Url::parse("https://client.test/page").unwrap())
+            .unwrap(),
+    );
+
+    let error = runtime().block_on(async {
+        let response = controller.fetch(request).await.unwrap();
+        assert_eq!(response.response_type, net::ResponseType::Cors);
+        response.body.bytes().await.unwrap_err()
+    });
+
+    server.join();
+    assert!(matches!(error, RequestError::Transport(_)));
+    assert_eq!(services.response_checks.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -150,7 +259,10 @@ fn non_cacheable_post_requests_are_sent_each_time() {
         request
             .set_body(Some(Body::from_bytes(b"payload".to_vec())))
             .unwrap();
-        controller.fetch(request.clone()).await.unwrap();
+        controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
         controller.fetch(request).await.unwrap();
     });
 
@@ -229,7 +341,10 @@ fn cached_browser_response_is_rechecked_before_exposure() {
         FetchEnvironment::from_url(reqwest::Url::parse(&server.url()).unwrap()).unwrap(),
     );
     runtime().block_on(async {
-        let response = controller.fetch(request.clone()).await.unwrap();
+        let response = controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
         response.body.bytes().await.unwrap();
     });
     let error = runtime().block_on(controller.fetch(request)).unwrap_err();
@@ -238,4 +353,137 @@ fn cached_browser_response_is_rechecked_before_exposure() {
         error,
         RequestError::UnsupportedFeature("cached response policy")
     ));
+}
+
+#[test]
+fn unsupported_request_features_fail_before_browser_service_or_network_side_effects() {
+    let mut integrity = Request::get("http://127.0.0.1:9/");
+    integrity.set_integrity(Some("sha256-example".into()));
+
+    let mut revalidation = Request::get("http://127.0.0.1:9/");
+    revalidation.set_cache_mode(net::CacheMode::NoCache);
+
+    let mut priority = Request::get("http://127.0.0.1:9/");
+    priority.set_priority(net::RequestPriority::High);
+
+    let mut keepalive = Request::get("http://127.0.0.1:9/");
+    keepalive.set_keepalive(true);
+
+    let mut navigation = Request::get("http://127.0.0.1:9/");
+    navigation.set_mode(net::RequestMode::Navigate).unwrap();
+
+    for (request, feature) in [
+        (integrity, "subresource integrity"),
+        (revalidation, "HTTP cache revalidation"),
+        (priority, "priority scheduling"),
+        (keepalive, "keepalive lifetime"),
+        (navigation, "navigation fetch"),
+    ] {
+        let services = Arc::new(RecordingServices::new(false));
+        let controller = RequestController::builder(Config::default())
+            .with_fetch_services(services.clone())
+            .build()
+            .unwrap();
+
+        let error = runtime().block_on(controller.fetch(request)).unwrap_err();
+
+        assert!(matches!(error, RequestError::UnsupportedFeature(name) if name == feature));
+        assert_eq!(
+            services.total_calls(),
+            0,
+            "{feature} must fail before services"
+        );
+    }
+}
+
+#[test]
+fn service_worker_interception_fails_before_cache_cookie_or_transport_work() {
+    let services = Arc::new(RecordingServices::new(true));
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(services.clone())
+        .build()
+        .unwrap();
+
+    let error = runtime()
+        .block_on(controller.fetch(Request::get("http://127.0.0.1:9/")))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RequestError::UnsupportedFeature("service-worker interception")
+    ));
+    assert_eq!(services.request_checks.load(Ordering::SeqCst), 1);
+    assert_eq!(services.worker_checks.load(Ordering::SeqCst), 1);
+    assert_eq!(services.response_checks.load(Ordering::SeqCst), 0);
+    assert_eq!(services.cookie_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(services.cookie_writes.load(Ordering::SeqCst), 0);
+    assert_eq!(services.cache_partitions.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn relative_urls_resolve_against_the_client_environment_and_invalid_joins_fail() {
+    let server = TestServer::start(1, |request| {
+        assert!(request.starts_with("GET /base/image.png HTTP"));
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+    });
+    let services = Arc::new(RecordingServices::new(false));
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(services)
+        .build()
+        .unwrap();
+    let environment = FetchEnvironment::from_url(
+        reqwest::Url::parse(&format!("{}/base/page.html", server.url())).unwrap(),
+    )
+    .unwrap();
+    let mut relative = Request::get("image.png");
+    relative.set_environment(environment.clone());
+
+    let response = runtime().block_on(controller.fetch(relative)).unwrap();
+    assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
+    server.join();
+
+    let mut invalid = Request::get("http://[::1");
+    invalid.set_environment(environment);
+    assert!(matches!(
+        runtime().block_on(controller.fetch(invalid)),
+        Err(RequestError::InvalidUrl(url)) if url == "http://[::1"
+    ));
+}
+
+#[test]
+fn connection_refusal_is_a_typed_transport_error() {
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+
+    assert!(matches!(
+        runtime().block_on(controller.fetch(Request::get("http://127.0.0.1:9/"))),
+        Err(RequestError::Transport(_))
+    ));
+}
+
+#[test]
+fn same_origin_mode_rejects_a_cross_origin_http_response_before_exposure() {
+    let server = TestServer::start(1, |_| {
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+    });
+    let services = Arc::new(RecordingServices::new(false));
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(services)
+        .build()
+        .unwrap();
+    let port = reqwest::Url::parse(&server.url()).unwrap().port().unwrap();
+    let mut request = Request::get(server.url());
+    request.set_mode(net::RequestMode::SameOrigin).unwrap();
+    request.set_environment(
+        FetchEnvironment::from_url(
+            reqwest::Url::parse(&format!("http://localhost:{port}/")).unwrap(),
+        )
+        .unwrap(),
+    );
+
+    let error = runtime().block_on(controller.fetch(request)).unwrap_err();
+    server.join();
+
+    assert!(matches!(error, RequestError::SameOriginViolation));
 }

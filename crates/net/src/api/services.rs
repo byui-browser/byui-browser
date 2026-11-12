@@ -1,6 +1,6 @@
 //! Browser-owned inputs to the process-local Fetch engine.
 
-use crate::{Headers, Origin, Request, RequestError, RequestMode, ResponseType};
+use crate::{Headers, Origin, Request, RequestError, RequestMode, ResponseType, Url};
 
 /// Decision made by the service-worker owner before network I/O.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,10 +46,31 @@ pub struct ResponseInfo {
 /// decisions or typed errors; the engine does not own their durable state.
 pub trait FetchServices: Send + Sync {
     /// Authorizes a request before cache lookup, cookies, or network I/O.
+    ///
+    /// The controller invokes this once for the initial request and again for
+    /// each followed redirect. Use [`Request::active_url`] when making a
+    /// per-hop decision; [`Request::url`] remains the original caller input.
     fn check_request(&self, request: &Request) -> Result<(), RequestError>;
 
     /// Authorizes complete internal response metadata before public exposure.
     fn check_response(&self, request: &Request, info: &ResponseInfo) -> Result<(), RequestError>;
+
+    /// Returns browser-owned request headers for one validated transport hop.
+    ///
+    /// These values are merged into an internal transport-only channel before
+    /// CORS-preflight calculation and after Fetch-owned headers are derived.
+    /// The default is empty for standalone consumers; browser implementations
+    /// can provide destination, language, identity, and Fetch Metadata headers
+    /// here. Use [`Headers::generated_request_headers`] for forbidden
+    /// browser-owned names such as `Sec-Fetch-*`; Fetch-owned `Origin`,
+    /// referrer, body, cookie, and preflight fields are rejected.
+    fn generated_request_headers(
+        &self,
+        _request: &Request,
+        _target: &Url,
+    ) -> Result<Headers, RequestError> {
+        Ok(Headers::generated_request_headers())
+    }
 
     /// Returns the cookie header selected by storage and security policy.
     ///
@@ -69,10 +90,10 @@ pub trait FetchServices: Send + Sync {
     /// is implemented in a later plan step.
     fn service_worker(&self, request: &Request) -> Result<ServiceWorkerDecision, RequestError>;
 
-    /// Returns an owned cache partition key for this browser request.
+    /// Returns an owned HTTP and CORS-preflight cache partition key for this request.
     ///
-    /// The process-local cache uses the key only within this controller. It is
-    /// not a durable HTTP cache or a substitute for the storage owner.
+    /// The process-local caches use the key only within this controller. It is
+    /// not a durable cache or a substitute for the storage owner.
     fn cache_partition(&self, request: &Request) -> Result<String, RequestError>;
 
     /// Observes approved response headers for diagnostics and timing clients.
