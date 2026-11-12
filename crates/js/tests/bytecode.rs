@@ -169,6 +169,41 @@ fn arrows_compile_expression_and_block_bodies_and_cannot_be_constructed() {
 }
 
 #[test]
+fn arrows_capture_locals_and_nested_arrows_share_their_cells() {
+    assert_eq!(
+        execute("const make = base => () => base; const read = make(7); read()"),
+        Value::Number(7.0)
+    );
+    assert_eq!(
+        execute(
+            "const make = () => { let count = 0; return () => { count = count + 1; return count; }; }; const next = make(); next() + next()"
+        ),
+        Value::Number(3.0)
+    );
+}
+
+#[test]
+fn arrows_support_recursion_and_missing_arguments() {
+    assert_eq!(
+        execute(
+            "let factorial = n => { if (n < 2) return 1; return n * factorial(n - 1); }; factorial(5)"
+        ),
+        Value::Number(120.0)
+    );
+    assert_eq!(execute("((left, right) => right)(4)"), Value::Undefined);
+}
+
+#[test]
+fn arrows_capture_lexical_this() {
+    assert_eq!(
+        execute(
+            "class Counter { constructor() { this.value = 9; this.read = () => this.value; } } new Counter().read()"
+        ),
+        Value::Number(9.0)
+    );
+}
+
+#[test]
 fn binding_errors_are_reported() {
     let program = parse("{ value; let value = 1; }").expect("source should parse");
     let chunk = compile(&program).expect("source should compile");
