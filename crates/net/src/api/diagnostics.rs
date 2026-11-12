@@ -21,6 +21,8 @@ pub enum NetworkPhase {
     PreflightCacheMiss,
     /// A CORS-preflight transport request is beginning.
     PreflightStarted,
+    /// A CORS-preflight response arrived and is being checked.
+    PreflightCompleted,
     /// The request is waiting for a shared transport slot.
     QueueStarted,
     /// The request acquired a shared transport slot.

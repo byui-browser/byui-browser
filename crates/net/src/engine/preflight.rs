@@ -89,6 +89,13 @@ impl RequestController {
             .inspect_err(|_| {
                 self.inner.preflight_cache.clear_for_request(request, url);
             })?;
+        self.observe(
+            request,
+            NetworkPhase::PreflightCompleted,
+            url,
+            Some(response.status.as_u16()),
+            false,
+        );
 
         if !response.status.is_success()
             || !self
