@@ -63,6 +63,59 @@ fn html_script_reaches_registered_web_api() {
 }
 
 #[test]
+fn page_script_runs_queued_microtasks_before_the_next_script() {
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+    let results = BrowserRuntime::in_memory()
+        .evaluate_page_scripts(
+            "<script>var order = ''; function callback() { order = order + 'a'; } queueMicrotask(callback)</script><script>order</script>",
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            security_context(),
+        )
+        .expect("page script should evaluate");
+    assert_eq!(results[1], js::Value::String("a".into()));
+}
+
+#[test]
+fn page_session_script_evaluates_through_a_microtask_checkpoint() {
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+    let runtime = BrowserRuntime::in_memory();
+    let session = runtime
+        .open_page(
+            &browser::Page {
+                html: "<main></main>".into(),
+                url: "https://example.com/".into(),
+                scripts: Vec::new(),
+                stylesheets: Vec::new(),
+                resources: Default::default(),
+            },
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            security_context(),
+        )
+        .expect("page session should open");
+    session
+        .evaluate_script(
+            "var order = ''; function callback() { order = order + 'a'; } queueMicrotask(callback)",
+        )
+        .expect("script should evaluate");
+    assert_eq!(
+        session.evaluate_script("order"),
+        Ok(js::Value::String("a".into()))
+    );
+}
+
+#[test]
 fn html_script_history_survives_document_registration() {
     let controller = Arc::new(
         net::RequestController::builder(net::Config::default())
@@ -144,6 +197,7 @@ fn linked_page_script_reads_its_navigation_url_from_window_location() {
         html: String::new(),
         stylesheets: Vec::new(),
         scripts: vec!["if (document.location === window.location && window.location.href === 'https://example.com/path?q=term#section') window.location.href = window.location.href".into()],
+        resources: Default::default(),
     };
     let controller = Arc::new(
         net::RequestController::builder(net::Config::default())
@@ -181,6 +235,7 @@ fn window_location_shares_the_window_with_viewport_and_device_scale() {
              && window.location.href === 'https://example.com/start') location.assign('/next')"
                 .into(),
         ],
+        resources: Default::default(),
     };
     let controller = Arc::new(
         net::RequestController::builder(net::Config::default())
@@ -263,6 +318,7 @@ fn linked_script_finds_page_elements_and_handles_their_clicks() {
              btn.addEventListener('click', callback);"
                 .into(),
         ],
+        resources: Default::default(),
     };
 
     let session = BrowserRuntime::in_memory()

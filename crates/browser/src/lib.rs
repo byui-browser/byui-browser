@@ -23,7 +23,7 @@ use webapis::local_storage::register_local_storage_with_url;
 use webapis::session_storage::register_session_storage;
 use webapis::{
     AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, register_alert,
-    register_console, register_document_with_location, register_fetch,
+    register_console, register_document_with_location, register_fetch_with_url,
     register_location_with_navigation, register_print, register_window_with_security_context,
     register_window_with_url_device_pixel_ratio_and_viewport,
 };
@@ -222,6 +222,17 @@ impl FileAccessConfiguration {
 /// Browser services use a conservative no-cookie, no-worker default and
 /// permit requests carrying browser client context.
 pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<RequestController> {
+    request_controller_with_observer(file_access, None)
+}
+
+/// Builds a browser request controller and optionally reports network lifecycle events.
+///
+/// The observer is diagnostic-only and receives redacted URLs, never request
+/// or response bodies, headers, credentials, or errors.
+pub fn request_controller_with_observer(
+    file_access: Option<FileAccessConfiguration>,
+    observer: Option<Arc<dyn net::NetworkObserver>>,
+) -> Arc<RequestController> {
     let mut providers = SchemeProviders::new().with_page(byui_provider::provider());
     log::debug!(
         "building request controller (file provider: {})",
@@ -240,10 +251,15 @@ pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<R
             file_access.content_policy,
         ));
     }
+    let builder = RequestController::builder(net::Config::default())
+        .with_fetch_services(Arc::new(fetch_services::BrowserFetchServices::default()))
+        .with_scheme_providers(providers);
+    let builder = match observer {
+        Some(observer) => builder.with_network_observer(observer),
+        None => builder,
+    };
     Arc::new(
-        RequestController::builder(net::Config::default())
-            .with_fetch_services(Arc::new(fetch_services::BrowserFetchServices::default()))
-            .with_scheme_providers(providers)
+        builder
             .build()
             .expect("network controller should initialize"),
     )
@@ -271,6 +287,80 @@ pub struct Page {
     /// holding its inline text or the fetched body of its `src`. A `src` that
     /// failed to load is an empty entry, so entries stay aligned with elements.
     pub scripts: Vec<String>,
+    /// Other downloaded subresources, such as images.
+    pub resources: PageResources,
+}
+
+/// Subresources of a [`Page`] other than its stylesheets and scripts:
+/// images and web fonts.
+///
+/// Pages built by hand (tests, built-in pages) use
+/// `PageResources::default()`, which holds nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageResources {
+    /// One entry per distinct `<img src>` that downloaded successfully, in
+    /// document order. The list is shared, so cloning a page does not copy
+    /// image data, and shells can recognize the same page's images by
+    /// pointer (`Arc::ptr_eq`) to reuse decoded pictures.
+    pub images: Arc<[ImageResource]>,
+    /// One entry per `@font-face` rule whose font downloaded, in stylesheet
+    /// order. Shared like [`Self::images`].
+    pub fonts: Arc<[FontResource]>,
+}
+
+/// A web font downloaded for an `@font-face` rule. The bytes are still in
+/// their file format (WOFF2, WOFF, TrueType, OpenType); parsing is up to the
+/// renderer.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FontResource {
+    /// The rule's `font-family` descriptor, unquoted.
+    pub family: String,
+    /// The rule's inclusive `font-weight` range, such as `(400, 400)`.
+    pub weight: (u16, u16),
+    /// Whether the rule's `font-style` is italic or oblique.
+    pub italic: bool,
+    /// The URL the font was finally served from, after redirects.
+    pub url: String,
+    /// The response body.
+    pub bytes: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for FontResource {
+    /// Shows the size of the body instead of every byte.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FontResource")
+            .field("family", &self.family)
+            .field("weight", &self.weight)
+            .field("italic", &self.italic)
+            .field("url", &self.url)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// An image file downloaded for a page. The bytes are still encoded (PNG,
+/// JPEG, SVG, ...); decoding is up to the renderer.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ImageResource {
+    /// The `<img>` element's `src` attribute, trimmed but otherwise as
+    /// written. Layout identifies images by this text
+    /// (`layout::ImageKey::Src`).
+    pub src: String,
+    /// The URL the image was finally served from, after redirects.
+    pub url: String,
+    /// The response body.
+    pub bytes: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for ImageResource {
+    /// Shows the size of the body instead of every byte.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageResource")
+            .field("src", &self.src)
+            .field("url", &self.url)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
 }
 
 /// Returns the browser's default log file: `logs/browser.log` inside
@@ -633,7 +723,6 @@ impl BrowserRuntime {
         register_print(&mut realm, Arc::clone(&console))?;
         register_console(&mut realm, console)?;
         register_alert(&mut realm, alert_sink)?;
-        register_fetch(&mut realm, controller)?;
         let initial_url = input
             .url
             .filter(|url| !url.is_empty())
@@ -644,6 +733,7 @@ impl BrowserRuntime {
             device_pixel_ratio,
             viewport,
         )?;
+        register_fetch_with_url(&mut realm, controller, Some(initial_url))?;
         let document_url = net::Url::parse(initial_url)
             .unwrap_or_else(|_| net::Url::parse("about:blank").expect("valid about:blank URL"));
         // Installs the live `Location` accessor on the window registered above.
@@ -663,15 +753,20 @@ impl BrowserRuntime {
             None => html_document.script_sources(),
         };
         log::debug!("evaluating {} page scripts", sources.len());
-        let results = sources
-            .iter()
-            .enumerate()
-            .map(|(index, source)| {
-                log::trace!("evaluating script {index}: {} bytes", source.len());
-                realm.evaluate_script(source)
-            })
-            .collect::<JsResult<Vec<_>>>()
-            .inspect_err(|error| log::warn!("page script failed: {error}"))?;
+        let mut results = Vec::with_capacity(sources.len());
+        for (index, source) in sources.iter().enumerate() {
+            log::trace!("evaluating script {index}: {} bytes", source.len());
+            let result = realm.evaluate_script(source);
+            let checkpoint = webapis::run_window_microtasks(&window);
+            match (result, checkpoint) {
+                (Ok(result), Ok(_)) => results.push(result),
+                (Err(error), _) => {
+                    log::warn!("page script failed: {error}");
+                    return Err(error);
+                }
+                (Ok(_), Err(error)) => return Err(error),
+            }
+        }
         log::debug!("evaluated {} page scripts", results.len());
         Ok(BootedPage {
             session: PageSession {
@@ -698,6 +793,22 @@ pub struct PageSession {
 }
 
 impl PageSession {
+    /// Evaluates one page script as a task and performs its microtask
+    /// checkpoint before returning.
+    ///
+    /// The checkpoint runs even when the script returns an error, matching
+    /// the event-loop rule that a completed script task is followed by a
+    /// microtask checkpoint.
+    pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
+        let result = self.realm.evaluate_script(source);
+        let checkpoint = webapis::run_window_microtasks(&self.window);
+        match (result, checkpoint) {
+            (Err(error), _) => Err(error),
+            (Ok(value), Ok(_)) => Ok(value),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
     /// Returns the current live document serialization after script mutations.
     pub fn document_html(&self) -> String {
         self.document.inner_html()
@@ -727,6 +838,17 @@ impl PageSession {
         self.window.set("innerHeight", height.clone());
         let _ = self.realm.register_global_value("innerWidth", width);
         let _ = self.realm.register_global_value("innerHeight", height);
+        let ratio = match self.window.get("devicePixelRatio") {
+            Some(Value::Number(ratio)) => ratio,
+            _ => 1.0,
+        };
+        if let Some(Value::Function(update)) = self.window.get("__updateMediaQueries") {
+            let _ = update.call(&[
+                Value::Number(viewport.width as f64),
+                Value::Number(viewport.height as f64),
+                Value::Number(ratio),
+            ]);
+        }
     }
 
     /// Updates the output device scale visible as `window.devicePixelRatio`.
@@ -742,6 +864,21 @@ impl PageSession {
         }
         self.window
             .update_replaceable_read_only("devicePixelRatio", Value::Number(device_pixel_ratio));
+        let width = match self.window.get("innerWidth") {
+            Some(Value::Number(width)) => width,
+            _ => 0.0,
+        };
+        let height = match self.window.get("innerHeight") {
+            Some(Value::Number(height)) => height,
+            _ => 0.0,
+        };
+        if let Some(Value::Function(update)) = self.window.get("__updateMediaQueries") {
+            let _ = update.call(&[
+                Value::Number(width),
+                Value::Number(height),
+                Value::Number(device_pixel_ratio),
+            ]);
+        }
         Ok(())
     }
 
@@ -750,7 +887,9 @@ impl PageSession {
     /// Runs listeners registered with `document.addEventListener('click', ...)`.
     /// Element hit testing is not performed.
     pub fn dispatch_click(&self) -> JsResult<Value> {
-        webapis::dispatch_click(&self.document)
+        let result = webapis::dispatch_click(&self.document);
+        webapis::run_window_microtasks(&self.window)?;
+        result
     }
 
     /// Fires a user `click` at the element containing `node`.
@@ -759,7 +898,9 @@ impl PageSession {
     /// bubbles from that element to the document, so both element and
     /// `document` listeners run.
     pub fn dispatch_click_at(&self, node: html::NodeID) -> JsResult<Value> {
-        webapis::dispatch_click_at(&self.document, node)
+        let result = webapis::dispatch_click_at(&self.document, node);
+        webapis::run_window_microtasks(&self.window)?;
+        result
     }
 
     /// Runs this page's elapsed `window.setInterval()` callbacks.
@@ -768,6 +909,15 @@ impl PageSession {
     /// number of interval callbacks delivered during this pump.
     pub fn run_timers(&self) -> JsResult<usize> {
         webapis::run_window_timers(&self.window)
+    }
+
+    /// Runs this page's queued microtasks to a stable queue.
+    ///
+    /// Call this from the page/event-loop thread after a JavaScript task or
+    /// other callback completes. Microtasks queued during the checkpoint are
+    /// included in the returned count.
+    pub fn run_microtasks(&self) -> JsResult<usize> {
+        webapis::run_window_microtasks(&self.window)
     }
 
     /// Runs this page's pending `window.requestAnimationFrame()` callbacks.
@@ -908,6 +1058,7 @@ mod tests {
             html: "<main>content</main>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         let runtime = BrowserRuntime::in_memory();
         let controller = request_controller(None);
