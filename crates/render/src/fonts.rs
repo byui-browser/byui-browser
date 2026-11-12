@@ -85,6 +85,28 @@ impl OutlineFont {
         Some(Self { font, units_per_em })
     }
 
+    /// Parses a downloaded web font: WOFF2, WOFF, TrueType, OpenType, or a
+    /// collection (first face), recognized by its leading signature.
+    ///
+    /// Returns `None` when the data cannot be decompressed or parsed.
+    pub fn from_web_font_bytes(data: &[u8]) -> Option<Self> {
+        let decoded = match data.get(..4) {
+            Some(b"wOF2") => wuff::decompress_woff2(data),
+            Some(b"wOFF") => wuff::decompress_woff1(data),
+            _ => return Self::from_bytes(data.to_vec()),
+        };
+        match decoded {
+            Ok(sfnt) => Self::from_bytes(sfnt),
+            Err(error) => {
+                log::debug!(
+                    "web font ({} bytes) not decompressed: {error:?}",
+                    data.len()
+                );
+                None
+            }
+        }
+    }
+
     /// Loads the first of `paths` that reads and parses as a font, or `None`
     /// when none does.
     pub fn load_first<P: AsRef<std::path::Path>>(
@@ -151,6 +173,180 @@ impl layout::FontMetrics for OutlineFont {
             descent: -self.font.descent_unscaled() * scale,
             line_gap: self.font.line_gap_unscaled() * scale,
         }
+    }
+}
+
+/// One downloadable face from an `@font-face` rule.
+#[derive(Debug, Clone)]
+struct WebFace {
+    /// The rule's `font-family`, matched ignoring ASCII case.
+    family: String,
+    /// The inclusive `font-weight` range the face covers.
+    weight: (u16, u16),
+    italic: bool,
+    font: OutlineFont,
+}
+
+/// The fonts one page's text is laid out and drawn with: a default font
+/// plus the page's `@font-face` web fonts.
+///
+/// Layout measures through its [`layout::FontMetrics`] implementation, which
+/// picks faces with [`layout::FontMetrics::select_font`], and
+/// [`crate::Compositor::compose_page`] draws each run with the face layout
+/// chose. [`layout::FontId::DEFAULT`] is the default font: an
+/// [`OutlineFont`], or the built-in [`BitmapFont`] when there is none;
+/// `FontId(n)` for `n > 0` is the `n`th added face.
+///
+/// Matching follows CSS Fonts 4 §5.2 in simplified form: families are tried
+/// in order (names compared ignoring ASCII case; generic families such as
+/// `serif` match only faces declared with that name), faces with the wanted
+/// style are preferred, then the face whose weight range is nearest using
+/// the §5.2 weight rules. Limitations: there are no system fonts besides the
+/// default, no synthetic bold or italic, and no per-character fallback, so
+/// characters missing from a web font draw its missing-glyph shape;
+/// `unicode-range` is ignored.
+#[derive(Debug, Clone, Default)]
+pub struct FontCollection {
+    default: Option<OutlineFont>,
+    faces: Vec<WebFace>,
+}
+
+impl FontCollection {
+    /// A collection with only a default font; `None` uses [`BitmapFont`].
+    pub fn new(default: Option<OutlineFont>) -> Self {
+        Self {
+            default,
+            faces: Vec::new(),
+        }
+    }
+
+    /// Parses web font `data` (see [`OutlineFont::from_web_font_bytes`]) and
+    /// adds it as a face of `family` covering the `weight` range (inclusive,
+    /// 1–1000) in an upright or `italic` style. Returns `false`, adding
+    /// nothing, when the data is not a usable font.
+    pub fn add_face(
+        &mut self,
+        family: &str,
+        weight: (u16, u16),
+        italic: bool,
+        data: &[u8],
+    ) -> bool {
+        let Some(font) = OutlineFont::from_web_font_bytes(data) else {
+            return false;
+        };
+        self.add_font(family, weight, italic, font);
+        true
+    }
+
+    /// Adds an already parsed font as a face; see [`Self::add_face`].
+    pub fn add_font(&mut self, family: &str, weight: (u16, u16), italic: bool, font: OutlineFont) {
+        log::debug!("font face added: {family:?} weight {weight:?} italic {italic}");
+        self.faces.push(WebFace {
+            family: family.to_owned(),
+            weight: (weight.0.min(weight.1), weight.0.max(weight.1)),
+            italic,
+            font,
+        });
+    }
+
+    /// Copies every face of `other` into this collection, after its own.
+    /// Font data is shared, not parsed again.
+    pub fn extend_faces(&mut self, other: &FontCollection) {
+        self.faces.extend(other.faces.iter().cloned());
+    }
+
+    /// The default font, or `None` when text falls back to [`BitmapFont`].
+    pub fn default_font(&self) -> Option<&OutlineFont> {
+        self.default.as_ref()
+    }
+
+    /// How many web font faces were added.
+    pub fn face_count(&self) -> usize {
+        self.faces.len()
+    }
+
+    /// The outline font for `font`: the added face, or the default font for
+    /// [`layout::FontId::DEFAULT`] and unknown ids. `None` means the bitmap
+    /// font.
+    pub fn outline(&self, font: layout::FontId) -> Option<&OutlineFont> {
+        (font.0 as usize)
+            .checked_sub(1)
+            .and_then(|index| self.faces.get(index))
+            .map(|face| &face.font)
+            .or(self.default.as_ref())
+    }
+
+    fn metrics(&self, font: layout::FontId) -> &dyn layout::FontMetrics {
+        match self.outline(font) {
+            Some(outline) => outline,
+            None => &BitmapFont,
+        }
+    }
+}
+
+/// How well a face's weight range suits a wanted weight, smaller is better
+/// (CSS Fonts 4 §5.2, step 4 for `font-weight`).
+fn weight_rank(wanted: u16, (low, high): (u16, u16)) -> (u8, u16) {
+    let nearest = wanted.clamp(low, high);
+    if nearest == wanted {
+        return (0, 0);
+    }
+    let above = nearest > wanted;
+    let distance = nearest.abs_diff(wanted);
+    let preferred = match wanted {
+        400..=500 => {
+            return match (above, nearest <= 500) {
+                (true, true) => (1, distance),
+                (false, _) => (2, distance),
+                (true, false) => (3, distance),
+            };
+        }
+        0..400 => !above,
+        _ => above,
+    };
+    (if preferred { 1 } else { 2 }, distance)
+}
+
+impl layout::FontMetrics for FontCollection {
+    fn advance(&self, character: char, font_size: f32) -> f32 {
+        self.metrics(layout::FontId::DEFAULT)
+            .advance(character, font_size)
+    }
+
+    fn vertical_metrics(&self, font_size: f32) -> layout::VerticalMetrics {
+        self.metrics(layout::FontId::DEFAULT)
+            .vertical_metrics(font_size)
+    }
+
+    fn select_font(&self, families: &[String], weight: u16, italic: bool) -> layout::FontId {
+        for family in families {
+            let candidates = || {
+                self.faces
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, face)| face.family.eq_ignore_ascii_case(family))
+            };
+            let styled = candidates().any(|(_, face)| face.italic == italic);
+            let best = candidates()
+                .filter(|(_, face)| !styled || face.italic == italic)
+                .min_by_key(|(index, face)| (weight_rank(weight, face.weight), *index));
+            if let Some((index, _)) = best {
+                return layout::FontId(index as u32 + 1);
+            }
+        }
+        layout::FontId::DEFAULT
+    }
+
+    fn font_advance(&self, font: layout::FontId, character: char, font_size: f32) -> f32 {
+        self.metrics(font).advance(character, font_size)
+    }
+
+    fn font_vertical_metrics(
+        &self,
+        font: layout::FontId,
+        font_size: f32,
+    ) -> layout::VerticalMetrics {
+        self.metrics(font).vertical_metrics(font_size)
     }
 }
 
@@ -266,6 +462,116 @@ pub(crate) mod tests {
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
         ])
+    }
+
+    /// Wraps an sfnt (TrueType/OpenType) file in a WOFF 1.0 container with
+    /// every table stored uncompressed, which the format allows.
+    fn woff1(sfnt: &[u8]) -> Vec<u8> {
+        let u16_at = |offset: usize| u16::from_be_bytes([sfnt[offset], sfnt[offset + 1]]);
+        let u32_at =
+            |offset: usize| u32::from_be_bytes(sfnt[offset..offset + 4].try_into().unwrap());
+        let count = usize::from(u16_at(4));
+        let tables: Vec<_> = (0..count)
+            .map(|index| {
+                let record = 12 + 16 * index;
+                (
+                    u32_at(record),
+                    u32_at(record + 4),
+                    u32_at(record + 8) as usize,
+                    u32_at(record + 12) as usize,
+                )
+            })
+            .collect();
+        let padded = |length: usize| (length + 3) & !3;
+        let sfnt_size = 12 + 16 * count + tables.iter().map(|t| padded(t.3)).sum::<usize>();
+        let mut directory = Vec::new();
+        let mut data = Vec::new();
+        let data_start = 44 + 20 * count;
+        for (tag, checksum, offset, length) in &tables {
+            directory.extend(tag.to_be_bytes());
+            directory.extend(((data_start + data.len()) as u32).to_be_bytes());
+            directory.extend((*length as u32).to_be_bytes());
+            directory.extend((*length as u32).to_be_bytes());
+            directory.extend(checksum.to_be_bytes());
+            data.extend(&sfnt[*offset..offset + length]);
+            data.resize(padded(data.len()), 0);
+        }
+        let mut woff = b"wOFF".to_vec();
+        woff.extend(u32_at(0).to_be_bytes());
+        woff.extend(((data_start + data.len()) as u32).to_be_bytes());
+        woff.extend((count as u16).to_be_bytes());
+        woff.extend(0_u16.to_be_bytes());
+        woff.extend((sfnt_size as u32).to_be_bytes());
+        woff.extend([0, 1, 0, 0]);
+        woff.extend([0; 20]);
+        woff.extend(directory);
+        woff.extend(data);
+        woff
+    }
+
+    fn system_font_bytes() -> Option<Vec<u8>> {
+        [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ]
+        .into_iter()
+        .find_map(|path| std::fs::read(path).ok())
+    }
+
+    #[test]
+    fn web_fonts_load_from_woff_and_raw_sfnt_data() {
+        let Some(sfnt) = system_font_bytes() else {
+            return;
+        };
+        let raw = OutlineFont::from_web_font_bytes(&sfnt).expect("TrueType parses");
+        let wrapped = OutlineFont::from_web_font_bytes(&woff1(&sfnt)).expect("WOFF parses");
+        assert_eq!(wrapped.advance('W', 16.0), raw.advance('W', 16.0));
+        assert!(OutlineFont::from_web_font_bytes(b"wOF2 truncated").is_none());
+        assert!(OutlineFont::from_web_font_bytes(b"wOFF").is_none());
+    }
+
+    #[test]
+    fn font_collection_matches_family_style_then_nearest_weight() {
+        use super::{FontCollection, weight_rank};
+        use layout::FontId;
+        let Some(font) = system_font() else {
+            return;
+        };
+        let mut fonts = FontCollection::new(None);
+        fonts.add_font("Brand", (400, 400), false, font.clone()); // FontId(1)
+        fonts.add_font("Brand", (700, 700), false, font.clone()); // FontId(2)
+        fonts.add_font("brand", (300, 300), true, font.clone()); // FontId(3)
+        fonts.add_font("Wide", (100, 900), false, font); // FontId(4)
+        let families = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        let select =
+            |names: &[&str], weight, italic| fonts.select_font(&families(names), weight, italic);
+        assert_eq!(select(&["Brand"], 400, false), FontId(1));
+        assert_eq!(select(&["BRAND"], 700, false), FontId(2));
+        // 600 prefers heavier faces first.
+        assert_eq!(select(&["Brand"], 600, false), FontId(2));
+        // 450 prefers 450..=500, then lighter: 400 beats 700.
+        assert_eq!(select(&["Brand"], 450, false), FontId(1));
+        // Italic wins over weight when an italic face exists.
+        assert_eq!(select(&["Brand"], 700, true), FontId(3));
+        assert_eq!(select(&["Missing", "wide"], 550, false), FontId(4));
+        assert_eq!(select(&["Missing", "serif"], 400, false), FontId::DEFAULT);
+        // Without a default outline font, the default id measures with the
+        // bitmap font, and faces with their own font.
+        assert!(fonts.outline(FontId::DEFAULT).is_none());
+        assert!(fonts.outline(FontId(2)).is_some());
+        assert_eq!(fonts.font_advance(FontId::DEFAULT, 'W', 10.0), 6.0);
+        assert_ne!(fonts.font_advance(FontId(1), 'i', 10.0), 6.0);
+
+        assert_eq!(weight_rank(400, (300, 500)), (0, 0));
+        assert!(weight_rank(300, (200, 200)) < weight_rank(300, (400, 400)));
+        assert!(weight_rank(800, (900, 900)) < weight_rank(800, (700, 700)));
     }
 
     #[test]

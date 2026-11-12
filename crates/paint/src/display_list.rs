@@ -1,6 +1,6 @@
 //! Display-list commands.
 
-use crate::{Color, CornerRadii, PaintBox, Rect};
+use crate::{Color, CornerRadii, FontId, ImageKey, PaintBox, Rect};
 
 /// One ordered drawing command. Coordinates are CSS pixels.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,10 +31,26 @@ pub enum DisplayItem {
         baseline: f32,
         /// Font size; the renderer scales its glyphs to it.
         font_size: f32,
+        /// The face layout measured the run with
+        /// ([`layout::TextFragment::font`]); [`FontId::DEFAULT`] for the
+        /// renderer's default font.
+        font: FontId,
         /// Text to draw.
         text: String,
         /// Text color.
         color: Color,
+    },
+    /// Draws a picture (a decoded bitmap or an SVG document) stretched to
+    /// fill `rect`.
+    ///
+    /// Painted for replaced elements such as `<img>` and inline `<svg>`. The
+    /// renderer looks `image` up in its image store and draws nothing when
+    /// it has no picture for it.
+    Image {
+        /// The replaced box's content box.
+        rect: Rect,
+        /// Which picture to draw.
+        image: ImageKey,
     },
 }
 

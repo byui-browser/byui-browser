@@ -147,13 +147,13 @@ fn inline_styles_and_html_elements_are_audited() {
         .expect("text-shadow has no effect");
     assert_eq!(
         shadow.location.as_deref(),
-        Some("HTML line 2 (style attribute)")
+        Some("HTML markup (style attribute)")
     );
     let canvas = report
         .in_area(Area::Html)
         .find(|finding| finding.feature == "<canvas>")
         .expect("canvas is not rendered");
-    assert_eq!(canvas.location.as_deref(), Some("HTML line 3"));
+    assert_eq!(canvas.location.as_deref(), Some("HTML markup"));
 }
 
 #[test]
