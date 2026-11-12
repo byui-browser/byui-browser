@@ -663,15 +663,20 @@ impl BrowserRuntime {
             None => html_document.script_sources(),
         };
         log::debug!("evaluating {} page scripts", sources.len());
-        let results = sources
-            .iter()
-            .enumerate()
-            .map(|(index, source)| {
-                log::trace!("evaluating script {index}: {} bytes", source.len());
-                realm.evaluate_script(source)
-            })
-            .collect::<JsResult<Vec<_>>>()
-            .inspect_err(|error| log::warn!("page script failed: {error}"))?;
+        let mut results = Vec::with_capacity(sources.len());
+        for (index, source) in sources.iter().enumerate() {
+            log::trace!("evaluating script {index}: {} bytes", source.len());
+            let result = realm.evaluate_script(source);
+            let checkpoint = webapis::run_window_microtasks(&window);
+            match (result, checkpoint) {
+                (Ok(result), Ok(_)) => results.push(result),
+                (Err(error), _) => {
+                    log::warn!("page script failed: {error}");
+                    return Err(error);
+                }
+                (Ok(_), Err(error)) => return Err(error),
+            }
+        }
         log::debug!("evaluated {} page scripts", results.len());
         Ok(BootedPage {
             session: PageSession {
@@ -698,6 +703,22 @@ pub struct PageSession {
 }
 
 impl PageSession {
+    /// Evaluates one page script as a task and performs its microtask
+    /// checkpoint before returning.
+    ///
+    /// The checkpoint runs even when the script returns an error, matching
+    /// the event-loop rule that a completed script task is followed by a
+    /// microtask checkpoint.
+    pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
+        let result = self.realm.evaluate_script(source);
+        let checkpoint = webapis::run_window_microtasks(&self.window);
+        match (result, checkpoint) {
+            (Err(error), _) => Err(error),
+            (Ok(value), Ok(_)) => Ok(value),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
     /// Returns the current live document serialization after script mutations.
     pub fn document_html(&self) -> String {
         self.document.inner_html()
@@ -750,7 +771,9 @@ impl PageSession {
     /// Runs listeners registered with `document.addEventListener('click', ...)`.
     /// Element hit testing is not performed.
     pub fn dispatch_click(&self) -> JsResult<Value> {
-        webapis::dispatch_click(&self.document)
+        let result = webapis::dispatch_click(&self.document);
+        webapis::run_window_microtasks(&self.window)?;
+        result
     }
 
     /// Fires a user `click` at the element containing `node`.
@@ -759,7 +782,9 @@ impl PageSession {
     /// bubbles from that element to the document, so both element and
     /// `document` listeners run.
     pub fn dispatch_click_at(&self, node: html::NodeID) -> JsResult<Value> {
-        webapis::dispatch_click_at(&self.document, node)
+        let result = webapis::dispatch_click_at(&self.document, node);
+        webapis::run_window_microtasks(&self.window)?;
+        result
     }
 
     /// Runs this page's elapsed `window.setInterval()` callbacks.
@@ -768,6 +793,15 @@ impl PageSession {
     /// number of interval callbacks delivered during this pump.
     pub fn run_timers(&self) -> JsResult<usize> {
         webapis::run_window_timers(&self.window)
+    }
+
+    /// Runs this page's queued microtasks to a stable queue.
+    ///
+    /// Call this from the page/event-loop thread after a JavaScript task or
+    /// other callback completes. Microtasks queued during the checkpoint are
+    /// included in the returned count.
+    pub fn run_microtasks(&self) -> JsResult<usize> {
+        webapis::run_window_microtasks(&self.window)
     }
 
     /// Runs this page's pending `window.requestAnimationFrame()` callbacks.
