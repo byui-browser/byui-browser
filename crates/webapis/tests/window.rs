@@ -73,6 +73,45 @@ fn window_navigator_accepts_extra_arguments_without_changing_the_result() {
 }
 
 #[test]
+fn window_performance_exposes_a_stable_monotonic_clock() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "performance === window.performance && \
+             performance.timeOrigin > 0 && \
+             performance.now() >= 0",
+        ),
+        Ok(Value::Boolean(true))
+    );
+
+    let first = realm.evaluate_script("performance.now()").unwrap();
+    thread::sleep(Duration::from_millis(1));
+    let second = realm.evaluate_script("window.performance.now()").unwrap();
+    let (Value::Number(first), Value::Number(second)) = (first, second) else {
+        panic!("performance.now() should return numbers");
+    };
+    assert!(second >= first);
+}
+
+#[test]
+fn window_performance_object_and_time_origin_are_read_only() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var original = window.performance; \
+             window.performance = null; \
+             performance.timeOrigin = 0; \
+             window.performance === original && performance.timeOrigin > 0",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
 fn window_origin_uses_the_renderer_security_context() {
     let mut realm = Realm::new();
     register_window_with_security_context(
@@ -359,6 +398,64 @@ fn inner_height_is_replaceable_like_the_cssom_view_attribute() {
     assert_eq!(
         realm.evaluate_script("window.innerHeight = 42; window.innerHeight"),
         Ok(Value::Number(42.0))
+    );
+}
+
+#[test]
+fn match_media_exposes_window_management_and_viewport_features() {
+    let mut realm = Realm::new();
+    webapis::register_window_with_url_device_pixel_ratio_and_viewport(
+        &mut realm,
+        "https://example.test/",
+        2.0,
+        Some(webapis::ViewportSize {
+            width: 800,
+            height: 600,
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var a = matchMedia('(min-width: 700px) and (orientation: landscape)'); \
+             var b = window.matchMedia('(resolution: 192dpi)'); \
+             var c = matchMedia('(display-state: normal) and (resizable: true)'); \
+             a.media === '(min-width: 700px) and (orientation: landscape)' && \
+             a.matches && b.matches && c.matches && a === matchMedia('(min-width: 700px) and (orientation: landscape)') === false",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn match_media_change_events_update_matches_and_support_legacy_listeners() {
+    let mut realm = Realm::new();
+    webapis::register_window_with_url_device_pixel_ratio_and_viewport(
+        &mut realm,
+        "https://example.test/",
+        1.0,
+        Some(webapis::ViewportSize {
+            width: 800,
+            height: 600,
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var list = matchMedia('(min-width: 700px)'); var calls = 0; var seen = false; \
+             function listener(event) { calls = calls + 1; seen = event.matches === false && event.media === list.media; } \
+             list.addListener(listener); list.onchange = listener; \
+             window.__updateMediaQueries(500, 600, 1); \
+             list.matches === false && calls === 2 && seen",
+        ),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(
+        realm.evaluate_script(
+            "list.removeListener(listener); window.__updateMediaQueries(800, 600, 1); calls === 3",
+        ),
+        Ok(Value::Boolean(true))
     );
 }
 
