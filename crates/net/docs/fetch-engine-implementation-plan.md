@@ -25,7 +25,7 @@ operations, so Rust callers must migrate those calls.
 
 | Priority | Issue                                                                                                                                                                                                                                                                                           | Potential solution                                                                                                                                                                                                                                         |
 | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| High     | `FetchServices` is a broad capability interface combining request/response authorization, cookies, service workers, cache partitioning, and diagnostics. Most current browser implementations are no-op adapters, so ownership and failure behavior are difficult to see at call sites.         | Split the interface into focused capability boundaries or an explicit services aggregate. Document which decisions are per request, per redirect hop, or per response, and define fail-closed behavior for every absent or unsupported capability.         |
+| High     | `FetchServices` is a broad capability interface combining request/response authorization, cookies, service workers, and cache partitioning. Most current browser implementations are no-op adapters, so ownership and failure behavior are difficult to see at call sites.         | Split the interface into focused capability boundaries or an explicit services aggregate. Keep the separate non-failing `NetworkObserver` for lifecycle diagnostics. Document which decisions are per request, per redirect hop, or per response, and define fail-closed behavior for every absent or unsupported capability.         |
 | Medium   | Provider-backed scheme handlers repeat the same method gate, provider lookup, cancellation wait, and response-finalization sequence across `blob:`, `file:`, and `byui:`.                                                                                                                       | Retain one common provider execution path and move scheme metadata, provider selection, and read-method policy into a declarative dispatch layer. Keep provider-specific ownership and error categories explicit.                                          |
 | Medium   | `Headers` mixes ordered storage, public mutations, guards, forbidden-header policy, CORS safelisting, exposure parsing, and transport conversion. Its public iteration and lookup repeatedly scan and allocate, including an effectively O(n²) combination path.                                | Split storage/API from guard and CORS policy; implement combined iteration in one pass and avoid temporary allocations in ordinary `get` calls.                                                                                                            |
 | Medium   | `Request` and `InternalResponse` expose broadly mutable internal field bags. Request configuration, redirect state, cache partitioning, and transport state are intermixed.                                                                                                                     | Introduce caller-facing request initialization plus prepared/redirect execution state, and use narrow constructors and transition methods for internal responses.                                                                                          |
@@ -49,7 +49,8 @@ sequenced as follows:
    cookies, service-worker decisions, and security-policy checks.
 3. Expand the process-local cache into a standards-aware, partitioned cache
    with freshness, validators, revalidation, and 304 handling.
-4. Add transport limits and diagnostics, then broaden conformance coverage.
+4. Add transport limits and complete diagnostics for body timing and
+   cancellation, then expand conformance coverage.
 
 The `byui:` and `file:` providers should receive maintenance fixes and
 regression tests during these slices, but they are no longer the critical path.
@@ -100,7 +101,8 @@ them with browser-owned implementations for:
 - CSP, mixed-content, Upgrade Insecure Requests, CORP, MIME/nosniff, and SRI;
 - service-worker interception and bypass decisions;
 - keepalive quotas and lifetime handling;
-- offline/network state, timing, and diagnostics hooks; and
+- offline/network state, complete timing coverage, and browser integrations for
+  the existing diagnostics hooks; and
 - browser client, destination, initiator, and navigation context.
 
 Each hook must specify its fail-closed, unsupported, or default behavior when

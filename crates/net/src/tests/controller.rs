@@ -3,19 +3,28 @@
 use std::{
     io::{Read, Write},
     net::TcpListener,
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     thread,
 };
 
 use crate::{
-    AbortController, Body, CacheMode, Config, Request, RequestController, RequestError,
-    ResponseType,
+    AbortController, Body, CacheMode, Config, NetworkEvent, NetworkObserver, NetworkPhase, Request,
+    RequestController, RequestError, ResponseType,
 };
 use futures_util::StreamExt;
 use reqwest::{
     Method, StatusCode,
     header::{HeaderName, HeaderValue},
 };
+
+#[derive(Default)]
+struct EventLog(Mutex<Vec<NetworkEvent>>);
+
+impl NetworkObserver for EventLog {
+    fn observe(&self, event: NetworkEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
 
 #[test]
 /// Verifies the convenience GET constructor sets Fetch defaults.
@@ -185,6 +194,58 @@ fn can_fetch_resource_from_local_server() {
     assert_eq!(
         runtime.block_on(response.body.bytes()).unwrap(),
         b"local body"
+    );
+}
+
+#[test]
+/// Verifies observers distinguish scheduling, transport, and completion.
+fn observer_receives_network_lifecycle_events() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("test server should receive a request");
+        let mut request = [0; 4096];
+        let _ = stream
+            .read(&mut request)
+            .expect("test server should read request");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .expect("test server should write response");
+    });
+    let events = Arc::new(EventLog::default());
+    let client = RequestController::builder(Config::default())
+        .with_network_observer(events.clone())
+        .build()
+        .expect("controller should initialize");
+    let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
+    let response = runtime
+        .block_on(client.fetch(Request::get(&address)))
+        .expect("request should succeed");
+    server.join().expect("test server should exit");
+
+    let events = events.0.lock().unwrap();
+    let phases: Vec<_> = events.iter().map(|event| event.phase).collect();
+    for phase in [
+        NetworkPhase::Started,
+        NetworkPhase::Prepared,
+        NetworkPhase::CacheLookup,
+        NetworkPhase::CacheMiss,
+        NetworkPhase::QueueStarted,
+        NetworkPhase::QueueAdmitted,
+        NetworkPhase::TransportStarted,
+        NetworkPhase::ResponseHeaders,
+        NetworkPhase::ResponseFinalized,
+        NetworkPhase::Completed,
+    ] {
+        assert!(phases.contains(&phase), "missing {phase:?}: {phases:?}");
+    }
+    assert!(events.windows(2).all(|pair| pair[0].at <= pair[1].at));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.status == Some(response.status))
     );
 }
 

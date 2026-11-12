@@ -3,6 +3,7 @@
 use crate::{
     api::{
         body::Body,
+        diagnostics::NetworkPhase,
         error::RequestError,
         request::{CacheMode, PreparedRequest, Request},
         response::{InternalResponse, Response, has_null_body},
@@ -43,12 +44,20 @@ impl RequestController {
                 CacheMode::NoStore | CacheMode::Reload | CacheMode::NoCache => None,
             };
             if cacheable {
+                self.observe(&request, NetworkPhase::CacheLookup, &url, None, false);
                 if let Some(allow_stale) = cache_lookup
                     && let Some(cached) =
                         self.inner
                             .cache
                             .get_with_staleness(&request, &url, allow_stale)
                 {
+                    self.observe(
+                        &request,
+                        NetworkPhase::CacheHit,
+                        &url,
+                        Some(cached.status.as_u16()),
+                        true,
+                    );
                     log::debug!(
                         "cache hit: {} {} -> {} ({} bytes, allow_stale={allow_stale})",
                         request.method(),
@@ -76,9 +85,17 @@ impl RequestController {
                         .inspect_err(|_| {
                             self.clear_preflight_cache_after_failure(&request, &url);
                         })?;
+                    self.observe(
+                        &request,
+                        NetworkPhase::ResponseFinalized,
+                        &url,
+                        Some(internal.status.as_u16()),
+                        true,
+                    );
                     return Ok(internal.expose());
                 }
                 if cache_lookup.is_some() {
+                    self.observe(&request, NetworkPhase::CacheMiss, &url, None, false);
                     log::debug!(
                         "cache miss: {} {}",
                         request.method(),
@@ -225,6 +242,7 @@ impl RequestController {
                 crate::log_url::loggable(next_url.as_str()),
                 request.redirect_count + 1
             );
+            self.observe(&request, NetworkPhase::Redirect, &url, Some(status), false);
             request.apply_redirect_policy(&next_url, &candidate.headers);
             request.follow_url(next_url.clone());
             self.inner
@@ -244,6 +262,13 @@ impl RequestController {
             .inspect_err(|_| {
                 self.clear_preflight_cache_after_failure(&request, &url);
             })?;
+        self.observe(
+            &request,
+            NetworkPhase::ResponseFinalized,
+            &url,
+            Some(response.status.as_u16()),
+            response.from_cache,
+        );
         self.process_response_cookies(&request, &url, &mut response)?;
 
         if request.is_cacheable_method() && request.cache_mode != CacheMode::NoStore {

@@ -65,6 +65,20 @@ pub enum Instruction {
     /// Pushes the call argument at this position, or `undefined` when the
     /// caller passed fewer arguments.
     LoadArgument(u16),
+    /// Reads a binding captured by the running function.
+    LoadCapture {
+        /// Capture index.
+        index: u16,
+        /// Binding-name pool index used in diagnostics.
+        name: u16,
+    },
+    /// Stores the value on top of the stack into a captured binding.
+    StoreCapture {
+        /// Capture index.
+        index: u16,
+        /// Binding-name pool index used in diagnostics.
+        name: u16,
+    },
     /// Pushes a new function value made from the template at this index of
     /// [`Chunk::functions`](super::Chunk::functions).
     MakeFunction(u16),

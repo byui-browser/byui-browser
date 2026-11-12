@@ -13,10 +13,18 @@ pub enum ResourceType {
 /// One completed resource request suitable for rendering in a network table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestEntry {
+    /// Redacted request URL.
     pub url: String,
+    /// HTTP status, or `None` when the request failed before headers arrived.
     pub status: Option<u16>,
+    /// Resource class assigned by the browser loader.
     pub resource_type: ResourceType,
+    /// Total time from controller acceptance through response return, in milliseconds.
     pub duration_ms: u64,
+    /// Time waiting for a shared transport slot, in milliseconds.
+    pub queue_ms: Option<u64>,
+    /// Time from transport start until response headers, in milliseconds.
+    pub headers_ms: Option<u64>,
 }
 
 impl RequestEntry {
@@ -31,7 +39,16 @@ impl RequestEntry {
             status,
             resource_type,
             duration_ms,
+            queue_ms: None,
+            headers_ms: None,
         }
+    }
+
+    /// Adds measured scheduler-queue and transport-header timings.
+    pub fn with_network_timing(mut self, queue_ms: Option<u64>, headers_ms: Option<u64>) -> Self {
+        self.queue_ms = queue_ms;
+        self.headers_ms = headers_ms;
+        self
     }
 }
 

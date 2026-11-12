@@ -14,17 +14,28 @@ pub(super) enum NetworkColumn {
     Name,
     Status,
     Type,
+    Queue,
+    Headers,
     Time,
 }
 
 impl NetworkColumn {
-    pub(super) const ALL: [Self; 4] = [Self::Name, Self::Status, Self::Type, Self::Time];
+    pub(super) const ALL: [Self; 6] = [
+        Self::Name,
+        Self::Status,
+        Self::Type,
+        Self::Queue,
+        Self::Headers,
+        Self::Time,
+    ];
 
     fn title(self) -> &'static str {
         match self {
             Self::Name => "Name",
             Self::Status => "Status",
             Self::Type => "Type",
+            Self::Queue => "Queue",
+            Self::Headers => "Headers",
             Self::Time => "Time",
         }
     }
@@ -35,13 +46,18 @@ impl NetworkColumn {
             Self::Name => 0.0,
             Self::Status => 76.0,
             Self::Type => 104.0,
+            Self::Queue => 76.0,
+            Self::Headers => 88.0,
             Self::Time => 84.0,
         }
     }
 
     /// Numbers read best aligned on their last digit.
     fn right_aligned(self) -> bool {
-        matches!(self, Self::Status | Self::Time)
+        matches!(
+            self,
+            Self::Status | Self::Queue | Self::Headers | Self::Time
+        )
     }
 
     /// `Name` identifies each request, so it cannot be hidden.
@@ -64,6 +80,12 @@ impl NetworkColumn {
                 .status
                 .map_or_else(|| "failed".to_owned(), |status| status.to_string()),
             Self::Type => resource_type_name(entry.resource_type).to_owned(),
+            Self::Queue => entry
+                .queue_ms
+                .map_or_else(|| "—".to_owned(), |ms| format!("{ms} ms")),
+            Self::Headers => entry
+                .headers_ms
+                .map_or_else(|| "—".to_owned(), |ms| format!("{ms} ms")),
             Self::Time => format!("{} ms", entry.duration_ms),
         }
     }
@@ -77,6 +99,8 @@ impl NetworkColumn {
             Self::Type => {
                 resource_type_name(a.resource_type).cmp(resource_type_name(b.resource_type))
             }
+            Self::Queue => a.queue_ms.cmp(&b.queue_ms),
+            Self::Headers => a.headers_ms.cmp(&b.headers_ms),
             Self::Time => a.duration_ms.cmp(&b.duration_ms),
         }
     }
@@ -117,7 +141,7 @@ const CELL_PAD: f32 = 10.0;
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct NetworkView {
     /// Indexed like [`NetworkColumn::ALL`].
-    visible: [bool; 4],
+    visible: [bool; 6],
     sort: Option<(NetworkColumn, SortDirection)>,
     /// Top-left corner of the open column menu, in logical pixels.
     menu: Option<(f32, f32)>,
@@ -126,7 +150,7 @@ pub(super) struct NetworkView {
 impl NetworkView {
     pub(super) fn new() -> Self {
         Self {
-            visible: [true; 4],
+            visible: [true; 6],
             sort: None,
             menu: None,
         }
@@ -606,7 +630,7 @@ mod tests {
         let table = table();
         let at = |x: f32| Some((f64::from(x), f64::from(table.top() + 5.0)));
         let columns = view.columns(table);
-        assert_eq!(columns.len(), 4);
+        assert_eq!(columns.len(), 6);
         for (column, left, right) in &columns {
             assert!(left < right);
             assert_eq!(view.heading_at(table, at(left + 1.0)), Some(*column));
@@ -633,6 +657,8 @@ mod tests {
             [
                 NetworkColumn::Name,
                 NetworkColumn::Status,
+                NetworkColumn::Queue,
+                NetworkColumn::Headers,
                 NetworkColumn::Time
             ]
         );

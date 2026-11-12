@@ -36,7 +36,7 @@ pub use event::{
     abort_controller_constructor, add_event_listener, dispatch_click, dispatch_click_at,
     dispatch_event, event_constructor, remove_event_listener,
 };
-pub use fetch::{fetch, register_fetch};
+pub use fetch::{fetch, register_fetch, register_fetch_with_url};
 pub use location::{
     LocationNavigate, NavigationBehavior, register_location, register_location_with_navigation,
 };
@@ -47,5 +47,5 @@ pub use window::{
     register_window_with_security_context_and_viewport, register_window_with_url,
     register_window_with_url_and_device_pixel_ratio,
     register_window_with_url_device_pixel_ratio_and_viewport, run_window_animation_frames,
-    run_window_timers,
+    run_window_microtasks, run_window_timers,
 };

@@ -6,6 +6,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method};
 
 use crate::{
     HeaderGuard, Headers,
+    api::diagnostics::NetworkPhase,
     api::{
         error::RequestError,
         headers::cors_unsafe_request_header_names,
@@ -45,6 +46,7 @@ impl RequestController {
             .preflight_cache
             .allows(request, url, &unsafe_names)
         {
+            self.observe(request, NetworkPhase::PreflightCacheHit, url, None, false);
             log::debug!(
                 "cors preflight cache hit: {} {}",
                 request.method(),
@@ -52,6 +54,7 @@ impl RequestController {
             );
             return Ok(());
         }
+        self.observe(request, NetworkPhase::PreflightCacheMiss, url, None, false);
 
         let headers = preflight_headers(request, &unsafe_names)?;
         let mut preflight = request.clone_without_body();
@@ -70,6 +73,7 @@ impl RequestController {
             request.method(),
             crate::log_url::loggable(url.as_str())
         );
+        self.observe(request, NetworkPhase::PreflightStarted, url, None, false);
         let response = self
             .inner
             .scheduler
@@ -85,6 +89,13 @@ impl RequestController {
             .inspect_err(|_| {
                 self.inner.preflight_cache.clear_for_request(request, url);
             })?;
+        self.observe(
+            request,
+            NetworkPhase::PreflightCompleted,
+            url,
+            Some(response.status.as_u16()),
+            false,
+        );
 
         if !response.status.is_success()
             || !self

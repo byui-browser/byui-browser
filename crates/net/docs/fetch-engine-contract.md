@@ -2,7 +2,8 @@
 
 `net` is the reusable Rust Fetch engine. It owns request preparation, response
 tainting and exposure, body transport, cancellation, process-local scheduling,
-and coordination of cache, credential, security, and transport services. It does
+and coordination of cache, credential, security, transport, and lifecycle
+diagnostic services. It does
 not create JavaScript objects or promises. `webapis` owns that conversion; its
 current binding returns a string and is not yet a complete Fetch binding.
 
@@ -10,6 +11,18 @@ current binding returns a string and is not yet a complete Fetch binding.
 headers pass Fetch filtering. Its abort-aware `Body` holds the scheduler permit
 until it is consumed or dropped. Body errors may occur after headers. Callers
 cannot obtain the transport response.
+
+Controllers may install a [`NetworkObserver`] with
+`RequestController::builder(...).with_network_observer(...)`. The observer is
+shared by controller clones, receives best-effort non-failing events, and must
+be quick, non-blocking, and panic-free. The feed reports request preparation,
+cache and preflight decisions, queue start and admission, transport start and
+response headers, redirects, response finalization, and completion or failure
+for the relevant execution paths. The abort phase is reserved in the public
+enum but is not currently emitted by the controller's cancellation branch.
+Events contain request IDs, active URLs, timestamps, status when known, cache
+provenance, and redirect counts, but never bodies, credentials, or error
+strings.
 
 `Body` owns one source and reports one lifecycle state for helper locking,
 direct streaming, transport handoff, completion, failure, and abort. Nullness
