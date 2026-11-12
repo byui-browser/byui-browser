@@ -3,8 +3,7 @@
 use super::{CallableKind, Chunk, FunctionTemplate, Instruction};
 use crate::Value;
 use crate::ast::{
-    ArrowBody, ClassDefinition, Expr, LogicalOperator, MemberProperty, Program, PropertyKey,
-    Statement, VarKind,
+    ArrowBody, ClassDefinition, Expr, MemberProperty, Program, PropertyKey, Statement, VarKind,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -13,6 +12,8 @@ use std::sync::Arc;
 
 #[path = "control_flow.rs"]
 mod control_flow;
+#[path = "expressions.rs"]
+mod expressions;
 
 /// A source construct that the initial bytecode compiler cannot lower yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +84,9 @@ pub struct Compiler {
     /// Enclosing loops and exception handlers of the code being compiled,
     /// outermost first.
     control: Vec<Control>,
+    /// For each optional chain being compiled, the `?.` jumps waiting for the
+    /// chain's end, each with the number of extra values it must discard.
+    optional_exits: Vec<Vec<(usize, usize)>>,
 }
 
 /// A construct that an abrupt exit may have to leave.
@@ -143,6 +147,7 @@ impl Compiler {
             enclosing: HashSet::new(),
             live: 0,
             control: Vec::new(),
+            optional_exits: Vec::new(),
         }
     }
 
@@ -170,6 +175,7 @@ impl Compiler {
             enclosing,
             live: 0,
             control: Vec::new(),
+            optional_exits: Vec::new(),
         }
     }
 
@@ -693,11 +699,7 @@ impl Compiler {
             Expr::Boolean(value) => self.constant(Value::Boolean(*value)),
             Expr::Null => self.constant(Value::Null),
             Expr::Undefined => self.constant(Value::Undefined),
-            Expr::Unary { operator, operand } => {
-                self.compile_expression(operand)?;
-                self.chunk.emit(Instruction::Unary(*operator));
-                Ok(())
-            }
+            Expr::Unary { operator, operand } => self.compile_unary(*operator, operand),
             Expr::Binary {
                 left,
                 operator,
@@ -723,12 +725,7 @@ impl Compiler {
                 Ok(())
             }
             Expr::Call { callee, arguments } => self.compile_call(callee, arguments),
-            Expr::New { callee, arguments } => {
-                self.compile_expression(callee)?;
-                let count = self.compile_arguments(arguments)?;
-                self.chunk.emit(Instruction::New(count));
-                Ok(())
-            }
+            Expr::New { callee, arguments } => self.compile_new(callee, arguments),
             Expr::SuperCall { arguments } => {
                 if self.function != Some(CallableKind::DerivedConstructor) {
                     return Err(CompileError {
@@ -795,23 +792,48 @@ impl Compiler {
                             self.compile_expression(&property.value)?;
                             self.chunk.emit(Instruction::DefineComputedProperty);
                         }
+                        PropertyKey::Spread => {
+                            self.compile_expression(&property.value)?;
+                            self.chunk.emit(Instruction::SpreadProperties);
+                        }
                     }
                 }
                 Ok(())
             }
-            Expr::Array(elements) => {
-                for element in elements {
-                    match element {
-                        Some(element) => self.compile_expression(element)?,
-                        None => self.constant(Value::Undefined)?,
-                    }
-                }
-                let count = u16::try_from(elements.len()).map_err(|_| {
-                    CompileError::unsupported("array literal with too many elements")
-                })?;
-                self.chunk.emit(Instruction::NewArray(count));
-                Ok(())
+            Expr::Array(elements) => self.compile_array(elements),
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => self.compile_conditional(test, consequent, alternate),
+            Expr::Sequence(operands) => self.compile_comma(operands),
+            Expr::Template {
+                quasis,
+                expressions,
+            } => self.compile_template(quasis, expressions),
+            Expr::Update {
+                target,
+                operator,
+                prefix,
+            } => self.compile_update(target, *operator, *prefix),
+            Expr::CompoundAssign {
+                target,
+                operator,
+                value,
+            } => self.compile_compound(target, *operator, value),
+            Expr::Delete(operand) => self.compile_delete(operand),
+            Expr::OptionalChain(chain) => self.compile_optional_chain(chain),
+            Expr::OptionalMember { object, property } => {
+                self.compile_optional_member(object, property)
             }
+            Expr::OptionalCall { callee, arguments } => {
+                self.compile_optional_call(callee, arguments)
+            }
+            Expr::Spread(_) => Err(CompileError {
+                message: "spread is only valid in an array, call, or object literal".into(),
+                unsupported: false,
+                location: None,
+            }),
         }
     }
 
@@ -835,43 +857,6 @@ impl Compiler {
             unsupported: false,
             location: None,
         })
-    }
-
-    /// Lowers a call. A member callee is a method call: the object is kept
-    /// below the function so it becomes `this`.
-    fn compile_call(&mut self, callee: &Expr, arguments: &[Expr]) -> Result<(), CompileError> {
-        match callee {
-            Expr::Member { object, property } => {
-                self.compile_expression(object)?;
-                self.chunk.emit(Instruction::Dup);
-                match property {
-                    MemberProperty::Named(name) => {
-                        let index = self.name_constant(name)?;
-                        self.chunk.emit(Instruction::LoadProperty(index));
-                    }
-                    MemberProperty::Computed(key) => {
-                        self.compile_expression(key)?;
-                        self.chunk.emit(Instruction::LoadComputedProperty);
-                    }
-                }
-                let count = self.compile_arguments(arguments)?;
-                self.chunk.emit(Instruction::CallMethod(count));
-            }
-            Expr::SuperMember { name } => {
-                self.require_super()?;
-                self.chunk.emit(Instruction::LoadThis);
-                let index = self.name_constant(name)?;
-                self.chunk.emit(Instruction::LoadSuperProperty(index));
-                let count = self.compile_arguments(arguments)?;
-                self.chunk.emit(Instruction::CallMethod(count));
-            }
-            _ => {
-                self.compile_expression(callee)?;
-                let count = self.compile_arguments(arguments)?;
-                self.chunk.emit(Instruction::Call(count));
-            }
-        }
-        Ok(())
     }
 
     /// Lowers a class declaration: the optional superclass value, the
@@ -980,26 +965,6 @@ impl Compiler {
                 name: name_index,
             });
         }
-        Ok(())
-    }
-
-    fn compile_logical(
-        &mut self,
-        left: &Expr,
-        operator: LogicalOperator,
-        right: &Expr,
-    ) -> Result<(), CompileError> {
-        self.compile_expression(left)?;
-        let jump = match operator {
-            LogicalOperator::And => self.chunk.emit(Instruction::JumpIfFalse(usize::MAX)),
-            LogicalOperator::Or => self.chunk.emit(Instruction::JumpIfTrue(usize::MAX)),
-        };
-        self.chunk.emit(Instruction::Pop);
-        self.compile_expression(right)?;
-        self.chunk.code[jump] = match operator {
-            LogicalOperator::And => Instruction::JumpIfFalse(self.chunk.code.len()),
-            LogicalOperator::Or => Instruction::JumpIfTrue(self.chunk.code.len()),
-        };
         Ok(())
     }
 
