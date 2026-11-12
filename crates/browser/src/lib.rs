@@ -222,6 +222,17 @@ impl FileAccessConfiguration {
 /// Browser services use a conservative no-cookie, no-worker default and
 /// permit requests carrying browser client context.
 pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<RequestController> {
+    request_controller_with_observer(file_access, None)
+}
+
+/// Builds a browser request controller and optionally reports network lifecycle events.
+///
+/// The observer is diagnostic-only and receives redacted URLs, never request
+/// or response bodies, headers, credentials, or errors.
+pub fn request_controller_with_observer(
+    file_access: Option<FileAccessConfiguration>,
+    observer: Option<Arc<dyn net::NetworkObserver>>,
+) -> Arc<RequestController> {
     let mut providers = SchemeProviders::new().with_page(byui_provider::provider());
     log::debug!(
         "building request controller (file provider: {})",
@@ -240,10 +251,15 @@ pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<R
             file_access.content_policy,
         ));
     }
+    let builder = RequestController::builder(net::Config::default())
+        .with_fetch_services(Arc::new(fetch_services::BrowserFetchServices::default()))
+        .with_scheme_providers(providers);
+    let builder = match observer {
+        Some(observer) => builder.with_network_observer(observer),
+        None => builder,
+    };
     Arc::new(
-        RequestController::builder(net::Config::default())
-            .with_fetch_services(Arc::new(fetch_services::BrowserFetchServices::default()))
-            .with_scheme_providers(providers)
+        builder
             .build()
             .expect("network controller should initialize"),
     )

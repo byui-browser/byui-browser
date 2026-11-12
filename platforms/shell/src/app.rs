@@ -2,6 +2,7 @@
 //! pointer handling for the painted chrome, and presenting frames through
 //! `softbuffer`.
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -9,7 +10,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use ab_glyph::FontVec;
-use net::Url;
+use net::{NetworkEvent, NetworkPhase, Url};
 use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use tiny_skia::Pixmap;
 use webapis::{AlertSink, NavigationBehavior};
@@ -742,6 +743,75 @@ impl App {
         self.redraw();
     }
 
+    /// Replaces synthetic resource rows with completed controller diagnostics.
+    fn record_network_diagnostics(&mut self, events: &[NetworkEvent]) {
+        #[derive(Default)]
+        struct RequestTiming {
+            url: String,
+            started: Option<Instant>,
+            queue_started: Option<Instant>,
+            queue_ms: Option<u64>,
+            transport_started: Option<Instant>,
+            headers_ms: Option<u64>,
+            status: Option<u16>,
+        }
+
+        let mut requests: HashMap<u64, RequestTiming> = HashMap::new();
+        let mut completed = Vec::new();
+        for event in events {
+            let request = requests.entry(event.request_id).or_default();
+            request.url = event.url.clone();
+            request.status = event.status.or(request.status);
+            match event.phase {
+                NetworkPhase::Started => request.started = Some(event.at),
+                NetworkPhase::QueueStarted => request.queue_started = Some(event.at),
+                NetworkPhase::QueueAdmitted => {
+                    request.queue_ms = request.queue_started.map(|started| {
+                        event.at.saturating_duration_since(started).as_millis() as u64
+                    });
+                }
+                NetworkPhase::TransportStarted => request.transport_started = Some(event.at),
+                NetworkPhase::ResponseHeaders => {
+                    request.headers_ms = request.transport_started.map(|started| {
+                        event.at.saturating_duration_since(started).as_millis() as u64
+                    });
+                }
+                NetworkPhase::Completed | NetworkPhase::Failed | NetworkPhase::Aborted => {
+                    completed.push((event.request_id, event.at, event.status));
+                }
+                _ => {}
+            }
+        }
+        if completed.is_empty() {
+            return;
+        }
+        completed.sort_by_key(|(_, ended, _)| *ended);
+        self.network_log.clear();
+        for (index, (id, ended, terminal_status)) in completed.into_iter().enumerate() {
+            let Some(request) = requests.remove(&id) else {
+                continue;
+            };
+            let duration_ms = request
+                .started
+                .map(|started| ended.saturating_duration_since(started).as_millis() as u64)
+                .unwrap_or_default();
+            let resource_type = if index == 0 {
+                devtools::network::ResourceType::Document
+            } else {
+                resource_type_for_url(&request.url)
+            };
+            self.network_log.record(
+                devtools::network::RequestEntry::new(
+                    request.url,
+                    terminal_status.or(request.status),
+                    resource_type,
+                    duration_ms,
+                )
+                .with_network_timing(request.queue_ms, request.headers_ms),
+            );
+        }
+    }
+
     fn begin_address_edit(&mut self) {
         if let Some(find) = &mut self.find {
             find.focused = false;
@@ -875,8 +945,16 @@ impl App {
                 self.redraw();
             }
         }
-        // After the new page cleared the log, so the load leads its timeline.
-        self.record_performance(navigation.timeline);
+        self.record_network_diagnostics(&navigation.network_events);
+        if let Some(panel) = &mut self.devtools_panel {
+            sync_devtools_panel(panel, &self.network_log, &self.console, &self.performance);
+        }
+        // Replace coarse loader download spans with phases emitted by `net`.
+        // Parse, style, layout, paint, and script events remain unchanged.
+        let mut timeline = navigation.timeline;
+        timeline.retain(|event| event.category != EventCategory::Network);
+        timeline.extend(network_phase_timeline(&navigation.network_events));
+        self.record_performance(timeline);
     }
 
     /// Starts a fresh Performance timeline for a newly shown page.
@@ -2402,6 +2480,148 @@ fn record_events(log: &Mutex<PerformanceLog>, events: impl IntoIterator<Item = T
     }
 }
 
+/// Splits each completed Fetch request into the engine phases that can explain
+/// a slow Network bar. Events without a paired endpoint are intentionally not
+/// shown: an unfinished request has no meaningful duration yet.
+fn network_phase_timeline(events: &[NetworkEvent]) -> Vec<TimelineEvent> {
+    #[derive(Default)]
+    struct Starts {
+        url: String,
+        request: Option<Instant>,
+        cache: Option<Instant>,
+        preflight: Option<Instant>,
+        queue: Option<Instant>,
+        transport: Option<Instant>,
+        headers: Option<Instant>,
+        finalized: Option<Instant>,
+    }
+
+    let mut ordered = events.to_vec();
+    ordered.sort_by_key(|event| event.at);
+    let mut starts: HashMap<u64, Starts> = HashMap::new();
+    let mut timeline = Vec::new();
+    for event in ordered {
+        let state = starts.entry(event.request_id).or_default();
+        state.url = event.url.clone();
+        match event.phase {
+            NetworkPhase::Started => state.request = Some(event.at),
+            NetworkPhase::Prepared => {
+                record_network_phase(
+                    &mut timeline,
+                    "Prepare",
+                    state.request,
+                    event.at,
+                    &state.url,
+                );
+            }
+            NetworkPhase::CacheLookup => state.cache = Some(event.at),
+            NetworkPhase::CacheHit | NetworkPhase::CacheMiss => {
+                record_network_phase(
+                    &mut timeline,
+                    "Cache lookup",
+                    state.cache,
+                    event.at,
+                    &state.url,
+                );
+            }
+            NetworkPhase::PreflightStarted => state.preflight = Some(event.at),
+            NetworkPhase::PreflightCompleted => {
+                record_network_phase(
+                    &mut timeline,
+                    "CORS preflight",
+                    state.preflight,
+                    event.at,
+                    &state.url,
+                );
+            }
+            NetworkPhase::QueueStarted => state.queue = Some(event.at),
+            NetworkPhase::QueueAdmitted => {
+                record_network_phase(&mut timeline, "Queue", state.queue, event.at, &state.url);
+            }
+            NetworkPhase::TransportStarted => state.transport = Some(event.at),
+            NetworkPhase::ResponseHeaders => {
+                record_network_phase(
+                    &mut timeline,
+                    "Transport",
+                    state.transport,
+                    event.at,
+                    &state.url,
+                );
+                state.headers = Some(event.at);
+            }
+            NetworkPhase::ResponseFinalized => {
+                record_network_phase(
+                    &mut timeline,
+                    "Response policy",
+                    state.headers.or(state.cache),
+                    event.at,
+                    &state.url,
+                );
+                state.finalized = Some(event.at);
+            }
+            NetworkPhase::Completed | NetworkPhase::Failed | NetworkPhase::Aborted => {
+                let label = match event.phase {
+                    NetworkPhase::Completed => "Deliver response",
+                    NetworkPhase::Failed => "Request failure",
+                    NetworkPhase::Aborted => "Request abort",
+                    _ => unreachable!(),
+                };
+                record_network_phase(
+                    &mut timeline,
+                    label,
+                    state.finalized.or(state.headers).or(state.request),
+                    event.at,
+                    &state.url,
+                );
+            }
+            NetworkPhase::PreflightCacheHit
+            | NetworkPhase::PreflightCacheMiss
+            | NetworkPhase::Redirect => {}
+        }
+    }
+    timeline
+}
+
+/// Appends one labelled Network segment when both lifecycle boundaries exist.
+fn record_network_phase(
+    timeline: &mut Vec<TimelineEvent>,
+    phase: &str,
+    start: Option<Instant>,
+    end: Instant,
+    url: &str,
+) {
+    let Some(start) = start else {
+        return;
+    };
+    timeline.push(TimelineEvent::new(
+        EventCategory::Network,
+        format!("{phase} {url}"),
+        start,
+        end.saturating_duration_since(start),
+    ));
+}
+
+/// Infers the current resource class from a completed redacted request URL.
+fn resource_type_for_url(url: &str) -> devtools::network::ResourceType {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    if path.ends_with(".css") {
+        devtools::network::ResourceType::Stylesheet
+    } else if path.ends_with(".js") || path.ends_with(".mjs") {
+        devtools::network::ResourceType::Script
+    } else if matches!(
+        path.rsplit('.').next(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico")
+    ) {
+        devtools::network::ResourceType::Image
+    } else {
+        devtools::network::ResourceType::Other
+    }
+}
+
 /// Copies the session's Network, Console, and Performance data into a
 /// DevTools `panel` so it shows the latest entries.
 fn sync_devtools_panel(
@@ -2464,6 +2684,46 @@ pub fn run(platform: Platform) -> Result<(), EventLoopError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_diagnostics_are_split_into_bottleneck_phases() {
+        let origin = Instant::now();
+        let event = |phase, millis| NetworkEvent {
+            request_id: 7,
+            phase,
+            at: origin + Duration::from_millis(millis),
+            url: "https://example.test/app.js".into(),
+            status: (millis >= 9).then_some(200),
+            from_cache: false,
+            redirect_count: 0,
+        };
+        let timeline = network_phase_timeline(&[
+            event(NetworkPhase::Started, 0),
+            event(NetworkPhase::Prepared, 2),
+            event(NetworkPhase::CacheLookup, 2),
+            event(NetworkPhase::CacheMiss, 3),
+            event(NetworkPhase::QueueStarted, 3),
+            event(NetworkPhase::QueueAdmitted, 8),
+            event(NetworkPhase::TransportStarted, 8),
+            event(NetworkPhase::ResponseHeaders, 18),
+            event(NetworkPhase::ResponseFinalized, 20),
+            event(NetworkPhase::Completed, 21),
+        ]);
+        let phases: Vec<_> = timeline.iter().map(|event| event.label.as_str()).collect();
+        assert_eq!(
+            phases,
+            [
+                "Prepare https://example.test/app.js",
+                "Cache lookup https://example.test/app.js",
+                "Queue https://example.test/app.js",
+                "Transport https://example.test/app.js",
+                "Response policy https://example.test/app.js",
+                "Deliver response https://example.test/app.js",
+            ]
+        );
+        assert_eq!(timeline[2].duration, Duration::from_millis(5));
+        assert_eq!(timeline[3].duration, Duration::from_millis(10));
+    }
 
     fn app() -> App {
         App::with_runtime(
@@ -3399,6 +3659,7 @@ mod tests {
             address: address.to_owned(),
             result,
             timeline: Vec::new(),
+            network_events: Vec::new(),
         }
     }
 
