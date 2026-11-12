@@ -35,8 +35,11 @@ pub(crate) struct Context<'a> {
 /// alignment, and anonymous flex items for mixed text are not implemented.
 /// Grid and table modes are preserved distinctly in computed display values,
 /// but still use ordinary flow layout. Other supported properties are
-/// margins, padding, `width`, `height`, `font-size`, `color`, and
-/// `background-color`; unsupported properties use their initial values.
+/// margins, padding, `width`, `height`, `font-size`, `font-family`,
+/// `font-weight`, `font-style`, `color`, and `background-color`;
+/// unsupported properties (including the `font` shorthand) use their initial
+/// values. The font properties choose a face through
+/// [`FontMetrics::select_font`], which measures each text run.
 /// Floats, positioning, borders, and min/max sizes are not implemented.
 /// Content may overflow the viewport; the root box's rect stays viewport-sized.
 ///
@@ -83,7 +86,7 @@ pub fn layout_document_with_images(
     if root.is_none() {
         log::debug!("document has no root element; laying out an empty canvas");
     }
-    let style_map = StyleMap::new(document, styles, root, viewport);
+    let style_map = StyleMap::new(document, styles, root, viewport, fonts);
     let icb = build_initial_containing_block(document, &style_map, images);
     let context = Context { fonts };
     let mut tree = LayoutTree {

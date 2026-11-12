@@ -178,6 +178,8 @@ pub struct TextFragment {
     pub text: String,
     /// The computed font size in CSS pixels.
     pub font_size: f32,
+    /// The face the run was measured with; paint it with the same face.
+    pub font: crate::FontId,
     /// The text color.
     pub color: CssColor,
 }
@@ -383,6 +385,7 @@ mod tests {
                 baseline: 8.0,
                 text: "a".into(),
                 font_size: 10.0,
+                font: crate::FontId::DEFAULT,
                 color: BoxStyle::default().text_color,
             })],
         });

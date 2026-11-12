@@ -14,6 +14,7 @@
 mod cascade;
 mod color;
 mod computed;
+pub mod fonts;
 mod matching;
 mod parser;
 mod rule_index;
@@ -28,6 +29,7 @@ pub mod values;
 pub use cascade::style_document;
 pub use color::{CssColor, parse_color};
 pub use computed::ComputedStyles;
+pub use fonts::{FontFaceRule, FontSource, font_face_rules, parse_font_family_list};
 pub use parser::{parse_stylesheet, parse_stylesheet_with_errors};
 pub use selector::{
     AttributeOperator, AttributeSelector, Combinator, ComplexSelector, CompoundSelector,

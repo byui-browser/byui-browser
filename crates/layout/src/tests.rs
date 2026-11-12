@@ -749,3 +749,93 @@ mod images {
         assert_eq!((image.rect.width, image.rect.height), (0.0, 0.0));
     }
 }
+
+mod fonts {
+    use super::*;
+    use crate::FontId;
+
+    /// The test font, plus face 1 ("Wide") whose characters advance a whole
+    /// em and whose ascent is a full em.
+    struct TwoFaces;
+
+    impl FontMetrics for TwoFaces {
+        fn advance(&self, character: char, font_size: f32) -> f32 {
+            TestFont.advance(character, font_size)
+        }
+
+        fn vertical_metrics(&self, font_size: f32) -> VerticalMetrics {
+            TestFont.vertical_metrics(font_size)
+        }
+
+        fn select_font(&self, families: &[String], weight: u16, _italic: bool) -> FontId {
+            let wide = families.iter().any(|family| family == "Wide") && weight >= 600;
+            if wide { FontId(1) } else { FontId::DEFAULT }
+        }
+
+        fn font_advance(&self, font: FontId, character: char, font_size: f32) -> f32 {
+            match font {
+                FontId(1) => font_size,
+                _ => self.advance(character, font_size),
+            }
+        }
+
+        fn font_vertical_metrics(&self, font: FontId, font_size: f32) -> VerticalMetrics {
+            match font {
+                FontId(1) => VerticalMetrics {
+                    ascent: font_size,
+                    descent: 0.0,
+                    line_gap: 0.0,
+                },
+                _ => self.vertical_metrics(font_size),
+            }
+        }
+    }
+
+    #[test]
+    fn text_is_measured_with_the_face_selected_from_font_properties() {
+        let document = html::parse_raw_html(
+            "<body><p id=p>ab<span>cd</span></p><p id=q>ab</p></body>".to_owned(),
+        );
+        let styles = css::style_document(
+            &document,
+            &[css::parse_stylesheet(
+                "body { margin: 0 } p { margin: 0 } \
+                 #p { font-family: 'Missing', Wide, serif; font-weight: bold }",
+            )],
+        );
+        let tree = layout_document(
+            &document,
+            &styles,
+            Size {
+                width: 400.0,
+                height: 600.0,
+            },
+            &TwoFaces,
+        );
+        let fragments = |name: &str| -> Vec<(String, FontId, f32)> {
+            box_for(&tree, &document, name).lines[0]
+                .fragments
+                .iter()
+                .filter_map(|fragment| match fragment {
+                    LineFragment::Text(text) => {
+                        Some((text.text.clone(), text.font, text.rect.width))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        // The span inherits the paragraph's family and weight.
+        assert_eq!(
+            fragments("p"),
+            [
+                ("ab".to_owned(), FontId(1), 32.0),
+                ("cd".to_owned(), FontId(1), 32.0)
+            ]
+        );
+        assert_eq!(fragments("q"), [("ab".to_owned(), FontId::DEFAULT, 16.0)]);
+        // The wide face's ascent (16px) exceeds the strut's (12.8 + half
+        // leading 1.6), so it sets the baseline.
+        let line = &box_for(&tree, &document, "p").lines[0];
+        assert_eq!(line.baseline, 16.0);
+    }
+}

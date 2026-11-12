@@ -16,14 +16,33 @@ pub struct VerticalMetrics {
     pub line_gap: f32,
 }
 
+/// Identifies one font face chosen by [`FontMetrics::select_font`].
+///
+/// The number is meaningful only to the [`FontMetrics`] that returned it;
+/// layout stores it on text fragments and paint passes it to the renderer,
+/// which must use a font collection that agrees with the one layout measured
+/// with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct FontId(pub u32);
+
+impl FontId {
+    /// The embedder's default font, used when no family matches and by
+    /// [`FontMetrics`] implementations with a single font.
+    pub const DEFAULT: Self = Self(0);
+}
+
 /// Measures text for layout.
 ///
 /// Layout never rasterizes glyphs. Instead the embedder supplies the font that
 /// will draw the text, so that line breaking and the painted glyphs agree.
-/// `render::BitmapFont` implements this for the software renderer.
+/// `render::BitmapFont` and `render::OutlineFont` implement this with a
+/// single font; `render::FontCollection` adds `@font-face` web fonts.
 ///
-/// Font family, weight, and style are not modelled yet: one font is used for
-/// all text, and only `font-size` varies.
+/// Layout calls [`Self::select_font`] once per element style to choose a face
+/// from the computed `font-family`, `font-weight`, and `font-style`, then
+/// measures with the `font_*` methods. Their default implementations ignore
+/// the font and forward to the single-font methods, so a single-font
+/// implementation only needs [`Self::advance`] and [`Self::vertical_metrics`].
 pub trait FontMetrics {
     /// Horizontal advance of `character` at `font_size` CSS pixels.
     fn advance(&self, character: char, font_size: f32) -> f32;
@@ -35,6 +54,36 @@ pub trait FontMetrics {
     fn text_width(&self, text: &str, font_size: f32) -> f32 {
         text.chars()
             .map(|character| self.advance(character, font_size))
+            .sum()
+    }
+
+    /// Chooses the face for a computed `font-family` list (names in order
+    /// of preference, unquoted), `font-weight` (1–1000), and whether
+    /// `font-style` is italic or oblique. Returns [`FontId::DEFAULT`] when
+    /// nothing matches; the default implementation always does.
+    fn select_font(&self, families: &[String], weight: u16, italic: bool) -> FontId {
+        let _ = (families, weight, italic);
+        FontId::DEFAULT
+    }
+
+    /// Horizontal advance of `character` in `font` at `font_size` CSS
+    /// pixels.
+    fn font_advance(&self, font: FontId, character: char, font_size: f32) -> f32 {
+        let _ = font;
+        self.advance(character, font_size)
+    }
+
+    /// Vertical metrics of `font` at `font_size` CSS pixels.
+    fn font_vertical_metrics(&self, font: FontId, font_size: f32) -> VerticalMetrics {
+        let _ = font;
+        self.vertical_metrics(font_size)
+    }
+
+    /// Width of `text` in `font` at `font_size` CSS pixels, as the sum of
+    /// advances.
+    fn font_text_width(&self, font: FontId, text: &str, font_size: f32) -> f32 {
+        text.chars()
+            .map(|character| self.font_advance(font, character, font_size))
             .sum()
     }
 }

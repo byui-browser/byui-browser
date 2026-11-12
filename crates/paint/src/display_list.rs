@@ -1,6 +1,6 @@
 //! Display-list commands.
 
-use crate::{Color, CornerRadii, ImageKey, PaintBox, Rect};
+use crate::{Color, CornerRadii, FontId, ImageKey, PaintBox, Rect};
 
 /// One ordered drawing command. Coordinates are CSS pixels.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +31,10 @@ pub enum DisplayItem {
         baseline: f32,
         /// Font size; the renderer scales its glyphs to it.
         font_size: f32,
+        /// The face layout measured the run with
+        /// ([`layout::TextFragment::font`]); [`FontId::DEFAULT`] for the
+        /// renderer's default font.
+        font: FontId,
         /// Text to draw.
         text: String,
         /// Text color.

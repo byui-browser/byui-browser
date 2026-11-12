@@ -112,3 +112,10 @@ opt-level = 3
 
 [profile.dev.package.usvg]
 opt-level = 3
+
+# WOFF2 web fonts are brotli-compressed and decoded on page load.
+[profile.dev.package.wuff]
+opt-level = 3
+
+[profile.dev.package.brotli-decompressor]
+opt-level = 3

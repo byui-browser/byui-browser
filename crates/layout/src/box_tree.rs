@@ -113,6 +113,7 @@ impl StyleMap {
         styles: &css::ComputedStyles,
         root: Option<NodeID>,
         viewport: crate::Size,
+        fonts: &dyn crate::FontMetrics,
     ) -> Self {
         let root_font_size = root
             .and_then(|root| styles.value_for(root, "font-size"))
@@ -138,6 +139,8 @@ impl StyleMap {
                 if Some(node) == root {
                     style.display = style.display.blockified();
                 }
+                style.font =
+                    fonts.select_font(&style.font_families, style.font_weight, style.font_italic);
                 Some(Rc::new(style))
             })
             .collect();

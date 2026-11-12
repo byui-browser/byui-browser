@@ -7,6 +7,8 @@
 //! value. Lengths are resolved to CSS pixels here; percentages are kept
 //! because they resolve against the containing block during layout.
 
+use std::rc::Rc;
+
 use css::values::{LengthContext, parse_length, parse_percentage};
 use css::{CssColor, Declaration};
 
@@ -351,6 +353,16 @@ pub(crate) struct ComputedStyle {
     /// `max-height`, as for `max_width`.
     pub max_height: Dimension,
     pub font_size: f32,
+    /// The computed `font-family` list, unquoted, in order of preference.
+    /// Empty means the user agent's default font.
+    pub font_families: Rc<[String]>,
+    /// The computed `font-weight`, from 1 to 1000.
+    pub font_weight: u16,
+    /// Whether the computed `font-style` is italic or oblique.
+    pub font_italic: bool,
+    /// The face [`crate::FontMetrics::select_font`] chose for the three
+    /// properties above. Set by the style map, which knows the fonts.
+    pub font: crate::FontId,
     pub color: CssColor,
     pub text_transform: TextTransform,
     pub text_align: TextAlign,
@@ -385,6 +397,13 @@ impl ComputedStyle {
             max_width: Dimension::Auto,
             max_height: Dimension::Auto,
             font_size: parent.map_or(css::values::MEDIUM_FONT_SIZE, |parent| parent.font_size),
+            font_families: parent.map_or_else(
+                || Rc::from(Vec::new()),
+                |parent| Rc::clone(&parent.font_families),
+            ),
+            font_weight: parent.map_or(400, |parent| parent.font_weight),
+            font_italic: parent.is_some_and(|parent| parent.font_italic),
+            font: parent.map_or(crate::FontId::DEFAULT, |parent| parent.font),
             color: parent.map_or_else(
                 || {
                     css::user_agent_default_color("color")
@@ -436,6 +455,16 @@ impl ComputedStyle {
                 ),
             }
         }
+        if let Some(value) = get("font-family") {
+            style.font_families = css::parse_font_family_list(value).into();
+        }
+        if let Some(value) = get("font-weight") {
+            match css::fonts::parse_font_weight(value) {
+                Some(weight) => style.font_weight = weight,
+                None => log::debug!("ignoring invalid font-weight value {value:?}; using 400"),
+            }
+        }
+        style.font_italic = get("font-style").is_some_and(css::fonts::is_italic);
         if let Some(value) = get("color") {
             match css::parse_color(value) {
                 Some(color) => style.color = color,

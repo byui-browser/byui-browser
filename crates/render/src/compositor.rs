@@ -1,6 +1,17 @@
 //! Software compositor and rasterization.
 
-use crate::{BitmapFont, DisplayItem, Frame, ImageStore, OutlineFont, fonts::glyph};
+use crate::{
+    BitmapFont, DisplayItem, FontCollection, Frame, ImageStore, OutlineFont, fonts::glyph,
+};
+
+/// Which fonts [`Compositor::compose_scaled`] draws text with.
+#[derive(Clone, Copy)]
+enum FontChoice<'a> {
+    /// One font for every run.
+    Single(&'a OutlineFont),
+    /// The face each run's [`paint::FontId`] names.
+    Collection(&'a FontCollection),
+}
 
 /// A software compositor for a fixed device-pixel viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +332,7 @@ impl Compositor {
                     font_size,
                     text,
                     color,
+                    ..
                 } => Some(DisplayItem::Text {
                     x: x.round(),
                     baseline: baseline.round(),
@@ -347,6 +359,7 @@ impl Compositor {
     /// widths layout measured. Rectangle edges round to the nearest device
     /// pixel boundary, and parts outside the frame are clipped.
     ///
+    /// Every text run uses `font`, whatever its [`paint::FontId`].
     /// [`paint::DisplayItem::Image`] items are skipped; use
     /// [`Self::compose_page`] to draw them.
     pub fn compose_paint_with_font(
@@ -355,15 +368,17 @@ impl Compositor {
         font: &OutlineFont,
         scale: f32,
     ) -> Frame {
-        self.compose_scaled(list, Some(font), None, scale)
+        self.compose_scaled(list, FontChoice::Single(font), None, scale)
     }
 
     /// Rasterizes a paint crate display list into a new frame, drawing
-    /// pictures from `images` and text with `font`.
+    /// pictures from `images` and each text run with the face `fonts` has
+    /// for its [`paint::FontId`].
     ///
-    /// This is [`Self::compose_paint_with_font`] plus images. With `font`
-    /// `None`, text uses the built-in [`BitmapFont`] scaled to device pixels;
-    /// lay the document out with [`BitmapFont`] metrics in that case.
+    /// This is [`Self::compose_paint_with_font`] plus images and web fonts.
+    /// Lay the document out with the same `fonts` so each run uses the face
+    /// layout measured. Runs whose face is the [`BitmapFont`] fallback (no
+    /// default outline font) are drawn with it, scaled to device pixels.
     ///
     /// Each [`paint::DisplayItem::Image`] is stretched to fill its rectangle,
     /// whose edges snap to device pixel boundaries like rectangle fills. The
@@ -373,25 +388,24 @@ impl Compositor {
     pub fn compose_page(
         &self,
         list: &paint::DisplayList,
-        font: Option<&OutlineFont>,
+        fonts: &FontCollection,
         images: &ImageStore,
         scale: f32,
     ) -> Frame {
-        self.compose_scaled(list, font, Some(images), scale)
+        self.compose_scaled(list, FontChoice::Collection(fonts), Some(images), scale)
     }
 
     fn compose_scaled(
         &self,
         list: &paint::DisplayList,
-        font: Option<&OutlineFont>,
+        fonts: FontChoice<'_>,
         images: Option<&ImageStore>,
         scale: f32,
     ) -> Frame {
         log::debug!(
-            "compositing frame {}x{} ({} font) from {} items at scale {scale}",
+            "compositing frame {}x{} from {} items at scale {scale}",
             self.width,
             self.height,
-            if font.is_some() { "outline" } else { "bitmap" },
             list.items.len()
         );
         if self.width == 0 || self.height == 0 {
@@ -436,11 +450,16 @@ impl Compositor {
                     x,
                     baseline,
                     font_size,
+                    font,
                     text,
                     color,
                 } => {
                     let rgba = [color.r, color.g, color.b, color.a];
-                    match font {
+                    let outline = match fonts {
+                        FontChoice::Single(font) => Some(font),
+                        FontChoice::Collection(fonts) => fonts.outline(*font),
+                    };
+                    match outline {
                         Some(font) => self.draw_outline_text(
                             &mut frame,
                             font,
@@ -710,6 +729,7 @@ mod tests {
                 x: 4.0,
                 baseline: 20.0,
                 font_size: 16.0,
+                font: paint::FontId::DEFAULT,
                 text: "Hi".into(),
                 color: black,
             }],
@@ -830,7 +850,8 @@ mod image_tests {
         let list = paint::DisplayList {
             items: vec![image_item("red.png", 1.0, 1.0, 2.0, 1.0)],
         };
-        let frame = Compositor::new(8, 8).compose_page(&list, None, &images, 2.0);
+        let frame =
+            Compositor::new(8, 8).compose_page(&list, &FontCollection::default(), &images, 2.0);
         let red = frame
             .pixels
             .as_chunks::<4>()
@@ -853,7 +874,8 @@ mod image_tests {
                 image_item("missing.png", 2.0, 0.0, 2.0, 2.0),
             ],
         };
-        let frame = Compositor::new(4, 2).compose_page(&list, None, &images, 1.0);
+        let frame =
+            Compositor::new(4, 2).compose_page(&list, &FontCollection::default(), &images, 1.0);
         assert_eq!(pixel(&frame, 0, 0), [127, 127, 127, 255]);
         assert_eq!(pixel(&frame, 3, 1), Compositor::CLEAR_COLOR);
     }
@@ -865,7 +887,8 @@ mod image_tests {
         let list = paint::DisplayList {
             items: vec![image_item("a.png", -2.0, -2.0, 4.0, 4.0)],
         };
-        let frame = Compositor::new(4, 4).compose_page(&list, None, &images, 1.0);
+        let frame =
+            Compositor::new(4, 4).compose_page(&list, &FontCollection::default(), &images, 1.0);
         assert_eq!(pixel(&frame, 0, 0), [0, 0, 255, 255]);
         assert_eq!(pixel(&frame, 1, 1), [0, 0, 255, 255]);
         assert_eq!(pixel(&frame, 2, 2), Compositor::CLEAR_COLOR);
@@ -893,6 +916,7 @@ mod image_tests {
                     x: 1.2,
                     baseline: 9.4,
                     font_size: 10.0,
+                    font: paint::FontId::DEFAULT,
                     text: "HI".into(),
                     color: paint::Color {
                         r: 0,
@@ -905,7 +929,7 @@ mod image_tests {
         };
         let compositor = Compositor::new(16, 12);
         assert_eq!(
-            compositor.compose_page(&list, None, &ImageStore::new(), 1.0),
+            compositor.compose_page(&list, &FontCollection::default(), &ImageStore::new(), 1.0),
             compositor.compose_paint(&list)
         );
     }

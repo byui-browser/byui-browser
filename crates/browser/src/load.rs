@@ -15,7 +15,7 @@ use futures_util::future::join_all;
 use net::{Request, RequestController, Url};
 use security::{Origin, RendererSecurityContext, StoragePermission};
 
-use crate::{ImageResource, Page, PageResources, attribute, request_controller};
+use crate::{FontResource, ImageResource, Page, PageResources, attribute, request_controller};
 
 /// Why a page, or the main document of a page, could not be loaded.
 ///
@@ -154,12 +154,16 @@ async fn fetch_bytes(
 /// load is skipped with a logged warning; it does not fail the page.
 /// Every distinct `<img src>` is downloaded as bytes into
 /// [`PageResources::images`]; images that fail to load are left out, which
-/// layout shows as broken images. A page served over a non-`byui:` scheme may
+/// layout shows as broken images. Once the stylesheets are in, each
+/// top-level `@font-face` rule's first `src` URL that loads (relative to its
+/// stylesheet's URL, skipping `local()` and unsupported `format()` hints) is
+/// downloaded into [`PageResources::fonts`]. A page served over a non-`byui:` scheme may
 /// not pull `byui:` or `file:` subresources.
 ///
-/// Limitation: CSS `@import` inside stylesheets is not followed, fonts and
-/// CSS background images are not fetched, and `srcset`/`<picture>` sources
-/// are ignored.
+/// Limitation: CSS `@import` inside stylesheets is not followed, CSS
+/// background images are not fetched, `srcset`/`<picture>` sources are
+/// ignored, and fonts are fetched without the CORS check browsers apply to
+/// cross-origin fonts.
 pub async fn load_page(controller: &RequestController, address: &str) -> Result<Page, LoadError> {
     load_page_timed(controller, address).await.0
 }
@@ -290,17 +294,28 @@ where
         image_sources.len()
     );
     let (stylesheets, scripts, images) = futures_util::future::join3(
-        resolve_slots(&fetch, sheet_slots, "stylesheet", false, timeline),
-        resolve_slots(&fetch, script_slots, "script", true, timeline),
+        resolve_slots(
+            &fetch,
+            sheet_slots,
+            "stylesheet",
+            false,
+            &main.url,
+            timeline,
+        ),
+        resolve_slots(&fetch, script_slots, "script", true, &main.url, timeline),
         fetch_images(&fetch_bytes, &main.url, image_sources, timeline),
     )
     .await;
+    let fonts = fetch_fonts(&fetch_bytes, &stylesheets, timeline).await;
     log::debug!(
-        "subresources loaded: {} stylesheets, {} scripts, {} images",
+        "subresources loaded: {} stylesheets, {} scripts, {} images, {} fonts",
         stylesheets.len(),
         scripts.len(),
-        images.len()
+        images.len(),
+        fonts.len()
     );
+    let stylesheets = stylesheets.into_iter().map(|(_, source)| source).collect();
+    let scripts = scripts.into_iter().map(|(_, source)| source).collect();
     log::info!(
         "page loaded: {} ({} ms)",
         main.url,
@@ -313,6 +328,7 @@ where
         scripts,
         resources: PageResources {
             images: images.into(),
+            fonts: fonts.into(),
         },
     })
 }
@@ -363,6 +379,76 @@ where
     fetched.into_iter().flatten().collect()
 }
 
+/// Downloads the web fonts of every `@font-face` rule in `stylesheets`
+/// (each paired with the URL its relative URLs resolve against), trying
+/// each rule's loadable `src` URLs in order until one downloads. Rules are
+/// fetched concurrently; results keep stylesheet and rule order. Each
+/// download is appended to `timeline`.
+async fn fetch_fonts<G, GFut>(
+    fetch_bytes: &G,
+    stylesheets: &[(Url, String)],
+    timeline: &Mutex<Vec<TimelineEvent>>,
+) -> Vec<FontResource>
+where
+    G: Fn(Url) -> GFut,
+    GFut: Future<Output = Result<Fetched<Vec<u8>>, LoadError>>,
+{
+    let rules = stylesheets
+        .iter()
+        // Skip parsing sheets that cannot contain a rule.
+        .filter(|(_, source)| source.to_ascii_lowercase().contains("@font-face"))
+        .flat_map(|(base, source)| {
+            css::font_face_rules(&css::parse_stylesheet(source))
+                .into_iter()
+                .map(move |rule| (base, rule))
+        });
+    let fetched = join_all(rules.map(|(base, rule)| async move {
+        for source in rule
+            .sources
+            .iter()
+            .filter(|source| source.is_loadable_url())
+        {
+            let css::FontSource::Url { url, .. } = source else {
+                continue;
+            };
+            let url = match subresource_url(base, url) {
+                Ok(url) => url,
+                Err(reason) => {
+                    log::warn!("skipping font {url:?} for {:?}: {reason}", rule.family);
+                    continue;
+                }
+            };
+            let started = Instant::now();
+            let result = fetch_bytes(url.clone()).await;
+            push_event(
+                timeline,
+                TimelineEvent::since(EventCategory::Network, download_label(&url), started),
+            );
+            match result {
+                Ok(fetched) => {
+                    log::debug!(
+                        "fetched font {url} for {:?}: {} bytes",
+                        rule.family,
+                        fetched.body.len()
+                    );
+                    return Some(FontResource {
+                        family: rule.family.clone(),
+                        weight: rule.weight,
+                        italic: rule.italic,
+                        url: fetched.url.to_string(),
+                        bytes: fetched.body.into(),
+                    });
+                }
+                Err(error) => log::warn!("font {url} for {:?} failed: {error}", rule.family),
+            }
+        }
+        log::warn!("no source of @font-face {:?} loaded", rule.family);
+        None
+    }))
+    .await;
+    fetched.into_iter().flatten().collect()
+}
+
 /// A stylesheet or script as found in the document, before fetching.
 enum Slot {
     Inline(String),
@@ -385,23 +471,26 @@ fn subresource_url(base: &Url, reference: &str) -> Result<Url, String> {
 }
 
 /// Fetches the remote slots concurrently and returns every source in slot
-/// order. A failed slot is dropped, or kept as an empty string when
-/// `keep_gap` is set so scripts stay aligned with their `<script>` elements.
-/// Each download, successful or not, is appended to `timeline`.
+/// order, paired with its URL: the final response URL for a fetched slot,
+/// `document` for inline ones. A failed slot is dropped, or kept as an empty
+/// string when `keep_gap` is set so scripts stay aligned with their
+/// `<script>` elements. Each download, successful or not, is appended to
+/// `timeline`.
 async fn resolve_slots<F, Fut>(
     fetch: &F,
     slots: Vec<Slot>,
     kind: &str,
     keep_gap: bool,
+    document: &Url,
     timeline: &Mutex<Vec<TimelineEvent>>,
-) -> Vec<String>
+) -> Vec<(Url, String)>
 where
     F: Fn(Url) -> Fut,
     Fut: Future<Output = Result<Fetched, LoadError>>,
 {
     let fetched = join_all(slots.into_iter().map(|slot| async move {
         match slot {
-            Slot::Inline(text) => Some(text),
+            Slot::Inline(text) => Some((document.clone(), text)),
             Slot::Remote(Err(reason)) => {
                 log::warn!("skipping {kind}: {reason}");
                 None
@@ -416,7 +505,7 @@ where
                 match fetched {
                     Ok(fetched) => {
                         log::debug!("fetched {kind} {url}: {} bytes", fetched.body.len());
-                        Some(fetched.body)
+                        Some((fetched.url, fetched.body))
                     }
                     Err(error) => {
                         log::warn!("skipping {kind} {url}: {error}");
@@ -429,7 +518,7 @@ where
     .await;
     fetched
         .into_iter()
-        .filter_map(|source| source.or_else(|| keep_gap.then(String::new)))
+        .filter_map(|source| source.or_else(|| keep_gap.then(|| (document.clone(), String::new()))))
         .collect()
 }
 
@@ -663,6 +752,56 @@ mod tests {
             .filter(|url| url.ends_with(".png") || url.ends_with(".svg"))
             .count();
         assert_eq!(image_requests, 3, "{requested:?}");
+    }
+
+    #[test]
+    fn font_face_sources_resolve_against_their_stylesheet_and_fall_back() {
+        let (result, requested) = load(
+            &[
+                (
+                    "https://example.test/page.html",
+                    r#"<link rel="stylesheet" href="css/site.css">
+                       <style>@font-face { font-family: "B"; font-weight: bold;
+                         src: local(B), url(missing.woff), url(x.eot) format("embedded-opentype"),
+                              url(b.ttf) format("truetype") }</style>"#,
+                ),
+                (
+                    "https://example.test/css/site.css",
+                    "@font-face { font-family: A; font-style: italic;                      src: url(../f/a.woff2) format('woff2'), url(a.ttf) }",
+                ),
+                ("https://example.test/f/a.woff2", "wOF2"),
+                ("https://example.test/b.ttf", "TTF"),
+            ],
+            "https://example.test/page.html",
+        );
+        let page = result.expect("page loads");
+        let fonts: Vec<_> = page
+            .resources
+            .fonts
+            .iter()
+            .map(|font| {
+                (
+                    font.family.as_str(),
+                    font.weight,
+                    font.italic,
+                    font.url.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            fonts,
+            [
+                ("A", (400, 400), true, "https://example.test/f/a.woff2"),
+                ("B", (700, 700), false, "https://example.test/b.ttf"),
+            ]
+        );
+        assert_eq!(&page.resources.fonts[1].bytes[..], b"TTF");
+        assert!(requested.contains(&"https://example.test/missing.woff".to_owned()));
+        assert!(
+            !requested
+                .iter()
+                .any(|url| url.ends_with(".eot") || url.ends_with("a.ttf"))
+        );
     }
 
     #[test]

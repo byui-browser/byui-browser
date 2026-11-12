@@ -18,6 +18,6 @@ mod images;
 
 pub use compositor::Compositor;
 pub use display_item::DisplayItem;
-pub use fonts::{BitmapFont, OutlineFont};
+pub use fonts::{BitmapFont, FontCollection, OutlineFont};
 pub use frame::Frame;
 pub use images::ImageStore;

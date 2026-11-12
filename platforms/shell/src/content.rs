@@ -9,7 +9,7 @@ use browser::{BrowserRuntime, Page};
 use devtools::performance::{EventCategory, PerformanceLog, TimelineEvent};
 use html::NodeID;
 use layout::{FontMetrics, ImageKey, LayoutTree, Size, layout_document_with_images};
-use render::{BitmapFont, Compositor, Frame, ImageStore, OutlineFont};
+use render::{Compositor, FontCollection, Frame, ImageStore, OutlineFont};
 use tiny_skia::Pixmap;
 use webapis::{AlertSink, ConsoleSink, LocationNavigate, ViewportSize};
 
@@ -147,12 +147,49 @@ fn add_inline_svgs(document: &html::HTMLDocument, images: &mut ImageStore) {
     }
 }
 
-/// The metrics layout uses, matching the font [`render_document`] draws with.
-fn page_metrics() -> &'static dyn FontMetrics {
-    match page_font() {
-        Some(font) => font,
-        None => &BitmapFont,
+/// The `@font-face` fonts of the page decoded last, kept like
+/// [`DECODED_IMAGES`] so relayouts reuse them.
+type DecodedFonts = (Arc<[browser::FontResource]>, Arc<FontCollection>);
+static DECODED_FONTS: Mutex<Option<DecodedFonts>> = Mutex::new(None);
+
+/// The fonts layout measures and the compositor draws `page` with: the
+/// system page font (or the bitmap fallback) as the default, plus the page's
+/// downloaded web fonts, parsed once per page.
+fn page_fonts(page: &Page) -> FontCollection {
+    let mut fonts = FontCollection::new(page_font().cloned());
+    let resources = &page.resources.fonts;
+    if resources.is_empty() {
+        return fonts;
     }
+    let mut cached = DECODED_FONTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let faces = match cached.as_ref() {
+        Some((list, faces)) if Arc::ptr_eq(list, resources) => Arc::clone(faces),
+        _ => {
+            let mut faces = FontCollection::new(None);
+            for font in resources.iter() {
+                if !faces.add_face(&font.family, font.weight, font.italic, &font.bytes) {
+                    log::warn!(
+                        "web font {} for {:?} could not be parsed; text falls back",
+                        font.url,
+                        font.family
+                    );
+                }
+            }
+            log::debug!(
+                "parsed {} of {} web fonts for {}",
+                faces.face_count(),
+                resources.len(),
+                page.url
+            );
+            let faces = Arc::new(faces);
+            *cached = Some((Arc::clone(resources), Arc::clone(&faces)));
+            faces
+        }
+    };
+    fonts.extend_faces(&faces);
+    fonts
 }
 
 /// Renders `page` into a `width` × `height` device-pixel frame, first
@@ -242,27 +279,27 @@ fn compose_frame_with_find(
             })
         }
     };
-    match page_font() {
-        Some(font) => {
-            let scale = scale_factor as f32;
-            let scroll_y = (scroll_y * scale).round() / scale;
-            let display_list = display_list(scroll_y);
-            Compositor::new(width, height).compose_page(
-                &display_list,
-                Some(font),
-                &layout.images,
-                scale,
-            )
-        }
-        None => {
-            let display_list = display_list(scroll_y.round());
-            Compositor::new(css_width, css_height).compose_page(
-                &display_list,
-                None,
-                &layout.images,
-                1.0,
-            )
-        }
+    // With an outline default font, text is rasterized at device
+    // resolution; the bitmap fallback renders one device pixel per CSS
+    // pixel and [`render_page`] scales the frame up.
+    if layout.fonts.default_font().is_some() {
+        let scale = scale_factor as f32;
+        let scroll_y = (scroll_y * scale).round() / scale;
+        let display_list = display_list(scroll_y);
+        Compositor::new(width, height).compose_page(
+            &display_list,
+            &layout.fonts,
+            &layout.images,
+            scale,
+        )
+    } else {
+        let display_list = display_list(scroll_y.round());
+        Compositor::new(css_width, css_height).compose_page(
+            &display_list,
+            &layout.fonts,
+            &layout.images,
+            1.0,
+        )
     }
 }
 
@@ -287,6 +324,8 @@ pub(crate) struct PageLayout {
     /// Decoded `<img>` files and inline `<svg>` documents the tree's
     /// replaced boxes paint.
     images: ImageStore,
+    /// The default and web fonts the tree was measured with.
+    fonts: FontCollection,
     /// How long each stage of building this layout took, until the app moves
     /// them to the Performance panel with [`Self::take_timeline`].
     timeline: Vec<TimelineEvent>,
@@ -328,6 +367,7 @@ impl PageLayout {
         if !images.is_empty() {
             timeline.push(event);
         }
+        let fonts = page_fonts(page);
         let (styles, event) =
             TimelineEvent::measure(EventCategory::Style, "Recalculate style", || {
                 css::style_document(&document, &stylesheets)
@@ -344,7 +384,7 @@ impl PageLayout {
                         width: width as f32,
                         height: height as f32,
                     },
-                    page_metrics(),
+                    &fonts,
                     &images,
                 )
             },
@@ -354,6 +394,7 @@ impl PageLayout {
             css_size: (width, height),
             tree,
             images,
+            fonts,
             timeline,
         }
     }
@@ -439,7 +480,7 @@ impl PageLayout {
             let Some((fragment, _, _)) = fragments.get(range.run) else {
                 continue;
             };
-            if let Some(rect) = text_range_rect(fragment, range.bytes, page_metrics()) {
+            if let Some(rect) = text_range_rect(fragment, range.bytes, &self.fonts) {
                 result
                     .entry(*fragment as *const layout::TextFragment)
                     .or_default()
@@ -478,8 +519,8 @@ fn text_range_rect(
 ) -> Option<layout::Rect> {
     let prefix = fragment.text.get(..range.start)?;
     let matched = fragment.text.get(range)?;
-    let x = fragment.rect.x + metrics.text_width(prefix, fragment.font_size);
-    let width = metrics.text_width(matched, fragment.font_size);
+    let x = fragment.rect.x + metrics.font_text_width(fragment.font, prefix, fragment.font_size);
+    let width = metrics.font_text_width(fragment.font, matched, fragment.font_size);
     (width > 0.0).then_some(layout::Rect {
         x,
         y: fragment.rect.y,
@@ -1462,6 +1503,7 @@ mod tests {
                     },
                 ]
                 .into(),
+                ..Default::default()
             },
         };
         let mut layout = PageLayout::new(&page, 40, 40);
@@ -1484,6 +1526,62 @@ mod tests {
         assert_eq!(pixel(5, 25), [0, 0, 255, 255]);
         assert_eq!(pixel(15, 25), [255, 255, 255, 255]);
         assert_eq!(pixel(30, 10), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn web_fonts_from_font_face_are_used_for_matching_text() {
+        let Some(data) = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ]
+        .into_iter()
+        .find_map(|path| std::fs::read(path).ok()) else {
+            return;
+        };
+        let font = |family: &str, bytes: &[u8]| browser::FontResource {
+            family: family.into(),
+            weight: (400, 400),
+            italic: false,
+            url: format!("https://example.test/{family}.ttf"),
+            bytes: bytes.into(),
+        };
+        let page = Page {
+            url: "https://example.test/".into(),
+            html: "<body><p id=\"web\">Web font</p><p id=\"bad\">Broken</p></body>".into(),
+            stylesheets: vec![
+                "body { margin: 0 } #web { font-family: 'Web' } #bad { font-family: Bad }".into(),
+            ],
+            scripts: Vec::new(),
+            resources: browser::PageResources {
+                fonts: vec![font("Web", &data), font("Bad", b"not a font")].into(),
+                ..Default::default()
+            },
+        };
+        let layout = PageLayout::new(&page, 200, 100);
+        let fonts: Vec<_> = layout
+            .find_fragments()
+            .into_iter()
+            .map(|(text, _, _)| (text.text.clone(), text.font))
+            .collect();
+        assert_eq!(
+            fonts,
+            [
+                ("Web font".to_owned(), layout::FontId(1)),
+                ("Broken".to_owned(), layout::FontId::DEFAULT),
+            ],
+            "the unparsable font is skipped, so its text uses the default"
+        );
+        let frame = compose_frame(&layout, 200, 100, 1.0, 0.0);
+        assert!(
+            frame
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[0] < 128)
+        );
     }
 
     fn long_page() -> Page {

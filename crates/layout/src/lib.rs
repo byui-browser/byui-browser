@@ -24,7 +24,7 @@ mod replaced;
 mod style;
 mod tree;
 
-pub use fonts::{FontMetrics, VerticalMetrics};
+pub use fonts::{FontId, FontMetrics, VerticalMetrics};
 pub use geometry::{Edges, Rect, Sides, Size};
 pub use layout::{layout_document, layout_document_with_images};
 pub use radius::{BorderRadius, CornerRadii, CornerRadius, Corners, LengthPercentage};

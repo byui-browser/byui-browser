@@ -21,6 +21,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # Default features (SVG text with system fonts, embedded raster images) are
 # off to keep the dependency tree small.
 resvg = { version = "0.45", default-features = false }
+# Decompressing WOFF and WOFF2 web fonts (`@font-face`) to OpenType data.
+wuff = "0.2"
 
 [dev-dependencies]
 # Builds `layout::ImageKey::InlineSvg` keys in tests.
