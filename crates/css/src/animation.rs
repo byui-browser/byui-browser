@@ -1,7 +1,7 @@
 //! CSS Animations Level 1: `@keyframes`, the `animation-*` properties, and
 //! sampling animated values at a moment of the document timeline.
 //!
-//! The cascade calls [`apply_animations`] for each element after resolving
+//! The cascade calls `apply_animations` for each element after resolving
 //! CSS-wide keywords. Animated values replace the element's normal
 //! declarations but lose to `!important` ones (CSS Cascade 4 §6.1), and they
 //! are applied before inheritance passes values to children, so an animated
