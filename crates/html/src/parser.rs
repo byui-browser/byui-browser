@@ -1,5 +1,5 @@
 use crate::{
-    Attribute, ElementData, HTMLDocument, Namespace, NodeID, NodeKind, SourceSpan,
+    Attribute, ElementData, HTMLDocument, Namespace, NodeID, NodeKind,
     escape_characters::decode_html_entities,
 };
 
@@ -34,7 +34,6 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
         };
         let close = open + relative_close;
         let tag = raw[open + 1..close].trim();
-        let span = Some(SourceSpan::new(open, close + 1));
         cursor = close + 1;
 
         // A '<' followed by whitespace is not the start of a tag. Preserve
@@ -58,7 +57,7 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
         if let Some(comment_body) = tag.strip_prefix("!--") {
             let comment = comment_body.strip_suffix("--").unwrap_or(comment_body);
             log::trace!("comment at byte {open} ({} bytes)", comment.len());
-            let id = document.push_node(NodeKind::Comment(comment.to_owned()), span);
+            let id = document.push_node(NodeKind::Comment(comment.to_owned()));
             document.append_child(current_parent(&stack, root), id);
             continue;
         }
@@ -67,14 +66,11 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
             .is_some_and(|name| name.eq_ignore_ascii_case("!doctype"))
         {
             log::trace!("doctype at byte {open}");
-            let id = document.push_node(
-                NodeKind::Doctype {
-                    name: Some(tag[8..].trim().to_ascii_lowercase()),
-                    public_id: None,
-                    system_id: None,
-                },
-                span,
-            );
+            let id = document.push_node(NodeKind::Doctype {
+                name: Some(tag[8..].trim().to_ascii_lowercase()),
+                public_id: None,
+                system_id: None,
+            });
             document.append_child(root, id);
             continue;
         }
@@ -125,10 +121,11 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
             "start tag <{name}> at byte {open} ({} attributes, self_closing={self_closing})",
             attributes.len()
         );
-        let id = document.push_node(
-            NodeKind::Element(ElementData::new(name.clone(), namespace, attributes)),
-            span,
-        );
+        let id = document.push_node(NodeKind::Element(ElementData::new(
+            name.clone(),
+            namespace,
+            attributes,
+        )));
         document.append_child(current_parent(&stack, root), id);
         if !self_closing && !is_void_element(&name) {
             stack.push(id);
@@ -164,7 +161,6 @@ fn append_text(document: &mut HTMLDocument, parent: NodeID, text: &str, start: u
         // Decode after tokenizing markup so a decoded `<` remains text and
         // cannot introduce new elements into the tree.
         NodeKind::Text(decode_html_entities(text, false)),
-        Some(SourceSpan::new(start, end)),
     );
     document.append_child(parent, id);
 }
