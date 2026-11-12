@@ -1197,6 +1197,16 @@ impl Interpreter {
             }
             Expr::Array(elements) => {
                 let array = Object::new();
+                // A literal with a spread is built incrementally by the VM
+                // from an empty array, whose `length` is already defined.
+                // Define it first here too so both engines produce the same
+                // property order.
+                if elements
+                    .iter()
+                    .any(|element| matches!(element, Some(Expr::Spread(_))))
+                {
+                    array.set("length", Value::Number(0.0));
+                }
                 let mut length = 0usize;
                 for element in elements {
                     match element {

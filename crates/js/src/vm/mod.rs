@@ -7,8 +7,9 @@
 
 use crate::bytecode::{CallableKind, Chunk, FunctionTemplate, Instruction};
 use crate::runtime::{
-    BytecodeCapture, ExecutionLimits, binary, get_array_property, is_truthy, non_object,
-    set_array_property, to_property_key, unary,
+    BytecodeCapture, ExecutionLimits, array_len, binary, copy_data_properties, delete_property,
+    get_array_property, is_nullish, is_truthy, non_object, set_array_property, spread_values,
+    to_property_key, unary,
 };
 use crate::{Function, JsError, JsErrorCategory, JsResult, Object, Value};
 use std::sync::{Arc, Mutex};

@@ -39,7 +39,7 @@ fn has(report: &AuditReport, area: Area, feature: &str) -> bool {
 
 #[test]
 fn reports_unsupported_javascript_syntax_with_locations() {
-    let script = "var total = 0;\nfor (var i = 0; i < 3; i++) { total += i; }\nvar kind = typeof total;\nvar add = (a) => a + 1;";
+    let script = "var total = 0;\nfor (var i = 0; i < 3; i++) { total += i; }\nvar kind = /x/.test('x');\nvar add = (a) => a + 1;";
     let report = audit("<script>x</script>", &[], &[script], None);
     let for_loop = report
         .in_area(Area::JavaScriptSyntax)
@@ -47,7 +47,11 @@ fn reports_unsupported_javascript_syntax_with_locations() {
         .expect("for loops are not implemented by the engine");
     assert_eq!(for_loop.location.as_deref(), Some("inline script #1:2"));
     assert_eq!(for_loop.evidence, Evidence::Probed);
-    assert!(has(&report, Area::JavaScriptSyntax, "typeof operator"));
+    assert!(has(
+        &report,
+        Area::JavaScriptSyntax,
+        "Regular expression literals"
+    ));
     // Supported syntax is checked but not reported.
     assert!(!has(
         &report,
