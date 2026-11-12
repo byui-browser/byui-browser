@@ -37,6 +37,7 @@ fn main() {
         x: box_rect.x + 89.0,
         baseline: box_rect.y + 49.0 + 7.0,
         font_size: 10.0,
+        font: paint::FontId::DEFAULT,
         text: "Hello Mars, We Are Earthlings".to_owned(),
         color: text_color,
     });

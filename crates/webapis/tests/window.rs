@@ -73,6 +73,45 @@ fn window_navigator_accepts_extra_arguments_without_changing_the_result() {
 }
 
 #[test]
+fn window_performance_exposes_a_stable_monotonic_clock() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "performance === window.performance && \
+             performance.timeOrigin > 0 && \
+             performance.now() >= 0",
+        ),
+        Ok(Value::Boolean(true))
+    );
+
+    let first = realm.evaluate_script("performance.now()").unwrap();
+    thread::sleep(Duration::from_millis(1));
+    let second = realm.evaluate_script("window.performance.now()").unwrap();
+    let (Value::Number(first), Value::Number(second)) = (first, second) else {
+        panic!("performance.now() should return numbers");
+    };
+    assert!(second >= first);
+}
+
+#[test]
+fn window_performance_object_and_time_origin_are_read_only() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var original = window.performance; \
+             window.performance = null; \
+             performance.timeOrigin = 0; \
+             window.performance === original && performance.timeOrigin > 0",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
 fn window_origin_uses_the_renderer_security_context() {
     let mut realm = Realm::new();
     register_window_with_security_context(
@@ -281,6 +320,58 @@ fn history_state_is_structured_cloned() {
 }
 
 #[test]
+fn structured_clone_deep_copies_objects_arrays_cycles_and_shared_references() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var child = {value: 1}; var original = {left: child, right: child}; \
+             original.self = original; original.list = [child, 2]; \
+             var copy = window.structuredClone(original); \
+             copy !== original && copy.self === copy && copy.left === copy.right && \
+             copy.left !== child && copy.list[0] === copy.left && \
+             structuredClone === window.structuredClone",
+        ),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(
+        realm.evaluate_script("child.value = 3; copy.left.value === 1"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn structured_clone_accepts_empty_transfer_list_and_rejects_functions() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "function callback() {} var cloneError = false; \
+             try { structuredClone({callback: callback}); } \
+             catch (error) { cloneError = error.name === 'DataCloneError'; } \
+             structuredClone({value: 1}, {transfer: []}).value === 1 && cloneError",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn structured_clone_reports_unsupported_transfers_as_data_clone_errors() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "try { structuredClone({}, {transfer: [{}]}); } \
+             catch (error) { error.name === 'DataCloneError'; }",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
 fn inner_width_is_zero_without_a_viewport() {
     let mut realm = Realm::new();
     register_window(&mut realm).unwrap();
@@ -363,6 +454,64 @@ fn inner_height_is_replaceable_like_the_cssom_view_attribute() {
 }
 
 #[test]
+fn match_media_exposes_window_management_and_viewport_features() {
+    let mut realm = Realm::new();
+    webapis::register_window_with_url_device_pixel_ratio_and_viewport(
+        &mut realm,
+        "https://example.test/",
+        2.0,
+        Some(webapis::ViewportSize {
+            width: 800,
+            height: 600,
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var a = matchMedia('(min-width: 700px) and (orientation: landscape)'); \
+             var b = window.matchMedia('(resolution: 192dpi)'); \
+             var c = matchMedia('(display-state: normal) and (resizable: true)'); \
+             a.media === '(min-width: 700px) and (orientation: landscape)' && \
+             a.matches && b.matches && c.matches && a === matchMedia('(min-width: 700px) and (orientation: landscape)') === false",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn match_media_change_events_update_matches_and_support_legacy_listeners() {
+    let mut realm = Realm::new();
+    webapis::register_window_with_url_device_pixel_ratio_and_viewport(
+        &mut realm,
+        "https://example.test/",
+        1.0,
+        Some(webapis::ViewportSize {
+            width: 800,
+            height: 600,
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var list = matchMedia('(min-width: 700px)'); var calls = 0; var seen = false; \
+             function listener(event) { calls = calls + 1; seen = event.matches === false && event.media === list.media; } \
+             list.addListener(listener); list.onchange = listener; \
+             window.__updateMediaQueries(500, 600, 1); \
+             list.matches === false && calls === 2 && seen",
+        ),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(
+        realm.evaluate_script(
+            "list.removeListener(listener); window.__updateMediaQueries(800, 600, 1); calls === 3",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
 fn set_interval_returns_positive_id_passes_arguments_and_repeats() {
     let mut realm = Realm::new();
     register_window(&mut realm).unwrap();
@@ -428,6 +577,66 @@ fn clear_timeout_cancels_callback_and_string_handler_runs() {
     };
     assert_eq!(webapis::run_window_timers(&window).unwrap(), 1);
     assert_eq!(realm.evaluate_script("calls"), Ok(Value::Number(1.0)));
+}
+
+#[test]
+fn queue_microtask_runs_in_fifo_order_and_drains_new_microtasks() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var order = ''; \
+             function first() { order = order + 'a'; queueMicrotask(third); } \
+             function second() { order = order + 'b'; } \
+             function third() { order = order + 'c'; } \
+             queueMicrotask(first); window.queueMicrotask(second); \
+             order",
+        )
+        .unwrap();
+    assert_eq!(realm.evaluate_script("order"), Ok(Value::String("".into())));
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    assert_eq!(webapis::run_window_microtasks(&window).unwrap(), 3);
+    assert_eq!(
+        realm.evaluate_script("order"),
+        Ok(Value::String("abc".into()))
+    );
+}
+
+#[test]
+fn queue_microtask_requires_a_function_and_returns_undefined() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    assert_eq!(
+        realm.evaluate_script("function callback() {} queueMicrotask(callback)"),
+        Ok(Value::Undefined)
+    );
+    assert!(realm.evaluate_script("queueMicrotask(1)").is_err());
+}
+
+#[test]
+fn timer_checkpoint_runs_microtasks_before_the_next_timer() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var order = ''; \
+             function first() { order = order + 'a'; queueMicrotask(micro); } \
+             function micro() { order = order + 'm'; } \
+             function second() { order = order + 'b'; } \
+             setTimeout(first, 0); setTimeout(second, 0)",
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(2));
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 2);
+    assert_eq!(
+        realm.evaluate_script("order"),
+        Ok(Value::String("amb".into()))
+    );
 }
 
 #[test]

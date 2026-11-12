@@ -164,10 +164,14 @@ credential-free targets, per-hop browser policy, service-worker bypass, intermed
 cookie processing, simple CORS checks, redirect-taint serialization, referrer-policy
 updates, redirect-aware cache lookup, and representative credential decisions.
 
-Add conformance cases alongside future same-site cookie, full-cache,
-mixed-content, and timing integrations. Public final-URL and redirect-count
-behavior is covered; expand internal URL-list assertions if that state becomes
-observable through diagnostics.
+Add conformance cases alongside future same-site cookie, full-cache, and
+mixed-content integrations. The current `NetworkObserver` feed covers
+preparation, cache/preflight decisions, queue admission, transport, redirects,
+finalization, completion, and failure; add focused tests for event ordering,
+request IDs, redirect counts, cache provenance, cancellation behavior, and
+observer isolation. Public final-URL and redirect-count behavior is covered;
+expand internal URL-list assertions if that state becomes observable through
+diagnostics.
 
 ### 5. Credentials, cookies, and cache
 
