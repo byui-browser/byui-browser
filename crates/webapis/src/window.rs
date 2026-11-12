@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicU32, Ordering},
     sync::{Arc, Mutex, PoisonError},
-    time::Instant,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::custom_elements::CustomElementRegistry;
@@ -32,6 +32,35 @@ struct AnimationFrameCallbacks {
     next_id: u32,
     callbacks: Vec<(u32, Function)>,
     time_origin: Instant,
+}
+
+/// The monotonic clock exposed through the High Resolution Time API.
+///
+/// `time_origin` is captured once for a Window, so `now()` remains a duration
+/// from the same navigation-specific origin even if the system wall clock is
+/// adjusted after the Window is created.
+struct PerformanceClock {
+    time_origin: Instant,
+    time_origin_timestamp_ms: f64,
+}
+
+impl PerformanceClock {
+    fn new() -> Self {
+        let time_origin = Instant::now();
+        let time_origin_timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs_f64()
+            * 1000.0;
+        Self {
+            time_origin,
+            time_origin_timestamp_ms,
+        }
+    }
+
+    fn now(&self) -> f64 {
+        self.time_origin.elapsed().as_secs_f64() * 1000.0
+    }
 }
 
 impl AnimationFrameCallbacks {
@@ -356,6 +385,8 @@ fn register_window_object(
     let timers = Arc::new(Mutex::new(WindowTimers::new()));
     let microtasks = Arc::new(Mutex::new(MicrotaskQueue::new()));
     let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
+    let performance = Object::new();
+    let performance_clock = Arc::new(PerformanceClock::new());
     let evaluator = realm.script_evaluator();
     let timer_this = Value::Object(window.clone());
     let nesting_context = Arc::new(AtomicU32::new(0));
@@ -369,6 +400,16 @@ fn register_window_object(
         Arc::new(move |_| Ok(Value::Object(navigator_for_window.clone()))),
     );
     window.set("customElements", Value::Object(custom_elements.clone()));
+    let performance_for_now = Arc::clone(&performance_clock);
+    performance.set_method(
+        "now",
+        Arc::new(move |_| Ok(Value::Number(performance_for_now.now()))),
+    );
+    performance.set_read_only(
+        "timeOrigin",
+        Value::Number(performance_clock.time_origin_timestamp_ms),
+    );
+    window.set_read_only("performance", Value::Object(performance.clone()));
     // CSSOM View exposes scrollX as a readonly number. The renderer does not
     // yet have document horizontal scrolling, so the initial offset is zero.
     window.set_read_only("scrollX", Value::Number(0.0));
@@ -770,6 +811,7 @@ fn register_window_object(
     realm.register_global_value("self", Value::Object(window.clone()))?;
     realm.register_global_value("customElements", Value::Object(custom_elements))?;
     realm.register_global_value("navigator", Value::Object(navigator))?;
+    realm.register_global_value("performance", Value::Object(performance))?;
     realm.register_global_value("innerWidth", inner_width)?;
     realm.register_global_value("innerHeight", inner_height)?;
     realm.register_global_value(
