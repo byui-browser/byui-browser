@@ -7,8 +7,8 @@
 
 use crate::bytecode::{CallableKind, Chunk, FunctionTemplate, Instruction};
 use crate::runtime::{
-    ExecutionLimits, binary, get_array_property, is_truthy, non_object, set_array_property,
-    to_property_key, unary,
+    ExecutionLimits, binary, builtins, get_array_property, is_truthy, non_object,
+    set_array_property, to_property_key, unary,
 };
 use crate::{Function, JsError, JsErrorCategory, JsResult, Object, Value};
 use std::sync::Arc;
@@ -419,6 +419,10 @@ impl Vm {
                     let Value::Function(function) = constructor else {
                         return Err(not_a_constructor(&constructor));
                     };
+                    if function.template().is_none() {
+                        self.push(function.construct(&arguments)?);
+                        continue;
+                    }
                     switched = self.construct(
                         function.clone(),
                         function,
@@ -561,6 +565,10 @@ impl Vm {
                 }
                 Instruction::LoadUnresolved { name } => {
                     let name = self.binding_name(name, &chunk)?;
+                    if let Some(value) = builtins::value(name) {
+                        self.push(value);
+                        continue;
+                    }
                     return Err(JsError::new(format!("`{name}` is not defined")));
                 }
                 Instruction::StoreUnresolved { name } => {

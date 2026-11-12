@@ -28,6 +28,7 @@
 //!   endless loops fail with an error instead of running forever.
 
 mod array;
+pub(crate) mod builtins;
 mod conversions;
 mod object;
 mod operators;
@@ -295,6 +296,7 @@ enum FunctionKind {
     Host {
         name: String,
         function: HostFunction,
+        constructor: Option<HostFunction>,
     },
     /// A function compiled to bytecode; only the VM can run it.
     Bytecode {
@@ -315,6 +317,22 @@ impl Function {
         Self(Arc::new(FunctionKind::Host {
             name: name.into(),
             function,
+            constructor: None,
+        }))
+    }
+
+    /// Wraps a Rust callback as a callable and constructible JavaScript
+    /// function. The constructor callback receives the arguments passed to
+    /// `new` and must return the constructed value.
+    pub(crate) fn from_host_constructor(
+        name: impl Into<String>,
+        function: HostFunction,
+        constructor: HostFunction,
+    ) -> Self {
+        Self(Arc::new(FunctionKind::Host {
+            name: name.into(),
+            function,
+            constructor: Some(constructor),
         }))
     }
 
@@ -417,7 +435,14 @@ impl Function {
     /// construction does not retain the VM's global environment, so a
     /// constructor that reads global variables may also fail.
     pub fn construct(&self, arguments: &[Value]) -> JsResult<Value> {
-        crate::Vm::construct_function(self.clone(), arguments)
+        match &*self.0 {
+            FunctionKind::Host {
+                constructor: Some(constructor),
+                ..
+            } => constructor(arguments),
+            FunctionKind::Host { .. } => Err(JsError::runtime("function is not a constructor")),
+            _ => crate::Vm::construct_function(self.clone(), arguments),
+        }
     }
 
     /// Calls this function with an explicit receiver using a fresh bytecode
@@ -558,7 +583,9 @@ impl GlobalState {
     pub(crate) fn new() -> Self {
         let object: ScopeRef = Arc::default();
         let lexical = child_scope(&object);
-        Self { object, lexical }
+        let state = Self { object, lexical };
+        builtins::install(&state);
+        state
     }
 
     /// Binds a host-provided global, replacing any binding in the object
@@ -1016,7 +1043,21 @@ impl Interpreter {
             // any other undeclared name.
             Expr::This if self.this_enabled => Ok(self.this_value.clone()),
             Expr::This => Err(JsError::new("`this` is not defined")),
-            Expr::New { .. } => Err(unsupported_here("`new`")),
+            Expr::New { callee, arguments } => {
+                let constructor = self.evaluate(callee, scope)?;
+                let Value::Function(function) = constructor else {
+                    return Err(JsError::with_context(
+                        crate::JsErrorCategory::Runtime,
+                        format!("`{constructor}` is not a constructor"),
+                        "new expression",
+                    ));
+                };
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| self.evaluate(argument, scope))
+                    .collect::<JsResult<Vec<_>>>()?;
+                function.construct(&arguments)
+            }
             Expr::SuperCall { .. } | Expr::SuperMember { .. } => Err(unsupported_here("`super`")),
             Expr::Identifier(name) => read(scope, name),
             Expr::ArrowFunction { params, body } => {
