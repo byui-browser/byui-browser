@@ -531,3 +531,19 @@ fn extracts_inline_script_sources_in_document_order() {
         ["print()", "fetch('https://example.com')"]
     );
 }
+
+#[test]
+fn outer_html_serializes_one_subtree_including_the_node() {
+    let document = parse_raw_html(
+        "<p>before</p><svg id=s viewBox='0 0 1 1'><path d='M0 0'/><text>a &amp; b</text></svg>"
+            .to_owned(),
+    );
+    let svg = document.get_element_by_id("s").expect("svg element");
+    assert_eq!(
+        document.outer_html(svg).as_deref(),
+        Some(
+            "<svg id=\"s\" viewbox=\"0 0 1 1\"><path d=\"M0 0\"></path><text>a &amp; b</text></svg>"
+        )
+    );
+    assert_eq!(document.outer_html(html::NodeID::new(10_000)), None);
+}

@@ -9,8 +9,8 @@ use std::time::Duration;
 use browser::{BrowserRuntime, Page};
 use devtools::performance::{EventCategory, PerformanceLog, TimelineEvent};
 use html::NodeID;
-use layout::{FontMetrics, LayoutTree, Size, layout_document};
-use render::{BitmapFont, Compositor, Frame, OutlineFont};
+use layout::{FontMetrics, ImageKey, LayoutTree, Size, layout_document_with_images};
+use render::{Compositor, FontCollection, Frame, ImageStore, OutlineFont};
 use tiny_skia::Pixmap;
 use webapis::{AlertSink, ConsoleSink, LocationNavigate, ViewportSize};
 
@@ -73,12 +73,124 @@ fn page_font() -> Option<&'static OutlineFont> {
     PAGE_FONT.get().and_then(Option::as_ref)
 }
 
-/// The metrics layout uses, matching the font [`render_document`] draws with.
-fn page_metrics() -> &'static dyn FontMetrics {
-    match page_font() {
-        Some(font) => font,
-        None => &BitmapFont,
+/// The decoded `<img>` files of the page decoded last, kept so relayouts
+/// (window resizes, zoom) reuse them instead of decoding again. Pages are
+/// recognized by their shared image list (`Arc::ptr_eq`), so a clone of the
+/// same loaded page hits and a newly loaded page replaces the entry.
+type DecodedImages = (Arc<[browser::ImageResource]>, Arc<ImageStore>);
+static DECODED_IMAGES: Mutex<Option<DecodedImages>> = Mutex::new(None);
+
+/// Decodes `page`'s downloaded images into a store keyed by their `src`,
+/// reusing the previous result for the same page.
+fn decoded_images(page: &Page) -> Arc<ImageStore> {
+    let resources = &page.resources.images;
+    if resources.is_empty() {
+        return Arc::new(ImageStore::new());
     }
+    let mut cached = DECODED_IMAGES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some((list, store)) = cached.as_ref()
+        && Arc::ptr_eq(list, resources)
+    {
+        return Arc::clone(store);
+    }
+    let mut store = ImageStore::new();
+    for image in resources.iter() {
+        if !store.insert_encoded(ImageKey::Src(image.src.clone()), &image.bytes) {
+            log::warn!(
+                "image {} could not be decoded; it shows as broken",
+                image.url
+            );
+        }
+    }
+    log::debug!(
+        "decoded {} of {} images for {}",
+        store.len(),
+        resources.len(),
+        page.url
+    );
+    let store = Arc::new(store);
+    *cached = Some((Arc::clone(resources), Arc::clone(&store)));
+    store
+}
+
+/// Adds every outermost inline `<svg>` element of `document` to `images`,
+/// keyed by its node, serialized from the parsed tree.
+fn add_inline_svgs(document: &html::HTMLDocument, images: &mut ImageStore) {
+    let is_svg_element = |id: NodeID| {
+        matches!(
+            document.node(id).map(|node| node.get_kind()),
+            Some(html::NodeKind::Element(element))
+                if *element.get_namespace() == html::Namespace::Svg
+        )
+    };
+    for index in 0..document.nodes.len() {
+        let id = NodeID::new(index);
+        let Some(node) = document.node(id) else {
+            continue;
+        };
+        let html::NodeKind::Element(element) = node.get_kind() else {
+            continue;
+        };
+        if element.get_name() != "svg"
+            || *element.get_namespace() != html::Namespace::Svg
+            || node.get_parent().is_some_and(is_svg_element)
+        {
+            continue;
+        }
+        let Some(markup) = document.outer_html(id) else {
+            continue;
+        };
+        if !images.insert_svg(ImageKey::InlineSvg(id), &markup) {
+            log::warn!("inline <svg> (node {id:?}) could not be parsed; it paints nothing");
+        }
+    }
+}
+
+/// The `@font-face` fonts of the page decoded last, kept like
+/// [`DECODED_IMAGES`] so relayouts reuse them.
+type DecodedFonts = (Arc<[browser::FontResource]>, Arc<FontCollection>);
+static DECODED_FONTS: Mutex<Option<DecodedFonts>> = Mutex::new(None);
+
+/// The fonts layout measures and the compositor draws `page` with: the
+/// system page font (or the bitmap fallback) as the default, plus the page's
+/// downloaded web fonts, parsed once per page.
+fn page_fonts(page: &Page) -> FontCollection {
+    let mut fonts = FontCollection::new(page_font().cloned());
+    let resources = &page.resources.fonts;
+    if resources.is_empty() {
+        return fonts;
+    }
+    let mut cached = DECODED_FONTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let faces = match cached.as_ref() {
+        Some((list, faces)) if Arc::ptr_eq(list, resources) => Arc::clone(faces),
+        _ => {
+            let mut faces = FontCollection::new(None);
+            for font in resources.iter() {
+                if !faces.add_face(&font.family, font.weight, font.italic, &font.bytes) {
+                    log::warn!(
+                        "web font {} for {:?} could not be parsed; text falls back",
+                        font.url,
+                        font.family
+                    );
+                }
+            }
+            log::debug!(
+                "parsed {} of {} web fonts for {}",
+                faces.face_count(),
+                resources.len(),
+                page.url
+            );
+            let faces = Arc::new(faces);
+            *cached = Some((Arc::clone(resources), Arc::clone(&faces)));
+            faces
+        }
+    };
+    fonts.extend_faces(&faces);
+    fonts
 }
 
 /// Renders `page` into a `width` × `height` device-pixel frame, first
@@ -168,17 +280,27 @@ fn compose_frame_with_find(
             })
         }
     };
-    match page_font() {
-        Some(font) => {
-            let scale = scale_factor as f32;
-            let scroll_y = (scroll_y * scale).round() / scale;
-            let display_list = display_list(scroll_y);
-            Compositor::new(width, height).compose_paint_with_font(&display_list, font, scale)
-        }
-        None => {
-            let display_list = display_list(scroll_y.round());
-            Compositor::new(css_width, css_height).compose_paint(&display_list)
-        }
+    // With an outline default font, text is rasterized at device
+    // resolution; the bitmap fallback renders one device pixel per CSS
+    // pixel and [`render_page`] scales the frame up.
+    if layout.fonts.default_font().is_some() {
+        let scale = scale_factor as f32;
+        let scroll_y = (scroll_y * scale).round() / scale;
+        let display_list = display_list(scroll_y);
+        Compositor::new(width, height).compose_page(
+            &display_list,
+            &layout.fonts,
+            &layout.images,
+            scale,
+        )
+    } else {
+        let display_list = display_list(scroll_y.round());
+        Compositor::new(css_width, css_height).compose_page(
+            &display_list,
+            &layout.fonts,
+            &layout.images,
+            1.0,
+        )
     }
 }
 
@@ -203,6 +325,11 @@ pub(crate) struct PageLayout {
     /// The viewport width and height in CSS pixels.
     css_size: (u32, u32),
     tree: LayoutTree,
+    /// Decoded `<img>` files and inline `<svg>` documents the tree's
+    /// replaced boxes paint.
+    images: ImageStore,
+    /// The default and web fonts the tree was measured with.
+    fonts: FontCollection,
     /// The parsed document and stylesheets, kept so animation frames only
     /// redo style and layout.
     document: html::HTMLDocument,
@@ -219,8 +346,11 @@ impl PageLayout {
     /// Lays out `page` for a `width` × `height` CSS-pixel viewport at the
     /// start of its animation timeline.
     ///
-    /// Times HTML parsing, each stylesheet's parse, style computation, and
-    /// layout as Performance events; see [`Self::take_timeline`].
+    /// Times HTML parsing, each stylesheet's parse, image decoding (when the
+    /// page has pictures), style computation, and layout as Performance
+    /// events; see [`Self::take_timeline`]. Downloaded images are decoded once
+    /// per page and shared by later layouts of it; inline `<svg>` elements are
+    /// parsed for each layout, since their node ids come from this parse.
     #[cfg(test)]
     pub(crate) fn new(page: &Page, width: u32, height: u32) -> Self {
         Self::new_at(page, width, height, Duration::ZERO)
@@ -247,9 +377,20 @@ impl PageLayout {
                 sheet
             })
             .collect();
+        let (images, event) = TimelineEvent::measure(EventCategory::Parse, "Decode images", || {
+            let mut images = (*decoded_images(page)).clone();
+            add_inline_svgs(&document, &mut images);
+            images
+        });
+        // Pages without pictures leave the stage out of the panel.
+        if !images.is_empty() {
+            timeline.push(event);
+        }
+        let fonts = page_fonts(page);
         let (tree, running_animations, events) = style_and_layout(
             &document,
             &stylesheets,
+            (&fonts, &images),
             (width, height),
             elapsed,
             "Recalculate style",
@@ -258,6 +399,8 @@ impl PageLayout {
         Self {
             css_size: (width, height),
             tree,
+            images,
+            fonts,
             document,
             stylesheets,
             running_animations,
@@ -277,6 +420,7 @@ impl PageLayout {
         let (tree, running_animations, events) = style_and_layout(
             &self.document,
             &self.stylesheets,
+            (&self.fonts, &self.images),
             self.css_size,
             elapsed,
             "Animation frame: recalculate style",
@@ -367,7 +511,7 @@ impl PageLayout {
             let Some((fragment, _, _)) = fragments.get(range.run) else {
                 continue;
             };
-            if let Some(rect) = text_range_rect(fragment, range.bytes, page_metrics()) {
+            if let Some(rect) = text_range_rect(fragment, range.bytes, &self.fonts) {
                 result
                     .entry(*fragment as *const layout::TextFragment)
                     .or_default()
@@ -398,13 +542,15 @@ impl PageLayout {
 }
 
 /// Styles `document` with CSS animations sampled at `elapsed` and lays it
-/// out for a `width` × `height` CSS-pixel viewport.
+/// out for a `width` × `height` CSS-pixel viewport, measuring text with
+/// `fonts` and sizing replaced elements with `images`.
 ///
 /// Returns the layout, the number of running animations, and Performance
 /// events for the style (named `style_label`) and layout stages.
 fn style_and_layout(
     document: &html::HTMLDocument,
     stylesheets: &[css::Stylesheet],
+    (fonts, images): (&FontCollection, &ImageStore),
     (width, height): (u32, u32),
     elapsed: Duration,
     style_label: &str,
@@ -416,14 +562,15 @@ fn style_and_layout(
         EventCategory::Layout,
         format!("Layout {width}×{height}"),
         || {
-            layout_document(
+            layout_document_with_images(
                 document,
                 &styles,
                 Size {
                     width: width as f32,
                     height: height as f32,
                 },
-                page_metrics(),
+                fonts,
+                images,
             )
         },
     );
@@ -439,8 +586,8 @@ fn text_range_rect(
 ) -> Option<layout::Rect> {
     let prefix = fragment.text.get(..range.start)?;
     let matched = fragment.text.get(range)?;
-    let x = fragment.rect.x + metrics.text_width(prefix, fragment.font_size);
-    let width = metrics.text_width(matched, fragment.font_size);
+    let x = fragment.rect.x + metrics.font_text_width(fragment.font, prefix, fragment.font_size);
+    let width = metrics.font_text_width(fragment.font, matched, fragment.font_size);
     (width > 0.0).then_some(layout::Rect {
         x,
         y: fragment.rect.y,
@@ -890,7 +1037,7 @@ mod tests {
         .expect("macOS page font");
         let doc = html::parse_raw_html("<body><p>WiWi</p></body>".into());
         let styles = css::style_document(&doc, &[]);
-        let tree = layout_document(
+        let tree = layout::layout_document(
             &doc,
             &styles,
             Size {
@@ -976,7 +1123,7 @@ mod tests {
         }
         let doc = html::parse_raw_html("<body>WiWi</body>".into());
         let styles = css::style_document(&doc, &[]);
-        let tree = layout_document(
+        let tree = layout::layout_document(
             &doc,
             &styles,
             Size {
@@ -1013,6 +1160,7 @@ mod tests {
                 .into(),
             stylesheets: vec![],
             scripts: vec![],
+            resources: Default::default(),
         };
         for width in [95, 300] {
             let layout = PageLayout::new(&page, width, 100);
@@ -1086,7 +1234,7 @@ mod tests {
         use crate::find_in_page::FindInPage;
         let page = browser::Page { url: "https://example.com/".into(),
             html: "<html><head><title>secret</title><script>secret</script><style>.gone {display:none}</style></head><body><p>Hello <span>world</span> again</p><p class='gone'>secret</p><p>world</p></body></html>".into(),
-            stylesheets: vec![".gone {display:none}".into()], scripts: vec![] };
+            stylesheets: vec![".gone {display:none}".into()], scripts: vec![], resources: Default::default() };
         let mut find = FindInPage::default();
         let wide = PageLayout::new(&page, 600, 100);
         find.replace_runs(wide.find_text());
@@ -1188,6 +1336,7 @@ mod tests {
             html: "<script>location.assign('/next')</script>".into(),
             stylesheets: Vec::new(),
             scripts: vec!["location.assign('/next')".into()],
+            resources: Default::default(),
         };
         events.load_with_viewport(
             &page,
@@ -1218,6 +1367,7 @@ mod tests {
             html: "<script>1 + 1</script>".into(),
             stylesheets: Vec::new(),
             scripts: vec!["1 + 1".into()],
+            resources: Default::default(),
         };
         events.load_with_viewport(
             &page,
@@ -1256,6 +1406,7 @@ mod tests {
             html: "<p>Hello</p>".into(),
             stylesheets: vec!["p { color: red }".into(), "p { margin: 0 }".into()],
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         let mut layout = PageLayout::new(&page, 320, 200);
         let labels: Vec<_> = layout
@@ -1288,6 +1439,7 @@ mod tests {
                     .into(),
             ],
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         let mut layout = PageLayout::new(&page, 100, 200);
         assert!(layout.is_animating());
@@ -1346,6 +1498,7 @@ mod tests {
                      document.addEventListener('click', callback)"
                         .into(),
                 ],
+                resources: Default::default(),
             },
             alert.clone(),
             test_runtime(),
@@ -1432,6 +1585,113 @@ mod tests {
         }
     }
 
+    #[test]
+    fn img_files_and_inline_svg_are_laid_out_and_painted() {
+        let red_square = r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">
+            <rect width="20" height="20" fill="red"/></svg>"#;
+        let page = Page {
+            url: "https://example.test/".into(),
+            html: "<body><img src=\"square.svg\"><img src=\"broken.png\" alt=\"\">\
+                   <svg width=\"10\" height=\"10\" viewBox=\"0 0 1 1\">\
+                   <rect width=\"1\" height=\"1\" fill=\"blue\"></rect></svg></body>"
+                .into(),
+            stylesheets: vec!["body { margin: 0 } img, svg { display: block }".into()],
+            scripts: Vec::new(),
+            resources: browser::PageResources {
+                images: vec![
+                    browser::ImageResource {
+                        src: "square.svg".into(),
+                        url: "https://example.test/square.svg".into(),
+                        bytes: red_square.as_bytes().into(),
+                    },
+                    browser::ImageResource {
+                        src: "broken.png".into(),
+                        url: "https://example.test/broken.png".into(),
+                        bytes: b"not an image"[..].into(),
+                    },
+                ]
+                .into(),
+                ..Default::default()
+            },
+        };
+        let mut layout = PageLayout::new(&page, 40, 40);
+        assert!(
+            layout
+                .take_timeline()
+                .iter()
+                .any(|event| event.label == "Decode images")
+        );
+        // A second layout of the same page reuses the decoded pictures.
+        assert!(Arc::ptr_eq(&decoded_images(&page), &decoded_images(&page)));
+        let frame = compose_frame(&layout, 40, 40, 1.0, 0.0);
+        let pixel = |x: u32, y: u32| {
+            let offset = ((y * frame.width + x) * 4) as usize;
+            frame.pixels[offset..offset + 4].to_vec()
+        };
+        // The 20px image, then the broken image (no height), then the
+        // 10px inline SVG directly below.
+        assert_eq!(pixel(10, 10), [255, 0, 0, 255]);
+        assert_eq!(pixel(5, 25), [0, 0, 255, 255]);
+        assert_eq!(pixel(15, 25), [255, 255, 255, 255]);
+        assert_eq!(pixel(30, 10), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn web_fonts_from_font_face_are_used_for_matching_text() {
+        let Some(data) = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ]
+        .into_iter()
+        .find_map(|path| std::fs::read(path).ok()) else {
+            return;
+        };
+        let font = |family: &str, bytes: &[u8]| browser::FontResource {
+            family: family.into(),
+            weight: (400, 400),
+            italic: false,
+            url: format!("https://example.test/{family}.ttf"),
+            bytes: bytes.into(),
+        };
+        let page = Page {
+            url: "https://example.test/".into(),
+            html: "<body><p id=\"web\">Web font</p><p id=\"bad\">Broken</p></body>".into(),
+            stylesheets: vec![
+                "body { margin: 0 } #web { font-family: 'Web' } #bad { font-family: Bad }".into(),
+            ],
+            scripts: Vec::new(),
+            resources: browser::PageResources {
+                fonts: vec![font("Web", &data), font("Bad", b"not a font")].into(),
+                ..Default::default()
+            },
+        };
+        let layout = PageLayout::new(&page, 200, 100);
+        let fonts: Vec<_> = layout
+            .find_fragments()
+            .into_iter()
+            .map(|(text, _, _)| (text.text.clone(), text.font))
+            .collect();
+        assert_eq!(
+            fonts,
+            [
+                ("Web font".to_owned(), layout::FontId(1)),
+                ("Broken".to_owned(), layout::FontId::DEFAULT),
+            ],
+            "the unparsable font is skipped, so its text uses the default"
+        );
+        let frame = compose_frame(&layout, 200, 100, 1.0, 0.0);
+        assert!(
+            frame
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[0] < 128)
+        );
+    }
+
     fn long_page() -> Page {
         Page {
             url: String::new(),
@@ -1442,6 +1702,7 @@ mod tests {
                     .into(),
             ],
             scripts: Vec::new(),
+            resources: Default::default(),
         }
     }
 
@@ -1484,6 +1745,7 @@ mod tests {
             html: "<body>short</body>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         let layout = PageLayout::new(&short, 160, 120);
         assert_eq!(layout.max_scroll(), 0.0);
@@ -1519,6 +1781,7 @@ mod tests {
             html: "<main><script src=\"script.js\"></script></main>".into(),
             stylesheets: Vec::new(),
             scripts: vec!["alert('rendered page')".into()],
+            resources: Default::default(),
         };
 
         let runtime = test_runtime();
@@ -1553,6 +1816,7 @@ mod tests {
             html: welcome.html,
             stylesheets: welcome.stylesheets,
             scripts: vec!["alert('Hello from script.js')".into()],
+            resources: Default::default(),
         };
         let alert = Arc::new(Recording::default());
         let runtime = test_runtime();
@@ -1586,6 +1850,7 @@ mod tests {
             html: "<main>Hello</main>".into(),
             stylesheets: vec!["main { background-color: #abc; color: red; }".into()],
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         let first = render_document(
             &page,
@@ -1650,6 +1915,7 @@ mod tests {
             html: "<html><body><main>Hi</main></body></html>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         let frame = render_document(
             &page,

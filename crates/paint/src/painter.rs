@@ -26,6 +26,10 @@ pub const CANVAS_COLOR: Color = Color {
 /// set, producing [`DisplayItem::FillRoundedRect`]. An inline box split across
 /// lines rounds every fragment's corners, as if each fragment were a whole
 /// box. Borders, outlines, and other decorations are not supported yet.
+///
+/// Replaced boxes (`<img>`, inline `<svg>`) produce a [`DisplayItem::Image`]
+/// covering their content box, after their background. Their pictures are
+/// not clipped to `border-radius`.
 pub fn paint_document(tree: &LayoutTree) -> DisplayList {
     paint(tree, 0.0, false, |_| Vec::new())
 }
@@ -125,8 +129,22 @@ fn paint(
                         x: text.rect.x,
                         baseline: text.baseline - scroll_y,
                         font_size: text.font_size,
+                        font: text.font,
                         text: text.text.clone(),
                         color: text.color.into(),
+                    });
+                }
+            }
+            PaintItem::Image(layout_box) => {
+                let rect = layout_box.content_rect();
+                if let Some(image) = &layout_box.image
+                    && rect.width > 0.0
+                    && rect.height > 0.0
+                    && visible(&rect)
+                {
+                    items.push(DisplayItem::Image {
+                        rect: scrolled(rect),
+                        image: image.clone(),
                     });
                 }
             }
@@ -218,6 +236,7 @@ mod tests {
                 DisplayItem::FillRect { color, .. } => format!("fill {}", color.b),
                 DisplayItem::FillRoundedRect { color, .. } => format!("round {}", color.b),
                 DisplayItem::Text { text, baseline, .. } => format!("text {text} {baseline:.1}"),
+                DisplayItem::Image { .. } => "image".to_owned(),
             })
             .collect::<Vec<_>>();
         // Canvas, then both block backgrounds, then the text of both blocks
@@ -409,5 +428,91 @@ mod text_background_tests {
             vec![]
         });
         assert_eq!(count, 0);
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use layout::{ImageKey, ImageMetrics, Size, layout_document_with_images};
+
+    struct Metrics;
+
+    impl layout::FontMetrics for Metrics {
+        fn advance(&self, _: char, size: f32) -> f32 {
+            size / 2.0
+        }
+        fn vertical_metrics(&self, size: f32) -> layout::VerticalMetrics {
+            layout::VerticalMetrics {
+                ascent: size * 0.8,
+                descent: size * 0.2,
+                line_gap: 0.0,
+            }
+        }
+    }
+
+    struct Images;
+
+    impl ImageMetrics for Images {
+        fn natural_size(&self, _: &ImageKey) -> Option<Size> {
+            Some(Size {
+                width: 30.0,
+                height: 10.0,
+            })
+        }
+    }
+
+    #[test]
+    fn replaced_boxes_paint_their_picture_in_the_content_box_after_the_background() {
+        let document = html::parse_raw_html(
+            "<body><img src=a.png><div style=height:300px></div><img src=b.png></body>".into(),
+        );
+        let styles = css::style_document(
+            &document,
+            &[css::parse_stylesheet(
+                "body { margin: 0 } img { display: block; padding: 2px; background-color: red }",
+            )],
+        );
+        let tree = layout_document_with_images(
+            &document,
+            &styles,
+            Size {
+                width: 200.0,
+                height: 100.0,
+            },
+            &Metrics,
+            &Images,
+        );
+        let list = paint_document_scrolled(&tree, 0.0);
+        let background = list
+            .items
+            .iter()
+            .position(|item| matches!(item, DisplayItem::FillRect { color, .. } if color.g == 0))
+            .expect("image background");
+        let image = list
+            .items
+            .iter()
+            .position(|item| matches!(item, DisplayItem::Image { .. }))
+            .expect("image item");
+        assert!(image > background);
+        assert_eq!(
+            list.items[image],
+            DisplayItem::Image {
+                rect: layout::Rect {
+                    x: 2.0,
+                    y: 2.0,
+                    width: 30.0,
+                    height: 10.0
+                },
+                image: ImageKey::Src("a.png".into()),
+            }
+        );
+        // The second image is far below the viewport and culled.
+        let images = list
+            .items
+            .iter()
+            .filter(|item| matches!(item, DisplayItem::Image { .. }))
+            .count();
+        assert_eq!(images, 1);
     }
 }

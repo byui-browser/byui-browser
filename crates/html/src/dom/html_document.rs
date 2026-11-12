@@ -215,6 +215,19 @@ impl HTMLDocument {
         output
     }
 
+    /// Serializes the node `id` and its descendants as an HTML fragment, or
+    /// returns `None` when `id` is not a node of this document.
+    ///
+    /// This uses the same rules and limitations as [`Self::inner_html`]; the
+    /// node itself is included. Names are written as the parser stored them,
+    /// which is ASCII lowercase, also for SVG content.
+    pub fn outer_html(&self, id: NodeID) -> Option<String> {
+        self.node(id)?;
+        let mut output = String::new();
+        self.serialize_node(id, &mut output, false);
+        Some(output)
+    }
+
     fn serialize_node(&self, id: NodeID, output: &mut String, raw_text: bool) {
         let Some(node) = self.node(id) else {
             return;
