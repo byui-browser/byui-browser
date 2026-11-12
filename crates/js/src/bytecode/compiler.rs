@@ -1,6 +1,6 @@
 //! AST-to-bytecode compiler.
 
-use super::{CallableKind, Chunk, FunctionTemplate, Instruction};
+use super::{CallableKind, CaptureSource, Chunk, FunctionTemplate, Instruction};
 use crate::Value;
 use crate::ast::{
     ArrowBody, ClassDefinition, Expr, LogicalOperator, MemberProperty, Program, PropertyKey,
@@ -73,9 +73,13 @@ pub struct Compiler {
     function: Option<CallableKind>,
     /// Top-level bindings, visible from every function body.
     globals: HashMap<String, Binding>,
-    /// Names of local variables of enclosing blocks and functions. A function
-    /// body cannot capture them, so referring to one is a compile error.
+    /// Captured bindings available to this function.
+    captures: HashMap<String, Binding>,
+    /// Names from enclosing non-global scopes, used to reject captures by
+    /// legacy function and method bodies.
     enclosing: HashSet<String>,
+    /// Runtime sources for this function's captured bindings.
+    capture_sources: Vec<CaptureSource>,
     /// Number of statement-level values on the operand stack: completion
     /// values waiting in enclosing sequences and loops. `break`, `continue`,
     /// and `return` use it to discard exactly the values they leave behind.
@@ -127,6 +131,7 @@ struct Binding {
     slot: u16,
     kind: VarKind,
     global: bool,
+    capture: Option<u16>,
 }
 
 impl Compiler {
@@ -140,7 +145,9 @@ impl Compiler {
             }],
             function: None,
             globals: HashMap::new(),
+            captures: HashMap::new(),
             enclosing: HashSet::new(),
+            capture_sources: Vec::new(),
             live: 0,
             control: Vec::new(),
         }
@@ -149,9 +156,57 @@ impl Compiler {
     /// Creates the compiler for a function body nested in this compiler's code.
     fn child(&self, kind: CallableKind) -> Self {
         let mut enclosing = self.enclosing.clone();
-        for (index, scope) in self.scopes.iter().enumerate() {
-            if !self.is_global_scope(index) {
+        for (scope_index, scope) in self.scopes.iter().enumerate() {
+            if !self.is_global_scope(scope_index) {
                 enclosing.extend(scope.bindings.keys().cloned());
+            }
+        }
+        let mut captures = HashMap::new();
+        let mut capture_sources = Vec::new();
+        for (scope_index, scope) in self.scopes.iter().enumerate().rev() {
+            if kind != CallableKind::Arrow {
+                break;
+            }
+            if self.is_global_scope(scope_index) {
+                continue;
+            }
+            for (name, binding) in &scope.bindings {
+                if captures.contains_key(name) {
+                    continue;
+                }
+                let index = u16::try_from(capture_sources.len()).unwrap();
+                capture_sources.push(CaptureSource::Local {
+                    depth: u16::try_from(self.scopes.len() - 1 - scope_index).unwrap(),
+                    slot: binding.slot,
+                });
+                captures.insert(
+                    name.clone(),
+                    Binding {
+                        scope: 0,
+                        slot: 0,
+                        kind: binding.kind,
+                        global: false,
+                        capture: Some(index),
+                    },
+                );
+            }
+        }
+        if kind == CallableKind::Arrow {
+            for (name, binding) in &self.captures {
+                if captures.contains_key(name) {
+                    continue;
+                }
+                let index = u16::try_from(capture_sources.len()).unwrap();
+                capture_sources.push(CaptureSource::Capture {
+                    index: binding.capture.expect("captured binding has an index"),
+                });
+                captures.insert(
+                    name.clone(),
+                    Binding {
+                        capture: Some(index),
+                        ..*binding
+                    },
+                );
             }
         }
         let globals = if self.function.is_none() {
@@ -167,6 +222,8 @@ impl Compiler {
             }],
             function: Some(kind),
             globals,
+            captures,
+            capture_sources,
             enclosing,
             live: 0,
             control: Vec::new(),
@@ -216,6 +273,7 @@ impl Compiler {
             name: name.to_owned(),
             kind,
             param_count,
+            captures: compiler.capture_sources,
             chunk: Arc::new(compiler.chunk),
         })
     }
@@ -249,6 +307,7 @@ impl Compiler {
             name: "<arrow>".into(),
             kind: CallableKind::Arrow,
             param_count,
+            captures: compiler.capture_sources,
             chunk: Arc::new(compiler.chunk),
         })
     }
@@ -429,6 +488,7 @@ impl Compiler {
             slot,
             kind,
             global: self.is_global_scope(scope),
+            capture: None,
         };
         self.scopes[scope].bindings.insert(name.to_owned(), binding);
         Ok(binding)
@@ -496,24 +556,28 @@ impl Compiler {
             .iter()
             .rev()
             .find_map(|scope| scope.bindings.get(name).copied())
+            .or_else(|| self.captures.get(name).copied())
             .or_else(|| self.globals.get(name).copied())
     }
 
-    /// Resolves a name for reading or assignment. A name that belongs to an
-    /// enclosing function or block is an error because bytecode functions do
-    /// not capture variables.
+    /// Resolves a name for reading or assignment, including closure captures.
     fn resolve(&self, name: &str) -> Result<Option<Binding>, CompileError> {
         let own = self
             .scopes
             .iter()
             .rev()
             .find_map(|scope| scope.bindings.get(name).copied());
-        if own.is_none() && self.enclosing.contains(name) {
+        if own.is_none()
+            && self.function != Some(CallableKind::Arrow)
+            && self.enclosing.contains(name)
+        {
             return Err(CompileError::unsupported(&format!(
                 "functions that capture the enclosing local `{name}`"
             )));
         }
-        Ok(own.or_else(|| self.globals.get(name).copied()))
+        Ok(own
+            .or_else(|| self.captures.get(name).copied())
+            .or_else(|| self.globals.get(name).copied()))
     }
 
     fn name(&mut self, name: &str) -> Result<u16, CompileError> {
@@ -939,6 +1003,11 @@ impl Compiler {
                 slot: binding.slot,
                 name: name_index,
             });
+        } else if let Some(index) = binding.capture {
+            self.chunk.emit(Instruction::LoadCapture {
+                index,
+                name: name_index,
+            });
         } else {
             let depth =
                 u16::try_from(self.scopes.len() - 1 - binding.scope).map_err(|_| CompileError {
@@ -965,6 +1034,11 @@ impl Compiler {
         if binding.global {
             self.chunk.emit(Instruction::StoreGlobal {
                 slot: binding.slot,
+                name: name_index,
+            });
+        } else if let Some(index) = binding.capture {
+            self.chunk.emit(Instruction::StoreCapture {
+                index,
                 name: name_index,
             });
         } else {

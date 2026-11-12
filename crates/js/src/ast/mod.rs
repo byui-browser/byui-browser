@@ -24,9 +24,8 @@ pub enum Expr {
     Identifier(String),
     /// Arrow function with positional parameters and an expression or block body.
     ///
-    /// The bytecode VM supports expression and block bodies. Arrow functions
-    /// currently share the engine's no-closure limitation and do not capture
-    /// enclosing locals or lexical `this`.
+    /// The bytecode VM supports expression and block bodies, lexical captures,
+    /// and lexical `this`.
     ArrowFunction {
         /// Owned parameter names in argument order.
         params: Vec<String>,
