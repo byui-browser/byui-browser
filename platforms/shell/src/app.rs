@@ -1283,6 +1283,30 @@ impl App {
         self.menu_pressed = None;
     }
 
+    /// Opens the toolbar overflow menu beneath the browser controls.
+    fn open_overflow_menu(&mut self) {
+        self.dismiss_context_menu();
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+        self.context_menu = Some(ContextMenu::overflow(size.width, size.height));
+        self.chrome.pressed = None;
+        self.set_hovered(None);
+        self.frame_key = None;
+        self.redraw();
+    }
+
+    /// Clears the network state shared by all future page navigations.
+    fn clear_cache(&mut self) {
+        let Some(loader) = &self.loader else {
+            log::warn!("cache clear unavailable: page loader is not running");
+            return;
+        };
+        loader.clear_cache();
+        log::info!("cleared page-load HTTP and CORS-preflight caches");
+    }
+
     fn close_page_source(&mut self) {
         self.source_close_pressed = false;
         if self.page_source.take().is_some() {
@@ -1681,6 +1705,7 @@ impl App {
                     log::debug!("context menu action: {action:?}");
                     match action {
                         Some(MenuAction::Reload) => self.activate(Control::Reload),
+                        Some(MenuAction::ClearCache) => self.clear_cache(),
                         Some(MenuAction::PageSource) => self.show_page_source(),
                         Some(MenuAction::Inspect) => self.show_elements(),
                         Some(MenuAction::Compatibility) => self.show_compatibility(),
@@ -1850,9 +1875,9 @@ impl App {
                 log::debug!("toolbar action: address");
                 self.begin_address_edit()
             }
-            // Tabs and the menu are not implemented yet; these controls only
-            // give visual feedback.
-            Control::NewTab | Control::Menu => {
+            Control::Menu => self.open_overflow_menu(),
+            // Tabs are not implemented yet; this control only gives visual feedback.
+            Control::NewTab => {
                 log::debug!("toolbar action: {control:?} (not implemented)");
             }
         }
