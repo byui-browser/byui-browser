@@ -1,4 +1,5 @@
-//! DevTools protocol and tooling: inspector, debugger, profiler, network panel, console.
+//! DevTools protocol and tooling: inspector, debugger, profiler, network panel,
+//! performance timeline, console.
 //!
 //! **Owning team**: Devtools Team
 //!
@@ -8,6 +9,7 @@
 
 pub mod compat;
 pub mod network;
+pub mod performance;
 
 /// Severity of a console entry, mirroring `console.log` / `warn` / `error`.
 // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the

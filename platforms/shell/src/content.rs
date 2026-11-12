@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 
 use browser::{BrowserRuntime, Page};
+use devtools::performance::{EventCategory, PerformanceLog, TimelineEvent};
 use html::NodeID;
 use layout::{FontMetrics, LayoutTree, Size, layout_document};
 use render::{BitmapFont, Compositor, Frame, OutlineFont};
@@ -198,31 +199,67 @@ pub(crate) struct PageLayout {
     /// The viewport width and height in CSS pixels.
     css_size: (u32, u32),
     tree: LayoutTree,
+    /// How long each stage of building this layout took, until the app moves
+    /// them to the Performance panel with [`Self::take_timeline`].
+    timeline: Vec<TimelineEvent>,
 }
 
 impl PageLayout {
     /// Lays out `page` for a `width` × `height` CSS-pixel viewport.
+    ///
+    /// Times HTML parsing, each stylesheet's parse, style computation, and
+    /// layout as Performance events; see [`Self::take_timeline`].
     pub(crate) fn new(page: &Page, width: u32, height: u32) -> Self {
-        let document = html::parse_raw_html(page.html.to_owned());
+        let mut timeline = Vec::new();
+        let (document, event) = TimelineEvent::measure(EventCategory::Parse, "Parse HTML", || {
+            html::parse_raw_html(page.html.to_owned())
+        });
+        timeline.push(event);
         let stylesheets: Vec<_> = page
             .stylesheets
             .iter()
-            .map(|source| css::parse_stylesheet(source))
+            .enumerate()
+            .map(|(index, source)| {
+                let label = format!("Parse stylesheet {}", index + 1);
+                let (sheet, event) = TimelineEvent::measure(EventCategory::Parse, label, || {
+                    css::parse_stylesheet(source)
+                });
+                timeline.push(event);
+                sheet
+            })
             .collect();
-        let styles = css::style_document(&document, &stylesheets);
-        let tree = layout_document(
-            &document,
-            &styles,
-            Size {
-                width: width as f32,
-                height: height as f32,
+        let (styles, event) =
+            TimelineEvent::measure(EventCategory::Style, "Recalculate style", || {
+                css::style_document(&document, &stylesheets)
+            });
+        timeline.push(event);
+        let (tree, event) = TimelineEvent::measure(
+            EventCategory::Layout,
+            format!("Layout {width}×{height}"),
+            || {
+                layout_document(
+                    &document,
+                    &styles,
+                    Size {
+                        width: width as f32,
+                        height: height as f32,
+                    },
+                    page_metrics(),
+                )
             },
-            page_metrics(),
         );
+        timeline.push(event);
         Self {
             css_size: (width, height),
             tree,
+            timeline,
         }
+    }
+
+    /// Removes and returns the timings recorded while building this layout.
+    /// Later calls return an empty list.
+    pub(crate) fn take_timeline(&mut self) -> Vec<TimelineEvent> {
+        std::mem::take(&mut self.timeline)
     }
 
     /// Lays out `page` for a `width` × `height` device-pixel page area at
@@ -377,12 +414,15 @@ enum PageCommand {
         device_pixel_ratio: f64,
         viewport: Option<ViewportSize>,
         navigate: LocationNavigate,
+        performance: Option<Arc<Mutex<PerformanceLog>>>,
     },
     Resize(ViewportSize),
     ScrollY(f64),
     DevicePixelRatio(f64),
     Click(Option<NodeID>),
     Snapshot(mpsc::Sender<String>),
+    /// Answers once every earlier command has been handled.
+    Flush(mpsc::Sender<()>),
 }
 
 /// Owns the page's JavaScript session on a thread that is not the UI thread.
@@ -411,10 +451,26 @@ impl PageEvents {
         }
     }
 
-    /// The error that stopped the current page's scripts, or `None` when
-    /// they finished (or have not run yet).
-    pub(crate) fn script_error(&self) -> Option<String> {
-        self.script_error.lock().map_or(None, |error| error.clone())
+    /// Returns a function that waits, up to `timeout`, until the session has
+    /// handled every command sent before this call (such as a page load and
+    /// its scripts), then returns the error that stopped the current page's
+    /// scripts, or `None` when they finished (or have not run yet).
+    ///
+    /// Call the function off the UI thread: a script waiting on `alert`
+    /// holds up the session until the UI thread shows the dialog.
+    pub(crate) fn settled_script_error(
+        &self,
+        timeout: std::time::Duration,
+    ) -> impl FnOnce() -> Option<String> + Send + 'static {
+        let (sender, receiver) = mpsc::channel();
+        let queued = self.commands.send(PageCommand::Flush(sender)).is_ok();
+        let slot = Arc::clone(&self.script_error);
+        move || {
+            if queued && receiver.recv_timeout(timeout).is_err() {
+                log::debug!("page session still busy; reading its script error early");
+            }
+            slot.lock().map_or(None, |error| error.clone())
+        }
     }
 
     /// Replaces the live document with `page` and runs its script.
@@ -434,12 +490,15 @@ impl PageEvents {
             device_pixel_ratio,
             None,
             Arc::new(|_, _| {}),
+            None,
         );
     }
 
     /// Replaces the live document and exposes `device_pixel_ratio` and
     /// `viewport` (CSS pixels) to page scripts. `Location` navigation
     /// requests from the page are passed to `navigate` on the session thread.
+    /// When `performance` is given, script evaluation and click listeners
+    /// for this page are recorded there as [`EventCategory::Script`] events.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn load_with_viewport(
         &self,
@@ -450,6 +509,7 @@ impl PageEvents {
         device_pixel_ratio: f64,
         viewport: Option<ViewportSize>,
         navigate: LocationNavigate,
+        performance: Option<Arc<Mutex<PerformanceLog>>>,
     ) {
         if self
             .commands
@@ -461,6 +521,7 @@ impl PageEvents {
                 device_pixel_ratio,
                 viewport,
                 navigate,
+                performance,
             })
             .is_err()
         {
@@ -520,6 +581,14 @@ impl PageEvents {
 
 fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<Option<String>>) {
     let mut session = None;
+    let mut performance: Option<Arc<Mutex<PerformanceLog>>> = None;
+    let record = |log: &Option<Arc<Mutex<PerformanceLog>>>, event: TimelineEvent| {
+        if let Some(log) = log
+            && let Ok(mut log) = log.lock()
+        {
+            log.record(event);
+        }
+    };
     while let Ok(command) = commands.recv() {
         match command {
             PageCommand::Load {
@@ -530,21 +599,28 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
                 device_pixel_ratio,
                 viewport,
                 navigate,
+                performance: log,
             } => {
                 log::debug!("page session loading {}", page.url);
+                performance = log;
                 // A previous page's failure must not be blamed on this one.
                 set_script_error(script_error, None);
                 let controller = browser::request_controller(None);
-                match runtime.open_page_with_viewport_and_navigation(
-                    &page,
-                    console,
-                    alert_sink,
-                    controller,
-                    browser::security_context_for_url(&page.url),
-                    device_pixel_ratio,
-                    viewport,
-                    navigate,
-                ) {
+                let (result, event) =
+                    TimelineEvent::measure(EventCategory::Script, "Evaluate scripts", || {
+                        runtime.open_page_with_viewport_and_navigation(
+                            &page,
+                            console,
+                            alert_sink,
+                            controller,
+                            browser::security_context_for_url(&page.url),
+                            device_pixel_ratio,
+                            viewport,
+                            navigate,
+                        )
+                    });
+                record(&performance, event);
+                match result {
                     Ok(loaded) => {
                         session = Some(loaded);
                         set_script_error(script_error, None);
@@ -577,13 +653,21 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
                 let Some(session) = &session else {
                     continue;
                 };
-                let result = match target {
-                    Some(node) => session.dispatch_click_at(node),
-                    None => session.dispatch_click(),
-                };
+                let (result, event) = TimelineEvent::measure(
+                    EventCategory::Script,
+                    "Click listeners",
+                    || match target {
+                        Some(node) => session.dispatch_click_at(node),
+                        None => session.dispatch_click(),
+                    },
+                );
+                record(&performance, event);
                 if let Err(error) = result {
                     log::warn!("page click failed: {error}");
                 }
+            }
+            PageCommand::Flush(sender) => {
+                let _ = sender.send(());
             }
             PageCommand::Snapshot(sender) => {
                 let html = session
@@ -1052,6 +1136,7 @@ mod tests {
             Arc::new(move |url, behavior| {
                 let _ = navigate_tx.send((url, behavior));
             }),
+            None,
         );
 
         let (url, behavior) = navigate_rx
@@ -1059,6 +1144,73 @@ mod tests {
             .expect("Location.assign should reach the navigation callback");
         assert_eq!(url.as_str(), "https://example.test/next");
         assert_eq!(behavior, webapis::NavigationBehavior::Auto);
+    }
+
+    #[test]
+    fn script_evaluation_is_recorded_on_the_performance_timeline() {
+        let events = PageEvents::new();
+        let performance = Arc::new(Mutex::new(PerformanceLog::new()));
+        let page = Page {
+            url: "https://example.test/".into(),
+            html: "<script>1 + 1</script>".into(),
+            stylesheets: Vec::new(),
+            scripts: vec!["1 + 1".into()],
+        };
+        events.load_with_viewport(
+            &page,
+            Arc::new(NoopConsole),
+            test_alert_sink(),
+            test_runtime(),
+            1.0,
+            None,
+            Arc::new(|_, _| {}),
+            Some(Arc::clone(&performance)),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let labels = loop {
+            let labels: Vec<_> = performance
+                .lock()
+                .unwrap()
+                .entries()
+                .iter()
+                .map(|event| (event.category, event.label.clone()))
+                .collect();
+            if !labels.is_empty() || std::time::Instant::now() > deadline {
+                break labels;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(
+            labels,
+            [(EventCategory::Script, "Evaluate scripts".to_owned())]
+        );
+    }
+
+    #[test]
+    fn page_layout_times_each_stage_once() {
+        let page = Page {
+            url: "https://example.test/".into(),
+            html: "<p>Hello</p>".into(),
+            stylesheets: vec!["p { color: red }".into(), "p { margin: 0 }".into()],
+            scripts: Vec::new(),
+        };
+        let mut layout = PageLayout::new(&page, 320, 200);
+        let labels: Vec<_> = layout
+            .take_timeline()
+            .into_iter()
+            .map(|event| (event.category, event.label))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                (EventCategory::Parse, "Parse HTML".to_owned()),
+                (EventCategory::Parse, "Parse stylesheet 1".to_owned()),
+                (EventCategory::Parse, "Parse stylesheet 2".to_owned()),
+                (EventCategory::Style, "Recalculate style".to_owned()),
+                (EventCategory::Layout, "Layout 320×200".to_owned()),
+            ]
+        );
+        assert!(layout.take_timeline().is_empty());
     }
 
     #[test]
