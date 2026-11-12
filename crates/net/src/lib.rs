@@ -1,130 +1,71 @@
-//! Networking stack: HTTP/1.1, HTTP/2, HTTP/3, TLS, caching, cookies.
+//! Rust Fetch engine boundary for browser and other Rust consumers.
 //!
 //! **Owning team**: Networking Team
 //!
-//! Planned high-level API (architecture §3.2): `fetch(request) -> Response`.
-//! Renderer processes never open raw sockets; all network goes through
-//! the Network process. Cookie jar / cache policy decisions are owned by
-//! Security & Storage.
+//! [`RequestController::fetch`] returns a filtered [`Response`] as soon as its
+//! response headers pass Fetch filtering. [`Body`] is the sole body channel;
+//! it is abort-aware and network errors can arrive while it is consumed.
+//! The transport and its Reqwest header/status/stream types stay behind this
+//! response boundary. The `webapis` crate adapts these Rust values to
+//! JavaScript objects, promises, and streams; this crate owns no JS identity.
+//!
+//! The engine coordinates process-local scheduling and a small in-memory cache.
+//! Durable storage, security policy, service workers, client context, and
+//! diagnostics belong to their browser services and enter through
+//! [`FetchServices`]. Renderer processes do not open sockets directly.
+//!
+//! The current transport executes HTTP(S) requests. Relative URLs require a
+//! [`FetchEnvironment`] with a base URL. Engine-owned `data:` and the exact
+//! `about:blank` URL are resolved locally; `blob:`, `file:`, and `byui:` require
+//! matching providers installed with [`RequestController::builder`]. Unsupported schemes
+//! return [`RequestError::UnsupportedScheme`]. Local schemes bypass HTTP
+//! transport, cookies, and the HTTP cache. Provider resolution and streams
+//! observe request cancellation, and provider metadata is validated before
+//! public response exposure. Provider-backed local resources accept only `GET`
+//! and `HEAD`; other methods fail before provider lookup.
+//! This first engine slice supports basic same-origin responses, simple CORS
+//! checks, opaque no-CORS views, and forbidden response-header filtering.
+//! Requests requiring absent providers or algorithms fail with a typed
+//! [`RequestError::UnsupportedFeature`] before transport. HTTP redirects are
+//! handled by the controller according to [`RedirectMode`]. See the
+//! [engine contract](../docs/fetch-engine-contract.md) for the supported subset.
 
+// Crate-wide flags to ignore dead code warnings. Will be removed once implementation
+// is finished, but is required for now to prevent the integration tests from failing.
+#![allow(dead_code)]
+// Flag to forbid unsafe code. This is security-critical and permanant.
 #![forbid(unsafe_code)]
 
-use std::fmt;
+// TODO(net): Add persistent cookie storage, strict CORS, and HTTP/3 transport.
 
-/// A validated absolute URL.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
-// types, names, and module layout however your crate's public API needs.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Url(String);
-
-impl Url {
-    /// Parses and validates an absolute URL.
-    ///
-    /// Currently only rejects the empty string.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
-    pub fn parse(input: &str) -> Result<Self, NetError> {
-        if input.is_empty() {
-            return Err(NetError::InvalidUrl(String::new()));
-        }
-        todo!("TODO(net): validate URL: {input:?}")
-    }
-
-    /// The URL as text.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for Url {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// HTTP method.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Method {
-    Get,
-    Post,
-}
-
-/// An outgoing request.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Request {
-    pub url: Url,
-    pub method: Method,
-    pub headers: Vec<(String, String)>,
-}
-
-impl Request {
-    /// A `GET` request with no headers.
-    // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
-    pub fn get(url: Url) -> Self {
-        Self {
-            url,
-            method: Method::Get,
-            headers: Vec::new(),
-        }
-    }
-}
-
-/// A received response.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Response {
-    pub status: u16,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-}
-
-/// Network failure.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NetError {
-    InvalidUrl(String),
-    UnsupportedScheme(String),
-    ConnectionFailed(String),
-}
-
-impl fmt::Display for NetError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidUrl(u) => write!(f, "invalid url: {u:?}"),
-            Self::UnsupportedScheme(s) => write!(f, "unsupported scheme: {s}"),
-            Self::ConnectionFailed(why) => write!(f, "connection failed: {why}"),
-        }
-    }
-}
-
-impl std::error::Error for NetError {}
-
-/// Performs a request, following redirects (architecture §3.2).
-///
-/// Not implemented: every call is a `todo!()` until the Networking team lands
-/// a transport. Tests must not depend on a live network.
-// NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
-// signature (likely `async`) however your crate's public API needs.
-pub fn fetch(request: &Request) -> Result<Response, NetError> {
-    todo!("TODO(net): fetch {:?} {}", request.method, request.url)
-}
+mod api;
+mod cache;
+mod engine;
+mod policy;
+mod scheduling;
+mod transport;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    #[test]
-    fn empty_url_is_invalid() {
-        assert_eq!(Url::parse(""), Err(NetError::InvalidUrl(String::new())));
-    }
-
-    #[test]
-    fn get_request_defaults() {
-        let url = Url("https://example.test/".into());
-        let req = Request::get(url.clone());
-        assert_eq!(req.method, Method::Get);
-        assert!(req.headers.is_empty());
-        assert_eq!(req.url, url);
-    }
-}
+pub use api::{
+    body::{Blob, Body, FormData, FormDataEntry},
+    cancellation::{AbortController, AbortSignal},
+    config::Config,
+    error::{ProviderErrorKind, RequestError},
+    headers::{HeaderGuard, Headers},
+    providers::{
+        BlobProvider, FileProvider, PageProvider, ProviderBodyStream, ProviderFuture, SchemeBody,
+        SchemeProviders, SchemeResource,
+    },
+    request::{
+        CacheMode, CredentialsMode, FetchContext, FetchEnvironment, InitiatorType,
+        NetworkPartitionKey, Origin, RedirectMode, Referrer, ReferrerPolicy, Request,
+        RequestDestination, RequestMode, RequestPriority, ServiceWorkersMode,
+    },
+    response::{Response, ResponseType},
+    services::{FetchServices, ResponseInfo, ServiceWorkerDecision},
+};
+pub use engine::{RequestController, RequestControllerBuilder};
+pub use http::{HeaderName, HeaderValue, Method};
+pub use url::Url;

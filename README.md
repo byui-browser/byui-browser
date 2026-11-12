@@ -33,6 +33,8 @@ crate ownership, and collaboration rules. Team overviews live in
 └── docs/
     ├── TECH_ARCHITECTURE.md
     ├── TEAMS.md
+    ├── CI.md
+    ├── PLATFORM_TESTING.md
     └── adr/             # Architecture Decision Records
 ```
 
@@ -48,6 +50,7 @@ rustup update stable
 
 ```bash
 make build                 # build the workspace (debug)
+make run                   # run the native shell for the current OS
 make test                  # unit tests across the workspace
 make test html             # tests for a single crate
 cargo test -p html -- --ignored   # backlog: contract tests not yet implemented
@@ -61,6 +64,11 @@ The binary entry point:
 cargo run -p browser
 ```
 
+`make run` selects the platform shell automatically. The macOS, Linux, and
+Windows shells currently render the startup HTML page, parse its CSS, and
+execute its JavaScript startup script; see [`platforms/`](platforms/README.md)
+for what each shell needs.
+
 ## Development workflow
 
 - Trunk-based development on `main`
@@ -68,6 +76,7 @@ cargo run -p browser
 - Before merge: `make lint` and `make test` (or `make test <crate>` for changed crates)
 - Cross-crate / `common` changes need review from affected owning teams
 - Record architecture decisions in [`docs/adr/`](docs/adr/)
+- See [`docs/CI.md`](docs/CI.md) for pull-request checks and local equivalents.
 
 ## Status
 

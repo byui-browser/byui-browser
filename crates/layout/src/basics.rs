@@ -5,16 +5,6 @@ async fn main() {
     loop {
         clear_background(WHITE);
 
-        draw_rectangle(
-            100.0, // x position
-            100.0, // y position
-            200.0, // width
-            150.0, // height
-            BLUE,  // color
-
-        );
-         
-        clear background(WHITE); 
         let parent_x = 100.0;
         let parent_y = 100.0;
         let parent_width = 200.0;

@@ -1,10 +1,10 @@
-.PHONY: all build test release lint
+.PHONY: all build run test release lint
 
-# Secondary goals after `test` / `release` (crate name or platform).
+# Secondary goals after `run`, `test`, or `release` (crate name or platform).
 CMD  := $(firstword $(MAKECMDGOALS))
 ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
 
-ifneq (,$(filter $(CMD),test release))
+ifneq (,$(filter $(CMD),run test release))
 $(ARGS):
 	@:
 endif
@@ -15,12 +15,31 @@ all: build
 build:
 	cargo build --workspace
 
-## Run all workspace tests, or `make test <crate_name>` for one crate.
+## Run a platform shell: `make run shell` for the browser, or `make run js`
+## for the interactive JavaScript engine shell.
+run:
+ifeq ($(ARGS),js)
+	cargo run -p browser-js
+else ifeq ($(ARGS),shell)
+	cargo run -p browser
+else ifeq ($(OS),Windows_NT)
+	cargo run -p byui-browser-windows
+else ifneq (,$(filter Darwin darwin,$(shell uname -s)))
+	cargo run -p browser-macos
+else ifneq (,$(filter Linux linux,$(shell uname -s)))
+	cargo run -p browser-linux
+else ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(shell uname -s)))
+	cargo run -p byui-browser-windows
+else
+	$(error Unsupported operating system '$(shell uname -s)')
+endif
+
+## Run all workspace tests, or `make test <crate_name>...` for specific crates.
 test:
 ifeq ($(strip $(ARGS)),)
 	cargo test --workspace
 else
-	cargo test -p $(ARGS)
+	cargo test $(foreach crate,$(ARGS),-p $(crate))
 endif
 
 ## Release-build the browser for a platform: `make release <macos|linux|windows>`.

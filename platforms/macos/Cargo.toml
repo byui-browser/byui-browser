@@ -1,0 +1,17 @@
+[package]
+name = "browser-macos"
+description = "Minimal native macOS window for BYUI Browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+browser-shell = { path = "../shell" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+
+[lints]
+workspace = true

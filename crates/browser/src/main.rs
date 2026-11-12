@@ -6,7 +6,43 @@
 //! Utility/Storage, and DevTools processes per the architecture process model.
 //! Teams own the crates; this crate only composes them.
 
+use std::sync::Arc;
+
+use browser::{evaluate_page_scripts, request_controller};
+use rfd::{MessageButtons, MessageDialog, MessageLevel};
+use webapis::{AlertSink, ConsoleSink};
+
+struct StdoutConsole;
+
+impl ConsoleSink for StdoutConsole {
+    fn log(&self, message: &str) {
+        println!("{message}");
+    }
+}
+
+/// Native modal alert adapter for the standalone browser composition binary.
+struct NativeAlert;
+
+impl AlertSink for NativeAlert {
+    fn alert(&self, message: &str) {
+        MessageDialog::new()
+            .set_title("BYUI Browser")
+            .set_description(message)
+            .set_level(MessageLevel::Info)
+            .set_buttons(MessageButtons::Ok)
+            .show();
+    }
+}
+
 fn main() {
-    // TODO(browser): Wire up multi-process startup and the first vertical slice.
-    eprintln!("byui-browser: scaffolding only — engine not implemented yet");
+    // Keep the standalone binary useful while native platform shells are
+    // brought online. `make run` selects the platform shell below.
+    let controller = request_controller(None);
+    evaluate_page_scripts(
+        "<script>print()</script>",
+        Arc::new(StdoutConsole),
+        Arc::new(NativeAlert),
+        controller,
+    )
+    .expect("page scripts should evaluate");
 }
