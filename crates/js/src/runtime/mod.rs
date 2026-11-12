@@ -45,7 +45,10 @@ use crate::{HostFunction, JsError, JsResult, Value};
 pub use array::MAX_ARRAY_LENGTH;
 pub(crate) use array::{array_to_string, get_array_property, set_array_property};
 pub(crate) use conversions::{is_truthy, number_to_string, to_property_key};
-pub use object::{HostGetter, HostSetter, Object, WeakObject};
+pub use object::{
+    HostGetter, HostPropertyGetter, HostPropertyKeys, HostPropertySetter, HostSetter, Object,
+    WeakObject,
+};
 pub(crate) use operators::{binary, unary};
 
 const STACK_OVERFLOW: &str = "Maximum call stack size exceeded";

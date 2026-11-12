@@ -19,7 +19,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-pub use runtime::{Function, HostGetter, HostSetter, MAX_ARRAY_LENGTH, Object, WeakObject};
+pub use runtime::{
+    Function, HostGetter, HostPropertyGetter, HostPropertyKeys, HostPropertySetter, HostSetter,
+    MAX_ARRAY_LENGTH, Object, WeakObject,
+};
 pub use vm::Vm;
 
 /// A JavaScript value produced by evaluation or passed to host functions.

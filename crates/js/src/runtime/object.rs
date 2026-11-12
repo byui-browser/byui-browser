@@ -11,6 +11,12 @@ use crate::{HostFunction, JsResult, Value};
 pub type HostGetter = Arc<dyn Fn() -> JsResult<Value> + Send + Sync>;
 /// A thread-safe host setter for a JavaScript object property.
 pub type HostSetter = Arc<dyn Fn(Value) -> JsResult<()> + Send + Sync>;
+/// A thread-safe host hook for a dynamic JavaScript property read.
+pub type HostPropertyGetter = Arc<dyn Fn(&str) -> JsResult<Option<Value>> + Send + Sync>;
+/// A thread-safe host hook for a dynamic JavaScript property write.
+pub type HostPropertySetter = Arc<dyn Fn(&str, Value) -> JsResult<bool> + Send + Sync>;
+/// A thread-safe host hook for dynamic JavaScript property names.
+pub type HostPropertyKeys = Arc<dyn Fn() -> JsResult<Vec<String>> + Send + Sync>;
 
 /// A JavaScript object value: a table of owned string keys to owned values.
 ///
@@ -54,6 +60,9 @@ struct ObjectData {
     replaceable_properties: Mutex<HashSet<String>>,
     prototype: Mutex<Option<Object>>,
     constructor: Mutex<Option<WeakFunction>>,
+    property_getter: Mutex<Option<HostPropertyGetter>>,
+    property_setter: Mutex<Option<HostPropertySetter>>,
+    property_keys: Mutex<Option<HostPropertyKeys>>,
     /// For the object a `catch` clause receives for an engine error: the
     /// error itself, restored if the object is thrown again unchanged.
     origin: Mutex<Option<crate::JsError>>,
@@ -178,6 +187,16 @@ impl Object {
             if let Some(value) = current.get_own(key) {
                 return Ok(Some(value));
             }
+            if let Some(getter) = current
+                .0
+                .property_getter
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+                && let Some(value) = getter(key)?
+            {
+                return Ok(Some(value));
+            }
             let Some(prototype) = current.prototype() else {
                 return Ok(None);
             };
@@ -232,8 +251,43 @@ impl Object {
                 None => Ok(()),
             };
         }
+        if !self.contains_key(&key)
+            && let Some(setter) = self
+                .0
+                .property_setter
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+            && setter(&key, value.clone())?
+        {
+            return Ok(());
+        }
         self.set(key, value);
         Ok(())
+    }
+
+    /// Installs hooks for properties backed by an external host object.
+    pub fn set_property_hooks(
+        &self,
+        getter: HostPropertyGetter,
+        setter: HostPropertySetter,
+        keys: HostPropertyKeys,
+    ) {
+        *self
+            .0
+            .property_getter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(getter);
+        *self
+            .0
+            .property_setter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(setter);
+        *self
+            .0
+            .property_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(keys);
     }
 
     /// Returns a clone of the value stored under `key` on this object
@@ -410,6 +464,20 @@ impl Object {
         {
             if !keys.contains(name) {
                 keys.push(name.clone());
+            }
+        }
+        if let Some(property_keys) = self
+            .0
+            .property_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            && let Ok(dynamic_keys) = property_keys()
+        {
+            for name in dynamic_keys {
+                if !keys.contains(&name) {
+                    keys.push(name);
+                }
             }
         }
         keys

@@ -19,7 +19,7 @@ use security::{
 use storage::{
     OriginStorage, PersistentOriginStorage, SharedStorage, StorageError, shared_storage,
 };
-use webapis::local_storage::register_local_storage;
+use webapis::local_storage::register_local_storage_with_url;
 use webapis::session_storage::register_session_storage;
 use webapis::{
     AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, register_alert,
@@ -649,10 +649,11 @@ impl BrowserRuntime {
         // Installs the live `Location` accessor on the window registered above.
         let location = register_location_with_navigation(&mut realm, document_url, navigate)?;
         register_document_with_location(&mut realm, document, location)?;
-        register_local_storage(
+        register_local_storage_with_url(
             &mut realm,
             Arc::clone(&self.storage),
             security_context.clone(),
+            initial_url,
         )?;
         register_session_storage(&mut realm, security_context)?;
 
@@ -810,6 +811,7 @@ fn attribute<'a>(attributes: &'a [html::Attribute], name: &str) -> Option<&'a st
 mod tests {
     use super::*;
     use security::{Origin, RendererSecurityContext, StoragePermission};
+    use webapis::local_storage::register_local_storage;
 
     struct TestConsole;
 
