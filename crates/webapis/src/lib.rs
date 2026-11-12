@@ -19,6 +19,7 @@ mod event;
 mod fetch;
 pub mod local_storage;
 mod location;
+mod math;
 mod selector;
 pub mod session_storage;
 mod timer;
@@ -42,6 +43,7 @@ pub use fetch::{fetch, register_fetch, register_fetch_with_url};
 pub use location::{
     LocationNavigate, NavigationBehavior, register_location, register_location_with_navigation,
 };
+pub use math::register_math;
 pub use selector::SelectorError;
 pub use timer::{TimerId, TimerQueue};
 pub use window::{

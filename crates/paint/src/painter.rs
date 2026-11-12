@@ -516,3 +516,76 @@ mod image_tests {
         assert_eq!(images, 1);
     }
 }
+
+#[cfg(test)]
+mod generated_content_tests {
+    use super::*;
+    use layout::{Size, layout_document};
+
+    struct Metrics;
+    impl layout::FontMetrics for Metrics {
+        fn advance(&self, _character: char, size: f32) -> f32 {
+            size / 2.0
+        }
+        fn vertical_metrics(&self, size: f32) -> layout::VerticalMetrics {
+            layout::VerticalMetrics {
+                ascent: size * 0.8,
+                descent: size * 0.2,
+                line_gap: 0.0,
+            }
+        }
+    }
+
+    const fn rgb(r: u8, g: u8, b: u8) -> Color {
+        Color { r, g, b, a: 255 }
+    }
+
+    #[test]
+    fn before_and_after_pseudo_elements_are_painted() {
+        let document = html::parse_raw_html("<body><p>mid</p></body>".into());
+        let sheet = css::parse_stylesheet(
+            "body, p { margin: 0 } \
+             p::before { content: '>>'; color: #ff0000; background-color: #ffff00 } \
+             p:after { content: ''; display: block; height: 5px; background-color: #0000ff }",
+        );
+        let styles = css::style_document(&document, &[sheet]);
+        let tree = layout_document(
+            &document,
+            &styles,
+            Size {
+                width: 200.0,
+                height: 100.0,
+            },
+            &Metrics,
+        );
+        let list = paint_document(&tree);
+        let position = |wanted: &dyn Fn(&DisplayItem) -> bool| {
+            list.items
+                .iter()
+                .position(wanted)
+                .unwrap_or_else(|| panic!("item missing from {:#?}", list.items))
+        };
+        // The block `::after` background: full width, below the 16px line.
+        let after = position(&|item| {
+            matches!(item, DisplayItem::FillRect { rect, color }
+                if *color == rgb(0, 0, 255)
+                    && (rect.x, rect.y, rect.width, rect.height) == (0.0, 16.0, 200.0, 5.0))
+        });
+        // The inline `::before` background spans its two 8px glyphs.
+        let before_background = position(&|item| {
+            matches!(item, DisplayItem::FillRect { rect, color }
+                if *color == rgb(255, 255, 0) && (rect.x, rect.width) == (0.0, 16.0))
+        });
+        let before_text = position(&|item| {
+            matches!(item, DisplayItem::Text { x, text, color, .. }
+                if text == ">>" && *x == 0.0 && *color == rgb(255, 0, 0))
+        });
+        let element_text = position(
+            &|item| matches!(item, DisplayItem::Text { x, text, .. } if text == "mid" && *x == 16.0),
+        );
+        // Block backgrounds first, then inline content in tree order.
+        assert!(after < before_background);
+        assert!(before_background < before_text);
+        assert!(before_text < element_text);
+    }
+}

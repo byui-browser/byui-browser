@@ -440,6 +440,135 @@ fn br_forces_a_break_without_adding_a_trailing_empty_line() {
 }
 
 #[test]
+fn before_and_after_generate_inline_text_around_the_children() {
+    let (document, tree) = lay_out(
+        "<body><p id='p' title='tip'>mid</p><p id='legacy'>x</p><p id='none'>y</p></body>",
+        "body { margin: 0 } p { margin: 0 } \
+         #p::before { content: '[' attr(title) '] '; color: red; text-transform: uppercase } \
+         #p::after { content: ' \\2713'; padding-left: 4px } \
+         #legacy:before { content: '>' } #legacy:after { content: '<' } \
+         #none::before { content: none } #none::after { color: red }",
+        800.0,
+    );
+    let node = id(&document, "p");
+    let paragraph = box_for(&tree, &document, "p");
+    assert_eq!(paragraph.lines.len(), 1);
+    let described = paragraph.lines[0]
+        .fragments
+        .iter()
+        .map(|fragment| match fragment {
+            LineFragment::InlineBox(inline) => {
+                assert_eq!(inline.node, node);
+                format!("box@{}+{}", inline.rect.x, inline.rect.width)
+            }
+            LineFragment::Text(text) => format!("{:?}@{}", text.text, text.rect.x),
+            LineFragment::Atomic(_) => "atomic".to_owned(),
+        })
+        .collect::<Vec<_>>();
+    // "[TIP] " is 6 characters (48px), "mid" 3, and " ✓" 2 after 4px padding.
+    assert_eq!(
+        described,
+        [
+            "box@0+48",
+            "\"[TIP] \"@0",
+            "\"mid\"@48",
+            "box@72+20",
+            "\" \u{2713}\"@76"
+        ]
+    );
+    let LineFragment::Text(generated) = &paragraph.lines[0].fragments[1] else {
+        panic!("expected the generated text");
+    };
+    assert_eq!(generated.color, css::parse_color("red").unwrap());
+    // Generated text belongs to its originating element.
+    assert_eq!((generated.node, generated.element), (node, Some(node)));
+    assert_eq!(tree.hit_test(4.0, 4.0), Some(node));
+
+    assert_eq!(texts(box_for(&tree, &document, "legacy")), [">x<"]);
+    assert_eq!(texts(box_for(&tree, &document, "none")), ["y"]);
+}
+
+#[test]
+fn before_and_after_take_block_and_inline_block_display() {
+    let (document, tree) = lay_out(
+        "<body><div id='d'>text</div><span id='s'>in</span><div id='clear'>x</div></body>",
+        "body { margin: 0 } \
+         #d::before { content: ''; display: block; height: 10px; background-color: red } \
+         #d::after { content: 'ab'; display: inline-block; width: 30px; padding: 2px } \
+         #s::after { content: 'tail'; display: block } \
+         #clear::after { content: ''; display: table } \
+         img::before, br::before { content: 'never' }",
+        800.0,
+    );
+    let node = id(&document, "d");
+    let div = box_for(&tree, &document, "d");
+    // The block `::before`, then an anonymous block for the text and the
+    // inline-block `::after`.
+    assert_eq!(div.children.len(), 2);
+    let before = &div.children[0];
+    assert_eq!((before.kind, before.node), (BoxKind::Block, Some(node)));
+    assert_eq!((before.rect.width, before.rect.height), (800.0, 10.0));
+    assert_eq!(
+        before.style.background_color,
+        Some(css::parse_color("red").unwrap())
+    );
+    let line = &div.children[1].lines[0];
+    let Some(LineFragment::Atomic(after)) = line.fragments.last() else {
+        panic!("expected the inline-block ::after");
+    };
+    assert_eq!((after.kind, after.node), (BoxKind::InlineBlock, Some(node)));
+    assert_eq!((after.rect.x, after.rect.width), (32.0, 34.0));
+    assert_eq!(texts(after), ["ab"]);
+    assert_close(line.rect.y, 10.0);
+
+    // A block `::after` splits its inline element like a block child does.
+    let body = &tree.root.children[0];
+    let kinds = body
+        .children
+        .iter()
+        .map(|child| (child.kind, child.node.is_some()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        [
+            (BoxKind::Block, true),
+            (BoxKind::AnonymousBlock, false),
+            (BoxKind::Block, true),
+            (BoxKind::AnonymousBlock, false),
+            (BoxKind::Block, true)
+        ]
+    );
+    // The inline's empty continuation after the block takes no space.
+    assert_close(body.children[3].rect.height, 0.0);
+    assert_eq!(texts(&body.children[1]), ["in"]);
+    assert_eq!(body.children[2].node, Some(id(&document, "s")));
+    assert_eq!(texts(&body.children[2]), ["tail"]);
+
+    // An empty block `::after` (a clearfix) adds a box but no height.
+    let clear = box_for(&tree, &document, "clear");
+    assert_close(clear.rect.height, LINE);
+    assert_eq!(clear.children.len(), 2);
+    assert_close(clear.children[1].rect.height, 0.0);
+}
+
+#[test]
+fn empty_inline_generated_content_and_quotes() {
+    let (document, tree) = lay_out(
+        "<body><p id='p'>a</p><p id='q'>He said <q>hi</q>.</p></body>",
+        "body { margin: 0 } p { margin: 0 } #p::after { content: '' }",
+        800.0,
+    );
+    let paragraph = box_for(&tree, &document, "p");
+    assert_eq!(texts(paragraph), ["a"]);
+    assert_close(paragraph.rect.height, LINE);
+    // The user-agent stylesheet quotes `<q>` with generated content.
+    assert_eq!(
+        texts(box_for(&tree, &document, "q")),
+        ["He said \u{201C}hi\u{201D}."]
+    );
+}
+
+#[test]
 fn inline_box_padding_takes_inline_space_but_not_line_height() {
     let (document, tree) = lay_out(
         "<body><p id='p'>a<span id='s' style='padding: 10px 4px'>b</span>c</p></body>",

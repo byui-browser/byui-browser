@@ -27,6 +27,13 @@ pub(crate) struct Context<'a> {
 /// - Inline layout: white-space collapsing, wrapping at spaces, `<br>`, line
 ///   boxes sized by baseline alignment, and inline-blocks with shrink-to-fit
 ///   widths.
+/// - Generated content: `::before` and `::after` pseudo-elements whose
+///   `content` is not `none` or `normal` generate a box as the first or last
+///   child of their element's box, holding the text of the strings,
+///   `attr()`, and quote keywords in `content` (see
+///   [`css::generated_content_text`]). They take any supported `display` and
+///   the same properties as elements. Replaced elements and `<br>` generate
+///   none; images and counters in `content` are not supported.
 /// - Canvas background propagation from the root element or `body`
 ///   (CSS Backgrounds 3 §2.11.2).
 ///

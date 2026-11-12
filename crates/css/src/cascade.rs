@@ -4,7 +4,8 @@
 //! which rules an element is tested against lives in [`crate::rule_index`].
 
 use crate::animation::{ElementContext, KeyframesRegistry, apply_animations};
-use crate::computed::{ComputedStyles, computed_style};
+use crate::computed::{ComputedStyles, PseudoElement, computed_style};
+use crate::content;
 use crate::matching::{ElementTree, attribute};
 use crate::parser::parse_declarations;
 use crate::rule_index::{CompiledDeclaration, CompiledSheet, RuleIndex, compile_declarations};
@@ -12,6 +13,7 @@ use crate::stylesheet::{Declaration, Dom, Specificity, Stylesheet};
 use crate::user_agent::{user_agent_compiled, user_agent_stylesheet};
 use crate::values;
 use html::{NodeID, NodeKind};
+use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -69,9 +71,15 @@ pub(crate) struct CascadeStats {
 ///
 /// Selector support is described in [`crate::selector`] (syntax) and the
 /// matcher: combinators, attribute selectors, and structural and logical
-/// pseudo-classes match; dynamic pseudo-classes such as `:hover` and all
-/// pseudo-elements never match. Rules inside at-rules such as `@media` are
-/// not applied yet.
+/// pseudo-classes match; dynamic pseudo-classes such as `:hover` never
+/// match. Rules inside at-rules such as `@media` are not applied yet.
+///
+/// A selector ending in `::before` or `::after` (or the legacy `:before` and
+/// `:after`) styles that pseudo-element of the elements the rest of the
+/// selector matches. A pseudo-element whose computed `content` is not `none`
+/// or `normal` is listed in [`ComputedStyles::pseudo_elements`]; it inherits
+/// from its originating element and can be animated like an element. Other
+/// pseudo-elements, such as `::first-line` and `::marker`, never match.
 ///
 /// CSS animations (`@keyframes` with `animation-*`) are sampled at the start
 /// of the document timeline; use [`style_document_at`] to style a later
@@ -136,9 +144,12 @@ pub(crate) fn style_document_with_stats(
     for (position, sheet) in author_sheets.iter().enumerate() {
         index.add_sheet(sheet, position + 1, AUTHOR_NORMAL, AUTHOR_IMPORTANT);
     }
-    let keyframes = KeyframesRegistry::new(stylesheets);
-    let time = time.as_secs_f64();
-    let mut running_animations = 0;
+    let resolver = Resolver {
+        keyframes: KeyframesRegistry::new(stylesheets),
+        time: time.as_secs_f64(),
+        initial_color: initial_color_value(),
+        running_animations: Cell::new(0),
+    };
     let tree = ElementTree::new(dom);
     let mut stats = CascadeStats {
         indexed_selectors: index.rules.len(),
@@ -146,9 +157,9 @@ pub(crate) fn style_document_with_stats(
     };
 
     let mut computed: Vec<(NodeID, Vec<Declaration>)> = Vec::new();
+    let mut pseudo_elements = Vec::new();
     let mut root_font_size = None;
     let mut candidates = Vec::new();
-    let initial_color = initial_color_value();
     for (node_index, node) in dom.nodes.iter().enumerate() {
         let NodeKind::Element(element) = node.get_kind() else {
             continue;
@@ -157,15 +168,6 @@ pub(crate) fn style_document_with_stats(
         let parent = node
             .get_parent()
             .and_then(|parent| computed_style(&computed, parent));
-        let parent_value = |property: &str| {
-            parent.and_then(|declarations| {
-                declarations
-                    .iter()
-                    .find(|declaration| declaration.property == property)
-                    .map(|declaration| declaration.value.as_str())
-            })
-        };
-
         // Inline declarations must outlive `cascaded`, which borrows them.
         let inline: Vec<CompiledDeclaration> = match attribute(element, "style") {
             Some(style) => {
@@ -175,7 +177,9 @@ pub(crate) fn style_document_with_stats(
             None => Vec::new(),
         };
 
-        let mut cascaded = HashMap::<&str, (CascadePriority, &str)>::new();
+        // Winning declarations for the element, its `::before`, and its
+        // `::after`, in that order.
+        let mut cascaded: [HashMap<&str, (CascadePriority, &str)>; 3] = Default::default();
         index.candidates(element, &mut candidates);
         for &candidate in &candidates {
             let indexed = &index.rules[candidate as usize];
@@ -189,6 +193,11 @@ pub(crate) fn style_document_with_stats(
                 indexed.rule.rule_index,
                 indexed.sheet_index
             );
+            let target = match indexed.rule.pseudo_element {
+                None => 0,
+                Some(PseudoElement::Before) => 1,
+                Some(PseudoElement::After) => 2,
+            };
             for (position, declaration) in indexed.rule.declarations.iter().enumerate() {
                 let level = if declaration.important {
                     indexed.important_level
@@ -197,7 +206,7 @@ pub(crate) fn style_document_with_stats(
                 };
                 stats.declarations_applied += 1;
                 apply(
-                    &mut cascaded,
+                    &mut cascaded[target],
                     declaration,
                     CascadePriority {
                         level,
@@ -209,6 +218,7 @@ pub(crate) fn style_document_with_stats(
                 );
             }
         }
+        let [mut own, before, after] = cascaded;
         for (position, declaration) in inline.iter().enumerate() {
             let level = if declaration.important {
                 INLINE_IMPORTANT
@@ -217,7 +227,7 @@ pub(crate) fn style_document_with_stats(
             };
             stats.declarations_applied += 1;
             apply(
-                &mut cascaded,
+                &mut own,
                 declaration,
                 CascadePriority {
                     level,
@@ -229,6 +239,85 @@ pub(crate) fn style_document_with_stats(
             );
         }
 
+        let (declarations, font_size) =
+            resolver.resolve(own, parent.map(Vec::as_slice), root_font_size, node_index);
+        let root_size = *root_font_size.get_or_insert(font_size);
+        // A pseudo-element inherits from its originating element.
+        for (pseudo, cascaded) in [
+            (PseudoElement::Before, before),
+            (PseudoElement::After, after),
+        ] {
+            if !cascaded.contains_key("content") {
+                continue;
+            }
+            let (pseudo_declarations, _) =
+                resolver.resolve(cascaded, Some(&declarations), Some(root_size), node_index);
+            let generates_box = pseudo_declarations
+                .iter()
+                .any(|item| item.property == "content" && content::generates_box(&item.value));
+            if generates_box {
+                log::trace!("node {node_index} generates {pseudo:?}");
+                pseudo_elements.push((NodeID::new(node_index), pseudo, pseudo_declarations));
+            }
+        }
+        computed.push((NodeID::new(node_index), declarations));
+    }
+    let running_animations = resolver.running_animations.get();
+    log::debug!(
+        "styled document: {} elements, {} indexed selectors, {} selector checks ({} matched), \
+         {} longhand declarations considered, {running_animations} running animations",
+        stats.elements,
+        stats.indexed_selectors,
+        stats.selectors_checked,
+        stats.selectors_matched,
+        stats.declarations_applied
+    );
+    (
+        ComputedStyles {
+            styles: computed,
+            pseudo_elements,
+            running_animations,
+        },
+        stats,
+    )
+}
+
+/// Turns the winning declarations of an element or pseudo-element into
+/// computed declarations.
+struct Resolver {
+    keyframes: KeyframesRegistry,
+    /// Seconds since the origin of the document timeline.
+    time: f64,
+    /// The initial `color`, used when nothing is inherited.
+    initial_color: String,
+    /// Animations that are delayed or still playing, over all calls.
+    running_animations: Cell<usize>,
+}
+
+impl Resolver {
+    /// Applies inheritance from `parent`, CSS-wide keywords, and animations
+    /// to `cascaded`, and computes `font-size`.
+    ///
+    /// `parent` is the parent element's computed declarations or, for a
+    /// pseudo-element, its originating element's. `root_font_size` is `None`
+    /// while resolving the root element itself. Returns the computed
+    /// declarations sorted by property, and the computed font size in CSS
+    /// pixels.
+    fn resolve(
+        &self,
+        cascaded: HashMap<&str, (CascadePriority, &str)>,
+        parent: Option<&[Declaration]>,
+        root_font_size: Option<f32>,
+        node_index: usize,
+    ) -> (Vec<Declaration>, f32) {
+        let parent_value = |property: &str| {
+            parent.and_then(|declarations| {
+                declarations
+                    .iter()
+                    .find(|declaration| declaration.property == property)
+                    .map(|declaration| declaration.value.as_str())
+            })
+        };
         // Animations do not override `!important` declarations.
         let important: Vec<&str> = cascaded
             .iter()
@@ -245,7 +334,7 @@ pub(crate) fn style_document_with_stats(
         }
         properties
             .entry("color".to_owned())
-            .or_insert_with(|| initial_color.clone());
+            .or_insert_with(|| self.initial_color.clone());
         for (property, (_, value)) in cascaded {
             let keyword = value.trim();
             let inherit = if keyword.eq_ignore_ascii_case("inherit") {
@@ -266,7 +355,7 @@ pub(crate) fn style_document_with_stats(
                     properties.insert(property.to_owned(), inherited.to_owned());
                 }
                 None if property == "color" => {
-                    properties.insert(property.to_owned(), initial_color.clone());
+                    properties.insert(property.to_owned(), self.initial_color.clone());
                 }
                 None => {
                     properties.remove(property);
@@ -280,12 +369,12 @@ pub(crate) fn style_document_with_stats(
             })
             .unwrap_or(values::MEDIUM_FONT_SIZE);
         let root_size = root_font_size.unwrap_or(values::MEDIUM_FONT_SIZE);
-        running_animations += apply_animations(
-            &keyframes,
+        let running = apply_animations(
+            &self.keyframes,
             &mut properties,
-            time,
+            self.time,
             &ElementContext {
-                parent: parent.map(Vec::as_slice),
+                parent,
                 parent_font_size,
                 // Before the root's own font size is known, `rem` in the
                 // root's animations uses the parent size, as for `em`.
@@ -293,6 +382,8 @@ pub(crate) fn style_document_with_stats(
                 important: &important,
             },
         );
+        self.running_animations
+            .set(self.running_animations.get() + running);
         let font_size = properties
             .get("font-size")
             .and_then(|value| values::compute_font_size(value, parent_font_size, root_size))
@@ -301,33 +392,12 @@ pub(crate) fn style_document_with_stats(
                 parent_font_size
             });
         properties.insert("font-size".to_owned(), values::format_px(font_size));
-        if root_font_size.is_none() {
-            root_font_size = Some(font_size);
-        }
-        computed.push((
-            NodeID::new(node_index),
-            properties
-                .into_iter()
-                .map(|(property, value)| Declaration { property, value })
-                .collect(),
-        ));
+        let declarations = properties
+            .into_iter()
+            .map(|(property, value)| Declaration { property, value })
+            .collect();
+        (declarations, font_size)
     }
-    log::debug!(
-        "styled document: {} elements, {} indexed selectors, {} selector checks ({} matched), \
-         {} longhand declarations considered, {running_animations} running animations",
-        stats.elements,
-        stats.indexed_selectors,
-        stats.selectors_checked,
-        stats.selectors_matched,
-        stats.declarations_applied
-    );
-    (
-        ComputedStyles {
-            styles: computed,
-            running_animations,
-        },
-        stats,
-    )
 }
 
 /// Records `declaration` for its property if it beats the current winner.
@@ -575,6 +645,59 @@ mod tests {
         // User-agent rules that rely on attribute and pseudo-class selectors.
         assert_eq!(value("second", "display").as_deref(), Some("none"));
         assert_eq!(value("link", "color").as_deref(), Some("#0000ee"));
+    }
+
+    #[test]
+    fn before_and_after_are_cascaded_and_inherit_from_their_element() {
+        let document = html::parse_raw_html(
+            "<div id='note' class='note' style='color: red; font-size: 20px'>x</div>\
+             <p id='plain'>y</p><q id='quote'>z</q>"
+                .into(),
+        );
+        let sheet = parse_stylesheet(
+            ".note::before { content: 'a'; font-size: 2em; margin: 1px } \
+             div.note:before { content: 'b' } \
+             .note::after { content: none; color: blue } \
+             p::after { color: blue } \
+             #note::before { color: inherit; width: inherit }",
+        );
+        let styles = style_document(&document, &[sheet]);
+        let id = |name| document.get_element_by_id(name).unwrap();
+        let before = styles
+            .pseudo_declarations_for(id("note"), PseudoElement::Before)
+            .expect("::before is generated");
+        let value = |property: &str| {
+            before
+                .iter()
+                .find(|declaration| declaration.property == property)
+                .map(|declaration| declaration.value.as_str())
+        };
+        // The legacy single-colon rule is more specific and wins.
+        assert_eq!(value("content"), Some("'b'"));
+        assert_eq!(value("color"), Some("red"));
+        assert_eq!(value("font-size"), Some("40px"));
+        assert_eq!(value("margin-top"), Some("1px"));
+        assert_eq!(value("width"), None);
+        // Pseudo-element rules do not style the element itself.
+        assert_eq!(styles.value_for(id("note"), "margin-top"), None);
+        // `content: none` and a missing `content` generate nothing.
+        assert_eq!(
+            styles.pseudo_declarations_for(id("note"), PseudoElement::After),
+            None
+        );
+        assert_eq!(
+            styles.pseudo_declarations_for(id("plain"), PseudoElement::After),
+            None
+        );
+        // The user-agent stylesheet quotes `<q>`.
+        let quote = styles
+            .pseudo_declarations_for(id("quote"), PseudoElement::After)
+            .expect("q::after is generated");
+        assert!(quote.contains(&Declaration {
+            property: "content".into(),
+            value: "close-quote".into()
+        }));
+        assert_eq!(styles.pseudo_elements.len(), 3);
     }
 
     fn animated(css: &str, html: &str, seconds: f64) -> (ComputedStyles, HTMLDocument) {

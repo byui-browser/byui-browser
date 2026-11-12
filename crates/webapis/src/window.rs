@@ -9,6 +9,7 @@ use std::{
 
 use crate::crypto::register_crypto;
 use crate::custom_elements::CustomElementRegistry;
+use crate::math::register_math;
 use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
 use security::RendererSecurityContext;
@@ -675,6 +676,7 @@ fn register_window_object(
         }),
     );
     register_crypto(realm, &window)?;
+    register_math(realm, &window)?;
     let performance_for_now = Arc::clone(&performance_clock);
     performance.set_method(
         "now",

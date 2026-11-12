@@ -654,3 +654,23 @@ fn unsupported_keywords_and_globals_fail_at_run_time() {
         assert_eq!(runtime_error(source).message, message, "{source}");
     }
 }
+
+/// `new` on a tree-walk function used to bounce forever between
+/// `Function::construct` and a fresh bytecode VM, overflowing the native
+/// stack and aborting the process.
+#[test]
+fn tree_walk_functions_can_be_constructed_without_recursing() {
+    let realm = Realm::new();
+    assert_eq!(
+        realm.evaluate_script("function Point(x) { this.x = x; } new Point(3).x"),
+        number(3.0)
+    );
+    assert_eq!(
+        realm.evaluate_script("function Boxed() { return { value: 7 }; } new Boxed().value"),
+        number(7.0)
+    );
+    assert_eq!(
+        realm.evaluate_script("function Plain() { this.kept = 1; return 5; } new Plain().kept"),
+        number(1.0)
+    );
+}

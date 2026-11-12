@@ -13,10 +13,11 @@
 //! specificity is computed, `!important` is split off, and shorthands are
 //! expanded to longhands.
 
+use crate::computed::PseudoElement;
 use crate::matching::compound_never_matches;
 use crate::selector::{ComplexSelector, CompoundSelector, SimpleSelector, parse_selector_list};
 use crate::shorthands;
-use crate::specificity::complex_specificity;
+use crate::specificity::{complex_specificity, is_legacy_pseudo_element};
 use crate::stylesheet::{Declaration, Specificity, Stylesheet};
 use html::ElementData;
 use std::collections::HashMap;
@@ -74,9 +75,14 @@ fn split_important(value: &str) -> (&str, bool) {
 /// One complex selector of a stylesheet rule, with its declarations.
 #[derive(Debug)]
 pub(crate) struct CompiledRule {
-    /// The parsed selector.
+    /// The parsed selector. For a rule that styles a pseudo-element, the
+    /// trailing `::before` or `::after` has been removed, so the selector
+    /// matches the originating element.
     pub(crate) selector: ComplexSelector,
-    /// Specificity of `selector`.
+    /// The pseudo-element of the matched element that the rule styles, or
+    /// `None` when it styles the element itself.
+    pub(crate) pseudo_element: Option<PseudoElement>,
+    /// Specificity of the selector as written, including a pseudo-element.
     pub(crate) specificity: Specificity,
     /// Index of the source rule in [`Stylesheet::rules`] (source order).
     pub(crate) rule_index: usize,
@@ -109,13 +115,15 @@ impl CompiledSheet {
                 }
             };
             let before = skipped;
-            let selectors: Vec<ComplexSelector> = list
+            let selectors: Vec<(ComplexSelector, Specificity, Option<PseudoElement>)> = list
                 .selectors
                 .into_iter()
-                .filter(|selector| {
+                .filter_map(|mut selector| {
+                    let specificity = complex_specificity(&selector);
+                    let pseudo_element = take_generated_pseudo_element(&mut selector);
                     let never = selector.compounds.iter().any(compound_never_matches);
                     skipped += usize::from(never);
-                    !never
+                    (!never).then_some((selector, specificity, pseudo_element))
                 })
                 .collect();
             if selectors.is_empty() {
@@ -139,10 +147,11 @@ impl CompiledSheet {
                     compiled
                 }
             };
-            for selector in selectors {
+            for (selector, specificity, pseudo_element) in selectors {
                 rules.push(CompiledRule {
-                    specificity: complex_specificity(&selector),
+                    specificity,
                     selector,
+                    pseudo_element,
                     rule_index,
                     declarations: Arc::clone(&declarations),
                 });
@@ -154,6 +163,26 @@ impl CompiledSheet {
         );
         Self { rules }
     }
+}
+
+/// Removes a `::before` or `::after` (or legacy `:before`/`:after`) that ends
+/// `selector` and returns which it was, leaving a selector for the
+/// originating element.
+///
+/// The pseudo-element must be the last simple selector of the rightmost
+/// compound. Anywhere else it is left in place, where it never matches, as
+/// do the pseudo-elements this engine does not generate.
+fn take_generated_pseudo_element(selector: &mut ComplexSelector) -> Option<PseudoElement> {
+    let simples = &mut selector.compounds.last_mut()?.simples;
+    let SimpleSelector::Pseudo(pseudo) = simples.last()? else {
+        return None;
+    };
+    if pseudo.argument.is_some() || !(pseudo.element || is_legacy_pseudo_element(&pseudo.name)) {
+        return None;
+    }
+    let pseudo_element = PseudoElement::from_name(&pseudo.name)?;
+    simples.pop();
+    Some(pseudo_element)
 }
 
 /// A rule filed in the index, with its origin's cascade levels.
@@ -308,7 +337,8 @@ mod tests {
 
     #[test]
     fn compiles_shared_declarations_once_and_skips_unmatchable_rules() {
-        let sheet = parse_stylesheet("a, b, a:hover, p::before { margin: 0 !important }");
+        let sheet =
+            parse_stylesheet("a, b, a:hover, p::first-line, p::before b { margin: 0 !important }");
         let compiled = CompiledSheet::compile(&sheet);
         assert_eq!(compiled.rules.len(), 2);
         assert!(Arc::ptr_eq(
@@ -317,6 +347,28 @@ mod tests {
         ));
         assert_eq!(compiled.rules[0].declarations.len(), 4);
         assert!(compiled.rules[0].declarations[0].important);
+    }
+
+    #[test]
+    fn trailing_before_and_after_target_the_pseudo_element() {
+        let sheet = parse_stylesheet("p.note::before, #x:AFTER, ::after, p {a:b}");
+        let compiled = CompiledSheet::compile(&sheet);
+        let targets: Vec<_> = compiled
+            .rules
+            .iter()
+            .map(|rule| (rule.pseudo_element, rule.specificity))
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                (Some(PseudoElement::Before), Specificity(0, 1, 2)),
+                (Some(PseudoElement::After), Specificity(1, 0, 1)),
+                (Some(PseudoElement::After), Specificity(0, 0, 1)),
+                (None, Specificity(0, 0, 1)),
+            ]
+        );
+        // The pseudo-element is gone from the selector that gets matched.
+        assert_eq!(compiled.rules[0].selector.compounds[0].simples.len(), 1);
     }
 
     #[test]

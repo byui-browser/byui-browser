@@ -9,6 +9,10 @@
 //! selectors once, indexes rules by their rightmost ID, class, attribute, or
 //! tag, and only tests an element against rules that could match it.
 //!
+//! The cascade also styles the `::before` and `::after` pseudo-elements of
+//! every element whose `content` generates a box; see
+//! [`ComputedStyles::pseudo_elements`] and [`generated_content_text`].
+//!
 //! [`style_document_at`] also samples CSS animations (`@keyframes` and the
 //! `animation-*` properties) at a moment of the document timeline; see
 //! [`animation`] for what is supported.
@@ -19,6 +23,7 @@ pub mod animation;
 mod cascade;
 mod color;
 mod computed;
+mod content;
 pub mod fonts;
 mod matching;
 mod parser;
@@ -33,7 +38,8 @@ pub mod values;
 
 pub use cascade::{style_document, style_document_at};
 pub use color::{CssColor, parse_color};
-pub use computed::ComputedStyles;
+pub use computed::{ComputedStyles, PseudoElement};
+pub use content::generated_content_text;
 pub use fonts::{FontFaceRule, FontSource, font_face_rules, parse_font_family_list};
 pub use parser::{parse_stylesheet, parse_stylesheet_with_errors};
 pub use selector::{

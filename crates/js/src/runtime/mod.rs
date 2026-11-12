@@ -506,11 +506,14 @@ impl Function {
         self.template().is_some()
     }
 
-    /// Constructs an instance by running this bytecode function with `new`.
+    /// Constructs an instance by running this function with `new`.
     ///
-    /// Returns an error for host and tree-walk functions. A standalone
-    /// construction does not retain the VM's global environment, so a
-    /// constructor that reads global variables may also fail.
+    /// Host functions use their constructor callback and fail without one.
+    /// Tree-walk functions run on a fresh interpreter with a new empty object
+    /// as `this`; their `prototype` is not modeled, so the instance has no
+    /// prototype. Bytecode functions run on a fresh VM, which does not retain
+    /// the original VM's global environment, so a constructor that reads
+    /// global variables may fail.
     pub fn construct(&self, arguments: &[Value]) -> JsResult<Value> {
         match &*self.0 {
             FunctionKind::Host {
@@ -518,7 +521,14 @@ impl Function {
                 ..
             } => constructor(arguments),
             FunctionKind::Host { .. } => Err(JsError::runtime("function is not a constructor")),
-            _ => crate::Vm::construct_function(self.clone(), arguments),
+            // The VM cannot run tree-walk functions; handing one to it would
+            // come straight back here and recurse until the stack overflows.
+            FunctionKind::Script { .. } => with_engine_stack(|| {
+                let mut interpreter = Interpreter::new(ExecutionLimits::default());
+                interpreter.this_enabled = true;
+                interpreter.construct(self, arguments)
+            }),
+            FunctionKind::Bytecode { .. } => crate::Vm::construct_function(self.clone(), arguments),
         }
     }
 
@@ -1133,7 +1143,7 @@ impl Interpreter {
                     .iter()
                     .map(|argument| self.evaluate(argument, scope))
                     .collect::<JsResult<Vec<_>>>()?;
-                function.construct(&arguments)
+                self.construct(&function, &arguments)
             }
             Expr::SuperCall { .. } | Expr::SuperMember { .. } => Err(unsupported_here("`super`")),
             Expr::Identifier(name) => read(scope, name),
@@ -1516,6 +1526,26 @@ impl Interpreter {
 
     fn call(&mut self, function: &Function, arguments: &[Value]) -> JsResult<Value> {
         self.call_with_this(function, Value::Undefined, arguments)
+    }
+
+    /// Runs `function` as a constructor.
+    ///
+    /// A tree-walk function is called on this interpreter, so the call depth
+    /// and stack limits keep applying, with a new empty object as `this`.
+    /// Returning an object replaces that instance. Other kinds of function
+    /// construct themselves.
+    fn construct(&mut self, function: &Function, arguments: &[Value]) -> JsResult<Value> {
+        if !matches!(&*function.0, FunctionKind::Script { .. }) {
+            return function.construct(arguments);
+        }
+        let instance = Value::Object(Object::new());
+        let was_enabled = std::mem::replace(&mut self.this_enabled, true);
+        let returned = self.call_with_this(function, instance.clone(), arguments);
+        self.this_enabled = was_enabled;
+        Ok(match returned? {
+            returned @ (Value::Object(_) | Value::Array(_) | Value::Function(_)) => returned,
+            _ => instance,
+        })
     }
 
     fn call_with_this(

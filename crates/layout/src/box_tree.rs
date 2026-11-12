@@ -2,8 +2,10 @@
 //! (CSS Display 3 §2, CSS 2.2 §9.2).
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
+use css::PseudoElement;
 use html::{HTMLDocument, NodeID, NodeKind};
 
 use crate::replaced::{
@@ -15,7 +17,8 @@ use crate::style::{ComputedStyle, Dimension, Display, DisplayInside, DisplayOuts
 #[derive(Debug, Clone)]
 pub(crate) struct BlockBox {
     /// The generating element, or `None` for anonymous boxes and the initial
-    /// containing block.
+    /// containing block. The box of a `::before` or `::after` pseudo-element
+    /// names its originating element.
     pub node: Option<NodeID>,
     pub style: Rc<ComputedStyle>,
     /// Whether the box establishes a new block formatting context
@@ -70,7 +73,17 @@ enum Level {
 /// Computed styles for every element, indexed by DOM arena index.
 pub(crate) struct StyleMap {
     styles: Vec<Option<Rc<ComputedStyle>>>,
+    /// Generated `::before` and `::after` pseudo-elements, keyed by the DOM
+    /// arena index of their originating element.
+    generated: HashMap<(usize, PseudoElement), GeneratedContent>,
     initial: Rc<ComputedStyle>,
+}
+
+/// A `::before` or `::after` pseudo-element that generates a box.
+pub(crate) struct GeneratedContent {
+    pub style: Rc<ComputedStyle>,
+    /// The text of its `content`, before `text-transform`; may be empty.
+    pub text: String,
 }
 
 /// The computed `text-align` of `node`'s nearest element ancestor, for
@@ -125,7 +138,7 @@ impl StyleMap {
                 )
             })
             .unwrap_or(css::values::MEDIUM_FONT_SIZE);
-        let resolved = (0..document.nodes.len())
+        let resolved: Vec<Option<Rc<ComputedStyle>>> = (0..document.nodes.len())
             .map(|index| {
                 let node = NodeID::new(index);
                 let declarations = styles.declarations_for(node)?;
@@ -144,14 +157,53 @@ impl StyleMap {
                 Some(Rc::new(style))
             })
             .collect();
+        let generated = styles
+            .pseudo_elements
+            .iter()
+            .filter_map(|(node, pseudo, declarations)| {
+                let origin = resolved.get(node.get())?.as_ref()?;
+                let NodeKind::Element(element) = document.node(*node)?.get_kind() else {
+                    return None;
+                };
+                let content = declarations
+                    .iter()
+                    .find(|declaration| declaration.property == "content")?;
+                let text = css::generated_content_text(&content.value, |name| {
+                    element
+                        .get_attributes()
+                        .iter()
+                        .find(|attribute| attribute.get_name() == name)
+                        .map(|attribute| attribute.get_value().clone())
+                })?;
+                let mut style = ComputedStyle::from_declarations(
+                    declarations,
+                    root_font_size,
+                    viewport,
+                    || origin.text_align,
+                );
+                style.font =
+                    fonts.select_font(&style.font_families, style.font_weight, style.font_italic);
+                let content = GeneratedContent {
+                    style: Rc::new(style),
+                    text,
+                };
+                Some(((node.get(), *pseudo), content))
+            })
+            .collect();
         Self {
             styles: resolved,
+            generated,
             initial: Rc::new(ComputedStyle::anonymous(None)),
         }
     }
 
     pub(crate) fn get(&self, node: NodeID) -> Option<&Rc<ComputedStyle>> {
         self.styles.get(node.get())?.as_ref()
+    }
+
+    /// The `pseudo` pseudo-element of `node`, when it generates a box.
+    fn generated(&self, node: NodeID, pseudo: PseudoElement) -> Option<&GeneratedContent> {
+        self.generated.get(&(node.get(), pseudo))
     }
 
     /// The style text inherits: its parent element's style, or initial values
@@ -211,7 +263,7 @@ pub(crate) fn build_initial_containing_block(
         .unwrap_or_default();
     let block = BlockBox {
         node: None,
-        contents: builder.container_contents(children, &style),
+        contents: builder.container_contents(None, children, &style),
         style,
         establishes_bfc: true,
     };
@@ -289,19 +341,31 @@ impl Builder<'_> {
         );
         BlockBox {
             node: Some(node),
-            contents: self.container_contents(children, style),
+            contents: self.container_contents(Some(node), children, style),
             style: Rc::clone(style),
             establishes_bfc: is_root || flow_root,
         }
     }
 
     /// Boxes a block container's children, wrapping inline-level runs in
-    /// anonymous block boxes when block-level siblings exist.
-    fn container_contents(&self, children: &[NodeID], style: &Rc<ComputedStyle>) -> BlockContents {
+    /// anonymous block boxes when block-level siblings exist. `owner` is the
+    /// element whose `::before` and `::after` boxes surround the children.
+    fn container_contents(
+        &self,
+        owner: Option<NodeID>,
+        children: &[NodeID],
+        style: &Rc<ComputedStyle>,
+    ) -> BlockContents {
         let mut levels = Vec::new();
         let mut open_inlines = Vec::new();
+        if let Some(owner) = owner {
+            self.generated(owner, PseudoElement::Before, &mut levels, &open_inlines);
+        }
         for child in children {
             self.collect(*child, &mut levels, &mut open_inlines);
+        }
+        if let Some(owner) = owner {
+            self.generated(owner, PseudoElement::After, &mut levels, &open_inlines);
         }
         if !levels.iter().any(|level| matches!(level, Level::Block(_))) {
             return BlockContents::Inlines(
@@ -352,6 +416,74 @@ impl Builder<'_> {
         }
         flush(&mut run, &mut blocks);
         BlockContents::Blocks(blocks)
+    }
+
+    /// Boxes the `pseudo` pseudo-element of `node`, if it generates one, as
+    /// the next child of `node`'s box.
+    ///
+    /// The generated text is a single run in the pseudo-element's style. An
+    /// inline pseudo-element is an inline box around it; block-level and
+    /// atomic ones are block containers holding it. `display: contents` is
+    /// treated as `inline`. Every box and text run names `node`, so hit
+    /// testing reports the originating element.
+    fn generated(
+        &self,
+        node: NodeID,
+        pseudo: PseudoElement,
+        levels: &mut Vec<Level>,
+        open_inlines: &[(NodeID, Rc<ComputedStyle>)],
+    ) {
+        let Some(content) = self.styles.generated(node, pseudo) else {
+            return;
+        };
+        let style = &content.style;
+        let text = (!content.text.is_empty()).then(|| {
+            BuildStats::bump(&self.stats.text_runs);
+            InlineItem::Text {
+                node,
+                element: Some(node),
+                text: style.text_transform.apply(&content.text),
+                style: Rc::clone(style),
+            }
+        });
+        log::trace!(
+            "{pseudo:?} box for node {node:?}: display {:?}, text {:?}",
+            style.display,
+            content.text
+        );
+        let block = |establishes_bfc| {
+            BuildStats::bump(&self.stats.boxes);
+            BlockBox {
+                node: Some(node),
+                style: Rc::clone(style),
+                establishes_bfc,
+                contents: BlockContents::Inlines(text.clone().into_iter().collect()),
+            }
+        };
+        match style.display {
+            Display::None => {}
+            Display::Contents
+            | Display::Box {
+                outside: DisplayOutside::Inline,
+                inside: DisplayInside::Flow,
+            } => {
+                levels.push(Level::Inline(InlineItem::Start {
+                    node,
+                    style: Rc::clone(style),
+                    start_edge: true,
+                }));
+                levels.extend(text.map(Level::Inline));
+                levels.push(Level::Inline(InlineItem::End { end_edge: true }));
+            }
+            Display::Box {
+                outside: DisplayOutside::Inline,
+                ..
+            } => levels.push(Level::Inline(InlineItem::Atomic(block(true)))),
+            Display::Box {
+                outside: DisplayOutside::Block,
+                inside,
+            } => split_inlines_around(block(inside != DisplayInside::Flow), levels, open_inlines),
+        }
     }
 
     fn collect(
@@ -407,9 +539,11 @@ impl Builder<'_> {
                             "node {node:?} <{}>: display contents, boxing children in its place",
                             element.get_name()
                         );
+                        self.generated(node, PseudoElement::Before, levels, open_inlines);
                         for child in dom_node.get_children() {
                             self.collect(*child, levels, open_inlines);
                         }
+                        self.generated(node, PseudoElement::After, levels, open_inlines);
                     }
                     Display::Box {
                         outside: DisplayOutside::Inline,
@@ -425,9 +559,11 @@ impl Builder<'_> {
                             start_edge: true,
                         }));
                         open_inlines.push((node, Rc::clone(style)));
+                        self.generated(node, PseudoElement::Before, levels, open_inlines);
                         for child in dom_node.get_children() {
                             self.collect(*child, levels, open_inlines);
                         }
+                        self.generated(node, PseudoElement::After, levels, open_inlines);
                         open_inlines.pop();
                         levels.push(Level::Inline(InlineItem::End { end_edge: true }));
                     }
