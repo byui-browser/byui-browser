@@ -1,7 +1,7 @@
 //! The script-visible `Window`, `History`, and `Location` objects.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicU32, Ordering},
     sync::{Arc, Mutex, PoisonError},
     time::Instant,
@@ -75,6 +75,44 @@ impl AnimationFrameCallbacks {
 struct WindowTimers {
     queue: TimerQueue,
     callbacks: HashMap<TimerId, TimerCallback>,
+}
+
+struct MicrotaskQueue {
+    callbacks: VecDeque<Function>,
+}
+
+impl MicrotaskQueue {
+    fn new() -> Self {
+        Self {
+            callbacks: VecDeque::new(),
+        }
+    }
+
+    fn enqueue(&mut self, callback: Function) {
+        self.callbacks.push_back(callback);
+    }
+
+    fn dequeue(&mut self) -> Option<Function> {
+        self.callbacks.pop_front()
+    }
+}
+
+fn drain_microtasks(queue: &Arc<Mutex<MicrotaskQueue>>, evaluator: &js::ScriptEvaluator) -> usize {
+    let mut completed = 0;
+    loop {
+        let callback = queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .dequeue();
+        let Some(callback) = callback else {
+            break;
+        };
+        if let Err(error) = evaluator.call(&callback, &[]) {
+            log::warn!("window microtask callback threw: {error}");
+        }
+        completed += 1;
+    }
+    completed
 }
 
 impl WindowTimers {
@@ -503,6 +541,7 @@ fn register_window_object(
         _ => CustomElementRegistry::new().object(),
     };
     let timers = Arc::new(Mutex::new(WindowTimers::new()));
+    let microtasks = Arc::new(Mutex::new(MicrotaskQueue::new()));
     let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
     let evaluator = realm.script_evaluator();
     let timer_this = Value::Object(window.clone());
@@ -712,6 +751,23 @@ fn register_window_object(
         realm.register_global_value("setTimeout", timeout)?;
     }
 
+    let microtasks_for_queue = Arc::clone(&microtasks);
+    window.set_method(
+        "queueMicrotask",
+        Arc::new(move |arguments| {
+            let Some(Value::Function(function)) = arguments.first() else {
+                return Err(JsError::runtime(
+                    "queueMicrotask() requires a function callback",
+                ));
+            };
+            microtasks_for_queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .enqueue(function.clone());
+            Ok(Value::Undefined)
+        }),
+    );
+
     let timers_for_interval = Arc::clone(&timers);
     window.set_method(
         "setInterval",
@@ -782,6 +838,8 @@ fn register_window_object(
     );
 
     let animation_frames_for_pump = Arc::clone(&animation_frames);
+    let microtasks_for_animation = Arc::clone(&microtasks);
+    let evaluator_for_animation = evaluator.clone();
     window.set_method(
         "__runAnimationFrames",
         Arc::new(move |_| {
@@ -802,12 +860,15 @@ fn register_window_object(
                     log::warn!("requestAnimationFrame callback threw: {error}");
                 }
                 fired += 1;
+                drain_microtasks(&microtasks_for_animation, &evaluator_for_animation);
             }
             Ok(Value::Number(fired as f64))
         }),
     );
 
     let timers_for_pump = Arc::clone(&timers);
+    let microtasks_for_timer = Arc::clone(&microtasks);
+    let evaluator_for_timers = evaluator.clone();
     window.set_method(
         "__runTimers",
         Arc::new(move |_| {
@@ -827,11 +888,13 @@ fn register_window_object(
                 let previous_nesting =
                     nesting_context.swap(callback.nesting_level, Ordering::AcqRel);
                 let result = match callback.handler {
-                    TimerHandler::Callback(function) => {
-                        evaluator.call_with_this(&function, timer_this.clone(), &callback.arguments)
-                    }
+                    TimerHandler::Callback(function) => evaluator_for_timers.call_with_this(
+                        &function,
+                        timer_this.clone(),
+                        &callback.arguments,
+                    ),
                     TimerHandler::Source(source) => {
-                        evaluator.evaluate_script_with_this(&source, timer_this.clone())
+                        evaluator_for_timers.evaluate_script_with_this(&source, timer_this.clone())
                     }
                 };
                 nesting_context.store(previous_nesting, Ordering::Release);
@@ -839,8 +902,19 @@ fn register_window_object(
                     log::warn!("window timer callback threw: {error}");
                 }
                 fired += 1;
+                drain_microtasks(&microtasks_for_timer, &evaluator_for_timers);
             }
             Ok(Value::Number(fired as f64))
+        }),
+    );
+
+    let microtasks_for_pump = Arc::clone(&microtasks);
+    let evaluator_for_microtasks = evaluator.clone();
+    window.set_method(
+        "__runMicrotasks",
+        Arc::new(move |_| {
+            let completed = drain_microtasks(&microtasks_for_pump, &evaluator_for_microtasks);
+            Ok(Value::Number(completed as f64))
         }),
     );
 
@@ -1040,6 +1114,12 @@ fn register_window_object(
             .expect("setInterval should be installed on Window"),
     )?;
     realm.register_global_value(
+        "queueMicrotask",
+        window
+            .get("queueMicrotask")
+            .expect("queueMicrotask should be installed on Window"),
+    )?;
+    realm.register_global_value(
         "clearInterval",
         window
             .get("clearInterval")
@@ -1080,6 +1160,25 @@ pub fn run_window_timers(window: &Object) -> JsResult<usize> {
     match pump.call(&[]) {
         Ok(Value::Number(fired)) => Ok(fired as usize),
         Ok(_) => Err(JsError::runtime("window timer pump returned a non-number")),
+        Err(error) => Err(error),
+    }
+}
+
+/// Runs the Window's microtask checkpoint.
+///
+/// Browser integrations call this from the owning page/event-loop thread
+/// after a JavaScript task or other callback completes. Microtasks queued by a
+/// microtask are also run during the same checkpoint. A callback exception is
+/// reported and does not prevent later microtasks from running.
+pub fn run_window_microtasks(window: &Object) -> JsResult<usize> {
+    let Some(Value::Function(pump)) = window.get("__runMicrotasks") else {
+        return Err(JsError::runtime("window microtask pump is not installed"));
+    };
+    match pump.call(&[]) {
+        Ok(Value::Number(completed)) => Ok(completed as usize),
+        Ok(_) => Err(JsError::runtime(
+            "window microtask pump returned a non-number",
+        )),
         Err(error) => Err(error),
     }
 }

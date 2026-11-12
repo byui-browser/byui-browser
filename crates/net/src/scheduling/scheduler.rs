@@ -9,7 +9,12 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use crate::{
-    api::{error::RequestError, request::PreparedRequest, response::InternalResponse},
+    api::{
+        diagnostics::{NetworkEvent, NetworkPhase, SharedNetworkObserver},
+        error::RequestError,
+        request::PreparedRequest,
+        response::InternalResponse,
+    },
     transport::Transport,
 };
 
@@ -36,6 +41,7 @@ pub(crate) enum RequestPriority {
 pub(crate) struct RequestScheduler {
     transport: Arc<dyn Transport>,
     permits: Arc<Semaphore>,
+    observer: SharedNetworkObserver,
 }
 
 impl RequestScheduler {
@@ -43,10 +49,15 @@ impl RequestScheduler {
     ///
     /// A zero configured limit is treated as one so a misconfigured browser
     /// cannot deadlock every request permanently.
-    pub(crate) fn new(transport: Arc<dyn Transport>, max_in_flight: usize) -> Self {
+    pub(crate) fn new(
+        transport: Arc<dyn Transport>,
+        max_in_flight: usize,
+        observer: SharedNetworkObserver,
+    ) -> Self {
         Self {
             transport,
             permits: Arc::new(Semaphore::new(max_in_flight.max(1))),
+            observer,
         }
     }
 
@@ -63,6 +74,7 @@ impl RequestScheduler {
         if request.request.signal.is_aborted() {
             return Err(RequestError::Aborted);
         }
+        self.observe(&request, NetworkPhase::QueueStarted, None);
         log::trace!(
             "scheduler admitting {} {} ({} permits available)",
             request.request.method,
@@ -80,8 +92,50 @@ impl RequestScheduler {
         if request.request.signal.is_aborted() {
             return Err(RequestError::Aborted);
         }
+        self.observe(&request, NetworkPhase::QueueAdmitted, None);
+        self.observe(&request, NetworkPhase::TransportStarted, None);
+        let request_id = request.request.id;
+        let url = request.url.to_string();
+        let redirect_count = request.request.redirect_count;
         let mut response = self.transport.send(request).await?;
+        self.observe_parts(
+            request_id,
+            &url,
+            redirect_count,
+            NetworkPhase::ResponseHeaders,
+            Some(response.status.as_u16()),
+        );
         response.body.attach_permit(permit);
         Ok(response)
+    }
+
+    fn observe(&self, request: &PreparedRequest, phase: NetworkPhase, status: Option<u16>) {
+        self.observe_parts(
+            request.request.id,
+            request.url.as_str(),
+            request.request.redirect_count,
+            phase,
+            status,
+        );
+    }
+
+    fn observe_parts(
+        &self,
+        request_id: u64,
+        url: &str,
+        redirect_count: usize,
+        phase: NetworkPhase,
+        status: Option<u16>,
+    ) {
+        if let Some(observer) = &self.observer {
+            observer.observe(NetworkEvent::now(
+                request_id,
+                phase,
+                url,
+                status,
+                false,
+                redirect_count,
+            ));
+        }
     }
 }

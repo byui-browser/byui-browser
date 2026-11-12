@@ -23,7 +23,7 @@ use webapis::local_storage::register_local_storage_with_url;
 use webapis::session_storage::register_session_storage;
 use webapis::{
     AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, register_alert,
-    register_console, register_document_with_location, register_fetch,
+    register_console, register_document_with_location, register_fetch_with_url,
     register_location_with_navigation, register_print, register_window_with_security_context,
     register_window_with_url_device_pixel_ratio_and_viewport,
 };
@@ -222,6 +222,17 @@ impl FileAccessConfiguration {
 /// Browser services use a conservative no-cookie, no-worker default and
 /// permit requests carrying browser client context.
 pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<RequestController> {
+    request_controller_with_observer(file_access, None)
+}
+
+/// Builds a browser request controller and optionally reports network lifecycle events.
+///
+/// The observer is diagnostic-only and receives redacted URLs, never request
+/// or response bodies, headers, credentials, or errors.
+pub fn request_controller_with_observer(
+    file_access: Option<FileAccessConfiguration>,
+    observer: Option<Arc<dyn net::NetworkObserver>>,
+) -> Arc<RequestController> {
     let mut providers = SchemeProviders::new().with_page(byui_provider::provider());
     log::debug!(
         "building request controller (file provider: {})",
@@ -240,10 +251,15 @@ pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<R
             file_access.content_policy,
         ));
     }
+    let builder = RequestController::builder(net::Config::default())
+        .with_fetch_services(Arc::new(fetch_services::BrowserFetchServices::default()))
+        .with_scheme_providers(providers);
+    let builder = match observer {
+        Some(observer) => builder.with_network_observer(observer),
+        None => builder,
+    };
     Arc::new(
-        RequestController::builder(net::Config::default())
-            .with_fetch_services(Arc::new(fetch_services::BrowserFetchServices::default()))
-            .with_scheme_providers(providers)
+        builder
             .build()
             .expect("network controller should initialize"),
     )
@@ -633,7 +649,6 @@ impl BrowserRuntime {
         register_print(&mut realm, Arc::clone(&console))?;
         register_console(&mut realm, console)?;
         register_alert(&mut realm, alert_sink)?;
-        register_fetch(&mut realm, controller)?;
         let initial_url = input
             .url
             .filter(|url| !url.is_empty())
@@ -644,6 +659,7 @@ impl BrowserRuntime {
             device_pixel_ratio,
             viewport,
         )?;
+        register_fetch_with_url(&mut realm, controller, Some(initial_url))?;
         let document_url = net::Url::parse(initial_url)
             .unwrap_or_else(|_| net::Url::parse("about:blank").expect("valid about:blank URL"));
         // Installs the live `Location` accessor on the window registered above.
@@ -663,15 +679,20 @@ impl BrowserRuntime {
             None => html_document.script_sources(),
         };
         log::debug!("evaluating {} page scripts", sources.len());
-        let results = sources
-            .iter()
-            .enumerate()
-            .map(|(index, source)| {
-                log::trace!("evaluating script {index}: {} bytes", source.len());
-                realm.evaluate_script(source)
-            })
-            .collect::<JsResult<Vec<_>>>()
-            .inspect_err(|error| log::warn!("page script failed: {error}"))?;
+        let mut results = Vec::with_capacity(sources.len());
+        for (index, source) in sources.iter().enumerate() {
+            log::trace!("evaluating script {index}: {} bytes", source.len());
+            let result = realm.evaluate_script(source);
+            let checkpoint = webapis::run_window_microtasks(&window);
+            match (result, checkpoint) {
+                (Ok(result), Ok(_)) => results.push(result),
+                (Err(error), _) => {
+                    log::warn!("page script failed: {error}");
+                    return Err(error);
+                }
+                (Ok(_), Err(error)) => return Err(error),
+            }
+        }
         log::debug!("evaluated {} page scripts", results.len());
         Ok(BootedPage {
             session: PageSession {
@@ -698,6 +719,22 @@ pub struct PageSession {
 }
 
 impl PageSession {
+    /// Evaluates one page script as a task and performs its microtask
+    /// checkpoint before returning.
+    ///
+    /// The checkpoint runs even when the script returns an error, matching
+    /// the event-loop rule that a completed script task is followed by a
+    /// microtask checkpoint.
+    pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
+        let result = self.realm.evaluate_script(source);
+        let checkpoint = webapis::run_window_microtasks(&self.window);
+        match (result, checkpoint) {
+            (Err(error), _) => Err(error),
+            (Ok(value), Ok(_)) => Ok(value),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
     /// Returns the current live document serialization after script mutations.
     pub fn document_html(&self) -> String {
         self.document.inner_html()
@@ -776,7 +813,9 @@ impl PageSession {
     /// Runs listeners registered with `document.addEventListener('click', ...)`.
     /// Element hit testing is not performed.
     pub fn dispatch_click(&self) -> JsResult<Value> {
-        webapis::dispatch_click(&self.document)
+        let result = webapis::dispatch_click(&self.document);
+        webapis::run_window_microtasks(&self.window)?;
+        result
     }
 
     /// Fires a user `click` at the element containing `node`.
@@ -785,7 +824,9 @@ impl PageSession {
     /// bubbles from that element to the document, so both element and
     /// `document` listeners run.
     pub fn dispatch_click_at(&self, node: html::NodeID) -> JsResult<Value> {
-        webapis::dispatch_click_at(&self.document, node)
+        let result = webapis::dispatch_click_at(&self.document, node);
+        webapis::run_window_microtasks(&self.window)?;
+        result
     }
 
     /// Runs this page's elapsed `window.setInterval()` callbacks.
@@ -794,6 +835,15 @@ impl PageSession {
     /// number of interval callbacks delivered during this pump.
     pub fn run_timers(&self) -> JsResult<usize> {
         webapis::run_window_timers(&self.window)
+    }
+
+    /// Runs this page's queued microtasks to a stable queue.
+    ///
+    /// Call this from the page/event-loop thread after a JavaScript task or
+    /// other callback completes. Microtasks queued during the checkpoint are
+    /// included in the returned count.
+    pub fn run_microtasks(&self) -> JsResult<usize> {
+        webapis::run_window_microtasks(&self.window)
     }
 
     /// Runs this page's pending `window.requestAnimationFrame()` callbacks.
