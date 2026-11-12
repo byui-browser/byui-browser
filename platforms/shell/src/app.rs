@@ -28,6 +28,7 @@ use crate::elements_panel::{DockTab, ElementsPanel};
 use crate::find_in_page::{Action as FindAction, FindInPage};
 use crate::page_source::PageSource;
 use crate::toolbar::{self, ChromeState, Control};
+use devtools::performance::{EventCategory, PerformanceLog, TimelineEvent};
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
@@ -96,6 +97,9 @@ struct App {
     devtools_cursor: Option<(f64, f64)>,
     network_log: devtools::network::NetworkLog,
     console: Arc<Mutex<devtools::Console>>,
+    /// Timeline events for the Performance tab. Shared with the page session
+    /// thread, which records script work.
+    performance: Arc<Mutex<PerformanceLog>>,
     font: Option<FontVec>,
     chrome: ChromeState,
     /// Session history shared by all desktop platforms.
@@ -274,6 +278,7 @@ impl App {
             devtools_cursor: None,
             network_log: devtools::network::NetworkLog::new(),
             console: Arc::new(Mutex::new(devtools::Console::new())),
+            performance: Arc::new(Mutex::new(PerformanceLog::new())),
             font: None,
             chrome: ChromeState {
                 window_controls_inset: platform.window_controls_inset,
@@ -499,10 +504,12 @@ impl App {
             .filter(|html| !html.is_empty())
             .or_else(|| self.loaded_page.as_ref().map(|page| page.html.as_str()));
         let mut panel = ElementsPanel::new(html);
-        panel.set_network(self.network_log.clone());
-        if let Ok(console) = self.console.lock() {
-            panel.set_console(console.clone());
-        }
+        sync_devtools_panel(
+            &mut panel,
+            &self.network_log,
+            &self.console,
+            &self.performance,
+        );
         self.devtools_panel = Some(panel);
         self.devtools_cursor = None;
         self.devtools_surface = Some(surface);
@@ -537,10 +544,7 @@ impl App {
         };
         pixmap.fill(background);
         if let Some(panel) = &mut self.devtools_panel {
-            panel.set_network(self.network_log.clone());
-            if let Ok(console) = self.console.lock() {
-                panel.set_console(console.clone());
-            }
+            sync_devtools_panel(panel, &self.network_log, &self.console, &self.performance);
             panel.draw(
                 &mut pixmap,
                 scale,
@@ -676,12 +680,12 @@ impl App {
         behavior: NavigationBehavior,
     ) {
         log::debug!("page displayed: {url}");
-        // Elements is a document snapshot; never retain it across navigation.
-        self.close_elements();
         self.loaded_page = Some(page);
+        self.refresh_devtools_document();
         if let Ok(mut console) = self.console.lock() {
             console.clear();
         }
+        self.clear_performance();
         self.network_log
             .record(devtools::network::RequestEntry::new(
                 url,
@@ -693,10 +697,7 @@ impl App {
             self.record_page_resources(url, &page);
         }
         if let Some(panel) = &mut self.devtools_panel {
-            panel.set_network(self.network_log.clone());
-            if let Ok(console) = self.console.lock() {
-                panel.set_console(console.clone());
-            }
+            sync_devtools_panel(panel, &self.network_log, &self.console, &self.performance);
         }
         self.find_reveal = self.find.is_some();
         // Scripts of the new document run after its first frame is presented.
@@ -828,8 +829,9 @@ impl App {
             Err(error) => {
                 // `browser::load` already logged the failure at error level.
                 log::debug!("showing error page for {}: {error}", navigation.address);
-                self.close_elements();
                 self.loaded_page = Some(browser::error_page(&navigation.address, &error));
+                self.refresh_devtools_document();
+                self.clear_performance();
                 self.network_log
                     .record(devtools::network::RequestEntry::new(
                         &navigation.address,
@@ -838,10 +840,7 @@ impl App {
                         0,
                     ));
                 if let Some(panel) = &mut self.devtools_panel {
-                    panel.set_network(self.network_log.clone());
-                    if let Ok(console) = self.console.lock() {
-                        panel.set_console(console.clone());
-                    }
+                    sync_devtools_panel(panel, &self.network_log, &self.console, &self.performance);
                 }
                 self.find_reveal = self.find.is_some();
                 self.scripts_evaluated = false;
@@ -857,6 +856,20 @@ impl App {
                 self.redraw();
             }
         }
+        // After the new page cleared the log, so the load leads its timeline.
+        self.record_performance(navigation.timeline);
+    }
+
+    /// Starts a fresh Performance timeline for a newly shown page.
+    fn clear_performance(&mut self) {
+        if let Ok(mut performance) = self.performance.lock() {
+            performance.clear();
+        }
+    }
+
+    /// Adds `events` to the Performance tab's timeline.
+    fn record_performance(&self, events: impl IntoIterator<Item = TimelineEvent>) {
+        record_events(&self.performance, events);
     }
 
     fn key_input(&mut self, event: KeyEvent) {
@@ -1125,10 +1138,7 @@ impl App {
             .or_else(|| self.loaded_page.as_ref().map(|page| page.html.as_str()));
         self.elements = Some(ElementsPanel::new(html));
         if let Some(panel) = &mut self.elements {
-            panel.set_network(self.network_log.clone());
-            if let Ok(console) = self.console.lock() {
-                panel.set_console(console.clone());
-            }
+            sync_devtools_panel(panel, &self.network_log, &self.console, &self.performance);
         }
         self.resize_elements();
         self.chrome.address_focused = false;
@@ -1177,9 +1187,15 @@ impl App {
             self.auditor
                 .get_or_insert_with(|| Arc::new(ShellAuditor::new(ShellScriptEngine::new()))),
         );
-        let script_error = self.page_events.script_error();
+        // Read the error only once the page session has caught up, so a
+        // just-loaded page's scripts have run and an earlier page's failure
+        // is not reported against it.
+        let script_error = self
+            .page_events
+            .settled_script_error(Duration::from_secs(5));
         log::debug!("compatibility audit {id} started for {}", page.url);
         let run = move || {
+            let script_error = script_error();
             Box::new(crate::compat_panel::audit_page(
                 &auditor,
                 &page,
@@ -1215,6 +1231,25 @@ impl App {
         }
     }
 
+    /// Points open DevTools (the dock and the DevTools window) at the newly
+    /// loaded page. They stay open on the same tab; the Elements tree and
+    /// Compatibility audit start over for the new document. An audit still
+    /// running for the previous page is discarded; if the dock is showing
+    /// Compatibility, a new one starts once the page's scripts are sent to
+    /// the page session (see `about_to_wait`).
+    fn refresh_devtools_document(&mut self) {
+        self.audit_id += 1;
+        let html = self.loaded_page.as_ref().map(|page| page.html.as_str());
+        for panel in [&mut self.elements, &mut self.devtools_panel]
+            .into_iter()
+            .flatten()
+        {
+            panel.load_document(html);
+        }
+        self.frame_key = None;
+        self.redraw();
+    }
+
     fn close_elements(&mut self) {
         // Any audit still running belongs to the closed dock.
         self.audit_id += 1;
@@ -1239,6 +1274,10 @@ impl App {
                 self.dismiss_context_menu();
             } else if self.page_source.is_some() {
                 self.close_page_source();
+            } else if let Some(panel) = &mut self.elements
+                && panel.dismiss_menu()
+            {
+                self.redraw();
             } else {
                 self.close_elements();
             }
@@ -1335,12 +1374,16 @@ impl App {
 
     fn open_context_menu(&mut self, width: u32, height: u32, scale: f64) {
         self.dismiss_context_menu();
-        if self.page_source.is_some()
-            || self
-                .elements
-                .as_ref()
-                .is_some_and(|panel| panel.contains(self.cursor))
+        if self.page_source.is_some() {
+            return;
+        }
+        // The DevTools dock has its own menus, such as Network's columns.
+        if let Some(panel) = &mut self.elements
+            && panel.contains(self.cursor)
         {
+            if panel.context_click(self.cursor) {
+                self.redraw();
+            }
             return;
         }
         self.chrome.pressed = None;
@@ -1477,6 +1520,10 @@ impl App {
                         self.chrome.address_focused = false;
                         if let Some(tab) = tab {
                             self.select_dock_tab(tab);
+                        } else if let Some(panel) = &mut self.elements
+                            && panel.click(self.cursor)
+                        {
+                            self.redraw();
                         }
                     }
                     ElementState::Released => {
@@ -1602,11 +1649,13 @@ impl App {
                 let layout_changed =
                     self.page_layout.as_ref().map(|layout| layout.css_size()) != Some(css_size);
                 if layout_changed {
-                    self.page_layout = Some(crate::content::PageLayout::new(
+                    let mut layout = crate::content::PageLayout::new(
                         self.loaded_page.as_ref().expect("page was loaded"),
                         css_size.0,
                         css_size.1,
-                    ));
+                    );
+                    record_events(&self.performance, layout.take_timeline());
+                    self.page_layout = Some(layout);
                 }
                 let layout = self.page_layout.as_ref()?;
                 if let Some(find) = &mut self.find {
@@ -1624,16 +1673,19 @@ impl App {
                 // A resize or reload can leave less to scroll than before.
                 self.scroll_y = self.scroll_y.clamp(0.0, layout.max_scroll());
                 self.page_events.set_scroll_y(self.scroll_y);
-                crate::content::render_page_with_find(
-                    layout,
-                    card.width,
-                    card.height,
-                    page_scale,
-                    self.scroll_y,
-                    self.find.as_ref(),
-                    self.chrome.dark,
-                )
-                .map(|page| ((card.width, card.height), page))
+                let (page, paint) = TimelineEvent::measure(EventCategory::Paint, "Paint", || {
+                    crate::content::render_page_with_find(
+                        layout,
+                        card.width,
+                        card.height,
+                        page_scale,
+                        self.scroll_y,
+                        self.find.as_ref(),
+                        self.chrome.dark,
+                    )
+                });
+                record_events(&self.performance, [paint]);
+                page.map(|page| ((card.width, card.height), page))
             });
             full = true;
             if let Some(layout) = &self.page_layout {
@@ -1675,6 +1727,7 @@ impl App {
             find.draw(&mut composed, scale, self.chrome.dark, self.font.as_ref());
         }
         if let Some(panel) = &mut self.elements {
+            sync_devtools_panel(panel, &self.network_log, &self.console, &self.performance);
             panel.draw(
                 &mut composed,
                 scale,
@@ -1902,11 +1955,22 @@ impl ApplicationHandler<UserEvent> for App {
                     if event.state == ElementState::Pressed =>
                 {
                     match event.logical_key {
-                        Key::Named(NamedKey::Escape) => self.close_devtools_window(),
+                        Key::Named(NamedKey::Escape) => {
+                            if let Some(panel) = &mut self.devtools_panel
+                                && panel.dismiss_menu()
+                            {
+                                if let Some(window) = &self.devtools_window {
+                                    window.request_redraw();
+                                }
+                            } else {
+                                self.close_devtools_window();
+                            }
+                        }
                         Key::Named(NamedKey::Delete) => {
                             let tab = self.devtools_panel.as_ref().map(ElementsPanel::tab);
                             match tab {
                                 Some(DockTab::Network) => self.network_log.clear(),
+                                Some(DockTab::Performance) => self.clear_performance(),
                                 Some(DockTab::Console) => {
                                     if let Ok(mut console) = self.console.lock() {
                                         console.clear();
@@ -1952,12 +2016,29 @@ impl ApplicationHandler<UserEvent> for App {
                 } => {
                     if let (Some(panel), Some(cursor)) =
                         (&mut self.devtools_panel, self.devtools_cursor)
-                        && let Some(tab) = panel.tab_at(Some(cursor))
                     {
-                        panel.set_tab(tab);
-                        if let Some(window) = &self.devtools_window {
+                        let changed = match panel.tab_at(Some(cursor)) {
+                            Some(tab) => {
+                                panel.set_tab(tab);
+                                true
+                            }
+                            None => panel.click(Some(cursor)),
+                        };
+                        if changed && let Some(window) = &self.devtools_window {
                             window.request_redraw();
                         }
+                    }
+                }
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: MouseButton::Right,
+                    ..
+                } => {
+                    if let Some(panel) = &mut self.devtools_panel
+                        && panel.context_click(self.devtools_cursor)
+                        && let Some(window) = &self.devtools_window
+                    {
+                        window.request_redraw();
                     }
                 }
                 WindowEvent::MouseWheel { delta, .. } => {
@@ -2179,7 +2260,40 @@ impl ApplicationHandler<UserEvent> for App {
             device_pixel_ratio,
             viewport,
             navigate,
+            Some(Arc::clone(&self.performance)),
         );
+        // A dock left on Compatibility across navigation audits the new
+        // page now that its scripts are queued ahead of the audit.
+        if self.elements.as_ref().is_some_and(|panel| {
+            panel.tab() == DockTab::Compatibility && *panel.compat.state() == CompatState::Idle
+        }) {
+            self.start_audit();
+        }
+    }
+}
+
+/// Adds `events` to the Performance timeline `log`. A free function so
+/// closures that already borrow other `App` fields can record.
+fn record_events(log: &Mutex<PerformanceLog>, events: impl IntoIterator<Item = TimelineEvent>) {
+    if let Ok(mut log) = log.lock() {
+        log.extend(events);
+    }
+}
+
+/// Copies the session's Network, Console, and Performance data into a
+/// DevTools `panel` so it shows the latest entries.
+fn sync_devtools_panel(
+    panel: &mut ElementsPanel,
+    network: &devtools::network::NetworkLog,
+    console: &Mutex<devtools::Console>,
+    performance: &Mutex<PerformanceLog>,
+) {
+    panel.set_network(network.clone());
+    if let Ok(console) = console.lock() {
+        panel.set_console(console.clone());
+    }
+    if let Ok(performance) = performance.lock() {
+        panel.set_performance(performance.clone());
     }
 }
 
@@ -2530,15 +2644,62 @@ mod tests {
     }
 
     #[test]
-    fn official_page_loading_closes_the_previous_elements_snapshot() {
+    fn devtools_stay_open_across_navigation_and_show_the_new_page() {
         let mut app = app();
         app.ensure_welcome_loaded();
         app.show_elements();
-        assert!(app.elements.is_some());
-        app.page_loaded("byui://welcome", browser::welcome_page());
-        assert!(app.elements.is_none());
-        assert_eq!(app.browser_state.current_url(), Some("byui://welcome"));
-        assert!(app.loaded_page.is_some());
+        app.select_dock_tab(DockTab::Compatibility);
+        assert!(matches!(
+            app.elements.as_ref().unwrap().compat.state(),
+            CompatState::Ready(_)
+        ));
+        if let Ok(mut console) = app.console.lock() {
+            console.log(devtools::Level::Log, "from the old page");
+        }
+        let audit_before = app.audit_id;
+
+        let next = browser::Page {
+            url: "byui://test/next".into(),
+            html: "<html><body><article><h1>Next</h1></article></body></html>".into(),
+            stylesheets: Vec::new(),
+            scripts: Vec::new(),
+        };
+        app.page_loaded("byui://test/next", next);
+        let panel = app.elements.as_ref().expect("the dock stays open");
+        assert_eq!(panel.tab(), DockTab::Compatibility, "the tab is kept");
+        assert_eq!(
+            *panel.compat.state(),
+            CompatState::Idle,
+            "the old page's audit is not shown for the new page"
+        );
+        assert!(app.audit_id > audit_before, "a running audit is discarded");
+        assert!(app.console.lock().unwrap().entries().is_empty());
+        app.select_dock_tab(DockTab::Elements);
+        let mut frame = tiny_skia::Pixmap::new(800, 600).unwrap();
+        let panel = app.elements.as_mut().unwrap();
+        panel.draw(&mut frame, 1.0, false, None, None, None);
+        assert!(
+            panel.shows_element("article"),
+            "Elements shows the new tree"
+        );
+        assert_eq!(app.browser_state.current_url(), Some("byui://test/next"));
+
+        // A failed load keeps DevTools open too, on the error page.
+        app.navigation_id += 1;
+        let id = app.navigation_id;
+        app.navigation_finished(
+            id,
+            navigation(
+                "https://missing.test/",
+                Err(browser::LoadError::Status {
+                    status: 404,
+                    status_text: "Not Found".into(),
+                }),
+            ),
+            NavigationBehavior::Auto,
+        );
+        let panel = app.elements.as_ref().expect("the dock stays open");
+        assert!(!panel.shows_element("article"));
     }
 
     #[test]
@@ -3058,6 +3219,7 @@ mod tests {
         browser::Navigation {
             address: address.to_owned(),
             result,
+            timeline: Vec::new(),
         }
     }
 

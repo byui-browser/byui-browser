@@ -1,7 +1,15 @@
 //! Loading a page from an address: fetch the document, then the stylesheets
 //! and scripts it references.
 
-use std::{fmt, future::Future, io, sync::Arc, time::Instant};
+use std::{
+    fmt,
+    future::Future,
+    io,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+
+use devtools::performance::{EventCategory, TimelineEvent};
 
 use futures_util::future::join_all;
 use net::{Request, RequestController, Url};
@@ -127,11 +135,50 @@ async fn fetch_document(controller: &RequestController, url: Url) -> Result<Fetc
 /// Limitation: CSS `@import` inside stylesheets is not followed, and fonts
 /// and images are not fetched.
 pub async fn load_page(controller: &RequestController, address: &str) -> Result<Page, LoadError> {
-    load_page_with(address, |url| fetch_document(controller, url)).await
+    load_page_timed(controller, address).await.0
+}
+
+/// [`load_page`], also returning a DevTools Performance timeline of the load.
+///
+/// The timeline holds one [`EventCategory::Network`] event per download (the
+/// document, then each remote stylesheet and script, including failed ones)
+/// and one [`EventCategory::Parse`] event for parsing the document's HTML to
+/// discover subresources. It is returned even when the load fails, covering
+/// the work done before the failure.
+pub async fn load_page_timed(
+    controller: &RequestController,
+    address: &str,
+) -> (Result<Page, LoadError>, Vec<TimelineEvent>) {
+    let timeline = Mutex::new(Vec::new());
+    let result = load_page_with(address, |url| fetch_document(controller, url), &timeline).await;
+    (result, timeline.into_inner().unwrap_or_default())
+}
+
+/// Appends `event` to `timeline`.
+fn push_event(timeline: &Mutex<Vec<TimelineEvent>>, event: TimelineEvent) {
+    if let Ok(mut timeline) = timeline.lock() {
+        timeline.push(event);
+    }
+}
+
+/// `"Download <name>"`, naming `url` by its last path segment (such as
+/// `style.css`), or the whole URL when its path has no file name.
+fn download_label(url: &Url) -> String {
+    let name = url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|segment| !segment.is_empty())
+        .map_or_else(|| url.to_string(), str::to_owned);
+    format!("Download {name}")
 }
 
 /// [`load_page`] with the fetch step injected so tests need no network.
-async fn load_page_with<F, Fut>(address: &str, fetch: F) -> Result<Page, LoadError>
+/// Each stage's timing is appended to `timeline`.
+async fn load_page_with<F, Fut>(
+    address: &str,
+    fetch: F,
+    timeline: &Mutex<Vec<TimelineEvent>>,
+) -> Result<Page, LoadError>
 where
     F: Fn(Url) -> Fut,
     Fut: Future<Output = Result<Fetched, LoadError>>,
@@ -141,11 +188,24 @@ where
         log::error!("page load failed for {:?}: {error}", address.trim());
     })?;
     log::info!("navigation started: {url}");
-    let main = fetch(url.clone()).await.inspect_err(|error| {
+    let download_started = Instant::now();
+    let main = fetch(url.clone()).await;
+    push_event(
+        timeline,
+        TimelineEvent::since(
+            EventCategory::Network,
+            download_label(&url),
+            download_started,
+        ),
+    );
+    let main = main.inspect_err(|error| {
         log::error!("page load failed for {url}: {error}");
     })?;
     log::trace!("parsing document {}: {} bytes", main.url, main.body.len());
-    let document = html::parse_raw_html(main.body.clone());
+    let (document, parse) = TimelineEvent::measure(EventCategory::Parse, "Parse HTML", || {
+        html::parse_raw_html(main.body.clone())
+    });
+    push_event(timeline, parse);
 
     let mut sheet_slots = Vec::new();
     let mut script_slots = Vec::new();
@@ -184,8 +244,8 @@ where
         script_slots.len()
     );
     let (stylesheets, scripts) = futures_util::future::join(
-        resolve_slots(&fetch, sheet_slots, "stylesheet", false),
-        resolve_slots(&fetch, script_slots, "script", true),
+        resolve_slots(&fetch, sheet_slots, "stylesheet", false, timeline),
+        resolve_slots(&fetch, script_slots, "script", true, timeline),
     )
     .await;
     log::debug!(
@@ -230,11 +290,13 @@ fn subresource_url(base: &Url, reference: &str) -> Result<Url, String> {
 /// Fetches the remote slots concurrently and returns every source in slot
 /// order. A failed slot is dropped, or kept as an empty string when
 /// `keep_gap` is set so scripts stay aligned with their `<script>` elements.
+/// Each download, successful or not, is appended to `timeline`.
 async fn resolve_slots<F, Fut>(
     fetch: &F,
     slots: Vec<Slot>,
     kind: &str,
     keep_gap: bool,
+    timeline: &Mutex<Vec<TimelineEvent>>,
 ) -> Vec<String>
 where
     F: Fn(Url) -> Fut,
@@ -247,16 +309,24 @@ where
                 log::warn!("skipping {kind}: {reason}");
                 None
             }
-            Slot::Remote(Ok(url)) => match fetch(url.clone()).await {
-                Ok(fetched) => {
-                    log::debug!("fetched {kind} {url}: {} bytes", fetched.body.len());
-                    Some(fetched.body)
+            Slot::Remote(Ok(url)) => {
+                let started = Instant::now();
+                let fetched = fetch(url.clone()).await;
+                push_event(
+                    timeline,
+                    TimelineEvent::since(EventCategory::Network, download_label(&url), started),
+                );
+                match fetched {
+                    Ok(fetched) => {
+                        log::debug!("fetched {kind} {url}: {} bytes", fetched.body.len());
+                        Some(fetched.body)
+                    }
+                    Err(error) => {
+                        log::warn!("skipping {kind} {url}: {error}");
+                        None
+                    }
                 }
-                Err(error) => {
-                    log::warn!("skipping {kind} {url}: {error}");
-                    None
-                }
-            },
+            }
         }
     }))
     .await;
@@ -321,6 +391,9 @@ pub struct Navigation {
     pub address: String,
     /// The loaded page, or why loading failed.
     pub result: Result<Page, LoadError>,
+    /// Downloads and parsing done during the load, for the DevTools
+    /// Performance panel; see [`load_page_timed`].
+    pub timeline: Vec<TimelineEvent>,
 }
 
 /// Loads pages on a background Tokio runtime so a UI thread never blocks.
@@ -353,7 +426,7 @@ impl PageLoader {
         log::debug!("page load scheduled: {typed}");
         self.runtime.spawn(async move {
             let shown = normalize_address(&address).map_or(typed, |url| url.to_string());
-            let result = load_page(&controller, &address).await;
+            let (result, timeline) = load_page_timed(&controller, &address).await;
             let shown = match &result {
                 Ok(page) => page.url.clone(),
                 Err(_) => shown,
@@ -361,6 +434,7 @@ impl PageLoader {
             on_done(Navigation {
                 address: shown,
                 result,
+                timeline,
             });
         });
     }
@@ -392,15 +466,71 @@ mod tests {
     }
 
     fn load(pages: &[(&str, &str)], address: &str) -> (Result<Page, LoadError>, Vec<String>) {
+        let (result, requested, _) = load_timed(pages, address);
+        (result, requested)
+    }
+
+    /// [`load`], also returning the Performance timeline.
+    fn load_timed(
+        pages: &[(&str, &str)],
+        address: &str,
+    ) -> (Result<Page, LoadError>, Vec<String>, Vec<TimelineEvent>) {
         let pages: HashMap<_, _> = pages.iter().copied().collect();
         let requested = Mutex::new(Vec::new());
+        let timeline = Mutex::new(Vec::new());
         let result = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(load_page_with(address, |url| {
-                serve(&pages, &requested, url)
-            }));
-        (result, requested.into_inner().unwrap())
+            .block_on(load_page_with(
+                address,
+                |url| serve(&pages, &requested, url),
+                &timeline,
+            ));
+        (
+            result,
+            requested.into_inner().unwrap(),
+            timeline.into_inner().unwrap(),
+        )
+    }
+
+    #[test]
+    fn timeline_records_each_download_and_the_html_parse() {
+        let (result, _, timeline) = load_timed(
+            &[
+                (
+                    "https://example.test/",
+                    r#"<link rel="stylesheet" href="style.css"><style>p{}</style><script src="app.js"></script><script src="gone.js"></script>"#,
+                ),
+                ("https://example.test/style.css", "p { color: red }"),
+                ("https://example.test/app.js", "1"),
+            ],
+            "https://example.test/",
+        );
+        assert!(result.is_ok());
+        let mut labels: Vec<_> = timeline
+            .iter()
+            .map(|event| (event.category, event.label.as_str()))
+            .collect();
+        labels.sort_by_key(|(_, label)| *label);
+        assert_eq!(
+            labels,
+            [
+                (EventCategory::Network, "Download app.js"),
+                (EventCategory::Network, "Download gone.js"),
+                (EventCategory::Network, "Download https://example.test/"),
+                (EventCategory::Network, "Download style.css"),
+                (EventCategory::Parse, "Parse HTML"),
+            ],
+            "inline <style> is not a download; failed downloads still appear"
+        );
+    }
+
+    #[test]
+    fn timeline_covers_a_failed_document_download() {
+        let (result, _, timeline) = load_timed(&[], "https://example.test/missing.html");
+        assert!(result.is_err());
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].label, "Download missing.html");
     }
 
     #[test]
