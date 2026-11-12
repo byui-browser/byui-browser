@@ -596,3 +596,24 @@ fn unsupported_text_transform_values_leave_text_unchanged() {
     );
     assert_eq!(texts(box_for(&tree, &document, "p")), ["abc"]);
 }
+
+#[test]
+fn transparent_text_is_laid_out_with_zero_alpha() {
+    let (document, tree) = lay_out(
+        "<body><p id='p' style='color: transparent'>hidden</p></body>",
+        "body { margin: 0 }",
+        800.0,
+    );
+    let paragraph = box_for(&tree, &document, "p");
+    let colors: Vec<_> = paragraph
+        .lines
+        .iter()
+        .flat_map(|line| &line.fragments)
+        .filter_map(|fragment| match fragment {
+            LineFragment::Text(text) => Some(text.color.a),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(colors, [0]);
+    assert_eq!(texts(paragraph), ["hidden"]);
+}
