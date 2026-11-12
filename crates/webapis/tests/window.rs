@@ -73,6 +73,45 @@ fn window_navigator_accepts_extra_arguments_without_changing_the_result() {
 }
 
 #[test]
+fn window_performance_exposes_a_stable_monotonic_clock() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "performance === window.performance && \
+             performance.timeOrigin > 0 && \
+             performance.now() >= 0",
+        ),
+        Ok(Value::Boolean(true))
+    );
+
+    let first = realm.evaluate_script("performance.now()").unwrap();
+    thread::sleep(Duration::from_millis(1));
+    let second = realm.evaluate_script("window.performance.now()").unwrap();
+    let (Value::Number(first), Value::Number(second)) = (first, second) else {
+        panic!("performance.now() should return numbers");
+    };
+    assert!(second >= first);
+}
+
+#[test]
+fn window_performance_object_and_time_origin_are_read_only() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var original = window.performance; \
+             window.performance = null; \
+             performance.timeOrigin = 0; \
+             window.performance === original && performance.timeOrigin > 0",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
 fn window_origin_uses_the_renderer_security_context() {
     let mut realm = Realm::new();
     register_window_with_security_context(
