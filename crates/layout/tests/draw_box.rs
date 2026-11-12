@@ -8,8 +8,7 @@ use render::Compositor;
 
 fn write_png(path: &std::path::Path, frame: &render::Frame) {
     let file = fs::File::create(path).expect("create png file");
-    let mut encoder =
-        png::Encoder::new(std::io::BufWriter::new(file), frame.width, frame.height);
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), frame.width, frame.height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     encoder

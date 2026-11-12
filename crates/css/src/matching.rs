@@ -768,10 +768,40 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_pseudo_classes_and_pseudo_elements_never_match() {
+    fn empty_interaction_state_does_not_match_dynamic_pseudo_classes() {
         assert!(matching_ids(LIST, "a:hover, a:visited, li::before, li:after").is_empty());
         let list = parse_selector_list("a:hover").unwrap();
-        assert!(compound_never_matches(&list.selectors[0].compounds[0]));
+        assert!(!compound_never_matches(&list.selectors[0].compounds[0]));
+    }
+
+    #[test]
+    fn dynamic_pseudo_classes_match_supplied_interaction_state() {
+        let dom = html::parse_raw_html(
+            "<div id='parent'><button id='target'></button></div><input id='focused'>".into(),
+        );
+        let target = dom.get_element_by_id("target").unwrap();
+        let focused = dom.get_element_by_id("focused").unwrap();
+        let tree = ElementTree::new(
+            &dom,
+            SelectorState {
+                hovered: Some(target),
+                active: Some(target),
+                focused: Some(focused),
+                keyboard_focus: true,
+            },
+        );
+        let matches = |selector: &str, id: &str| {
+            let list = parse_selector_list(selector).unwrap();
+            let node = dom.get_element_by_id(id).unwrap();
+            tree.matches_any(&list, node.get())
+        };
+        assert!(matches("#target:hover", "target"));
+        assert!(matches("#parent:hover", "parent"));
+        assert!(matches("#target:active", "target"));
+        assert!(matches("#focused:focus", "focused"));
+        assert!(matches("#focused:focus-within", "focused"));
+        assert!(matches("#focused:focus-visible", "focused"));
+        assert!(!matches("#target:focus-visible", "target"));
     }
 
     #[test]
