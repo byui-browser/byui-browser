@@ -281,6 +281,58 @@ fn history_state_is_structured_cloned() {
 }
 
 #[test]
+fn structured_clone_deep_copies_objects_arrays_cycles_and_shared_references() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var child = {value: 1}; var original = {left: child, right: child}; \
+             original.self = original; original.list = [child, 2]; \
+             var copy = window.structuredClone(original); \
+             copy !== original && copy.self === copy && copy.left === copy.right && \
+             copy.left !== child && copy.list[0] === copy.left && \
+             structuredClone === window.structuredClone",
+        ),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(
+        realm.evaluate_script("child.value = 3; copy.left.value === 1"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn structured_clone_accepts_empty_transfer_list_and_rejects_functions() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "function callback() {} var cloneError = false; \
+             try { structuredClone({callback: callback}); } \
+             catch (error) { cloneError = error.name === 'DataCloneError'; } \
+             structuredClone({value: 1}, {transfer: []}).value === 1 && cloneError",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn structured_clone_reports_unsupported_transfers_as_data_clone_errors() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "try { structuredClone({}, {transfer: [{}]}); } \
+             catch (error) { error.name === 'DataCloneError'; }",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
 fn inner_width_is_zero_without_a_viewport() {
     let mut realm = Realm::new();
     register_window(&mut realm).unwrap();
