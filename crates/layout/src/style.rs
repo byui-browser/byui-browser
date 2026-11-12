@@ -439,6 +439,14 @@ impl ComputedStyle {
         if let Some(value) = get("color") {
             match css::parse_color(value) {
                 Some(color) => style.color = color,
+                // Transparent text is laid out but paints nothing, as when a
+                // CSS animation fades text in from `transparent`.
+                None if value.eq_ignore_ascii_case("transparent") => {
+                    style.color = CssColor {
+                        a: 0,
+                        ..style.color
+                    };
+                }
                 None if is_no_color_keyword(value) => {}
                 None => log::debug!("ignoring invalid color value {value:?}; using the default"),
             }

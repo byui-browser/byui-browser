@@ -8,7 +8,7 @@ null-body rules. The detailed audit below records the wider unfinished Fetch
 algorithms; see `fetch-engine-contract.md` for the current supported subset and
 capability errors.
 
-Status: audit of the implementation as of 2026-11-10, including the current
+Status: audit of the implementation as of 2026-11-12, including the current
 `crates/net` implementation, browser composition, and the Feature 4.4 plan
 updates. Body ownership and streaming claims below describe the current
 compiled implementation.
@@ -22,6 +22,12 @@ engine-owned and currently decodes percent-encoded and base64 payloads;
 and reach the shared response pipeline; the engine-owned `about:blank` case is
 implemented while other `about:` URLs remain unsupported.
 
+The controller also accepts an optional `NetworkObserver`. It receives
+best-effort request-preparation, cache, preflight, queue, transport, redirect,
+response-finalization, completion, and failure events shared across controller
+clones. The public phase enum reserves abort reporting, but the current
+cancellation branch does not emit that phase.
+
 ## Summary
 
 | Area                        | Current state                                                                                                                                                                                                                                    | Gap severity |
@@ -34,9 +40,9 @@ implemented while other `about:` URLs remain unsupported.
 | Redirects                   | Controller follows validated HTTP(S) redirects with per-hop policy, credentials, origin/referrer transitions, cache lookup, and `follow`, `error`, and `manual` modes; broader browser subsystems remain partial                                  | Medium       |
 | HTTP cache                  | Process-local max-age cache with provider-supplied partition keys and `Vary`-aware request-header variants; full matching/revalidation is absent                                                                                              | High         |
 | Fetch policy integrations   | Browser-context requests require `FetchServices`; CSP, mixed content, CORP, SRI, and worker interception remain provider/later-step work                                                                                                         | Critical     |
-| Cancellation and lifecycle  | Basic abort signal works, but Fetch controller state/reasons/timing are absent                                                                                                                                                                   | Medium       |
+| Cancellation and lifecycle  | Basic abort signal and broad best-effort lifecycle observer events work, but Fetch controller state, abort reasons, body timing, and abort-event reporting are absent                                                               | Medium       |
 | Fetch API surface           | Rust `Request`, filtered `Response`, guarded `Headers`, shared `Body`, response cloning, and body helpers exist; complete JavaScript bindings remain                                                                                             | High         |
-| Scheduling and transport    | HTTP/2, compression, pooling, and priority mapping are available; scheduler ordering and HTTP/3 are absent                                                                                                                                       | Low/Medium   |
+| Scheduling and transport    | HTTP/2, compression, pooling, priority mapping, and lifecycle diagnostics are available; scheduler ordering, body timing, and HTTP/3 are absent                                                                                          | Low/Medium   |
 
 ## Detailed gaps
 
@@ -258,7 +264,7 @@ subset and limitations are stated in
 
 **Evidence:** [`Request::transport_priority`](../src/api/request/definition.rs) maps Fetch low/auto/high priority to scheduler priority classes, but [`RequestScheduler::submit`](../src/scheduling/scheduler.rs) still receives `_priority` and never reorders admission. Reqwest is configured for Rustls, HTTP/2, compression, pooling, and a custom user agent in [`ReqwestTransport::new`](../src/transport/reqwest.rs).
 
-The semaphore provides concurrency admission, and Fetch priority now reaches the scheduler boundary, but it still has no effect on ordering. There are no per-origin/host limits, network partition-aware connection pools, connection timing records, proxy policy, offline mode, or HTTP/3 transport. These are not all required for a minimal HTTP(S) Fetch subset, but they are gaps from the browser-wide behavior described by the standard and the crate's stated browser boundary.
+The semaphore provides concurrency admission, and Fetch priority now reaches the scheduler boundary, but it still has no effect on ordering. Lifecycle events cover decision points and response headers, but not body timing, and cancellation does not yet emit the reserved abort event. There are no per-origin/host limits, network partition-aware connection pools, connection timing records, proxy policy, offline mode, or HTTP/3 transport. These are not all required for a minimal HTTP(S) Fetch subset, but they are gaps from the browser-wide behavior described by the standard and the crate's stated browser boundary.
 
 ### 13. Scheme-provider contract and local response lifecycle
 

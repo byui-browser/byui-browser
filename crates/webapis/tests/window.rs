@@ -431,6 +431,66 @@ fn clear_timeout_cancels_callback_and_string_handler_runs() {
 }
 
 #[test]
+fn queue_microtask_runs_in_fifo_order_and_drains_new_microtasks() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var order = ''; \
+             function first() { order = order + 'a'; queueMicrotask(third); } \
+             function second() { order = order + 'b'; } \
+             function third() { order = order + 'c'; } \
+             queueMicrotask(first); window.queueMicrotask(second); \
+             order",
+        )
+        .unwrap();
+    assert_eq!(realm.evaluate_script("order"), Ok(Value::String("".into())));
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    assert_eq!(webapis::run_window_microtasks(&window).unwrap(), 3);
+    assert_eq!(
+        realm.evaluate_script("order"),
+        Ok(Value::String("abc".into()))
+    );
+}
+
+#[test]
+fn queue_microtask_requires_a_function_and_returns_undefined() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    assert_eq!(
+        realm.evaluate_script("function callback() {} queueMicrotask(callback)"),
+        Ok(Value::Undefined)
+    );
+    assert!(realm.evaluate_script("queueMicrotask(1)").is_err());
+}
+
+#[test]
+fn timer_checkpoint_runs_microtasks_before_the_next_timer() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var order = ''; \
+             function first() { order = order + 'a'; queueMicrotask(micro); } \
+             function micro() { order = order + 'm'; } \
+             function second() { order = order + 'b'; } \
+             setTimeout(first, 0); setTimeout(second, 0)",
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(2));
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    assert_eq!(webapis::run_window_timers(&window).unwrap(), 2);
+    assert_eq!(
+        realm.evaluate_script("order"),
+        Ok(Value::String("amb".into()))
+    );
+}
+
+#[test]
 fn clear_interval_can_be_called_inside_its_callback() {
     let mut realm = Realm::new();
     register_window(&mut realm).unwrap();
