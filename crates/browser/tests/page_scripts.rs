@@ -144,6 +144,7 @@ fn linked_page_script_reads_its_navigation_url_from_window_location() {
         html: String::new(),
         stylesheets: Vec::new(),
         scripts: vec!["if (document.location === window.location && window.location.href === 'https://example.com/path?q=term#section') window.location.href = window.location.href".into()],
+        resources: Default::default(),
     };
     let controller = Arc::new(
         net::RequestController::builder(net::Config::default())
@@ -181,6 +182,7 @@ fn window_location_shares_the_window_with_viewport_and_device_scale() {
              && window.location.href === 'https://example.com/start') location.assign('/next')"
                 .into(),
         ],
+        resources: Default::default(),
     };
     let controller = Arc::new(
         net::RequestController::builder(net::Config::default())
@@ -263,6 +265,7 @@ fn linked_script_finds_page_elements_and_handles_their_clicks() {
              btn.addEventListener('click', callback);"
                 .into(),
         ],
+        resources: Default::default(),
     };
 
     let session = BrowserRuntime::in_memory()

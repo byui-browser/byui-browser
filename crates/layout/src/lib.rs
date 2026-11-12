@@ -20,14 +20,16 @@ mod inline;
 mod layout;
 mod radius;
 mod rectangle;
+mod replaced;
 mod style;
 mod tree;
 
 pub use fonts::{FontMetrics, VerticalMetrics};
 pub use geometry::{Edges, Rect, Sides, Size};
-pub use layout::layout_document;
+pub use layout::{layout_document, layout_document_with_images};
 pub use radius::{BorderRadius, CornerRadii, CornerRadius, Corners, LengthPercentage};
 pub use rectangle::create_rectangle;
+pub use replaced::{ImageKey, ImageMetrics, NoImages};
 pub use tree::{
     BoxKind, BoxStyle, InlineBoxFragment, LayoutBox, LayoutTree, LineBox, LineFragment, PaintItem,
     TextFragment,

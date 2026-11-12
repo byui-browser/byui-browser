@@ -341,6 +341,15 @@ pub(crate) struct ComputedStyle {
     pub padding: Sides<Dimension>,
     pub width: Dimension,
     pub height: Dimension,
+    /// `min-width`; only replaced elements honor it so far.
+    pub min_width: Dimension,
+    /// `min-height`; only replaced elements honor it so far.
+    pub min_height: Dimension,
+    /// `max-width`, with `none` stored as [`Dimension::Auto`]; only replaced
+    /// elements honor it so far.
+    pub max_width: Dimension,
+    /// `max-height`, as for `max_width`.
+    pub max_height: Dimension,
     pub font_size: f32,
     pub color: CssColor,
     pub text_transform: TextTransform,
@@ -371,6 +380,10 @@ impl ComputedStyle {
             padding: zero,
             width: Dimension::Auto,
             height: Dimension::Auto,
+            min_width: Dimension::Px(0.0),
+            min_height: Dimension::Px(0.0),
+            max_width: Dimension::Auto,
+            max_height: Dimension::Auto,
             font_size: parent.map_or(css::values::MEDIUM_FONT_SIZE, |parent| parent.font_size),
             color: parent.map_or_else(
                 || {
@@ -495,6 +508,22 @@ impl ComputedStyle {
         style.padding = side("padding", false, false);
         style.width = dimension("width", true, false).unwrap_or(Dimension::Auto);
         style.height = dimension("height", true, false).unwrap_or(Dimension::Auto);
+        // `min-*: auto` computes to 0 outside flex and grid items, and
+        // `max-*: none` is stored as `Auto` (no maximum).
+        style.min_width = dimension("min-width", true, false)
+            .filter(|value| *value != Dimension::Auto)
+            .unwrap_or(Dimension::Px(0.0));
+        style.min_height = dimension("min-height", true, false)
+            .filter(|value| *value != Dimension::Auto)
+            .unwrap_or(Dimension::Px(0.0));
+        let max = |property: &str| {
+            if get(property).is_some_and(|value| value.eq_ignore_ascii_case("none")) {
+                return Dimension::Auto;
+            }
+            dimension(property, false, false).unwrap_or(Dimension::Auto)
+        };
+        style.max_width = max("max-width");
+        style.max_height = max("max-height");
         style.border_radius = Corners::from_array(
             ["top-left", "top-right", "bottom-right", "bottom-left"].map(|corner| {
                 let property = format!("border-{corner}-radius");

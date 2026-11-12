@@ -2497,7 +2497,7 @@ mod tests {
     fn find_named_space_types_phrases_with_real_counts_and_highlight_ranges() {
         let page=browser::Page {url:"byui://test".into(),
             html:"<body><p>Start Welcome <span>to</span> BYUI <b>Browser</b> end</p><button>Click <span>Me</span></button></body>".into(),
-            stylesheets:vec!["body {height:2000px}".into()],scripts:vec![]};
+            stylesheets:vec!["body {height:2000px}".into()],scripts:vec![], resources: Default::default() };
         for query in [
             "Welcome to",
             "BYUI Browser",
@@ -2786,6 +2786,7 @@ mod tests {
             html: "<html><body><article><h1>Next</h1></article></body></html>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         app.page_loaded("byui://test/next", next);
         let panel = app.elements.as_ref().expect("the dock stays open");
@@ -2982,6 +2983,7 @@ mod tests {
             html: "<h1>Already loaded</h1>\n<script>not executed</script>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         app.page_loaded("byui://source-fixture", page.clone());
         let before = app.browser_state.clone();
@@ -3205,6 +3207,7 @@ mod tests {
             html: "<body><div></div></body>".into(),
             stylesheets: vec!["body { margin: 0 } div { height: 1000px }".into()],
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         app.page_loaded("byui://long", page.clone());
         app.page_layout = Some(crate::content::PageLayout::new(&page, 160, 200));
@@ -3432,6 +3435,7 @@ mod tests {
             html: "<p>Loaded</p>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
 
         app.navigation_finished(
@@ -3487,6 +3491,7 @@ mod tests {
             html: "<p>Old</p>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
 
         app.navigation_finished(

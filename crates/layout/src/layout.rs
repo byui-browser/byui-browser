@@ -3,7 +3,7 @@
 use html::{HTMLDocument, NodeID, NodeKind};
 
 use crate::box_tree::{StyleMap, build_initial_containing_block, root_element};
-use crate::{FontMetrics, LayoutBox, LayoutTree, Size};
+use crate::{FontMetrics, ImageMetrics, LayoutBox, LayoutTree, NoImages, Size};
 
 /// State shared by the layout algorithms.
 pub(crate) struct Context<'a> {
@@ -39,11 +39,40 @@ pub(crate) struct Context<'a> {
 /// `background-color`; unsupported properties use their initial values.
 /// Floats, positioning, borders, and min/max sizes are not implemented.
 /// Content may overflow the viewport; the root box's rect stays viewport-sized.
+///
+/// This lays out without images: every `<img>` is treated as broken. Use
+/// [`layout_document_with_images`] to size images by their natural size.
 pub fn layout_document(
     document: &HTMLDocument,
     styles: &css::ComputedStyles,
     viewport: Size,
     fonts: &dyn FontMetrics,
+) -> LayoutTree {
+    layout_document_with_images(document, styles, viewport, fonts, &NoImages)
+}
+
+/// Lays out `document` like [`layout_document`], sizing replaced elements
+/// with `images`.
+///
+/// Replaced elements are `<img>` and every `<svg>` element that is not inside
+/// another SVG element. Each generates an atomic box of kind
+/// [`crate::BoxKind::Replaced`] whose [`LayoutBox::image`] names the picture
+/// to paint in its content box. Sizes follow CSS 2.2 §10.3.2, §10.4 and
+/// §10.6.2: `width`/`height` (or the element's `width`/`height` attributes
+/// when those are `auto`), the natural size and ratio from `images` (or, for
+/// inline SVG, its `width`, `height`, and `viewBox` attributes), and
+/// `min-*`/`max-*` sizes. A broken `<img>` with `alt` text and no specified
+/// size is laid out as that text.
+///
+/// Limitations: `object-fit` and `object-position` are not supported (the
+/// picture always stretches to the content box), `srcset`/`<picture>` are
+/// ignored, and `min-*`/`max-*` sizes apply only to replaced elements.
+pub fn layout_document_with_images(
+    document: &HTMLDocument,
+    styles: &css::ComputedStyles,
+    viewport: Size,
+    fonts: &dyn FontMetrics,
+    images: &dyn ImageMetrics,
 ) -> LayoutTree {
     log::debug!(
         "layout pass start: viewport {}x{}",
@@ -55,7 +84,7 @@ pub fn layout_document(
         log::debug!("document has no root element; laying out an empty canvas");
     }
     let style_map = StyleMap::new(document, styles, root, viewport);
-    let icb = build_initial_containing_block(document, &style_map);
+    let icb = build_initial_containing_block(document, &style_map, images);
     let context = Context { fonts };
     let mut tree = LayoutTree {
         root: context.layout_initial_containing_block(&icb, viewport),

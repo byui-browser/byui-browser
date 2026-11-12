@@ -14,6 +14,17 @@ layout = { workspace = true }
 paint = { workspace = true }
 # Outline (TrueType/OpenType) font parsing and anti-aliased glyph rasterizing.
 ab_glyph = "0.2"
+# Decoding <img> bitmaps (PNG, JPEG, GIF, WebP, BMP, ICO) to RGBA pixels and
+# resampling them to their painted size.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
+# Parsing and rasterizing SVG images (`<img src=x.svg>` and inline `<svg>`).
+# Default features (SVG text with system fonts, embedded raster images) are
+# off to keep the dependency tree small.
+resvg = { version = "0.45", default-features = false }
+
+[dev-dependencies]
+# Builds `layout::ImageKey::InlineSvg` keys in tests.
+html = { workspace = true }
 
 [lints]
 workspace = true

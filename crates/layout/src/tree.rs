@@ -6,7 +6,7 @@
 use css::CssColor;
 use html::NodeID;
 
-use crate::{BorderRadius, Edges, Rect};
+use crate::{BorderRadius, Edges, ImageKey, Rect};
 
 /// Paint-relevant computed values for a box or inline box fragment.
 ///
@@ -48,6 +48,11 @@ pub enum BoxKind {
     /// An atomic inline-level box such as `display: inline-block`. It appears
     /// inside a [`LineBox`] as [`LineFragment::Atomic`].
     InlineBlock,
+    /// A replaced element such as `<img>` or inline `<svg>`. Its
+    /// [`LayoutBox::image`] is painted to fill its content box. It is a
+    /// [`LineFragment::Atomic`] when inline-level and a child box when
+    /// block-level.
+    Replaced,
 }
 
 /// A box fragment: a block container laid out with the CSS box model.
@@ -74,6 +79,9 @@ pub struct LayoutBox {
     /// Line boxes when the box establishes an inline formatting context, in
     /// order from top to bottom.
     pub lines: Vec<LineBox>,
+    /// For [`BoxKind::Replaced`] boxes, the picture to draw in the content
+    /// box; `None` for every other kind.
+    pub image: Option<ImageKey>,
 }
 
 impl LayoutBox {
@@ -194,6 +202,9 @@ pub enum PaintItem<'a> {
     InlineBox(&'a InlineBoxFragment),
     /// A text run.
     Text(&'a TextFragment),
+    /// The picture of a [`BoxKind::Replaced`] box, drawn in its content box
+    /// after its background.
+    Image(&'a LayoutBox),
 }
 
 impl LayoutTree {
@@ -202,6 +213,8 @@ impl LayoutTree {
     /// Within the root stacking context this follows CSS 2.2 Appendix E: the
     /// canvas, then the backgrounds of all block-level boxes in
     /// tree order, then the inline content of every line box in tree order.
+    /// The picture of a block-level replaced box is painted at its place in
+    /// that last step, as CSS 2.2 Appendix E step 7 says.
     /// Atomic inlines are painted as if they created a stacking context, at
     /// their place in the line. Positioned boxes, floats, and `z-index` are
     /// not supported yet, so there are no other layers.
@@ -246,6 +259,9 @@ impl LayoutTree {
                 }
                 PaintItem::InlineBox(inline) => inline.rect.contains(x, y).then_some(inline.node),
                 PaintItem::Text(text) => text.element.filter(|_| text.rect.contains(x, y)),
+                PaintItem::Image(layout_box) => {
+                    layout_box.node.filter(|_| layout_box.rect.contains(x, y))
+                }
             });
         match hit {
             Some(node) => log::trace!("hit test at ({x}, {y}): node {node:?}"),
@@ -286,6 +302,9 @@ fn push_block_decorations<'a>(layout_box: &'a LayoutBox, items: &mut Vec<PaintIt
 }
 
 fn push_inline_content<'a>(layout_box: &'a LayoutBox, items: &mut Vec<PaintItem<'a>>) {
+    if layout_box.image.is_some() {
+        items.push(PaintItem::Image(layout_box));
+    }
     for line in &layout_box.lines {
         for fragment in &line.fragments {
             match fragment {
@@ -318,6 +337,7 @@ mod tests {
             style: BoxStyle::default(),
             children,
             lines: Vec::new(),
+            image: None,
         }
     }
 
@@ -379,6 +399,7 @@ mod tests {
                 }
                 PaintItem::InlineBox(_) => "inline".to_owned(),
                 PaintItem::Text(text) => format!("text {}", text.text),
+                PaintItem::Image(_) => "image".to_owned(),
             })
             .collect::<Vec<_>>();
         assert_eq!(order, ["box None", "box Some(1)", "box Some(2)", "text a"]);
