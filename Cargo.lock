@@ -4657,6 +4657,7 @@ version = "0.1.0"
 dependencies = [
  "common",
  "css",
+ "getrandom 0.3.4",
  "html",
  "js",
  "log",

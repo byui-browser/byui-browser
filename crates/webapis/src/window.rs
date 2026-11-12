@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::crypto::register_crypto;
 use crate::custom_elements::CustomElementRegistry;
 use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
@@ -587,6 +588,7 @@ fn register_window_object(
         Arc::new(move |_| Ok(Value::Object(navigator_for_window.clone()))),
     );
     window.set("customElements", Value::Object(custom_elements.clone()));
+    register_crypto(realm, &window)?;
     let performance_for_now = Arc::clone(&performance_clock);
     performance.set_method(
         "now",
