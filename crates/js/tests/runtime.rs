@@ -465,3 +465,49 @@ fn values_can_cross_threads() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Value>();
 }
+
+/// `new` on a tree-walk function used to bounce between `Function::construct`
+/// and a fresh bytecode VM forever, aborting the process with a native stack
+/// overflow. It now constructs in the interpreter.
+#[test]
+fn tree_walk_functions_can_be_constructed() {
+    use js::{ExecutionMode, eval_with_mode};
+
+    let value = eval_with_mode(
+        "function Point(x) { this.x = x; } let p = new Point(3); p.x",
+        ExecutionMode::Interpreter,
+    );
+    assert_eq!(value, Ok(Value::Number(3.0)));
+
+    // An object returned by the constructor replaces the instance.
+    let value = eval_with_mode(
+        "function Make() { this.a = 1; return { b: 2 }; } let m = new Make(); m.b",
+        ExecutionMode::Interpreter,
+    );
+    assert_eq!(value, Ok(Value::Number(2.0)));
+
+    // The host-facing entry point handles tree-walk functions too.
+    let Ok(Value::Function(constructor)) = eval_with_mode(
+        "function Box(v) { this.v = v; } Box",
+        ExecutionMode::Interpreter,
+    ) else {
+        panic!("expected a function");
+    };
+    let Ok(Value::Object(instance)) = constructor.construct(&[Value::Number(7.0)]) else {
+        panic!("expected an object");
+    };
+    assert_eq!(instance.get("v"), Some(Value::Number(7.0)));
+}
+
+/// Unbounded recursive construction is a catchable limit error, not a crash.
+#[test]
+fn recursive_tree_walk_construction_hits_the_depth_limit() {
+    use js::{ExecutionMode, eval_with_mode};
+
+    let error = eval_with_mode(
+        "function Loop() { return new Loop(); } new Loop();",
+        ExecutionMode::Interpreter,
+    )
+    .expect_err("recursion must be bounded");
+    assert_eq!(error.category, JsErrorCategory::Limit, "{error}");
+}
