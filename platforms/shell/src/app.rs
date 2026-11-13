@@ -178,6 +178,13 @@ pub(crate) enum UserEvent {
         url: Url,
         behavior: NavigationBehavior,
     },
+    /// A page script changed its document's DOM; the tab lays out `dom`.
+    DomChanged {
+        tab: TabId,
+        /// The script run this tree belongs to; stale ones are dropped.
+        document: u64,
+        dom: Box<html::HTMLDocument>,
+    },
     /// A background compatibility audit finished.
     AuditFinished {
         tab: TabId,
@@ -466,6 +473,22 @@ impl App {
                     self.with_tab(tab, |app| {
                         app.start_navigation_with_behavior(url.as_str(), behavior)
                     });
+                }
+            }
+            UserEvent::DomChanged { tab, document, dom } => {
+                let active = self.tab.id == tab;
+                self.with_tab(tab, |app| {
+                    // A newer script run, such as a reload, owns the tab now.
+                    if app.tab.document_id != document {
+                        return;
+                    }
+                    app.tab.live_document = Some((document, *dom));
+                    app.tab.page = None;
+                    app.retire_page_layout();
+                });
+                if active {
+                    self.frame_key = None;
+                    self.redraw();
                 }
             }
             UserEvent::AuditFinished { tab, id, report } => {
@@ -2222,8 +2245,15 @@ impl App {
                     .map(|layout| layout.css_size())
                     != Some(css_size);
                 if layout_changed {
-                    let mut layout = crate::content::PageLayout::new_with_state_at(
+                    let live = self
+                        .tab
+                        .live_document
+                        .as_ref()
+                        .filter(|(document, _)| *document == self.tab.document_id)
+                        .map(|(_, dom)| dom);
+                    let mut layout = crate::content::PageLayout::new_with_document_state_at(
                         self.tab.loaded_page.as_ref().expect("page was loaded"),
+                        live,
                         css_size.0,
                         css_size.1,
                         self.tab.selector_state,
@@ -2231,6 +2261,7 @@ impl App {
                     );
                     record_events(&self.tab.performance, layout.take_timeline());
                     self.tab.page_layout = Some(layout);
+                    self.tab.retired_layout = None;
                 }
                 let layout = self.tab.page_layout.as_ref()?;
                 if let Some(find) = &mut self.tab.find {
@@ -2489,16 +2520,35 @@ impl App {
     /// Discards the page frame and layout after an interaction selector changes.
     fn invalidate_page_style(&mut self) {
         self.tab.page = None;
-        self.tab.page_layout = None;
+        self.retire_page_layout();
         self.frame_key = None;
         self.redraw();
+    }
+
+    /// Discards the page layout for a restyle of the same document, keeping
+    /// it for hit tests until the next frame lays the page out again.
+    ///
+    /// Pointer input can arrive before that frame: a `:hover` change discards
+    /// the layout as the pointer moves, and a quick click presses and
+    /// releases before anything is drawn. Hit testing the retired layout
+    /// sends such clicks to the element that was on screen.
+    fn retire_page_layout(&mut self) {
+        if let Some(layout) = self.tab.page_layout.take() {
+            self.tab.retired_layout = Some((self.tab.document_id, layout));
+        }
     }
 
     /// Returns the page node under a logical-pixel window point, matching the
     /// geometry and scroll position `paint` used to render the page card.
     fn page_node_at(&self, x: f64, y: f64) -> Option<html::NodeID> {
         let window = self.window.as_ref()?;
-        let layout = self.tab.page_layout.as_ref()?;
+        let layout = self.tab.page_layout.as_ref().or_else(|| {
+            self.tab
+                .retired_layout
+                .as_ref()
+                .filter(|(document, _)| *document == self.tab.document_id)
+                .map(|(_, layout)| layout)
+        })?;
         let size = window.inner_size();
         let scale = window.scale_factor();
         let card =
@@ -2918,6 +2968,16 @@ impl ApplicationHandler<UserEvent> for App {
                 });
             }
         });
+        let proxy = self.proxy.clone();
+        self.tab.page_events.watch_dom(Arc::new(move |dom| {
+            if let Some(proxy) = &proxy {
+                let _ = proxy.send_event(UserEvent::DomChanged {
+                    tab,
+                    document,
+                    dom: Box::new(dom),
+                });
+            }
+        }));
         self.tab.page_events.load_with_viewport(
             &page,
             Arc::new(crate::content::DevtoolsConsole(Arc::clone(

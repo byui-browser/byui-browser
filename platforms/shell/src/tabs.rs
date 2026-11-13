@@ -25,6 +25,13 @@ pub(crate) struct TabState {
     pub address: String,
     pub address_before_edit: String,
     pub loaded_page: Option<browser::Page>,
+    /// The DOM page scripts last changed, tagged with the `document_id` of
+    /// the script run that changed it. Layout uses it in place of
+    /// `loaded_page.html` while that run is current.
+    pub live_document: Option<(u64, html::HTMLDocument)>,
+    /// The last layout discarded by a restyle, tagged with its `document_id`,
+    /// kept for hit tests until the next layout replaces it.
+    pub retired_layout: Option<(u64, crate::content::PageLayout)>,
     pub page: Option<((u32, u32), Pixmap)>,
     pub page_layout: Option<PageLayout>,
     /// CSS pointer and focus state (`:hover`, `:active`, `:focus`) for this
@@ -68,6 +75,8 @@ impl TabState {
             address: "byui://welcome".into(),
             address_before_edit: "byui://welcome".into(),
             loaded_page: None,
+            live_document: None,
+            retired_layout: None,
             page: None,
             page_layout: None,
             selector_state: css::SelectorState::default(),

@@ -1025,7 +1025,7 @@ mod tests {
             .block_on(load_page(&controller, "byui://welcome/page"))
             .expect("welcome page should load");
         assert!(page.stylesheets[0].contains("background-color"));
-        assert!(page.scripts[0].contains("btn.addEventListener"));
+        assert!(page.scripts[0].contains("showOak("));
     }
 
     #[test]

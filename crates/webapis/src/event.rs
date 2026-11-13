@@ -577,6 +577,26 @@ pub fn dispatch_click(document: &Document) -> JsResult<Value> {
 /// Clones share listener lists. Returns `false` when a listener called
 /// `preventDefault()`.
 pub fn dispatch_click_at(document: &Document, node: NodeID) -> JsResult<Value> {
+    dispatch_click_at_in(document, node, Arc::new(Mutex::new(document.clone())))
+}
+
+/// Dispatches a user `click` like [`dispatch_click_at`] in the live document
+/// registered with
+/// [`register_shared_document_with_location`](crate::register_shared_document_with_location).
+///
+/// The event target's element object mutates `document` itself, so a
+/// listener's `event.target.setAttribute(...)` changes the live tree. The
+/// lock is released while listeners run, because they lock it themselves.
+pub fn dispatch_click_at_live(document: &Arc<Mutex<Document>>, node: NodeID) -> JsResult<Value> {
+    let snapshot = document.lock().unwrap().clone();
+    dispatch_click_at_in(&snapshot, node, Arc::clone(document))
+}
+
+fn dispatch_click_at_in(
+    document: &Document,
+    node: NodeID,
+    target_document: Arc<Mutex<Document>>,
+) -> JsResult<Value> {
     let Some(element) = nearest_element(document, node) else {
         log::debug!("click target has no element; dispatching at the document");
         return dispatch_click(document);
@@ -586,7 +606,7 @@ pub fn dispatch_click_at(document: &Document, node: NodeID) -> JsResult<Value> {
     options.set("cancelable", Value::Boolean(true));
     let event = event_constructor(&[Value::String("click".into()), Value::Object(options)])?;
     let target_node = element.node;
-    let target = element_object(element, Arc::new(Mutex::new(document.clone())));
+    let target = element_object(element, target_document);
     dispatch_event_at(document, Some(target_node), &target, &[event])
 }
 
