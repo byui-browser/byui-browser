@@ -1,7 +1,6 @@
 use super::{
     dom_error::DomError, dom_token_list::DOMTokenList, element_data::ElementData,
     namespace::Namespace, node::Node, node_id::NodeID, node_kind::NodeKind,
-    source_span::SourceSpan,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,14 +21,14 @@ impl HTMLDocument {
             nodes: Vec::new(),
             root: NodeID::new(0),
         };
-        let root = document.push_node(NodeKind::Document, None);
+        let root = document.push_node(NodeKind::Document);
         document.root = root;
         document
     }
 
-    pub fn push_node(&mut self, kind: NodeKind, span: Option<SourceSpan>) -> NodeID {
+    pub fn push_node(&mut self, kind: NodeKind) -> NodeID {
         let id = NodeID::new(self.nodes.len());
-        let node = Node::new(None, Vec::new(), kind, span);
+        let node = Node::new(None, Vec::new(), kind);
         self.nodes.push(node);
         id
     }
@@ -117,7 +116,7 @@ impl HTMLDocument {
 
         let element =
             ElementData::new(local_name.to_ascii_lowercase(), Namespace::Html, Vec::new());
-        let id = self.push_node(NodeKind::Element(element), None);
+        let id = self.push_node(NodeKind::Element(element));
         log::trace!("created element <{local_name}> as node {}", id.get());
         Ok(id)
     }
@@ -213,6 +212,19 @@ impl HTMLDocument {
             }
         }
         output
+    }
+
+    /// Serializes the node `id` and its descendants as an HTML fragment, or
+    /// returns `None` when `id` is not a node of this document.
+    ///
+    /// This uses the same rules and limitations as [`Self::inner_html`]; the
+    /// node itself is included. Names are written as the parser stored them,
+    /// which is ASCII lowercase, also for SVG content.
+    pub fn outer_html(&self, id: NodeID) -> Option<String> {
+        self.node(id)?;
+        let mut output = String::new();
+        self.serialize_node(id, &mut output, false);
+        Some(output)
     }
 
     fn serialize_node(&self, id: NodeID, output: &mut String, raw_text: bool) {

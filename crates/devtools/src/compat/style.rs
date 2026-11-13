@@ -901,7 +901,7 @@ struct Decl {
 /// attribute, and reports parse errors.
 fn collect(
     page: &PageSources<'_>,
-    map: &PageMap<'_>,
+    map: &PageMap,
     report: &mut AuditReport,
 ) -> (Vec<Decl>, Usage, Usage) {
     let mut declarations = Vec::new();
@@ -958,10 +958,10 @@ fn collect(
             push_declarations(&rule.declarations, text, &label);
         }
     }
-    for (style, line) in &map.inline_styles {
+    for style in &map.inline_styles {
         let sheet = css::parse_stylesheet(&format!("*{{{style}}}"));
         if let Some(rule) = sheet.rules.first() {
-            let label = format!("HTML line {line} (style attribute)");
+            let label = "HTML markup (style attribute)".to_owned();
             for declaration in &rule.declarations {
                 declarations.push(Decl {
                     property: declaration.property.clone(),
@@ -1094,7 +1094,7 @@ fn selector_features(selector: &str) -> Vec<String> {
 pub(crate) fn audit<E: PageScriptEngine>(
     auditor: &Auditor<E>,
     page: &PageSources<'_>,
-    map: &PageMap<'_>,
+    map: &PageMap,
     report: &mut AuditReport,
 ) {
     let (declarations, at_rules, selectors) = collect(page, map, report);
@@ -1429,6 +1429,15 @@ mod tests {
             find_property(css, "justify-content").map(|o| line_at(css, o)),
             Some(1)
         );
+    }
+
+    #[test]
+    fn keyframes_probe_reports_animations_as_working() {
+        let probe = AT_RULES
+            .iter()
+            .find(|probe| probe.names.contains(&"keyframes"))
+            .expect("@keyframes probe");
+        assert!(matches!((probe.check)(), Outcome::Works));
     }
 
     #[test]

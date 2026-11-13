@@ -2,6 +2,7 @@
 //! pointer handling for the painted chrome, and presenting frames through
 //! `softbuffer`.
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -9,7 +10,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use ab_glyph::FontVec;
-use net::Url;
+use net::{NetworkEvent, NetworkPhase, Url};
 use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use tiny_skia::Pixmap;
 use webapis::{AlertSink, NavigationBehavior};
@@ -47,6 +48,10 @@ const PAGE_SCROLL_OVERLAP: f32 = 40.0;
 const PAGE_ZOOM_RANGE: (f64, f64) = (0.5, 3.0);
 /// Page zoom increment for each keyboard shortcut press.
 const PAGE_ZOOM_STEP: f64 = 0.1;
+
+/// Time between CSS animation frames: about 60 frames per second. Frames
+/// that take longer to style, lay out, and paint simply arrive later.
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 /// A caret movement in the address field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +142,12 @@ struct App {
     page_layout: Option<crate::content::PageLayout>,
     /// CSS interaction state for the currently displayed page.
     selector_state: css::SelectorState,
+    /// When `loaded_page`'s animation timeline started: its first layout.
+    /// `None` until then; cleared when another page is loaded. Rebuilding the
+    /// layout (on resize, zoom, or find) keeps the timeline running.
+    animation_clock: Option<Instant>,
+    /// When the next CSS animation frame is due, while animations run.
+    next_animation_frame: Option<Instant>,
     /// How far the page is scrolled down, in CSS pixels; kept within
     /// `0..=page_layout.max_scroll()`.
     scroll_y: f32,
@@ -314,6 +325,8 @@ impl App {
             page: None,
             page_layout: None,
             selector_state: css::SelectorState::default(),
+            animation_clock: None,
+            next_animation_frame: None,
             scroll_y: 0.0,
             page_zoom: 1.0,
             frame: Vec::new(),
@@ -705,6 +718,7 @@ impl App {
         log::debug!("page displayed: {url}");
         self.loaded_page = Some(page);
         self.selector_state = css::SelectorState::default();
+        self.animation_clock = None;
         self.refresh_devtools_document();
         if let Ok(mut console) = self.console.lock() {
             console.clear();
@@ -744,6 +758,75 @@ impl App {
         self.page_layout = None;
         self.scroll_y = 0.0;
         self.redraw();
+    }
+
+    /// Replaces synthetic resource rows with completed controller diagnostics.
+    fn record_network_diagnostics(&mut self, events: &[NetworkEvent]) {
+        #[derive(Default)]
+        struct RequestTiming {
+            url: String,
+            started: Option<Instant>,
+            queue_started: Option<Instant>,
+            queue_ms: Option<u64>,
+            transport_started: Option<Instant>,
+            headers_ms: Option<u64>,
+            status: Option<u16>,
+        }
+
+        let mut requests: HashMap<u64, RequestTiming> = HashMap::new();
+        let mut completed = Vec::new();
+        for event in events {
+            let request = requests.entry(event.request_id).or_default();
+            request.url = event.url.clone();
+            request.status = event.status.or(request.status);
+            match event.phase {
+                NetworkPhase::Started => request.started = Some(event.at),
+                NetworkPhase::QueueStarted => request.queue_started = Some(event.at),
+                NetworkPhase::QueueAdmitted => {
+                    request.queue_ms = request.queue_started.map(|started| {
+                        event.at.saturating_duration_since(started).as_millis() as u64
+                    });
+                }
+                NetworkPhase::TransportStarted => request.transport_started = Some(event.at),
+                NetworkPhase::ResponseHeaders => {
+                    request.headers_ms = request.transport_started.map(|started| {
+                        event.at.saturating_duration_since(started).as_millis() as u64
+                    });
+                }
+                NetworkPhase::Completed | NetworkPhase::Failed | NetworkPhase::Aborted => {
+                    completed.push((event.request_id, event.at, event.status));
+                }
+                _ => {}
+            }
+        }
+        if completed.is_empty() {
+            return;
+        }
+        completed.sort_by_key(|(_, ended, _)| *ended);
+        self.network_log.clear();
+        for (index, (id, ended, terminal_status)) in completed.into_iter().enumerate() {
+            let Some(request) = requests.remove(&id) else {
+                continue;
+            };
+            let duration_ms = request
+                .started
+                .map(|started| ended.saturating_duration_since(started).as_millis() as u64)
+                .unwrap_or_default();
+            let resource_type = if index == 0 {
+                devtools::network::ResourceType::Document
+            } else {
+                resource_type_for_url(&request.url)
+            };
+            self.network_log.record(
+                devtools::network::RequestEntry::new(
+                    request.url,
+                    terminal_status.or(request.status),
+                    resource_type,
+                    duration_ms,
+                )
+                .with_network_timing(request.queue_ms, request.headers_ms),
+            );
+        }
     }
 
     fn begin_address_edit(&mut self) {
@@ -853,6 +936,7 @@ impl App {
                 // `browser::load` already logged the failure at error level.
                 log::debug!("showing error page for {}: {error}", navigation.address);
                 self.loaded_page = Some(browser::error_page(&navigation.address, &error));
+                self.animation_clock = None;
                 self.refresh_devtools_document();
                 self.clear_performance();
                 self.network_log
@@ -879,8 +963,16 @@ impl App {
                 self.redraw();
             }
         }
-        // After the new page cleared the log, so the load leads its timeline.
-        self.record_performance(navigation.timeline);
+        self.record_network_diagnostics(&navigation.network_events);
+        if let Some(panel) = &mut self.devtools_panel {
+            sync_devtools_panel(panel, &self.network_log, &self.console, &self.performance);
+        }
+        // Replace coarse loader download spans with phases emitted by `net`.
+        // Parse, style, layout, paint, and script events remain unchanged.
+        let mut timeline = navigation.timeline;
+        timeline.retain(|event| event.category != EventCategory::Network);
+        timeline.extend(network_phase_timeline(&navigation.network_events));
+        self.record_performance(timeline);
     }
 
     /// Starts a fresh Performance timeline for a newly shown page.
@@ -1195,6 +1287,30 @@ impl App {
         self.menu_pressed = None;
     }
 
+    /// Opens the toolbar overflow menu beneath the browser controls.
+    fn open_overflow_menu(&mut self) {
+        self.dismiss_context_menu();
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+        self.context_menu = Some(ContextMenu::overflow(size.width, size.height));
+        self.chrome.pressed = None;
+        self.set_hovered(None);
+        self.frame_key = None;
+        self.redraw();
+    }
+
+    /// Clears the network state shared by all future page navigations.
+    fn clear_cache(&mut self) {
+        let Some(loader) = &self.loader else {
+            log::warn!("cache clear unavailable: page loader is not running");
+            return;
+        };
+        loader.clear_cache();
+        log::info!("cleared page-load HTTP and CORS-preflight caches");
+    }
+
     fn close_page_source(&mut self) {
         self.source_close_pressed = false;
         if self.page_source.take().is_some() {
@@ -1441,6 +1557,51 @@ impl App {
             .map_or(0.0, |layout| layout.css_size().1 as f32)
     }
 
+    /// Advances running CSS animations when a frame is due: restyles and lays
+    /// out the page for the time since its animation clock started, and asks
+    /// the window to repaint it.
+    ///
+    /// Returns when the next frame is due, or `None` when no animation is
+    /// running (or the page has not been laid out yet), so the event loop
+    /// can sleep until the next input.
+    fn pump_animations(&mut self) -> Option<Instant> {
+        let (Some(layout), Some(clock)) = (&mut self.page_layout, self.animation_clock) else {
+            self.next_animation_frame = None;
+            return None;
+        };
+        if !layout.is_animating() {
+            self.next_animation_frame = None;
+            return None;
+        }
+        let now = Instant::now();
+        let due = *self.next_animation_frame.get_or_insert(now);
+        if now < due {
+            return Some(due);
+        }
+        layout.animate(clock.elapsed());
+        record_events(&self.performance, layout.take_timeline());
+        if let Some(find) = &mut self.find {
+            // Highlights follow text that the animation moved.
+            find.replace_runs(layout.find_text());
+        }
+        // An animation can shrink the page below the current scroll position.
+        let scroll_y = self.scroll_y.clamp(0.0, layout.max_scroll());
+        let still_running = layout.is_animating();
+        if scroll_y != self.scroll_y {
+            self.scroll_y = scroll_y;
+            self.page_events.set_scroll_y(scroll_y);
+        }
+        // Only the page pixmap changes. The DevTools window is not repainted
+        // every frame.
+        self.page = None;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        let next = now + ANIMATION_FRAME_INTERVAL;
+        self.next_animation_frame = still_running.then_some(next);
+        still_running.then_some(next)
+    }
+
     /// Scrolls the page down by `delta` CSS pixels (up when negative),
     /// stopping at the top and bottom of the document, and repaints when
     /// the position changed.
@@ -1548,6 +1709,7 @@ impl App {
                     log::debug!("context menu action: {action:?}");
                     match action {
                         Some(MenuAction::Reload) => self.activate(Control::Reload),
+                        Some(MenuAction::ClearCache) => self.clear_cache(),
                         Some(MenuAction::PageSource) => self.show_page_source(),
                         Some(MenuAction::Inspect) => self.show_elements(),
                         Some(MenuAction::Compatibility) => self.show_compatibility(),
@@ -1720,9 +1882,9 @@ impl App {
                 log::debug!("toolbar action: address");
                 self.begin_address_edit()
             }
-            // Tabs and the menu are not implemented yet; these controls only
-            // give visual feedback.
-            Control::NewTab | Control::Menu => {
+            Control::Menu => self.open_overflow_menu(),
+            // Tabs are not implemented yet; this control only gives visual feedback.
+            Control::NewTab => {
                 log::debug!("toolbar action: {control:?} (not implemented)");
             }
         }
@@ -1760,6 +1922,7 @@ impl App {
             || self.elements.is_some();
         let page_size_changed = self.page.as_ref().map(|(size, _)| *size) != card_size;
         if page_size_changed {
+            let animation_clock = *self.animation_clock.get_or_insert_with(Instant::now);
             // Painting never runs the page script: evaluation joins the JS
             // engine thread, and doing that inside this draw leaves `alert`
             // unable to finish. `about_to_wait` starts it after this frame.
@@ -1768,11 +1931,12 @@ impl App {
                 let layout_changed =
                     self.page_layout.as_ref().map(|layout| layout.css_size()) != Some(css_size);
                 if layout_changed {
-                    let mut layout = crate::content::PageLayout::new_with_state(
+                    let mut layout = crate::content::PageLayout::new_with_state_at(
                         self.loaded_page.as_ref().expect("page was loaded"),
                         css_size.0,
                         css_size.1,
                         self.selector_state,
+                        animation_clock.elapsed(),
                     );
                     record_events(&self.performance, layout.take_timeline());
                     self.page_layout = Some(layout);
@@ -2382,11 +2546,17 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_reload();
-        event_loop.set_control_flow(if self.reload_completion.is_some() {
-            ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(40))
-        } else {
-            ControlFlow::Wait
-        });
+        let reload_poll = self
+            .reload_completion
+            .is_some()
+            .then(|| Instant::now() + Duration::from_millis(40));
+        let animation_frame = self.pump_animations();
+        event_loop.set_control_flow(
+            match [reload_poll, animation_frame].into_iter().flatten().min() {
+                Some(deadline) => ControlFlow::WaitUntil(deadline),
+                None => ControlFlow::Wait,
+            },
+        );
 
         // `frame_key` is set only after a frame has been presented, so the
         // window is on screen before the page script can request an alert.
@@ -2441,6 +2611,148 @@ impl ApplicationHandler<UserEvent> for App {
 fn record_events(log: &Mutex<PerformanceLog>, events: impl IntoIterator<Item = TimelineEvent>) {
     if let Ok(mut log) = log.lock() {
         log.extend(events);
+    }
+}
+
+/// Splits each completed Fetch request into the engine phases that can explain
+/// a slow Network bar. Events without a paired endpoint are intentionally not
+/// shown: an unfinished request has no meaningful duration yet.
+fn network_phase_timeline(events: &[NetworkEvent]) -> Vec<TimelineEvent> {
+    #[derive(Default)]
+    struct Starts {
+        url: String,
+        request: Option<Instant>,
+        cache: Option<Instant>,
+        preflight: Option<Instant>,
+        queue: Option<Instant>,
+        transport: Option<Instant>,
+        headers: Option<Instant>,
+        finalized: Option<Instant>,
+    }
+
+    let mut ordered = events.to_vec();
+    ordered.sort_by_key(|event| event.at);
+    let mut starts: HashMap<u64, Starts> = HashMap::new();
+    let mut timeline = Vec::new();
+    for event in ordered {
+        let state = starts.entry(event.request_id).or_default();
+        state.url = event.url.clone();
+        match event.phase {
+            NetworkPhase::Started => state.request = Some(event.at),
+            NetworkPhase::Prepared => {
+                record_network_phase(
+                    &mut timeline,
+                    "Prepare",
+                    state.request,
+                    event.at,
+                    &state.url,
+                );
+            }
+            NetworkPhase::CacheLookup => state.cache = Some(event.at),
+            NetworkPhase::CacheHit | NetworkPhase::CacheMiss => {
+                record_network_phase(
+                    &mut timeline,
+                    "Cache lookup",
+                    state.cache,
+                    event.at,
+                    &state.url,
+                );
+            }
+            NetworkPhase::PreflightStarted => state.preflight = Some(event.at),
+            NetworkPhase::PreflightCompleted => {
+                record_network_phase(
+                    &mut timeline,
+                    "CORS preflight",
+                    state.preflight,
+                    event.at,
+                    &state.url,
+                );
+            }
+            NetworkPhase::QueueStarted => state.queue = Some(event.at),
+            NetworkPhase::QueueAdmitted => {
+                record_network_phase(&mut timeline, "Queue", state.queue, event.at, &state.url);
+            }
+            NetworkPhase::TransportStarted => state.transport = Some(event.at),
+            NetworkPhase::ResponseHeaders => {
+                record_network_phase(
+                    &mut timeline,
+                    "Transport",
+                    state.transport,
+                    event.at,
+                    &state.url,
+                );
+                state.headers = Some(event.at);
+            }
+            NetworkPhase::ResponseFinalized => {
+                record_network_phase(
+                    &mut timeline,
+                    "Response policy",
+                    state.headers.or(state.cache),
+                    event.at,
+                    &state.url,
+                );
+                state.finalized = Some(event.at);
+            }
+            NetworkPhase::Completed | NetworkPhase::Failed | NetworkPhase::Aborted => {
+                let label = match event.phase {
+                    NetworkPhase::Completed => "Deliver response",
+                    NetworkPhase::Failed => "Request failure",
+                    NetworkPhase::Aborted => "Request abort",
+                    _ => unreachable!(),
+                };
+                record_network_phase(
+                    &mut timeline,
+                    label,
+                    state.finalized.or(state.headers).or(state.request),
+                    event.at,
+                    &state.url,
+                );
+            }
+            NetworkPhase::PreflightCacheHit
+            | NetworkPhase::PreflightCacheMiss
+            | NetworkPhase::Redirect => {}
+        }
+    }
+    timeline
+}
+
+/// Appends one labelled Network segment when both lifecycle boundaries exist.
+fn record_network_phase(
+    timeline: &mut Vec<TimelineEvent>,
+    phase: &str,
+    start: Option<Instant>,
+    end: Instant,
+    url: &str,
+) {
+    let Some(start) = start else {
+        return;
+    };
+    timeline.push(TimelineEvent::new(
+        EventCategory::Network,
+        format!("{phase} {url}"),
+        start,
+        end.saturating_duration_since(start),
+    ));
+}
+
+/// Infers the current resource class from a completed redacted request URL.
+fn resource_type_for_url(url: &str) -> devtools::network::ResourceType {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    if path.ends_with(".css") {
+        devtools::network::ResourceType::Stylesheet
+    } else if path.ends_with(".js") || path.ends_with(".mjs") {
+        devtools::network::ResourceType::Script
+    } else if matches!(
+        path.rsplit('.').next(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico")
+    ) {
+        devtools::network::ResourceType::Image
+    } else {
+        devtools::network::ResourceType::Other
     }
 }
 
@@ -2507,6 +2819,46 @@ pub fn run(platform: Platform) -> Result<(), EventLoopError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn network_diagnostics_are_split_into_bottleneck_phases() {
+        let origin = Instant::now();
+        let event = |phase, millis| NetworkEvent {
+            request_id: 7,
+            phase,
+            at: origin + Duration::from_millis(millis),
+            url: "https://example.test/app.js".into(),
+            status: (millis >= 9).then_some(200),
+            from_cache: false,
+            redirect_count: 0,
+        };
+        let timeline = network_phase_timeline(&[
+            event(NetworkPhase::Started, 0),
+            event(NetworkPhase::Prepared, 2),
+            event(NetworkPhase::CacheLookup, 2),
+            event(NetworkPhase::CacheMiss, 3),
+            event(NetworkPhase::QueueStarted, 3),
+            event(NetworkPhase::QueueAdmitted, 8),
+            event(NetworkPhase::TransportStarted, 8),
+            event(NetworkPhase::ResponseHeaders, 18),
+            event(NetworkPhase::ResponseFinalized, 20),
+            event(NetworkPhase::Completed, 21),
+        ]);
+        let phases: Vec<_> = timeline.iter().map(|event| event.label.as_str()).collect();
+        assert_eq!(
+            phases,
+            [
+                "Prepare https://example.test/app.js",
+                "Cache lookup https://example.test/app.js",
+                "Queue https://example.test/app.js",
+                "Transport https://example.test/app.js",
+                "Response policy https://example.test/app.js",
+                "Deliver response https://example.test/app.js",
+            ]
+        );
+        assert_eq!(timeline[2].duration, Duration::from_millis(5));
+        assert_eq!(timeline[3].duration, Duration::from_millis(10));
+    }
+
     fn app() -> App {
         App::with_runtime(
             Platform {
@@ -2539,7 +2891,7 @@ mod tests {
     fn find_named_space_types_phrases_with_real_counts_and_highlight_ranges() {
         let page=browser::Page {url:"byui://test".into(),
             html:"<body><p>Start Welcome <span>to</span> BYUI <b>Browser</b> end</p><button>Click <span>Me</span></button></body>".into(),
-            stylesheets:vec!["body {height:2000px}".into()],scripts:vec![]};
+            stylesheets:vec!["body {height:2000px}".into()],scripts:vec![], resources: Default::default() };
         for query in [
             "Welcome to",
             "BYUI Browser",
@@ -2828,6 +3180,7 @@ mod tests {
             html: "<html><body><article><h1>Next</h1></article></body></html>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         app.page_loaded("byui://test/next", next);
         let panel = app.elements.as_ref().expect("the dock stays open");
@@ -3024,6 +3377,7 @@ mod tests {
             html: "<h1>Already loaded</h1>\n<script>not executed</script>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         app.page_loaded("byui://source-fixture", page.clone());
         let before = app.browser_state.clone();
@@ -3247,6 +3601,7 @@ mod tests {
             html: "<body><div></div></body>".into(),
             stylesheets: vec!["body { margin: 0 } div { height: 1000px }".into()],
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         app.page_loaded("byui://long", page.clone());
         app.page_layout = Some(crate::content::PageLayout::new(&page, 160, 200));
@@ -3441,6 +3796,7 @@ mod tests {
             address: address.to_owned(),
             result,
             timeline: Vec::new(),
+            network_events: Vec::new(),
         }
     }
 
@@ -3474,6 +3830,7 @@ mod tests {
             html: "<p>Loaded</p>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
 
         app.navigation_finished(
@@ -3529,6 +3886,7 @@ mod tests {
             html: "<p>Old</p>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
 
         app.navigation_finished(

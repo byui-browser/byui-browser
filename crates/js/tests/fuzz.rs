@@ -491,7 +491,7 @@ impl<'rng> Generator<'rng> {
         match self.rng.below(6) {
             0 => {
                 let operator = self.rng.pick(&["-", "!", "~"]).to_string();
-                format!("{operator}{}", self.expression(depth))
+                format!("{operator} {}", self.expression(depth))
             }
             1 => {
                 let operator = self.rng.pick(BINARY_OPERATORS).to_string();

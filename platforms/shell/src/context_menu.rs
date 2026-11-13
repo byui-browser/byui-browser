@@ -1,15 +1,16 @@
-//! Shared page popup: disabled navigation, Reload, View Page Source, Inspect,
-//! and Audit Compatibility.
+//! Shared popup menus for page and browser-chrome actions.
 
 use ab_glyph::FontVec;
 use tiny_skia::{Color, PathBuilder, Pixmap, Rect, Transform};
 
 use crate::toolbar;
 
-/// Independent actions offered by the page popup.
+/// Independent actions offered by browser popup menus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuAction {
     Reload,
+    /// Removes the in-memory network cache used by future page loads.
+    ClearCache,
     PageSource,
     Inspect,
     /// Opens the DevTools dock on its Compatibility tab.
@@ -18,7 +19,9 @@ pub(crate) enum MenuAction {
 
 // Disabled rows deliberately have no executable action. Navigation wiring is
 // outside this feature even when BrowserState has previous/next entries.
-const MENU_ITEMS: [(&str, Option<MenuAction>); 6] = [
+type MenuItem = (&'static str, Option<MenuAction>);
+
+const PAGE_MENU_ITEMS: [MenuItem; 6] = [
     ("Back", None),
     ("Forward", None),
     ("Reload", Some(MenuAction::Reload)),
@@ -26,6 +29,8 @@ const MENU_ITEMS: [(&str, Option<MenuAction>); 6] = [
     ("Inspect", Some(MenuAction::Inspect)),
     ("Audit Compatibility", Some(MenuAction::Compatibility)),
 ];
+
+const OVERFLOW_MENU_ITEMS: [MenuItem; 1] = [("Clear cache", Some(MenuAction::ClearCache))];
 
 /// Index of the first item after the separator that splits navigation
 /// (Back, Forward, Reload) from developer tools (Source, Inspect, Audit).
@@ -40,9 +45,6 @@ const ROW: f64 = 24.0;
 const SEPARATOR: f64 = 9.0;
 /// Corner radius of the menu surface in logical pixels.
 const RADIUS: f32 = 8.0;
-/// Full menu height in logical pixels.
-const HEIGHT: f64 = 2.0 * PAD + MENU_ITEMS.len() as f64 * ROW + SEPARATOR;
-
 /// Popup bounds in logical pixels, independent of display scaling.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ContextMenu {
@@ -50,29 +52,60 @@ pub(crate) struct ContextMenu {
     y: f64,
     width: f64,
     height: f64,
+    items: &'static [MenuItem],
+    second_group: Option<usize>,
 }
 
 impl ContextMenu {
     /// Anchors the popup at the pointer, clamped to the window.
     pub(crate) fn new(x: f64, y: f64, width: f64, height: f64) -> Self {
+        Self::with_items(x, y, width, height, &PAGE_MENU_ITEMS, Some(SECOND_GROUP))
+    }
+
+    /// Places the browser overflow menu below the toolbar's trailing controls.
+    pub(crate) fn overflow(width: f64, height: f64) -> Self {
+        Self::with_items(
+            width - WIDTH - 8.0,
+            toolbar::TOOLBAR_HEIGHT,
+            width,
+            height,
+            &OVERFLOW_MENU_ITEMS,
+            None,
+        )
+    }
+
+    fn with_items(
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        items: &'static [MenuItem],
+        second_group: Option<usize>,
+    ) -> Self {
         let menu_width = WIDTH.min(width);
-        let menu_height = HEIGHT.min(height);
+        let menu_height = Self::height_for(items.len(), second_group).min(height);
         Self {
             x: x.clamp(0.0, width - menu_width),
             y: y.clamp(0.0, height - menu_height),
             width: menu_width,
             height: menu_height,
+            items,
+            second_group,
         }
     }
 
     /// Top of item `index` relative to the menu's top edge, in logical pixels.
-    fn row_top(index: usize) -> f64 {
-        let gap = if index >= SECOND_GROUP {
+    fn row_top(self, index: usize) -> f64 {
+        let gap = if self.second_group.is_some_and(|group| index >= group) {
             SEPARATOR
         } else {
             0.0
         };
         PAD + index as f64 * ROW + gap
+    }
+
+    fn height_for(items: usize, second_group: Option<usize>) -> f64 {
+        2.0 * PAD + items as f64 * ROW + second_group.map_or(0.0, |_| SEPARATOR)
     }
 
     /// Whether the pointer is inside the popup, including disabled rows/padding.
@@ -90,11 +123,11 @@ impl ContextMenu {
             return None;
         }
         let y = y - self.y;
-        MENU_ITEMS
+        self.items
             .iter()
             .enumerate()
             .find(|(index, _)| {
-                let top = Self::row_top(*index);
+                let top = self.row_top(*index);
                 y >= top && y < top + ROW
             })
             .and_then(|(_, (_, action))| *action)
@@ -105,7 +138,7 @@ impl ContextMenu {
     pub(crate) fn item_center(self, index: usize) -> (f64, f64) {
         (
             self.x + self.width / 2.0,
-            self.y + Self::row_top(index) + ROW / 2.0,
+            self.y + self.row_top(index) + ROW / 2.0,
         )
     }
 
@@ -164,20 +197,22 @@ impl ContextMenu {
         {
             toolbar::stroke(frame, &path, border, 1.0, transform);
         }
-        let separator_y = y + (Self::row_top(SECOND_GROUP) - SEPARATOR / 2.0) as f32;
-        if separator_y + 1.0 < y + h
-            && let Some(rect) = Rect::from_xywh(
-                x + PAD as f32 + 8.0,
-                separator_y.floor(),
-                w - 2.0 * PAD as f32 - 16.0,
-                1.0,
-            )
-        {
-            toolbar::fill(frame, &PathBuilder::from_rect(rect), separator, transform);
+        if let Some(second_group) = self.second_group {
+            let separator_y = y + (self.row_top(second_group) - SEPARATOR / 2.0) as f32;
+            if separator_y + 1.0 < y + h
+                && let Some(rect) = Rect::from_xywh(
+                    x + PAD as f32 + 8.0,
+                    separator_y.floor(),
+                    w - 2.0 * PAD as f32 - 16.0,
+                    1.0,
+                )
+            {
+                toolbar::fill(frame, &PathBuilder::from_rect(rect), separator, transform);
+            }
         }
 
-        for (index, (label, action)) in MENU_ITEMS.into_iter().enumerate() {
-            let top = y + Self::row_top(index) as f32;
+        for (index, (label, action)) in self.items.iter().copied().enumerate() {
+            let top = y + self.row_top(index) as f32;
             if top + ROW as f32 > y + h {
                 break;
             }
@@ -224,7 +259,7 @@ mod tests {
     #[test]
     fn rows_have_the_requested_order_and_disabled_rows_have_no_actions() {
         assert_eq!(
-            MENU_ITEMS.map(|(label, _)| label),
+            PAGE_MENU_ITEMS.map(|(label, _)| label),
             [
                 "Back",
                 "Forward",
@@ -235,7 +270,7 @@ mod tests {
             ]
         );
         let menu = ContextMenu::new(100.0, 100.0, 800.0, 600.0);
-        for (row, (_, expected)) in MENU_ITEMS.into_iter().enumerate() {
+        for (row, (_, expected)) in PAGE_MENU_ITEMS.into_iter().enumerate() {
             let cursor = Some(menu.item_center(row));
             assert!(menu.contains(cursor));
             assert_eq!(menu.action_at(cursor), expected);
@@ -244,10 +279,19 @@ mod tests {
     }
 
     #[test]
+    fn overflow_menu_exposes_clear_cache_only() {
+        let menu = ContextMenu::overflow(800.0, 600.0);
+        assert_eq!(
+            menu.action_at(Some(menu.item_center(0))),
+            Some(MenuAction::ClearCache)
+        );
+    }
+
+    #[test]
     fn separator_and_padding_are_inert() {
         let menu = ContextMenu::new(100.0, 100.0, 800.0, 600.0);
         let (x, _) = menu.item_center(0);
-        let separator = menu.y + ContextMenu::row_top(SECOND_GROUP) - SEPARATOR / 2.0;
+        let separator = menu.y + menu.row_top(SECOND_GROUP) - SEPARATOR / 2.0;
         assert!(menu.contains(Some((x, separator))));
         assert_eq!(menu.action_at(Some((x, separator))), None);
         assert_eq!(
@@ -267,7 +311,7 @@ mod tests {
                 assert!(menu.y + menu.height <= height);
                 assert_eq!(menu.action_at(Some((menu.x, menu.y))), None);
                 assert_eq!(menu.action_at(None), None);
-                if height < HEIGHT {
+                if height < ContextMenu::height_for(PAGE_MENU_ITEMS.len(), Some(SECOND_GROUP)) {
                     continue;
                 }
                 assert_eq!(

@@ -6,7 +6,7 @@ use crate::ast::{CatchClause, Expr, Statement, VarKind};
 use std::rc::Rc;
 
 impl Compiler {
-    fn patch(&mut self, jump: usize) -> Result<(), super::CompileError> {
+    pub(super) fn patch(&mut self, jump: usize) -> Result<(), super::CompileError> {
         self.chunk
             .patch_jump(jump, self.chunk.current_offset())
             .map_err(|message| super::CompileError {
@@ -16,7 +16,10 @@ impl Compiler {
             })
     }
 
-    fn emit_placeholder(&mut self, instruction: Instruction) -> Result<usize, super::CompileError> {
+    pub(super) fn emit_placeholder(
+        &mut self,
+        instruction: Instruction,
+    ) -> Result<usize, super::CompileError> {
         self.chunk
             .emit_jump(instruction)
             .map_err(|message| super::CompileError {
@@ -187,7 +190,11 @@ impl Compiler {
         Ok(is_completion)
     }
 
-    fn patch_to(&mut self, jump: usize, target: usize) -> Result<(), super::CompileError> {
+    pub(super) fn patch_to(
+        &mut self,
+        jump: usize,
+        target: usize,
+    ) -> Result<(), super::CompileError> {
         self.chunk
             .patch_jump(jump, target)
             .map_err(|message| super::CompileError {
