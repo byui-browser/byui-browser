@@ -310,10 +310,14 @@ mod tests {
     fn compiles_shared_declarations_once_and_skips_unmatchable_rules() {
         let sheet = parse_stylesheet("a, b, a:hover, p::before { margin: 0 !important }");
         let compiled = CompiledSheet::compile(&sheet);
-        assert_eq!(compiled.rules.len(), 2);
+        assert_eq!(compiled.rules.len(), 3);
         assert!(Arc::ptr_eq(
             &compiled.rules[0].declarations,
             &compiled.rules[1].declarations
+        ));
+        assert!(Arc::ptr_eq(
+            &compiled.rules[0].declarations,
+            &compiled.rules[2].declarations
         ));
         assert_eq!(compiled.rules[0].declarations.len(), 4);
         assert!(compiled.rules[0].declarations[0].important);

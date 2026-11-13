@@ -31,10 +31,13 @@ pub mod tokenizer;
 mod user_agent;
 pub mod values;
 
-pub use cascade::{style_document, style_document_at};
+pub use cascade::{
+    style_document, style_document_at, style_document_with_state, style_document_with_state_at,
+};
 pub use color::{CssColor, parse_color};
 pub use computed::ComputedStyles;
 pub use fonts::{FontFaceRule, FontSource, font_face_rules, parse_font_family_list};
+pub use matching::SelectorState;
 pub use parser::{parse_stylesheet, parse_stylesheet_with_errors};
 pub use selector::{
     AttributeOperator, AttributeSelector, Combinator, ComplexSelector, CompoundSelector,

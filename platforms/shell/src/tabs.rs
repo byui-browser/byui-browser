@@ -27,6 +27,9 @@ pub(crate) struct TabState {
     pub loaded_page: Option<browser::Page>,
     pub page: Option<((u32, u32), Pixmap)>,
     pub page_layout: Option<PageLayout>,
+    /// CSS pointer and focus state (`:hover`, `:active`, `:focus`) for this
+    /// tab's document; reset when another document is shown.
+    pub selector_state: css::SelectorState,
     /// Wall-clock origin of this document's CSS animation timeline, after its first layout.
     pub animation_clock: Option<Instant>,
     /// Next visible animation sample. Hidden tabs keep their clock without frame wakeups.
@@ -67,6 +70,7 @@ impl TabState {
             loaded_page: None,
             page: None,
             page_layout: None,
+            selector_state: css::SelectorState::default(),
             animation_clock: None,
             next_animation_frame: None,
             scroll_y: 0.0,

@@ -846,6 +846,7 @@ impl App {
         self.tab.loaded_page = Some(page);
         self.tab.animation_clock = None;
         self.tab.next_animation_frame = None;
+        self.tab.selector_state = css::SelectorState::default();
         self.refresh_devtools_document();
         if let Ok(mut console) = self.tab.console.lock() {
             console.clear();
@@ -2062,6 +2063,10 @@ impl App {
             ElementState::Released => {
                 let page_press = self.page_press;
                 self.page_press = false;
+                let page_target = self.cursor.and_then(|(x, y)| self.page_node_at(x, y));
+                if self.tab.selector_state.active.take().is_some() {
+                    self.invalidate_page_style();
+                }
                 if let Some(control) = self.tab.chrome.pressed.take() {
                     self.redraw();
                     if control == Control::Address {
@@ -2075,8 +2080,7 @@ impl App {
                     && let Some((x, y)) = self.cursor
                     && self.pointer_is_on_page(x, y)
                 {
-                    let target = self.page_node_at(x, y);
-                    self.tab.page_events.click(target);
+                    self.tab.page_events.click(page_target);
                 }
             }
         }
@@ -2191,10 +2195,11 @@ impl App {
                     .map(|layout| layout.css_size())
                     != Some(css_size);
                 if layout_changed {
-                    let mut layout = crate::content::PageLayout::new_at(
+                    let mut layout = crate::content::PageLayout::new_with_state_at(
                         self.tab.loaded_page.as_ref().expect("page was loaded"),
                         css_size.0,
                         css_size.1,
+                        self.tab.selector_state,
                         animation_clock.elapsed(),
                     );
                     record_events(&self.tab.performance, layout.take_timeline());
@@ -2361,6 +2366,14 @@ impl App {
         let strip = self.strip();
         let tab_hover_changed = strip.action_at(self.cursor) != strip.action_at(Some((x, y)));
         self.cursor = Some((x, y));
+        let hovered_page_node = self
+            .pointer_is_on_page(x, y)
+            .then(|| self.page_node_at(x, y))
+            .flatten();
+        if self.tab.selector_state.hovered != hovered_page_node {
+            self.tab.selector_state.hovered = hovered_page_node;
+            self.invalidate_page_style();
+        }
         log::trace!("cursor moved: ({x:.0}, {y:.0})");
         if self.address_press.is_some()
             && let Some(offset) = self.address_offset_under_pointer()
@@ -2433,7 +2446,25 @@ impl App {
             .is_some_and(|(x, y)| self.pointer_is_on_page(x, y))
         {
             self.page_press = true;
+            let target = self.cursor.and_then(|(x, y)| self.page_node_at(x, y));
+            self.tab.selector_state.active = target;
+            self.tab.selector_state.focused = target.filter(|node| {
+                self.tab
+                    .page_layout
+                    .as_ref()
+                    .is_some_and(|layout| layout.is_focusable(*node))
+            });
+            self.tab.selector_state.keyboard_focus = false;
+            self.invalidate_page_style();
         }
+    }
+
+    /// Discards the page frame and layout after an interaction selector changes.
+    fn invalidate_page_style(&mut self) {
+        self.tab.page = None;
+        self.tab.page_layout = None;
+        self.frame_key = None;
+        self.redraw();
     }
 
     /// Returns the page node under a logical-pixel window point, matching the
@@ -2669,6 +2700,12 @@ impl ApplicationHandler<UserEvent> for App {
                 if event.state == ElementState::Pressed && self.tab_shortcut(&event.logical_key) {
                     return;
                 }
+                if event.state == ElementState::Pressed && !self.tab.selector_state.keyboard_focus {
+                    self.tab.selector_state.keyboard_focus = true;
+                    if self.tab.selector_state.focused.is_some() {
+                        self.invalidate_page_style();
+                    }
+                }
                 if event.state == ElementState::Pressed && self.find_key(&event.logical_key) {
                     return;
                 }
@@ -2724,6 +2761,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.redraw();
                 self.page_press = false;
                 self.set_hovered(None);
+                if self.tab.selector_state.hovered.take().is_some() {
+                    self.invalidate_page_style();
+                }
                 if self.context_menu.is_some() {
                     self.redraw();
                 }
