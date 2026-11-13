@@ -24,6 +24,7 @@ fn main() -> Result<(), winit::error::EventLoopError> {
                 .with_fullsize_content_view(true)
         },
         window_created: center_traffic_lights,
+        window_changed: sync_native_toolbar,
         ui_font_files: || {
             [
                 "/System/Library/Fonts/SFNS.ttf",
@@ -51,50 +52,67 @@ fn main() -> Result<(), winit::error::EventLoopError> {
     })
 }
 
-/// Gives the window an empty unified-style `NSToolbar`, Safari's setup. That
-/// makes AppKit's titlebar 52 points tall, the shared toolbar's height, and
-/// AppKit centers the traffic lights vertically in it, so they line up with
-/// the Back, Forward, and Reload buttons. The toolbar holds no items; the
-/// transparent titlebar and hidden title keep it invisible, and the content
-/// view still extends under it.
-///
-/// The window is also made unmovable by AppKit's own titlebar dragging, so
-/// drags reach the toolbar controls; the shell starts window drags itself.
+/// Normal windows keep the existing unified titlebar/traffic-light layout.
+#[cfg(target_os = "macos")]
+fn center_traffic_lights(window: &winit::window::Window) {
+    sync_native_toolbar(window);
+}
+
+/// AppKit manages native toolbars specially in full screen. Detach the empty
+/// titlebar-sizing helper there so it cannot obscure the software-painted tabs
+/// and address row in the full-size content view. Restore it on exit. Native
+/// decorations remain AppKit-owned; winit keeps its own window delegate.
+/// Returns true only when a native layout change requires a fresh frame.
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
-fn center_traffic_lights(window: &winit::window::Window) {
+fn sync_native_toolbar(window: &winit::window::Window) -> bool {
     use objc2::MainThreadMarker;
     use objc2::rc::Retained;
-    use objc2_app_kit::{NSToolbar, NSView, NSWindowToolbarStyle};
+    use objc2_app_kit::{NSToolbar, NSView, NSWindowStyleMask, NSWindowToolbarStyle};
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     let Some(mtm) = MainThreadMarker::new() else {
-        return;
+        return false;
     };
     let Ok(handle) = window.window_handle() else {
-        return;
+        return false;
     };
     let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-        return;
+        return false;
     };
     // SAFETY: winit's AppKit handle points at the window's live content
-    // `NSView`, which `window` keeps alive for this call; retaining it only
-    // adds a reference.
+    // NSView, which `window` keeps alive for this main-thread call. Retaining
+    // it only adds a reference; it is never retained past this function.
     let Some(view) = (unsafe { Retained::retain(handle.ns_view.as_ptr().cast::<NSView>()) }) else {
-        return;
+        return false;
     };
     let Some(ns_window) = view.window() else {
-        return;
+        return false;
     };
-    let toolbar = NSToolbar::new(mtm);
-    ns_window.setToolbar(Some(&toolbar));
-    ns_window.setToolbarStyle(NSWindowToolbarStyle::Unified);
-    // AppKit would otherwise move the window for any drag in the now
-    // 52-point titlebar, because winit's content view reports that a mouse
-    // down there can move the window. That steals drags meant to select text
-    // in the address field. The shared shell still moves the window from
-    // empty toolbar space with `Window::drag_window`.
+    // Inspect AppKit's actual style rather than winit's requested mode, which
+    // can change before the native full-screen transition has finished.
+    let fullscreen = ns_window
+        .styleMask()
+        .contains(NSWindowStyleMask::FullScreen);
+    let attached = ns_window.toolbar().is_some();
+    if fullscreen {
+        if !attached {
+            return false;
+        }
+        ns_window.setToolbar(None);
+    } else {
+        if attached {
+            return false;
+        }
+        let toolbar = NSToolbar::new(mtm);
+        ns_window.setToolbar(Some(&toolbar));
+        ns_window.setToolbarStyle(NSWindowToolbarStyle::Unified);
+    }
+    ns_window.setTitlebarAppearsTransparent(true);
+    // Native titlebar dragging must not steal address-field text-selection
+    // drags. Empty chrome still uses Window::drag_window, as before.
     ns_window.setMovable(false);
+    true
 }
 
 #[cfg(not(target_os = "macos"))]

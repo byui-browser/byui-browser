@@ -66,7 +66,7 @@ impl ContextMenu {
     pub(crate) fn overflow(width: f64, height: f64) -> Self {
         Self::with_items(
             width - WIDTH - 8.0,
-            toolbar::TOOLBAR_HEIGHT,
+            toolbar::PAGE_TOP,
             width,
             height,
             &OVERFLOW_MENU_ITEMS,
@@ -279,12 +279,19 @@ mod tests {
     }
 
     #[test]
-    fn overflow_menu_exposes_clear_cache_only() {
-        let menu = ContextMenu::overflow(800.0, 600.0);
-        assert_eq!(
-            menu.action_at(Some(menu.item_center(0))),
-            Some(MenuAction::ClearCache)
-        );
+    fn overflow_menu_exposes_clear_cache_below_all_browser_controls() {
+        for (width, height) in [(420.0, 280.0), (800.0, 600.0), (1728.0, 1117.0)] {
+            let menu = ContextMenu::overflow(width, height);
+            assert_eq!(
+                menu.action_at(Some(menu.item_center(0))),
+                Some(MenuAction::ClearCache)
+            );
+            assert!(menu.y >= toolbar::PAGE_TOP);
+            assert!(menu.x >= 0.0 && menu.x + menu.width <= width);
+            assert!(menu.y + menu.height <= height);
+            // The popup must not cover the toolbar button that opened it.
+            assert!(!menu.contains(Some((width - 30.0, crate::tab_strip::HEIGHT + 26.0))));
+        }
     }
 
     #[test]

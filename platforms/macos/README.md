@@ -31,6 +31,16 @@ behave as in any Mac app, and the window resizes from its edges as usual.
 Dragging empty toolbar space moves the window, and double-clicking it toggles
 the zoomed size.
 
+The empty native toolbar is a windowed-mode sizing helper only. In native
+full-screen mode it is detached, keeping the shared software-painted tab strip
+and address controls in the content view instead of under AppKit's full-screen
+native toolbar treatment. Leaving full screen restores the same unified native
+setup. The shell checks native layout before drawing and after transitions and
+repaints the full frame when the helper is attached or removed. Test the
+green full-screen button, then return to normal mode;
+tabs, +, close buttons, address editing and navigation must remain usable.
+
+
 From left to right the toolbar shows Back, Forward, Reload, a centered address
 field labelled `byui://welcome`, New Tab, and a menu button. Back and Forward
 are drawn disabled, Reload re-renders the welcome page, and the address field

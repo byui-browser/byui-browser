@@ -670,6 +670,7 @@ fn evaluate_page_script(page: &Page, alert_sink: Arc<dyn AlertSink>, runtime: Br
 }
 
 enum PageCommand {
+    Unload,
     Load {
         page: Page,
         console: Arc<dyn ConsoleSink>,
@@ -703,6 +704,13 @@ pub(crate) struct PageEvents {
 }
 
 impl PageEvents {
+    /// Drops the old document session after navigation; switching tabs never unloads it.
+    pub(crate) fn unload(&self) {
+        if self.commands.send(PageCommand::Unload).is_err() {
+            log::debug!("page session already stopped");
+        }
+    }
+
     /// Starts the session thread. It exits when the last sender is dropped.
     pub(crate) fn new() -> Self {
         let (commands, incoming) = mpsc::channel();
@@ -855,6 +863,11 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
     };
     while let Ok(command) = commands.recv() {
         match command {
+            PageCommand::Unload => {
+                session = None;
+                performance = None;
+                set_script_error(script_error, None);
+            }
             PageCommand::Load {
                 page,
                 console,
@@ -1078,6 +1091,51 @@ mod tests {
             .expect("welcome color declaration");
         let color = css::parse_color(&value.value).expect("supported welcome color");
         [color.r, color.g, color.b, color.a]
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unloading_a_replaced_document_removes_old_click_listeners() {
+        struct Recording(std::sync::mpsc::Sender<String>);
+        impl AlertSink for Recording {
+            fn alert(&self, message: &str) {
+                let _ = self.0.send(message.into());
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let alerts = Arc::new(Recording(tx));
+        let events = PageEvents::new();
+        let old = Page {
+            url: "https://old.test/".into(),
+            html: "<script></script>".into(),
+            stylesheets: vec![],
+            scripts: vec![
+                "function click() { alert('old') } document.addEventListener('click', click)"
+                    .into(),
+            ],
+            resources: Default::default(),
+        };
+        events.load(&old, alerts.clone(), test_runtime(), 1.0);
+        events.click(None);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            "old"
+        );
+        events.unload();
+        events.click(None);
+        let new = Page {
+            url: "https://new.test/".into(),
+            html: "<script></script>".into(),
+            stylesheets: vec![],
+            scripts: vec!["alert('new')".into()],
+            resources: Default::default(),
+        };
+        events.load(&new, alerts, test_runtime(), 1.0);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            "new"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[cfg(target_os = "macos")]
@@ -2011,5 +2069,82 @@ mod tests {
                 .copied()
                 .any(|p| p == [255, 0, 0, 255])
         );
+    }
+    #[test]
+    fn find_highlights_use_each_fragments_web_font_after_animation_and_reflow() {
+        let Some(bytes) = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ]
+        .into_iter()
+        .find_map(|path| std::fs::read(path).ok()) else {
+            return;
+        };
+        let page = Page {
+            url: "https://font.test/".into(),
+            html: "<body><div id='spacer'></div><p><span class='web'>Wi</span><span>Wi</span></p></body>".into(),
+            stylesheets: vec!["body, p { margin: 0 } .web { font-family: Web } @keyframes grow { from { height: 0px } to { height: 40px } } #spacer { animation: grow 1s linear forwards }".into()],
+            scripts: vec![],
+            resources: browser::PageResources {
+                fonts: vec![browser::FontResource { family: "Web".into(), weight: (400,400), italic: false,
+                    url: "https://font.test/web.ttf".into(), bytes: bytes.into() }].into(),
+                ..Default::default()
+            },
+        };
+        let mut find = crate::find_in_page::FindInPage::default();
+        find.insert("iW");
+        for (width, elapsed) in [(320, Duration::ZERO), (180, Duration::from_millis(500))] {
+            let mut layout = PageLayout::new_at(&page, width, 100, elapsed);
+            layout.animate(elapsed);
+            find.replace_runs(layout.find_text());
+            assert_eq!(find.count(), "1/1");
+            let fragments = layout.find_fragments();
+            assert_eq!(fragments[0].0.font, layout::FontId(1));
+            assert_eq!(fragments[1].0.font, layout::FontId::DEFAULT);
+            let ranges = find.highlight_ranges(false);
+            assert_eq!(ranges.len(), 2);
+            let backgrounds = layout.text_backgrounds(Some(&find), false);
+            for (range, _) in ranges {
+                let fragment = fragments[range.run].0;
+                let rect = backgrounds[&(fragment as *const layout::TextFragment)][0].rect;
+                assert_eq!(
+                    rect.x,
+                    fragment.rect.x
+                        + layout.fonts.font_text_width(
+                            fragment.font,
+                            &fragment.text[..range.bytes.start],
+                            fragment.font_size
+                        )
+                );
+                assert_eq!(
+                    rect.width,
+                    layout.fonts.font_text_width(
+                        fragment.font,
+                        &fragment.text[range.bytes],
+                        fragment.font_size
+                    )
+                );
+                assert_eq!(rect.y, fragment.rect.y);
+                if elapsed > Duration::ZERO {
+                    assert!(rect.y >= 20.0);
+                }
+            }
+            for scale in [1.0, 1.5, 2.0] {
+                assert!(
+                    render_page_with_find(
+                        &layout,
+                        (width as f64 * scale) as u32,
+                        (100.0 * scale) as u32,
+                        scale,
+                        0.0,
+                        Some(&find),
+                        false
+                    )
+                    .is_some()
+                );
+            }
+        }
     }
 }

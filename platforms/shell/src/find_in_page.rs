@@ -302,7 +302,7 @@ impl FindInPage {
     pub fn regions(width: f32) -> [(Action, Rect); 4] {
         let width = width.max(160.0);
         let x = 12.0;
-        let y = toolbar::TOOLBAR_HEIGHT as f32 + 5.0;
+        let y = toolbar::PAGE_TOP as f32 + 5.0;
         let right = width - 12.0;
         let field = (right - x - 154.0).max(1.0);
         [
@@ -339,7 +339,7 @@ impl FindInPage {
         let palette = toolbar::palette(dark);
         let mut paint = Paint::default();
         paint.set_color(palette.field);
-        let bar = Rect::from_xywh(0.0, toolbar::TOOLBAR_HEIGHT as f32, width, HEIGHT).unwrap();
+        let bar = Rect::from_xywh(0.0, toolbar::PAGE_TOP as f32, width, HEIGHT).unwrap();
         pixmap.fill_path(
             &PathBuilder::from_rect(bar),
             &paint,
@@ -454,7 +454,7 @@ impl FindInPage {
                 font,
                 count_size * scale,
                 x * scale,
-                (toolbar::TOOLBAR_HEIGHT as f32 + 25.0) * scale,
+                (toolbar::PAGE_TOP as f32 + 25.0) * scale,
                 (width - 116.0) * scale,
                 palette.text_muted,
                 &self.count(),
@@ -567,7 +567,7 @@ mod tests {
                 let mut after = Pixmap::new(before.width(), before.height()).unwrap();
                 f.draw(&mut after, scale, dark, Some(&font));
                 assert_ne!(before.data(), after.data());
-                let top = (toolbar::TOOLBAR_HEIGHT * scale) as usize * after.width() as usize * 4;
+                let top = (toolbar::PAGE_TOP * scale) as usize * after.width() as usize * 4;
                 assert!(after.data()[..top].iter().all(|b| *b == 0));
             }
         }
@@ -670,7 +670,7 @@ mod tests {
         for dark in [false, true] {
             let mut pixmap = Pixmap::new(420, 280).unwrap();
             f.draw(&mut pixmap, 1.0, dark, None);
-            let top = toolbar::TOOLBAR_HEIGHT as usize * 420 * 4;
+            let top = toolbar::PAGE_TOP as usize * 420 * 4;
             assert!(pixmap.data()[..top].iter().all(|b| *b == 0));
             assert!(
                 pixmap.data()[top..top + HEIGHT as usize * 420 * 4]
