@@ -47,6 +47,13 @@ const WHEEL_LINE_SCROLL: f32 = 20.0;
 /// Space, so the reader keeps their place.
 const PAGE_SCROLL_OVERLAP: f32 = 40.0;
 
+/// How long after the last scroll step the page's `:hover` state is
+/// recomputed. Hover changes restyle and lay out the whole page, which takes
+/// far longer than a frame on large pages; doing that while content moves
+/// under the pointer made scrolling stutter, so like other browsers the
+/// shell waits for scrolling to settle.
+const SCROLL_HOVER_DELAY: Duration = Duration::from_millis(150);
+
 /// Smallest and largest supported page zoom, expressed as a multiplier.
 const PAGE_ZOOM_RANGE: (f64, f64) = (0.5, 3.0);
 /// Page zoom increment for each keyboard shortcut press.
@@ -133,6 +140,10 @@ struct App {
     refresh: Option<browser::refresh::RefreshClient>,
     modifiers: ModifiersState,
     cursor: Option<(f64, f64)>,
+    /// While the page is scrolling, the earliest time its `:hover` state may
+    /// be recomputed; `None` when hover tracks the pointer directly. See
+    /// [`SCROLL_HOVER_DELAY`].
+    hover_update_after: Option<Instant>,
     frame: Vec<u32>,
     frame_key: Option<(u32, u32, u64, bool)>,
     last_toolbar_click: Option<Instant>,
@@ -223,6 +234,7 @@ impl App {
             strip_offset: 0,
             modifiers: ModifiersState::default(),
             cursor: None,
+            hover_update_after: None,
             frame: Vec::new(),
             frame_key: None,
             last_toolbar_click: None,
@@ -1780,7 +1792,10 @@ impl App {
                 .values()
                 .any(|tab| tab.reload_completion.is_some()))
         .then_some(now + Duration::from_millis(40));
-        [reload, animation].into_iter().flatten().min()
+        [reload, animation, self.hover_update_after]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Samples only the visible tab; hidden tabs retain elapsed wall-clock time.
@@ -1843,6 +1858,7 @@ impl App {
         self.dismiss_context_menu();
         self.tab.scroll_y = target;
         self.tab.page_events.set_scroll_y(self.tab.scroll_y);
+        self.hover_update_after = Some(Instant::now() + SCROLL_HOVER_DELAY);
         // Only the page pixmap changes; the layout is reused.
         self.tab.page = None;
         self.redraw();
@@ -2215,13 +2231,15 @@ impl App {
             // unable to finish. `about_to_wait` starts it after this frame.
             self.tab.page = card.and_then(|card| {
                 let css_size = crate::content::css_viewport(card.width, card.height, page_scale);
-                let layout_changed = self
-                    .tab
-                    .page_layout
-                    .as_ref()
-                    .map(|layout| layout.css_size())
-                    != Some(css_size);
+                let layout_changed = self.tab.page_layout_stale
+                    || self
+                        .tab
+                        .page_layout
+                        .as_ref()
+                        .map(|layout| layout.css_size())
+                        != Some(css_size);
                 if layout_changed {
+                    self.tab.page_layout_stale = false;
                     let mut layout = crate::content::PageLayout::new_with_state_at(
                         self.tab.loaded_page.as_ref().expect("page was loaded"),
                         css_size.0,
@@ -2393,13 +2411,8 @@ impl App {
         let strip = self.strip();
         let tab_hover_changed = strip.action_at(self.cursor) != strip.action_at(Some((x, y)));
         self.cursor = Some((x, y));
-        let hovered_page_node = self
-            .pointer_is_on_page(x, y)
-            .then(|| self.page_node_at(x, y))
-            .flatten();
-        if self.tab.selector_state.hovered != hovered_page_node {
-            self.tab.selector_state.hovered = hovered_page_node;
-            self.invalidate_page_style();
+        if self.hover_update_after.is_none() {
+            self.update_page_hover();
         }
         log::trace!("cursor moved: ({x:.0}, {y:.0})");
         if self.address_press.is_some()
@@ -2424,6 +2437,29 @@ impl App {
         }
         let inset = self.platform.window_controls_inset;
         self.set_hovered(toolbar::hit_test(x, y, width, inset));
+    }
+
+    /// Sets the page's `:hover` element to the one under the pointer and
+    /// restyles the page when it changed.
+    fn update_page_hover(&mut self) {
+        let hovered_page_node = self.cursor.and_then(|(x, y)| {
+            self.pointer_is_on_page(x, y)
+                .then(|| self.page_node_at(x, y))
+                .flatten()
+        });
+        if self.tab.selector_state.hovered != hovered_page_node {
+            self.tab.selector_state.hovered = hovered_page_node;
+            self.invalidate_page_style();
+        }
+    }
+
+    /// Recomputes `:hover` once scrolling has settled; see
+    /// [`SCROLL_HOVER_DELAY`].
+    fn settle_scroll_hover(&mut self, now: Instant) {
+        if self.hover_update_after.is_some_and(|due| now >= due) {
+            self.hover_update_after = None;
+            self.update_page_hover();
+        }
     }
 
     fn pressed(&mut self) {
@@ -2486,10 +2522,13 @@ impl App {
         }
     }
 
-    /// Discards the page frame and layout after an interaction selector changes.
+    /// Discards the page frame and marks the layout for restyling after an
+    /// interaction selector changes.
     fn invalidate_page_style(&mut self) {
         self.tab.page = None;
-        self.tab.page_layout = None;
+        // Keep the old layout for scrolling and hit testing until `paint`
+        // restyles; see `TabState::page_layout_stale`.
+        self.tab.page_layout_stale = true;
         self.frame_key = None;
         self.redraw();
     }
@@ -2873,6 +2912,7 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(window) = &self.window {
             self.alerts.present(window, self.tab.id);
         }
+        self.settle_scroll_hover(Instant::now());
         let animation_frame = self.pump_animations();
         event_loop.set_control_flow(
             match self.wakeup_deadline(Instant::now(), animation_frame) {
@@ -3953,6 +3993,66 @@ mod tests {
         assert_eq!(app.tab.loaded_page, original);
         assert_eq!(app.tab.browser_state.current_url(), Some("byui://welcome"));
         assert_eq!(app.tab.browser_state.visited_urls(), &["byui://welcome"]);
+    }
+
+    #[test]
+    fn hover_restyle_keeps_the_layout_so_scrolling_still_works() {
+        let mut app = app();
+        let page = browser::Page {
+            url: String::from("byui://long"),
+            html: "<body><div></div></body>".into(),
+            stylesheets: vec!["body { margin: 0 } div { height: 1000px }".into()],
+            scripts: Vec::new(),
+            resources: Default::default(),
+        };
+        app.page_loaded("byui://long", page.clone());
+        app.tab.page_layout = Some(crate::content::PageLayout::new(&page, 160, 200));
+        app.key_pressed(&Key::Named(NamedKey::ArrowDown));
+        assert_eq!(app.tab.scroll_y, ARROW_SCROLL);
+
+        // A pointer moving onto another element restyles for `:hover`. Until
+        // the next paint redoes layout, scrolling must keep its position and
+        // still respond instead of seeing an empty document.
+        app.tab.selector_state.hovered = Some(html::NodeID::new(1));
+        app.invalidate_page_style();
+        assert!(app.tab.page_layout_stale);
+        assert!(app.tab.page_layout.is_some());
+        app.key_pressed(&Key::Named(NamedKey::ArrowDown));
+        assert_eq!(app.tab.scroll_y, 2.0 * ARROW_SCROLL);
+    }
+
+    #[test]
+    fn scrolling_defers_hover_restyles_until_it_settles() {
+        let mut app = app();
+        let page = browser::Page {
+            url: String::from("byui://long"),
+            html: "<body><div></div></body>".into(),
+            stylesheets: vec!["body { margin: 0 } div { height: 1000px }".into()],
+            scripts: Vec::new(),
+            resources: Default::default(),
+        };
+        app.page_loaded("byui://long", page.clone());
+        app.tab.page_layout = Some(crate::content::PageLayout::new(&page, 160, 200));
+        let hovered = Some(html::NodeID::new(1));
+        app.tab.selector_state.hovered = hovered;
+
+        let before = Instant::now();
+        app.key_pressed(&Key::Named(NamedKey::ArrowDown));
+        let due = app.hover_update_after.expect("scrolling defers hover");
+        assert!(due >= before + SCROLL_HOVER_DELAY);
+        assert_eq!(app.wakeup_deadline(before, None), Some(due));
+
+        // Mid-scroll, hover is left alone so frames stay cheap.
+        app.settle_scroll_hover(due - Duration::from_millis(1));
+        assert_eq!(app.tab.selector_state.hovered, hovered);
+        assert!(!app.tab.page_layout_stale);
+
+        // Once settled, hover follows the pointer again; here it is off the
+        // page, so the old hover ends and the page is restyled.
+        app.settle_scroll_hover(due);
+        assert_eq!(app.hover_update_after, None);
+        assert_eq!(app.tab.selector_state.hovered, None);
+        assert!(app.tab.page_layout_stale);
     }
 
     #[test]
