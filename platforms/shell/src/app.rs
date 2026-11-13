@@ -96,6 +96,11 @@ pub struct Platform {
     /// the titlebar the toolbar's height so the traffic lights sit centered
     /// beside the toolbar controls. Runs once, before the first redraw.
     pub window_created: fn(&Window),
+    /// Synchronizes native window chrome after size/full-screen changes and before
+    /// drawing or sleeping. Must be idempotent; return true only when native
+    /// layout changed, so the shell discards its cached frame and repaints.
+    /// Platforms without special chrome handling should return false.
+    pub window_changed: fn(&Window) -> bool,
     /// Returns font files to try, in order, for toolbar text. The first one
     /// that loads is used; if none loads the toolbar omits its text.
     pub ui_font_files: fn() -> Vec<PathBuf>,
@@ -338,6 +343,8 @@ impl App {
             .page_events
             .set_device_pixel_ratio(scale * self.tab.page_zoom);
         self.tab.page_events.set_scroll_y(self.tab.scroll_y);
+        self.tab.next_animation_frame = None;
+        self.pump_animations();
         self.reveal_active_tab();
         self.redraw();
     }
@@ -838,6 +845,7 @@ impl App {
         self.tab.title = crate::tabs::page_title(&page, url);
         self.tab.loaded_page = Some(page);
         self.tab.animation_clock = None;
+        self.tab.next_animation_frame = None;
         self.refresh_devtools_document();
         if let Ok(mut console) = self.tab.console.lock() {
             console.clear();
@@ -1088,6 +1096,7 @@ impl App {
                 self.tab.title = crate::tabs::page_title(&page, &navigation.address);
                 self.tab.loaded_page = Some(page);
                 self.tab.animation_clock = None;
+                self.tab.next_animation_frame = None;
                 self.refresh_devtools_document();
                 self.clear_performance();
                 self.tab
@@ -1735,15 +1744,25 @@ impl App {
             .map_or(0.0, |layout| layout.css_size().1 as f32)
     }
 
-    /// Advances running CSS animations when a frame is due: restyles and lays
-    /// out the page for the time since its animation clock started, and asks
-    /// the window to repaint it.
-    ///
-    /// Returns when the next frame is due, or `None` when no animation is
-    /// running (or the page has not been laid out yet), so the event loop
-    /// can sleep until the next input.
+    /// Combines all pending Reload tasks with the selected tab's next frame.
+    fn wakeup_deadline(&self, now: Instant, animation: Option<Instant>) -> Option<Instant> {
+        let reload = (self.tab.reload_completion.is_some()
+            || self
+                .inactive
+                .values()
+                .any(|tab| tab.reload_completion.is_some()))
+        .then_some(now + Duration::from_millis(40));
+        [reload, animation].into_iter().flatten().min()
+    }
+
+    /// Samples only the visible tab; hidden tabs retain elapsed wall-clock time.
     fn pump_animations(&mut self) -> Option<Instant> {
-        let (Some(layout), Some(clock)) = (&mut self.tab.page_layout, self.tab.animation_clock) else {
+        self.pump_animations_at(Instant::now())
+    }
+
+    fn pump_animations_at(&mut self, now: Instant) -> Option<Instant> {
+        let (Some(layout), Some(clock)) = (&mut self.tab.page_layout, self.tab.animation_clock)
+        else {
             self.tab.next_animation_frame = None;
             return None;
         };
@@ -1751,12 +1770,11 @@ impl App {
             self.tab.next_animation_frame = None;
             return None;
         }
-        let now = Instant::now();
         let due = *self.tab.next_animation_frame.get_or_insert(now);
         if now < due {
             return Some(due);
         }
-        layout.animate(clock.elapsed());
+        layout.animate(now.saturating_duration_since(clock));
         record_events(&self.tab.performance, layout.take_timeline());
         if let Some(find) = &mut self.tab.find {
             // Highlights follow text that the animation moved.
@@ -2113,14 +2131,20 @@ impl App {
                 self.begin_address_edit()
             }
             Control::Menu => self.open_overflow_menu(),
-            // Tabs are not implemented yet; this control only gives visual feedback.
-            Control::NewTab => {
-                log::debug!("toolbar action: {control:?} (not implemented)");
-            }
+        }
+    }
+
+    fn sync_platform_window(&mut self) {
+        if let Some(window) = &self.window
+            && (self.platform.window_changed)(window)
+        {
+            self.frame_key = None;
+            window.request_redraw();
         }
     }
 
     fn paint(&mut self) {
+        self.sync_platform_window();
         if self.window.is_none() || self.surface.is_none() {
             return;
         }
@@ -2657,6 +2681,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(_)
             | WindowEvent::ScaleFactorChanged { .. }
             | WindowEvent::ThemeChanged(_) => {
+                self.sync_platform_window();
                 if log::log_enabled!(log::Level::Debug) {
                     match &event {
                         WindowEvent::Resized(size) => {
@@ -2771,20 +2796,15 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.sync_platform_window();
         self.tabs.update_url(self.tab.id, &self.tab.address);
         self.poll_reloads();
         if let Some(window) = &self.window {
             self.alerts.present(window, self.tab.id);
         }
-        let reload_poll = (self.tab.reload_completion.is_some()
-            || self
-                .inactive
-                .values()
-                .any(|state| state.reload_completion.is_some()))
-        .then(|| Instant::now() + Duration::from_millis(40));
         let animation_frame = self.pump_animations();
         event_loop.set_control_flow(
-            match [reload_poll, animation_frame].into_iter().flatten().min() {
+            match self.wakeup_deadline(Instant::now(), animation_frame) {
                 Some(deadline) => ControlFlow::WaitUntil(deadline),
                 None => ControlFlow::Wait,
             },
@@ -3113,6 +3133,7 @@ mod tests {
             Platform {
                 configure_window: |attributes| attributes,
                 window_created: |_| {},
+                window_changed: |_| false,
                 ui_font_files: Vec::new,
                 page_font_files: Vec::new,
                 window_controls_inset: 0.0,
@@ -4190,6 +4211,7 @@ mod tab_tests {
             Platform {
                 configure_window: |attributes| attributes,
                 window_created: |_| {},
+                window_changed: |_| false,
                 ui_font_files: Vec::new,
                 page_font_files: Vec::new,
                 window_controls_inset: 0.0,
@@ -4874,5 +4896,255 @@ mod tab_tests {
         assert_eq!(owner.network_log.entries().len(), 1);
         assert_eq!(owner.network_log.entries()[0].url, url);
         assert_eq!(owner.network_log.entries()[0].duration_ms, 12);
+    }
+    fn animated_fixture(url: &str) -> browser::Page {
+        browser::Page {
+            url: url.into(),
+            html: "<body><div id='spacer'></div><p>moving match</p></body>".into(),
+            stylesheets: vec!["body, p { margin: 0 } @keyframes grow { from { height: 0px } to { height: 200px } } #spacer { animation: grow 2s linear forwards }".into()],
+            scripts: vec![], resources: Default::default(),
+        }
+    }
+
+    fn prepare_animation(app: &mut App, page: &browser::Page, clock: Instant) {
+        app.page_loaded(&page.url, page.clone());
+        app.open_find();
+        app.tab.page_layout = Some(crate::content::PageLayout::new_at(
+            page,
+            320,
+            50,
+            Duration::ZERO,
+        ));
+        app.tab.animation_clock = Some(clock);
+        app.tab.find.as_mut().unwrap().insert("moving");
+        app.tab.scripts_evaluated = true;
+    }
+
+    #[test]
+    fn tab_animation_clocks_and_find_geometry_stay_independent() {
+        let mut app = app();
+        let origin = Instant::now() - Duration::from_secs(1);
+        prepare_animation(&mut app, &animated_fixture("https://first.test/"), origin);
+        let first = app.tab.id;
+        let document = app.tab.document_id;
+        app.pump_animations_at(origin + Duration::from_millis(500));
+        let first_y = app.tab.find.as_ref().unwrap().target().unwrap().y;
+        assert!(first_y >= 50.0);
+        assert_eq!(app.tab.find.as_ref().unwrap().count(), "1/1");
+        app.new_tab();
+        let second = app.tab.id;
+        let second_clock = origin + Duration::from_millis(100);
+        prepare_animation(
+            &mut app,
+            &animated_fixture("https://second.test/"),
+            second_clock,
+        );
+        app.pump_animations_at(origin + Duration::from_millis(500));
+        assert!(app.tab.find.as_ref().unwrap().target().unwrap().y < first_y);
+        app.pump_animations_at(origin + Duration::from_millis(700));
+        // Hidden tabs retain their layout until selected; they do not run extra frame work.
+        assert_eq!(
+            app.tab_state(first)
+                .unwrap()
+                .find
+                .as_ref()
+                .unwrap()
+                .target()
+                .unwrap()
+                .y,
+            first_y
+        );
+        assert_eq!(app.tab_state(first).unwrap().animation_clock, Some(origin));
+        app.switch_tab(first);
+        assert_eq!(app.tab.animation_clock, Some(origin));
+        assert_eq!(app.tab.document_id, document);
+        assert!(app.tab.scripts_evaluated);
+        assert_eq!(app.tab.find.as_ref().unwrap().count(), "1/1");
+        assert!(app.tab.find.as_ref().unwrap().target().unwrap().y > first_y);
+        assert_eq!(
+            app.tab_state(second).unwrap().animation_clock,
+            Some(second_clock)
+        );
+    }
+
+    #[test]
+    fn animation_deadlines_and_background_reload_polling_share_the_earliest_wakeup() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut app = app();
+        let now = Instant::now();
+        prepare_animation(&mut app, &animated_fixture("https://animated.test/"), now);
+        let animation = app.pump_animations_at(now).unwrap();
+        assert_eq!(animation, now + ANIMATION_FRAME_INTERVAL);
+        let completed = Arc::new(AtomicBool::new(false));
+        let task = Arc::clone(&completed);
+        let id = app.begin_loading();
+        app.tab.reload_completion = Some((id, Box::new(move || task.load(Ordering::SeqCst))));
+        assert_eq!(app.wakeup_deadline(now, Some(animation)), Some(animation));
+        // A future animation deadline must not delay the next Reload poll.
+        assert_eq!(
+            app.wakeup_deadline(now, Some(now + Duration::from_millis(60))),
+            Some(now + Duration::from_millis(40))
+        );
+        let animated = app.tab.id;
+        app.new_tab();
+        assert_eq!(app.pump_animations_at(now), None);
+        assert_eq!(
+            app.wakeup_deadline(now, None),
+            Some(now + Duration::from_millis(40))
+        );
+        completed.store(true, Ordering::SeqCst);
+        app.poll_reloads();
+        assert!(!app.tab_state(animated).unwrap().chrome.loading);
+        assert!(app.tab_state(animated).unwrap().reload_completion.is_none());
+        assert_eq!(app.wakeup_deadline(now, None), None);
+        app.switch_tab(animated);
+        assert_eq!(app.tab.animation_clock, Some(now));
+    }
+
+    #[test]
+    fn background_navigation_resets_only_its_owners_animation_timeline() {
+        let mut app = app();
+        let now = Instant::now();
+        prepare_animation(&mut app, &animated_fixture("https://first.test/"), now);
+        let owner = app.tab.id;
+        app.tab.navigation_id = 4;
+        app.tab.next_animation_frame = Some(now + ANIMATION_FRAME_INTERVAL);
+        app.new_tab();
+        let active = app.tab.id;
+        prepare_animation(&mut app, &animated_fixture("https://active.test/"), now);
+        app.pump_animations_at(now);
+        let frame = app.tab.next_animation_frame;
+        let loaded = fixture_page("https://background.test/", "loaded");
+        app.handle_user_event(UserEvent::Navigated {
+            tab: owner,
+            id: 4,
+            navigation: navigation(&loaded.url, Ok(loaded.clone())),
+            behavior: NavigationBehavior::Auto,
+        });
+        assert_eq!(app.tab.id, active);
+        assert_eq!(app.tab.animation_clock, Some(now));
+        assert_eq!(app.tab.next_animation_frame, frame);
+        let background = app.tab_state(owner).unwrap();
+        assert_eq!(background.loaded_page, Some(loaded));
+        assert!(background.animation_clock.is_none());
+        assert!(background.next_animation_frame.is_none());
+        assert!(background.page_layout.is_none());
+    }
+
+    #[test]
+    fn finished_animations_stop_frame_wakeups_and_resize_keeps_elapsed_time() {
+        let mut app = app();
+        let now = Instant::now();
+        let page = animated_fixture("https://animated.test/");
+        prepare_animation(&mut app, &page, now);
+        app.pump_animations_at(now + Duration::from_millis(500));
+        let y = app.tab.find.as_ref().unwrap().target().unwrap().y;
+        // A resize/zoom rebuild uses the original document clock, not a new timeline.
+        app.tab.page_layout = Some(crate::content::PageLayout::new_at(
+            &page,
+            180,
+            40,
+            Duration::from_millis(700),
+        ));
+        app.tab.next_animation_frame = None;
+        app.pump_animations_at(now + Duration::from_millis(700));
+        assert_eq!(app.tab.animation_clock, Some(now));
+        assert!(app.tab.find.as_ref().unwrap().target().unwrap().y > y);
+        assert_eq!(app.pump_animations_at(now + Duration::from_secs(3)), None);
+        assert!(!app.tab.page_layout.as_ref().unwrap().is_animating());
+        assert!(app.tab.next_animation_frame.is_none());
+        assert_eq!(app.wakeup_deadline(now, None), None);
+        assert_eq!(app.tab.find.as_ref().unwrap().count(), "1/1");
+    }
+
+    #[test]
+    fn switching_tabs_preserves_their_own_rendered_svg_resources() {
+        let mut app = app();
+        let svg = |color| browser::Page {
+            url: format!("https://{color}.test/"),
+            html: format!(
+                "<body><svg width='20' height='20' xmlns='http://www.w3.org/2000/svg'><rect width='20' height='20' fill='{color}'/></svg></body>"
+            ),
+            stylesheets: vec!["body { margin: 0 }".into()],
+            scripts: vec![],
+            resources: Default::default(),
+        };
+        let page = svg("red");
+        app.page_loaded(&page.url, page.clone());
+        app.tab.page_layout = Some(crate::content::PageLayout::new(&page, 80, 50));
+        let first = app.tab.id;
+        app.new_tab();
+        let page = svg("blue");
+        app.page_loaded(&page.url, page.clone());
+        app.tab.page_layout = Some(crate::content::PageLayout::new(&page, 80, 50));
+        let pixel = |app: &App| {
+            let layout = app.tab.page_layout.as_ref().unwrap();
+            let frame = crate::content::render_page(layout, 80, 50, 1.0, 0.0).unwrap();
+            frame.pixel(5, 5).unwrap()
+        };
+        assert_eq!(
+            pixel(&app),
+            tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 255, 255).unwrap()
+        );
+        app.switch_tab(first);
+        assert_eq!(
+            pixel(&app),
+            tiny_skia::PremultipliedColorU8::from_rgba(255, 0, 0, 255).unwrap()
+        );
+    }
+    #[test]
+    fn shrinking_animation_clamps_scroll_without_changing_history_or_zoom() {
+        let mut app = app();
+        let now = Instant::now();
+        let mut page = animated_fixture("https://shrinking.test/");
+        page.stylesheets[0] =
+            page.stylesheets[0].replace("2s linear forwards", "2s linear reverse forwards");
+        prepare_animation(&mut app, &page, now);
+        let history = app.tab.browser_state.clone();
+        app.tab.scroll_y = 120.0;
+        app.tab.page_zoom = 1.5;
+        assert!(app.tab.page_layout.as_ref().unwrap().max_scroll() >= 120.0);
+        assert_eq!(app.pump_animations_at(now + Duration::from_secs(3)), None);
+        assert_eq!(app.tab.scroll_y, 0.0);
+        assert_eq!(app.tab.page_zoom, 1.5);
+        assert_eq!(app.tab.browser_state, history);
+        assert_eq!(app.tab.find.as_ref().unwrap().count(), "1/1");
+    }
+    #[test]
+    fn clear_cache_menu_preserves_tabs_pages_history_find_and_loading_state() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let first = app.tab.id;
+        let first_page = app.tab.loaded_page.clone();
+        let first_history = app.tab.browser_state.clone();
+        app.new_tab();
+        let second = app.tab.id;
+        app.open_find();
+        app.tab.find.as_mut().unwrap().insert("Welcome");
+        app.tab.scroll_y = 64.0;
+        app.tab.page_zoom = 1.25;
+        app.tab.chrome.loading = true;
+        let history = app.tab.browser_state.clone();
+        let page = app.tab.loaded_page.clone();
+        app.context_menu = Some(ContextMenu::overflow(800.0, 600.0));
+        app.cursor = Some(app.context_menu.unwrap().item_center(0));
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        assert!(app.context_menu.is_none());
+        assert_eq!(app.tabs.tab_count(), 2);
+        assert_eq!(app.tab.id, second);
+        assert_eq!(app.tab.loaded_page, page);
+        assert_eq!(app.tab.browser_state, history);
+        assert_eq!(app.tab.find.as_ref().unwrap().query, "Welcome");
+        assert_eq!(app.tab.scroll_y, 64.0);
+        assert_eq!(app.tab.page_zoom, 1.25);
+        assert!(app.tab.chrome.loading);
+        assert_eq!(app.tab_state(first).unwrap().loaded_page, first_page);
+        assert_eq!(app.tab_state(first).unwrap().browser_state, first_history);
+        // An unavailable loader must also leave all tab state untouched.
+        app.loader = None;
+        app.clear_cache();
+        assert_eq!(app.tab.browser_state, history);
+        assert_eq!(app.tab.id, second);
     }
 }

@@ -1059,7 +1059,7 @@ mod tests {
                 "function click() { alert('old') } document.addEventListener('click', click)"
                     .into(),
             ],
-           resources: Default::default(),
+            resources: Default::default(),
         };
         events.load(&old, alerts.clone(), test_runtime(), 1.0);
         events.click(None);
@@ -1074,7 +1074,7 @@ mod tests {
             html: "<script></script>".into(),
             stylesheets: vec![],
             scripts: vec!["alert('new')".into()],
-           resources: Default::default(),
+            resources: Default::default(),
         };
         events.load(&new, alerts, test_runtime(), 1.0);
         assert_eq!(
@@ -2015,5 +2015,82 @@ mod tests {
                 .copied()
                 .any(|p| p == [255, 0, 0, 255])
         );
+    }
+    #[test]
+    fn find_highlights_use_each_fragments_web_font_after_animation_and_reflow() {
+        let Some(bytes) = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ]
+        .into_iter()
+        .find_map(|path| std::fs::read(path).ok()) else {
+            return;
+        };
+        let page = Page {
+            url: "https://font.test/".into(),
+            html: "<body><div id='spacer'></div><p><span class='web'>Wi</span><span>Wi</span></p></body>".into(),
+            stylesheets: vec!["body, p { margin: 0 } .web { font-family: Web } @keyframes grow { from { height: 0px } to { height: 40px } } #spacer { animation: grow 1s linear forwards }".into()],
+            scripts: vec![],
+            resources: browser::PageResources {
+                fonts: vec![browser::FontResource { family: "Web".into(), weight: (400,400), italic: false,
+                    url: "https://font.test/web.ttf".into(), bytes: bytes.into() }].into(),
+                ..Default::default()
+            },
+        };
+        let mut find = crate::find_in_page::FindInPage::default();
+        find.insert("iW");
+        for (width, elapsed) in [(320, Duration::ZERO), (180, Duration::from_millis(500))] {
+            let mut layout = PageLayout::new_at(&page, width, 100, elapsed);
+            layout.animate(elapsed);
+            find.replace_runs(layout.find_text());
+            assert_eq!(find.count(), "1/1");
+            let fragments = layout.find_fragments();
+            assert_eq!(fragments[0].0.font, layout::FontId(1));
+            assert_eq!(fragments[1].0.font, layout::FontId::DEFAULT);
+            let ranges = find.highlight_ranges(false);
+            assert_eq!(ranges.len(), 2);
+            let backgrounds = layout.text_backgrounds(Some(&find), false);
+            for (range, _) in ranges {
+                let fragment = fragments[range.run].0;
+                let rect = backgrounds[&(fragment as *const layout::TextFragment)][0].rect;
+                assert_eq!(
+                    rect.x,
+                    fragment.rect.x
+                        + layout.fonts.font_text_width(
+                            fragment.font,
+                            &fragment.text[..range.bytes.start],
+                            fragment.font_size
+                        )
+                );
+                assert_eq!(
+                    rect.width,
+                    layout.fonts.font_text_width(
+                        fragment.font,
+                        &fragment.text[range.bytes],
+                        fragment.font_size
+                    )
+                );
+                assert_eq!(rect.y, fragment.rect.y);
+                if elapsed > Duration::ZERO {
+                    assert!(rect.y >= 20.0);
+                }
+            }
+            for scale in [1.0, 1.5, 2.0] {
+                assert!(
+                    render_page_with_find(
+                        &layout,
+                        (width as f64 * scale) as u32,
+                        (100.0 * scale) as u32,
+                        scale,
+                        0.0,
+                        Some(&find),
+                        false
+                    )
+                    .is_some()
+                );
+            }
+        }
     }
 }

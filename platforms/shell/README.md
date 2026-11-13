@@ -34,7 +34,8 @@ restore the previous value. `Ctrl+R` triggers Reload. Submitted HTTP and HTTPS
 URLs remain in the address field while loading and are replaced by the loaded
 page or an error page when the request completes. The tab strip opens, switches
 and closes independent tabs; toolbar Back/Forward uses the active tab history.
-The three-dot menu remains staged.
+The three-dot menu offers **Clear cache** for future page-load HTTP responses
+and CORS-preflight permissions, without changing tab contents or history.
 
 Run `cargo test -p browser refresh::tests` to verify fresh HTTP requests,
 internal pages, saved URLs, error reporting, and unchanged history.
@@ -64,8 +65,8 @@ Line numbers, a wrapped-row count, and a scroll-position indicator help with
 long documents (the indicator is not draggable). Wrapped text is cached until
 width changes, and resizing preserves the reading position where possible.
 Click the visible **Close** button, press Escape, or click the toolbar to close
-the panel and restore the cached page. Keyboard menu-item navigation and the
-three-dot menu remain future work. macOS and Windows use the same implementation.
+the panel and restore the cached page. Keyboard menu-item navigation remains
+future work; the three-dot menu provides Clear cache. macOS and Windows use the same implementation.
 
 For a manual demo, run `cargo run -p browser-macos`, right-click the welcome page,
 click Reload, and look for `Refresh byui://welcome`, `Status: 200`, and the HTML.
@@ -297,6 +298,16 @@ alerts from old documents or closed tabs are rejected. Existing viewport-height
 and live scroll bindings (PRs #340/#341) receive the active tab's actual viewport,
 scale and scroll position.
 
+CSS animation clocks and next-frame deadlines belong to each tab. Timelines start
+at the document's first layout and survive resize, zoom, Find, and tab switching.
+Hidden tabs keep elapsed wall-clock time but do no per-frame layout work and do not
+wake the UI for CSS animation frames; selecting one samples its current animation
+before drawing. New documents reset only their owner's clock. The event loop waits
+for the earliest visible animation frame or pending Reload poll from any tab.
+Animation relayout updates Find runs/highlights and clamps scroll when content
+shrinks. Page layouts retain their own decoded images/SVG and font collections;
+Find measurements use each text fragment's selected font from main's renderer.
+
 Manual macOS check (`cargo run -p browser-macos`):
 
 1. Open `https://example.com`, then use + and Command-T. Each new tab starts at
@@ -311,6 +322,9 @@ Manual macOS check (`cargo run -p browser-macos`):
    the browser remains open. Close inactive and active tabs, then the final tab.
 5. Open many tabs, use ‹ / ›, resize and switch. Verify the active underline and
    close/+ controls stay usable. Repeat in light/dark appearance.
+6. Load pages with CSS animations, images/SVG and web fonts in different tabs.
+   Search animated text, resize and zoom, switch away and back, and verify the
+   highlights follow the text and each page retains its own resources/timeline.
 
 Windows/Linux use the same implementation; native manual UI/alert checks remain
 pending. This is an in-process desktop tab implementation, not process isolation.

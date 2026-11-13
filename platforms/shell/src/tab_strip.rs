@@ -494,4 +494,96 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn normal_fullscreen_sized_and_restored_frames_keep_controls_above_the_page() {
+        let ids = [TabId(0), TabId(1), TabId(2)];
+        let entries = vec![
+            (ids[0], "Welcome".into()),
+            (ids[1], "Example".into()),
+            (ids[2], "Other".into()),
+        ];
+        for dark in [false, true] {
+            let mut normal = None;
+            for (width, height, scale) in [(1120, 720, 1.0), (1728, 1117, 2.0), (1120, 720, 1.0)] {
+                let state = toolbar::ChromeState {
+                    dark,
+                    window_controls_inset: 72.0,
+                    ..Default::default()
+                };
+                let w = (width as f64 * scale) as u32;
+                let h = (height as f64 * scale) as u32;
+                let strip = Strip::new(width as f32, &ids, 0, 72.0);
+                let mut frame = toolbar::compose(
+                    w,
+                    h,
+                    scale,
+                    &state,
+                    "https://example.com/full/path",
+                    None,
+                    None,
+                )
+                .unwrap();
+                strip.draw(&mut frame, scale, dark, ids[0], &entries, None);
+                let page = toolbar::page_rect(w, h, scale).unwrap();
+                assert_eq!(page.y, (toolbar::PAGE_TOP * scale) as u32);
+                assert_eq!(
+                    toolbar::hit_test(width as f64 / 2.0, HEIGHT + 26.0, width as f64, 72.0),
+                    Some(toolbar::Control::Address)
+                );
+                assert_eq!(
+                    strip
+                        .regions
+                        .iter()
+                        .filter(|(a, _)| *a == Action::New)
+                        .count(),
+                    1
+                );
+                for (action, rect) in &strip.regions {
+                    assert!(rect.bottom() as f64 * scale < page.y as f64);
+                    if matches!(action, Action::New | Action::Close(_)) {
+                        assert_eq!(
+                            strip.action_at(Some((
+                                (rect.x() + rect.width() / 2.0) as f64,
+                                (rect.y() + rect.height() / 2.0) as f64
+                            ))),
+                            Some(*action)
+                        );
+                    }
+                }
+                let selected = strip
+                    .regions
+                    .iter()
+                    .find(|(a, _)| *a == Action::Select(ids[0]))
+                    .unwrap()
+                    .1;
+                let blue = frame
+                    .pixel(
+                        ((selected.x() + 10.0) as f64 * scale) as u32,
+                        ((selected.bottom() - 1.0) as f64 * scale) as u32,
+                    )
+                    .unwrap();
+                assert_eq!(blue.blue(), if dark { 255 } else { 182 });
+                assert_eq!(blue.red(), if dark { 77 } else { 0 });
+                // Hover-only repainting must preserve the same chrome pixels at every size.
+                let mut partial = toolbar::compose_controls(
+                    w,
+                    h,
+                    scale,
+                    &state,
+                    "https://example.com/full/path",
+                    None,
+                )
+                .unwrap();
+                strip.draw(&mut partial, scale, dark, ids[0], &entries, None);
+                assert_eq!(partial.data(), &frame.data()[..partial.data().len()]);
+                if scale == 1.0 {
+                    if let Some(original) = &normal {
+                        assert_eq!(frame.data(), original);
+                    } else {
+                        normal = Some(frame.data().to_vec());
+                    }
+                }
+            }
+        }
+    }
 }

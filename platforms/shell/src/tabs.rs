@@ -3,6 +3,7 @@
 use chrome::{BrowserState, TabId};
 use net::Url;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tiny_skia::Pixmap;
 
 use crate::{
@@ -26,10 +27,10 @@ pub(crate) struct TabState {
     pub loaded_page: Option<browser::Page>,
     pub page: Option<((u32, u32), Pixmap)>,
     pub page_layout: Option<PageLayout>,
-    /// When the loaded page's animation timeline started (its first layout).
-    pub animation_clock: Option<std::time::Instant>,
-    /// When the next CSS animation frame is due, while animations run.
-    pub next_animation_frame: Option<std::time::Instant>,
+    /// Wall-clock origin of this document's CSS animation timeline, after its first layout.
+    pub animation_clock: Option<Instant>,
+    /// Next visible animation sample. Hidden tabs keep their clock without frame wakeups.
+    pub next_animation_frame: Option<Instant>,
     pub scroll_y: f32,
     pub page_zoom: f64,
     pub page_events: PageEvents,
