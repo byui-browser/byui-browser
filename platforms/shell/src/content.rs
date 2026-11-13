@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use browser::{BrowserRuntime, Page};
 use devtools::performance::{EventCategory, PerformanceLog, TimelineEvent};
-use html::NodeID;
+use html::{NodeID, NodeKind};
 use layout::{FontMetrics, ImageKey, LayoutTree, Size, layout_document_with_images};
 use render::{Compositor, FontCollection, Frame, ImageStore, OutlineFont};
 use tiny_skia::Pixmap;
@@ -325,6 +325,8 @@ pub(crate) struct PageLayout {
     /// The viewport width and height in CSS pixels.
     css_size: (u32, u32),
     tree: LayoutTree,
+    /// Elements that can take focus from a click, in document order.
+    focusable: Vec<NodeID>,
     /// Decoded `<img>` files and inline `<svg>` documents the tree's
     /// replaced boxes paint.
     images: ImageStore,
@@ -334,6 +336,9 @@ pub(crate) struct PageLayout {
     /// redo style and layout.
     document: html::HTMLDocument,
     stylesheets: Vec<css::Stylesheet>,
+    /// The pointer and focus state the tree was styled with; animation frames
+    /// reuse it.
+    state: css::SelectorState,
     /// CSS animations that were delayed or playing when this layout was
     /// last styled; see [`css::ComputedStyles::running_animations`].
     running_animations: usize,
@@ -358,12 +363,52 @@ impl PageLayout {
 
     /// Lays out `page` like [`Self::new`], with CSS animations sampled
     /// `elapsed` after the page was first shown.
+    #[cfg(test)]
     pub(crate) fn new_at(page: &Page, width: u32, height: u32, elapsed: Duration) -> Self {
+        Self::new_with_state_at(page, width, height, css::SelectorState::default(), elapsed)
+    }
+
+    /// Lays out `page` like [`Self::new`], styled with the pointer and focus
+    /// `state` and with CSS animations sampled `elapsed` after the page was
+    /// first shown.
+    pub(crate) fn new_with_state_at(
+        page: &Page,
+        width: u32,
+        height: u32,
+        state: css::SelectorState,
+        elapsed: Duration,
+    ) -> Self {
         let mut timeline = Vec::new();
         let (document, event) = TimelineEvent::measure(EventCategory::Parse, "Parse HTML", || {
             html::parse_raw_html(page.html.to_owned())
         });
         timeline.push(event);
+        let focusable = document
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                let NodeKind::Element(element) = node.get_kind() else {
+                    return None;
+                };
+                let name = element.get_name();
+                let has_tabindex = element.get_attributes().iter().any(|attribute| {
+                    attribute.get_name().eq_ignore_ascii_case("tabindex")
+                        && attribute
+                            .get_value()
+                            .parse::<i32>()
+                            .is_ok_and(|value| value >= 0)
+                });
+                let naturally_focusable =
+                    matches!(name.as_str(), "button" | "input" | "select" | "textarea")
+                        || matches!(name.as_str(), "a" | "area")
+                            && element
+                                .get_attributes()
+                                .iter()
+                                .any(|attribute| attribute.get_name().eq_ignore_ascii_case("href"));
+                (has_tabindex || naturally_focusable).then(|| NodeID::new(index))
+            })
+            .collect();
         let stylesheets: Vec<_> = page
             .stylesheets
             .iter()
@@ -392,6 +437,7 @@ impl PageLayout {
             &stylesheets,
             (&fonts, &images),
             (width, height),
+            state,
             elapsed,
             "Recalculate style",
         );
@@ -399,10 +445,12 @@ impl PageLayout {
         Self {
             css_size: (width, height),
             tree,
+            focusable,
             images,
             fonts,
             document,
             stylesheets,
+            state,
             running_animations,
             timeline,
         }
@@ -422,6 +470,7 @@ impl PageLayout {
             &self.stylesheets,
             (&self.fonts, &self.images),
             self.css_size,
+            self.state,
             elapsed,
             "Animation frame: recalculate style",
         );
@@ -539,10 +588,14 @@ impl PageLayout {
     pub(crate) fn hit_test(&self, x: f32, y: f32, scroll_y: f32) -> Option<NodeID> {
         self.tree.hit_test(x, y + scroll_y)
     }
+
+    pub(crate) fn is_focusable(&self, node: NodeID) -> bool {
+        self.focusable.contains(&node)
+    }
 }
 
-/// Styles `document` with CSS animations sampled at `elapsed` and lays it
-/// out for a `width` × `height` CSS-pixel viewport, measuring text with
+/// Styles `document` with the pointer and focus `state` and CSS animations
+/// sampled at `elapsed`, and lays it out for a `width` × `height` CSS-pixel viewport, measuring text with
 /// `fonts` and sizing replaced elements with `images`.
 ///
 /// Returns the layout, the number of running animations, and Performance
@@ -552,11 +605,12 @@ fn style_and_layout(
     stylesheets: &[css::Stylesheet],
     (fonts, images): (&FontCollection, &ImageStore),
     (width, height): (u32, u32),
+    state: css::SelectorState,
     elapsed: Duration,
     style_label: &str,
 ) -> (LayoutTree, usize, [TimelineEvent; 2]) {
     let (styles, style_event) = TimelineEvent::measure(EventCategory::Style, style_label, || {
-        css::style_document_at(document, stylesheets, elapsed)
+        css::style_document_with_state_at(document, stylesheets, state, elapsed)
     });
     let (tree, layout_event) = TimelineEvent::measure(
         EventCategory::Layout,

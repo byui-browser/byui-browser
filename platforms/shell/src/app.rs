@@ -140,6 +140,8 @@ struct App {
     /// Layout of `loaded_page` for the current viewport, kept so scrolling
     /// repaints without laying the document out again.
     page_layout: Option<crate::content::PageLayout>,
+    /// CSS interaction state for the currently displayed page.
+    selector_state: css::SelectorState,
     /// When `loaded_page`'s animation timeline started: its first layout.
     /// `None` until then; cleared when another page is loaded. Rebuilding the
     /// layout (on resize, zoom, or find) keeps the timeline running.
@@ -322,6 +324,7 @@ impl App {
             loaded_page: None,
             page: None,
             page_layout: None,
+            selector_state: css::SelectorState::default(),
             animation_clock: None,
             next_animation_frame: None,
             scroll_y: 0.0,
@@ -714,6 +717,7 @@ impl App {
     ) {
         log::debug!("page displayed: {url}");
         self.loaded_page = Some(page);
+        self.selector_state = css::SelectorState::default();
         self.animation_clock = None;
         self.refresh_devtools_document();
         if let Ok(mut console) = self.console.lock() {
@@ -1812,6 +1816,10 @@ impl App {
             ElementState::Released => {
                 let page_press = self.page_press;
                 self.page_press = false;
+                let page_target = self.cursor.and_then(|(x, y)| self.page_node_at(x, y));
+                if self.selector_state.active.take().is_some() {
+                    self.invalidate_page_style();
+                }
                 if let Some(control) = self.chrome.pressed.take() {
                     self.redraw();
                     if control == Control::Address {
@@ -1825,8 +1833,7 @@ impl App {
                     && let Some((x, y)) = self.cursor
                     && self.pointer_is_on_page(x, y)
                 {
-                    let target = self.page_node_at(x, y);
-                    self.page_events.click(target);
+                    self.page_events.click(page_target);
                 }
             }
         }
@@ -1924,10 +1931,11 @@ impl App {
                 let layout_changed =
                     self.page_layout.as_ref().map(|layout| layout.css_size()) != Some(css_size);
                 if layout_changed {
-                    let mut layout = crate::content::PageLayout::new_at(
+                    let mut layout = crate::content::PageLayout::new_with_state_at(
                         self.loaded_page.as_ref().expect("page was loaded"),
                         css_size.0,
                         css_size.1,
+                        self.selector_state,
                         animation_clock.elapsed(),
                     );
                     record_events(&self.performance, layout.take_timeline());
@@ -2067,6 +2075,14 @@ impl App {
             .as_ref()
             .is_some_and(|panel| panel.contains(self.cursor) && !panel.contains(Some((x, y))));
         self.cursor = Some((x, y));
+        let hovered_page_node = self
+            .pointer_is_on_page(x, y)
+            .then(|| self.page_node_at(x, y))
+            .flatten();
+        if self.selector_state.hovered != hovered_page_node {
+            self.selector_state.hovered = hovered_page_node;
+            self.invalidate_page_style();
+        }
         log::trace!("cursor moved: ({x:.0}, {y:.0})");
         if self.address_press.is_some()
             && let Some(offset) = self.address_offset_under_pointer()
@@ -2141,7 +2157,24 @@ impl App {
             .is_some_and(|(x, y)| self.pointer_is_on_page(x, y))
         {
             self.page_press = true;
+            let target = self.cursor.and_then(|(x, y)| self.page_node_at(x, y));
+            self.selector_state.active = target;
+            self.selector_state.focused = target.filter(|node| {
+                self.page_layout
+                    .as_ref()
+                    .is_some_and(|layout| layout.is_focusable(*node))
+            });
+            self.selector_state.keyboard_focus = false;
+            self.invalidate_page_style();
         }
+    }
+
+    /// Discards the page frame and layout after an interaction selector changes.
+    fn invalidate_page_style(&mut self) {
+        self.page = None;
+        self.page_layout = None;
+        self.frame_key = None;
+        self.redraw();
     }
 
     /// Returns the page node under a logical-pixel window point, matching the
@@ -2374,6 +2407,12 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 log::trace!("key event: {:?}", event.state);
+                if event.state == ElementState::Pressed && !self.selector_state.keyboard_focus {
+                    self.selector_state.keyboard_focus = true;
+                    if self.selector_state.focused.is_some() {
+                        self.invalidate_page_style();
+                    }
+                }
                 if event.state == ElementState::Pressed && self.find_key(&event.logical_key) {
                     return;
                 }
@@ -2425,6 +2464,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.cursor = None;
                 self.page_press = false;
                 self.set_hovered(None);
+                if self.selector_state.hovered.take().is_some() {
+                    self.invalidate_page_style();
+                }
                 if self.context_menu.is_some() {
                     self.redraw();
                 }

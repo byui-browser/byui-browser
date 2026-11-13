@@ -5,7 +5,7 @@
 
 use crate::animation::{ElementContext, KeyframesRegistry, apply_animations};
 use crate::computed::{ComputedStyles, computed_style};
-use crate::matching::{ElementTree, attribute};
+use crate::matching::{ElementTree, SelectorState, attribute};
 use crate::parser::parse_declarations;
 use crate::rule_index::{CompiledDeclaration, CompiledSheet, RuleIndex, compile_declarations};
 use crate::stylesheet::{Declaration, Dom, Specificity, Stylesheet};
@@ -69,9 +69,10 @@ pub(crate) struct CascadeStats {
 ///
 /// Selector support is described in [`crate::selector`] (syntax) and the
 /// matcher: combinators, attribute selectors, and structural and logical
-/// pseudo-classes match; dynamic pseudo-classes such as `:hover` and all
-/// pseudo-elements never match. Rules inside at-rules such as `@media` are
-/// not applied yet.
+/// pseudo-classes match. `style_document` uses empty interaction state;
+/// [`style_document_with_state`] accepts pointer and focus state. History
+/// pseudo-classes and pseudo-elements remain unsupported. Rules inside
+/// at-rules such as `@media` are not applied yet.
 ///
 /// CSS animations (`@keyframes` with `animation-*`) are sampled at the start
 /// of the document timeline; use [`style_document_at`] to style a later
@@ -95,12 +96,40 @@ pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
 /// later moment could produce different styles. See [`crate::animation`]
 /// for the supported features.
 pub fn style_document_at(dom: &Dom, stylesheets: &[Stylesheet], time: Duration) -> ComputedStyles {
-    style_document_with_stats(dom, stylesheets, time).0
+    style_document_with_state_at(dom, stylesheets, SelectorState::default(), time)
+}
+
+/// Applies CSS using the supplied pointer and focus state.
+///
+/// State node IDs must refer to `dom`. The default [`style_document`] entry
+/// point matches no dynamic pseudo-classes. This initial implementation
+/// supports `:hover`, `:active`, `:focus`, `:focus-within`, and keyboard-driven
+/// `:focus-visible`. CSS animations are sampled at the start of the document
+/// timeline; use [`style_document_with_state_at`] to style a later moment.
+pub fn style_document_with_state(
+    dom: &Dom,
+    stylesheets: &[Stylesheet],
+    state: SelectorState,
+) -> ComputedStyles {
+    style_document_with_state_at(dom, stylesheets, state, Duration::ZERO)
+}
+
+/// Styles the document with both pointer and focus `state` (as in
+/// [`style_document_with_state`]) and CSS animations sampled `time` after the
+/// origin of the document timeline (as in [`style_document_at`]).
+pub fn style_document_with_state_at(
+    dom: &Dom,
+    stylesheets: &[Stylesheet],
+    state: SelectorState,
+    time: Duration,
+) -> ComputedStyles {
+    style_document_with_stats(dom, stylesheets, state, time).0
 }
 
 pub(crate) fn style_document_with_stats(
     dom: &Dom,
     stylesheets: &[Stylesheet],
+    state: SelectorState,
     time: Duration,
 ) -> (ComputedStyles, CascadeStats) {
     log::debug!(
@@ -139,7 +168,7 @@ pub(crate) fn style_document_with_stats(
     let keyframes = KeyframesRegistry::new(stylesheets);
     let time = time.as_secs_f64();
     let mut running_animations = 0;
-    let tree = ElementTree::new(dom);
+    let tree = ElementTree::new(dom, state);
     let mut stats = CascadeStats {
         indexed_selectors: index.rules.len(),
         ..CascadeStats::default()
@@ -714,8 +743,12 @@ mod tests {
         }
         html.push_str("</div>");
         let document = html::parse_raw_html(html);
-        let (styles, stats) =
-            style_document_with_stats(&document, &[parse_stylesheet(&css)], Duration::ZERO);
+        let (styles, stats) = style_document_with_stats(
+            &document,
+            &[parse_stylesheet(&css)],
+            SelectorState::default(),
+            Duration::ZERO,
+        );
         assert_eq!(
             computed(&styles, &document, "i42", "color").as_deref(),
             Some("blue")
