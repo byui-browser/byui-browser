@@ -7,8 +7,9 @@
 
 use crate::bytecode::{CallableKind, Chunk, FunctionTemplate, Instruction};
 use crate::runtime::{
-    BytecodeCapture, ExecutionLimits, binary, get_array_property, is_truthy, non_object,
-    set_array_property, to_property_key, unary,
+    BytecodeCapture, ExecutionLimits, array_len, binary, builtins, copy_data_properties,
+    delete_property, get_array_property, is_nullish, is_truthy, non_object, set_array_property,
+    spread_values, to_property_key, unary,
 };
 use crate::{Function, JsError, JsErrorCategory, JsResult, Object, Value};
 use std::sync::{Arc, Mutex};
@@ -342,7 +343,91 @@ impl Vm {
                 Instruction::Binary(operator) => {
                     let right = self.pop()?;
                     let left = self.pop()?;
-                    self.push(binary(operator, &left, &right));
+                    self.push(binary(operator, &left, &right)?);
+                }
+                Instruction::Dup2 => {
+                    let length = self.stack.len();
+                    if length < 2 {
+                        return Err(stack_underflow());
+                    }
+                    let (first, second) = (
+                        self.stack[length - 2].clone(),
+                        self.stack[length - 1].clone(),
+                    );
+                    self.push(first);
+                    self.push(second);
+                }
+                Instruction::MoveTop(passed) => {
+                    let value = self.pop()?;
+                    let at = self
+                        .stack
+                        .len()
+                        .checked_sub(usize::from(passed))
+                        .ok_or_else(stack_underflow)?;
+                    self.stack.insert(at, value);
+                }
+                Instruction::JumpIfNullish(target) => {
+                    validate_jump(target, &chunk, instruction_pointer - 1)?;
+                    if is_nullish(self.stack.last().ok_or_else(stack_underflow)?) {
+                        instruction_pointer = target;
+                    }
+                }
+                Instruction::DeleteProperty(index) => {
+                    let key = property_name(&chunk, index)?;
+                    let target = self.pop()?;
+                    self.push(Value::Boolean(delete_property(&target, &key)?));
+                }
+                Instruction::DeleteComputedProperty => {
+                    let key = to_property_key(&self.pop()?);
+                    let target = self.pop()?;
+                    self.push(Value::Boolean(delete_property(&target, &key)?));
+                }
+                Instruction::ArrayPush => {
+                    let value = self.pop()?;
+                    append_to_array(self.peek()?, value)?;
+                }
+                Instruction::ArrayExtend => {
+                    let source = self.pop()?;
+                    let values = spread_values(&source)?;
+                    let array = self.peek()?.clone();
+                    for value in values {
+                        append_to_array(&array, value)?;
+                    }
+                }
+                Instruction::SpreadProperties => {
+                    let source = self.pop()?;
+                    let Value::Object(target) = self.peek()? else {
+                        return Err(JsError::runtime(
+                            "bytecode object spread target is not an object",
+                        ));
+                    };
+                    copy_data_properties(target, &source)?;
+                }
+                Instruction::CallSpread => {
+                    let arguments = self.pop_spread_arguments()?;
+                    let callee = self.pop()?;
+                    switched =
+                        self.call(callee, Value::Undefined, arguments, instruction_pointer)?;
+                }
+                Instruction::CallMethodSpread => {
+                    let arguments = self.pop_spread_arguments()?;
+                    let callee = self.pop()?;
+                    let receiver = self.pop()?;
+                    switched = self.call(callee, receiver, arguments, instruction_pointer)?;
+                }
+                Instruction::NewSpread => {
+                    let arguments = self.pop_spread_arguments()?;
+                    let constructor = self.pop()?;
+                    let Value::Function(function) = constructor else {
+                        return Err(not_a_constructor(&constructor));
+                    };
+                    switched = self.construct(
+                        function.clone(),
+                        function,
+                        arguments,
+                        ReturnMode::Construct,
+                        instruction_pointer,
+                    )?;
                 }
                 Instruction::JumpIfFalse(target) => {
                     validate_jump(target, &chunk, instruction_pointer - 1)?;
@@ -482,6 +567,10 @@ impl Vm {
                     let Value::Function(function) = constructor else {
                         return Err(not_a_constructor(&constructor));
                     };
+                    if function.template().is_none() {
+                        self.push(function.construct(&arguments)?);
+                        continue;
+                    }
                     switched = self.construct(
                         function.clone(),
                         function,
@@ -625,6 +714,10 @@ impl Vm {
                 }
                 Instruction::LoadUnresolved { name } => {
                     let name = self.binding_name(name, &chunk)?;
+                    if let Some(value) = builtins::value(name) {
+                        self.push(value);
+                        continue;
+                    }
                     return Err(JsError::new(format!("`{name}` is not defined")));
                 }
                 Instruction::StoreUnresolved { name } => {
@@ -657,6 +750,17 @@ impl Vm {
             .checked_sub(count)
             .ok_or_else(stack_underflow)?;
         Ok(self.stack.split_off(start))
+    }
+
+    /// Pops the array that holds the arguments of a spread call, returning
+    /// them in call order.
+    fn pop_spread_arguments(&mut self) -> JsResult<Vec<Value>> {
+        match self.pop()? {
+            array @ Value::Array(_) => spread_values(&array),
+            _ => Err(JsError::runtime(
+                "bytecode spread arguments are not an array",
+            )),
+        }
     }
 
     /// Pops the value after `extends`, which must be a constructor.
@@ -1108,6 +1212,17 @@ fn load_property(target: &Value, key: &str) -> JsResult<Value> {
         }
         _ => Err(non_object(target, "read", key, "property access")),
     }
+}
+
+/// Appends `value` to the array literal being built, which must be an array.
+fn append_to_array(array: &Value, value: Value) -> JsResult<()> {
+    let Value::Array(array) = array else {
+        return Err(JsError::runtime(
+            "bytecode array append target is not an array",
+        ));
+    };
+    let length = array_len(array);
+    set_array_property(array, &length.to_string(), value)
 }
 
 fn store_property(target: &Value, key: String, value: &Value) -> JsResult<()> {

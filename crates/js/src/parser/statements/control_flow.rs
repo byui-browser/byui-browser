@@ -11,7 +11,7 @@ pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Statement> {
         parser.expect(&Token::While, "while statement")?;
     }
     parser.expect(&Token::LeftParen, "condition")?;
-    let condition = parser.parse_expression(0)?;
+    let condition = parser.parse_sequence()?;
     parser.expect(&Token::RightParen, "condition")?;
     if !is_if {
         parser.loops.push(parser.function_depth);
@@ -44,21 +44,21 @@ fn parse_for(parser: &mut Parser<'_>) -> ParseResult<Statement> {
     } else if matches!(parser.peek(), Some(Token::Var | Token::Let | Token::Const)) {
         Some(Box::new(super::declaration::parse_for(parser)?))
     } else {
-        let expression = parser.parse_expression(0)?;
+        let expression = parser.parse_sequence()?;
         parser.expect(&Token::Semicolon, "for initializer")?;
         Some(Box::new(Statement::Expression(expression)))
     };
     let condition = if parser.consume(&Token::Semicolon) {
         None
     } else {
-        let expression = parser.parse_expression(0)?;
+        let expression = parser.parse_sequence()?;
         parser.expect(&Token::Semicolon, "for condition")?;
         Some(expression)
     };
     let update = if parser.consume(&Token::RightParen) {
         None
     } else {
-        let expression = parser.parse_expression(0)?;
+        let expression = parser.parse_sequence()?;
         parser.expect(&Token::RightParen, "for update")?;
         Some(expression)
     };

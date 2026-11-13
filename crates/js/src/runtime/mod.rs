@@ -10,6 +10,11 @@
 //! `const` are block scoped and unusable before their declaration runs, and
 //! operators use JavaScript type conversions.
 //!
+//! The conditional, comma, update, compound-assignment, `??`, `typeof`,
+//! `void`, `delete`, `in`, `instanceof`, `**`, template, spread, and
+//! optional-chaining expression forms are implemented here with the same
+//! semantics as the bytecode VM; see `docs/js/expression-forms.md`.
+//!
 //! Limitations:
 //! - Assigning to an undeclared name is an error, as in strict mode.
 //! - Member access works only on [`Object`] values. Reading a property of any
@@ -28,7 +33,9 @@
 //!   endless loops fail with an error instead of running forever.
 
 mod array;
+pub(crate) mod builtins;
 mod conversions;
+mod expressions;
 mod object;
 mod operators;
 
@@ -37,14 +44,16 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::ast::{
-    ArrowBody, Expr, LogicalOperator, MemberProperty, Program, PropertyKey, Statement, VarKind,
+    ArrowBody, AssignmentOperator, BinaryOperator, Expr, LogicalOperator, MemberProperty, Program,
+    PropertyKey, Statement, UnaryOperator, UpdateOperator, VarKind,
 };
 use crate::bytecode::FunctionTemplate;
 use crate::stack::{StackGuard, with_engine_stack};
 use crate::{HostFunction, JsError, JsResult, Value};
 pub use array::MAX_ARRAY_LENGTH;
-pub(crate) use array::{array_to_string, get_array_property, set_array_property};
+pub(crate) use array::{array_len, array_to_string, get_array_property, set_array_property};
 pub(crate) use conversions::{is_truthy, number_to_string, to_property_key};
+pub(crate) use expressions::{copy_data_properties, delete_property, is_nullish, spread_values};
 pub use object::{
     HostGetter, HostPropertyGetter, HostPropertyKeys, HostPropertySetter, HostSetter, Object,
     WeakObject,
@@ -158,6 +167,31 @@ fn read(scope: &ScopeRef, name: &str) -> JsResult<Value> {
     with_binding(scope, name, |binding| {
         binding.value.clone().ok_or_else(|| uninitialized(name))
     })
+}
+
+/// Whether `name` is bound in `scope` or an enclosing one, even if it is
+/// still uninitialized.
+fn is_declared(scope: &ScopeRef, name: &str) -> bool {
+    with_binding(scope, name, |_| Ok(())).is_ok()
+}
+
+/// Reads `target[key]` for an object or array; any other value is an error.
+fn read_member(target: &Value, key: &str) -> JsResult<Value> {
+    match target {
+        Value::Object(target) => Ok(target.get_property(key)?.unwrap_or(Value::Undefined)),
+        Value::Array(target) => Ok(get_array_property(target, key)),
+        target => Err(non_object(target, "read", key, "property access")),
+    }
+}
+
+/// Writes `target[key] = value` for an object or array; any other value is
+/// an error.
+fn write_member(target: &Value, key: String, value: Value) -> JsResult<()> {
+    match target {
+        Value::Object(target) => target.set_property(key, value),
+        Value::Array(target) => set_array_property(target, &key, value),
+        target => Err(non_object(target, "set", &key, "property assignment")),
+    }
 }
 
 fn assign(scope: &ScopeRef, name: &str, value: Value) -> JsResult<()> {
@@ -302,6 +336,7 @@ enum FunctionKind {
     Host {
         name: String,
         function: HostFunction,
+        constructor: Option<HostFunction>,
     },
     /// A function compiled to bytecode; only the VM can run it.
     Bytecode {
@@ -324,6 +359,22 @@ impl Function {
         Self(Arc::new(FunctionKind::Host {
             name: name.into(),
             function,
+            constructor: None,
+        }))
+    }
+
+    /// Wraps a Rust callback as a callable and constructible JavaScript
+    /// function. The constructor callback receives the arguments passed to
+    /// `new` and must return the constructed value.
+    pub(crate) fn from_host_constructor(
+        name: impl Into<String>,
+        function: HostFunction,
+        constructor: HostFunction,
+    ) -> Self {
+        Self(Arc::new(FunctionKind::Host {
+            name: name.into(),
+            function,
+            constructor: Some(constructor),
         }))
     }
 
@@ -461,7 +512,14 @@ impl Function {
     /// construction does not retain the VM's global environment, so a
     /// constructor that reads global variables may also fail.
     pub fn construct(&self, arguments: &[Value]) -> JsResult<Value> {
-        crate::Vm::construct_function(self.clone(), arguments)
+        match &*self.0 {
+            FunctionKind::Host {
+                constructor: Some(constructor),
+                ..
+            } => constructor(arguments),
+            FunctionKind::Host { .. } => Err(JsError::runtime("function is not a constructor")),
+            _ => crate::Vm::construct_function(self.clone(), arguments),
+        }
     }
 
     /// Calls this function with an explicit receiver using a fresh bytecode
@@ -602,7 +660,9 @@ impl GlobalState {
     pub(crate) fn new() -> Self {
         let object: ScopeRef = Arc::default();
         let lexical = child_scope(&object);
-        Self { object, lexical }
+        let state = Self { object, lexical };
+        builtins::install(&state);
+        state
     }
 
     /// Binds a host-provided global, replacing any binding in the object
@@ -1060,7 +1120,21 @@ impl Interpreter {
             // any other undeclared name.
             Expr::This if self.this_enabled => Ok(self.this_value.clone()),
             Expr::This => Err(JsError::new("`this` is not defined")),
-            Expr::New { .. } => Err(unsupported_here("`new`")),
+            Expr::New { callee, arguments } => {
+                let constructor = self.evaluate(callee, scope)?;
+                let Value::Function(function) = constructor else {
+                    return Err(JsError::with_context(
+                        crate::JsErrorCategory::Runtime,
+                        format!("`{constructor}` is not a constructor"),
+                        "new expression",
+                    ));
+                };
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| self.evaluate(argument, scope))
+                    .collect::<JsResult<Vec<_>>>()?;
+                function.construct(&arguments)
+            }
             Expr::SuperCall { .. } | Expr::SuperMember { .. } => Err(unsupported_here("`super`")),
             Expr::Identifier(name) => read(scope, name),
             Expr::ArrowFunction { params, body } => {
@@ -1088,6 +1162,13 @@ impl Interpreter {
             Expr::Null => Ok(Value::Null),
             Expr::Undefined => Ok(Value::Undefined),
             Expr::Unary { operator, operand } => {
+                // `typeof missing` is `"undefined"`, not a reference error.
+                if *operator == UnaryOperator::Typeof
+                    && let Expr::Identifier(name) = &**operand
+                    && !is_declared(scope, name)
+                {
+                    return Ok(Value::String("undefined".to_owned()));
+                }
                 let value = self.evaluate(operand, scope)?;
                 Ok(unary(*operator, &value))
             }
@@ -1098,7 +1179,7 @@ impl Interpreter {
             } => {
                 let left = self.evaluate(left, scope)?;
                 let right = self.evaluate(right, scope)?;
-                Ok(binary(*operator, &left, &right))
+                binary(*operator, &left, &right)
             }
             Expr::Logical {
                 left,
@@ -1109,6 +1190,7 @@ impl Interpreter {
                 let use_right = match operator {
                     LogicalOperator::And => is_truthy(&left),
                     LogicalOperator::Or => !is_truthy(&left),
+                    LogicalOperator::Nullish => is_nullish(&left),
                 };
                 if use_right {
                     self.evaluate(right, scope)
@@ -1118,33 +1200,13 @@ impl Interpreter {
             }
             Expr::Call { callee, arguments } => {
                 let function = self.evaluate(callee, scope)?;
-                let arguments = arguments
-                    .iter()
-                    .map(|argument| self.evaluate(argument, scope))
-                    .collect::<JsResult<Vec<_>>>()?;
-                let Value::Function(function) = function else {
-                    let description = match describe(callee) {
-                        Some(path) => format!("`{path}`"),
-                        None => "expression".to_owned(),
-                    };
-                    return Err(JsError::with_context(
-                        crate::JsErrorCategory::Runtime,
-                        format!("{description} is not a function"),
-                        "function call",
-                    ));
-                };
-                self.call(&function, &arguments)
+                let arguments = self.evaluate_arguments(arguments, scope)?;
+                self.call_value(function, callee, &arguments)
             }
             Expr::Member { object, property } => {
                 let target = self.evaluate(object, scope)?;
                 let key = self.property_key(property, scope)?;
-                match target {
-                    Value::Object(target) => {
-                        Ok(target.get_property(&key)?.unwrap_or(Value::Undefined))
-                    }
-                    Value::Array(target) => Ok(get_array_property(&target, &key)),
-                    target => Err(non_object(&target, "read", &key, "property access")),
-                }
+                read_member(&target, &key)
             }
             Expr::MemberAssign {
                 object,
@@ -1154,11 +1216,7 @@ impl Interpreter {
                 let target = self.evaluate(object, scope)?;
                 let key = self.property_key(property, scope)?;
                 let value = self.evaluate(value, scope)?;
-                match target {
-                    Value::Object(target) => target.set_property(key, value.clone())?,
-                    Value::Array(target) => set_array_property(&target, &key, value.clone())?,
-                    target => return Err(non_object(&target, "set", &key, "property assignment")),
-                }
+                write_member(&target, key, value.clone())?;
                 Ok(value)
             }
             Expr::Object(properties) => {
@@ -1167,6 +1225,11 @@ impl Interpreter {
                     let key = match &property.key {
                         PropertyKey::Named(name) => name.clone(),
                         PropertyKey::Computed(key) => to_property_key(&self.evaluate(key, scope)?),
+                        PropertyKey::Spread => {
+                            let source = self.evaluate(&property.value, scope)?;
+                            copy_data_properties(&object, &source)?;
+                            continue;
+                        }
                     };
                     let value = self.evaluate(&property.value, scope)?;
                     object.set(key, value);
@@ -1175,15 +1238,270 @@ impl Interpreter {
             }
             Expr::Array(elements) => {
                 let array = Object::new();
-                for (index, element) in elements.iter().enumerate() {
-                    let value = match element {
-                        Some(element) => self.evaluate(element, scope)?,
-                        None => Value::Undefined,
-                    };
-                    array.set(index.to_string(), value);
+                // A literal with a spread is built incrementally by the VM
+                // from an empty array, whose `length` is already defined.
+                // Define it first here too so both engines produce the same
+                // property order.
+                if elements
+                    .iter()
+                    .any(|element| matches!(element, Some(Expr::Spread(_))))
+                {
+                    array.set("length", Value::Number(0.0));
                 }
-                array.set("length", Value::Number(elements.len() as f64));
+                let mut length = 0usize;
+                for element in elements {
+                    match element {
+                        Some(Expr::Spread(source)) => {
+                            let source = self.evaluate(source, scope)?;
+                            for value in spread_values(&source)? {
+                                set_array_property(&array, &length.to_string(), value)?;
+                                length += 1;
+                            }
+                        }
+                        Some(element) => {
+                            let value = self.evaluate(element, scope)?;
+                            array.set(length.to_string(), value);
+                            length += 1;
+                        }
+                        None => {
+                            array.set(length.to_string(), Value::Undefined);
+                            length += 1;
+                        }
+                    }
+                }
+                array.set("length", Value::Number(length as f64));
                 Ok(Value::Array(array))
+            }
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
+                let test = self.evaluate(test, scope)?;
+                if is_truthy(&test) {
+                    self.evaluate(consequent, scope)
+                } else {
+                    self.evaluate(alternate, scope)
+                }
+            }
+            Expr::Sequence(operands) => {
+                let mut result = Value::Undefined;
+                for operand in operands {
+                    result = self.evaluate(operand, scope)?;
+                }
+                Ok(result)
+            }
+            Expr::Template {
+                quasis,
+                expressions,
+            } => {
+                let mut parts = quasis.iter();
+                let mut text = parts.next().cloned().unwrap_or_default();
+                for (expression, quasi) in expressions.iter().zip(parts) {
+                    let value = self.evaluate(expression, scope)?;
+                    text = binary(BinaryOperator::Add, &Value::String(text), &value)?.to_string();
+                    text.push_str(quasi);
+                }
+                Ok(Value::String(text))
+            }
+            Expr::Update {
+                target,
+                operator,
+                prefix,
+            } => self.evaluate_update(target, *operator, *prefix, scope),
+            Expr::CompoundAssign {
+                target,
+                operator,
+                value,
+            } => self.evaluate_compound(target, *operator, value, scope),
+            Expr::Delete(operand) => match &**operand {
+                Expr::Member { object, property } => {
+                    let target = self.evaluate(object, scope)?;
+                    let key = self.property_key(property, scope)?;
+                    delete_property(&target, &key).map(Value::Boolean)
+                }
+                other => {
+                    self.evaluate(other, scope)?;
+                    Ok(Value::Boolean(true))
+                }
+            },
+            Expr::OptionalChain(chain) => Ok(self
+                .evaluate_chain(chain, scope)?
+                .unwrap_or(Value::Undefined)),
+            Expr::OptionalMember { .. } | Expr::OptionalCall { .. } => Err(JsError::runtime(
+                "optional access outside an optional chain",
+            )),
+            Expr::Spread(_) => Err(JsError::runtime(
+                "spread outside an array, call, or object literal",
+            )),
+        }
+    }
+
+    /// Evaluates the call arguments in order, expanding each spread.
+    fn evaluate_arguments(&mut self, arguments: &[Expr], scope: &ScopeRef) -> JsResult<Vec<Value>> {
+        let mut values = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            if let Expr::Spread(source) = argument {
+                let source = self.evaluate(source, scope)?;
+                values.extend(spread_values(&source)?);
+            } else {
+                values.push(self.evaluate(argument, scope)?);
+            }
+        }
+        Ok(values)
+    }
+
+    /// Calls an already-evaluated callee, describing `callee` in the error
+    /// when the value is not a function.
+    fn call_value(
+        &mut self,
+        function: Value,
+        callee: &Expr,
+        arguments: &[Value],
+    ) -> JsResult<Value> {
+        let Value::Function(function) = function else {
+            let description = match describe(callee) {
+                Some(path) => format!("`{path}`"),
+                None => "expression".to_owned(),
+            };
+            return Err(JsError::with_context(
+                crate::JsErrorCategory::Runtime,
+                format!("{description} is not a function"),
+                "function call",
+            ));
+        };
+        self.call(&function, arguments)
+    }
+
+    /// Evaluates a link of an optional chain, returning `None` when a `?.`
+    /// inside it found a `null` or `undefined` base.
+    fn evaluate_chain(&mut self, expression: &Expr, scope: &ScopeRef) -> JsResult<Option<Value>> {
+        match expression {
+            Expr::OptionalMember { object, property } => {
+                let Some(target) = self.evaluate_chain(object, scope)? else {
+                    return Ok(None);
+                };
+                if is_nullish(&target) {
+                    return Ok(None);
+                }
+                let key = self.property_key(property, scope)?;
+                read_member(&target, &key).map(Some)
+            }
+            Expr::Member { object, property } => {
+                let Some(target) = self.evaluate_chain(object, scope)? else {
+                    return Ok(None);
+                };
+                let key = self.property_key(property, scope)?;
+                read_member(&target, &key).map(Some)
+            }
+            Expr::OptionalCall { callee, arguments } => {
+                let Some(function) = self.evaluate_chain(callee, scope)? else {
+                    return Ok(None);
+                };
+                if is_nullish(&function) {
+                    return Ok(None);
+                }
+                let arguments = self.evaluate_arguments(arguments, scope)?;
+                self.call_value(function, callee, &arguments).map(Some)
+            }
+            Expr::Call { callee, arguments } => {
+                let Some(function) = self.evaluate_chain(callee, scope)? else {
+                    return Ok(None);
+                };
+                let arguments = self.evaluate_arguments(arguments, scope)?;
+                self.call_value(function, callee, &arguments).map(Some)
+            }
+            other => self.evaluate(other, scope).map(Some),
+        }
+    }
+
+    /// Evaluates `++x`, `x++`, `--x`, or `x--`.
+    fn evaluate_update(
+        &mut self,
+        target: &Expr,
+        operator: UpdateOperator,
+        prefix: bool,
+        scope: &ScopeRef,
+    ) -> JsResult<Value> {
+        let step = match operator {
+            UpdateOperator::Increment => BinaryOperator::Add,
+            UpdateOperator::Decrement => BinaryOperator::Subtract,
+        };
+        match target {
+            Expr::Identifier(name) => {
+                let old = unary(UnaryOperator::Plus, &read(scope, name)?);
+                let new = binary(step, &old, &Value::Number(1.0))?;
+                assign(scope, name, new.clone())?;
+                Ok(if prefix { new } else { old })
+            }
+            Expr::Member { object, property } => {
+                let target = self.evaluate(object, scope)?;
+                let key = self.property_key(property, scope)?;
+                let old = unary(UnaryOperator::Plus, &read_member(&target, &key)?);
+                let new = binary(step, &old, &Value::Number(1.0))?;
+                write_member(&target, key, new.clone())?;
+                Ok(if prefix { new } else { old })
+            }
+            _ => Err(JsError::runtime("Invalid update target")),
+        }
+    }
+
+    /// Evaluates a compound assignment such as `x += 1` or `o.a ??= 2`.
+    fn evaluate_compound(
+        &mut self,
+        target: &Expr,
+        operator: AssignmentOperator,
+        value: &Expr,
+        scope: &ScopeRef,
+    ) -> JsResult<Value> {
+        match target {
+            Expr::Identifier(name) => {
+                let old = read(scope, name)?;
+                let Some(new) = self.combine(&old, operator, value, scope)? else {
+                    return Ok(old);
+                };
+                assign(scope, name, new.clone())?;
+                Ok(new)
+            }
+            Expr::Member { object, property } => {
+                let target = self.evaluate(object, scope)?;
+                let key = self.property_key(property, scope)?;
+                let old = read_member(&target, &key)?;
+                let Some(new) = self.combine(&old, operator, value, scope)? else {
+                    return Ok(old);
+                };
+                write_member(&target, key, new.clone())?;
+                Ok(new)
+            }
+            _ => Err(JsError::runtime("Invalid assignment target")),
+        }
+    }
+
+    /// Computes the value a compound assignment stores, or `None` when a
+    /// logical operator leaves the target alone without evaluating `value`.
+    fn combine(
+        &mut self,
+        old: &Value,
+        operator: AssignmentOperator,
+        value: &Expr,
+        scope: &ScopeRef,
+    ) -> JsResult<Option<Value>> {
+        match operator {
+            AssignmentOperator::Binary(operator) => {
+                let right = self.evaluate(value, scope)?;
+                binary(operator, old, &right).map(Some)
+            }
+            AssignmentOperator::Logical(operator) => {
+                let assigns = match operator {
+                    LogicalOperator::And => is_truthy(old),
+                    LogicalOperator::Or => !is_truthy(old),
+                    LogicalOperator::Nullish => is_nullish(old),
+                };
+                if assigns {
+                    self.evaluate(value, scope).map(Some)
+                } else {
+                    Ok(None)
+                }
             }
         }
     }

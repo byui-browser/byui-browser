@@ -26,6 +26,10 @@ pub(crate) struct TabState {
     pub loaded_page: Option<browser::Page>,
     pub page: Option<((u32, u32), Pixmap)>,
     pub page_layout: Option<PageLayout>,
+    /// When the loaded page's animation timeline started (its first layout).
+    pub animation_clock: Option<std::time::Instant>,
+    /// When the next CSS animation frame is due, while animations run.
+    pub next_animation_frame: Option<std::time::Instant>,
     pub scroll_y: f32,
     pub page_zoom: f64,
     pub page_events: PageEvents,
@@ -62,6 +66,8 @@ impl TabState {
             loaded_page: None,
             page: None,
             page_layout: None,
+            animation_clock: None,
+            next_animation_frame: None,
             scroll_y: 0.0,
             page_zoom: 1.0,
             page_events: PageEvents::new(),
@@ -149,6 +155,7 @@ mod tests {
             html: html.into(),
             stylesheets: vec![],
             scripts: vec![],
+            resources: Default::default(),
         }
     }
     #[test]

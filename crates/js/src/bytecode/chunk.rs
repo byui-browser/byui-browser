@@ -169,6 +169,7 @@ impl Chunk {
             Instruction::Jump(target) => format!("JUMP -> {target:04}"),
             Instruction::JumpIfFalse(target) => format!("JUMP_IF_FALSE -> {target:04}"),
             Instruction::JumpIfTrue(target) => format!("JUMP_IF_TRUE -> {target:04}"),
+            Instruction::JumpIfNullish(target) => format!("JUMP_IF_NULLISH -> {target:04}"),
             Instruction::EnterTry(target) => format!("ENTER_TRY -> {target:04}"),
             Instruction::DeclareGlobal { slot, name, .. }
             | Instruction::DeclareLocal { slot, name, .. }
@@ -209,6 +210,7 @@ impl Chunk {
             Instruction::Jump(_)
                 | Instruction::JumpIfFalse(_)
                 | Instruction::JumpIfTrue(_)
+                | Instruction::JumpIfNullish(_)
                 | Instruction::EnterTry(_)
         ) {
             return Err("instruction is not patchable");
@@ -226,6 +228,7 @@ impl Chunk {
             Instruction::Jump(target_slot)
             | Instruction::JumpIfFalse(target_slot)
             | Instruction::JumpIfTrue(target_slot)
+            | Instruction::JumpIfNullish(target_slot)
             | Instruction::EnterTry(target_slot) => *target_slot = target,
             _ => return Err("instruction is not patchable"),
         }

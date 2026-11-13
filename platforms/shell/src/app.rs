@@ -52,6 +52,10 @@ const PAGE_ZOOM_RANGE: (f64, f64) = (0.5, 3.0);
 /// Page zoom increment for each keyboard shortcut press.
 const PAGE_ZOOM_STEP: f64 = 0.1;
 
+/// Time between CSS animation frames: about 60 frames per second. Frames
+/// that take longer to style, lay out, and paint simply arrive later.
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
 /// A caret movement in the address field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaretMove {
@@ -833,6 +837,7 @@ impl App {
         self.tab.page_events.unload();
         self.tab.title = crate::tabs::page_title(&page, url);
         self.tab.loaded_page = Some(page);
+        self.tab.animation_clock = None;
         self.refresh_devtools_document();
         if let Ok(mut console) = self.tab.console.lock() {
             console.clear();
@@ -1082,6 +1087,7 @@ impl App {
                 let page = browser::error_page(&navigation.address, &error);
                 self.tab.title = crate::tabs::page_title(&page, &navigation.address);
                 self.tab.loaded_page = Some(page);
+                self.tab.animation_clock = None;
                 self.refresh_devtools_document();
                 self.clear_performance();
                 self.tab
@@ -1444,6 +1450,30 @@ impl App {
         self.menu_pressed = None;
     }
 
+    /// Opens the toolbar overflow menu beneath the browser controls.
+    fn open_overflow_menu(&mut self) {
+        self.dismiss_context_menu();
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+        self.context_menu = Some(ContextMenu::overflow(size.width, size.height));
+        self.tab.chrome.pressed = None;
+        self.set_hovered(None);
+        self.frame_key = None;
+        self.redraw();
+    }
+
+    /// Clears the network state shared by all future page navigations.
+    fn clear_cache(&mut self) {
+        let Some(loader) = &self.loader else {
+            log::warn!("cache clear unavailable: page loader is not running");
+            return;
+        };
+        loader.clear_cache();
+        log::info!("cleared page-load HTTP and CORS-preflight caches");
+    }
+
     fn close_page_source(&mut self) {
         if self.tabs.active() == Some(self.tab.id) {
             self.source_close_pressed = false;
@@ -1705,6 +1735,51 @@ impl App {
             .map_or(0.0, |layout| layout.css_size().1 as f32)
     }
 
+    /// Advances running CSS animations when a frame is due: restyles and lays
+    /// out the page for the time since its animation clock started, and asks
+    /// the window to repaint it.
+    ///
+    /// Returns when the next frame is due, or `None` when no animation is
+    /// running (or the page has not been laid out yet), so the event loop
+    /// can sleep until the next input.
+    fn pump_animations(&mut self) -> Option<Instant> {
+        let (Some(layout), Some(clock)) = (&mut self.tab.page_layout, self.tab.animation_clock) else {
+            self.tab.next_animation_frame = None;
+            return None;
+        };
+        if !layout.is_animating() {
+            self.tab.next_animation_frame = None;
+            return None;
+        }
+        let now = Instant::now();
+        let due = *self.tab.next_animation_frame.get_or_insert(now);
+        if now < due {
+            return Some(due);
+        }
+        layout.animate(clock.elapsed());
+        record_events(&self.tab.performance, layout.take_timeline());
+        if let Some(find) = &mut self.tab.find {
+            // Highlights follow text that the animation moved.
+            find.replace_runs(layout.find_text());
+        }
+        // An animation can shrink the page below the current scroll position.
+        let scroll_y = self.tab.scroll_y.clamp(0.0, layout.max_scroll());
+        let still_running = layout.is_animating();
+        if scroll_y != self.tab.scroll_y {
+            self.tab.scroll_y = scroll_y;
+            self.tab.page_events.set_scroll_y(scroll_y);
+        }
+        // Only the page pixmap changes. The DevTools window is not repainted
+        // every frame.
+        self.tab.page = None;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        let next = now + ANIMATION_FRAME_INTERVAL;
+        self.tab.next_animation_frame = still_running.then_some(next);
+        still_running.then_some(next)
+    }
+
     /// Scrolls the page down by `delta` CSS pixels (up when negative),
     /// stopping at the top and bottom of the document, and repaints when
     /// the position changed.
@@ -1816,6 +1891,7 @@ impl App {
                     log::debug!("context menu action: {action:?}");
                     match action {
                         Some(MenuAction::Reload) => self.activate(Control::Reload),
+                        Some(MenuAction::ClearCache) => self.clear_cache(),
                         Some(MenuAction::PageSource) => self.show_page_source(),
                         Some(MenuAction::Inspect) => self.show_elements(),
                         Some(MenuAction::Compatibility) => self.show_compatibility(),
@@ -2036,9 +2112,9 @@ impl App {
                 log::debug!("toolbar action: address");
                 self.begin_address_edit()
             }
-            // Tabs and the menu are not implemented yet; these controls only
-            // give visual feedback.
-            Control::Menu => {
+            Control::Menu => self.open_overflow_menu(),
+            // Tabs are not implemented yet; this control only gives visual feedback.
+            Control::NewTab => {
                 log::debug!("toolbar action: {control:?} (not implemented)");
             }
         }
@@ -2078,6 +2154,7 @@ impl App {
             || self.tab.elements.is_some();
         let page_size_changed = self.tab.page.as_ref().map(|(size, _)| *size) != card_size;
         if page_size_changed {
+            let animation_clock = *self.tab.animation_clock.get_or_insert_with(Instant::now);
             // Painting never runs the page script: evaluation joins the JS
             // engine thread, and doing that inside this draw leaves `alert`
             // unable to finish. `about_to_wait` starts it after this frame.
@@ -2090,10 +2167,11 @@ impl App {
                     .map(|layout| layout.css_size())
                     != Some(css_size);
                 if layout_changed {
-                    let mut layout = crate::content::PageLayout::new(
+                    let mut layout = crate::content::PageLayout::new_at(
                         self.tab.loaded_page.as_ref().expect("page was loaded"),
                         css_size.0,
                         css_size.1,
+                        animation_clock.elapsed(),
                     );
                     record_events(&self.tab.performance, layout.take_timeline());
                     self.tab.page_layout = Some(layout);
@@ -2698,16 +2776,17 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(window) = &self.window {
             self.alerts.present(window, self.tab.id);
         }
+        let reload_poll = (self.tab.reload_completion.is_some()
+            || self
+                .inactive
+                .values()
+                .any(|state| state.reload_completion.is_some()))
+        .then(|| Instant::now() + Duration::from_millis(40));
+        let animation_frame = self.pump_animations();
         event_loop.set_control_flow(
-            if self.tab.reload_completion.is_some()
-                || self
-                    .inactive
-                    .values()
-                    .any(|state| state.reload_completion.is_some())
-            {
-                ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(40))
-            } else {
-                ControlFlow::Wait
+            match [reload_poll, animation_frame].into_iter().flatten().min() {
+                Some(deadline) => ControlFlow::WaitUntil(deadline),
+                None => ControlFlow::Wait,
             },
         );
 
@@ -3061,7 +3140,7 @@ mod tests {
     fn find_named_space_types_phrases_with_real_counts_and_highlight_ranges() {
         let page=browser::Page {url:"byui://test".into(),
             html:"<body><p>Start Welcome <span>to</span> BYUI <b>Browser</b> end</p><button>Click <span>Me</span></button></body>".into(),
-            stylesheets:vec!["body {height:2000px}".into()],scripts:vec![]};
+            stylesheets:vec!["body {height:2000px}".into()],scripts:vec![], resources: Default::default() };
         for query in [
             "Welcome to",
             "BYUI Browser",
@@ -3358,6 +3437,7 @@ mod tests {
             html: "<html><body><article><h1>Next</h1></article></body></html>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         app.page_loaded("byui://test/next", next);
         let panel = app.tab.elements.as_ref().expect("the dock stays open");
@@ -3566,6 +3646,7 @@ mod tests {
             html: "<h1>Already loaded</h1>\n<script>not executed</script>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         app.page_loaded("byui://source-fixture", page.clone());
         let before = app.tab.browser_state.clone();
@@ -3790,6 +3871,7 @@ mod tests {
             html: "<body><div></div></body>".into(),
             stylesheets: vec!["body { margin: 0 } div { height: 1000px }".into()],
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         app.page_loaded("byui://long", page.clone());
         app.tab.page_layout = Some(crate::content::PageLayout::new(&page, 160, 200));
@@ -4030,6 +4112,7 @@ mod tests {
             html: "<p>Loaded</p>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
 
         app.navigation_finished(
@@ -4085,6 +4168,7 @@ mod tests {
             html: "<p>Old</p>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
 
         app.navigation_finished(
@@ -4120,6 +4204,7 @@ mod tab_tests {
             html: format!("<body><p>{text}</p></body>"),
             stylesheets: vec![],
             scripts: vec![],
+            resources: Default::default(),
         }
     }
 
@@ -4539,6 +4624,7 @@ mod tab_tests {
             html: "<body><script></script></body>".into(),
             stylesheets: vec![],
             scripts: vec![script.into()],
+            resources: Default::default(),
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let alerts = Arc::new(Recording(tx));
@@ -4735,6 +4821,7 @@ mod tab_tests {
             html: "<body><article>second</article></body>".into(),
             stylesheets: vec![],
             scripts: vec![],
+            resources: Default::default(),
         };
         app.page_loaded(&second.url, second.clone());
         assert_eq!(app.tab.page_source.as_ref().unwrap().html, second.html);

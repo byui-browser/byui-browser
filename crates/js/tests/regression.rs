@@ -602,16 +602,29 @@ fn realm_script_bindings_persist_between_scripts() {
 #[test]
 fn unsupported_syntax_is_rejected_at_parse_time() {
     for source in [
-        // Update and compound assignment.
-        "let i = 0; i++;",
-        "let i = 0; i += 1;",
-        // Unary plus and `typeof`.
-        "+'3'",
-        "typeof 1",
+        // Update and compound assignment need an assignable target.
+        "1++;",
+        "++(1 + 2);",
+        "1 += 1;",
+        "a + b = 1;",
+        // `delete` of a bare name, and `**` after a unary operator.
+        "let x = 1; delete x;",
+        "-1 ** 2",
+        // `??` cannot be mixed with `||` or `&&` without parentheses.
+        "1 ?? 2 || 3",
+        "1 || 2 ?? 3",
+        // Optional chains cannot be assigned to or constructed.
+        "let a = {}; a?.b = 1;",
+        "let a = {}; new a?.b();",
+        // Regular-expression literals and tagged templates.
+        "let r = /a/g;",
+        "/=/",
+        "let tag = 1; tag`text`",
         // Function expressions.
         "let f = function () {};",
-        // Template literals.
-        "`text`",
+        // Unterminated template literals.
+        "`text",
+        "`${1`",
         // Multiple declarators.
         "let a = 1, b = 2;",
         // Empty statements.
