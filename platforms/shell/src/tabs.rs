@@ -27,6 +27,13 @@ pub(crate) struct TabState {
     pub loaded_page: Option<browser::Page>,
     pub page: Option<((u32, u32), Pixmap)>,
     pub page_layout: Option<PageLayout>,
+    /// Whether [`Self::page_layout`] was built with an outdated
+    /// [`Self::selector_state`] and must be restyled at the next paint.
+    ///
+    /// A stale layout is kept rather than dropped so scrolling and hit
+    /// testing keep working against its geometry until the restyle lands;
+    /// dropping it made wheel input see nothing to scroll.
+    pub page_layout_stale: bool,
     /// CSS pointer and focus state (`:hover`, `:active`, `:focus`) for this
     /// tab's document; reset when another document is shown.
     pub selector_state: css::SelectorState,
@@ -70,6 +77,7 @@ impl TabState {
             loaded_page: None,
             page: None,
             page_layout: None,
+            page_layout_stale: false,
             selector_state: css::SelectorState::default(),
             animation_clock: None,
             next_animation_frame: None,
