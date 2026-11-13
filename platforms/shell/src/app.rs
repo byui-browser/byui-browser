@@ -148,6 +148,9 @@ struct App {
     auditor: Option<Arc<ShellAuditor>>,
     loader: Option<browser::PageLoader>,
     proxy: Option<EventLoopProxy<UserEvent>>,
+    /// Set when the last tab is closed; `about_to_wait` then exits the event
+    /// loop, which quits the application like closing its window.
+    exit_requested: bool,
 }
 
 /// Messages that background threads post to the UI thread's event loop.
@@ -237,6 +240,7 @@ impl App {
                 .map_err(|error| log::error!("page loader initialization failed: {error}"))
                 .ok(),
             proxy: None,
+            exit_requested: false,
         }
     }
 
@@ -362,6 +366,8 @@ impl App {
         }
         self.reset_tab_interaction();
         self.ensure_welcome_loaded();
+        // A fresh tab is for typing an address, as in other browsers.
+        self.begin_address_edit();
     }
 
     fn switch_tab(&mut self, id: TabId) {
@@ -378,21 +384,22 @@ impl App {
         self.resize_elements();
     }
 
+    /// Closes tab `id`. Closing the only remaining tab quits the application
+    /// instead: the tab is left in place and [`App::exit_requested`] is set.
     fn close_tab(&mut self, id: TabId) {
         if self.tab_state(id).is_none() {
+            return;
+        }
+        if self.tabs.tab_count() == 1 {
+            log::info!("last tab closed, exiting");
+            self.exit_requested = true;
             return;
         }
         self.tabs.close(id);
         self.alerts.close_tab(id);
         if self.tab.id == id {
-            let target = if let Some(next) = self.tabs.active() {
-                self.inactive.remove(&next).expect("neighbor tab state")
-            } else {
-                let next = self.tabs.open("byui://welcome");
-                self.alerts.set_document(next, 0);
-                TabState::new(next, self.platform.window_controls_inset)
-            };
-            self.tab = target;
+            let next = self.tabs.active().expect("another tab remains open");
+            self.tab = self.inactive.remove(&next).expect("neighbor tab state");
             self.reset_tab_interaction();
             self.ensure_welcome_loaded();
             self.resize_elements();
@@ -404,18 +411,35 @@ impl App {
         }
     }
 
+    /// Handles tab shortcuts with Control (or Command on macOS) held and no
+    /// Shift or Alt: `T` opens a tab, `W` closes the active tab, `1`–`8`
+    /// select that tab by position, and `9` selects the last tab. Returns
+    /// whether the key was consumed.
     fn tab_shortcut(&mut self, key: &Key) -> bool {
         let shortcut = self.modifiers.control_key()
             || (cfg!(target_os = "macos") && self.modifiers.super_key());
-        if shortcut
-            && !self.modifiers.shift_key()
-            && matches!(key,Key::Character(c) if c.eq_ignore_ascii_case("t"))
-        {
-            self.new_tab();
-            true
-        } else {
-            false
+        if !shortcut || self.modifiers.shift_key() || self.modifiers.alt_key() {
+            return false;
         }
+        let Key::Character(character) = key else {
+            return false;
+        };
+        match character.to_ascii_lowercase().as_str() {
+            "t" => self.new_tab(),
+            "w" => self.close_tab(self.tab.id),
+            digit @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9") => {
+                let tabs = self.tabs.tabs();
+                let index = match digit {
+                    "9" => tabs.len().saturating_sub(1),
+                    _ => usize::from(digit.as_bytes()[0] - b'1'),
+                };
+                if let Some(id) = tabs.get(index).map(|tab| tab.id) {
+                    self.switch_tab(id);
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn handle_user_event(&mut self, event: UserEvent) {
@@ -1160,10 +1184,13 @@ impl App {
     }
 
     fn key_input(&mut self, event: KeyEvent) {
-        if event.state != ElementState::Pressed {
-            return;
+        if event.state == ElementState::Pressed {
+            self.key_down(event.logical_key.as_ref());
         }
-        let key = event.logical_key.as_ref();
+    }
+
+    /// Applies browser shortcuts and address-field editing for a pressed key.
+    fn key_down(&mut self, key: Key<&str>) {
         let modifiers = self.modifiers;
         // Command is the shortcut modifier on macOS; Control works everywhere.
         let shortcut =
@@ -2836,6 +2863,10 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.exit_requested {
+            event_loop.exit();
+            return;
+        }
         self.sync_platform_window();
         self.tabs.update_url(self.tab.id, &self.tab.address);
         self.poll_reloads();
@@ -4396,7 +4427,7 @@ mod tab_tests {
     }
 
     #[test]
-    fn new_tab_shortcut_and_final_close_keep_welcome_and_window_state() {
+    fn new_tab_shortcut_and_closing_the_final_tab_quits() {
         let mut app = app();
         app.ensure_welcome_loaded();
         let first = app.tab.id;
@@ -4415,16 +4446,88 @@ mod tab_tests {
         app.close_tab(second);
         assert_eq!(app.tab.id, third);
         app.close_tab(first);
+        assert!(!app.exit_requested, "closing a non-final tab keeps running");
         app.close_tab(third);
-        assert_eq!(app.tabs.tab_count(), 1);
-        assert!(![first, second, third].contains(&app.tab.id));
-        assert_eq!(app.tab.address, "byui://welcome");
-        assert_eq!(app.tab.browser_state.visited_urls(), ["byui://welcome"]);
+        assert!(app.exit_requested, "closing the final tab quits");
+        assert_eq!(app.tabs.tab_count(), 1, "the final tab is left in place");
+        assert_eq!(app.tab.id, third);
         #[cfg(target_os = "macos")]
         {
             app.modifiers = ModifiersState::SUPER;
             assert!(app.tab_shortcut(&Key::Character("t".into())));
         }
+    }
+
+    #[test]
+    fn new_tab_focuses_the_address_field() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        assert!(!app.tab.chrome.address_focused);
+        app.new_tab();
+        assert!(app.tab.chrome.address_focused);
+        assert_eq!(
+            app.tab.chrome.address_selection(&app.tab.address),
+            Some((0, app.tab.address.len()))
+        );
+    }
+
+    #[test]
+    fn close_and_number_shortcuts_close_and_select_tabs() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let first = app.tab.id;
+        app.new_tab();
+        let second = app.tab.id;
+        app.new_tab();
+        let third = app.tab.id;
+        app.modifiers = ModifiersState::CONTROL;
+        assert!(app.tab_shortcut(&Key::Character("1".into())));
+        assert_eq!(app.tab.id, first);
+        assert!(app.tab_shortcut(&Key::Character("2".into())));
+        assert_eq!(app.tab.id, second);
+        assert!(app.tab_shortcut(&Key::Character("9".into())));
+        assert_eq!(app.tab.id, third, "9 selects the last tab");
+        assert!(app.tab_shortcut(&Key::Character("8".into())));
+        assert_eq!(app.tab.id, third, "a missing position is ignored");
+        assert!(app.tab_shortcut(&Key::Character("w".into())));
+        assert_eq!(app.tabs.tab_count(), 2);
+        assert!(!app.tabs.tabs().iter().any(|tab| tab.id == third));
+        assert_ne!(app.tab.id, third);
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(!app.tab_shortcut(&Key::Character("W".into())));
+        assert_eq!(app.tabs.tab_count(), 2);
+        app.modifiers = ModifiersState::empty();
+        assert!(!app.tab_shortcut(&Key::Character("w".into())));
+        #[cfg(target_os = "macos")]
+        {
+            app.modifiers = ModifiersState::SUPER;
+            assert!(app.tab_shortcut(&Key::Character("1".into())));
+            assert_eq!(app.tab.id, first);
+            assert!(app.tab_shortcut(&Key::Character("w".into())));
+            assert_eq!(app.tabs.tab_count(), 1);
+            assert!(!app.exit_requested);
+        }
+        app.modifiers = ModifiersState::CONTROL;
+        while app.tabs.tab_count() > 1 {
+            assert!(app.tab_shortcut(&Key::Character("w".into())));
+        }
+        assert!(!app.exit_requested);
+        assert!(app.tab_shortcut(&Key::Character("w".into())));
+        assert!(app.exit_requested, "Control+W on the final tab quits");
+    }
+
+    #[test]
+    fn address_shortcut_focuses_and_selects_the_address() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        assert!(!app.tab.chrome.address_focused);
+        app.modifiers = ModifiersState::CONTROL;
+        app.key_down(Key::Character("l"));
+        assert!(app.tab.chrome.address_focused);
+        assert_eq!(
+            app.tab.chrome.address_selection(&app.tab.address),
+            Some((0, app.tab.address.len()))
+        );
     }
 
     #[test]
@@ -4855,7 +4958,11 @@ mod tab_tests {
         assert_eq!(selection, Some((2, 7)));
         app.new_tab();
         assert!(app.address_press.is_none());
-        assert!(app.tab.chrome.address_anchor.is_none());
+        // The new tab focuses its own address with all of it selected.
+        assert_eq!(
+            app.tab.chrome.address_selection(&app.tab.address),
+            Some((0, app.tab.address.len()))
+        );
         app.switch_tab(first);
         assert_eq!(
             app.tab.chrome.address_selection(&app.tab.address),
