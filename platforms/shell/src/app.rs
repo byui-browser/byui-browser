@@ -189,6 +189,13 @@ pub(crate) enum UserEvent {
         url: Url,
         behavior: NavigationBehavior,
     },
+    /// A page script changed its document's DOM; the tab lays out `dom`.
+    DomChanged {
+        tab: TabId,
+        /// The script run this tree belongs to; stale ones are dropped.
+        document: u64,
+        dom: Box<html::HTMLDocument>,
+    },
     /// A background compatibility audit finished.
     AuditFinished {
         tab: TabId,
@@ -478,6 +485,24 @@ impl App {
                     self.with_tab(tab, |app| {
                         app.start_navigation_with_behavior(url.as_str(), behavior)
                     });
+                }
+            }
+            UserEvent::DomChanged { tab, document, dom } => {
+                let active = self.tab.id == tab;
+                self.with_tab(tab, |app| {
+                    // A newer script run, such as a reload, owns the tab now.
+                    if app.tab.document_id != document {
+                        return;
+                    }
+                    app.tab.live_document = Some((document, *dom));
+                    app.tab.page = None;
+                    // Relaid out by the next `paint`; until then clicks
+                    // hit-test the layout that is still on screen.
+                    app.tab.page_layout_stale = true;
+                });
+                if active {
+                    self.frame_key = None;
+                    self.redraw();
                 }
             }
             UserEvent::AuditFinished { tab, id, report } => {
@@ -2240,8 +2265,15 @@ impl App {
                         != Some(css_size);
                 if layout_changed {
                     self.tab.page_layout_stale = false;
-                    let mut layout = crate::content::PageLayout::new_with_state_at(
+                    let live = self
+                        .tab
+                        .live_document
+                        .as_ref()
+                        .filter(|(document, _)| *document == self.tab.document_id)
+                        .map(|(_, dom)| dom);
+                    let mut layout = crate::content::PageLayout::new_with_document_state_at(
                         self.tab.loaded_page.as_ref().expect("page was loaded"),
+                        live,
                         css_size.0,
                         css_size.1,
                         self.tab.selector_state,
@@ -2958,6 +2990,16 @@ impl ApplicationHandler<UserEvent> for App {
                 });
             }
         });
+        let proxy = self.proxy.clone();
+        self.tab.page_events.watch_dom(Arc::new(move |dom| {
+            if let Some(proxy) = &proxy {
+                let _ = proxy.send_event(UserEvent::DomChanged {
+                    tab,
+                    document,
+                    dom: Box::new(dom),
+                });
+            }
+        }));
         self.tab.page_events.load_with_viewport(
             &page,
             Arc::new(crate::content::DevtoolsConsole(Arc::clone(

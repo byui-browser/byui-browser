@@ -25,6 +25,10 @@ pub(crate) struct TabState {
     pub address: String,
     pub address_before_edit: String,
     pub loaded_page: Option<browser::Page>,
+    /// The DOM page scripts last changed, tagged with the `document_id` of
+    /// the script run that changed it. Layout uses it in place of
+    /// `loaded_page.html` while that run is current.
+    pub live_document: Option<(u64, html::HTMLDocument)>,
     pub page: Option<((u32, u32), Pixmap)>,
     pub page_layout: Option<PageLayout>,
     /// Whether [`Self::page_layout`] was built with an outdated
@@ -75,6 +79,7 @@ impl TabState {
             address: "byui://welcome".into(),
             address_before_edit: "byui://welcome".into(),
             loaded_page: None,
+            live_document: None,
             page: None,
             page_layout: None,
             page_layout_stale: false,
