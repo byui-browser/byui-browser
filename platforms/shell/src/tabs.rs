@@ -29,11 +29,15 @@ pub(crate) struct TabState {
     /// the script run that changed it. Layout uses it in place of
     /// `loaded_page.html` while that run is current.
     pub live_document: Option<(u64, html::HTMLDocument)>,
-    /// The last layout discarded by a restyle, tagged with its `document_id`,
-    /// kept for hit tests until the next layout replaces it.
-    pub retired_layout: Option<(u64, crate::content::PageLayout)>,
     pub page: Option<((u32, u32), Pixmap)>,
     pub page_layout: Option<PageLayout>,
+    /// Whether [`Self::page_layout`] was built with an outdated
+    /// [`Self::selector_state`] and must be restyled at the next paint.
+    ///
+    /// A stale layout is kept rather than dropped so scrolling and hit
+    /// testing keep working against its geometry until the restyle lands;
+    /// dropping it made wheel input see nothing to scroll.
+    pub page_layout_stale: bool,
     /// CSS pointer and focus state (`:hover`, `:active`, `:focus`) for this
     /// tab's document; reset when another document is shown.
     pub selector_state: css::SelectorState,
@@ -76,9 +80,9 @@ impl TabState {
             address_before_edit: "byui://welcome".into(),
             loaded_page: None,
             live_document: None,
-            retired_layout: None,
             page: None,
             page_layout: None,
+            page_layout_stale: false,
             selector_state: css::SelectorState::default(),
             animation_clock: None,
             next_animation_frame: None,

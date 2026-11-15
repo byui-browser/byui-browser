@@ -32,7 +32,8 @@ mod user_agent;
 pub mod values;
 
 pub use cascade::{
-    style_document, style_document_at, style_document_with_state, style_document_with_state_at,
+    style_document, style_document_at, style_document_with_context, style_document_with_state,
+    style_document_with_state_at,
 };
 pub use color::{CssColor, parse_color};
 pub use computed::ComputedStyles;
@@ -46,6 +47,7 @@ pub use selector::{
 };
 pub use specificity::specificity;
 pub use stylesheet::{
-    AtRule, Declaration, Dom, Keyframe, ParseError, Rule, Selector, Specificity, Stylesheet,
+    AtRule, Declaration, Dom, Keyframe, ParseError, Rule, Selector, Specificity, StyleContext,
+    Stylesheet,
 };
 pub use user_agent::{user_agent_default_color, user_agent_stylesheet};
