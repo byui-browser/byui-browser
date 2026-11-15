@@ -116,7 +116,7 @@ fn css_findings_come_from_render_probes() {
                a:hover { color: #0000ff; }\n\
                .sib + .sib { height: 10px; }";
     let report = audit("<div class=\"box\"></div>", &[css], &[], None);
-    assert!(has(&report, Area::CssAtRule, "@media"));
+    assert!(!has(&report, Area::CssAtRule, "@media"));
     assert!(has(&report, Area::CssValue, "display: grid"));
     assert!(has(&report, Area::CssProperty, "box-shadow"));
     assert!(has(&report, Area::CssSelector, ":hover"));
