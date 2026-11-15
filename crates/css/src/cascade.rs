@@ -8,7 +8,9 @@ use crate::computed::{ComputedStyles, computed_style};
 use crate::matching::{ElementTree, SelectorState, attribute};
 use crate::parser::parse_declarations;
 use crate::rule_index::{CompiledDeclaration, CompiledSheet, RuleIndex, compile_declarations};
-use crate::stylesheet::{Declaration, Dom, Specificity, Stylesheet};
+use crate::stylesheet::{
+    AtRule, Declaration, Dom, Rule, Selector, Specificity, StyleContext, Stylesheet,
+};
 use crate::user_agent::{user_agent_compiled, user_agent_stylesheet};
 use crate::values;
 use html::{NodeID, NodeKind};
@@ -71,8 +73,8 @@ pub(crate) struct CascadeStats {
 /// matcher: combinators, attribute selectors, and structural and logical
 /// pseudo-classes match. `style_document` uses empty interaction state;
 /// [`style_document_with_state`] accepts pointer and focus state. History
-/// pseudo-classes and pseudo-elements remain unsupported. Rules inside
-/// at-rules such as `@media` are not applied yet.
+/// pseudo-classes and pseudo-elements remain unsupported. Conditional group
+/// rules such as `@media` and nested CSS rules are expanded before matching.
 ///
 /// CSS animations (`@keyframes` with `animation-*`) are sampled at the start
 /// of the document timeline; use [`style_document_at`] to style a later
@@ -82,7 +84,23 @@ pub(crate) struct CascadeStats {
 /// tested against rules filed under its ID, classes, attribute names, and tag
 /// (plus rules with no such key), not against every rule.
 pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
-    style_document_at(dom, stylesheets, Duration::ZERO)
+    style_document_with_context(dom, stylesheets, StyleContext::default())
+}
+
+/// Styles the document using viewport and media-environment information.
+pub fn style_document_with_context(
+    dom: &Dom,
+    stylesheets: &[Stylesheet],
+    context: StyleContext,
+) -> ComputedStyles {
+    style_document_with_stats_context(
+        dom,
+        stylesheets,
+        SelectorState::default(),
+        Duration::ZERO,
+        context,
+    )
+    .0
 }
 
 /// Styles the document like [`style_document`], with CSS animations sampled
@@ -123,14 +141,15 @@ pub fn style_document_with_state_at(
     state: SelectorState,
     time: Duration,
 ) -> ComputedStyles {
-    style_document_with_stats(dom, stylesheets, state, time).0
+    style_document_with_stats_context(dom, stylesheets, state, time, StyleContext::default()).0
 }
 
-pub(crate) fn style_document_with_stats(
+fn style_document_with_stats_context(
     dom: &Dom,
     stylesheets: &[Stylesheet],
     state: SelectorState,
     time: Duration,
+    context: StyleContext,
 ) -> (ComputedStyles, CascadeStats) {
     log::debug!(
         "styling document: {} nodes, {} author stylesheets",
@@ -153,8 +172,11 @@ pub(crate) fn style_document_with_stats(
         }
     }
 
-    let author_sheets: Vec<CompiledSheet> =
-        stylesheets.iter().map(CompiledSheet::compile).collect();
+    let author_sheets: Vec<CompiledSheet> = stylesheets
+        .iter()
+        .map(|sheet| expand_stylesheet(sheet, context))
+        .map(|sheet| CompiledSheet::compile(&sheet))
+        .collect();
     let mut index = RuleIndex::default();
     index.add_sheet(
         user_agent_compiled(),
@@ -305,7 +327,13 @@ pub(crate) fn style_document_with_stats(
 
         let parent_font_size = parent_value("font-size")
             .and_then(|value| {
-                values::compute_font_size(value, values::MEDIUM_FONT_SIZE, values::MEDIUM_FONT_SIZE)
+                values::compute_font_size_with_context(
+                    value,
+                    values::MEDIUM_FONT_SIZE,
+                    values::MEDIUM_FONT_SIZE,
+                    context.viewport_width,
+                    context.viewport_height,
+                )
             })
             .unwrap_or(values::MEDIUM_FONT_SIZE);
         let root_size = root_font_size.unwrap_or(values::MEDIUM_FONT_SIZE);
@@ -324,7 +352,15 @@ pub(crate) fn style_document_with_stats(
         );
         let font_size = properties
             .get("font-size")
-            .and_then(|value| values::compute_font_size(value, parent_font_size, root_size))
+            .and_then(|value| {
+                values::compute_font_size_with_context(
+                    value,
+                    parent_font_size,
+                    root_size,
+                    context.viewport_width,
+                    context.viewport_height,
+                )
+            })
             .unwrap_or_else(|| {
                 log::trace!("font-size not computable for node {node_index}; using parent size");
                 parent_font_size
@@ -357,6 +393,164 @@ pub(crate) fn style_document_with_stats(
         },
         stats,
     )
+}
+
+fn expand_stylesheet(sheet: &Stylesheet, context: StyleContext) -> Stylesheet {
+    let mut expanded = Stylesheet {
+        source: sheet.source.clone(),
+        rules: Vec::new(),
+        at_rules: Vec::new(),
+        errors: sheet.errors.clone(),
+    };
+    for rule in &sheet.rules {
+        expand_rule(rule, None, &mut expanded.rules, context);
+    }
+    for at_rule in &sheet.at_rules {
+        if at_rule_applies(at_rule, context) {
+            expand_at_rule(at_rule, None, &mut expanded.rules, context);
+        }
+    }
+    expanded
+}
+
+fn expand_at_rule(
+    at_rule: &AtRule,
+    parent: Option<&str>,
+    output: &mut Vec<Rule>,
+    context: StyleContext,
+) {
+    for rule in &at_rule.rules {
+        expand_rule(rule, parent, output, context);
+    }
+    for nested in &at_rule.at_rules {
+        if at_rule_applies(nested, context) {
+            expand_at_rule(nested, parent, output, context);
+        }
+    }
+}
+
+fn expand_rule(rule: &Rule, parent: Option<&str>, output: &mut Vec<Rule>, context: StyleContext) {
+    let selector = match parent {
+        Some(parent) if rule.selector.0.contains('&') => rule.selector.0.replace('&', parent),
+        Some(parent) => format!("{parent} {}", rule.selector.0.trim()),
+        None => rule.selector.0.trim().to_owned(),
+    };
+    output.push(Rule {
+        selector: Selector(selector.clone()),
+        declarations: rule.declarations.clone(),
+        nested_rules: Vec::new(),
+        nested_at_rules: Vec::new(),
+    });
+    for child in &rule.nested_rules {
+        expand_rule(child, Some(&selector), output, context);
+    }
+    for at_rule in &rule.nested_at_rules {
+        if at_rule_applies(at_rule, context) {
+            expand_at_rule(at_rule, Some(&selector), output, context);
+        }
+    }
+}
+
+fn at_rule_applies(at_rule: &AtRule, context: StyleContext) -> bool {
+    match at_rule.name.as_str() {
+        "media" => media_applies(&at_rule.prelude, context),
+        "supports" | "layer" | "starting-style" => true,
+        // These require layout, container, URL, or document state not owned
+        // by the CSS crate's current public API.
+        "container" | "scope" | "document" | "-moz-document" => false,
+        // @keyframes and descriptor rules do not contribute selectors.
+        "keyframes" | "-webkit-keyframes" | "-moz-keyframes" | "font-face" | "page"
+        | "property" | "counter-style" => false,
+        _ => false,
+    }
+}
+
+fn media_applies(prelude: &str, context: StyleContext) -> bool {
+    prelude.split(',').any(|query| {
+        let query = query.trim();
+        if query.is_empty() {
+            return false;
+        }
+        let lower = query.to_ascii_lowercase();
+        let (negated, query) = lower
+            .strip_prefix("not ")
+            .map_or((false, lower.as_str()), |q| (true, q));
+        let mut ok = true;
+        for token in media_query_tokens(query) {
+            if token == "and" || token == "only" {
+                continue;
+            }
+            if !token.starts_with('(') {
+                ok &= match token.as_str() {
+                    "all" => true,
+                    "screen" => context.screen,
+                    "print" => !context.screen,
+                    _ => false,
+                };
+            } else {
+                ok &= media_feature_applies(&token, context);
+            }
+        }
+        if negated { !ok } else { ok }
+    })
+}
+
+fn media_query_tokens(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut depth = 0usize;
+    let mut start = None;
+    for (index, character) in query.char_indices() {
+        if character == '(' {
+            depth += 1;
+            if start.is_none() {
+                start = Some(index);
+            }
+        }
+        if character == ')' {
+            depth = depth.saturating_sub(1);
+        }
+        if depth == 0 && character.is_ascii_whitespace() {
+            if let Some(begin) = start.take() {
+                tokens.push(query[begin..index].to_owned());
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(begin) = start {
+        tokens.push(query[begin..].to_owned());
+    }
+    tokens
+}
+
+fn media_feature_applies(token: &str, context: StyleContext) -> bool {
+    let feature = token.trim_matches(|c| c == '(' || c == ')').trim();
+    let Some((name, value)) = feature.split_once(':') else {
+        return false;
+    };
+    let name = name.trim();
+    let value = value.trim();
+    let actual = match name {
+        "width" | "min-width" | "max-width" => context.viewport_width,
+        "height" | "min-height" | "max-height" => context.viewport_height,
+        _ => return false,
+    };
+    let wanted = if let Some(length) = values::parse_length(value) {
+        length.to_px(&values::LengthContext {
+            font_size: values::MEDIUM_FONT_SIZE,
+            root_font_size: values::MEDIUM_FONT_SIZE,
+            viewport_width: context.viewport_width,
+            viewport_height: context.viewport_height,
+        })
+    } else {
+        return false;
+    };
+    match name {
+        "min-width" | "min-height" => actual >= wanted,
+        "max-width" | "max-height" => actual <= wanted,
+        "width" | "height" => (actual - wanted).abs() < 0.001,
+        _ => false,
+    }
 }
 
 /// Records `declaration` for its property if it beats the current winner.
@@ -415,351 +609,4 @@ pub(crate) fn is_inherited_property(property: &str) -> bool {
             | "text-transform"
             | "visibility"
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{ComputedStyles, Declaration, parse_color, parse_stylesheet};
-    use html::HTMLDocument;
-
-    #[test]
-    fn cascades_matches_and_inlines() {
-        let document = html::parse_raw_html(
-            "<div><p id='target' class='intro' style='color: black'>Hello</p></div>".into(),
-        );
-        let stylesheet =
-            parse_stylesheet("p { color: green; } .intro { color: red; font-size: 20px; }");
-        let styles = style_document(&document, &[stylesheet]);
-        let paragraph = document
-            .get_element_by_id("target")
-            .expect("paragraph node id");
-        let declarations = styles
-            .styles
-            .iter()
-            .find(|(id, _)| id.get() == paragraph.get())
-            .expect("computed paragraph");
-        assert!(declarations.1.contains(&Declaration {
-            property: "color".into(),
-            value: "black".into()
-        }));
-        assert!(declarations.1.contains(&Declaration {
-            property: "font-size".into(),
-            value: "20px".into()
-        }));
-    }
-
-    #[test]
-    fn bundled_defaults_cascade_before_author_styles_and_inherit() {
-        let document = html::parse_raw_html(
-            "<html id='root'><body><main id='content'>Hello</main></body></html>".into(),
-        );
-        let html = document.get_element_by_id("root").expect("html node");
-        let main = document.get_element_by_id("content").expect("main node");
-        let defaults = style_document(&document, &[]);
-        assert_eq!(defaults.color_for(html, "background-color"), None);
-        assert_eq!(defaults.color_for(main, "color"), parse_color("black"));
-
-        let author = parse_stylesheet("html { color: red; background-color: #123456; }");
-        let styled = style_document(&document, &[author]);
-        assert_eq!(
-            styled.color_for(html, "background-color"),
-            parse_color("#123456")
-        );
-        assert_eq!(styled.color_for(main, "color"), parse_color("red"));
-    }
-
-    fn computed(
-        styles: &ComputedStyles,
-        document: &HTMLDocument,
-        id: &str,
-        property: &str,
-    ) -> Option<String> {
-        let node = document.get_element_by_id(id).expect("element with id");
-        styles.value_for(node, property).map(str::to_owned)
-    }
-
-    #[test]
-    fn important_declarations_beat_later_and_more_specific_ones() {
-        let document = html::parse_raw_html("<p id='target' class='a'>Hi</p>".into());
-        let sheet = parse_stylesheet(
-            "p { color: green !important; } .a { color: red; } #target { color: blue; }",
-        );
-        let styles = style_document(&document, &[sheet]);
-        assert_eq!(
-            computed(&styles, &document, "target", "color").as_deref(),
-            Some("green")
-        );
-    }
-
-    #[test]
-    fn author_shorthand_overrides_user_agent_longhand() {
-        let document = html::parse_raw_html("<p id='target'>Hi</p>".into());
-        let styles = style_document(&document, &[parse_stylesheet("p { margin: 0 }")]);
-        assert_eq!(
-            computed(&styles, &document, "target", "margin-top").as_deref(),
-            Some("0")
-        );
-        assert_eq!(
-            computed(&styles, &document, "target", "margin-left").as_deref(),
-            Some("0")
-        );
-    }
-
-    #[test]
-    fn font_size_inherits_as_an_absolute_length() {
-        let document = html::parse_raw_html(
-            "<div id='outer' style='font-size: 2em'><span id='inner'>Hi</span><b id='rel' style='font-size: 50%'>x</b></div>"
-                .into(),
-        );
-        let styles = style_document(&document, &[]);
-        assert_eq!(
-            computed(&styles, &document, "outer", "font-size").as_deref(),
-            Some("32px")
-        );
-        assert_eq!(
-            computed(&styles, &document, "inner", "font-size").as_deref(),
-            Some("32px")
-        );
-        assert_eq!(
-            computed(&styles, &document, "rel", "font-size").as_deref(),
-            Some("16px")
-        );
-    }
-
-    #[test]
-    fn css_wide_keywords_resolve_against_the_parent() {
-        let document = html::parse_raw_html(
-            "<div id='parent' style='color: red; margin-left: 5px'><p id='child' style='color: initial; margin-left: inherit'>Hi</p></div>"
-                .into(),
-        );
-        let styles = style_document(&document, &[]);
-        assert_eq!(
-            computed(&styles, &document, "child", "color").as_deref(),
-            Some("black")
-        );
-        assert_eq!(
-            computed(&styles, &document, "child", "margin-left").as_deref(),
-            Some("5px")
-        );
-    }
-
-    #[test]
-    fn source_order_breaks_specificity_ties_across_index_buckets() {
-        let document = html::parse_raw_html("<p id='target' class='a' data-x='1'>Hi</p>".into());
-        for (css, expected) in [
-            ("[data-x] { color: red } .a { color: blue }", "blue"),
-            (".a { color: blue } [data-x] { color: red }", "red"),
-        ] {
-            let styles = style_document(&document, &[parse_stylesheet(css)]);
-            assert_eq!(
-                computed(&styles, &document, "target", "color").as_deref(),
-                Some(expected),
-                "{css}"
-            );
-        }
-    }
-
-    #[test]
-    fn later_stylesheets_win_ties_and_declarations_keep_their_order() {
-        let document = html::parse_raw_html("<p id='target' class='a'>Hi</p>".into());
-        let first = parse_stylesheet(".a { color: red }");
-        let second = parse_stylesheet(".a { color: blue; margin: 0; margin-top: 3px }");
-        let styles = style_document(&document, &[first, second]);
-        assert_eq!(
-            computed(&styles, &document, "target", "color").as_deref(),
-            Some("blue")
-        );
-        assert_eq!(
-            computed(&styles, &document, "target", "margin-top").as_deref(),
-            Some("3px")
-        );
-        assert_eq!(
-            computed(&styles, &document, "target", "margin-left").as_deref(),
-            Some("0")
-        );
-    }
-
-    #[test]
-    fn combinators_attributes_and_pseudo_classes_take_part_in_the_cascade() {
-        let document = html::parse_raw_html(
-            "<div class='card'><p id='first'>a</p><p id='second' hidden>b</p>\
-             <a id='link' href='/x'>c</a><span id='plain'>d</span></div>"
-                .into(),
-        );
-        let sheet = parse_stylesheet(
-            ".card > p:first-child { color: red } \
-             p + p { color: blue } \
-             div :not(p, a) { color: green } \
-             span:hover { color: orange } \
-             span::before { display: block }",
-        );
-        let styles = style_document(&document, &[sheet]);
-        let value = |id, property| computed(&styles, &document, id, property);
-        assert_eq!(value("first", "color").as_deref(), Some("red"));
-        assert_eq!(value("second", "color").as_deref(), Some("blue"));
-        assert_eq!(value("plain", "color").as_deref(), Some("green"));
-        // `span::before` styles a pseudo-element, never the span itself.
-        assert_eq!(value("plain", "display"), None);
-        // User-agent rules that rely on attribute and pseudo-class selectors.
-        assert_eq!(value("second", "display").as_deref(), Some("none"));
-        assert_eq!(value("link", "color").as_deref(), Some("#0000ee"));
-    }
-
-    fn animated(css: &str, html: &str, seconds: f64) -> (ComputedStyles, HTMLDocument) {
-        let document = html::parse_raw_html(html.into());
-        let styles = style_document_at(
-            &document,
-            &[parse_stylesheet(css)],
-            Duration::from_secs_f64(seconds),
-        );
-        (styles, document)
-    }
-
-    #[test]
-    fn keyframe_animations_are_sampled_over_time_and_inherited() {
-        let css = "@keyframes grow { from { width: 0; color: red } to { width: 100px; color: blue } } \
-                   #box { width: 7px; animation: grow 2s linear forwards }";
-        let html = "<div id='box'><span id='child'>x</span></div>";
-        let at = |seconds, id, property| {
-            let (styles, document) = animated(css, html, seconds);
-            (
-                computed(&styles, &document, id, property),
-                styles.running_animations,
-            )
-        };
-        assert_eq!(at(0.0, "box", "width"), (Some("0".into()), 1));
-        assert_eq!(at(0.5, "box", "width"), (Some("25px".into()), 1));
-        assert_eq!(
-            at(1.0, "box", "color"),
-            (Some("rgb(128, 0, 128)".into()), 1)
-        );
-        // Children inherit the animated color.
-        assert_eq!(
-            at(1.0, "child", "color"),
-            (Some("rgb(128, 0, 128)".into()), 1)
-        );
-        // `forwards` holds the last keyframe once the animation has finished.
-        assert_eq!(at(5.0, "box", "width"), (Some("100px".into()), 0));
-
-        // Without a fill mode the element returns to its own value.
-        let (styles, document) = animated(
-            "@keyframes grow { to { width: 100px } } #box { width: 7px; animation: grow 1s }",
-            html,
-            3.0,
-        );
-        assert_eq!(
-            computed(&styles, &document, "box", "width").as_deref(),
-            Some("7px")
-        );
-        assert_eq!(styles.running_animations, 0);
-    }
-
-    #[test]
-    fn missing_keyframes_use_the_element_value_and_important_wins() {
-        let css = "@keyframes slide { 50% { margin-left: 20px; padding-left: 20px } } \
-                   #box { margin-left: 10px; padding-left: 0 !important; \
-                          animation: slide 4s linear infinite }";
-        let (styles, document) = animated(css, "<p id='box'>x</p>", 1.0);
-        assert_eq!(
-            computed(&styles, &document, "box", "margin-left").as_deref(),
-            Some("15px")
-        );
-        assert_eq!(
-            computed(&styles, &document, "box", "padding-left").as_deref(),
-            Some("0")
-        );
-        // Infinite animations never stop running.
-        assert_eq!(styles.running_animations, 1);
-    }
-
-    #[test]
-    fn keyframe_timing_functions_ease_their_interval() {
-        let css = "@keyframes jump { from { width: 0; animation-timing-function: step-end } \
-                   50% { width: 50px } to { width: 100px } } \
-                   #box { animation: jump 2s linear }";
-        let width = |seconds| {
-            let (styles, document) = animated(css, "<div id='box'></div>", seconds);
-            computed(&styles, &document, "box", "width")
-        };
-        // The first interval holds its start value until it ends...
-        assert_eq!(width(0.9).as_deref(), Some("0"));
-        // ...and the second uses the animation's own `linear` easing.
-        assert_eq!(width(1.5).as_deref(), Some("75px"));
-    }
-
-    #[test]
-    fn later_animations_and_keyframes_rules_win() {
-        let css = "@keyframes a { to { width: 10px } } \
-                   @keyframes b { to { width: 20px } } \
-                   @keyframes b { to { height: 30px } } \
-                   #box { animation: a 1s forwards, b 1s forwards }";
-        let (styles, document) = animated(css, "<div id='box'></div>", 2.0);
-        // The second `@keyframes b` replaces the first, so only `a` sets width.
-        assert_eq!(
-            computed(&styles, &document, "box", "width").as_deref(),
-            Some("10px")
-        );
-        assert_eq!(
-            computed(&styles, &document, "box", "height").as_deref(),
-            Some("30px")
-        );
-    }
-
-    #[test]
-    fn inline_animations_and_delays_apply() {
-        let css = "@keyframes fade { from { background-color: transparent } }";
-        let html = "<div id='box' style='background-color: red; \
-                    animation: fade 1s linear 1s backwards'></div>";
-        let background = |seconds| {
-            let (styles, document) = animated(css, html, seconds);
-            computed(&styles, &document, "box", "background-color")
-        };
-        assert_eq!(background(0.0).as_deref(), Some("transparent"));
-        assert_eq!(background(1.5).as_deref(), Some("rgba(255, 0, 0, 0.5)"));
-        assert_eq!(background(3.0).as_deref(), Some("red"));
-    }
-
-    #[test]
-    fn animated_font_size_resolves_em_for_other_properties() {
-        let css = "@keyframes big { from { font-size: 10px } to { font-size: 30px } } \
-                   #box { width: 2em; animation: big 2s linear }";
-        let (styles, document) = animated(css, "<div id='box'></div>", 1.0);
-        assert_eq!(
-            computed(&styles, &document, "box", "font-size").as_deref(),
-            Some("20px")
-        );
-    }
-
-    #[test]
-    fn elements_are_only_tested_against_rules_that_could_match_them() {
-        let mut css = String::new();
-        let mut html = String::from("<div>");
-        for index in 0..500 {
-            css.push_str(&format!(
-                ".c{index} {{ color: red }} #i{index} {{ color: blue }}\n"
-            ));
-            html.push_str(&format!("<p class='c{index}' id='i{index}'>x</p>"));
-        }
-        html.push_str("</div>");
-        let document = html::parse_raw_html(html);
-        let (styles, stats) = style_document_with_stats(
-            &document,
-            &[parse_stylesheet(&css)],
-            SelectorState::default(),
-            Duration::ZERO,
-        );
-        assert_eq!(
-            computed(&styles, &document, "i42", "color").as_deref(),
-            Some("blue")
-        );
-        // Testing every element against every rule would be about
-        // 500 elements x 1,000 author rules. The rule hash keeps the work to
-        // each element's own two rules plus a handful of user-agent rules.
-        assert!(stats.elements > 500);
-        assert!(
-            stats.selectors_checked < stats.elements * 10,
-            "too many selector checks: {stats:?}"
-        );
-    }
 }

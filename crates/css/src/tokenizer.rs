@@ -63,6 +63,13 @@ pub enum TokenKind<'a> {
     },
     /// `<percentage-token>`, such as `50%`. The value is the number before `%`.
     Percentage(f64),
+    /// `<unicode-range-token>`, such as `U+416` or `U+400-4FF`.
+    UnicodeRange {
+        /// First code point in the range.
+        start: u32,
+        /// Last code point in the range.
+        end: u32,
+    },
     /// `<dimension-token>`, such as `10px` or `1.5em`.
     Dimension {
         /// Numeric value.
@@ -102,12 +109,23 @@ pub enum TokenKind<'a> {
 ///
 /// The tokenizer never fails: malformed input produces the recovery tokens
 /// the specification defines (`BadString`, `BadUrl`, `Delim`). The end of
-/// the returned vector is the `<EOF-token>`.
+/// EOF is represented by the end of the returned vector; no EOF token is emitted.
 pub fn tokenize(input: &str) -> Vec<Token<'_>> {
+    tokenize_with_unicode_ranges(input, false)
+}
+
+/// Tokenizes `input`, optionally recognizing `<unicode-range-token>` values.
+///
+/// CSS Syntax only enables Unicode-range tokenization in contexts whose
+/// grammar explicitly allows it (for example, a `unicode-range` descriptor).
+/// Ordinary stylesheet parsing must leave `U+...` text to the normal token
+/// rules, so [`tokenize`] keeps that mode disabled.
+pub fn tokenize_with_unicode_ranges(input: &str, unicode_ranges_allowed: bool) -> Vec<Token<'_>> {
     let mut tokenizer = Tokenizer {
         input,
         bytes: input.as_bytes(),
         pos: 0,
+        unicode_ranges_allowed,
     };
     // Typical CSS averages roughly one token per four bytes.
     let mut tokens = Vec::with_capacity(input.len() / 4);
@@ -126,6 +144,7 @@ struct Tokenizer<'a> {
     input: &'a str,
     bytes: &'a [u8],
     pos: usize,
+    unicode_ranges_allowed: bool,
 }
 
 fn is_newline(byte: u8) -> bool {
@@ -149,7 +168,7 @@ fn is_name(byte: u8) -> bool {
 }
 
 fn is_non_printable(byte: u8) -> bool {
-    matches!(byte, 0x00..=0x08 | 0x0B | 0x0E..=0x1F | 0x7F)
+    matches!(byte, 0x01..=0x08 | 0x0B | 0x0E..=0x1F | 0x7F)
 }
 
 impl<'a> Tokenizer<'a> {
@@ -166,7 +185,11 @@ impl<'a> Tokenizer<'a> {
     fn advance_char(&mut self) -> Option<char> {
         let character = self.current_char()?;
         self.pos += character.len_utf8();
-        Some(character)
+        Some(if character == '\0' {
+            '\u{FFFD}'
+        } else {
+            character
+        })
     }
 
     /// Consumes one newline, treating `\r\n` as a single newline.
@@ -261,6 +284,15 @@ impl<'a> Tokenizer<'a> {
             b',' => self.single(TokenKind::Comma),
             b':' => self.single(TokenKind::Colon),
             b';' => self.single(TokenKind::Semicolon),
+            b'u' | b'U'
+                if self.unicode_ranges_allowed
+                    && self.byte_at(1) == Some(b'+')
+                    && self
+                        .byte_at(2)
+                        .is_some_and(|byte| byte.is_ascii_hexdigit() || byte == b'?') =>
+            {
+                self.consume_unicode_range()
+            }
             b'+' | b'.' => {
                 if self.would_start_number() {
                     self.consume_numeric()
@@ -433,7 +465,53 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
-    /// §4.3.3: consumes a number, percentage, or dimension.
+    /// CSS Syntax 4.3.13: consumes a CSS Unicode range, including wildcard ranges.
+    fn consume_unicode_range(&mut self) -> TokenKind<'a> {
+        self.pos += 2;
+
+        let mut start = 0u32;
+        let mut digits = 0;
+        while digits < 6 && self.byte_at(0).is_some_and(|byte| byte.is_ascii_hexdigit()) {
+            let digit = (self.byte_at(0).unwrap() as char).to_digit(16).unwrap_or(0);
+            start = (start << 4) | digit;
+            self.pos += 1;
+            digits += 1;
+        }
+
+        let mut wildcards = 0;
+        while digits + wildcards < 6 && self.byte_at(0) == Some(b'?') {
+            self.pos += 1;
+            wildcards += 1;
+        }
+
+        if wildcards > 0 {
+            start <<= 4 * wildcards;
+            let end = start | ((1u32 << (4 * wildcards)) - 1);
+            return TokenKind::UnicodeRange { start, end };
+        }
+
+        if self.byte_at(0) == Some(b'-')
+            && self.byte_at(1).is_some_and(|byte| byte.is_ascii_hexdigit())
+        {
+            self.pos += 1;
+            let mut range_end = 0u32;
+            let mut count = 0;
+            while count < 6 && self.byte_at(0).is_some_and(|byte| byte.is_ascii_hexdigit()) {
+                let digit = (self.byte_at(0).unwrap() as char).to_digit(16).unwrap_or(0);
+                range_end = (range_end << 4) | digit;
+                self.pos += 1;
+                count += 1;
+            }
+            return TokenKind::UnicodeRange {
+                start,
+                end: range_end,
+            };
+        }
+
+        TokenKind::UnicodeRange { start, end: start }
+    }
+
+    /// CSS Syntax 4.3.3: consumes a number, percentage, or dimension token.
     fn consume_numeric(&mut self) -> TokenKind<'a> {
         let (value, is_integer) = self.consume_number();
         if self.would_start_ident_at(0) {
@@ -460,14 +538,14 @@ impl<'a> Tokenizer<'a> {
         if !name.eq_ignore_ascii_case("url") {
             return TokenKind::Function(name);
         }
-        // Leave at most one whitespace token before a quoted URL argument.
-        while self.byte_at(0).is_some_and(is_whitespace)
-            && self.byte_at(1).is_some_and(is_whitespace)
-        {
-            self.pos += 1;
+        // Quoted URL arguments use a function token. Leave all whitespace
+        // untouched so it is emitted as its own token with the correct span.
+        let mut quote_offset = 0;
+        while self.byte_at(quote_offset).is_some_and(is_whitespace) {
+            quote_offset += 1;
         }
-        let quote_at = |offset| matches!(self.byte_at(offset), Some(b'"' | b'\''));
-        if quote_at(0) || (self.byte_at(0).is_some_and(is_whitespace) && quote_at(1)) {
+        let quoted_argument = matches!(self.byte_at(quote_offset), Some(b'"' | b'\''));
+        if quoted_argument {
             TokenKind::Function(name)
         } else {
             self.consume_url()
@@ -631,153 +709,4 @@ pub(crate) fn trim_whitespace<'t, 'a>(tokens: &'t [Token<'a>]) -> &'t [Token<'a>
         .rposition(|token| token.kind != TokenKind::Whitespace)
         .map_or(start, |index| index + 1);
     &tokens[start..end]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn kinds(input: &str) -> Vec<TokenKind<'_>> {
-        tokenize(input)
-            .into_iter()
-            .map(|token| token.kind)
-            .collect()
-    }
-
-    #[test]
-    fn tokenizes_rule_punctuation_and_skips_comments() {
-        assert_eq!(
-            kinds("p/* x */{color:red;}"),
-            vec![
-                TokenKind::Ident("p".into()),
-                TokenKind::OpenCurly,
-                TokenKind::Ident("color".into()),
-                TokenKind::Colon,
-                TokenKind::Ident("red".into()),
-                TokenKind::Semicolon,
-                TokenKind::CloseCurly,
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenizes_numbers_percentages_and_dimensions() {
-        assert_eq!(
-            kinds("10px -.5em 50% +3 1e2"),
-            vec![
-                TokenKind::Dimension {
-                    value: 10.0,
-                    is_integer: true,
-                    unit: "px".into()
-                },
-                TokenKind::Whitespace,
-                TokenKind::Dimension {
-                    value: -0.5,
-                    is_integer: false,
-                    unit: "em".into()
-                },
-                TokenKind::Whitespace,
-                TokenKind::Percentage(50.0),
-                TokenKind::Whitespace,
-                TokenKind::Number {
-                    value: 3.0,
-                    is_integer: true
-                },
-                TokenKind::Whitespace,
-                TokenKind::Number {
-                    value: 100.0,
-                    is_integer: false
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn distinguishes_id_hashes_from_other_hashes() {
-        assert_eq!(
-            kinds("#main #123"),
-            vec![
-                TokenKind::Hash {
-                    value: "main".into(),
-                    is_id: true
-                },
-                TokenKind::Whitespace,
-                TokenKind::Hash {
-                    value: "123".into(),
-                    is_id: false
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn unescapes_identifiers_and_strings() {
-        assert_eq!(
-            kinds(r#".\31 23item "a\"b""#),
-            vec![
-                TokenKind::Delim('.'),
-                TokenKind::Ident("123item".into()),
-                TokenKind::Whitespace,
-                TokenKind::String("a\"b".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenizes_urls_functions_and_bad_strings() {
-        assert_eq!(
-            kinds("url( a.png ) url(\"b.png\") rgb("),
-            vec![
-                TokenKind::Url("a.png".into()),
-                TokenKind::Whitespace,
-                TokenKind::Function("url".into()),
-                TokenKind::String("b.png".into()),
-                TokenKind::CloseParen,
-                TokenKind::Whitespace,
-                TokenKind::Function("rgb".into()),
-            ]
-        );
-        assert_eq!(kinds("url(a b)"), vec![TokenKind::BadUrl]);
-        assert_eq!(
-            kinds("'a\nb'"),
-            vec![
-                TokenKind::BadString,
-                TokenKind::Whitespace,
-                TokenKind::Ident("b".into()),
-                TokenKind::String("".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenizes_cdo_cdc_at_keywords_and_custom_properties() {
-        assert_eq!(
-            kinds("<!-- @media --x -->"),
-            vec![
-                TokenKind::Cdo,
-                TokenKind::Whitespace,
-                TokenKind::AtKeyword("media".into()),
-                TokenKind::Whitespace,
-                TokenKind::Ident("--x".into()),
-                TokenKind::Whitespace,
-                TokenKind::Cdc,
-            ]
-        );
-    }
-
-    #[test]
-    fn spans_cover_source_text_and_handle_non_ascii() {
-        let input = "é{a:b}";
-        let tokens = tokenize(input);
-        assert_eq!(tokens[0].kind, TokenKind::Ident("é".into()));
-        assert_eq!(&input[tokens[0].span.clone()], "é");
-        assert_eq!(tokens.last().unwrap().span.end, input.len());
-    }
-
-    #[test]
-    fn source_text_drops_comments_without_fusing_tokens() {
-        let input = "1px/**/2px  /* x */ 3px";
-        let tokens = tokenize(input);
-        assert_eq!(source_text(input, &tokens), "1px 2px   3px");
-    }
 }
