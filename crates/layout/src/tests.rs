@@ -1693,7 +1693,8 @@ mod control_text {
         assert_eq!(texts(box_for(&tree, &document, "a")), ["Submit"]);
         assert_eq!(texts(box_for(&tree, &document, "b")), ["Reset"]);
         let c = box_for(&tree, &document, "c");
-        assert!(texts(c).is_empty());
+        // Only the empty strut line.
+        assert_eq!(texts(c), [""]);
         // No text, but the box keeps one line of height.
         assert_close(c.content_rect().height, LINE);
     }
@@ -1706,7 +1707,7 @@ mod control_text {
         let (document, tree) = lay_out(html, CSS, 800.0);
         assert_eq!(texts(box_for(&tree, &document, "a")), ["Google Search"]);
         assert_eq!(texts(box_for(&tree, &document, "b")), ["Lucky"]);
-        assert!(texts(box_for(&tree, &document, "c")).is_empty());
+        assert_eq!(texts(box_for(&tree, &document, "c")), [""]);
     }
 
     #[test]
@@ -1722,5 +1723,18 @@ mod control_text {
         assert_close(text.rect.width, 4.0 * 8.0);
         assert_close(text.rect.x - content.x, (200.0 - 32.0) / 2.0);
         assert_close(input.lines[0].rect.y - content.y, 10.0);
+    }
+
+    #[test]
+    fn empty_single_line_controls_align_with_filled_ones() {
+        let html = "<p><input id='a'><input id='b' value='x'>\
+            <input id='c' type='button'><input id='d' type='submit'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let a = box_for(&tree, &document, "a").rect;
+        for id in ["b", "c", "d"] {
+            let rect = box_for(&tree, &document, id).rect;
+            assert_close(rect.y, a.y);
+            assert_close(rect.height, a.height);
+        }
     }
 }
