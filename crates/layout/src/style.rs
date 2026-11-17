@@ -2,7 +2,8 @@
 //!
 //! [`css::style_document`] produces cascaded, inherited declarations as text.
 //! This module parses `display`, box dimensions and edges, `box-sizing`, text
-//! colors, `text-align`, `border-*-radius`, `box-shadow`, and the flex subset
+//! colors, `text-align`, `border-*-radius`, `box-shadow`, `position`, `float`,
+//! the inset properties (`top`, `right`, `bottom`, `left`), and the flex subset
 //! (`flex-direction`, `flex-grow`, `flex-shrink`, `flex-basis`, and `gap`). Other
 //! properties use their initial values. A missing or unparsable value falls back to the initial
 //! value. Lengths are resolved to CSS pixels here; percentages are kept
@@ -185,6 +186,57 @@ impl Display {
                 outside: DisplayOutside::Block,
                 inside,
             },
+        }
+    }
+}
+
+/// The computed `position` value (CSS Positioned Layout 3 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Position {
+    /// Normal flow; the inset properties do not apply.
+    #[default]
+    Static,
+    /// Laid out in flow, then shifted by its insets.
+    Relative,
+    /// Out of flow, placed against the nearest positioned ancestor.
+    Absolute,
+    /// Out of flow, placed against the viewport.
+    Fixed,
+    /// Laid out in flow. Scroll-dependent sticking is not implemented, so it
+    /// behaves as `relative` with zero offsets.
+    Sticky,
+}
+
+impl Position {
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "static" => Some(Self::Static),
+            "relative" => Some(Self::Relative),
+            "absolute" => Some(Self::Absolute),
+            "fixed" => Some(Self::Fixed),
+            "sticky" | "-webkit-sticky" => Some(Self::Sticky),
+            _ => None,
+        }
+    }
+}
+
+/// The computed `float` value (CSS 2.2 §9.5.1). Text is always
+/// left-to-right, so `inline-start` is `left` and `inline-end` is `right`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Float {
+    #[default]
+    None,
+    Left,
+    Right,
+}
+
+impl Float {
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "left" | "inline-start" => Some(Self::Left),
+            "right" | "inline-end" => Some(Self::Right),
+            _ => None,
         }
     }
 }
@@ -418,6 +470,39 @@ pub(crate) struct ComputedStyle {
     /// The text a `::before` / `::after` box holds, from the `content`
     /// property. `None` means no box is generated. Ignored on elements.
     pub content: Option<String>,
+    pub position: Position,
+    /// The computed `float`; always [`Float::None`] for absolutely
+    /// positioned boxes (CSS 2.2 §9.7).
+    pub float: Float,
+    /// The `top`, `right`, `bottom`, and `left` insets; `auto` by default.
+    pub inset: Sides<Dimension>,
+    /// Whether the specified `display` was inline-level before floating or
+    /// absolute positioning blockified it. It decides an absolutely
+    /// positioned box's static position inside a line.
+    pub blockified_from_inline: bool,
+}
+
+impl ComputedStyle {
+    /// Whether the box is taken out of flow by `position: absolute|fixed`.
+    pub(crate) fn is_absolutely_positioned(&self) -> bool {
+        matches!(self.position, Position::Absolute | Position::Fixed)
+    }
+
+    /// Whether the box is floated.
+    pub(crate) fn is_floated(&self) -> bool {
+        self.float != Float::None
+    }
+
+    /// Whether the box is floated or absolutely positioned.
+    pub(crate) fn is_out_of_flow(&self) -> bool {
+        self.is_floated() || self.is_absolutely_positioned()
+    }
+
+    /// Whether `position` is anything but `static`, which makes the box the
+    /// containing block of absolutely positioned descendants.
+    pub(crate) fn is_positioned(&self) -> bool {
+        self.position != Position::Static
+    }
 }
 
 /// Parses a `content` value into the text a generated box holds.
@@ -537,6 +622,10 @@ impl ComputedStyle {
             flex_basis: Dimension::Auto,
             flex_shrink: 1.0,
             gap: 0.0,
+            position: Position::Static,
+            float: Float::None,
+            inset: Sides::from_array([Dimension::Auto; 4]),
+            blockified_from_inline: false,
         }
     }
 
@@ -607,6 +696,35 @@ impl ComputedStyle {
             }
         }
         style.text_align = TextAlign::compute(get("text-align"), parent_text_align);
+        if let Some(value) = get("position") {
+            match Position::parse(value) {
+                Some(position) => style.position = position,
+                None if is_css_wide_keyword(value) => {}
+                None => log::debug!("ignoring invalid position value {value:?}; using static"),
+            }
+        }
+        if let Some(value) = get("float") {
+            match Float::parse(value) {
+                Some(float) => style.float = float,
+                None if is_css_wide_keyword(value) => {}
+                None => log::debug!("ignoring invalid float value {value:?}; using none"),
+            }
+        }
+        // CSS 2.2 §9.7: absolute positioning wins over floating, and both
+        // blockify the display type. `display: contents` generates no box,
+        // so there is nothing to blockify.
+        if style.is_absolutely_positioned() {
+            style.float = Float::None;
+        }
+        if style.is_out_of_flow()
+            && let Display::Box { outside, inside } = style.display
+        {
+            style.blockified_from_inline = outside == DisplayOutside::Inline;
+            style.display = Display::Box {
+                outside: DisplayOutside::Block,
+                inside,
+            };
+        }
         if let Some(value) = get("background-color") {
             style.background_color = css::parse_color(value);
             if style.background_color.is_none() && !is_no_color_keyword(value) {
@@ -667,6 +785,10 @@ impl ComputedStyle {
             }))
         };
         style.margin = side("margin", true, true);
+        style.inset = Sides::from_array(
+            ["top", "right", "bottom", "left"]
+                .map(|property| dimension(property, true, true).unwrap_or(Dimension::Auto)),
+        );
         style.padding = side("padding", false, false);
         style.width = dimension("width", true, false).unwrap_or(Dimension::Auto);
         style.height = dimension("height", true, false).unwrap_or(Dimension::Auto);
@@ -921,6 +1043,50 @@ mod tests {
         );
         assert_eq!(radius.bottom_right, CornerRadius::default());
         assert_eq!(radius.bottom_left, CornerRadius::default());
+    }
+
+    #[test]
+    fn position_float_and_insets_parse_and_blockify() {
+        let plain = style(&[]);
+        assert_eq!(plain.position, Position::Static);
+        assert_eq!(plain.float, Float::None);
+        assert_eq!(plain.inset.top, Dimension::Auto);
+
+        let absolute = style(&[
+            ("position", "ABSOLUTE"),
+            ("float", "left"),
+            ("top", "-5px"),
+            ("left", "10%"),
+        ]);
+        assert_eq!(absolute.position, Position::Absolute);
+        assert_eq!(absolute.float, Float::None);
+        assert_eq!(absolute.inset.top, Dimension::Px(-5.0));
+        assert_eq!(absolute.inset.left, Dimension::Percent(10.0));
+        assert_eq!(absolute.inset.right, Dimension::Auto);
+        assert!(absolute.blockified_from_inline);
+        assert!(matches!(
+            absolute.display,
+            Display::Box {
+                outside: DisplayOutside::Block,
+                ..
+            }
+        ));
+
+        let floated = style(&[("display", "inline-block"), ("float", "inline-end")]);
+        assert_eq!(floated.float, Float::Right);
+        assert_eq!(
+            floated.display,
+            Display::Box {
+                outside: DisplayOutside::Block,
+                inside: DisplayInside::FlowRoot
+            }
+        );
+        assert_eq!(style(&[("position", "bogus")]).position, Position::Static);
+        assert_eq!(style(&[("float", "middle")]).float, Float::None);
+        assert_eq!(
+            style(&[("position", "-webkit-sticky")]).position,
+            Position::Sticky
+        );
     }
 
     #[test]

@@ -118,9 +118,11 @@ pub struct Platform {
     /// one that loads is used; if none loads, pages use the built-in bitmap
     /// font.
     pub page_font_files: fn() -> Vec<PathBuf>,
-    /// Logical width at the toolbar's left that the system's window buttons
-    /// cover when they overlap the toolbar, as macOS's traffic lights do on a
-    /// transparent titlebar. Zero when the system draws its buttons in a
+    /// Logical width at the tab strip's left reserved for the system's window
+    /// buttons when they overlap the window contents, as macOS's traffic
+    /// lights do on a transparent titlebar, including the gap before the
+    /// first tab. Only the tab strip row reserves it; the toolbar below starts
+    /// at the window edge. Zero when the system draws its buttons in a
     /// separate titlebar above the window contents.
     pub window_controls_inset: f32,
 }
@@ -138,6 +140,9 @@ struct App {
     tabs: TabManager,
     inactive: HashMap<TabId, TabState>,
     tab_pressed: Option<TabAction>,
+    /// Tab under the middle button when it was pressed; released over the
+    /// same tab, that tab closes.
+    middle_tab_pressed: Option<TabId>,
     strip_offset: usize,
     refresh: Option<browser::refresh::RefreshClient>,
     modifiers: ModifiersState,
@@ -243,7 +248,7 @@ impl App {
         let id = tabs.open("byui://welcome");
         let alerts = Arc::new(PageAlerts::new());
         alerts.set_document(id, 0);
-        let mut tab = TabState::new(id, platform.window_controls_inset);
+        let mut tab = TabState::new(id);
         tab.chrome.dark = appearance.is_dark(None);
         Self {
             refresh,
@@ -259,6 +264,7 @@ impl App {
             tabs,
             inactive: HashMap::new(),
             tab_pressed: None,
+            middle_tab_pressed: None,
             strip_offset: 0,
             modifiers: ModifiersState::default(),
             cursor: None,
@@ -368,6 +374,7 @@ impl App {
         self.elements_close_pressed = false;
         self.page_press = false;
         self.tab_pressed = None;
+        self.middle_tab_pressed = None;
         self.tab.chrome.dark = self.appearance_dark();
         self.tab.chrome.hovered = None;
         self.tab.chrome.pressed = None;
@@ -398,10 +405,7 @@ impl App {
 
     fn new_tab(&mut self) {
         let id = self.tabs.open("byui://welcome");
-        let old = std::mem::replace(
-            &mut self.tab,
-            TabState::new(id, self.platform.window_controls_inset),
-        );
+        let old = std::mem::replace(&mut self.tab, TabState::new(id));
         self.inactive.insert(old.id, old);
         self.alerts.set_document(id, 0);
         if let Some(proxy) = self.proxy.clone() {
@@ -1478,7 +1482,6 @@ impl App {
         Some(toolbar::address_offset_at(
             x,
             width,
-            self.platform.window_controls_inset,
             scale as f32,
             self.font.as_ref(),
             &self.tab.address,
@@ -1567,12 +1570,7 @@ impl App {
             .inner_size()
             .to_logical::<f64>(window.scale_factor())
             .width;
-        self.set_hovered(toolbar::hit_test(
-            x,
-            y,
-            width,
-            self.platform.window_controls_inset,
-        ));
+        self.set_hovered(toolbar::hit_test(x, y, width));
     }
 
     fn dismiss_context_menu(&mut self) {
@@ -1588,7 +1586,7 @@ impl App {
     fn site_info_popup(&self) -> Option<site_info::Popup> {
         let window = self.window.as_ref()?;
         let size = window.inner_size().to_logical::<f64>(window.scale_factor());
-        site_info::Popup::new(size.width, size.height, self.platform.window_controls_inset)
+        site_info::Popup::new(size.width, size.height)
     }
 
     fn site_info_url(&self) -> &str {
@@ -2070,6 +2068,29 @@ impl App {
         self.set_hovered(None);
         self.frame_key = None;
         self.redraw();
+    }
+
+    /// Middle-clicking a tab closes it, like other desktop browsers. The tab
+    /// closes on release, and only when the release lands on the pressed tab.
+    fn middle_mouse_input(&mut self, state: ElementState) {
+        let on_strip = self
+            .cursor
+            .is_some_and(|(_, y)| (0.0..crate::tab_strip::HEIGHT).contains(&y));
+        let tab = if on_strip {
+            self.strip().tab_at(self.cursor)
+        } else {
+            None
+        };
+        match state {
+            ElementState::Pressed => self.middle_tab_pressed = tab,
+            ElementState::Released => {
+                if let Some(id) = self.middle_tab_pressed.take().filter(|id| Some(*id) == tab) {
+                    self.dismiss_context_menu();
+                    self.dismiss_site_info();
+                    self.close_tab(id);
+                }
+            }
+        }
     }
 
     fn left_mouse_input(&mut self, state: ElementState) {
@@ -2620,8 +2641,7 @@ impl App {
             self.redraw();
             return;
         }
-        let inset = self.platform.window_controls_inset;
-        self.set_hovered(toolbar::hit_test(x, y, width, inset));
+        self.set_hovered(toolbar::hit_test(x, y, width));
     }
 
     /// Sets the page's `:hover` element to the one under the pointer and
@@ -2667,7 +2687,7 @@ impl App {
                     .inner_size()
                     .to_logical::<f64>(window.scale_factor())
                     .width;
-                toolbar::hit_test(x, y, width, self.platform.window_controls_inset)
+                toolbar::hit_test(x, y, width)
             });
             // Disabled controls still occupy toolbar space. Do not let a
             // click on Back or Forward fall through to dragging or zooming.
@@ -2760,7 +2780,7 @@ impl App {
             } else {
                 0.0
             }
-            && toolbar::hit_test(x, y, width, self.platform.window_controls_inset).is_none()
+            && toolbar::hit_test(x, y, width).is_none()
     }
 }
 
@@ -3031,6 +3051,11 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => self.left_mouse_input(state),
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Middle,
+                ..
+            } => self.middle_mouse_input(state),
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Right,
@@ -4794,7 +4819,7 @@ mod tab_tests {
     #[test]
     fn site_info_dismissal_preserves_address_editing_and_find_state() {
         let mut app = app();
-        let popup = site_info::Popup::new(800.0, 600.0, 0.0).unwrap();
+        let popup = site_info::Popup::new(800.0, 600.0).unwrap();
         app.tab.address = "https://draft.test/".into();
         app.tab.chrome.address_focused = true;
         app.tab.chrome.address_caret = 11;
@@ -5281,6 +5306,59 @@ mod tab_tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn middle_click_closes_the_tab_released_on_and_ignores_drags_off_it() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let first = app.tab.id;
+        app.new_tab();
+        let second = app.tab.id;
+        app.new_tab();
+        let third = app.tab.id;
+        let center = |app: &App, id: TabId| {
+            let rect = app
+                .strip()
+                .regions
+                .into_iter()
+                .find(|(a, _)| *a == TabAction::Select(id))
+                .unwrap()
+                .1;
+            Some((
+                (rect.x() + rect.width() / 3.0) as f64,
+                (rect.y() + rect.height() / 2.0) as f64,
+            ))
+        };
+
+        // Pressing on one tab and releasing on another closes nothing.
+        app.cursor = center(&app, first);
+        app.middle_mouse_input(ElementState::Pressed);
+        app.cursor = center(&app, second);
+        app.middle_mouse_input(ElementState::Released);
+        assert_eq!(app.tabs.tab_count(), 3);
+
+        // Middle-clicking an inactive tab closes it without changing selection.
+        app.cursor = center(&app, first);
+        app.middle_mouse_input(ElementState::Pressed);
+        app.middle_mouse_input(ElementState::Released);
+        assert!(app.tab_state(first).is_none());
+        assert_eq!(app.tab.id, third);
+
+        // Middle-clicking the active tab closes it and activates a neighbor.
+        app.cursor = center(&app, third);
+        app.middle_mouse_input(ElementState::Pressed);
+        app.middle_mouse_input(ElementState::Released);
+        assert!(app.tab_state(third).is_none());
+        assert_eq!(app.tab.id, second);
+        assert!(!app.page_press);
+
+        // Middle-clicking the page leaves the last tab alone.
+        app.cursor = Some((200.0, crate::tab_strip::HEIGHT + 200.0));
+        app.middle_mouse_input(ElementState::Pressed);
+        app.middle_mouse_input(ElementState::Released);
+        assert_eq!(app.tabs.tab_count(), 1);
+        assert!(!app.exit_requested);
     }
 
     #[test]

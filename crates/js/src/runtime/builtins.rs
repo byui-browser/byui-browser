@@ -10,6 +10,7 @@ type Values = Arc<Mutex<Vec<Value>>>;
 /// Installs the standard-library objects supported by the engine.
 pub(super) fn install(state: &super::GlobalState) {
     super::primitives::install(state);
+    super::errors::install(state);
 
     state.install_host("Map", Value::Function(map_constructor()));
     state.install_host("Set", Value::Function(set_constructor()));
@@ -81,7 +82,7 @@ pub(crate) fn value(name: &str) -> Option<Value> {
         "ArrayBuffer" => Some(Value::Function(array_buffer_constructor())),
         "Uint8Array" => Some(Value::Function(uint8_array_constructor())),
         "Reflect" => Some(Value::Object(reflect_namespace())),
-        _ => None,
+        _ => super::global_functions::value(name).or_else(|| super::errors::value(name)),
     }
 }
 

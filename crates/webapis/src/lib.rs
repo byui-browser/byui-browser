@@ -19,6 +19,7 @@ mod event;
 mod fetch;
 pub mod local_storage;
 mod location;
+mod node_tree;
 mod selection;
 mod selector;
 pub mod session_storage;
@@ -44,6 +45,7 @@ pub use fetch::{fetch, register_fetch, register_fetch_with_url};
 pub use location::{
     LocationNavigate, NavigationBehavior, register_location, register_location_with_navigation,
 };
+pub use node_tree::{ClientSize, NodeInput};
 pub use selector::SelectorError;
 pub use timer::{TimerId, TimerQueue};
 pub use window::{

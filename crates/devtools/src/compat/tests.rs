@@ -206,3 +206,89 @@ fn findings_are_sorted_by_area_then_frequency() {
     );
     assert_eq!(line_at("a\nb\nc", 2), 2);
 }
+
+#[test]
+fn parse_failures_carry_a_preview_of_the_failing_line() {
+    let script = "var a = 1;\nvar b = 2;\nvar c = ;\nvar d = 4;";
+    let error = js::parse(script).expect_err("`var c = ;` is not valid");
+    let run_error = format!("{error}");
+    let report = audit("<script>x</script>", &[], &[script], Some(&run_error));
+    let failure = report
+        .findings
+        .iter()
+        .find(|finding| finding.feature == "inline script #1 cannot be parsed")
+        .expect("the script cannot be parsed");
+    let preview = failure.preview.as_ref().expect("parse failures show code");
+    assert_eq!(preview.source, "inline script #1");
+    assert_eq!(preview.line, 3);
+    assert_eq!(preview.column, error.column);
+    assert_eq!(preview.first_line, 1);
+    assert_eq!(preview.lines.len(), 4, "the whole short script fits");
+    assert_eq!(preview.focus(), "var c = ;");
+    // The observed run error points at the same spot, so it shares the preview.
+    let stopped = report
+        .findings
+        .iter()
+        .find(|finding| finding.feature == "Page scripts stopped with an error")
+        .unwrap();
+    assert_eq!(stopped.preview.as_ref(), Some(preview));
+}
+
+#[test]
+fn located_findings_get_previews_and_unlocated_ones_do_not() {
+    let script = "var total = 0;\nfor (var i = 0; i < 3; i++) { total += i; }";
+    let css = ".a { color: red; }\n.box { text-shadow: 1px 1px #000; }";
+    let report = audit("<div class=\"box\"></div>", &[css], &[script], None);
+    let for_loop = report
+        .findings
+        .iter()
+        .find(|finding| finding.feature == "for (;;) loops")
+        .unwrap();
+    let preview = for_loop.preview.as_ref().expect("script line is known");
+    assert_eq!(preview.line, 2);
+    assert_eq!(preview.column, None);
+    assert!(preview.focus().starts_with("for (var i"));
+    let shadow = report
+        .findings
+        .iter()
+        .find(|finding| finding.feature == "text-shadow")
+        .unwrap();
+    assert_eq!(
+        shadow.preview.as_ref().map(SourcePreview::focus),
+        Some(".box { text-shadow: 1px 1px #000; }")
+    );
+}
+
+#[test]
+fn data_block_scripts_preview_their_first_lines() {
+    let report = audit(
+        "<script type=\"application/ld+json\">{\"a\": 1}</script>",
+        &[],
+        &["{\"a\": 1}"],
+        None,
+    );
+    let block = report
+        .findings
+        .iter()
+        .find(|finding| finding.feature == "<script type=\"application/ld+json\">")
+        .unwrap();
+    assert_eq!(
+        block.preview.as_ref().map(SourcePreview::focus),
+        Some("{\"a\": 1}")
+    );
+}
+
+#[test]
+fn previews_window_long_minified_lines_around_the_column() {
+    let line = format!("{}BAD{}", "x".repeat(10_000), "y".repeat(10_000));
+    let preview = SourcePreview::new("min.js", &line, 1, Some(10_001)).unwrap();
+    assert_eq!(preview.first_line, 1);
+    assert_eq!(preview.lines.len(), 1);
+    assert!(preview.lines[0].chars().count() <= SourcePreview::MAX_COLUMNS);
+    let at = preview.column.unwrap() - preview.first_column;
+    assert!(preview.lines[0][at..].starts_with("BAD"));
+    assert!(SourcePreview::new("min.js", &line, 2, None).is_none());
+    // Tabs are shown as single spaces so columns stay accurate.
+    let tabbed = SourcePreview::new("t.js", "\tvar a;", 1, Some(2)).unwrap();
+    assert_eq!(tabbed.focus(), " var a;");
+}

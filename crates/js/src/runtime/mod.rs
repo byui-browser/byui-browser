@@ -37,7 +37,9 @@
 mod array;
 pub(crate) mod builtins;
 mod conversions;
+mod errors;
 mod expressions;
+mod global_functions;
 mod object;
 mod operators;
 mod primitives;
