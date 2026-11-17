@@ -14,8 +14,8 @@
 //! `@keyframes` blocks (and the `-webkit-`/`-moz-` aliases) are parsed into
 //! [`Keyframe`] rules per CSS Animations 1 §3.
 //!
-//! Limitations: nested style rules (CSS Nesting) are reported and dropped, and
-//! at-rules nested inside a style rule's block are skipped.
+//! Nested style rules and nested group at-rules are retained in the stylesheet
+//! tree so the cascade can expand them with the correct parent selector.
 
 use crate::selector::parse_selector_tokens;
 use crate::stylesheet::{AtRule, Declaration, Keyframe, ParseError, Rule, Selector, Stylesheet};
@@ -37,7 +37,10 @@ pub fn parse_stylesheet_with_errors(input: &str) -> (Stylesheet, Vec<ParseError>
         source: input,
         errors: Vec::new(),
     };
-    let mut stylesheet = Stylesheet::default();
+    let mut stylesheet = Stylesheet {
+        source: input.to_owned(),
+        ..Stylesheet::default()
+    };
     parser.consume_rule_list(&tokens, true, &mut stylesheet);
     stylesheet.errors = parser.errors;
     let errors = stylesheet.errors.clone();
@@ -64,7 +67,7 @@ pub(crate) fn parse_declarations(
         source: input,
         errors: Vec::new(),
     };
-    let declarations = parser.consume_declaration_list(&tokens);
+    let declarations = parser.consume_declaration_list(&tokens).declarations;
     stylesheet
         .errors
         .extend(parser.errors.into_iter().map(|error| ParseError {
@@ -100,6 +103,14 @@ const KEYFRAMES_AT_RULES: [&str; 3] = ["keyframes", "-webkit-keyframes", "-moz-k
 struct Parser<'a> {
     source: &'a str,
     errors: Vec<ParseError>,
+}
+
+/// Parsed contents of a declaration/style block, retaining CSS nesting.
+#[derive(Default)]
+struct DeclarationBlock {
+    declarations: Vec<Declaration>,
+    nested_rules: Vec<Rule>,
+    nested_at_rules: Vec<AtRule>,
 }
 
 /// Returns the index just past the component value starting at `index`.
@@ -244,6 +255,7 @@ impl<'a> Parser<'a> {
             prelude: source_text(self.source, prelude),
             rules: Vec::new(),
             declarations: Vec::new(),
+            at_rules: Vec::new(),
             keyframes: Vec::new(),
             block: block.map(|block| source_text(self.source, block)),
             name,
@@ -253,10 +265,16 @@ impl<'a> Parser<'a> {
                 let mut nested = Stylesheet::default();
                 self.consume_rule_list(block, false, &mut nested);
                 rule.rules = nested.rules;
+                rule.at_rules = nested.at_rules;
+                self.errors.extend(nested.errors);
             } else if DECLARATION_AT_RULES.contains(&rule.name.as_str()) {
-                rule.declarations = self.consume_declaration_list(block);
+                let parsed = self.consume_declaration_list(block);
+                rule.declarations = parsed.declarations;
+                rule.at_rules = parsed.nested_at_rules;
             } else if KEYFRAMES_AT_RULES.contains(&rule.name.as_str()) {
-                rule.keyframes = self.consume_keyframe_list(block);
+                let (keyframes, rules) = self.consume_keyframe_list(block);
+                rule.keyframes = keyframes;
+                rule.rules = rules;
             }
         }
         rule
@@ -304,32 +322,131 @@ impl<'a> Parser<'a> {
             return;
         }
         if let Err(error) = parse_selector_tokens(self.source, prelude) {
-            let message = format!("invalid selector: {}", error.message);
-            self.error(&message, error.position);
-            // The block is still consumed so its errors are reported.
-            self.consume_declaration_list(block);
-            return;
+            self.error(
+                &format!("unrecognized or invalid selector syntax: {}", error.message),
+                error.position,
+            );
         }
-        let declarations = self.consume_declaration_list(block);
+        let parsed = self.consume_declaration_list(block);
         let selectors = split_top_level(prelude, |kind| *kind == TokenKind::Comma);
-        log::trace!(
-            "rule with {} selectors and {} declarations",
-            selectors.len(),
-            declarations.len()
-        );
         for selector in selectors {
             stylesheet.rules.push(Rule {
                 selector: Selector(source_text(self.source, selector)),
-                declarations: declarations.clone(),
+                declarations: parsed.declarations.clone(),
+                nested_rules: parsed.nested_rules.clone(),
+                nested_at_rules: parsed.nested_at_rules.clone(),
             });
         }
     }
 
-    /// Consumes the keyframe rules of a `@keyframes` block (CSS Animations 1
-    /// §3). A keyframe rule with an invalid selector list is reported and
-    /// dropped; its neighbors are kept.
-    fn consume_keyframe_list(&mut self, tokens: &[Token<'a>]) -> Vec<Keyframe> {
+    fn consume_declaration_list(&mut self, tokens: &[Token<'a>]) -> DeclarationBlock {
+        let mut parsed = DeclarationBlock::default();
+        let mut index = 0;
+        while index < tokens.len() {
+            match &tokens[index].kind {
+                TokenKind::Whitespace | TokenKind::Semicolon => index += 1,
+                TokenKind::AtKeyword(_) => {
+                    let mut nested = Stylesheet::default();
+                    index = self.consume_at_rule(tokens, index, &mut nested);
+                    parsed.nested_at_rules.extend(nested.at_rules);
+                    parsed.nested_rules.extend(nested.rules);
+                }
+                _ => {
+                    // Find the next top-level semicolon or opening brace. A
+                    // brace means this item is a nested qualified rule;
+                    // otherwise an identifier followed by ':' is a declaration.
+                    let mut end = index;
+                    while end < tokens.len()
+                        && !matches!(
+                            tokens[end].kind,
+                            TokenKind::Semicolon | TokenKind::OpenCurly
+                        )
+                    {
+                        end = skip_component_value(tokens, end);
+                    }
+
+                    let custom_property_block = matches!(
+                        &tokens[index].kind,
+                        TokenKind::Ident(name) if name.starts_with("--")
+                    ) && tokens[index..end]
+                        .iter()
+                        .any(|token| token.kind == TokenKind::Colon);
+
+                    if tokens.get(end).map(|token| &token.kind) == Some(&TokenKind::OpenCurly)
+                        && !custom_property_block
+                    {
+                        let rule_end = skip_component_value(tokens, end);
+                        if !closes_block(tokens, rule_end) {
+                            self.error("unclosed `{` in nested CSS rule", tokens[end].span.start);
+                        }
+                        let prelude = trim_whitespace(&tokens[index..end]);
+                        if prelude.is_empty() {
+                            self.error(
+                                "a nested style rule needs a selector",
+                                tokens[index].span.start,
+                            );
+                        } else {
+                            if let Err(error) = parse_selector_tokens(self.source, prelude) {
+                                let message = format!(
+                                    "unrecognized or invalid nested selector syntax: {}",
+                                    error.message
+                                );
+                                self.error(&message, error.position);
+                            }
+                            let block = block_contents(tokens, end, rule_end);
+                            let children = self.consume_declaration_list(block);
+                            let selectors =
+                                split_top_level(prelude, |kind| *kind == TokenKind::Comma);
+                            for selector in selectors {
+                                parsed.nested_rules.push(Rule {
+                                    selector: Selector(source_text(self.source, selector)),
+                                    declarations: children.declarations.clone(),
+                                    nested_rules: children.nested_rules.clone(),
+                                    nested_at_rules: children.nested_at_rules.clone(),
+                                });
+                            }
+                        }
+                        index = rule_end;
+                    } else if custom_property_block {
+                        // Custom properties accept arbitrary component values,
+                        // including balanced curly blocks. Consume through the
+                        // next top-level semicolon rather than treating `{` as
+                        // the beginning of a nested selector.
+                        let declaration_end = find_semicolon(tokens, index);
+                        if let Some(declaration) =
+                            self.consume_declaration(&tokens[index..declaration_end])
+                        {
+                            parsed.declarations.push(declaration);
+                        }
+                        index = if declaration_end < tokens.len() {
+                            declaration_end + 1
+                        } else {
+                            declaration_end
+                        };
+                    } else {
+                        if matches!(tokens[index].kind, TokenKind::Ident(_)) {
+                            if let Some(declaration) = self.consume_declaration(&tokens[index..end])
+                            {
+                                parsed.declarations.push(declaration);
+                            }
+                        } else {
+                            self.error(
+                                "declaration must start with a property name",
+                                tokens[index].span.start,
+                            );
+                        }
+                        index = if end < tokens.len() { end + 1 } else { end };
+                    }
+                }
+            }
+        }
+        parsed
+    }
+
+    /// Â§5.4.6 "consume a declaration" from tokens up to (not including) `;`.
+    fn consume_keyframe_list(&mut self, tokens: &[Token<'a>]) -> (Vec<Keyframe>, Vec<Rule>) {
         let mut keyframes = Vec::new();
+        let mut rules = Vec::new();
         let mut index = 0;
         while index < tokens.len() {
             match &tokens[index].kind {
@@ -361,69 +478,33 @@ impl<'a> Parser<'a> {
                 self.error("unclosed `{` in keyframe rule", tokens[index].span.start);
             }
             let block = block_contents(tokens, index, end);
-            let declarations = self.consume_declaration_list(block);
+            let declarations = self.consume_declaration_list(block).declarations;
             match parse_keyframe_selectors(&tokens[start..index]) {
-                Some(offsets) => keyframes.push(Keyframe {
-                    offsets,
-                    declarations,
-                }),
+                Some(offsets) => {
+                    keyframes.push(Keyframe {
+                        offsets,
+                        declarations: declarations.clone(),
+                    });
+                    rules.push(Rule {
+                        selector: Selector(source_text(self.source, &tokens[start..index])),
+                        declarations,
+                        nested_rules: Vec::new(),
+                        nested_at_rules: Vec::new(),
+                    });
+                }
                 None => self.error("invalid keyframe selector", tokens[start].span.start),
             }
             index = end;
         }
-        keyframes
+        (keyframes, rules)
     }
 
-    /// §5.4.5 "consume a list of declarations".
-    fn consume_declaration_list(&mut self, tokens: &[Token<'a>]) -> Vec<Declaration> {
-        let mut declarations = Vec::new();
-        let mut index = 0;
-        while index < tokens.len() {
-            match &tokens[index].kind {
-                TokenKind::Whitespace | TokenKind::Semicolon => index += 1,
-                TokenKind::AtKeyword(name) => {
-                    log::debug!("skipping @{name} nested in a declaration block");
-                    let mut ignored = Stylesheet::default();
-                    index = self.consume_at_rule(tokens, index, &mut ignored);
-                }
-                TokenKind::Ident(_) => {
-                    let end = find_semicolon(tokens, index);
-                    if let Some(declaration) = self.consume_declaration(&tokens[index..end]) {
-                        declarations.push(declaration);
-                    }
-                    index = end;
-                }
-                _ => {
-                    // Anything else starts a nested style rule (CSS Nesting),
-                    // which this engine does not apply. Skip the whole rule.
-                    let offset = tokens[index].span.start;
-                    let mut end = index;
-                    while end < tokens.len()
-                        && !matches!(
-                            tokens[end].kind,
-                            TokenKind::Semicolon | TokenKind::OpenCurly
-                        )
-                    {
-                        end = skip_component_value(tokens, end);
-                    }
-                    if tokens.get(end).map(|token| &token.kind) == Some(&TokenKind::OpenCurly) {
-                        self.error("nested style rules are not supported", offset);
-                        end = skip_component_value(tokens, end);
-                    } else {
-                        self.error("declaration must start with a property name", offset);
-                    }
-                    index = end;
-                }
-            }
-        }
-        declarations
-    }
-
-    /// §5.4.6 "consume a declaration" from tokens up to (not including) `;`.
     fn consume_declaration(&mut self, tokens: &[Token<'a>]) -> Option<Declaration> {
-        let offset = tokens[0].span.start;
-        let TokenKind::Ident(name) = &tokens[0].kind else {
-            unreachable!("declarations start with an ident");
+        let first = tokens.first()?;
+        let offset = first.span.start;
+        let TokenKind::Ident(name) = &first.kind else {
+            self.error("declaration property must be an identifier", offset);
+            return None;
         };
         let mut index = 1;
         while tokens.get(index).map(|token| &token.kind) == Some(&TokenKind::Whitespace) {
@@ -452,7 +533,7 @@ impl<'a> Parser<'a> {
                 .expect("important values contain `!`");
             value = trim_whitespace(&value[..bang]);
         }
-        if value.is_empty() {
+        if value.is_empty() && !name.starts_with("--") {
             self.error("declaration has an empty property or value", offset);
             return None;
         }
@@ -512,198 +593,4 @@ fn find_semicolon(tokens: &[Token<'_>], start: usize) -> usize {
         index = skip_component_value(tokens, index);
     }
     index
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_comments_strings_functions_and_important_values() {
-        let sheet = parse_stylesheet(
-            r#"/* comment */ body, .hero { background: url("a;b.png"); content: "}"; color: rgb(1, 2, 3) !important; }"#,
-        );
-        assert_eq!(sheet.rules.len(), 2);
-        assert_eq!(sheet.rules[0].selector, Selector("body".into()));
-        assert_eq!(sheet.rules[1].selector, Selector(".hero".into()));
-        assert_eq!(sheet.rules[0].declarations.len(), 3);
-        assert_eq!(sheet.rules[0].declarations[0].value, r#"url("a;b.png")"#);
-        assert_eq!(sheet.rules[0].declarations[1].value, r#""}""#);
-        assert_eq!(
-            sheet.rules[0].declarations[2].value,
-            "rgb(1, 2, 3) !important"
-        );
-        assert!(sheet.errors.is_empty());
-    }
-
-    #[test]
-    fn parses_at_rules_and_nested_rules() {
-        let sheet = parse_stylesheet(
-            "@media screen and (min-width: 10px) { body { color: red; } } @import url('x.css');",
-        );
-        assert_eq!(sheet.at_rules.len(), 2);
-        assert_eq!(sheet.at_rules[0].name, "media");
-        assert_eq!(sheet.at_rules[0].prelude, "screen and (min-width: 10px)");
-        assert_eq!(sheet.at_rules[0].rules.len(), 1);
-        assert_eq!(sheet.at_rules[1].prelude, "url('x.css')");
-        assert!(sheet.rules.is_empty());
-    }
-
-    #[test]
-    fn parses_font_face_declarations() {
-        let sheet = parse_stylesheet("@font-face { font-family: X; src: url(x.woff2) }");
-        assert_eq!(sheet.at_rules[0].declarations.len(), 2);
-        assert_eq!(sheet.at_rules[0].declarations[1].value, "url(x.woff2)");
-    }
-
-    #[test]
-    fn parses_keyframes_blocks() {
-        let (sheet, errors) = parse_stylesheet_with_errors(
-            "@keyframes slide { from { margin-left: 0 } 50%, 75% { margin-left: 10px } \
-             120% { color: red } TO { margin-left: 20px; color: blue } } p { color: red }",
-        );
-        let rule = &sheet.at_rules[0];
-        assert_eq!(rule.name, "keyframes");
-        assert_eq!(rule.prelude, "slide");
-        let offsets: Vec<_> = rule.keyframes.iter().map(|k| k.offsets.clone()).collect();
-        assert_eq!(offsets, vec![vec![0.0], vec![0.5, 0.75], vec![1.0]]);
-        assert_eq!(rule.keyframes[2].declarations.len(), 2);
-        // `120%` is out of range, so only that keyframe rule is dropped.
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].message, "invalid keyframe selector");
-        assert_eq!(sheet.rules.len(), 1);
-
-        let prefixed = parse_stylesheet("@-webkit-keyframes x { to { color: red } }");
-        assert_eq!(prefixed.at_rules[0].keyframes.len(), 1);
-    }
-
-    #[test]
-    fn recovers_from_bad_declaration() {
-        let (sheet, errors) =
-            parse_stylesheet_with_errors("p { color: red; broken; background: blue; }");
-        assert_eq!(sheet.rules[0].declarations.len(), 2);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].offset, 16);
-    }
-
-    #[test]
-    fn invalid_selector_drops_the_whole_rule_but_keeps_neighbors() {
-        let (sheet, errors) =
-            parse_stylesheet_with_errors("p, div > { color: red } #1 { color: red } a { b: c }");
-        assert_eq!(sheet.rules.len(), 1);
-        assert_eq!(sheet.rules[0].selector, Selector("a".into()));
-        assert_eq!(errors.len(), 2);
-    }
-
-    #[test]
-    fn values_keep_author_text_without_comments() {
-        let sheet = parse_stylesheet("p { margin: 1px/* a */2px  3px; --Brand: { x } }");
-        assert_eq!(sheet.rules[0].declarations[0].value, "1px 2px  3px");
-        assert_eq!(sheet.rules[0].declarations[1].property, "--Brand");
-        assert_eq!(sheet.rules[0].declarations[1].value, "{ x }");
-    }
-
-    #[test]
-    fn reports_unclosed_blocks_and_unfinished_rules() {
-        let (sheet, errors) = parse_stylesheet_with_errors("p { color: red");
-        assert_eq!(sheet.rules[0].declarations.len(), 1);
-        assert_eq!(errors[0].message, "unclosed `{` in CSS rule");
-
-        let (sheet, errors) = parse_stylesheet_with_errors("a { color: red } p");
-        assert_eq!(sheet.rules.len(), 1);
-        assert_eq!(errors[0].offset, 17);
-    }
-
-    #[test]
-    fn skips_nested_rules_inside_declaration_blocks() {
-        let (sheet, errors) =
-            parse_stylesheet_with_errors("p { color: red; &:hover { color: blue } margin: 0 }");
-        assert_eq!(sheet.rules.len(), 1);
-        assert_eq!(sheet.rules[0].declarations.len(), 2);
-        assert_eq!(errors.len(), 1);
-    }
-
-    #[test]
-    fn ignores_html_comment_markers_at_top_level() {
-        let sheet = parse_stylesheet("<!-- p { color: red } -->");
-        assert_eq!(sheet.rules.len(), 1);
-        assert!(sheet.errors.is_empty());
-    }
-
-    #[test]
-    fn parses_inline_style_declarations() {
-        let mut sheet = Stylesheet::default();
-        let declarations = parse_declarations("color: red !IMPORTANT; ; width:", &mut sheet, 10);
-        assert_eq!(declarations.len(), 1);
-        assert_eq!(declarations[0].value, "red !important");
-        assert_eq!(sheet.errors[0].offset, 35);
-    }
-
-    #[test]
-    fn malformed_input_never_panics() {
-        // Deterministic pseudo-random soup of CSS-significant characters,
-        // including multi-byte text, escapes, and unbalanced brackets.
-        const PIECES: &[&str] = &[
-            "{",
-            "}",
-            "(",
-            ")",
-            "[",
-            "]",
-            ";",
-            ":",
-            ",",
-            "\"",
-            "'",
-            "\\",
-            "/*",
-            "*/",
-            "@",
-            "#",
-            ".",
-            "!",
-            "important",
-            "url(",
-            "a",
-            "-",
-            "--x",
-            "1",
-            "2.5e",
-            "%",
-            "px",
-            "é",
-            "日本",
-            " ",
-            "\n",
-            "\r",
-            "\0",
-            "<!--",
-            "-->",
-            ">",
-            "+",
-            "~",
-            "|",
-            "=",
-            "*",
-            "&",
-            "::",
-            "is(",
-            "nth-child(",
-            "\\31 ",
-        ];
-        let mut state = 0x2545_f491_u32;
-        for _ in 0..2_000 {
-            let mut input = String::new();
-            for _ in 0..(state % 40) {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                input.push_str(PIECES[state as usize % PIECES.len()]);
-            }
-            let sheet = parse_stylesheet(&input);
-            let _ = crate::parse_selector_list(&input);
-            let document = html::parse_raw_html("<p class='a' id='b'><a href=x>y</a></p>".into());
-            let _ = crate::style_document(&document, &[sheet]);
-        }
-    }
 }

@@ -63,6 +63,23 @@ opt-level = 3
 [profile.dev.package.render]
 opt-level = 3
 
+# The shell parses, styles, and lays out a page on the UI thread when it is
+# first shown and again whenever hover or focus changes its selector state.
+# Unoptimized style recalculation on a large real-world page (for example
+# www.byui.edu) takes seconds and freezes the window; optimized it is ~10x
+# faster.
+[profile.dev.package.html]
+opt-level = 3
+
+[profile.dev.package.css]
+opt-level = 3
+
+[profile.dev.package.layout]
+opt-level = 3
+
+[profile.dev.package.paint]
+opt-level = 3
+
 [profile.dev.package.tiny-skia]
 opt-level = 3
 

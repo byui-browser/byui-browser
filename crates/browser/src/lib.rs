@@ -6,7 +6,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -23,8 +23,8 @@ use webapis::local_storage::register_local_storage_with_url;
 use webapis::session_storage::register_session_storage;
 use webapis::{
     AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, register_alert,
-    register_console, register_document_with_location, register_fetch_with_url,
-    register_location_with_navigation, register_print, register_window_with_security_context,
+    register_console, register_fetch_with_url, register_location_with_navigation, register_print,
+    register_shared_document_with_location, register_window_with_security_context,
     register_window_with_url_device_pixel_ratio_and_viewport,
 };
 
@@ -716,8 +716,9 @@ impl BrowserRuntime {
     ) -> JsResult<BootedPage> {
         log::trace!("booting page: {} bytes of html", input.html_source.len());
         let html_document = html::parse_raw_html(input.html_source.to_owned());
-        let document = Document::from_html_document(&html_document);
-        let retained = document.clone();
+        // Scripts and this session share one document, so the shell can lay
+        // out what scripts changed.
+        let document = Arc::new(Mutex::new(Document::from_html_document(&html_document)));
         let mut realm = Realm::new();
         register_window_with_security_context(&mut realm, security_context.clone())?;
         register_print(&mut realm, Arc::clone(&console))?;
@@ -738,7 +739,7 @@ impl BrowserRuntime {
             .unwrap_or_else(|_| net::Url::parse("about:blank").expect("valid about:blank URL"));
         // Installs the live `Location` accessor on the window registered above.
         let location = register_location_with_navigation(&mut realm, document_url, navigate)?;
-        register_document_with_location(&mut realm, document, location)?;
+        register_shared_document_with_location(&mut realm, Arc::clone(&document), location)?;
         register_local_storage_with_url(
             &mut realm,
             Arc::clone(&self.storage),
@@ -772,7 +773,7 @@ impl BrowserRuntime {
             session: PageSession {
                 realm,
                 window,
-                document: retained,
+                document,
             },
             results,
         })
@@ -789,7 +790,8 @@ pub struct PageSession {
     #[allow(dead_code)]
     realm: Realm,
     window: js::Object,
-    document: Document,
+    /// The live document scripts mutate, shared with the realm's bindings.
+    document: Arc<Mutex<Document>>,
 }
 
 impl PageSession {
@@ -811,7 +813,21 @@ impl PageSession {
 
     /// Returns the current live document serialization after script mutations.
     pub fn document_html(&self) -> String {
-        self.document.inner_html()
+        self.document.lock().unwrap().inner_html()
+    }
+
+    /// Returns a copy of the live HTML tree, including script DOM changes.
+    ///
+    /// Node IDs match the ones [`Self::dispatch_click_at`] accepts, so a
+    /// shell can lay out this tree and keep hit testing against it. Compare
+    /// copies to find out whether a script task changed the DOM.
+    pub fn live_document(&self) -> html::HTMLDocument {
+        self.document
+            .lock()
+            .unwrap()
+            .html_document()
+            .cloned()
+            .unwrap_or_else(html::HTMLDocument::new)
     }
 
     /// Updates the viewport's vertical scroll offset exposed as
@@ -887,7 +903,8 @@ impl PageSession {
     /// Runs listeners registered with `document.addEventListener('click', ...)`.
     /// Element hit testing is not performed.
     pub fn dispatch_click(&self) -> JsResult<Value> {
-        let result = webapis::dispatch_click(&self.document);
+        let document = self.document.lock().unwrap().clone();
+        let result = webapis::dispatch_click(&document);
         webapis::run_window_microtasks(&self.window)?;
         result
     }
@@ -898,7 +915,7 @@ impl PageSession {
     /// bubbles from that element to the document, so both element and
     /// `document` listeners run.
     pub fn dispatch_click_at(&self, node: html::NodeID) -> JsResult<Value> {
-        let result = webapis::dispatch_click_at(&self.document, node);
+        let result = webapis::dispatch_click_at_live(&self.document, node);
         webapis::run_window_microtasks(&self.window)?;
         result
     }
@@ -1002,7 +1019,7 @@ mod tests {
         assert!(page.html.contains("href=\"style.css\""));
         assert!(page.html.contains("src=\"script.js\""));
         assert!(page.stylesheets[0].contains("background-color"));
-        assert!(page.scripts[0].contains("btn.addEventListener('click', callback)"));
+        assert!(page.scripts[0].contains("linkTile('tile-ladder')"));
     }
 
     #[test]

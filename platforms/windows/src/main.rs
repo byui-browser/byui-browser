@@ -13,6 +13,7 @@ fn main() {
         // rounded normal window and square maximized treatment.
         configure_window: |attributes| attributes,
         window_created: |_| {},
+        window_changed: |_| false,
         ui_font_files: windows::ui_font_files,
         page_font_files: windows::page_font_files,
         window_controls_inset: 0.0,

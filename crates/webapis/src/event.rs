@@ -194,16 +194,16 @@ fn event_target_for(document: &Document, node: Option<NodeID>) -> EventTargetRef
     }
 }
 
-pub(crate) fn add_event_listener_at(
-    document: &Document,
-    node: Option<NodeID>,
+/// Registers a listener on an arbitrary EventTarget.
+pub(crate) fn add_event_listener_to_target(
+    target_ref: &EventTargetRef,
     arguments: &[Value],
+    target_name: &str,
 ) -> JsResult<Value> {
     let [event_type, callback, options @ ..] = arguments else {
-        log::debug!("addEventListener() called with too few arguments");
-        return Err(JsError::new(
-            "document.addEventListener() expects a type and callback",
-        ));
+        return Err(JsError::new(format!(
+            "{target_name}.addEventListener() expects a type and callback"
+        )));
     };
 
     let event_type = event_type.to_string();
@@ -214,15 +214,13 @@ pub(crate) fn add_event_listener_at(
             Value::Object(callback)
                 if matches!(callback.get("handleEvent"), Some(Value::Function(_))) => {}
             Value::Object(_) => {
-                log::debug!("addEventListener({event_type}) callback object has no handleEvent");
                 return Err(JsError::new(
-                    "document.addEventListener() callback object must define handleEvent",
+                    "event listener object must define handleEvent",
                 ));
             }
             _ => {
-                log::debug!("addEventListener({event_type}) callback has an unsupported type");
                 return Err(JsError::new(
-                    "document.addEventListener() callback must be a function, object, or null",
+                    "event listener callback must be a function, object, or null",
                 ));
             }
         }
@@ -240,34 +238,19 @@ pub(crate) fn add_event_listener_at(
         .as_ref()
         .and_then(|signal| signal.get("aborted"))
         .is_some_and(|aborted| javascript_truthy(&aborted))
+        || is_null_callback
     {
-        log::debug!("addEventListener({event_type}) ignored: signal already aborted");
-        return Ok(Value::Undefined);
-    }
-    if is_null_callback {
-        log::debug!("addEventListener({event_type}) ignored: null callback");
         return Ok(Value::Undefined);
     }
 
-    let target_ref = event_target_for(document, node);
-    let mut target = lock_event_target(&target_ref);
+    let mut target = lock_event_target(target_ref);
     if target.listeners().iter().any(|listener| {
         listener.event_type == event_type
             && listener.capture == capture
             && listener.callback == *callback
     }) {
-        log::debug!("addEventListener({event_type}) ignored: duplicate listener");
         return Ok(Value::Undefined);
     }
-
-    log::debug!(
-        "addEventListener({event_type}) on {} (capture: {capture}, once: {once})",
-        if node.is_some() {
-            "element"
-        } else {
-            "document"
-        }
-    );
     target.listeners_mut().push(EventListener {
         event_type,
         callback: callback.clone(),
@@ -277,6 +260,22 @@ pub(crate) fn add_event_listener_at(
         signal,
     });
     Ok(Value::Undefined)
+}
+
+pub(crate) fn add_event_listener_at(
+    document: &Document,
+    node: Option<NodeID>,
+    arguments: &[Value],
+) -> JsResult<Value> {
+    add_event_listener_to_target(
+        &event_target_for(document, node),
+        arguments,
+        if node.is_some() {
+            "element"
+        } else {
+            "document"
+        },
+    )
 }
 
 /// Implements `EventTarget.removeEventListener()` for the document target.
@@ -292,7 +291,7 @@ pub(crate) fn remove_event_listener_at(
     node: Option<NodeID>,
     arguments: &[Value],
 ) -> JsResult<Value> {
-    let [event_type, callback, options @ ..] = arguments else {
+    let [event_type, callback, _options @ ..] = arguments else {
         log::debug!("removeEventListener() called with too few arguments");
         return Err(JsError::new(
             "document.removeEventListener() expects a type and callback",
@@ -308,19 +307,34 @@ pub(crate) fn remove_event_listener_at(
             "document.removeEventListener() callback must be a function, object, or null",
         ));
     }
+    remove_event_listener_from_target(&event_target_for(document, node), arguments)
+}
+
+pub(crate) fn remove_event_listener_from_target(
+    target_ref: &EventTargetRef,
+    arguments: &[Value],
+) -> JsResult<Value> {
+    let [event_type, callback, options @ ..] = arguments else {
+        return Err(JsError::new(
+            "removeEventListener() expects a type and callback",
+        ));
+    };
+    let event_type = event_type.to_string();
+    if matches!(callback, Value::Null | Value::Undefined) {
+        return Ok(Value::Undefined);
+    }
+    if !matches!(callback, Value::Function(_) | Value::Object(_)) {
+        return Err(JsError::new(
+            "event listener callback must be a function, object, or null",
+        ));
+    }
     let (capture, _, _, _) = event_listener_options(options.first());
-    let target_ref = event_target_for(document, node);
-    let mut target = lock_event_target(&target_ref);
-    let before = target.listeners().len();
+    let mut target = lock_event_target(target_ref);
     target.listeners_mut().retain(|listener| {
         !(listener.event_type == event_type
             && listener.capture == capture
             && listener.callback == *callback)
     });
-    log::debug!(
-        "removeEventListener({event_type}) removed {} listeners",
-        before - target.listeners().len()
-    );
     Ok(Value::Undefined)
 }
 
@@ -399,6 +413,39 @@ fn invoke_listeners(
         }
         event.set("__passiveListener", Value::Boolean(false));
     }
+}
+
+/// Dispatches an event on a standalone EventTarget, such as Window.
+pub(crate) fn dispatch_event_target(
+    target: &EventTargetRef,
+    target_object: &Object,
+    arguments: &[Value],
+) -> JsResult<Value> {
+    let [Value::Object(event)] = arguments else {
+        return Err(JsError::new("dispatchEvent() expects one Event object"));
+    };
+    let Some(Value::String(event_type)) = event.get("type") else {
+        return Err(JsError::new("dispatchEvent() expects an Event object"));
+    };
+
+    event.set("target", Value::Object(target_object.clone()));
+    event.set("currentTarget", Value::Object(target_object.clone()));
+    event.set("eventPhase", Value::Number(2.0));
+    event.set("__stopPropagation", Value::Boolean(false));
+    event.set("__stopImmediatePropagation", Value::Boolean(false));
+    invoke_listeners(target, event, &event_type, target_object, true, 2.0);
+    if !matches!(
+        event.get("__stopImmediatePropagation"),
+        Some(Value::Boolean(true))
+    ) {
+        invoke_listeners(target, event, &event_type, target_object, false, 2.0);
+    }
+    event.set("eventPhase", Value::Number(0.0));
+    event.set("currentTarget", Value::Null);
+    Ok(Value::Boolean(!matches!(
+        event.get("defaultPrevented"),
+        Some(Value::Boolean(true))
+    )))
 }
 
 fn element_for_node(document: &Document, node: NodeID) -> Option<Element> {
@@ -577,6 +624,26 @@ pub fn dispatch_click(document: &Document) -> JsResult<Value> {
 /// Clones share listener lists. Returns `false` when a listener called
 /// `preventDefault()`.
 pub fn dispatch_click_at(document: &Document, node: NodeID) -> JsResult<Value> {
+    dispatch_click_at_in(document, node, Arc::new(Mutex::new(document.clone())))
+}
+
+/// Dispatches a user `click` like [`dispatch_click_at`] in the live document
+/// registered with
+/// [`register_shared_document_with_location`](crate::register_shared_document_with_location).
+///
+/// The event target's element object mutates `document` itself, so a
+/// listener's `event.target.setAttribute(...)` changes the live tree. The
+/// lock is released while listeners run, because they lock it themselves.
+pub fn dispatch_click_at_live(document: &Arc<Mutex<Document>>, node: NodeID) -> JsResult<Value> {
+    let snapshot = document.lock().unwrap().clone();
+    dispatch_click_at_in(&snapshot, node, Arc::clone(document))
+}
+
+fn dispatch_click_at_in(
+    document: &Document,
+    node: NodeID,
+    target_document: Arc<Mutex<Document>>,
+) -> JsResult<Value> {
     let Some(element) = nearest_element(document, node) else {
         log::debug!("click target has no element; dispatching at the document");
         return dispatch_click(document);
@@ -586,7 +653,7 @@ pub fn dispatch_click_at(document: &Document, node: NodeID) -> JsResult<Value> {
     options.set("cancelable", Value::Boolean(true));
     let event = event_constructor(&[Value::String("click".into()), Value::Object(options)])?;
     let target_node = element.node;
-    let target = element_object(element, Arc::new(Mutex::new(document.clone())));
+    let target = element_object(element, target_document);
     dispatch_event_at(document, Some(target_node), &target, &[event])
 }
 

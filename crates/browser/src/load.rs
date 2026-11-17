@@ -625,6 +625,15 @@ impl PageLoader {
         })
     }
 
+    /// Removes cached HTTP responses and CORS-preflight permissions used by
+    /// future page loads.
+    ///
+    /// Loads already in progress retain the responses they have received. The
+    /// cache is process-local, so this does not affect persistent site data.
+    pub fn clear_cache(&self) {
+        self.controller.clear_cache();
+    }
+
     /// Starts loading `address` and returns immediately.
     ///
     /// `on_done` runs once, on a runtime thread, with the [`Navigation`]. It
@@ -1016,7 +1025,7 @@ mod tests {
             .block_on(load_page(&controller, "byui://welcome/page"))
             .expect("welcome page should load");
         assert!(page.stylesheets[0].contains("background-color"));
-        assert!(page.scripts[0].contains("btn.addEventListener"));
+        assert!(page.scripts[0].contains("showOak("));
     }
 
     #[test]

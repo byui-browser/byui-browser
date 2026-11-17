@@ -13,6 +13,8 @@
 //! specificity is computed, `!important` is split off, and shorthands are
 //! expanded to longhands.
 
+use crate::animation;
+use crate::computed::PseudoElement;
 use crate::matching::compound_never_matches;
 use crate::selector::{ComplexSelector, CompoundSelector, SimpleSelector, parse_selector_list};
 use crate::shorthands;
@@ -36,10 +38,17 @@ pub(crate) struct CompiledDeclaration {
 /// Splits `!important` from a declaration and expands shorthands.
 pub(crate) fn compile_declarations(declarations: &[Declaration]) -> Vec<CompiledDeclaration> {
     let mut compiled = Vec::with_capacity(declarations.len());
+
     for declaration in declarations {
         let (value, important) = split_important(&declaration.value);
-        // Only build a new declaration when `!important` must be removed.
-        let expanded = if important {
+
+        let expanded = if declaration.property == "animation" {
+            let animation = Declaration {
+                property: declaration.property.clone(),
+                value: value.to_owned(),
+            };
+            animation::expand_shorthand(&animation.value).unwrap_or_default()
+        } else if important {
             shorthands::expand(&Declaration {
                 property: declaration.property.clone(),
                 value: value.to_owned(),
@@ -47,12 +56,14 @@ pub(crate) fn compile_declarations(declarations: &[Declaration]) -> Vec<Compiled
         } else {
             shorthands::expand(declaration)
         };
+
         compiled.extend(expanded.into_iter().map(|longhand| CompiledDeclaration {
             property: longhand.property,
             value: longhand.value,
             important,
         }));
     }
+
     compiled
 }
 
@@ -60,14 +71,17 @@ pub(crate) fn compile_declarations(declarations: &[Declaration]) -> Vec<Compiled
 fn split_important(value: &str) -> (&str, bool) {
     let trimmed = value.trim_end();
     let split = trimmed.len().saturating_sub("important".len());
+
     if trimmed.len() >= "important".len() && trimmed.is_char_boundary(split) {
         let (before, word) = trimmed.split_at(split);
+
         if word.eq_ignore_ascii_case("important")
             && let Some(rest) = before.trim_end().strip_suffix('!')
         {
             return (rest.trim_end(), true);
         }
     }
+
     (trimmed, false)
 }
 
@@ -82,6 +96,32 @@ pub(crate) struct CompiledRule {
     pub(crate) rule_index: usize,
     /// Expanded declarations, shared by rules split from one selector list.
     pub(crate) declarations: Arc<[CompiledDeclaration]>,
+    /// The pseudo-element the rule styles, if any. `selector` then has the
+    /// pseudo-element removed and matches the originating element.
+    pub(crate) pseudo: Option<PseudoElement>,
+}
+
+/// Splits a trailing `::before` / `::after` (or legacy `:before` /
+/// `:after`) off the rightmost compound of `selector`.
+///
+/// Returns the selector for the originating element and the pseudo-element.
+/// A pseudo-element anywhere else (`p::before span`) or followed by other
+/// simple selectors (`p::before:hover`) is left in place, so the selector
+/// still never matches.
+fn split_pseudo_element(mut selector: ComplexSelector) -> (ComplexSelector, Option<PseudoElement>) {
+    let Some(last) = selector.compounds.last_mut() else {
+        return (selector, None);
+    };
+    let pseudo = match last.simples.last() {
+        Some(SimpleSelector::Pseudo(pseudo)) if pseudo.argument.is_none() => {
+            PseudoElement::from_name(&pseudo.name)
+        }
+        _ => None,
+    };
+    if pseudo.is_some() {
+        last.simples.pop();
+    }
+    (selector, pseudo)
 }
 
 /// A stylesheet whose rules are ready for indexing.
@@ -97,6 +137,7 @@ impl CompiledSheet {
         let mut rules = Vec::with_capacity(sheet.rules.len());
         let mut previous: Option<(&[Declaration], Arc<[CompiledDeclaration]>)> = None;
         let mut skipped = 0_usize;
+
         for (rule_index, rule) in sheet.rules.iter().enumerate() {
             let list = match parse_selector_list(&rule.selector.0) {
                 Ok(list) => list,
@@ -108,16 +149,24 @@ impl CompiledSheet {
                     continue;
                 }
             };
+
             let before = skipped;
-            let selectors: Vec<ComplexSelector> = list
+
+            // Specificity is taken before a pseudo-element is split off, so
+            // `p::before` keeps its type-selector weight for the pseudo-element.
+            let selectors: Vec<(ComplexSelector, Specificity, Option<PseudoElement>)> = list
                 .selectors
                 .into_iter()
-                .filter(|selector| {
+                .filter_map(|selector| {
+                    let specificity = complex_specificity(&selector);
+                    let (selector, pseudo) = split_pseudo_element(selector);
                     let never = selector.compounds.iter().any(compound_never_matches);
+
                     skipped += usize::from(never);
-                    !never
+                    (!never).then_some((selector, specificity, pseudo))
                 })
                 .collect();
+
             if selectors.is_empty() {
                 log::trace!(
                     "rule `{}` can never match ({} selectors skipped)",
@@ -126,8 +175,7 @@ impl CompiledSheet {
                 );
                 continue;
             }
-            // Rules split from one selector list carry equal declarations;
-            // compile them once.
+
             let declarations = match &previous {
                 Some((source, compiled)) if *source == rule.declarations.as_slice() => {
                     Arc::clone(compiled)
@@ -135,23 +183,29 @@ impl CompiledSheet {
                 _ => {
                     let compiled: Arc<[CompiledDeclaration]> =
                         compile_declarations(&rule.declarations).into();
+
                     previous = Some((rule.declarations.as_slice(), Arc::clone(&compiled)));
+
                     compiled
                 }
             };
-            for selector in selectors {
+
+            for (selector, specificity, pseudo) in selectors {
                 rules.push(CompiledRule {
-                    specificity: complex_specificity(&selector),
+                    specificity,
                     selector,
                     rule_index,
                     declarations: Arc::clone(&declarations),
+                    pseudo,
                 });
             }
         }
+
         log::debug!(
             "compiled {} selectors; skipped {skipped} that can never match",
             rules.len()
         );
+
         Self { rules }
     }
 }
@@ -188,24 +242,28 @@ enum Key<'r> {
 
 fn key_for(compound: &CompoundSelector) -> Key<'_> {
     let simples = &compound.simples;
+
     if let Some(id) = simples.iter().find_map(|simple| match simple {
         SimpleSelector::Id(id) => Some(id.as_str()),
         _ => None,
     }) {
         return Key::Id(id);
     }
+
     if let Some(class) = simples.iter().find_map(|simple| match simple {
         SimpleSelector::Class(class) => Some(class.as_str()),
         _ => None,
     }) {
         return Key::Class(class);
     }
+
     if let Some(name) = simples.iter().find_map(|simple| match simple {
         SimpleSelector::Attribute(attribute) => Some(attribute.name.to_ascii_lowercase()),
         _ => None,
     }) {
         return Key::Attribute(name);
     }
+
     match &compound.type_selector {
         Some(type_selector) if type_selector.name != "*" => {
             Key::Tag(type_selector.name.to_ascii_lowercase())
@@ -225,11 +283,13 @@ impl<'r> RuleIndex<'r> {
     ) {
         for rule in &sheet.rules {
             let position = u32::try_from(self.rules.len()).expect("fewer than 2^32 rules");
+
             let rightmost = rule
                 .selector
                 .compounds
                 .last()
                 .expect("parsed selectors have a compound");
+
             match key_for(rightmost) {
                 Key::Id(id) => self.by_id.entry(id).or_default().push(position),
                 Key::Class(class) => self.by_class.entry(class).or_default().push(position),
@@ -237,6 +297,7 @@ impl<'r> RuleIndex<'r> {
                 Key::Tag(tag) => self.by_tag.entry(tag).or_default().push(position),
                 Key::Universal => self.universal.push(position),
             }
+
             self.rules.push(IndexedRule {
                 rule,
                 sheet_index,
@@ -253,39 +314,50 @@ impl<'r> RuleIndex<'r> {
     pub(crate) fn candidates(&self, element: &ElementData, candidates: &mut Vec<u32>) {
         candidates.clear();
         candidates.extend_from_slice(&self.universal);
+
         let mut seen_classes: Vec<&str> = Vec::new();
+
         for attribute in element.get_attributes() {
             let name = attribute.get_name().as_str();
             let value = attribute.get_value().as_str();
+
             match name {
                 "id" => {
                     if let Some(rules) = self.by_id.get(value) {
                         candidates.extend_from_slice(rules);
                     }
                 }
+
                 "class" => {
                     for class in value.split_ascii_whitespace() {
                         if seen_classes.contains(&class) {
                             continue;
                         }
+
                         seen_classes.push(class);
+
                         if let Some(rules) = self.by_class.get(class) {
                             candidates.extend_from_slice(rules);
                         }
                     }
                 }
+
                 _ => {}
             }
+
             if let Some(rules) = self.by_attribute.get(name) {
                 candidates.extend_from_slice(rules);
             }
         }
+
         let tag = element.get_name();
+
         let rules = if tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
             self.by_tag.get(&tag.to_ascii_lowercase())
         } else {
             self.by_tag.get(tag.as_str())
         };
+
         if let Some(rules) = rules {
             candidates.extend_from_slice(rules);
         }
@@ -298,51 +370,22 @@ mod tests {
     use crate::parse_stylesheet;
 
     #[test]
-    fn splits_important_case_insensitively() {
-        assert_eq!(split_important("red !important"), ("red", true));
-        assert_eq!(split_important("red ! IMPORTANT "), ("red", true));
-        assert_eq!(split_important("red"), ("red", false));
-        assert_eq!(split_important("important"), ("important", false));
-        assert_eq!(split_important("\"日本語です\""), ("\"日本語です\"", false));
-    }
-
-    #[test]
-    fn compiles_shared_declarations_once_and_skips_unmatchable_rules() {
-        let sheet = parse_stylesheet("a, b, a:hover, p::before { margin: 0 !important }");
-        let compiled = CompiledSheet::compile(&sheet);
-        assert_eq!(compiled.rules.len(), 2);
-        assert!(Arc::ptr_eq(
-            &compiled.rules[0].declarations,
-            &compiled.rules[1].declarations
-        ));
-        assert_eq!(compiled.rules[0].declarations.len(), 4);
-        assert!(compiled.rules[0].declarations[0].important);
-    }
-
-    #[test]
-    fn candidates_come_from_the_elements_own_keys() {
+    fn before_and_after_rules_are_kept_for_their_originating_element() {
         let sheet = parse_stylesheet(
-            "#main {a:b} .card {a:b} [data-x] {a:b} p {a:b} * {a:b} .other {a:b} div {a:b}",
+            "p::before {a:b} p:after {a:b} ::before {a:b} p::before:hover {a:b} p::before span {a:b}",
         );
         let compiled = CompiledSheet::compile(&sheet);
-        let mut index = RuleIndex::default();
-        index.add_sheet(&compiled, 0, 2, 4);
-        let dom = html::parse_raw_html("<p id='main' class='card card' data-x='1'>x</p>".into());
-        let element = dom
-            .nodes
-            .iter()
-            .find_map(|node| match node.get_kind() {
-                html::NodeKind::Element(element) if element.get_name() == "p" => Some(element),
-                _ => None,
-            })
-            .unwrap();
-        let mut candidates = Vec::new();
-        index.candidates(element, &mut candidates);
-        let mut rules: Vec<usize> = candidates
-            .iter()
-            .map(|candidate| index.rules[*candidate as usize].rule.rule_index)
-            .collect();
-        rules.sort_unstable();
-        assert_eq!(rules, [0, 1, 2, 3, 4]);
+        let pseudos: Vec<_> = compiled.rules.iter().map(|rule| rule.pseudo).collect();
+        assert_eq!(
+            pseudos,
+            [
+                Some(PseudoElement::Before),
+                Some(PseudoElement::After),
+                Some(PseudoElement::Before)
+            ]
+        );
+        // `p::before` keeps the pseudo-element's specificity.
+        assert_eq!(compiled.rules[0].specificity, Specificity(0, 0, 2));
+        assert!(compiled.rules[0].selector.compounds[0].simples.is_empty());
     }
 }

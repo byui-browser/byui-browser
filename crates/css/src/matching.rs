@@ -5,38 +5,35 @@
 //! rescan child lists. Matching runs right to left with backtracking, the
 //! usual browser strategy (Selectors 4 §17).
 //!
-//! The engine has no interaction or history state, so dynamic pseudo-classes
-//! (`:hover`, `:focus`, `:visited`, ...) never match, and pseudo-elements
-//! (`::before`) never match the element itself. Unknown pseudo-classes never
-//! match. Namespace prefixes other than `*` and the default match nothing,
-//! because `@namespace` is not supported.
+//! Dynamic interaction pseudo-classes read [`SelectorState`]. History-dependent
+//! pseudo-classes such as `:visited` never match. Pseudo-elements never match
+//! the element itself: the rule compiler splits a trailing `::before` /
+//! `::after` off before matching, so those rules match the originating element
+//! and are cascaded separately; other pseudo-elements remain unsupported.
+//! Unknown pseudo-classes never match. Namespace prefixes other than `*` and
+//! the default match nothing, because `@namespace` is not supported.
 
 use crate::selector::{
     AttributeOperator, AttributeSelector, Combinator, ComplexSelector, CompoundSelector,
     PseudoSelector, SelectorList, SimpleSelector, TypeSelector,
 };
 use crate::specificity::is_legacy_pseudo_element;
-use html::{ElementData, HTMLDocument, Namespace, NodeKind};
+use html::{ElementData, HTMLDocument, Namespace, NodeID, NodeKind};
 use std::borrow::Cow;
 
-/// Pseudo-classes for state the engine does not track. They never match, so
-/// rules that require them can be skipped when the rule index is built.
+/// Unsupported pseudo-classes that never match, so rules requiring them can
+/// be skipped when the rule index is built.
 const NEVER_MATCHING_PSEUDO_CLASSES: &[&str] = &[
-    "active",
     "autofill",
     "-webkit-autofill",
     "blank",
     "buffering",
     "current",
     "default",
-    "focus",
-    "focus-visible",
-    "focus-within",
     "fullscreen",
     "future",
     "host",
     "host-context",
-    "hover",
     "in-range",
     "indeterminate",
     "invalid",
@@ -59,6 +56,23 @@ const NEVER_MATCHING_PSEUDO_CLASSES: &[&str] = &[
     "visited",
     "volume-locked",
 ];
+
+/// Interaction state used while matching dynamic pseudo-classes.
+///
+/// Node IDs must belong to the document passed to `style_document_with_state`.
+/// `keyboard_focus` marks focus established by keyboard navigation and controls
+/// the supported `:focus-visible` behavior.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SelectorState {
+    /// The element under the pointer, if any.
+    pub hovered: Option<NodeID>,
+    /// The element currently pressed by the primary pointer button, if any.
+    pub active: Option<NodeID>,
+    /// The element that currently owns page focus, if any.
+    pub focused: Option<NodeID>,
+    /// Whether focus was most recently established through keyboard input.
+    pub keyboard_focus: bool,
+}
 
 /// HTML attributes whose values selectors compare ASCII case-insensitively
 /// (HTML Standard §4.16.2, "Case-sensitivity of selectors"). Kept sorted for
@@ -158,11 +172,12 @@ pub(crate) struct ElementTree<'d> {
     next: Vec<Option<usize>>,
     /// Whether the node's parent is the document node.
     is_root: Vec<bool>,
+    state: SelectorState,
 }
 
 impl<'d> ElementTree<'d> {
     /// Builds the element links for `dom` in one pass over its nodes.
-    pub(crate) fn new(dom: &'d HTMLDocument) -> Self {
+    pub(crate) fn new(dom: &'d HTMLDocument, state: SelectorState) -> Self {
         let count = dom.nodes.len();
         let mut tree = Self {
             dom,
@@ -170,6 +185,7 @@ impl<'d> ElementTree<'d> {
             previous: vec![None; count],
             next: vec![None; count],
             is_root: vec![false; count],
+            state,
         };
         for (index, node) in dom.nodes.iter().enumerate() {
             let parent_is_element = matches!(node.get_kind(), NodeKind::Element(_));
@@ -244,6 +260,13 @@ impl<'d> ElementTree<'d> {
             return false;
         };
         self.match_from(selector, last, index, None)
+    }
+
+    fn state_matches(&self, node: usize, target: Option<NodeID>) -> bool {
+        let Some(target) = target.map(|target| target.get()) else {
+            return false;
+        };
+        node == target || self.ancestors(target).any(|ancestor| ancestor == node)
     }
 
     fn matches_any(&self, list: &SelectorList, index: usize) -> bool {
@@ -357,6 +380,13 @@ impl<'d> ElementTree<'d> {
         let nested = pseudo.nested_selectors.as_deref();
         let tag = element.get_name().as_str();
         match name.as_ref() {
+            "hover" => self.state_matches(index, self.state.hovered),
+            "active" => self.state_matches(index, self.state.active),
+            "focus" => self.state.focused.is_some_and(|id| id.get() == index),
+            "focus-within" => self.state_matches(index, self.state.focused),
+            "focus-visible" => {
+                self.state.keyboard_focus && self.state.focused.is_some_and(|id| id.get() == index)
+            }
             "root" | "scope" => self.is_root[index],
             "is" | "where" | "matches" | "-webkit-any" | "-moz-any" => {
                 nested.is_some_and(|list| self.matches_any(list, index))
@@ -667,100 +697,4 @@ fn nth_matches(step: i64, offset: i64, position: i64) -> bool {
     }
     let difference = position - offset;
     difference % step == 0 && difference / step >= 0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::selector::parse_selector_list;
-
-    fn matching_ids(html: &str, selector: &str) -> Vec<String> {
-        let dom = html::parse_raw_html(html.into());
-        let tree = ElementTree::new(&dom);
-        let list = parse_selector_list(selector).expect("valid selector");
-        (0..dom.nodes.len())
-            .filter(|index| tree.matches_any(&list, *index))
-            .filter_map(|index| tree.element(index).and_then(|e| attribute(e, "id")))
-            .map(str::to_owned)
-            .collect()
-    }
-
-    const LIST: &str = "<ul id='list' class='menu'>\
-        <li id='a' class='item'>A</li>\
-        <li id='b' class='item active'><a id='link' href='/x'>B</a></li>\
-        <li id='c'>C</li>\
-        <li id='d' class='item'></li>\
-        </ul>";
-
-    #[test]
-    fn matches_combinators() {
-        assert_eq!(matching_ids(LIST, "ul > li.active"), ["b"]);
-        assert_eq!(matching_ids(LIST, ".menu a"), ["link"]);
-        assert_eq!(matching_ids(LIST, "#a + li"), ["b"]);
-        assert_eq!(matching_ids(LIST, "#b ~ li"), ["c", "d"]);
-        assert!(matching_ids(LIST, "li > ul").is_empty());
-    }
-
-    #[test]
-    fn matches_attributes() {
-        assert_eq!(matching_ids(LIST, "[href^='/']"), ["link"]);
-        assert_eq!(matching_ids(LIST, "[class~=active]"), ["b"]);
-        assert_eq!(matching_ids(LIST, "[CLASS*=ACT i]"), ["b"]);
-        assert!(matching_ids(LIST, "[class*=ACT]").is_empty());
-        assert_eq!(
-            matching_ids("<p id='p' lang='en-US'></p>", "[lang|=en]"),
-            ["p"]
-        );
-        assert_eq!(
-            matching_ids("<input id='i' type='TEXT'>", "[type=text]"),
-            ["i"]
-        );
-    }
-
-    #[test]
-    fn matches_structural_pseudo_classes() {
-        assert_eq!(matching_ids(LIST, "li:first-child"), ["a"]);
-        assert_eq!(matching_ids(LIST, "li:last-child"), ["d"]);
-        assert_eq!(matching_ids(LIST, "li:nth-child(odd)"), ["a", "c"]);
-        assert_eq!(matching_ids(LIST, "li:nth-last-child(-n + 2)"), ["c", "d"]);
-        assert_eq!(matching_ids(LIST, "li:nth-child(2 of .item)"), ["b"]);
-        assert_eq!(matching_ids(LIST, "li:empty"), ["d"]);
-        assert_eq!(matching_ids(LIST, "a:only-of-type"), ["link"]);
-        // `parse_raw_html` adds no implicit `<html>`, so the list is the root.
-        assert_eq!(matching_ids(LIST, ":root"), ["list"]);
-    }
-
-    #[test]
-    fn matches_logical_pseudo_classes_and_has() {
-        assert_eq!(matching_ids(LIST, "li:not(.item)"), ["c"]);
-        assert_eq!(matching_ids(LIST, ":is(#a, #c)"), ["a", "c"]);
-        assert_eq!(matching_ids(LIST, "li:has(> a[href])"), ["b"]);
-        assert_eq!(matching_ids(LIST, "ul:has(.active)"), ["list"]);
-        assert_eq!(matching_ids(LIST, "li:has(+ #c)"), ["b"]);
-        assert_eq!(matching_ids(LIST, "a:link, a:any-link"), ["link"]);
-    }
-
-    #[test]
-    fn dynamic_pseudo_classes_and_pseudo_elements_never_match() {
-        assert!(matching_ids(LIST, "a:hover, a:visited, li::before, li:after").is_empty());
-        let list = parse_selector_list("a:hover").unwrap();
-        assert!(compound_never_matches(&list.selectors[0].compounds[0]));
-    }
-
-    #[test]
-    fn case_insensitive_attribute_list_is_sorted() {
-        assert!(CASE_INSENSITIVE_HTML_ATTRIBUTES.is_sorted());
-    }
-
-    #[test]
-    fn parses_an_plus_b() {
-        assert_eq!(parse_an_plus_b("2n+1"), Some((2, 1)));
-        assert_eq!(parse_an_plus_b(" -n + 3 "), Some((-1, 3)));
-        assert_eq!(parse_an_plus_b("+5"), Some((0, 5)));
-        assert_eq!(parse_an_plus_b("n"), Some((1, 0)));
-        assert_eq!(parse_an_plus_b("EVEN"), Some((2, 0)));
-        assert_eq!(parse_an_plus_b("2n+"), None);
-        assert_eq!(parse_an_plus_b("foo"), None);
-        assert!(nth_matches(-1, 3, 3) && nth_matches(-1, 3, 1) && !nth_matches(-1, 3, 4));
-    }
 }

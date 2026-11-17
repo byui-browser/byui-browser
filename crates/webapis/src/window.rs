@@ -9,6 +9,10 @@ use std::{
 
 use crate::crypto::register_crypto;
 use crate::custom_elements::CustomElementRegistry;
+use crate::event::{
+    EventTarget, EventTargetRef, add_event_listener_to_target, dispatch_event_target,
+    remove_event_listener_from_target,
+};
 use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
 use security::RendererSecurityContext;
@@ -111,6 +115,10 @@ struct MicrotaskQueue {
     callbacks: VecDeque<Function>,
 }
 
+struct MessageQueue {
+    messages: VecDeque<Value>,
+}
+
 impl MicrotaskQueue {
     fn new() -> Self {
         Self {
@@ -124,6 +132,14 @@ impl MicrotaskQueue {
 
     fn dequeue(&mut self) -> Option<Function> {
         self.callbacks.pop_front()
+    }
+}
+
+impl MessageQueue {
+    fn new() -> Self {
+        Self {
+            messages: VecDeque::new(),
+        }
     }
 }
 
@@ -421,6 +437,78 @@ fn invoke_popstate(window: &Object, state: &Value) {
     }
 }
 
+fn message_target_origin(arguments: &[Value]) -> JsResult<String> {
+    let target = match arguments.get(1) {
+        None | Some(Value::Undefined) => "/".to_owned(),
+        Some(Value::String(target)) => target.clone(),
+        Some(Value::Object(options) | Value::Array(options)) => {
+            match options.get_property("targetOrigin")? {
+                None | Some(Value::Undefined) => "/".to_owned(),
+                Some(Value::String(target)) => target,
+                _ => return Err(type_error("targetOrigin must be a string")),
+            }
+        }
+        _ => {
+            return Err(type_error(
+                "targetOrigin must be a string or options object",
+            ));
+        }
+    };
+    if target == "*" || target == "/" || target == "null" {
+        return Ok(target);
+    }
+    let parsed = Url::parse(&target)
+        .map_err(|_| type_error("targetOrigin must be an origin, '*' or '/'"))?;
+    let origin = parsed.origin().ascii_serialization();
+    let origin_with_slash = format!("{origin}/");
+    if parsed.as_str() != origin && parsed.as_str() != origin_with_slash {
+        return Err(type_error("targetOrigin must be an origin, '*' or '/'"));
+    }
+    Ok(origin)
+}
+
+fn message_origin(window: &Object) -> String {
+    window
+        .get("__postMessageOrigin")
+        .and_then(|value| match value {
+            Value::String(origin) => Some(origin),
+            _ => None,
+        })
+        .unwrap_or_else(|| "null".into())
+}
+
+fn invoke_message(window: &Object, data: Value, origin: String) {
+    let event = Object::new();
+    event.set("type", Value::String("message".into()));
+    event.set("data", data);
+    event.set("origin", Value::String(origin));
+    event.set("source", Value::Object(window.clone()));
+    event.set("ports", Value::Array(Object::new()));
+    event.set("bubbles", Value::Boolean(false));
+    event.set("cancelable", Value::Boolean(false));
+    event.set("target", Value::Object(window.clone()));
+    event.set("currentTarget", Value::Object(window.clone()));
+
+    let mut callbacks = Vec::new();
+    if let Some(Value::Object(list)) = window.get("__messageListeners") {
+        for index in 0..list.len() {
+            if let Some(callback) = list.get(&index.to_string()) {
+                callbacks.push(callback);
+            }
+        }
+    }
+    if let Some(Value::Function(callback)) = window.get("onmessage") {
+        callbacks.push(Value::Function(callback));
+    }
+    for callback in callbacks {
+        if let Value::Function(callback) = callback
+            && let Err(error) = callback.call(&[Value::Object(event.clone())])
+        {
+            log::warn!("message listener threw: {error}");
+        }
+    }
+}
+
 /// The viewport dimensions exposed to a script-visible Window.
 ///
 /// Dimensions are CSS pixels, matching CSSOM View. A viewport is optional
@@ -643,6 +731,8 @@ fn register_window_object(
     };
     let timers = Arc::new(Mutex::new(WindowTimers::new()));
     let microtasks = Arc::new(Mutex::new(MicrotaskQueue::new()));
+    let messages = Arc::new(Mutex::new(MessageQueue::new()));
+    let event_target: EventTargetRef = Arc::new(Mutex::new(EventTarget::default()));
     let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
     let performance = Object::new();
     let performance_clock = Arc::new(PerformanceClock::new());
@@ -658,6 +748,9 @@ fn register_window_object(
         "navigator",
         Arc::new(move |_| Ok(Value::Object(navigator_for_window.clone()))),
     );
+    // A Window without an associated Document has no selection. Document
+    // registration replaces this with the document's singleton Selection.
+    window.set_method("getSelection", Arc::new(|_| Ok(Value::Null)));
     window.set("customElements", Value::Object(custom_elements.clone()));
     // HTML's structured cloning API deep-copies primitives, plain objects,
     // and arrays, preserving cycles and repeated references. This runtime
@@ -705,10 +798,40 @@ fn register_window_object(
     let inner_height = Value::Number(viewport.map_or(0, |size| size.height) as f64);
     window.set("innerHeight", inner_height.clone());
     window.set("onpopstate", Value::Null);
+    window.set("onmessage", Value::Null);
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__popstateListeners", Value::Object(Object::new()));
+    window.set("__messageListeners", Value::Object(Object::new()));
     window.set("__storageListeners", Value::Object(Object::new()));
     window.set("__mediaQueryLists", Value::Object(Object::new()));
+
+    let window_origin = Url::parse(initial_url)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|_| "null".into());
+    window.set("__postMessageOrigin", Value::String(window_origin));
+
+    let messages_for_post_message = Arc::clone(&messages);
+    let post_message_window = window.clone();
+    window.set_method(
+        "postMessage",
+        Arc::new(move |arguments| {
+            let target = message_target_origin(arguments)?;
+            let origin = message_origin(&post_message_window);
+            if target != "*" && target != "/" && target != origin {
+                return Ok(Value::Undefined);
+            }
+            let data = structured_clone(
+                arguments.first().unwrap_or(&Value::Undefined),
+                arguments.get(1),
+            )?;
+            messages_for_post_message
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .messages
+                .push_back(data);
+            Ok(Value::Undefined)
+        }),
+    );
 
     let media_window = window.clone();
     window.set_method(
@@ -1048,43 +1171,55 @@ fn register_window_object(
     );
 
     let listeners_window = window.clone();
+    let window_event_target = event_target.clone();
     window.set_method(
         "addEventListener",
         Arc::new(move |arguments| {
-            let [Value::String(event_type), Value::Function(callback), ..] = arguments else {
+            let Some(Value::String(event_type)) = arguments.first() else {
                 return Err(JsError::runtime(
                     "window.addEventListener() expects an event type and callback",
                 ));
             };
-            if event_type == "popstate" || event_type == "storage" {
+            let result = add_event_listener_to_target(&window_event_target, arguments, "window")?;
+            if event_type == "popstate" || event_type == "storage" || event_type == "message" {
                 let list_name = if event_type == "popstate" {
                     "__popstateListeners"
-                } else {
+                } else if event_type == "storage" {
                     "__storageListeners"
+                } else {
+                    "__messageListeners"
                 };
                 let list = match listeners_window.get(list_name) {
                     Some(Value::Object(list)) => list,
                     _ => return Ok(Value::Undefined),
                 };
                 let index = list.len();
-                list.set(index.to_string(), Value::Function(callback.clone()));
+                if let Some(Value::Function(callback)) = arguments.get(1) {
+                    list.set(index.to_string(), Value::Function(callback.clone()));
+                }
             }
-            Ok(Value::Undefined)
+            Ok(result)
         }),
     );
 
     let remove_window = window.clone();
+    let window_event_target = event_target.clone();
     window.set_method(
         "removeEventListener",
         Arc::new(move |arguments| {
-            let [Value::String(event_type), Value::Function(callback), ..] = arguments else {
-                return Ok(Value::Undefined);
+            let result = remove_event_listener_from_target(&window_event_target, arguments)?;
+            let (Some(Value::String(event_type)), Some(Value::Function(callback))) =
+                (arguments.first(), arguments.get(1))
+            else {
+                return Ok(result);
             };
-            if (event_type == "popstate" || event_type == "storage")
+            if (event_type == "popstate" || event_type == "storage" || event_type == "message")
                 && let Some(Value::Object(list)) = remove_window.get(if event_type == "popstate" {
                     "__popstateListeners"
-                } else {
+                } else if event_type == "storage" {
                     "__storageListeners"
+                } else {
+                    "__messageListeners"
                 })
             {
                 for index in 0..list.len() {
@@ -1096,7 +1231,39 @@ fn register_window_object(
                     }
                 }
             }
-            Ok(Value::Undefined)
+            Ok(result)
+        }),
+    );
+
+    let dispatch_window_event_target = event_target.clone();
+    let dispatch_window = window.clone();
+    window.set_method(
+        "dispatchEvent",
+        Arc::new(move |arguments| {
+            dispatch_event_target(&dispatch_window_event_target, &dispatch_window, arguments)
+        }),
+    );
+
+    let messages_for_pump = Arc::clone(&messages);
+    let microtasks_for_message = Arc::clone(&microtasks);
+    let evaluator_for_message = evaluator.clone();
+    let message_window = window.clone();
+    window.set_method(
+        "__runMessages",
+        Arc::new(move |_| {
+            let mut delivered = 0;
+            loop {
+                let message = messages_for_pump
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .messages
+                    .pop_front();
+                let Some(message) = message else { break };
+                invoke_message(&message_window, message, message_origin(&message_window));
+                drain_microtasks(&microtasks_for_message, &evaluator_for_message);
+                delivered += 1;
+            }
+            Ok(Value::Number(delivered as f64))
         }),
     );
 
@@ -1234,6 +1401,12 @@ fn register_window_object(
     )?;
     realm.register_global_value("customElements", Value::Object(custom_elements))?;
     realm.register_global_value("navigator", Value::Object(navigator))?;
+    realm.register_global_value(
+        "getSelection",
+        window
+            .get("getSelection")
+            .expect("getSelection should be installed on Window"),
+    )?;
     realm.register_global_value("performance", Value::Object(performance))?;
     realm.register_global_value("innerWidth", inner_width)?;
     realm.register_global_value("innerHeight", inner_height)?;
@@ -1319,6 +1492,25 @@ pub fn run_window_microtasks(window: &Object) -> JsResult<usize> {
     }
 }
 
+/// Delivers queued `message` events for a Window.
+///
+/// `postMessage()` queues delivery so scripts can install listeners before the
+/// event is dispatched. Browser integrations should call this from the owning
+/// page/event-loop thread at a task checkpoint. The return value is the number
+/// of messages delivered.
+pub fn run_window_messages(window: &Object) -> JsResult<usize> {
+    let Some(Value::Function(pump)) = window.get("__runMessages") else {
+        return Err(JsError::runtime("window message pump is not installed"));
+    };
+    match pump.call(&[]) {
+        Ok(Value::Number(delivered)) => Ok(delivered as usize),
+        Ok(_) => Err(JsError::runtime(
+            "window message pump returned a non-number",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
 /// Runs the pending `window.requestAnimationFrame()` callbacks for one frame.
 ///
 /// Browser integrations call this from the owning page/event-loop thread
@@ -1358,6 +1550,10 @@ pub fn register_window_with_security_context(
     let window = register_window_object(realm, "about:blank", 1.0, None)?;
     let serialized_origin = security_context.origin().ascii_serialization();
     window.set("origin", Value::String(serialized_origin.clone()));
+    window.set(
+        "__postMessageOrigin",
+        Value::String(serialized_origin.clone()),
+    );
     realm.register_global_value("origin", Value::String(serialized_origin))?;
     Ok(())
 }

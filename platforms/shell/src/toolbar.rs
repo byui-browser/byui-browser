@@ -4,29 +4,31 @@
 //! Window controls come from the operating system: each shell keeps its native
 //! decorations, and where those overlap the toolbar (macOS's traffic lights on
 //! a transparent titlebar) the controls shift right by
-//! [`ChromeState::window_controls_inset`]. Tabs remain staged; navigation and
-//! address editing are handled by the shared shell.
+//! [`ChromeState::window_controls_inset`]. The tab strip sits above this toolbar;
+//! navigation and address editing are handled by the shared shell.
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform};
 
-/// Toolbar height in logical pixels; the page card starts directly below it.
+/// Address toolbar height in logical pixels, below the shared tab strip.
 pub(crate) const TOOLBAR_HEIGHT: f64 = 52.0;
+/// Page origin below tabs and the address toolbar, in logical pixels.
+pub(crate) const PAGE_TOP: f64 = TOOLBAR_HEIGHT + crate::tab_strip::HEIGHT;
 /// Logical height of the strip holding every toolbar control. It stops above
 /// the page card's shadow so the strip can be repainted on its own.
-const CONTROLS_HEIGHT: f64 = 46.0;
+const CONTROLS_HEIGHT: f64 = crate::tab_strip::HEIGHT + 46.0;
 /// Gap in logical pixels between the page card and the window's side and
 /// bottom edges.
 const PAGE_INSET: f64 = 8.0;
 /// Corner radius in logical pixels of the page card and overlays docked to it.
 pub(crate) const PAGE_RADIUS: f32 = 10.0;
-const CENTER_Y: f32 = 26.0;
+const CENTER_Y: f32 = crate::tab_strip::HEIGHT as f32 + 26.0;
 const BUTTON_SIZE: f32 = 28.0;
 const BUTTON_TOP: f32 = CENTER_Y - BUTTON_SIZE / 2.0;
 const ADDRESS_HEIGHT: f32 = 34.0;
 const ADDRESS_MAX_WIDTH: f32 = 640.0;
 /// Logical distance from the address field's left edge to its text, leaving
-/// room for the lock icon.
+/// room for the Site Information button.
 const ADDRESS_TEXT_LEADING: f32 = 30.0;
 /// Logical distance from the toolbar's left edge (after the window-controls
 /// inset) to the Back button when it is furthest left: when the address field
@@ -43,7 +45,7 @@ const NAV_ADDRESS_GAP: f32 = ADDRESS_LEADING - NAV_LEADING - NAV_WIDTH;
 /// Logical distance from the toolbar's left edge (after the window-controls
 /// inset) to the earliest position of the address field.
 const ADDRESS_LEADING: f32 = 116.0;
-/// Narrower windows drop the New Tab and menu buttons to keep the address
+/// Narrower windows drop the menu button to keep the address
 /// field usable.
 const TRAILING_MIN_WIDTH: f32 = 360.0;
 const TEXT_SIZE: f32 = 13.0;
@@ -57,10 +59,10 @@ pub(crate) enum Control {
     Forward,
     /// Reload; fetches the current URL and repaints the loaded page.
     Reload,
+    /// Opens information about the active document.
+    SiteInfo,
     /// Address field; supports staged text editing.
     Address,
-    /// New tab placeholder; tabs are not implemented yet.
-    NewTab,
     /// Overflow menu placeholder.
     Menu,
 }
@@ -69,8 +71,8 @@ const CONTROLS: [Control; 6] = [
     Control::Back,
     Control::Forward,
     Control::Reload,
-    Control::NewTab,
     Control::Menu,
+    Control::SiteInfo,
     Control::Address,
 ];
 
@@ -152,7 +154,7 @@ pub(crate) struct PixelRect {
 /// pixels, or `None` when the window is too small to show any page.
 pub(crate) fn page_rect(width: u32, height: u32, scale_factor: f64) -> Option<PixelRect> {
     let inset = (PAGE_INSET * scale_factor).round() as u32;
-    let top = (TOOLBAR_HEIGHT * scale_factor).round() as u32;
+    let top = (PAGE_TOP * scale_factor).round() as u32;
     let page_width = width.checked_sub(inset * 2).filter(|w| *w > 0)?;
     let page_height = height.checked_sub(top + inset).filter(|h| *h > 0)?;
     Some(PixelRect {
@@ -388,7 +390,7 @@ fn draw_toolbar(
     let transform = Transform::from_scale(scale, scale);
     let inset = state.window_controls_inset;
     for control in CONTROLS {
-        if control == Control::Address {
+        if matches!(control, Control::Address | Control::SiteInfo) {
             continue;
         }
         let Some(rect) = control_rect(control, width, inset) else {
@@ -464,12 +466,6 @@ fn draw_icon(
             }
             return;
         }
-        Control::NewTab => {
-            builder.move_to(cx - 6.0, cy);
-            builder.line_to(cx + 6.0, cy);
-            builder.move_to(cx, cy - 6.0);
-            builder.line_to(cx, cy + 6.0);
-        }
         Control::Menu => {
             for offset in [-5.5, 0.0, 5.5] {
                 builder.push_circle(cx + offset, cy, 1.6);
@@ -524,25 +520,34 @@ fn draw_address_field(
     );
 
     let cy = CENTER_Y;
-    let lock_x = rect.x() + 16.0;
-    if let Some(body) = rounded_rect(lock_x - 4.0, cy - 1.5, 8.0, 6.5, 1.6) {
-        fill(pixmap, &body, palette.accent, transform);
+    let button = site_info_button(rect);
+    let cx = button.x() + button.width() / 2.0;
+    let background = if state.pressed == Some(Control::SiteInfo) {
+        palette.pressed
+    } else if state.hovered == Some(Control::SiteInfo) {
+        palette.hover
+    } else {
+        palette.field_border
+    };
+    if let Some(path) = rounded_rect(
+        button.x(),
+        button.y(),
+        button.width(),
+        button.height(),
+        11.0,
+    ) {
+        fill(pixmap, &path, background, transform);
     }
-    let mut shackle = PathBuilder::new();
-    let (r, top) = (2.5, cy - 3.6);
-    shackle.move_to(lock_x - r, cy - 1.0);
-    shackle.line_to(lock_x - r, top);
-    shackle.cubic_to(
-        lock_x - r,
-        top - r * 4.0 / 3.0,
-        lock_x + r,
-        top - r * 4.0 / 3.0,
-        lock_x + r,
-        top,
-    );
-    shackle.line_to(lock_x + r, cy - 1.0);
-    if let Some(path) = shackle.finish() {
-        stroke(pixmap, &path, palette.accent, 1.4, transform);
+    let mut sliders = PathBuilder::new();
+    for (dy, knob) in [(-3.0, -2.0), (3.0, 2.0)] {
+        let y = cy + dy;
+        sliders.move_to(cx - 5.0, y);
+        sliders.line_to(cx + 5.0, y);
+        sliders.move_to(cx + knob, y - 2.0);
+        sliders.line_to(cx + knob, y + 2.0);
+    }
+    if let Some(path) = sliders.finish() {
+        stroke(pixmap, &path, palette.icon, 1.4, transform);
     }
 
     let star_x = rect.right() - 18.0;
@@ -767,14 +772,24 @@ fn control_rect(control: Control, width: f32, inset: f32) -> Option<Rect> {
         Control::Back => button(nav_x()),
         Control::Forward => button(nav_x() + NAV_STRIDE),
         Control::Reload => button(nav_x() + 2.0 * NAV_STRIDE),
-        Control::NewTab => button(width - 80.0).filter(|_| trailing),
         Control::Menu => button(width - 44.0).filter(|_| trailing),
         Control::Address => address_rect(width, inset, trailing),
+        Control::SiteInfo => address_rect(width, inset, trailing).map(site_info_button),
     }
 }
 
+fn site_info_button(field: Rect) -> Rect {
+    Rect::from_xywh(field.x() + 5.0, CENTER_Y - 11.0, 22.0, 22.0)
+        .expect("positive Site Information button size")
+}
+
+/// Left edge of the Site Information button in logical window pixels.
+pub(crate) fn site_info_anchor(width: f64, inset: f32) -> Option<f32> {
+    control_rect(Control::SiteInfo, width as f32, inset).map(|rect| rect.left())
+}
+
 /// Returns where the address field sits, or `None` when the window is too
-/// narrow for it. `trailing` says whether New Tab and the menu are shown.
+/// narrow for it. `trailing` says whether the menu is shown.
 fn address_rect(width: f32, inset: f32, trailing: bool) -> Option<Rect> {
     let leading = inset + ADDRESS_LEADING;
     let right = if trailing { width - 92.0 } else { width - 12.0 };
@@ -979,14 +994,14 @@ mod tests {
             page_rect(640, 480, 1.0),
             Some(PixelRect {
                 x: 8,
-                y: 52,
+                y: 84,
                 width: 624,
-                height: 420
+                height: 388
             })
         );
         assert_eq!(
             page_rect(1280, 960, 2.0).map(|r| (r.x, r.y)),
-            Some((16, 104))
+            Some((16, 168))
         );
         assert_eq!(page_rect(640, 60, 1.0), None);
         assert_eq!(page_rect(16, 480, 1.0), None);
@@ -1022,15 +1037,24 @@ mod tests {
     fn hit_testing_finds_toolbar_controls() {
         // A 600-pixel window keeps the address field at its leftmost spot,
         // so the navigation buttons sit at their leading position.
-        assert_eq!(hit_test(26.0, 26.0, 600.0, 0.0), Some(Control::Back));
-        assert_eq!(hit_test(90.0, 26.0, 600.0, 0.0), Some(Control::Reload));
-        assert_eq!(hit_test(500.0, 26.0, 1000.0, 0.0), Some(Control::Address));
         assert_eq!(
-            hit_test(1000.0 - 30.0, 26.0, 1000.0, 0.0),
+            hit_test(26.0, CENTER_Y as f64, 600.0, 0.0),
+            Some(Control::Back)
+        );
+        assert_eq!(
+            hit_test(90.0, CENTER_Y as f64, 600.0, 0.0),
+            Some(Control::Reload)
+        );
+        assert_eq!(
+            hit_test(500.0, CENTER_Y as f64, 1000.0, 0.0),
+            Some(Control::Address)
+        );
+        assert_eq!(
+            hit_test(1000.0 - 30.0, CENTER_Y as f64, 1000.0, 0.0),
             Some(Control::Menu)
         );
-        assert_eq!(hit_test(109.0, 26.0, 600.0, 0.0), None);
-        assert_eq!(hit_test(26.0, 26.0, 1000.0, 0.0), None);
+        assert_eq!(hit_test(109.0, CENTER_Y as f64, 600.0, 0.0), None);
+        assert_eq!(hit_test(26.0, CENTER_Y as f64, 1000.0, 0.0), None);
         assert_eq!(hit_test(500.0, 200.0, 1000.0, 0.0), None);
         let state = ChromeState::default();
         assert!(!Control::Back.is_enabled(&state));
@@ -1038,9 +1062,32 @@ mod tests {
     }
 
     #[test]
+    fn site_info_has_a_separate_hit_region_before_address_text() {
+        for (width, inset) in [(420.0, 72.0), (1120.0, 0.0)] {
+            let field = control_rect(Control::Address, width as f32, inset).unwrap();
+            let button = control_rect(Control::SiteInfo, width as f32, inset).unwrap();
+            let text_x = field.left() + ADDRESS_TEXT_LEADING;
+            assert!(button.right() < text_x);
+            assert_eq!(
+                hit_test(
+                    f64::from(button.left() + 1.0),
+                    f64::from(CENTER_Y),
+                    width,
+                    inset
+                ),
+                Some(Control::SiteInfo)
+            );
+            assert_eq!(
+                hit_test(f64::from(text_x), f64::from(CENTER_Y), width, inset),
+                Some(Control::Address)
+            );
+        }
+    }
+
+    #[test]
     fn disabled_navigation_controls_still_occupy_hit_regions() {
-        let back = hit_test(26.0, 26.0, 600.0, 0.0);
-        let forward = hit_test(58.0, 26.0, 600.0, 0.0);
+        let back = hit_test(26.0, CENTER_Y as f64, 600.0, 0.0);
+        let forward = hit_test(58.0, CENTER_Y as f64, 600.0, 0.0);
 
         assert_eq!(back, Some(Control::Back));
         assert_eq!(forward, Some(Control::Forward));
@@ -1052,11 +1099,17 @@ mod tests {
     #[test]
     fn window_controls_inset_shifts_leading_controls() {
         // Space reserved for macOS's traffic lights holds no toolbar control.
-        assert_eq!(hit_test(20.0, 26.0, 1000.0, 72.0), None);
-        assert_eq!(hit_test(60.0, 26.0, 1000.0, 72.0), None);
-        assert_eq!(hit_test(98.0, 26.0, 600.0, 72.0), Some(Control::Back));
-        assert_eq!(hit_test(162.0, 26.0, 600.0, 72.0), Some(Control::Reload));
-        assert_eq!(hit_test(181.0, 26.0, 600.0, 72.0), None);
+        assert_eq!(hit_test(20.0, CENTER_Y as f64, 1000.0, 72.0), None);
+        assert_eq!(hit_test(60.0, CENTER_Y as f64, 1000.0, 72.0), None);
+        assert_eq!(
+            hit_test(98.0, CENTER_Y as f64, 600.0, 72.0),
+            Some(Control::Back)
+        );
+        assert_eq!(
+            hit_test(162.0, CENTER_Y as f64, 600.0, 72.0),
+            Some(Control::Reload)
+        );
+        assert_eq!(hit_test(181.0, CENTER_Y as f64, 600.0, 72.0), None);
         // The address field never slides under the leading controls.
         let narrow = control_rect(Control::Address, 400.0, 72.0).unwrap();
         assert_eq!(narrow.x(), 72.0 + ADDRESS_LEADING);
@@ -1109,6 +1162,30 @@ mod tests {
         assert_eq!(
             address_offset_at(text_x + 50.0, 1000.0, 0.0, 1.0, None, address),
             0
+        );
+    }
+
+    #[test]
+    fn toolbar_plus_is_removed_and_controls_stay_below_tabs() {
+        for width in [420.0, 640.0, 1120.0] {
+            assert_eq!(hit_test(width - 66.0, CENTER_Y as f64, width, 72.0), None);
+            for control in CONTROLS {
+                assert!(
+                    control_rect(control, width as f32, 72.0).unwrap().top()
+                        >= crate::tab_strip::HEIGHT as f32
+                );
+            }
+        }
+        assert_eq!(
+            CONTROLS,
+            [
+                Control::Back,
+                Control::Forward,
+                Control::Reload,
+                Control::Menu,
+                Control::SiteInfo,
+                Control::Address,
+            ]
         );
     }
 

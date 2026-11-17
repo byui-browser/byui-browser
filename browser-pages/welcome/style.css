@@ -1,19 +1,60 @@
-main {
-  background-color: #d4d4e8;
-  height: 400px;
-  padding: 40px;
-}
+/* Welcome page styles. Uses only CSS the BYUI Browser engine renders today:
+   no borders, shadows, gradients, max-width on blocks, or positioning, and
+   text is drawn in the engine's one page font (font-family, bold and italic
+   are not applied yet). */
 
-main span {
-  color: #0c121a;
-}
+body { margin: 0; background-color: #eef1f4; color: #1f2a36; }
 
-button {
-  width: 80px;
-  height: 30px;
-  background-color: #1a1508;
-  border: solid 1px #6c7074;
-  color: white;
-  text-align: center;
-  border-radius: 8px;
-}
+/* Oak toggle: only the tree named by #page's tree-* class shows. */
+.tree-green .oak-blue { display: none; }
+.tree-blue .oak-green { display: none; }
+
+.topbar { display: flex; flex-direction: row; gap: 8px; background-color: #006eb6; padding: 12px 40px; }
+.topbar .brand { color: #ffffff; font-size: 18px; padding-top: 3px; }
+.topbar .spacer { flex-grow: 1; }
+.toggle { display: flex; flex-direction: row; gap: 6px; }
+.toggle-label { color: #cfe4f4; font-size: 14px; padding: 6px 4px 0 0; }
+.pick { color: #ffffff; font-size: 14px; padding: 5px 14px; border-radius: 14px;
+        background-color: #1f82c4; }
+.pick:hover { background-color: #3f95d1; }
+.tree-green .pick-green, .tree-blue .pick-blue { background-color: #ffffff; color: #0b2545; }
+
+.hero { background-color: #ffffff; padding: 40px 0 44px; text-align: center; }
+.oak { display: block; margin: 0 auto; }
+h1 { color: #0b2545; font-size: 46px; margin: 14px 0 6px; }
+.tagline { color: #4a5562; font-size: 18px; margin: 0; }
+
+.quote { width: 640px; margin: 28px auto 0; padding: 18px 28px;
+         background-color: #e6f1fa; border-radius: 12px; color: #0b2545; font-size: 17px; }
+.quote .who { color: #006eb6; font-size: 14px; margin-top: 8px; }
+
+/* Fixed widths: max-width does not narrow ordinary blocks yet. */
+.section { width: 1080px; margin: 36px auto 0; }
+.label { color: #006eb6; font-size: 14px; text-transform: uppercase; margin: 0 0 12px 4px; }
+
+.tiles { display: flex; flex-direction: row; gap: 16px; }
+.tile { width: 130px; background-color: #ffffff; border-radius: 14px; padding: 18px 18px 20px; }
+.tile:hover { background-color: #dcecf8; }
+.tile .name { font-size: 18px; color: #0b2545; }
+.tile .sub { font-size: 13px; color: #6a7684; margin-top: 4px; }
+
+/* Tile icon colors are their own, separate from the oak artwork. */
+.dot { display: block; width: 34px; height: 34px; border-radius: 10px; margin-bottom: 12px; }
+.dot-byui { background-color: #006eb6; }
+.dot-canvas { background-color: #e2603b; }
+.dot-library { background-color: #2f8f6a; }
+.dot-email { background-color: #0b2545; }
+.dot-code { background-color: #4a5562; }
+.dot-ladder { background-color: #c48a1b; }
+
+.cols { display: flex; flex-direction: row; gap: 16px; }
+.card { background-color: #ffffff; border-radius: 14px; padding: 20px 24px 22px; }
+.card.keys { width: 320px; }
+.card.about { width: 648px; }
+.row { display: flex; flex-direction: row; margin-top: 10px; }
+.key { display: inline-block; width: 112px; background-color: #e9edf1; border-radius: 6px;
+       padding: 3px 8px; font-size: 14px; color: #1f2a36; text-align: center; }
+.what { font-size: 15px; color: #33404d; padding: 3px 0 0 12px; }
+.card p { font-size: 15px; color: #33404d; margin: 10px 0 0; }
+
+.footer { text-align: center; color: #7a8592; font-size: 13px; padding: 36px 0 32px; }

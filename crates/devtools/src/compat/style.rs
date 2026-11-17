@@ -877,9 +877,8 @@ const SELECTORS: &[SelectorProbe] = &[
     },
 ];
 
-/// Pseudo-classes for interaction or history state. The style engine
-/// documents that these never match (see `css`'s matching module), and a
-/// static render cannot exercise them.
+/// Dynamic pseudo-classes that the static compatibility audit cannot exercise
+/// because it does not synthesize pointer or focus events.
 const INTERACTIVE_PSEUDO_CLASSES: &[&str] = &[
     "hover",
     "active",
@@ -1383,8 +1382,8 @@ fn audit_selectors<E: PageScriptEngine>(
                 Finding::new(
                     Area::CssSelector,
                     format!(":{name}"),
-                    "The engine tracks no hover, focus, or history state, so these rules never \
-                     apply (documented in the css crate's matching module).",
+                    "The compatibility probe is static and does not synthesize pointer or focus \
+                     events; runtime interaction behavior is not verified here.",
                     Evidence::Documented,
                 )
                 .at(used),
