@@ -28,6 +28,8 @@ mod find_in_page;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 mod page_source;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+mod site_info;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 mod toolbar;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
