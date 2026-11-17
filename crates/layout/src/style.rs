@@ -1,20 +1,22 @@
 //! Typed computed values for the properties layout consumes.
 //!
 //! [`css::style_document`] produces cascaded, inherited declarations as text.
-//! This module parses `display`, box dimensions and edges, text colors, and
-//! `text-align`, `border-*-radius`, `position`, `float`, the inset
-//! properties (`top`, `right`, `bottom`, `left`), and the flex subset
+//! This module parses `display`, box dimensions and edges, `box-sizing`, text
+//! colors, `text-align`, `border-*-radius`, `box-shadow`, `position`, `float`,
+//! the inset properties (`top`, `right`, `bottom`, `left`), and the flex subset
 //! (`flex-direction`, `flex-grow`, `flex-shrink`, `flex-basis`, and `gap`). Other
 //! properties use their initial values. A missing or unparsable value falls back to the initial
 //! value. Lengths are resolved to CSS pixels here; percentages are kept
 //! because they resolve against the containing block during layout.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use css::values::{LengthContext, parse_length, parse_percentage};
 use css::{CssColor, Declaration};
 
-use crate::{BorderRadius, CornerRadius, Corners, LengthPercentage, Sides};
+use crate::shadow::parse_box_shadow;
+use crate::{BorderRadius, BoxShadow, CornerRadius, Corners, LengthPercentage, Sides};
 
 /// The outer display type: how a box participates in its parent's formatting
 /// context (CSS Display 3 §2.1).
@@ -388,14 +390,44 @@ impl TextAlign {
     }
 }
 
+/// The computed `box-sizing`: which box `width`, `height`, and their `min-*`
+/// and `max-*` limits size (CSS Box Sizing 3 §4.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum BoxSizing {
+    /// The sizes are the content box's.
+    #[default]
+    ContentBox,
+    /// The sizes are the border box's, so padding (and borders, once
+    /// supported) is subtracted to get the content size.
+    BorderBox,
+}
+
+impl BoxSizing {
+    /// Parses a `box-sizing` value, ignoring ASCII case.
+    fn parse(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("content-box") {
+            Some(Self::ContentBox)
+        } else if value.eq_ignore_ascii_case("border-box") {
+            Some(Self::BorderBox)
+        } else {
+            None
+        }
+    }
+}
+
 /// The values layout reads from one element's computed style.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ComputedStyle {
     pub display: Display,
     pub margin: Sides<Dimension>,
     pub padding: Sides<Dimension>,
+    /// `width`, measuring the box chosen by `box_sizing`; read the content
+    /// width through [`ComputedStyle::content_width`].
     pub width: Dimension,
+    /// `height`, as for `width`; see [`ComputedStyle::content_height`].
     pub height: Dimension,
+    /// Which box `width`, `height`, and their limits measure.
+    pub box_sizing: BoxSizing,
     /// `min-width`; replaced elements and flex items honor it so far.
     pub min_width: Dimension,
     /// `min-height`; replaced elements and flex items honor it so far.
@@ -425,6 +457,8 @@ pub(crate) struct ComputedStyle {
     pub text_align: TextAlign,
     pub background_color: Option<CssColor>,
     pub border_radius: BorderRadius,
+    /// The computed `box-shadow` list, first (topmost) shadow first.
+    pub box_shadow: Arc<[BoxShadow]>,
     pub flex_column: bool,
     pub flex_grow: f32,
     /// Flex base size before free-space distribution; `auto` uses the
@@ -555,6 +589,7 @@ impl ComputedStyle {
             padding: zero,
             width: Dimension::Auto,
             height: Dimension::Auto,
+            box_sizing: BoxSizing::ContentBox,
             min_width: Dimension::Px(0.0),
             min_height: Dimension::Px(0.0),
             min_width_auto: true,
@@ -581,6 +616,7 @@ impl ComputedStyle {
             background_color: None,
             content: None,
             border_radius: BorderRadius::default(),
+            box_shadow: Arc::from(Vec::new()),
             flex_column: false,
             flex_grow: 0.0,
             flex_basis: Dimension::Auto,
@@ -795,7 +831,82 @@ impl ComputedStyle {
             .and_then(|value| parse_length(value).map(|length| length.to_px(&context)))
             .filter(|value| value.is_finite() && *value >= 0.0)
             .unwrap_or(0.0);
+        if let Some(value) = get("box-sizing") {
+            match BoxSizing::parse(value) {
+                Some(sizing) => style.box_sizing = sizing,
+                None if is_css_wide_keyword(value) => {}
+                None => {
+                    log::debug!("ignoring invalid box-sizing value {value:?}; using content-box")
+                }
+            }
+        }
+        if let Some(value) = get("box-shadow") {
+            match parse_box_shadow(value, &context, style.color) {
+                Some(shadows) => style.box_shadow = shadows.into(),
+                None if is_css_wide_keyword(value) => {}
+                None => log::debug!("ignoring invalid box-shadow value {value:?}; using none"),
+            }
+        }
         style
+    }
+
+    /// The used content-box width for a `width` (or `min-width` /
+    /// `max-width`) value `size` resolved against `cb_width`.
+    ///
+    /// With `box-sizing: border-box` the horizontal padding is subtracted,
+    /// never going below zero. Returns `None` when `size` is `auto` or an
+    /// unresolvable percentage.
+    pub(crate) fn content_width_for(&self, size: Dimension, cb_width: Option<f32>) -> Option<f32> {
+        let width = size.resolve(cb_width)?;
+        Some(match self.box_sizing {
+            BoxSizing::ContentBox => width,
+            BoxSizing::BorderBox => (width
+                - self
+                    .padding
+                    .map(|value| value.resolve_or_zero(cb_width))
+                    .horizontal())
+            .max(0.0),
+        })
+    }
+
+    /// The used content-box height for a `height` (or `min-height` /
+    /// `max-height`) value `size` resolved against `cb_height`.
+    ///
+    /// Padding percentages resolve against `cb_width`, as in CSS. With
+    /// `box-sizing: border-box` the vertical padding is subtracted, never
+    /// going below zero.
+    pub(crate) fn content_height_for(
+        &self,
+        size: Dimension,
+        cb_width: Option<f32>,
+        cb_height: Option<f32>,
+    ) -> Option<f32> {
+        let height = size.resolve(cb_height)?;
+        Some(match self.box_sizing {
+            BoxSizing::ContentBox => height,
+            BoxSizing::BorderBox => (height
+                - self
+                    .padding
+                    .map(|value| value.resolve_or_zero(cb_width))
+                    .vertical())
+            .max(0.0),
+        })
+    }
+
+    /// The used content-box width from `width`; see
+    /// [`ComputedStyle::content_width_for`].
+    pub(crate) fn content_width(&self, cb_width: Option<f32>) -> Option<f32> {
+        self.content_width_for(self.width, cb_width)
+    }
+
+    /// The used content-box height from `height`; see
+    /// [`ComputedStyle::content_height_for`].
+    pub(crate) fn content_height(
+        &self,
+        cb_width: Option<f32>,
+        cb_height: Option<f32>,
+    ) -> Option<f32> {
+        self.content_height_for(self.height, cb_width, cb_height)
     }
 }
 

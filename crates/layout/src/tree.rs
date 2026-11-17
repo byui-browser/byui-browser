@@ -3,16 +3,18 @@
 //! All coordinates are absolute CSS pixels with the origin at the top-left of
 //! the initial containing block (the viewport).
 
+use std::sync::Arc;
+
 use css::CssColor;
 use html::NodeID;
 
-use crate::{BorderRadius, Edges, ImageKey, Rect};
+use crate::{BorderRadius, BoxShadow, Edges, ImageKey, Rect};
 
 /// Paint-relevant computed values for a box or inline box fragment.
 ///
-/// Colors and corner radii are painted today; borders and other decorations
-/// are not supported yet.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Colors, corner radii, and outer box shadows are painted today; borders,
+/// inset shadows, and other decorations are not supported yet.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoxStyle {
     /// The background color, or `None` when it is transparent or unsupported.
     pub background_color: Option<CssColor>,
@@ -21,6 +23,9 @@ pub struct BoxStyle {
     /// The computed `border-*-radius` values. The background is clipped to
     /// the rounded border box; resolve them with [`BorderRadius::resolve`].
     pub border_radius: BorderRadius,
+    /// The computed `box-shadow` list, first (topmost) shadow first; empty
+    /// for `none`. Shadows follow the rounded border box.
+    pub box_shadow: Arc<[BoxShadow]>,
 }
 
 impl Default for BoxStyle {
@@ -30,6 +35,7 @@ impl Default for BoxStyle {
             text_color: css::user_agent_default_color("color")
                 .expect("user-agent stylesheet must define html color"),
             border_radius: BorderRadius::default(),
+            box_shadow: Arc::from(Vec::new()),
         }
     }
 }

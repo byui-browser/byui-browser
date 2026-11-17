@@ -87,9 +87,90 @@ impl Compositor {
                     text,
                     rgba,
                 } => self.draw_text(&mut frame, *x, *baseline, *font_size, text, *rgba),
+                DisplayItem::BoxShadow {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    radii,
+                    sigma,
+                    rgba,
+                } => self.fill_box_shadow(
+                    &mut frame,
+                    [*left, *top, *right, *bottom],
+                    *radii,
+                    *sigma,
+                    *rgba,
+                ),
             }
         }
         frame
+    }
+
+    /// Fills the rounded rectangle `[left, top, right, bottom]` (device
+    /// pixels) blurred by a Gaussian with standard deviation `sigma`.
+    ///
+    /// Each pixel's coverage comes from its center's signed distance `d` to
+    /// the shape: `0.5 * erfc(d / (sigma * sqrt 2))`, the exact result for a
+    /// straight edge and a close approximation near corners. With `sigma`
+    /// 0, edges are anti-aliased over one pixel.
+    fn fill_box_shadow(
+        &self,
+        frame: &mut Frame,
+        [left, top, right, bottom]: [f32; 4],
+        radii: [[f32; 2]; 4],
+        sigma: f32,
+        rgba: [u8; 4],
+    ) {
+        log::trace!("box shadow ({left}, {top})-({right}, {bottom}) radii {radii:?} sigma {sigma}");
+        if right <= left || bottom <= top || rgba[3] == 0 {
+            return;
+        }
+        let reach = 3.0 * sigma + 1.0;
+        let first =
+            |value: f32, limit: u32| (value - reach).floor().clamp(0.0, limit as f32) as u32;
+        let last = |value: f32, limit: u32| (value + reach).ceil().clamp(0.0, limit as f32) as u32;
+        let (x_start, x_end) = (first(left, self.width), last(right, self.width));
+        let (y_start, y_end) = (first(top, self.height), last(bottom, self.height));
+        let [tl, tr, br, bl] = radii;
+        // Each corner as (center x, center y, radius x, radius y, which
+        // side of the center the curve is on).
+        let corners = [
+            (left + tl[0], top + tl[1], tl, -1.0, -1.0),
+            (right - tr[0], top + tr[1], tr, 1.0, -1.0),
+            (right - br[0], bottom - br[1], br, 1.0, 1.0),
+            (left + bl[0], bottom - bl[1], bl, -1.0, 1.0),
+        ];
+        let (center_x, center_y) = ((left + right) / 2.0, (top + bottom) / 2.0);
+        let (half_width, half_height) = ((right - left) / 2.0, (bottom - top) / 2.0);
+        let distance = |x: f32, y: f32| {
+            for &(cx, cy, [rx, ry], sx, sy) in &corners {
+                let (dx, dy) = ((x - cx) * sx, (y - cy) * sy);
+                if rx > 0.0 && ry > 0.0 && dx > 0.0 && dy > 0.0 {
+                    // Approximate distance to the ellipse, exact for circles.
+                    let normalized = ((dx / rx).powi(2) + (dy / ry).powi(2)).sqrt();
+                    return (normalized - 1.0) * rx.min(ry);
+                }
+            }
+            let qx = (x - center_x).abs() - half_width;
+            let qy = (y - center_y).abs() - half_height;
+            let outside = qx.max(0.0).hypot(qy.max(0.0));
+            outside + qx.max(qy).min(0.0)
+        };
+        for py in y_start..y_end {
+            for px in x_start..x_end {
+                let d = distance(px as f32 + 0.5, py as f32 + 0.5);
+                let coverage = if sigma > 0.0 {
+                    0.5 * erfc(d / (sigma * std::f32::consts::SQRT_2))
+                } else {
+                    (0.5 - d).clamp(0.0, 1.0)
+                };
+                let alpha = (f32::from(rgba[3]) * coverage).round() as u8;
+                if alpha > 0 {
+                    self.put_pixel(frame, px, py, [rgba[0], rgba[1], rgba[2], alpha]);
+                }
+            }
+        }
     }
 
     /// Fills the rectangle `[left, top, right, bottom]` (device pixels) with
@@ -189,11 +270,30 @@ impl Compositor {
             edge(rect.right()),
             edge(rect.bottom()),
         );
+        DisplayItem::FillRoundedRect {
+            left,
+            top,
+            right,
+            bottom,
+            radii: Self::device_radii(radii, scale, right - left, bottom - top),
+            rgba: [color.r, color.g, color.b, color.a],
+        }
+    }
+
+    /// `radii` in device pixels at `scale`, as `[horizontal, vertical]` per
+    /// corner, shrunk by a common factor if needed to fit a `width` by
+    /// `height` device-pixel rectangle.
+    fn device_radii(
+        radii: &paint::CornerRadii,
+        scale: f32,
+        width: f32,
+        height: f32,
+    ) -> [[f32; 2]; 4] {
         let mut radii = radii
             .scaled(scale)
             .into_array()
             .map(|radius| [radius.horizontal, radius.vertical]);
-        let (width, height) = ((right - left).max(0.0), (bottom - top).max(0.0));
+        let (width, height) = (width.max(0.0), height.max(0.0));
         let fit = |length: f32, a: f32, b: f32| {
             if a + b > length {
                 length / (a + b)
@@ -208,12 +308,28 @@ impl Compositor {
         for radius in radii.iter_mut().flatten() {
             *radius *= factor;
         }
-        DisplayItem::FillRoundedRect {
+        radii
+    }
+
+    /// Converts a paint box shadow to a device-pixel
+    /// [`DisplayItem::BoxShadow`] at `scale` device pixels per CSS pixel.
+    /// Edges are not snapped, since the blur softens them anyway.
+    fn box_shadow_item(
+        rect: &paint::Rect,
+        radii: &paint::CornerRadii,
+        blur: f32,
+        color: &paint::Color,
+        scale: f32,
+    ) -> DisplayItem {
+        let (left, top) = (rect.x * scale, rect.y * scale);
+        let (right, bottom) = (rect.right() * scale, rect.bottom() * scale);
+        DisplayItem::BoxShadow {
             left,
             top,
             right,
             bottom,
-            radii,
+            radii: Self::device_radii(radii, scale, right - left, bottom - top),
+            sigma: blur.max(0.0) * scale / 2.0,
             rgba: [color.r, color.g, color.b, color.a],
         }
     }
@@ -326,6 +442,12 @@ impl Compositor {
                 paint::DisplayItem::FillRoundedRect { rect, radii, color } => {
                     Some(Self::rounded_rect_item(rect, radii, color, 1.0))
                 }
+                paint::DisplayItem::BoxShadow {
+                    rect,
+                    radii,
+                    blur,
+                    color,
+                } => Some(Self::box_shadow_item(rect, radii, *blur, color, 1.0)),
                 paint::DisplayItem::Text {
                     x,
                     baseline,
@@ -444,6 +566,31 @@ impl Compositor {
                     } = Self::rounded_rect_item(rect, radii, color, scale)
                     {
                         self.fill_rounded_rect(&mut frame, [left, top, right, bottom], radii, rgba);
+                    }
+                }
+                paint::DisplayItem::BoxShadow {
+                    rect,
+                    radii,
+                    blur,
+                    color,
+                } => {
+                    if let DisplayItem::BoxShadow {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                        radii,
+                        sigma,
+                        rgba,
+                    } = Self::box_shadow_item(rect, radii, *blur, color, scale)
+                    {
+                        self.fill_box_shadow(
+                            &mut frame,
+                            [left, top, right, bottom],
+                            radii,
+                            sigma,
+                            rgba,
+                        );
                     }
                 }
                 paint::DisplayItem::Text {
@@ -597,6 +744,17 @@ impl Compositor {
             });
         }
     }
+}
+
+/// The complementary error function, `1 - erf(x)`, to within about 1e-7
+/// (Abramowitz and Stegun 7.1.26 gives erf to 1.5e-7).
+fn erfc(x: f32) -> f32 {
+    let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
+    let polynomial = t
+        * (0.254_829_6
+            + t * (-0.284_496_74 + t * (1.421_413_8 + t * (-1.453_152_1 + t * 1.061_405_4))));
+    let tail = polynomial * (-x * x).exp();
+    if x >= 0.0 { tail } else { 2.0 - tail }
 }
 
 #[cfg(test)]
@@ -802,6 +960,64 @@ mod tests {
             &frame.pixels[(2 * 8 + 2) * 4..(2 * 8 + 2) * 4 + 4],
             [255, 0, 0, 255]
         );
+    }
+
+    #[test]
+    fn blurred_shadows_fade_across_their_edges() {
+        let frame = Compositor::new(60, 20).compose(&[DisplayItem::BoxShadow {
+            left: 20.0,
+            top: 0.0,
+            right: 40.0,
+            bottom: 20.0,
+            radii: [[0.0; 2]; 4],
+            sigma: 4.0,
+            rgba: [0, 0, 0, 255],
+        }]);
+        let alpha_over_white = |x: u32| 255 - frame.pixels[((10 * 60 + x) * 4) as usize];
+        // Fully dark in the middle, about half dark at the edge, and fading
+        // to nothing three standard deviations out.
+        assert!(alpha_over_white(30) >= 240, "{}", alpha_over_white(30));
+        assert!(
+            (100..=155).contains(&alpha_over_white(20)),
+            "{}",
+            alpha_over_white(20)
+        );
+        assert!(alpha_over_white(8) <= 2, "{}", alpha_over_white(8));
+        assert!(alpha_over_white(14) > alpha_over_white(10));
+    }
+
+    #[test]
+    fn unblurred_shadows_have_sharp_edges_and_rounded_corners() {
+        let frame = Compositor::new(20, 20).compose(&[DisplayItem::BoxShadow {
+            left: 2.0,
+            top: 2.0,
+            right: 18.0,
+            bottom: 18.0,
+            radii: [[6.0; 2]; 4],
+            sigma: 0.0,
+            rgba: [255, 0, 0, 255],
+        }]);
+        let pixel = |x: u32, y: u32| {
+            let offset = ((y * 20 + x) * 4) as usize;
+            [frame.pixels[offset], frame.pixels[offset + 1]]
+        };
+        assert_eq!(pixel(10, 10), [255, 0]);
+        assert_eq!(pixel(1, 10), [255, 255]);
+        // The corner is cut away, but the straight edge next to it is not.
+        assert_eq!(pixel(2, 2), [255, 255]);
+        assert_eq!(pixel(2, 10), [255, 0]);
+    }
+
+    #[test]
+    fn erfc_matches_known_values() {
+        for (x, expected) in [
+            (0.0, 1.0),
+            (1.0, 0.157_299_2),
+            (-1.0, 1.842_700_8),
+            (3.0, 0.000_022),
+        ] {
+            assert!((erfc(x) - expected).abs() < 1e-5, "erfc({x}) = {}", erfc(x));
+        }
     }
 
     #[test]

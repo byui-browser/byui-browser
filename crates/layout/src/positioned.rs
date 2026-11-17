@@ -23,7 +23,7 @@ use crate::Rect;
 use crate::block::{BlockResult, ContainingBlock};
 use crate::box_tree::BlockBox;
 use crate::layout::Context;
-use crate::style::{ComputedStyle, Dimension, Float, Position};
+use crate::style::{BoxSizing, ComputedStyle, Dimension, Float, Position};
 use crate::tree::{BoxKind, LayoutBox};
 
 /// Tolerance for floating-point error when testing whether a float fits.
@@ -372,7 +372,7 @@ impl Context<'_> {
         let static_left = pending.x - cb.x;
         let specified_width = replaced
             .map(|(width, _)| width)
-            .or(style.width.resolve(basis));
+            .or(style.content_width(basis));
         let (left, width, margin_left, margin_right) = match (inset_left, inset_right) {
             (Some(left), Some(right)) => {
                 let (fixed_left, fixed_right) =
@@ -431,7 +431,7 @@ impl Context<'_> {
         let margin_bottom = style.margin.bottom.resolve(basis);
         let specified_height = replaced
             .map(|(_, height)| height)
-            .or(style.height.resolve(Some(cb.height)));
+            .or(style.content_height(basis, Some(cb.height)));
         let mut laid_out = block.clone();
         if let (None, Some(top), Some(bottom)) = (specified_height, inset_top, inset_bottom) {
             let height = (cb.height
@@ -442,7 +442,9 @@ impl Context<'_> {
                 - padding.vertical())
             .max(0.0);
             let mut computed = (**style).clone();
+            // `height` is a content size, so lay the box out as `content-box`.
             computed.height = Dimension::Px(height);
+            computed.box_sizing = BoxSizing::ContentBox;
             laid_out.style = std::rc::Rc::new(computed);
         }
         let result = self.layout_block_container_at(
