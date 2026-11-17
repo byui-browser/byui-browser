@@ -21,21 +21,7 @@ impl RequestController {
         let (mut request, mut url) = prepared.into_parts();
         let mut response;
         loop {
-            if request.signal().is_aborted() {
-                log::debug!(
-                    "request aborted before transport: {}",
-                    crate::log_url::loggable(url.as_str())
-                );
-                return Err(RequestError::Aborted);
-            }
-            if request.redirect_count() > 0 {
-                self.authorize_redirect_hop(&request)?;
-            }
-            request.reduce_referrer_for_target(&url);
-            let (mut transport_headers, generated_headers) =
-                self.transport_headers(&request, &url)?;
-            self.ensure_cors_preflight(&request, &url, &generated_headers)
-                .await?;
+            let transport_headers = self.validate_http_hop(&mut request, &url).await?;
 
             let cacheable = request.is_cacheable_method();
             let cache_lookup = match request.cache_mode() {
@@ -111,32 +97,15 @@ impl RequestController {
                 }
             }
 
-            if request.credentials_allowed(&url)
-                && let Some(services) = &self.inner.services
-                && let Some(cookie) = services.cookie_header(&request)?
-            {
-                let value = http::HeaderValue::from_str(&cookie).map_err(|_| {
-                    log::warn!(
-                        "cookie header from services is invalid; failing {}",
-                        crate::log_url::loggable(url.as_str())
-                    );
-                    RequestError::InvalidHeaderValue("cookie".into())
-                })?;
-                transport_headers.insert_internal_header(http::header::COOKIE, value)?;
-            }
-
             let had_nonreplayable_body = request
                 .body()
                 .as_ref()
                 .is_some_and(|body| !body.is_replayable());
-            let attempt = request.for_transport()?;
+            let validated = self.finish_http_hop(&mut request, &url, transport_headers)?;
             let mut candidate = self
                 .inner
                 .scheduler
-                .submit(
-                    ValidatedHop::new(attempt, transport_headers, url.clone()),
-                    request.transport_priority(),
-                )
+                .submit(validated, request.transport_priority())
                 .await
                 .inspect_err(|_| {
                     self.clear_preflight_cache_after_failure(&request, &url);
@@ -297,10 +266,71 @@ impl RequestController {
         Ok(response.expose())
     }
 
-    /// Repeats browser-owned request authorization for a followed hop.
-    fn authorize_redirect_hop(&self, request: &Request) -> Result<(), RequestError> {
-        if let Some(services) = &self.inner.services {
+    /// Validates the request state shared by every executable HTTP hop.
+    ///
+    /// Initial browser authorization has already run during preparation. For
+    /// followed redirects this method performs the per-hop authorization
+    /// before deriving any target-dependent headers or starting preflight.
+    /// Cookie selection intentionally remains after cache lookup so cache hits
+    /// do not consult browser cookie storage.
+    async fn validate_http_hop(
+        &self,
+        request: &mut Request,
+        url: &reqwest::Url,
+    ) -> Result<crate::Headers, RequestError> {
+        if request.signal().is_aborted() {
+            log::debug!(
+                "request aborted before transport: {}",
+                crate::log_url::loggable(url.as_str())
+            );
+            return Err(RequestError::Aborted);
+        }
+        if request.redirect_count() > 0
+            && let Some(services) = &self.inner.services
+        {
             services.check_request(request)?;
+        }
+        request.reduce_referrer_for_target(url);
+        let (headers, generated_headers) = self.transport_headers(request, url)?;
+        self.ensure_cors_preflight(request, url, &generated_headers)
+            .await?;
+        Ok(headers)
+    }
+
+    /// Completes a cache-miss hop with credentials and transport ownership.
+    fn finish_http_hop(
+        &self,
+        request: &mut Request,
+        url: &reqwest::Url,
+        mut transport_headers: crate::Headers,
+    ) -> Result<ValidatedHop, RequestError> {
+        self.select_cookies(request, url, &mut transport_headers)?;
+        Ok(ValidatedHop::new(
+            request.for_transport()?,
+            transport_headers,
+            url.clone(),
+        ))
+    }
+
+    /// Adds the browser-selected cookie to a cache-miss transport attempt.
+    fn select_cookies(
+        &self,
+        request: &Request,
+        url: &reqwest::Url,
+        transport_headers: &mut crate::Headers,
+    ) -> Result<(), RequestError> {
+        if request.credentials_allowed(url)
+            && let Some(services) = &self.inner.services
+            && let Some(cookie) = services.cookie_header(request)?
+        {
+            let value = http::HeaderValue::from_str(&cookie).map_err(|_| {
+                log::warn!(
+                    "cookie header from services is invalid; failing {}",
+                    crate::log_url::loggable(url.as_str())
+                );
+                RequestError::InvalidHeaderValue("cookie".into())
+            })?;
+            transport_headers.insert_internal_header(http::header::COOKIE, value)?;
         }
         Ok(())
     }
