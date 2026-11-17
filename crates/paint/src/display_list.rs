@@ -23,6 +23,24 @@ pub enum DisplayItem {
         /// Opaque or translucent fill color.
         color: Color,
     },
+    /// Fills a blurred, optionally rounded rectangle: one outer `box-shadow`.
+    ///
+    /// Painted below the box's background. `rect` and `radii` are the shadow
+    /// shape before blurring (the border box offset and grown by the
+    /// spread). The renderer fades the edges with a Gaussian of standard
+    /// deviation `blur / 2`, so paint reaches about `blur` pixels past
+    /// `rect`. A `blur` of 0 is a sharp-edged fill.
+    BoxShadow {
+        /// The shadow shape before blurring.
+        rect: Rect,
+        /// Corner radii in CSS pixels, already fit to `rect`; all zero for
+        /// a square shadow.
+        radii: CornerRadii,
+        /// The CSS blur radius in CSS pixels, never negative.
+        blur: f32,
+        /// Shadow color.
+        color: Color,
+    },
     /// Draws a run of text.
     Text {
         /// Left edge of the first glyph's advance.

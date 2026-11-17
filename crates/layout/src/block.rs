@@ -6,7 +6,9 @@
 
 use crate::box_tree::{BlockBox, BlockContents};
 use crate::layout::Context;
-use crate::style::{ComputedStyle, Dimension};
+use std::sync::Arc;
+
+use crate::style::{BoxSizing, ComputedStyle, Dimension};
 use crate::tree::{BoxKind, BoxStyle, LayoutBox};
 use crate::{Edges, Rect};
 
@@ -78,7 +80,7 @@ impl Context<'_> {
             BlockContents::Replaced(replaced) => {
                 Some(replaced.used_size(style, basis, cb.height).0)
             }
-            _ => style.width.resolve(basis),
+            _ => style.content_width(basis),
         };
         let (left, width, right) = match used_width {
             None => {
@@ -146,7 +148,7 @@ impl Context<'_> {
             BlockContents::Replaced(replaced) => Some(replaced.used_size(style, basis, None).0),
             _ => None,
         };
-        let width = replaced_width.or(style.width.resolve(basis)).unwrap_or_else(|| {
+        let width = replaced_width.or(style.content_width(basis)).unwrap_or_else(|| {
             let (min_content, max_content) = self.intrinsic_content_sizes(block);
             let available = cb_width - margin_left - margin_right - padding;
             let width = max_content.min(available.max(min_content));
@@ -236,7 +238,7 @@ impl Context<'_> {
             BlockContents::Replaced(replaced) => {
                 Some(replaced.used_size(style, basis, cb.height).1)
             }
-            _ => style.height.resolve(cb.height),
+            _ => style.content_height(basis, cb.height),
         };
 
         let edges = FlowEdges {
@@ -430,64 +432,89 @@ impl Context<'_> {
         let column = style.flex_column;
         let available = if column { height.unwrap_or(0.0) } else { width };
         let gaps = style.gap * list.len().saturating_sub(1) as f32;
+        // Each item's main-axis padding: free space is what is left after
+        // the items' outer sizes, not just their content sizes.
+        let main_padding = |item: &BlockBox| {
+            let padding = item
+                .style
+                .padding
+                .map(|value| value.resolve_or_zero(Some(width)));
+            if column {
+                padding.vertical()
+            } else {
+                padding.horizontal()
+            }
+        };
+        // The border-box height of an item laid out at its natural height,
+        // converted to a content-box height.
+        let natural_content_height = |item: &BlockBox| {
+            let border_box = self
+                .layout_block_level(
+                    item,
+                    ContainingBlock {
+                        width,
+                        height: None,
+                    },
+                )
+                .fragment
+                .rect
+                .height;
+            (border_box - main_padding(item)).max(0.0)
+        };
+        // Content-box sizes along the main axis. `flex-basis`, like the main
+        // size property, measures the box `box-sizing` selects.
         let basis = list
             .iter()
             .map(|item| {
-                let basis_size =
+                let basis_size = if column {
                     item.style
-                        .flex_basis
-                        .resolve(if column { height } else { Some(width) });
+                        .content_height_for(item.style.flex_basis, Some(width), height)
+                } else {
+                    item.style
+                        .content_width_for(item.style.flex_basis, Some(width))
+                };
                 basis_size.unwrap_or_else(|| {
                     if column {
-                        item.style.height.resolve(height).unwrap_or_else(|| {
-                            self.layout_block_level(
-                                item,
-                                ContainingBlock {
-                                    width,
-                                    height: None,
-                                },
-                            )
-                            .fragment
-                            .rect
-                            .height
-                        })
+                        item.style
+                            .content_height(Some(width), height)
+                            .unwrap_or_else(|| natural_content_height(item))
                     } else {
                         item.style
-                            .width
-                            .resolve(Some(width))
+                            .content_width(Some(width))
                             .unwrap_or_else(|| self.intrinsic_content_sizes(item).1)
                     }
                 })
             })
             .collect::<Vec<_>>();
+        // Content-box minimum main sizes that shrinking never goes below.
         let minimums = list
             .iter()
             .map(|item| {
                 if column {
                     if item.style.min_height_auto {
-                        self.layout_block_level(
-                            item,
-                            ContainingBlock {
-                                width,
-                                height: None,
-                            },
-                        )
-                        .fragment
-                        .rect
-                        .height
+                        natural_content_height(item)
                     } else {
-                        item.style.min_height.resolve(height).unwrap_or(0.0)
+                        item.style
+                            .content_height_for(item.style.min_height, Some(width), height)
+                            .unwrap_or(0.0)
                     }
                 } else if item.style.min_width_auto {
                     self.intrinsic_content_sizes(item).0
                 } else {
-                    item.style.min_width.resolve(Some(width)).unwrap_or(0.0)
+                    item.style
+                        .content_width_for(item.style.min_width, Some(width))
+                        .unwrap_or(0.0)
                 }
                 .max(0.0)
             })
             .collect::<Vec<_>>();
+        let outer: f32 = list
+            .iter()
+            .zip(&basis)
+            .map(|(item, base)| base + main_padding(item))
+            .sum();
         let grow: f32 = list.iter().map(|item| item.style.flex_grow).sum();
-        let free = available - gaps - basis.iter().sum::<f32>();
+        let free = available - gaps - outer;
         let shrink: f32 = list
             .iter()
             .zip(&basis)
@@ -506,6 +533,20 @@ impl Context<'_> {
             };
             let mut item = item.clone();
             let mut computed = (*item.style).clone();
+            // `target` is a content size, whatever the item's `box-sizing`.
+            // Convert the cross size to a content size too before switching
+            // the item to `content-box`, so a border-box cross size keeps
+            // its padding inside it.
+            if computed.box_sizing == BoxSizing::BorderBox {
+                if column {
+                    if let Some(content) = computed.content_width(Some(width)) {
+                        computed.width = Dimension::Px(content);
+                    }
+                } else if let Some(content) = computed.content_height(Some(width), height) {
+                    computed.height = Dimension::Px(content);
+                }
+            }
+            computed.box_sizing = BoxSizing::ContentBox;
             if column {
                 computed.height = Dimension::Px(target);
             } else {
@@ -585,7 +626,10 @@ impl Context<'_> {
             + fixed(style.margin.left)
             + fixed(style.margin.right);
         let (min, max) = match style.width {
-            Dimension::Px(width) => (width, width),
+            Dimension::Px(_) => {
+                let width = style.content_width(None).unwrap_or(0.0);
+                (width, width)
+            }
             _ => self.intrinsic_content_sizes(block),
         };
         (min + outer, max + outer)
@@ -632,5 +676,6 @@ pub(crate) fn box_style(style: &ComputedStyle) -> BoxStyle {
         background_color: style.background_color,
         text_color: style.color,
         border_radius: style.border_radius,
+        box_shadow: Arc::clone(&style.box_shadow),
     }
 }
