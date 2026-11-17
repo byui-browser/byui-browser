@@ -25,6 +25,15 @@ pub(crate) struct BlockBox {
     /// Whether the box establishes a new block formatting context
     /// (CSS 2.2 §9.4.1), which stops margins collapsing through it.
     pub establishes_bfc: bool,
+    /// Whether text painted inside the box is clipped to its padding box.
+    /// Set for form controls, whose contents the user agent draws (the
+    /// built-in stylesheet gives inputs `overflow: clip`). The general
+    /// `overflow` property is not implemented yet.
+    pub clips_contents: bool,
+    /// Whether the box's line boxes are centered vertically in its content
+    /// box when it is taller than they are, as single-line form controls
+    /// do. Ordinary blocks start their lines at the top.
+    pub centers_lines: bool,
     pub contents: BlockContents,
     /// The form control the box is, which gives `auto` sizes a default.
     pub control: Option<FormControl>,
@@ -52,6 +61,11 @@ pub(crate) enum InlineItem {
         element: Option<NodeID>,
         text: String,
         style: Rc<ComputedStyle>,
+        /// When `true`, the text is one unbreakable run whose spaces are
+        /// kept as written (like `white-space: pre` without segment breaks).
+        /// Used for text the user agent draws inside form controls; DOM text
+        /// is `false` and collapses as `white-space: normal`.
+        preserve: bool,
     },
     /// The start of an inline box. `start_edge` is `false` on the
     /// continuation after a block-level box split the inline box.
@@ -251,6 +265,8 @@ pub(crate) fn build_initial_containing_block(
         style,
         establishes_bfc: true,
         control: None,
+        clips_contents: false,
+        centers_lines: false,
     };
     let stats = &builder.stats;
     log::debug!(
@@ -331,12 +347,20 @@ impl Builder<'_> {
             // Floats and absolutely positioned boxes establish a new block
             // formatting context (CSS 2.2 §9.4.1).
             establishes_bfc: is_root || flow_root || style.is_out_of_flow(),
-            control: match self.document.node(node).map(|node| node.get_kind()) {
-                Some(NodeKind::Element(element)) => {
-                    FormControl::for_element(self.document, node, element)
-                }
-                _ => None,
-            },
+            control: self.form_control_sizing(node),
+            clips_contents: false,
+            centers_lines: false,
+        }
+    }
+
+    /// The form control `node` is, which gives its `auto` sizes a default;
+    /// `None` for other nodes.
+    fn form_control_sizing(&self, node: NodeID) -> Option<FormControl> {
+        match self.document.node(node).map(|node| node.get_kind()) {
+            Some(NodeKind::Element(element)) => {
+                FormControl::for_element(self.document, node, element)
+            }
+            _ => None,
         }
     }
 
@@ -404,6 +428,8 @@ impl Builder<'_> {
                 node: None,
                 style: Rc::new(ComputedStyle::anonymous(Some(style))),
                 establishes_bfc: false,
+                clips_contents: false,
+                centers_lines: false,
                 contents: BlockContents::Inlines(items),
                 control: None,
             });
@@ -447,6 +473,7 @@ impl Builder<'_> {
             element: Some(owner),
             text: style.text_transform.apply(content),
             style: Rc::clone(style),
+            preserve: false,
         };
         if style.is_out_of_flow() && style.display != Display::None {
             log::trace!("out-of-flow {which:?} box for node {owner:?}");
@@ -457,6 +484,8 @@ impl Builder<'_> {
                 establishes_bfc: true,
                 contents: BlockContents::Inlines(vec![text]),
                 control: None,
+                clips_contents: false,
+                centers_lines: false,
             })));
             return;
         }
@@ -477,6 +506,8 @@ impl Builder<'_> {
                     establishes_bfc: false,
                     contents: BlockContents::Inlines(vec![text]),
                     control: None,
+                    clips_contents: false,
+                    centers_lines: false,
                 }));
                 for (open, open_style) in open_inlines {
                     levels.push(Level::Inline(InlineItem::Start {
@@ -519,6 +550,7 @@ impl Builder<'_> {
                         .filter(|parent| self.styles.get(*parent).is_some()),
                     text: style.text_transform.apply(text),
                     style,
+                    preserve: false,
                 }));
             }
             NodeKind::Element(element) => {
@@ -531,7 +563,14 @@ impl Builder<'_> {
                     return;
                 };
                 let boxed = !matches!(style.display, Display::None | Display::Contents);
-                if boxed && let Some(level) = self.replaced(node, element, style) {
+                // Form controls with user-agent drawn contents are boxed like
+                // replaced elements, so floated or absolutely positioned
+                // controls go out of flow below too.
+                if boxed
+                    && let Some(level) = self
+                        .replaced(node, element, style)
+                        .or_else(|| self.form_control(node, element, style))
+                {
                     match level {
                         Level::Block(block) | Level::Inline(InlineItem::Atomic(block))
                             if style.is_out_of_flow() =>
@@ -670,6 +709,7 @@ impl Builder<'_> {
                                 element: Some(node),
                                 text: style.text_transform.apply(alt),
                                 style: Rc::clone(style),
+                                preserve: false,
                             }));
                         }
                         NaturalSize {
@@ -724,6 +764,8 @@ impl Builder<'_> {
             node: Some(node),
             style: Rc::clone(style),
             establishes_bfc: true,
+            clips_contents: false,
+            centers_lines: false,
             contents: BlockContents::Replaced(ReplacedBox {
                 key,
                 natural,
@@ -732,13 +774,212 @@ impl Builder<'_> {
             }),
             control: None,
         };
-        Some(match style.display {
-            Display::Box {
-                outside: DisplayOutside::Block,
-                ..
-            } => Level::Block(block),
-            _ => Level::Inline(InlineItem::Atomic(block)),
-        })
+        Some(level_for(block))
+    }
+
+    /// The box for a form control whose visible text the user agent draws,
+    /// or `None` for other elements.
+    ///
+    /// - Text-like `<input>`s (`text`, `search`, `email`, `url`, `tel`,
+    ///   `password`, `number`, and a missing or unknown `type`) show their
+    ///   `value` attribute with line breaks removed, or, when it is missing
+    ///   or empty, their `placeholder` in [`PLACEHOLDER_COLOR`]. A `password`
+    ///   input shows one `•` per character of its value instead.
+    /// - `<textarea>` shows its child text with line breaks kept, or its
+    ///   `placeholder` when it has no text.
+    ///
+    /// Other input types (buttons, checkboxes, dates, …) return `None` and
+    /// keep their empty inline-block box. Values changed at runtime, the
+    /// caret, and selection are not supported.
+    fn form_control(
+        &self,
+        node: NodeID,
+        element: &html::ElementData,
+        style: &Rc<ComputedStyle>,
+    ) -> Option<Level> {
+        if *element.get_namespace() != html::Namespace::Html {
+            return None;
+        }
+        let attribute = |name: &str| {
+            element
+                .get_attributes()
+                .iter()
+                .find(|attribute| attribute.get_name() == name)
+                .map(|attribute| attribute.get_value().as_str())
+        };
+        let placeholder = || {
+            let text: String = attribute("placeholder")
+                .unwrap_or_default()
+                .chars()
+                .filter(|character| !matches!(character, '\n' | '\r'))
+                .collect();
+            let style = Rc::new(ComputedStyle {
+                color: PLACEHOLDER_COLOR,
+                ..ComputedStyle::clone(style)
+            });
+            (text, style)
+        };
+        let block = match element.get_name().as_str() {
+            "input" => {
+                let kind = attribute("type").unwrap_or_default().to_ascii_lowercase();
+                if !is_text_like_input_type(&kind) {
+                    return None;
+                }
+                let value: String = attribute("value")
+                    .unwrap_or_default()
+                    .chars()
+                    .filter(|character| !matches!(character, '\n' | '\r'))
+                    .collect();
+                let (text, text_style) = if value.is_empty() {
+                    placeholder()
+                } else if kind == "password" {
+                    ("\u{2022}".repeat(value.chars().count()), Rc::clone(style))
+                } else {
+                    (value, Rc::clone(style))
+                };
+                self.control_text_box(node, style, &text, &text_style)
+            }
+            "textarea" => {
+                let mut text = String::new();
+                for child in self
+                    .document
+                    .node(node)
+                    .map(|dom_node| dom_node.get_children().as_slice())
+                    .unwrap_or_default()
+                {
+                    if let Some(NodeKind::Text(data)) =
+                        self.document.node(*child).map(|child| child.get_kind())
+                    {
+                        text.push_str(data);
+                    }
+                }
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                let (text, text_style) = if text.is_empty() {
+                    placeholder()
+                } else {
+                    (text, Rc::clone(style))
+                };
+                let mut items = Vec::new();
+                for (index, line) in text.split('\n').enumerate() {
+                    if index > 0 {
+                        items.push(InlineItem::ForcedBreak);
+                    }
+                    items.extend(control_text_item(node, line, &text_style));
+                }
+                BuildStats::bump(&self.stats.boxes);
+                BlockBox {
+                    node: Some(node),
+                    style: Rc::clone(style),
+                    establishes_bfc: true,
+                    clips_contents: true,
+                    centers_lines: false,
+                    control: self.form_control_sizing(node),
+                    contents: BlockContents::Inlines(items),
+                }
+            }
+            _ => return None,
+        };
+        log::trace!(
+            "form control box for node {node:?} <{}>",
+            element.get_name()
+        );
+        Some(level_for(block))
+    }
+
+    /// Builds the box of a single-line form control that shows `text`, text
+    /// the user agent draws rather than DOM children (an input's value or
+    /// placeholder, or a button-like input's label).
+    ///
+    /// `style` is the control's computed style and sizes the box;
+    /// `text_style` styles the text run, so callers can recolor it (as
+    /// placeholders do) without changing the box. The text is kept on one
+    /// line with its spaces preserved (see [`InlineItem::Text::preserve`]),
+    /// centered vertically in the content box, and clipped to the padding
+    /// box. Horizontal placement follows the control's `text-align`. Empty
+    /// `text` gives a box with no lines. `text-transform` is applied here.
+    ///
+    /// Wrap the result with [`level_for`] (or `InlineItem::Atomic`) to place
+    /// it.
+    pub(crate) fn control_text_box(
+        &self,
+        node: NodeID,
+        style: &Rc<ComputedStyle>,
+        text: &str,
+        text_style: &Rc<ComputedStyle>,
+    ) -> BlockBox {
+        BuildStats::bump(&self.stats.boxes);
+        BlockBox {
+            node: Some(node),
+            style: Rc::clone(style),
+            establishes_bfc: true,
+            clips_contents: true,
+            centers_lines: true,
+            control: self.form_control_sizing(node),
+            contents: BlockContents::Inlines(
+                control_text_item(node, text, text_style)
+                    .inspect(|_| BuildStats::bump(&self.stats.text_runs))
+                    .into_iter()
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// The color of placeholder text: Chrome's default `::placeholder` color,
+/// `#757575`. The `::placeholder` pseudo-element is not supported, so pages
+/// cannot restyle it.
+pub(crate) const PLACEHOLDER_COLOR: css::CssColor = css::CssColor {
+    r: 0x75,
+    g: 0x75,
+    b: 0x75,
+    a: 255,
+};
+
+/// Whether an `<input>` with the lowercased `type` value `kind` is a text
+/// field. Missing, empty, and unknown types are `text` per HTML.
+fn is_text_like_input_type(kind: &str) -> bool {
+    !matches!(
+        kind,
+        "hidden"
+            | "checkbox"
+            | "radio"
+            | "file"
+            | "image"
+            | "submit"
+            | "reset"
+            | "button"
+            | "color"
+            | "range"
+            | "date"
+            | "month"
+            | "week"
+            | "time"
+            | "datetime-local"
+    )
+}
+
+/// One preserved text run for user-agent-drawn control text, or `None` when
+/// `text` is empty. The run's `node` and `element` are the control, which is
+/// also its hit-test target.
+fn control_text_item(node: NodeID, text: &str, style: &Rc<ComputedStyle>) -> Option<InlineItem> {
+    (!text.is_empty()).then(|| InlineItem::Text {
+        node,
+        element: Some(node),
+        text: style.text_transform.apply(text),
+        style: Rc::clone(style),
+        preserve: true,
+    })
+}
+
+/// Places a box at its outer display type: block-level boxes become
+/// [`Level::Block`], everything else an atomic inline.
+fn level_for(block: BlockBox) -> Level {
+    match block.style.display {
+        Display::Box {
+            outside: DisplayOutside::Block,
+            ..
+        } => Level::Block(block),
+        _ => Level::Inline(InlineItem::Atomic(block)),
     }
 }
 

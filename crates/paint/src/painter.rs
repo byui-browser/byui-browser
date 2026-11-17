@@ -152,6 +152,7 @@ fn paint(
                         font: text.font,
                         text: text.text.clone(),
                         color: text.color.into(),
+                        clip: text.clip.map(scrolled),
                     });
                 }
             }
@@ -543,6 +544,25 @@ mod tests {
                 "text World 33.6"
             ]
         );
+    }
+
+    #[test]
+    fn input_values_are_painted_clipped_to_the_control() {
+        let list = paint(
+            "<body><input style='width: 40px; padding: 0 2px; font-size: 16px' value='much too long'></body>",
+            "body { margin: 0 }",
+        );
+        let (text, clip) = list
+            .items
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Text { text, clip, .. } => Some((text.as_str(), *clip)),
+                _ => None,
+            })
+            .expect("the value is painted");
+        assert_eq!(text, "much too long");
+        let clip = clip.expect("control text is clipped");
+        assert_eq!((clip.x, clip.width), (0.0, 44.0));
     }
 
     #[test]

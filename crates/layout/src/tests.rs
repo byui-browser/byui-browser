@@ -1473,3 +1473,111 @@ mod form_controls {
         assert_close(size("<input id=x type=checkbox>", CSS).0, 0.0);
     }
 }
+
+mod control_text {
+    use super::*;
+
+    const CSS: &str = "body { margin: 0 } p { margin: 0 } \
+        input, textarea { font-size: 16px; padding: 0; text-transform: none }";
+
+    fn text_color(layout_box: &LayoutBox) -> css::CssColor {
+        layout_box
+            .lines
+            .iter()
+            .flat_map(|line| &line.fragments)
+            .find_map(|fragment| match fragment {
+                LineFragment::Text(text) => Some(text.color),
+                _ => None,
+            })
+            .expect("control has text")
+    }
+
+    #[test]
+    fn text_inputs_show_their_value_with_spaces_kept_on_one_line() {
+        let html = "<p><input id='a' value='hello  world'>\
+            <input id='b' type='search' value='x'>\
+            <input id='c' type='bogus' value='y'>\
+            <input id='d' type='checkbox' value='z'></p>";
+        let (document, tree) = lay_out(html, CSS, 40.0);
+        let input = box_for(&tree, &document, "a");
+        assert_eq!(input.kind, BoxKind::InlineBlock);
+        // One unbreakable run even though 40px is narrower than the text.
+        assert_eq!(texts(input), ["hello  world"]);
+        // The default 20-character width, not the text's width.
+        assert_close(input.content_rect().width, 20.0 * 8.0);
+        assert_close(input.content_rect().height, LINE);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["x"]);
+        assert_eq!(texts(box_for(&tree, &document, "c")), ["y"]);
+        assert!(texts(box_for(&tree, &document, "d")).is_empty());
+    }
+
+    #[test]
+    fn value_line_breaks_are_stripped() {
+        let html = "<p><input id='a' value='one&#10;two'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["onetwo"]);
+    }
+
+    #[test]
+    fn placeholder_shows_in_grey_only_without_a_value() {
+        let html = "<p><input id='a' placeholder='Search'>\
+            <input id='b' value='' placeholder='Empty'>\
+            <input id='c' value='real' placeholder='ignored'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let grey = css::CssColor {
+            r: 0x75,
+            g: 0x75,
+            b: 0x75,
+            a: 255,
+        };
+        let a = box_for(&tree, &document, "a");
+        assert_eq!(texts(a), ["Search"]);
+        assert_eq!(text_color(a), grey);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["Empty"]);
+        let c = box_for(&tree, &document, "c");
+        assert_eq!(texts(c), ["real"]);
+        assert_ne!(text_color(c), grey);
+    }
+
+    #[test]
+    fn password_inputs_show_one_bullet_per_character() {
+        let html = "<p><input id='a' type='PassWord' value='secret'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["••••••"]);
+    }
+
+    #[test]
+    fn control_text_is_clipped_to_the_padding_box_and_centered() {
+        let html = "<p><input id='a' style='width: 40px; height: 39.2px; padding: 0 2px' \
+            value='much too long'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let input = box_for(&tree, &document, "a");
+        let LineFragment::Text(text) = &input.lines[0].fragments[0] else {
+            panic!("expected text");
+        };
+        assert!(text.rect.width > 40.0);
+        // The clip is the padding box: inside the user-agent border, so the
+        // text never paints over it.
+        let border = input.style.border_width;
+        assert!(border.left > 0.0, "inputs have a user-agent border");
+        let clip = text.clip.expect("control text is clipped");
+        assert_close(clip.x, input.rect.x + border.left);
+        assert_close(clip.y, input.rect.y + border.top);
+        assert_close(clip.width, input.rect.width - border.horizontal());
+        assert_close(clip.height, input.rect.height - border.vertical());
+        // 39.2px tall, one 19.2px line: 10px above and below.
+        assert_close(input.lines[0].rect.y - input.content_rect().y, 10.0);
+    }
+
+    #[test]
+    fn textarea_keeps_line_breaks_and_shows_its_placeholder_when_empty() {
+        let html = "<p><textarea id='a'>line one\nline two</textarea>\
+            <textarea id='b' placeholder='Write here'></textarea></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let a = box_for(&tree, &document, "a");
+        assert_eq!(texts(a), ["line one", "line two"]);
+        let b = box_for(&tree, &document, "b");
+        assert_eq!(texts(b), ["Write here"]);
+        assert_eq!(text_color(b).r, 0x75);
+    }
+}

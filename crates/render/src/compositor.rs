@@ -13,6 +13,21 @@ enum FontChoice<'a> {
     Collection(&'a FontCollection),
 }
 
+/// Spans of frame pixels saved by [`Compositor::save_outside`]: each entry
+/// is a byte offset into [`Frame::pixels`] and the bytes found there.
+struct SavedPixels {
+    pixels: Vec<(usize, Vec<u8>)>,
+}
+
+impl SavedPixels {
+    /// Writes the saved bytes back, undoing any drawing over them.
+    fn restore(self, frame: &mut Frame) {
+        for (offset, bytes) in self.pixels {
+            frame.pixels[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        }
+    }
+}
+
 /// A software compositor for a fixed device-pixel viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Compositor {
@@ -384,6 +399,41 @@ impl Compositor {
         }
     }
 
+    /// Saves the pixels a text run at `baseline` with `font_size` (CSS
+    /// pixels) could touch outside `clip` (CSS pixels), so they can be put
+    /// back after drawing the run. This is how text clipping is done: draw,
+    /// then restore. Only rows within two font sizes of the baseline are
+    /// saved, which covers every glyph's ascent and descent.
+    fn save_outside(
+        &self,
+        frame: &Frame,
+        clip: &paint::Rect,
+        baseline: f32,
+        font_size: f32,
+        scale: f32,
+    ) -> SavedPixels {
+        let device =
+            |value: f32, limit: u32| (value * scale).round().clamp(0.0, limit as f32) as u32;
+        let rows = device(baseline - 2.0 * font_size, self.height)
+            ..device(baseline + 2.0 * font_size, self.height);
+        let inside_x = device(clip.x, self.width)..device(clip.right(), self.width);
+        let inside_y = device(clip.y, self.height)..device(clip.bottom(), self.height);
+        let mut pixels = Vec::new();
+        for y in rows {
+            let row = (y * self.width) as usize * 4;
+            if inside_y.contains(&y) {
+                for span in [0..inside_x.start, inside_x.end..self.width] {
+                    let range = row + span.start as usize * 4..row + span.end as usize * 4;
+                    pixels.push((range.start, frame.pixels[range].to_vec()));
+                }
+            } else {
+                let range = row..row + self.width as usize * 4;
+                pixels.push((range.start, frame.pixels[range].to_vec()));
+            }
+        }
+        SavedPixels { pixels }
+    }
+
     fn put_pixel(&self, frame: &mut Frame, x: u32, y: u32, rgba: [u8; 4]) {
         if x >= self.width || y >= self.height {
             return;
@@ -415,7 +465,9 @@ impl Compositor {
     ///
     /// One CSS pixel maps to one device pixel. Rectangle edges are rounded to
     /// the nearest pixel boundary, so a rectangle covers the pixels whose
-    /// centers it contains, and parts outside the frame are clipped.
+    /// centers it contains, and parts outside the frame are clipped. Text
+    /// clip rectangles are ignored here; [`Compositor::compose_page`]
+    /// honors them.
     pub fn compose_paint(&self, list: &paint::DisplayList) -> Frame {
         log::debug!(
             "compositing paint display list with {} items",
@@ -600,7 +652,11 @@ impl Compositor {
                     font,
                     text,
                     color,
+                    clip,
                 } => {
+                    let saved = clip
+                        .as_ref()
+                        .map(|clip| self.save_outside(&frame, clip, *baseline, *font_size, scale));
                     let rgba = [color.r, color.g, color.b, color.a];
                     let outline = match fonts {
                         FontChoice::Single(font) => Some(font),
@@ -624,6 +680,9 @@ impl Compositor {
                             text,
                             rgba,
                         ),
+                    }
+                    if let Some(saved) = saved {
+                        saved.restore(&mut frame);
                     }
                 }
                 paint::DisplayItem::Image { rect, image } => match images {
@@ -890,6 +949,7 @@ mod tests {
                 font: paint::FontId::DEFAULT,
                 text: "Hi".into(),
                 color: black,
+                clip: None,
             }],
         };
         let scale = 2.0;
@@ -1140,6 +1200,7 @@ mod image_tests {
                         b: 0,
                         a: 255,
                     },
+                    clip: None,
                 },
             ],
         };
@@ -1148,5 +1209,53 @@ mod image_tests {
             compositor.compose_page(&list, &FontCollection::default(), &ImageStore::new(), 1.0),
             compositor.compose_paint(&list)
         );
+    }
+
+    #[test]
+    fn clipped_text_paints_nothing_outside_its_clip() {
+        let text = |clip| paint::DisplayList {
+            items: vec![paint::DisplayItem::Text {
+                x: 0.0,
+                baseline: 10.0,
+                font_size: 10.0,
+                font: paint::FontId::DEFAULT,
+                text: "HHHH".into(),
+                color: paint::Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+                clip,
+            }],
+        };
+        let compose = |list: &paint::DisplayList| {
+            Compositor::new(40, 16).compose_page(
+                list,
+                &FontCollection::default(),
+                &ImageStore::new(),
+                1.0,
+            )
+        };
+        let inked = |frame: &Frame, columns: std::ops::Range<u32>| {
+            columns
+                .flat_map(|x| (0..16).map(move |y| (x, y)))
+                .any(|(x, y)| pixel(frame, x, y) != Compositor::CLEAR_COLOR)
+        };
+        let unclipped = compose(&text(None));
+        let clipped = compose(&text(Some(paint::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 12.0,
+            height: 16.0,
+        })));
+        assert!(inked(&unclipped, 12..40));
+        assert!(!inked(&clipped, 12..40));
+        assert!(inked(&clipped, 0..12));
+        for y in 0..16 {
+            for x in 0..12 {
+                assert_eq!(pixel(&clipped, x, y), pixel(&unclipped, x, y));
+            }
+        }
     }
 }

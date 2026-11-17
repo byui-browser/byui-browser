@@ -4,7 +4,8 @@
 //! Supported today: `white-space: normal` collapsing, soft wrap
 //! opportunities at spaces and around atomic inlines, forced breaks from
 //! `<br>`, inline boxes split across lines, `line-height: normal`,
-//! `vertical-align: baseline`, and left-to-right text aligned by every
+//! `vertical-align: baseline`, preserved unbreakable runs for text the user
+//! agent draws in form controls, and left-to-right text aligned by every
 //! `text-align` keyword (`justify` widens the spaces between words). Other
 //! `white-space`, `line-height`, and `vertical-align` values, as well as
 //! bidirectional text, `text-align-last`, and hyphenation, are not
@@ -315,6 +316,7 @@ impl Context<'_> {
                     element,
                     text,
                     style,
+                    preserve,
                 } => {
                     let source = prepared.sources.len();
                     prepared.sources.push(TextSource {
@@ -322,6 +324,22 @@ impl Context<'_> {
                         element: *element,
                         style,
                     });
+                    if *preserve {
+                        // One unbreakable run with its spaces kept.
+                        if !text.is_empty() {
+                            prepared.pieces.push(Piece::Word {
+                                source,
+                                text: text.clone(),
+                                width: self.fonts.font_text_width(
+                                    style.font,
+                                    text,
+                                    style.font_size,
+                                ),
+                            });
+                            after_space = false;
+                        }
+                        continue;
+                    }
                     let mut rest = text.as_str();
                     while let Some(first) = rest.chars().next() {
                         let is_space = is_document_white_space(first);
@@ -778,6 +796,7 @@ impl Context<'_> {
             font_size: source.style.font_size,
             font: source.style.font,
             color: source.style.color,
+            clip: None,
         }));
     }
 }
