@@ -9,6 +9,7 @@
 use html::NodeID;
 
 use crate::Size;
+use crate::control::ToggleControl;
 use crate::style::{ComputedStyle, Dimension};
 
 /// Identifies the picture a replaced box shows, so the renderer can look up
@@ -81,8 +82,10 @@ const DEFAULT_HEIGHT: f32 = 150.0;
 /// A replaced element before layout.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReplacedBox {
-    /// What the box paints.
-    pub key: ImageKey,
+    /// The picture the box paints; `None` for form controls.
+    pub key: Option<ImageKey>,
+    /// The form control the box paints instead of a picture.
+    pub control: Option<ToggleControl>,
     pub natural: NaturalSize,
     /// The element's `width` attribute, which applies when the `width`
     /// property is `auto` (the HTML presentational hint, HTML §15.4.3).
@@ -235,7 +238,8 @@ mod tests {
 
     fn replaced(natural: NaturalSize) -> ReplacedBox {
         ReplacedBox {
-            key: ImageKey::Src("a.png".into()),
+            key: Some(ImageKey::Src("a.png".into())),
+            control: None,
             natural,
             width_hint: Dimension::Auto,
             height_hint: Dimension::Auto,

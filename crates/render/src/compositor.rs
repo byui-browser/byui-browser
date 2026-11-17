@@ -491,9 +491,22 @@ impl Compositor {
                     log::trace!("no image store to draw {image:?}; use compose_page");
                     None
                 }
+                paint::DisplayItem::StrokeLine { .. } => None,
             })
             .collect::<Vec<_>>();
-        self.compose(&items)
+        let mut frame = self.compose(&items);
+        for item in &list.items {
+            if let paint::DisplayItem::StrokeLine {
+                from,
+                to,
+                width,
+                color,
+            } = item
+            {
+                self.stroke_line(&mut frame, *from, *to, *width, *color, 1.0);
+            }
+        }
+        frame
     }
 
     /// Rasterizes a paint crate display list into a new frame, drawing text
@@ -665,6 +678,12 @@ impl Compositor {
                         ),
                     }
                 }
+                paint::DisplayItem::StrokeLine {
+                    from,
+                    to,
+                    width,
+                    color,
+                } => self.stroke_line(&mut frame, *from, *to, *width, *color, scale),
                 paint::DisplayItem::Image { rect, image } => match images {
                     Some(images) => self.draw_image(&mut frame, images, image, rect, scale),
                     None => log::trace!("no image store to draw {image:?}"),
@@ -672,6 +691,49 @@ impl Compositor {
             }
         }
         frame
+    }
+
+    /// Strokes the segment `from`-`to` (CSS pixels) with round caps, `width`
+    /// CSS pixels wide, at `scale` device pixels per CSS pixel. Edge pixels
+    /// are blended by their center's distance to the stroke's outline.
+    fn stroke_line(
+        &self,
+        frame: &mut Frame,
+        from: (f32, f32),
+        to: (f32, f32),
+        width: f32,
+        color: paint::Color,
+        scale: f32,
+    ) {
+        let (ax, ay) = (from.0 * scale, from.1 * scale);
+        let (bx, by) = (to.0 * scale, to.1 * scale);
+        let half = width.max(0.0) * scale / 2.0;
+        if half <= 0.0 {
+            return;
+        }
+        log::trace!("stroke line ({ax}, {ay})-({bx}, {by}) half width {half}");
+        let (dx, dy) = (bx - ax, by - ay);
+        let length_squared = dx * dx + dy * dy;
+        let range = |a: f32, b: f32, limit: u32| {
+            (a.min(b) - half - 1.0).floor().clamp(0.0, limit as f32) as u32
+                ..(a.max(b) + half + 1.0).ceil().clamp(0.0, limit as f32) as u32
+        };
+        for py in range(ay, by, self.height) {
+            for px in range(ax, bx, self.width) {
+                let (x, y) = (px as f32 + 0.5, py as f32 + 0.5);
+                let t = if length_squared > 0.0 {
+                    (((x - ax) * dx + (y - ay) * dy) / length_squared).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let distance = (x - (ax + t * dx)).hypot(y - (ay + t * dy));
+                let coverage = (half - distance + 0.5).clamp(0.0, 1.0);
+                let alpha = (coverage * f32::from(color.a)).round() as u8;
+                if alpha > 0 {
+                    self.put_pixel(frame, px, py, [color.r, color.g, color.b, alpha]);
+                }
+            }
+        }
     }
 
     /// Draws `key`'s picture stretched over `rect` (CSS pixels) at `scale`
@@ -1047,6 +1109,33 @@ mod tests {
         // The corner is cut away, but the straight edge next to it is not.
         assert_eq!(pixel(2, 2), [255, 255]);
         assert_eq!(pixel(2, 10), [255, 0]);
+    }
+
+    #[test]
+    fn stroked_lines_cover_the_segment_and_leave_the_rest_clear() {
+        let red = paint::Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let list = paint::DisplayList {
+            items: vec![paint::DisplayItem::StrokeLine {
+                from: (2.0, 5.0),
+                to: (8.0, 5.0),
+                width: 2.0,
+                color: red,
+            }],
+        };
+        let frame = Compositor::new(10, 10).compose_paint(&list);
+        let pixel = |x: u32, y: u32| -> [u8; 4] {
+            let offset = ((y * frame.width + x) * 4) as usize;
+            frame.pixels[offset..offset + 4].try_into().unwrap()
+        };
+        assert_eq!(pixel(5, 4), [255, 0, 0, 255]);
+        assert_eq!(pixel(5, 5), [255, 0, 0, 255]);
+        assert_eq!(pixel(5, 8), Compositor::CLEAR_COLOR);
+        assert_eq!(pixel(0, 5), Compositor::CLEAR_COLOR);
     }
 
     #[test]

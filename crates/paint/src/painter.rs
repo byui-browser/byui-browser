@@ -41,7 +41,9 @@ pub const CANVAS_COLOR: Color = Color {
 ///
 /// Replaced boxes (`<img>`, inline `<svg>`) produce a [`DisplayItem::Image`]
 /// covering their content box, after their background. Their pictures are
-/// not clipped to `border-radius`.
+/// not clipped to `border-radius`. Checkbox and radio inputs instead draw
+/// their control in the content box with [`DisplayItem::FillRoundedRect`]
+/// and, for a check mark, [`DisplayItem::StrokeLine`]; see [`crate::ACCENT`].
 pub fn paint_document(tree: &LayoutTree) -> DisplayList {
     paint(tree, 0.0, false, |_| Vec::new())
 }
@@ -157,6 +159,13 @@ fn paint(
                         rect: scrolled(rect),
                         image: image.clone(),
                     });
+                }
+                if let Some(control) = layout_box.control
+                    && rect.width > 0.0
+                    && rect.height > 0.0
+                    && visible(&rect)
+                {
+                    items.extend(crate::control::control_items(scrolled(rect), control));
                 }
             }
         }
@@ -741,6 +750,7 @@ mod tests {
                 DisplayItem::Text { text, baseline, .. } => format!("text {text} {baseline:.1}"),
                 DisplayItem::Image { .. } => "image".to_owned(),
                 DisplayItem::BoxShadow { .. } => "shadow".to_owned(),
+                DisplayItem::StrokeLine { .. } => "line".to_owned(),
             })
             .collect::<Vec<_>>();
         // Canvas, then both block backgrounds, then the text of both blocks
