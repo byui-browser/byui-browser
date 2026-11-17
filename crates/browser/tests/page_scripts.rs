@@ -63,6 +63,37 @@ fn html_script_reaches_registered_web_api() {
 }
 
 #[test]
+fn window_onload_runs_after_page_scripts_finish() {
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+    let session = BrowserRuntime::in_memory()
+        .open_page_session(
+            "<script>\
+                var scriptState = 'running';\
+                function onLoaded(event) {\
+                    window.onloadRan = this === window && event.type === 'load' &&\
+                        event.target === document && scriptState === 'finished';\
+                }\
+                window.onload = onLoaded;\
+                scriptState = 'finished';\
+             </script>",
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            security_context(),
+        )
+        .expect("page session should dispatch its load event");
+
+    assert_eq!(
+        session.evaluate_script("window.onloadRan === true"),
+        Ok(js::Value::Boolean(true))
+    );
+}
+
+#[test]
 fn page_script_runs_queued_microtasks_before_the_next_script() {
     let controller = Arc::new(
         net::RequestController::builder(net::Config::default())

@@ -769,6 +769,7 @@ impl BrowserRuntime {
             }
         }
         log::debug!("evaluated {} page scripts", results.len());
+        webapis::dispatch_window_load(&window)?;
         Ok(BootedPage {
             session: PageSession {
                 realm,
