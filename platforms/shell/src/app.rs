@@ -213,6 +213,8 @@ enum UserEvent {
         id: u64,
         report: Box<devtools::compat::AuditReport>,
     },
+    /// A console command completed and its output is ready to paint.
+    ConsoleUpdated,
 }
 
 /// Delivers `alert` on the UI thread, attached to the browser window.
@@ -2017,6 +2019,95 @@ impl App {
             }
             && toolbar::hit_test(x, y, width, self.platform.window_controls_inset).is_none()
     }
+
+    /// Handles text entry and command history while the Console tab is active.
+    fn handle_console_key(&mut self, event: &KeyEvent, standalone: bool) -> bool {
+        let panel = if standalone {
+            self.devtools_panel.as_ref()
+        } else {
+            self.elements.as_ref()
+        };
+        if panel.is_none_or(|panel| panel.tab() != DockTab::Console) {
+            return false;
+        }
+        let mut handled = true;
+        let mut command = None;
+        match event.logical_key.as_ref() {
+            Key::Named(NamedKey::Enter) => {
+                let panel = if standalone {
+                    self.devtools_panel.as_mut()
+                } else {
+                    self.elements.as_mut()
+                };
+                command = panel.and_then(ElementsPanel::submit_console_command);
+            }
+            Key::Named(NamedKey::Backspace) => {
+                let panel = if standalone {
+                    self.devtools_panel.as_mut()
+                } else {
+                    self.elements.as_mut()
+                };
+                if let Some(panel) = panel {
+                    panel.backspace_console();
+                }
+            }
+            Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown) => {
+                let older = matches!(event.logical_key.as_ref(), Key::Named(NamedKey::ArrowUp));
+                let panel = if standalone {
+                    self.devtools_panel.as_mut()
+                } else {
+                    self.elements.as_mut()
+                };
+                if let Some(panel) = panel {
+                    panel.console_history(older);
+                }
+            }
+            Key::Named(NamedKey::Space)
+                if !self.modifiers.control_key()
+                    && !self.modifiers.alt_key()
+                    && !self.modifiers.super_key() =>
+            {
+                let panel = if standalone {
+                    self.devtools_panel.as_mut()
+                } else {
+                    self.elements.as_mut()
+                };
+                if let Some(panel) = panel {
+                    panel.insert_console_text(" ");
+                }
+            }
+            Key::Character(character)
+                if !self.modifiers.control_key()
+                    && !self.modifiers.alt_key()
+                    && !self.modifiers.super_key() =>
+            {
+                let text = event.text.as_deref().unwrap_or(character);
+                if !text.chars().all(char::is_control)
+                    && let Some(panel) = if standalone {
+                        self.devtools_panel.as_mut()
+                    } else {
+                        self.elements.as_mut()
+                    }
+                {
+                    panel.insert_console_text(text);
+                }
+            }
+            _ => handled = false,
+        }
+        if let Some(source) = command {
+            if let Ok(mut console) = self.console.lock() {
+                console.log(devtools::Level::Log, &format!("> {source}"));
+            }
+            let proxy = self.proxy.clone();
+            self.page_events
+                .evaluate_console(source, Arc::clone(&self.console), move || {
+                    if let Some(proxy) = &proxy {
+                        let _ = proxy.send_event(UserEvent::ConsoleUpdated);
+                    }
+                });
+        }
+        handled
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -2076,6 +2167,12 @@ impl ApplicationHandler<UserEvent> for App {
                 WindowEvent::KeyboardInput { event, .. }
                     if event.state == ElementState::Pressed =>
                 {
+                    if self.handle_console_key(&event, true) {
+                        if let Some(window) = &self.devtools_window {
+                            window.request_redraw();
+                        }
+                        return;
+                    }
                     match event.logical_key {
                         Key::Named(NamedKey::Escape) => {
                             if let Some(panel) = &mut self.devtools_panel
@@ -2209,6 +2306,10 @@ impl ApplicationHandler<UserEvent> for App {
                 is_synthetic: false,
                 ..
             } => {
+                if event.state == ElementState::Pressed && self.handle_console_key(&event, false) {
+                    self.redraw();
+                    return;
+                }
                 log::trace!("key event: {:?}", event.state);
                 if event.state == ElementState::Pressed && self.find_key(&event.logical_key) {
                     return;
@@ -2335,6 +2436,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.start_navigation_with_behavior(url.as_str(), behavior)
             }
             UserEvent::AuditFinished { id, report } => self.audit_finished(id, *report),
+            UserEvent::ConsoleUpdated => {
+                if let Some(window) = &self.devtools_window {
+                    window.request_redraw();
+                }
+            }
         }
     }
 
@@ -2374,9 +2480,17 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = proxy.send_event(UserEvent::LocationNavigate { url, behavior });
             }
         });
+        let console_proxy = self.proxy.clone();
         self.page_events.load_with_viewport(
             &page,
-            Arc::new(crate::content::DevtoolsConsole(Arc::clone(&self.console))),
+            Arc::new(crate::content::DevtoolsConsole {
+                console: Arc::clone(&self.console),
+                notify: Box::new(move || {
+                    if let Some(proxy) = &console_proxy {
+                        let _ = proxy.send_event(UserEvent::ConsoleUpdated);
+                    }
+                }),
+            }),
             alerts,
             self.runtime.clone(),
             device_pixel_ratio,

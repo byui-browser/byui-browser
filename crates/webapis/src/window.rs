@@ -305,6 +305,9 @@ fn register_window_object(
         Some(Value::Object(window)) => window,
         _ => Object::new(),
     };
+    if let Some(console) = realm.registered_global_value("console") {
+        window.set("console", console);
+    }
     let self_window = window.clone();
     let navigator = Object::new();
     let navigator_for_window = navigator.clone();

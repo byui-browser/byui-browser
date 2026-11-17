@@ -283,8 +283,18 @@ pub struct Document {
     pub(crate) source_document: Option<HTMLDocument>,
     pub(crate) event_target: Arc<Mutex<EventTarget>>,
     pub(crate) event_targets: Arc<Mutex<HashMap<usize, EventTargetRef>>>,
+    pub(crate) console: Option<DocumentConsole>,
     custom_element_nodes: HashSet<NodeID>,
     script_elements: HashMap<NodeID, Object>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DocumentConsole(pub(crate) Arc<dyn crate::ConsoleSink>);
+
+impl std::fmt::Debug for DocumentConsole {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DocumentConsole")
+    }
 }
 
 impl PartialEq for Document {
@@ -312,6 +322,7 @@ impl Document {
             source_document: Some(HTMLDocument::new()),
             event_target: Arc::default(),
             event_targets: Arc::default(),
+            console: None,
             custom_element_nodes: HashSet::new(),
             script_elements: HashMap::new(),
         }
@@ -324,9 +335,16 @@ impl Document {
             source_document: Some(document.clone()),
             event_target: Arc::default(),
             event_targets: Arc::default(),
+            console: None,
             custom_element_nodes: HashSet::new(),
             script_elements: HashMap::new(),
         }
+    }
+
+    /// Routes uncaught event listener errors to the supplied console sink.
+    /// Listeners continue to run after an error, as required by event dispatch.
+    pub fn set_console_sink(&mut self, console: Arc<dyn crate::ConsoleSink>) {
+        self.console = Some(DocumentConsole(console));
     }
 
     /// Returns this document node's DOM `textContent` value.

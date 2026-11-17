@@ -626,7 +626,8 @@ impl BrowserRuntime {
     ) -> JsResult<BootedPage> {
         log::trace!("booting page: {} bytes of html", input.html_source.len());
         let html_document = html::parse_raw_html(input.html_source.to_owned());
-        let document = Document::from_html_document(&html_document);
+        let mut document = Document::from_html_document(&html_document);
+        document.set_console_sink(Arc::clone(&console));
         let retained = document.clone();
         let mut realm = Realm::new();
         register_window_with_security_context(&mut realm, security_context.clone())?;
@@ -698,6 +699,14 @@ pub struct PageSession {
 }
 
 impl PageSession {
+    /// Evaluates JavaScript in this page's persistent realm.
+    ///
+    /// Declarations and assignments share state with the scripts loaded by
+    /// this document, so callers can use this for an interactive console.
+    pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
+        self.realm.evaluate_script(source)
+    }
+
     /// Returns the current live document serialization after script mutations.
     pub fn document_html(&self) -> String {
         self.document.inner_html()

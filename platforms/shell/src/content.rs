@@ -13,25 +13,46 @@ use render::{BitmapFont, Compositor, Frame, OutlineFont};
 use tiny_skia::Pixmap;
 use webapis::{AlertSink, ConsoleSink, LocationNavigate, ViewportSize};
 
-pub(crate) struct DevtoolsConsole(pub(crate) Arc<Mutex<devtools::Console>>);
+pub(crate) struct DevtoolsConsole {
+    pub(crate) console: Arc<Mutex<devtools::Console>>,
+    pub(crate) notify: Box<dyn Fn() + Send + Sync>,
+}
+
+impl DevtoolsConsole {
+    fn write(&self, level: devtools::Level, message: &str) {
+        match self.console.lock() {
+            Ok(mut console) => console.log(level, message),
+            Err(error) => {
+                log::error!("could not record console message: {error}");
+                return;
+            }
+        }
+        (self.notify)();
+    }
+}
 
 impl ConsoleSink for DevtoolsConsole {
     fn log(&self, message: &str) {
-        if let Ok(mut console) = self.0.lock() {
-            console.log(devtools::Level::Log, message);
-        }
+        self.write(devtools::Level::Log, message);
     }
 
     fn warn(&self, message: &str) {
-        if let Ok(mut console) = self.0.lock() {
-            console.log(devtools::Level::Warn, message);
-        }
+        self.write(devtools::Level::Warn, message);
     }
 
     fn error(&self, message: &str) {
-        if let Ok(mut console) = self.0.lock() {
-            console.log(devtools::Level::Error, message);
+        self.write(devtools::Level::Error, message);
+    }
+
+    fn clear(&self) {
+        match self.console.lock() {
+            Ok(mut console) => console.clear(),
+            Err(error) => {
+                log::error!("could not clear console: {error}");
+                return;
+            }
         }
+        (self.notify)();
     }
 }
 
@@ -420,6 +441,11 @@ enum PageCommand {
     ScrollY(f64),
     DevicePixelRatio(f64),
     Click(Option<NodeID>),
+    EvaluateConsole {
+        source: String,
+        console: Arc<Mutex<devtools::Console>>,
+        notify: Box<dyn Fn() + Send>,
+    },
     Snapshot(mpsc::Sender<String>),
     /// Answers once every earlier command has been handled.
     Flush(mpsc::Sender<()>),
@@ -551,6 +577,26 @@ impl PageEvents {
         }
     }
 
+    /// Evaluates a console command in the live page realm.
+    pub(crate) fn evaluate_console(
+        &self,
+        source: String,
+        console: Arc<Mutex<devtools::Console>>,
+        notify: impl Fn() + Send + 'static,
+    ) {
+        if self
+            .commands
+            .send(PageCommand::EvaluateConsole {
+                source,
+                console,
+                notify: Box::new(notify),
+            })
+            .is_err()
+        {
+            log::warn!("page session is not running; dropped console command");
+        }
+    }
+
     /// Updates the viewport dimensions exposed to the live page session.
     pub(crate) fn resize(&self, viewport: ViewportSize) {
         if self.commands.send(PageCommand::Resize(viewport)).is_err() {
@@ -579,8 +625,18 @@ impl PageEvents {
     }
 }
 
+fn uncaught_error(error: &js::JsError) -> String {
+    let message = error.to_string();
+    if message.starts_with("Uncaught ") {
+        message
+    } else {
+        format!("Uncaught {message}")
+    }
+}
+
 fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<Option<String>>) {
     let mut session = None;
+    let mut page_console: Option<Arc<dyn ConsoleSink>> = None;
     let mut performance: Option<Arc<Mutex<PerformanceLog>>> = None;
     let record = |log: &Option<Arc<Mutex<PerformanceLog>>>, event: TimelineEvent| {
         if let Some(log) = log
@@ -603,6 +659,8 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
             } => {
                 log::debug!("page session loading {}", page.url);
                 performance = log;
+                session = None;
+                page_console = Some(Arc::clone(&console));
                 // A previous page's failure must not be blamed on this one.
                 set_script_error(script_error, None);
                 let controller = browser::request_controller(None);
@@ -627,6 +685,9 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
                     }
                     Err(error) => {
                         log::debug!("page script failed: {error}");
+                        if let Some(console) = &page_console {
+                            console.error(&uncaught_error(&error));
+                        }
                         set_script_error(script_error, Some(error.to_string()));
                     }
                 }
@@ -664,7 +725,40 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
                 record(&performance, event);
                 if let Err(error) = result {
                     log::warn!("page click failed: {error}");
+                    if let Some(console) = &page_console {
+                        console.error(&uncaught_error(&error));
+                    }
                 }
+            }
+            PageCommand::EvaluateConsole {
+                source,
+                console,
+                notify,
+            } => {
+                let Some(session) = &session else {
+                    if let Ok(mut console) = console.lock() {
+                        console.log(
+                            devtools::Level::Error,
+                            "No page is ready for console commands",
+                        );
+                    }
+                    notify();
+                    continue;
+                };
+                let (result, event) =
+                    TimelineEvent::measure(EventCategory::Script, "Console command", || {
+                        session.evaluate_script(&source)
+                    });
+                record(&performance, event);
+                if let Ok(mut console) = console.lock() {
+                    match result {
+                        Ok(js::Value::Undefined) => {}
+                        Ok(value) => console
+                            .log(devtools::Level::Log, &webapis::format_console_value(&value)),
+                        Err(error) => console.log(devtools::Level::Error, &error.to_string()),
+                    }
+                }
+                notify();
             }
             PageCommand::Flush(sender) => {
                 let _ = sender.send(());
@@ -799,6 +893,150 @@ mod tests {
 
     fn test_runtime() -> BrowserRuntime {
         BrowserRuntime::in_memory()
+    }
+
+    #[test]
+    fn console_captures_page_commands_clear_and_uncaught_errors() {
+        let events = PageEvents::new();
+        let console = Arc::new(Mutex::new(devtools::Console::new()));
+        let (updates, received) = mpsc::channel();
+        let sink = Arc::new(DevtoolsConsole {
+            console: Arc::clone(&console),
+            notify: Box::new(move || {
+                updates.send(()).unwrap();
+            }),
+        });
+        let page = Page {
+            url: "https://example.test/".into(),
+            html: "<p>Example</p>".into(),
+            stylesheets: Vec::new(),
+            scripts: vec!["console.warn('page'); let answer = 40;".into()],
+        };
+        events.load_with_viewport(
+            &page,
+            sink,
+            test_alert_sink(),
+            test_runtime(),
+            1.0,
+            None,
+            Arc::new(|_, _| {}),
+            None,
+        );
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (done, completed) = mpsc::channel();
+        events.evaluate_console("answer + 2".into(), Arc::clone(&console), move || {
+            done.send(()).unwrap();
+        });
+        completed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let entries = console.lock().unwrap().entries().to_vec();
+        assert_eq!(entries[0].level, devtools::Level::Warn);
+        assert_eq!(entries[0].message, "page");
+        assert_eq!(entries[1].message, "42");
+
+        let (done, completed) = mpsc::channel();
+        events.evaluate_console(
+            "console.clear(); console.error('after')".into(),
+            Arc::clone(&console),
+            move || {
+                done.send(()).unwrap();
+            },
+        );
+        completed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let entries = console.lock().unwrap().entries().to_vec();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].level, devtools::Level::Error);
+        assert_eq!(entries[0].message, "after");
+
+        let failing_page = Page {
+            scripts: vec!["throw 'broken'".into()],
+            ..page
+        };
+        let (updates, received) = mpsc::channel();
+        events.load_with_viewport(
+            &failing_page,
+            Arc::new(DevtoolsConsole {
+                console: Arc::clone(&console),
+                notify: Box::new(move || {
+                    updates.send(()).unwrap();
+                }),
+            }),
+            test_alert_sink(),
+            test_runtime(),
+            1.0,
+            None,
+            Arc::new(|_, _| {}),
+            None,
+        );
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            console.lock().unwrap().entries().last().unwrap().message,
+            "Uncaught broken"
+        );
+        let (done, completed) = mpsc::channel();
+        events.evaluate_console("answer".into(), Arc::clone(&console), move || {
+            done.send(()).unwrap();
+        });
+        completed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            console.lock().unwrap().entries().last().unwrap().message,
+            "No page is ready for console commands"
+        );
+    }
+
+    #[test]
+    fn console_reports_uncaught_click_listener_errors() {
+        let events = PageEvents::new();
+        let console = Arc::new(Mutex::new(devtools::Console::new()));
+        let (updates, received) = mpsc::channel();
+        let page = Page {
+            url: "https://example.test/".into(),
+            html: "<p>Example</p>".into(),
+            stylesheets: Vec::new(),
+            scripts: vec![
+                "function callback() { throw 'click failed'; } \
+                function next() { console.log('next listener'); } \
+                document.addEventListener('click', callback); \
+                document.addEventListener('click', next);"
+                    .into(),
+            ],
+        };
+        events.load_with_viewport(
+            &page,
+            Arc::new(DevtoolsConsole {
+                console: Arc::clone(&console),
+                notify: Box::new(move || {
+                    updates.send(()).unwrap();
+                }),
+            }),
+            test_alert_sink(),
+            test_runtime(),
+            1.0,
+            None,
+            Arc::new(|_, _| {}),
+            None,
+        );
+        events.click(None);
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let entries = console.lock().unwrap().entries().to_vec();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].level, devtools::Level::Error);
+        assert_eq!(entries[0].message, "Uncaught click failed");
+        assert_eq!(entries[1].message, "next listener");
     }
 
     fn welcome_color(page: &Page, property: &str) -> [u8; 4] {

@@ -64,6 +64,9 @@ pub(crate) struct ElementsPanel {
     network_view: NetworkView,
     pub(crate) console: Console,
     pub(crate) performance: PerformanceLog,
+    console_input: String,
+    console_history: Vec<String>,
+    console_history_index: Option<usize>,
 }
 
 impl ElementsPanel {
@@ -82,6 +85,9 @@ impl ElementsPanel {
             network_view: NetworkView::new(),
             console: Console::new(),
             performance: PerformanceLog::new(),
+            console_input: String::new(),
+            console_history: Vec::new(),
+            console_history_index: None,
         };
         panel.parse_rows(html);
         panel
@@ -167,6 +173,11 @@ impl ElementsPanel {
         );
         let footer = if self.message.is_some() { FOOTER } else { 0.0 };
         let tree = dock_height - f64::from(HEADER + 2.0 * TREE_PAD + footer);
+        let tree = if self.tab == DockTab::Console {
+            (tree - 34.0).max(0.0)
+        } else {
+            tree
+        };
         self.visible = (tree / f64::from(ROW)).max(0.0) as usize;
         self.offset = self.offset.min(self.max_offset());
         let body = dock_height - f64::from(HEADER + 2.0 * TREE_PAD);
@@ -184,6 +195,47 @@ impl ElementsPanel {
         self.tab = tab;
         self.network_view.close_menu();
         self.offset = self.offset.min(self.max_offset());
+    }
+
+    /// Inserts text into the Console command line.
+    pub(crate) fn insert_console_text(&mut self, text: &str) {
+        self.console_input.push_str(text);
+        self.console_history_index = None;
+    }
+
+    /// Removes the last Unicode character from the Console command line.
+    pub(crate) fn backspace_console(&mut self) {
+        self.console_input.pop();
+    }
+
+    /// Moves through previously submitted Console commands.
+    pub(crate) fn console_history(&mut self, older: bool) {
+        if self.console_history.is_empty() {
+            return;
+        }
+        let index = self
+            .console_history_index
+            .unwrap_or(self.console_history.len());
+        let next = if older {
+            index.saturating_sub(1)
+        } else {
+            (index + 1).min(self.console_history.len())
+        };
+        self.console_history_index = Some(next);
+        self.console_input = self.console_history.get(next).cloned().unwrap_or_default();
+    }
+
+    /// Submits the current command and records it in the history.
+    pub(crate) fn submit_console_command(&mut self) -> Option<String> {
+        let source = std::mem::take(&mut self.console_input);
+        self.console_history_index = None;
+        if source.trim().is_empty() {
+            return None;
+        }
+        if self.console_history.last() != Some(&source) {
+            self.console_history.push(source.clone());
+        }
+        Some(source)
     }
 
     /// Handles a primary click inside the panel body (not on a tab or the
@@ -247,7 +299,11 @@ impl ElementsPanel {
 
     pub(crate) fn set_console(&mut self, console: Console) {
         self.console = console;
-        self.offset = self.offset.min(self.max_offset());
+        self.offset = if self.tab == DockTab::Console {
+            self.max_offset()
+        } else {
+            self.offset.min(self.max_offset())
+        };
     }
 
     pub(crate) fn set_performance(&mut self, performance: PerformanceLog) {
@@ -726,6 +782,7 @@ impl ElementsPanel {
         font: &FontVec,
     ) {
         let device = |value: f32| value * s;
+        let input_top = (bottom - 27.0).max(top);
         let clip = device(bounds.right() - SCROLLBAR_GUTTER);
         for (index, entry) in self
             .console
@@ -736,6 +793,9 @@ impl ElementsPanel {
             .enumerate()
         {
             let row_top = top + index as f32 * ROW + 13.0;
+            if row_top >= input_top - 4.0 {
+                break;
+            }
             let color = match entry.level {
                 Level::Log => palette.text,
                 Level::Warn => toolbar::rgba(0xd9, 0x77, 0x06, 255),
@@ -759,7 +819,7 @@ impl ElementsPanel {
             );
         }
         if self.console.entries().len() > self.visible && self.visible > 0 {
-            let track_height = (bottom - TREE_PAD - top).max(0.0);
+            let track_height = (input_top - TREE_PAD - top).max(0.0);
             let thumb_height = (track_height * self.visible as f32
                 / self.console.entries().len() as f32)
                 .max(24.0);
@@ -775,6 +835,24 @@ impl ElementsPanel {
                 toolbar::fill(frame, &path, colors.scrollbar, Transform::from_scale(s, s));
             }
         }
+        hairline(
+            frame,
+            bounds.left() + 10.0,
+            bounds.right() - 10.0,
+            input_top - 5.0,
+            colors.separator,
+            Transform::from_scale(s, s),
+        );
+        toolbar::draw_text(
+            frame,
+            font,
+            device(TREE_SIZE),
+            device(bounds.left() + 14.0),
+            device(bottom - 8.0),
+            clip,
+            palette.text,
+            &format!("> {}", self.console_input),
+        );
     }
 
     /// The Performance tab's header subtitle: event count, timeline span,
@@ -1057,7 +1135,7 @@ impl ElementsPanel {
             DockTab::Compatibility => self.compat.summary(),
             DockTab::Network => "Completed resource requests · session log".to_owned(),
             DockTab::Performance => self.performance_summary(),
-            DockTab::Console => "JavaScript messages · session log".to_owned(),
+            DockTab::Console => "Enter runs JavaScript · ↑/↓ command history".to_owned(),
         };
         let subtitle_width = toolbar::text_advance(ui_font, device(SMALL_SIZE), &subtitle) / s;
         let show_hint = hint_left > subtitle_left + subtitle_width + 16.0;

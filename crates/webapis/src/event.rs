@@ -348,6 +348,7 @@ pub(crate) fn dispatch_event_with_target(
 }
 
 fn invoke_listeners(
+    document: &Document,
     target: &EventTargetRef,
     event: &Object,
     event_type: &str,
@@ -396,6 +397,14 @@ fn invoke_listeners(
         );
         if let Err(error) = invoke_event_listener(&listener.callback, event) {
             log::warn!("{event_type} listener threw: {error}");
+            if let Some(console) = &document.console {
+                let message = error.to_string();
+                if message.starts_with("Uncaught ") {
+                    console.0.error(&message);
+                } else {
+                    console.0.error(&format!("Uncaught {message}"));
+                }
+            }
         }
         event.set("__passiveListener", Value::Boolean(false));
     }
@@ -461,6 +470,7 @@ pub(crate) fn dispatch_event_at(
     let document_target = document.event_target.clone();
     if node.is_some() {
         invoke_listeners(
+            document,
             &document_target,
             event,
             &event_type,
@@ -475,17 +485,33 @@ pub(crate) fn dispatch_event_at(
             if let Some(element) = element_for_node(document, *ancestor) {
                 let target = event_target_for(document, Some(*ancestor));
                 let object = element_object(element, Arc::new(Mutex::new(document.clone())));
-                invoke_listeners(&target, event, &event_type, &object, true, 1.0);
+                invoke_listeners(document, &target, event, &event_type, &object, true, 1.0);
             }
         }
         if let Some(target_node) = node {
             let target = event_target_for(document, Some(target_node));
-            invoke_listeners(&target, event, &event_type, target_object, true, 2.0);
+            invoke_listeners(
+                document,
+                &target,
+                event,
+                &event_type,
+                target_object,
+                true,
+                2.0,
+            );
             if !matches!(
                 event.get("__stopImmediatePropagation"),
                 Some(Value::Boolean(true))
             ) {
-                invoke_listeners(&target, event, &event_type, target_object, false, 2.0);
+                invoke_listeners(
+                    document,
+                    &target,
+                    event,
+                    &event_type,
+                    target_object,
+                    false,
+                    2.0,
+                );
             }
         }
         if matches!(event.get("bubbles"), Some(Value::Boolean(true)))
@@ -498,10 +524,11 @@ pub(crate) fn dispatch_event_at(
                 if let Some(element) = element_for_node(document, *ancestor) {
                     let target = event_target_for(document, Some(*ancestor));
                     let object = element_object(element, Arc::new(Mutex::new(document.clone())));
-                    invoke_listeners(&target, event, &event_type, &object, false, 3.0);
+                    invoke_listeners(document, &target, event, &event_type, &object, false, 3.0);
                 }
             }
             invoke_listeners(
+                document,
                 &document_target,
                 event,
                 &event_type,
@@ -512,6 +539,7 @@ pub(crate) fn dispatch_event_at(
         }
     } else {
         invoke_listeners(
+            document,
             &document_target,
             event,
             &event_type,
@@ -524,6 +552,7 @@ pub(crate) fn dispatch_event_at(
             Some(Value::Boolean(true))
         ) {
             invoke_listeners(
+                document,
                 &document_target,
                 event,
                 &event_type,
