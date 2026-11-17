@@ -115,6 +115,10 @@ struct MicrotaskQueue {
     callbacks: VecDeque<Function>,
 }
 
+struct MessageQueue {
+    messages: VecDeque<Value>,
+}
+
 impl MicrotaskQueue {
     fn new() -> Self {
         Self {
@@ -128,6 +132,14 @@ impl MicrotaskQueue {
 
     fn dequeue(&mut self) -> Option<Function> {
         self.callbacks.pop_front()
+    }
+}
+
+impl MessageQueue {
+    fn new() -> Self {
+        Self {
+            messages: VecDeque::new(),
+        }
     }
 }
 
@@ -419,6 +431,72 @@ fn invoke_popstate(window: &Object, event_target: &EventTargetRef, state: &Value
     }
 }
 
+fn message_target_origin(arguments: &[Value]) -> JsResult<String> {
+    let target = match arguments.get(1) {
+        None | Some(Value::Undefined) => "/".to_owned(),
+        Some(Value::String(target)) => target.clone(),
+        Some(Value::Object(options) | Value::Array(options)) => {
+            match options.get_property("targetOrigin")? {
+                None | Some(Value::Undefined) => "/".to_owned(),
+                Some(Value::String(target)) => target,
+                _ => return Err(type_error("targetOrigin must be a string")),
+            }
+        }
+        _ => {
+            return Err(type_error(
+                "targetOrigin must be a string or options object",
+            ));
+        }
+    };
+    if target == "*" || target == "/" || target == "null" {
+        return Ok(target);
+    }
+    let parsed = Url::parse(&target)
+        .map_err(|_| type_error("targetOrigin must be an origin, '*' or '/'"))?;
+    let origin = parsed.origin().ascii_serialization();
+    let origin_with_slash = format!("{origin}/");
+    if parsed.as_str() != origin && parsed.as_str() != origin_with_slash {
+        return Err(type_error("targetOrigin must be an origin, '*' or '/'"));
+    }
+    Ok(origin)
+}
+
+fn message_origin(window: &Object) -> String {
+    window
+        .get("__postMessageOrigin")
+        .and_then(|value| match value {
+            Value::String(origin) => Some(origin),
+            _ => None,
+        })
+        .unwrap_or_else(|| "null".into())
+}
+
+fn invoke_message(window: &Object, event_target: &EventTargetRef, data: Value, origin: String) {
+    let event = Object::new();
+    event.set("type", Value::String("message".into()));
+    event.set("data", data);
+    event.set("origin", Value::String(origin));
+    event.set("source", Value::Object(window.clone()));
+    event.set("ports", Value::Array(Object::new()));
+    event.set("bubbles", Value::Boolean(false));
+    event.set("cancelable", Value::Boolean(false));
+    event.set("target", Value::Object(window.clone()));
+    event.set("currentTarget", Value::Object(window.clone()));
+
+    if let Err(error) =
+        dispatch_event_on_target(event_target, window, &[Value::Object(event.clone())])
+    {
+        log::warn!("message event dispatch failed: {error}");
+    }
+    if let Some(Value::Function(callback)) = window.get("onmessage") {
+        event.set("currentTarget", Value::Object(window.clone()));
+        event.set("eventPhase", Value::Number(2.0));
+        if let Err(error) = callback.call(&[Value::Object(event)]) {
+            log::warn!("message event handler threw: {error}");
+        }
+    }
+}
+
 /// The viewport dimensions exposed to a script-visible Window.
 ///
 /// Dimensions are CSS pixels, matching CSSOM View. A viewport is optional
@@ -641,6 +719,7 @@ fn register_window_object(
     };
     let timers = Arc::new(Mutex::new(WindowTimers::new()));
     let microtasks = Arc::new(Mutex::new(MicrotaskQueue::new()));
+    let messages = Arc::new(Mutex::new(MessageQueue::new()));
     let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
     let event_target: EventTargetRef = Arc::new(Mutex::new(crate::event::EventTarget::default()));
     let performance = Object::new();
@@ -704,6 +783,7 @@ fn register_window_object(
     let inner_height = Value::Number(viewport.map_or(0, |size| size.height) as f64);
     window.set("innerHeight", inner_height.clone());
     window.set("onpopstate", Value::Null);
+    window.set("onmessage", Value::Null);
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__mediaQueryLists", Value::Object(Object::new()));
 
@@ -727,6 +807,34 @@ fn register_window_object(
         "removeEventListener",
         Arc::new(move |arguments| {
             remove_event_listener_target(&event_target_for_remove, "window", arguments)
+        }),
+    );
+
+    let window_origin = Url::parse(initial_url)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|_| "null".into());
+    window.set("__postMessageOrigin", Value::String(window_origin));
+
+    let messages_for_post_message = Arc::clone(&messages);
+    let post_message_window = window.clone();
+    window.set_method(
+        "postMessage",
+        Arc::new(move |arguments| {
+            let target = message_target_origin(arguments)?;
+            let origin = message_origin(&post_message_window);
+            if target != "*" && target != "/" && target != origin {
+                return Ok(Value::Undefined);
+            }
+            let data = structured_clone(
+                arguments.first().unwrap_or(&Value::Undefined),
+                arguments.get(1),
+            )?;
+            messages_for_post_message
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .messages
+                .push_back(data);
+            Ok(Value::Undefined)
         }),
     );
 
@@ -1067,6 +1175,34 @@ fn register_window_object(
         }),
     );
 
+    let messages_for_pump = Arc::clone(&messages);
+    let microtasks_for_message = Arc::clone(&microtasks);
+    let evaluator_for_message = evaluator.clone();
+    let message_window = window.clone();
+    let event_target_for_message = event_target.clone();
+    window.set_method(
+        "__runMessages",
+        Arc::new(move |_| {
+            let mut delivered = 0;
+            loop {
+                let message = messages_for_pump
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .messages
+                    .pop_front();
+                let Some(message) = message else { break };
+                invoke_message(
+                    &message_window,
+                    &event_target_for_message,
+                    message,
+                    message_origin(&message_window),
+                );
+                drain_microtasks(&microtasks_for_message, &evaluator_for_message);
+                delivered += 1;
+            }
+            Ok(Value::Number(delivered as f64))
+        }),
+    );
     let history_for_window = history.clone();
     window.set_method(
         "history",
@@ -1301,6 +1437,25 @@ pub fn run_window_microtasks(window: &Object) -> JsResult<usize> {
     }
 }
 
+/// Delivers queued `message` events for a Window.
+///
+/// `postMessage()` queues delivery so scripts can install listeners before the
+/// event is dispatched. Browser integrations should call this from the owning
+/// page/event-loop thread at a task checkpoint. The return value is the number
+/// of messages delivered.
+pub fn run_window_messages(window: &Object) -> JsResult<usize> {
+    let Some(Value::Function(pump)) = window.get("__runMessages") else {
+        return Err(JsError::runtime("window message pump is not installed"));
+    };
+    match pump.call(&[]) {
+        Ok(Value::Number(delivered)) => Ok(delivered as usize),
+        Ok(_) => Err(JsError::runtime(
+            "window message pump returned a non-number",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
 /// Runs the pending `window.requestAnimationFrame()` callbacks for one frame.
 ///
 /// Browser integrations call this from the owning page/event-loop thread
@@ -1340,6 +1495,10 @@ pub fn register_window_with_security_context(
     let window = register_window_object(realm, "about:blank", 1.0, None)?;
     let serialized_origin = security_context.origin().ascii_serialization();
     window.set("origin", Value::String(serialized_origin.clone()));
+    window.set(
+        "__postMessageOrigin",
+        Value::String(serialized_origin.clone()),
+    );
     realm.register_global_value("origin", Value::String(serialized_origin))?;
     Ok(())
 }
