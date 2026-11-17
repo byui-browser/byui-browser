@@ -36,7 +36,7 @@ pub mod refresh;
 
 pub use load::{
     LoadError, Navigation, PageLoader, error_page, load_page, load_page_timed, normalize_address,
-    security_context_for_url,
+    security_context_for_url, security_context_for_url_with_policy,
 };
 
 /// Browser-owned resource limits for one local-file session.
