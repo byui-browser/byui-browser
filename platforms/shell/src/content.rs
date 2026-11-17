@@ -1174,6 +1174,40 @@ mod tests {
         [color.r, color.g, color.b, color.a]
     }
 
+    fn rect_for_class(page: &PageLayout, class: &str) -> Option<layout::Rect> {
+        let node = page
+            .document
+            .nodes
+            .iter()
+            .enumerate()
+            .find_map(|(index, node)| {
+                let NodeKind::Element(element) = node.get_kind() else {
+                    return None;
+                };
+                element
+                    .get_attributes()
+                    .iter()
+                    .any(|attribute| {
+                        attribute.get_name() == "class"
+                            && attribute
+                                .get_value()
+                                .split_ascii_whitespace()
+                                .any(|c| c == class)
+                    })
+                    .then(|| NodeID::new(index))
+            })?;
+        fn find(layout_box: &layout::LayoutBox, node: NodeID) -> Option<layout::Rect> {
+            if layout_box.node == Some(node) {
+                return Some(layout_box.rect);
+            }
+            layout_box
+                .children
+                .iter()
+                .find_map(|child| find(child, node))
+        }
+        find(&page.tree.root, node)
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn unloading_a_replaced_document_removes_old_click_listeners() {
@@ -1485,7 +1519,12 @@ mod tests {
                 .copied()
                 .any(|p| p == welcome_color(&page, ".topbar .brand", "color"))
         );
-        let in_hero = 160 * 70 * 4;
+        let layout = PageLayout::new(&page, 160, 120);
+        let hero_y = rect_for_class(&layout, "topbar")
+            .expect("welcome page top bar has a layout box")
+            .bottom()
+            .ceil() as usize;
+        let in_hero = 160 * hero_y * 4;
         assert_eq!(
             &frame.pixels[in_hero..in_hero + 4],
             &welcome_color(&page, ".hero", "background-color")
@@ -1516,7 +1555,12 @@ mod tests {
                     .copied()
                     .any(|p| p == welcome_color(&page_source, ".topbar .brand", "color"))
             );
-            let in_hero = ((70.0 * scale) as u32 * width) as usize * 4;
+            let hero_y = (rect_for_class(&layout, "topbar")
+                .expect("welcome page top bar has a layout box")
+                .bottom()
+                * scale as f32)
+                .ceil() as u32;
+            let in_hero = (hero_y * width) as usize * 4;
             assert_eq!(
                 &data[in_hero..in_hero + 4],
                 &welcome_color(&page_source, ".hero", "background-color")

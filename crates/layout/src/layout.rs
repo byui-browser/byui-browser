@@ -31,8 +31,9 @@ pub(crate) struct Context<'a> {
 ///   (CSS Backgrounds 3 §2.11.2).
 ///
 /// `display:flex` and `display:inline-flex` use a single-line flex subset with
-/// `flex-direction:row|column`, `flex-grow`, and `gap`. Wrapping, shrinking,
-/// alignment, and anonymous flex items for mixed text are not implemented.
+/// `flex-direction:row|column`, `flex-basis`, `flex-grow`, `flex-shrink`, and
+/// `gap`. Wrapping, alignment, and anonymous flex items for mixed text are not
+/// implemented.
 /// Grid and table modes are preserved distinctly in computed display values,
 /// but still use ordinary flow layout. Other supported properties are
 /// margins, padding, `width`, `height`, `font-size`, `font-family`,
@@ -40,7 +41,8 @@ pub(crate) struct Context<'a> {
 /// unsupported properties (including the `font` shorthand) use their initial
 /// values. The font properties choose a face through
 /// [`FontMetrics::select_font`], which measures each text run.
-/// Floats, positioning, borders, and min/max sizes are not implemented.
+/// Floats, positioning, and borders are not implemented. Min/max sizes apply
+/// to replaced elements; flex items also honor their main-axis minimum size.
 /// Content may overflow the viewport; the root box's rect stays viewport-sized.
 ///
 /// This lays out without images: every `<img>` is treated as broken. Use

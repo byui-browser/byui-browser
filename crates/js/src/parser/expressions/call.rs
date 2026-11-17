@@ -99,6 +99,7 @@ fn parse_template<'tokens>(parser: &mut Parser<'tokens>) -> ParseResult<(Expr, u
         inner.function_depth = parser.function_depth;
         inner.method_depth = parser.method_depth;
         inner.loops = parser.loops.clone();
+        inner.breakables = parser.breakables.clone();
         let result = inner.parse_sequence_with_depth().and_then(|parsed| {
             if inner.peek().is_some() {
                 Err(inner.error(

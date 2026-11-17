@@ -66,7 +66,7 @@ mod instruction;
 
 pub use chunk::{CallableKind, CaptureSource, Chunk, FunctionTemplate, SourceLocation};
 pub use compiler::{CompileError, Compiler};
-pub use instruction::Instruction;
+pub use instruction::{Instruction, IterationKind};
 
 /// Compiles a parsed program into an executable bytecode chunk.
 pub fn compile(program: &crate::Program) -> Result<Chunk, CompileError> {

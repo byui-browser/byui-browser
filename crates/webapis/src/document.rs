@@ -16,6 +16,7 @@ use crate::event::{
     EventTarget, EventTargetRef, abort_controller_constructor, add_event_listener,
     dispatch_event_with_target, event_constructor, remove_event_listener,
 };
+use crate::selection::{document_get_selection, new_selection};
 use crate::selector::{SelectorError, SimpleSelector, parse_selector_list};
 
 /// Implements JavaScript `document.getElementById(id)`.
@@ -94,6 +95,12 @@ fn register_shared_document(
         shared_document.lock().unwrap().elements.len()
     );
     let document_object = Object::new();
+    let selection = new_selection();
+    let document_selection = selection.clone();
+    document_object.set_method(
+        "getSelection",
+        Arc::new(move |arguments| document_get_selection(&document_selection, arguments)),
+    );
     if let Some(location) = location {
         let location_getter = location.clone();
         let location_setter = location;
@@ -283,6 +290,14 @@ fn register_shared_document(
         "getComputedStyle",
         Arc::new(move |arguments| get_computed_style(&computed_style_document, arguments)),
     );
+    let window_selection = selection.clone();
+    window_object.set_method(
+        "getSelection",
+        Arc::new(move |arguments| document_get_selection(&window_selection, arguments)),
+    );
+    if let Some(get_selection) = window_object.get("getSelection") {
+        realm.register_global_value("getSelection", get_selection)?;
+    }
     window_object.set_read_only("document", document_value.clone());
     realm.register_global_value("document", document_value)?;
     if realm.registered_global_value("window").is_none() {

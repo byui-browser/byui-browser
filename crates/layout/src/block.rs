@@ -445,32 +445,67 @@ impl Context<'_> {
                 padding.horizontal()
             }
         };
-        // Content-box sizes along the main axis.
+        // The border-box height of an item laid out at its natural height,
+        // converted to a content-box height.
+        let natural_content_height = |item: &BlockBox| {
+            let border_box = self
+                .layout_block_level(
+                    item,
+                    ContainingBlock {
+                        width,
+                        height: None,
+                    },
+                )
+                .fragment
+                .rect
+                .height;
+            (border_box - main_padding(item)).max(0.0)
+        };
+        // Content-box sizes along the main axis. `flex-basis`, like the main
+        // size property, measures the box `box-sizing` selects.
         let basis = list
             .iter()
             .map(|item| {
-                if column {
+                let basis_size = if column {
                     item.style
-                        .content_height(Some(width), height)
-                        .unwrap_or_else(|| {
-                            let border_box = self
-                                .layout_block_level(
-                                    item,
-                                    ContainingBlock {
-                                        width,
-                                        height: None,
-                                    },
-                                )
-                                .fragment
-                                .rect
-                                .height;
-                            (border_box - main_padding(item)).max(0.0)
-                        })
+                        .content_height_for(item.style.flex_basis, Some(width), height)
                 } else {
                     item.style
-                        .content_width(Some(width))
-                        .unwrap_or_else(|| self.intrinsic_content_sizes(item).1)
+                        .content_width_for(item.style.flex_basis, Some(width))
+                };
+                basis_size.unwrap_or_else(|| {
+                    if column {
+                        item.style
+                            .content_height(Some(width), height)
+                            .unwrap_or_else(|| natural_content_height(item))
+                    } else {
+                        item.style
+                            .content_width(Some(width))
+                            .unwrap_or_else(|| self.intrinsic_content_sizes(item).1)
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        // Content-box minimum main sizes that shrinking never goes below.
+        let minimums = list
+            .iter()
+            .map(|item| {
+                if column {
+                    if item.style.min_height_auto {
+                        natural_content_height(item)
+                    } else {
+                        item.style
+                            .content_height_for(item.style.min_height, Some(width), height)
+                            .unwrap_or(0.0)
+                    }
+                } else if item.style.min_width_auto {
+                    self.intrinsic_content_sizes(item).0
+                } else {
+                    item.style
+                        .content_width_for(item.style.min_width, Some(width))
+                        .unwrap_or(0.0)
                 }
+                .max(0.0)
             })
             .collect::<Vec<_>>();
         let outer: f32 = list
@@ -479,17 +514,23 @@ impl Context<'_> {
             .map(|(item, base)| base + main_padding(item))
             .sum();
         let grow: f32 = list.iter().map(|item| item.style.flex_grow).sum();
-        let free = (available - gaps - outer).max(0.0);
+        let free = available - gaps - outer;
+        let shrink: f32 = list
+            .iter()
+            .zip(&basis)
+            .map(|(item, base)| item.style.flex_shrink * base.max(0.0))
+            .sum();
         let mut cursor = 0.0;
         let mut cross = 0.0_f32;
-        for (source, base) in list.iter().zip(basis) {
+        for ((source, base), minimum) in list.iter().zip(basis).zip(minimums) {
             let item = source;
-            let share = if grow > 0.0 {
-                free * item.style.flex_grow / grow
+            let target = if free >= 0.0 && grow > 0.0 {
+                base + free * item.style.flex_grow / grow
+            } else if free < 0.0 && shrink > 0.0 {
+                (base + free * item.style.flex_shrink * base.max(0.0) / shrink).max(minimum)
             } else {
-                0.0
+                base
             };
-            let target = base + share;
             let mut item = item.clone();
             let mut computed = (*item.style).clone();
             // `target` is a content size, whatever the item's `box-sizing`.
