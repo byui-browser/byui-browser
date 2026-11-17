@@ -345,8 +345,20 @@ impl Context<'_> {
                 let inline = self.layout_inline(items, style, content_width, &mut floats);
                 lines = inline.lines;
                 children.extend(inline.floats);
+                let height = match lines.last() {
+                    Some(line) => line.rect.bottom(),
+                    // A single-line control with no text (an empty field or
+                    // `<input type=button>`) keeps one strut-high line.
+                    None if block.centers_lines => {
+                        let metrics = self
+                            .fonts
+                            .font_vertical_metrics(style.font, style.font_size);
+                        metrics.ascent + metrics.descent + metrics.line_gap
+                    }
+                    None => 0.0,
+                };
                 FlowResult {
-                    height: lines.last().map_or(0.0, |line| line.rect.bottom()),
+                    height,
                     margin_top: edges.own_top,
                     margin_bottom: edges.own_bottom,
                     has_content: !lines.is_empty(),
