@@ -14,6 +14,7 @@
 //! expanded to longhands.
 
 use crate::animation;
+use crate::computed::PseudoElement;
 use crate::matching::compound_never_matches;
 use crate::selector::{ComplexSelector, CompoundSelector, SimpleSelector, parse_selector_list};
 use crate::shorthands;
@@ -95,6 +96,32 @@ pub(crate) struct CompiledRule {
     pub(crate) rule_index: usize,
     /// Expanded declarations, shared by rules split from one selector list.
     pub(crate) declarations: Arc<[CompiledDeclaration]>,
+    /// The pseudo-element the rule styles, if any. `selector` then has the
+    /// pseudo-element removed and matches the originating element.
+    pub(crate) pseudo: Option<PseudoElement>,
+}
+
+/// Splits a trailing `::before` / `::after` (or legacy `:before` /
+/// `:after`) off the rightmost compound of `selector`.
+///
+/// Returns the selector for the originating element and the pseudo-element.
+/// A pseudo-element anywhere else (`p::before span`) or followed by other
+/// simple selectors (`p::before:hover`) is left in place, so the selector
+/// still never matches.
+fn split_pseudo_element(mut selector: ComplexSelector) -> (ComplexSelector, Option<PseudoElement>) {
+    let Some(last) = selector.compounds.last_mut() else {
+        return (selector, None);
+    };
+    let pseudo = match last.simples.last() {
+        Some(SimpleSelector::Pseudo(pseudo)) if pseudo.argument.is_none() => {
+            PseudoElement::from_name(&pseudo.name)
+        }
+        _ => None,
+    };
+    if pseudo.is_some() {
+        last.simples.pop();
+    }
+    (selector, pseudo)
 }
 
 /// A stylesheet whose rules are ready for indexing.
@@ -125,14 +152,18 @@ impl CompiledSheet {
 
             let before = skipped;
 
-            let selectors: Vec<ComplexSelector> = list
+            // Specificity is taken before a pseudo-element is split off, so
+            // `p::before` keeps its type-selector weight for the pseudo-element.
+            let selectors: Vec<(ComplexSelector, Specificity, Option<PseudoElement>)> = list
                 .selectors
                 .into_iter()
-                .filter(|selector| {
+                .filter_map(|selector| {
+                    let specificity = complex_specificity(&selector);
+                    let (selector, pseudo) = split_pseudo_element(selector);
                     let never = selector.compounds.iter().any(compound_never_matches);
 
                     skipped += usize::from(never);
-                    !never
+                    (!never).then_some((selector, specificity, pseudo))
                 })
                 .collect();
 
@@ -159,12 +190,13 @@ impl CompiledSheet {
                 }
             };
 
-            for selector in selectors {
+            for (selector, specificity, pseudo) in selectors {
                 rules.push(CompiledRule {
-                    specificity: complex_specificity(&selector),
+                    specificity,
                     selector,
                     rule_index,
                     declarations: Arc::clone(&declarations),
+                    pseudo,
                 });
             }
         }
@@ -329,5 +361,31 @@ impl<'r> RuleIndex<'r> {
         if let Some(rules) = rules {
             candidates.extend_from_slice(rules);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse_stylesheet;
+
+    #[test]
+    fn before_and_after_rules_are_kept_for_their_originating_element() {
+        let sheet = parse_stylesheet(
+            "p::before {a:b} p:after {a:b} ::before {a:b} p::before:hover {a:b} p::before span {a:b}",
+        );
+        let compiled = CompiledSheet::compile(&sheet);
+        let pseudos: Vec<_> = compiled.rules.iter().map(|rule| rule.pseudo).collect();
+        assert_eq!(
+            pseudos,
+            [
+                Some(PseudoElement::Before),
+                Some(PseudoElement::After),
+                Some(PseudoElement::Before)
+            ]
+        );
+        // `p::before` keeps the pseudo-element's specificity.
+        assert_eq!(compiled.rules[0].specificity, Specificity(0, 0, 2));
+        assert!(compiled.rules[0].selector.compounds[0].simples.is_empty());
     }
 }

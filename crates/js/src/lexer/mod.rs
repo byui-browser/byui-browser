@@ -45,6 +45,8 @@ pub enum Token {
     Else,
     /// `while` keyword.
     While,
+    /// `do` keyword.
+    Do,
     /// `for` keyword.
     For,
     /// `function` keyword.
@@ -63,6 +65,12 @@ pub enum Token {
     Break,
     /// `continue` keyword.
     Continue,
+    /// `switch` keyword.
+    Switch,
+    /// `case` keyword.
+    Case,
+    /// `default` keyword.
+    Default,
     /// `class` keyword.
     Class,
     /// `extends` keyword.
@@ -149,6 +157,8 @@ pub enum Token {
     Delete,
     /// `in` keyword.
     In,
+    /// `of` keyword.
+    Of,
     /// `instanceof` keyword.
     InstanceOf,
     /// `?` conditional operator.
@@ -818,6 +828,7 @@ fn keyword(name: &str) -> Option<Token> {
         "if" => Token::If,
         "else" => Token::Else,
         "while" => Token::While,
+        "do" => Token::Do,
         "for" => Token::For,
         "function" => Token::Function,
         "return" => Token::Return,
@@ -827,6 +838,9 @@ fn keyword(name: &str) -> Option<Token> {
         "finally" => Token::Finally,
         "break" => Token::Break,
         "continue" => Token::Continue,
+        "switch" => Token::Switch,
+        "case" => Token::Case,
+        "default" => Token::Default,
         "class" => Token::Class,
         "extends" => Token::Extends,
         "new" => Token::New,
@@ -840,6 +854,7 @@ fn keyword(name: &str) -> Option<Token> {
         "void" => Token::Void,
         "delete" => Token::Delete,
         "in" => Token::In,
+        "of" => Token::Of,
         "instanceof" => Token::InstanceOf,
         _ => return None,
     })

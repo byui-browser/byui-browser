@@ -28,7 +28,7 @@ const BUTTON_TOP: f32 = CENTER_Y - BUTTON_SIZE / 2.0;
 const ADDRESS_HEIGHT: f32 = 34.0;
 const ADDRESS_MAX_WIDTH: f32 = 640.0;
 /// Logical distance from the address field's left edge to its text, leaving
-/// room for the lock icon.
+/// room for the Site Information button.
 const ADDRESS_TEXT_LEADING: f32 = 30.0;
 /// Logical distance from the toolbar's left edge (after the window-controls
 /// inset) to the Back button when it is furthest left: when the address field
@@ -59,17 +59,20 @@ pub(crate) enum Control {
     Forward,
     /// Reload; fetches the current URL and repaints the loaded page.
     Reload,
+    /// Opens information about the active document.
+    SiteInfo,
     /// Address field; supports staged text editing.
     Address,
     /// Overflow menu placeholder.
     Menu,
 }
 
-const CONTROLS: [Control; 5] = [
+const CONTROLS: [Control; 6] = [
     Control::Back,
     Control::Forward,
     Control::Reload,
     Control::Menu,
+    Control::SiteInfo,
     Control::Address,
 ];
 
@@ -387,7 +390,7 @@ fn draw_toolbar(
     let transform = Transform::from_scale(scale, scale);
     let inset = state.window_controls_inset;
     for control in CONTROLS {
-        if control == Control::Address {
+        if matches!(control, Control::Address | Control::SiteInfo) {
             continue;
         }
         let Some(rect) = control_rect(control, width, inset) else {
@@ -517,25 +520,36 @@ fn draw_address_field(
     );
 
     let cy = CENTER_Y;
-    let lock_x = rect.x() + 16.0;
-    if let Some(body) = rounded_rect(lock_x - 4.0, cy - 1.5, 8.0, 6.5, 1.6) {
-        fill(pixmap, &body, palette.accent, transform);
+    let button = site_info_button(rect);
+    let cx = button.x() + button.width() / 2.0;
+    let background = if state.pressed == Some(Control::SiteInfo) {
+        palette.pressed
+    } else if state.hovered == Some(Control::SiteInfo) {
+        palette.hover
+    } else if state.dark {
+        palette.frame_top
+    } else {
+        palette.field_border
+    };
+    if let Some(path) = rounded_rect(
+        button.x(),
+        button.y(),
+        button.width(),
+        button.height(),
+        11.0,
+    ) {
+        fill(pixmap, &path, background, transform);
     }
-    let mut shackle = PathBuilder::new();
-    let (r, top) = (2.5, cy - 3.6);
-    shackle.move_to(lock_x - r, cy - 1.0);
-    shackle.line_to(lock_x - r, top);
-    shackle.cubic_to(
-        lock_x - r,
-        top - r * 4.0 / 3.0,
-        lock_x + r,
-        top - r * 4.0 / 3.0,
-        lock_x + r,
-        top,
-    );
-    shackle.line_to(lock_x + r, cy - 1.0);
-    if let Some(path) = shackle.finish() {
-        stroke(pixmap, &path, palette.accent, 1.4, transform);
+    let mut sliders = PathBuilder::new();
+    for (dy, knob) in [(-3.0, -2.0), (3.0, 2.0)] {
+        let y = cy + dy;
+        sliders.move_to(cx - 5.0, y);
+        sliders.line_to(cx + 5.0, y);
+        sliders.move_to(cx + knob, y - 2.0);
+        sliders.line_to(cx + knob, y + 2.0);
+    }
+    if let Some(path) = sliders.finish() {
+        stroke(pixmap, &path, palette.icon, 1.4, transform);
     }
 
     let star_x = rect.right() - 18.0;
@@ -611,7 +625,7 @@ fn draw_address_field(
             text_x * scale,
             baseline,
             clip_x * scale,
-            if state.address_focused {
+            if state.address_focused || state.dark {
                 palette.text
             } else {
                 palette.text_muted
@@ -762,7 +776,18 @@ fn control_rect(control: Control, width: f32, inset: f32) -> Option<Rect> {
         Control::Reload => button(nav_x() + 2.0 * NAV_STRIDE),
         Control::Menu => button(width - 44.0).filter(|_| trailing),
         Control::Address => address_rect(width, inset, trailing),
+        Control::SiteInfo => address_rect(width, inset, trailing).map(site_info_button),
     }
+}
+
+fn site_info_button(field: Rect) -> Rect {
+    Rect::from_xywh(field.x() + 5.0, CENTER_Y - 11.0, 22.0, 22.0)
+        .expect("positive Site Information button size")
+}
+
+/// Left edge of the Site Information button in logical window pixels.
+pub(crate) fn site_info_anchor(width: f64, inset: f32) -> Option<f32> {
+    control_rect(Control::SiteInfo, width as f32, inset).map(|rect| rect.left())
 }
 
 /// Returns where the address field sits, or `None` when the window is too
@@ -853,6 +878,10 @@ pub(crate) struct Palette {
     pub(crate) text: Color,
     pub(crate) text_muted: Color,
     pub(crate) accent: Color,
+    pub(crate) on_accent: Color,
+    pub(crate) active_tab: Color,
+    pub(crate) panel: Color,
+    pub(crate) panel_border: Color,
     pub(crate) selection: Color,
 }
 
@@ -878,6 +907,10 @@ fn light() -> Palette {
         text_muted: rgba(0x6b, 0x72, 0x80, 255),
         // BYU–Idaho blue.
         accent: rgba(0x00, 0x6e, 0xb6, 255),
+        on_accent: Color::WHITE,
+        active_tab: Color::WHITE,
+        panel: rgba(0xf4, 0xf5, 0xf8, 255),
+        panel_border: rgba(15, 23, 42, 34),
         selection: rgba(0x00, 0x6e, 0xb6, 64),
     }
 }
@@ -888,16 +921,20 @@ fn dark() -> Palette {
         frame_bottom: rgba(0x1b, 0x1c, 0x20, 255),
         shadow: rgba(0, 0, 0, 40),
         card_border: rgba(255, 255, 255, 20),
-        icon: rgba(0xe2, 0xe5, 0xeb, 255),
-        icon_disabled: rgba(0xe2, 0xe5, 0xeb, 70),
+        icon: rgba(0xec, 0xef, 0xf5, 255),
+        icon_disabled: rgba(0x7b, 0x82, 0x90, 255),
         hover: rgba(255, 255, 255, 18),
         pressed: rgba(255, 255, 255, 32),
-        field: rgba(255, 255, 255, 16),
-        field_hover: rgba(255, 255, 255, 26),
-        field_border: rgba(255, 255, 255, 16),
+        field: rgba(0x30, 0x33, 0x3c, 255),
+        field_hover: rgba(0x39, 0x3d, 0x48, 255),
+        field_border: rgba(0x67, 0x70, 0x83, 255),
         text: rgba(0xec, 0xee, 0xf2, 255),
-        text_muted: rgba(0x96, 0x9c, 0xa8, 255),
+        text_muted: rgba(0xb0, 0xb8, 0xc7, 255),
         accent: rgba(0x4d, 0xa3, 0xff, 255),
+        on_accent: rgba(0x12, 0x1b, 0x29, 255),
+        active_tab: rgba(0x41, 0x49, 0x59, 255),
+        panel: rgba(0x29, 0x2c, 0x35, 255),
+        panel_border: rgba(0x6e, 0x77, 0x89, 255),
         selection: rgba(0x4d, 0xa3, 0xff, 96),
     }
 }
@@ -909,6 +946,46 @@ mod tests {
     fn pixel(pixmap: &Pixmap, x: u32, y: u32) -> [u8; 4] {
         let p = pixmap.pixel(x, y).expect("pixel in bounds");
         [p.red(), p.green(), p.blue(), p.alpha()]
+    }
+
+    #[test]
+    fn dark_palette_keeps_text_controls_and_focus_legible() {
+        fn luminance(color: Color) -> f32 {
+            let linear = |value: f32| {
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(color.red())
+                + 0.7152 * linear(color.green())
+                + 0.0722 * linear(color.blue())
+        }
+        let contrast = |a, b| {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        };
+        let dark = palette(true);
+        for (foreground, background) in [
+            (dark.text, dark.field_hover),
+            (dark.text, dark.active_tab),
+            (dark.text_muted, dark.panel),
+            (dark.on_accent, dark.accent),
+        ] {
+            assert!(contrast(foreground, background) >= 4.5);
+        }
+        for (foreground, background) in [
+            (dark.icon, dark.field_hover),
+            (dark.icon_disabled, dark.frame_top),
+            (dark.accent, dark.active_tab),
+            (dark.accent, dark.field_hover),
+            (dark.panel_border, dark.panel),
+        ] {
+            assert!(contrast(foreground, background) >= 3.0);
+        }
+        let light = palette(false);
+        assert!(contrast(light.on_accent, light.accent) >= 4.5);
     }
 
     #[cfg(target_os = "macos")]
@@ -1039,6 +1116,29 @@ mod tests {
     }
 
     #[test]
+    fn site_info_has_a_separate_hit_region_before_address_text() {
+        for (width, inset) in [(420.0, 72.0), (1120.0, 0.0)] {
+            let field = control_rect(Control::Address, width as f32, inset).unwrap();
+            let button = control_rect(Control::SiteInfo, width as f32, inset).unwrap();
+            let text_x = field.left() + ADDRESS_TEXT_LEADING;
+            assert!(button.right() < text_x);
+            assert_eq!(
+                hit_test(
+                    f64::from(button.left() + 1.0),
+                    f64::from(CENTER_Y),
+                    width,
+                    inset
+                ),
+                Some(Control::SiteInfo)
+            );
+            assert_eq!(
+                hit_test(f64::from(text_x), f64::from(CENTER_Y), width, inset),
+                Some(Control::Address)
+            );
+        }
+    }
+
+    #[test]
     fn disabled_navigation_controls_still_occupy_hit_regions() {
         let back = hit_test(26.0, CENTER_Y as f64, 600.0, 0.0);
         let forward = hit_test(58.0, CENTER_Y as f64, 600.0, 0.0);
@@ -1130,7 +1230,17 @@ mod tests {
                 );
             }
         }
-        assert_eq!(CONTROLS.len(), 5);
+        assert_eq!(
+            CONTROLS,
+            [
+                Control::Back,
+                Control::Forward,
+                Control::Reload,
+                Control::Menu,
+                Control::SiteInfo,
+                Control::Address,
+            ]
+        );
     }
 
     #[test]

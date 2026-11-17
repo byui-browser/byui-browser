@@ -5,10 +5,11 @@
 //! of the caller is saved while a callee runs. Top-level bindings live in the
 //! outermost frame's first scope and are reachable from every frame.
 
-use crate::bytecode::{CallableKind, Chunk, FunctionTemplate, Instruction};
+use crate::bytecode::{CallableKind, Chunk, FunctionTemplate, Instruction, IterationKind};
 use crate::runtime::{
     BytecodeCapture, ExecutionLimits, array_len, binary, builtins, copy_data_properties,
-    delete_property, get_array_property, is_nullish, is_truthy, non_object, set_array_property,
+    delete_property, get_array_property, is_nullish, is_truthy, non_object,
+    primitives_get_number_property, primitives_get_string_property, set_array_property,
     spread_values, to_property_key, unary,
 };
 use crate::{Function, JsError, JsErrorCategory, JsResult, Object, Value};
@@ -53,6 +54,7 @@ struct Frame {
     resume: usize,
     scopes: Vec<Vec<Slot>>,
     captures: Vec<BytecodeCapture>,
+    iterators: Vec<IteratorState>,
     /// Height of the operand stack when the frame started.
     stack_base: usize,
     /// The receiver, or `None` in a derived constructor before `super(...)`.
@@ -63,6 +65,12 @@ struct Frame {
     /// The constructor `new` was applied to, for constructor frames.
     new_target: Option<Function>,
     mode: ReturnMode,
+}
+
+#[derive(Debug, Clone)]
+enum IteratorState {
+    Values { values: Vec<Value>, index: usize },
+    Keys { keys: Vec<String>, index: usize },
 }
 
 /// What the caller does with the value a finished frame produces.
@@ -393,6 +401,83 @@ impl Vm {
                     for value in values {
                         append_to_array(&array, value)?;
                     }
+                }
+                Instruction::IteratorStart(kind) => {
+                    let value = self.pop()?;
+                    let iterator = match kind {
+                        IterationKind::Of => match value {
+                            Value::Array(array) => IteratorState::Values {
+                                values: (0..array_len(&array))
+                                    .map(|i| get_array_property(&array, &i.to_string()))
+                                    .collect(),
+                                index: 0,
+                            },
+                            Value::String(text) => IteratorState::Values {
+                                values: text
+                                    .chars()
+                                    .map(|c| Value::String(c.to_string()))
+                                    .collect(),
+                                index: 0,
+                            },
+                            other => {
+                                return Err(JsError::runtime(format!("`{other}` is not iterable")));
+                            }
+                        },
+                        IterationKind::In => match value {
+                            value @ (Value::Object(_) | Value::Array(_)) => {
+                                let is_array = matches!(value, Value::Array(_));
+                                let object = match value {
+                                    Value::Object(object) | Value::Array(object) => object,
+                                    _ => unreachable!(),
+                                };
+                                IteratorState::Keys {
+                                    keys: object
+                                        .keys()
+                                        .into_iter()
+                                        .filter(|key| !(is_array && key == "length"))
+                                        .collect(),
+                                    index: 0,
+                                }
+                            }
+                            other => {
+                                return Err(JsError::runtime(format!(
+                                    "Cannot enumerate `{other}`"
+                                )));
+                            }
+                        },
+                    };
+                    self.frame.iterators.push(iterator);
+                }
+                Instruction::IteratorNext(target) => {
+                    let next = match self.frame.iterators.last_mut() {
+                        Some(IteratorState::Values { values, index }) if *index < values.len() => {
+                            let value = values[*index].clone();
+                            *index += 1;
+                            Some(value)
+                        }
+                        Some(IteratorState::Keys { keys, index }) if *index < keys.len() => {
+                            let value = Value::String(keys[*index].clone());
+                            *index += 1;
+                            Some(value)
+                        }
+                        Some(_) => {
+                            self.frame.iterators.pop();
+                            None
+                        }
+                        None => return Err(JsError::runtime("bytecode iterator stack underflow")),
+                    };
+                    if let Some(value) = next {
+                        self.push(value);
+                    } else {
+                        validate_jump(target, &chunk, instruction_pointer - 1)?;
+                        instruction_pointer = target;
+                    }
+                }
+                Instruction::IteratorEnd => {
+                    self.frame
+                        .iterators
+                        .pop()
+                        .ok_or_else(|| JsError::runtime("bytecode iterator stack underflow"))?;
                 }
                 Instruction::SpreadProperties => {
                     let source = self.pop()?;
@@ -801,7 +886,7 @@ impl Vm {
         };
         let Some(template) = function.template().cloned() else {
             log::trace!("calling host function with {} arguments", arguments.len());
-            return match function.call_host(&arguments) {
+            return match function.call_host(&receiver, &arguments) {
                 Some(result) => {
                     self.push(result?);
                     Ok(false)
@@ -1198,8 +1283,9 @@ fn property_name(chunk: &Chunk, index: u16) -> JsResult<String> {
     }
 }
 
-/// Reads a property of an object, following its prototype chain, or an own
-/// property of a bytecode function such as a class's `prototype`.
+/// Reads a property of an object, array, string, or number, following
+/// prototype chains where they apply, or an own property of a host/bytecode
+/// function such as a constructor's `prototype`.
 ///
 /// A missing property reads as `undefined`. Reading a property of any other
 /// value is an error.
@@ -1207,9 +1293,9 @@ fn load_property(target: &Value, key: &str) -> JsResult<Value> {
     match target {
         Value::Object(object) => Ok(object.get_property(key)?.unwrap_or(Value::Undefined)),
         Value::Array(array) => Ok(get_array_property(array, key)),
-        Value::Function(function) if function.template().is_some() => {
-            Ok(function.get_own(key).unwrap_or(Value::Undefined))
-        }
+        Value::String(text) => primitives_get_string_property(text, key),
+        Value::Number(_) => primitives_get_number_property(key),
+        Value::Function(function) => Ok(function.get_own(key).unwrap_or(Value::Undefined)),
         _ => Err(non_object(target, "read", key, "property access")),
     }
 }

@@ -98,6 +98,8 @@ pub struct Compiler {
 enum Control {
     /// A `while` loop.
     Loop {
+        /// Optional label targeting this loop.
+        label: Option<String>,
         /// Value of `Compiler::live` inside the loop body.
         live: usize,
         /// Number of compile-time scopes outside the loop body.
@@ -111,6 +113,19 @@ enum Control {
         breaks: Vec<usize>,
         /// `continue` jumps waiting for the update target.
         continues: Vec<usize>,
+        /// Whether this loop owns an active iterator state.
+        iterator: bool,
+    },
+    /// A switch or labeled non-loop statement that can receive `break`.
+    Breakable {
+        /// Optional label.
+        label: Option<String>,
+        /// Statement completion stack depth.
+        live: usize,
+        /// Scope depth to restore.
+        scopes: usize,
+        /// Break jumps.
+        breaks: Vec<usize>,
     },
     /// An active runtime exception handler.
     Handler {
@@ -445,6 +460,17 @@ impl Compiler {
                 }
                 self.collect_vars(body)?;
             }
+            Statement::DoWhile { body, .. }
+            | Statement::ForOf { body, .. }
+            | Statement::ForIn { body, .. }
+            | Statement::Labeled { body, .. } => self.collect_vars(body)?,
+            Statement::Switch { cases, .. } => {
+                for case in cases {
+                    for statement in &case.consequent {
+                        self.collect_vars(statement)?;
+                    }
+                }
+            }
             Statement::Try {
                 block,
                 handler,
@@ -458,10 +484,11 @@ impl Compiler {
             Statement::FunctionDeclaration { .. }
             | Statement::ClassDeclaration(_)
             | Statement::Expression(_)
+            | Statement::Empty
             | Statement::Return(_)
             | Statement::Throw(_)
-            | Statement::Break
-            | Statement::Continue
+            | Statement::Break(_)
+            | Statement::Continue(_)
             | Statement::VariableDeclaration { .. } => {}
         }
         Ok(())
@@ -632,6 +659,13 @@ impl Compiler {
         is_completion: bool,
     ) -> Result<bool, CompileError> {
         match statement {
+            Statement::Empty => {
+                self.constant(Value::Undefined)?;
+                if !is_completion {
+                    self.chunk.emit(Instruction::Pop);
+                }
+                Ok(is_completion)
+            }
             Statement::Expression(expression) => {
                 self.compile_expression(expression)?;
                 if !is_completion {
@@ -656,7 +690,10 @@ impl Compiler {
                 else_branch,
             } => self.compile_if(condition, then_branch, else_branch, is_completion),
             Statement::While { condition, body } => {
-                self.compile_while(condition, body, is_completion)
+                self.compile_while(condition, body, is_completion, None)
+            }
+            Statement::DoWhile { body, condition } => {
+                self.compile_do_while(body, condition, is_completion, None)
             }
             Statement::For {
                 init,
@@ -669,7 +706,25 @@ impl Compiler {
                 update.as_ref(),
                 body,
                 is_completion,
+                None,
             ),
+            Statement::ForOf {
+                kind,
+                name,
+                iterable,
+                body,
+            } => self.compile_for_of(*kind, name, iterable, body, is_completion, None),
+            Statement::ForIn {
+                kind,
+                name,
+                object,
+                body,
+            } => self.compile_for_in(*kind, name, object, body, is_completion, None),
+            Statement::Switch {
+                discriminant,
+                cases,
+            } => self.compile_switch(discriminant, cases, is_completion, None),
+            Statement::Labeled { label, body } => self.compile_labeled(label, body, is_completion),
             Statement::FunctionDeclaration { .. }
                 if self.function.is_none() && self.scopes.len() == 1 =>
             {
@@ -697,8 +752,12 @@ impl Compiler {
                 handler,
                 finalizer,
             } => self.compile_try(block, handler.as_ref(), finalizer.as_deref(), is_completion),
-            Statement::Break => self.compile_loop_jump(true, is_completion),
-            Statement::Continue => self.compile_loop_jump(false, is_completion),
+            Statement::Break(label) => {
+                self.compile_loop_jump(true, label.as_deref(), is_completion)
+            }
+            Statement::Continue(label) => {
+                self.compile_loop_jump(false, label.as_deref(), is_completion)
+            }
             Statement::Return(value) => {
                 if self.function.is_none() {
                     return Err(CompileError::unsupported("return outside a function"));

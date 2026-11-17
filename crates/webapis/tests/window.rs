@@ -1,10 +1,90 @@
-use js::{Realm, Value};
+use js::{JsError, Realm, Value};
 use security::{Origin, RendererSecurityContext, StoragePermission};
 use std::{thread, time::Duration};
 use webapis::{
-    register_window, register_window_with_security_context, register_window_with_url,
-    register_window_with_url_and_device_pixel_ratio,
+    Document, register_document, register_window, register_window_with_security_context,
+    register_window_with_url, register_window_with_url_and_device_pixel_ratio, report_window_error,
+    run_window_messages,
 };
+
+#[test]
+fn window_onerror_receives_legacy_error_arguments_and_can_cancel_reporting() {
+    let mut realm = Realm::new();
+    let window = register_window_with_url(&mut realm, "https://example.test/page").unwrap();
+    realm
+        .evaluate_script(
+            "var observed = []; window.onerror = (message, source, line, column, error) => { \
+             observed = [message, source, line, column, error.name, error.message]; return true; }; \
+             window.addEventListener('error', (event) => { observed.push(event.type + ':' + event.message); });",
+        )
+        .unwrap();
+
+    let mut error = JsError::runtime("boom");
+    error.location = Some(js::bytecode::SourceLocation {
+        offset: 0,
+        line: 3,
+        column: 7,
+    });
+    assert_eq!(
+        report_window_error(&window, &error, "https://example.test/page.js"),
+        Ok(Value::Boolean(false))
+    );
+    assert_eq!(
+        realm.evaluate_script(
+            "observed.length === 7 && observed[0] === 'boom' && \
+             observed[1] === 'https://example.test/page.js' && observed[2] === 3 && \
+             observed[3] === 7 && observed[4] === 'Error' && observed[5] === 'boom' && \
+             observed[6] === 'error:boom'"
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn post_message_queues_a_cloned_message_event() {
+    let mut realm = Realm::new();
+    let window = register_window_with_url(&mut realm, "https://example.test/page").unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var received = null; var source = null; var origin = null; \
+             window.addEventListener('message', (event) => { received = event.data; source = event.source; origin = event.origin; }); \
+             var payload = {nested: {value: 1}}; window.postMessage(payload, '/'); \
+             received === null"
+        ),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(run_window_messages(&window), Ok(1));
+    assert_eq!(
+        realm.evaluate_script(
+            "received !== null && received !== payload && received.nested.value === 1 && \
+             source === window && origin === 'https://example.test'"
+        ),
+        Ok(Value::Boolean(true))
+    );
+    realm.evaluate_script("payload.nested.value = 9").unwrap();
+    assert_eq!(
+        realm.evaluate_script("received.nested.value === 1"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn post_message_respects_target_origin_and_options() {
+    let mut realm = Realm::new();
+    let window = register_window_with_url(&mut realm, "https://example.test/page").unwrap();
+
+    realm
+        .evaluate_script(
+            "var calls = 0; window.addEventListener('message', () => calls++); \
+             window.postMessage('blocked', 'https://other.test'); \
+             window.postMessage('allowed', {targetOrigin: 'https://example.test'}); \
+             window.postMessage('wildcard', '*')",
+        )
+        .unwrap();
+    assert_eq!(run_window_messages(&window), Ok(2));
+    assert_eq!(realm.evaluate_script("calls"), Ok(Value::Number(2.0)));
+}
 
 #[test]
 fn window_self_returns_the_current_window_object() {
@@ -68,6 +148,26 @@ fn window_onload_and_load_listeners_receive_the_window_load_event_in_order() {
 }
 
 #[test]
+fn window_add_event_listener_dispatches_and_removes_callbacks() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var calls = ''; \
+             function listener(event) { calls += event.type + ':' + (event.target === window); } \
+             window.addEventListener('ready', listener); \
+             window.addEventListener('ready', listener); \
+             window.dispatchEvent({type: 'ready'}); \
+             window.removeEventListener('ready', listener); \
+             window.dispatchEvent({type: 'ready'}); \
+             calls",
+        ),
+        Ok(Value::String("ready:true".into()))
+    );
+}
+
+#[test]
 fn clearing_window_onload_deactivates_the_handler() {
     let mut realm = Realm::new();
     register_window(&mut realm).unwrap();
@@ -90,12 +190,76 @@ fn clearing_window_onload_deactivates_the_handler() {
 }
 
 #[test]
+fn window_add_event_listener_supports_once_objects_and_abort_signals() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var calls = 0; var signal = {aborted: true}; \
+             var objectListener = {}; function objectHandler(event) { calls += 1; } \
+             objectListener.handleEvent = objectHandler; \
+             function abortedHandler() { calls += 100; } \
+             window.addEventListener('once', objectListener, {once: true}); \
+             window.addEventListener('aborted', abortedHandler, {signal: signal}); \
+             window.dispatchEvent({type: 'once'}); window.dispatchEvent({type: 'once'}); \
+             window.dispatchEvent({type: 'aborted'}); calls",
+        ),
+        Ok(Value::Number(1.0))
+    );
+}
+
+#[test]
 fn window_self_accepts_extra_arguments_without_changing_the_result() {
     let mut realm = Realm::new();
     register_window(&mut realm).unwrap();
 
     assert_eq!(
         realm.evaluate_script("window.self(1, 'ignored') === window"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_dispatch_event_runs_listeners_and_returns_cancellation_state() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    register_document(&mut realm, Document::new()).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var order = []; \
+             window.addEventListener('ready', (event) => { order.push('capture:' + event.eventPhase); }, true); \
+             window.addEventListener('ready', (event) => { order.push('bubble:' + (event.target === window)); }); \
+             var event = Event('ready', {cancelable: true}); \
+             window.dispatchEvent(event) && order.length === 2 && order[0] === 'capture:2' && order[1] === 'bubble:true' && \
+             event.currentTarget === null && event.eventPhase === 0"
+        ),
+        Ok(Value::Boolean(true))
+    );
+
+    assert_eq!(
+        realm.evaluate_script(
+            "window.addEventListener('cancel', (event) => event.preventDefault()); \
+             window.dispatchEvent(Event('cancel', {cancelable: true})) === false"
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_dispatch_event_honors_once_and_abort_signal() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    register_document(&mut realm, Document::new()).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var calls = 0; var controller = AbortController(); \
+             window.addEventListener('ready', () => calls++, {once: true}); \
+             window.addEventListener('ready', () => calls += 10, {signal: controller.signal}); \
+             controller.abort(); window.dispatchEvent(Event('ready')); window.dispatchEvent(Event('ready')); calls === 1"
+        ),
         Ok(Value::Boolean(true))
     );
 }
@@ -129,6 +293,43 @@ fn window_navigator_accepts_extra_arguments_without_changing_the_result() {
 
     assert_eq!(
         realm.evaluate_script("window.navigator('ignored') === navigator"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_get_selection_is_null_without_an_associated_document() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.getSelection() === null"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_get_selection_returns_the_document_singleton_and_initial_empty_state() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    register_document(&mut realm, Document::new()).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "window.getSelection() === document.getSelection() && \
+             getSelection() === window.getSelection() && \
+             window.getSelection().anchorNode === null && \
+             window.getSelection().focusNode === null && \
+             window.getSelection().anchorOffset === 0 && \
+             window.getSelection().focusOffset === 0 && \
+             window.getSelection().isCollapsed === true && \
+             window.getSelection().rangeCount === 0 && \
+             window.getSelection().type === 'None' && \
+             window.getSelection().direction === 'none' && \
+             window.getSelection().toString() === '' && \
+             window.getSelection().getComposedRanges().length === 0 && \
+             window.getSelection().containsNode(null) === false"
+        ),
         Ok(Value::Boolean(true))
     );
 }

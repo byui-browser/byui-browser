@@ -284,6 +284,8 @@ pub enum MemberProperty {
 /// An owned statement in the supported program grammar.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    /// An empty statement written as `;`.
+    Empty,
     /// Owned statements enclosed in braces, in source order.
     Block(Vec<Statement>),
     /// Expression executed for its effects and completion value.
@@ -313,6 +315,13 @@ pub enum Statement {
         /// Owned statement executed on each iteration.
         body: Box<Statement>,
     },
+    /// Loop that tests its condition after each iteration.
+    DoWhile {
+        /// Owned statement executed before the condition is tested.
+        body: Box<Statement>,
+        /// Owned expression tested after each iteration.
+        condition: Expr,
+    },
     /// Loop with optional initialization, condition, and update clauses.
     For {
         /// Optional expression or variable declaration evaluated once before
@@ -323,6 +332,42 @@ pub enum Statement {
         /// Optional expression evaluated after each body iteration.
         update: Option<Expr>,
         /// Owned statement executed on each iteration.
+        body: Box<Statement>,
+    },
+    /// Iterates over the values produced by an array or string expression.
+    ForOf {
+        /// Loop binding initialized for each value.
+        kind: VarKind,
+        /// Binding name.
+        name: String,
+        /// Iterable expression.
+        iterable: Expr,
+        /// Loop body.
+        body: Box<Statement>,
+    },
+    /// Iterates over the enumerable keys of an object or array expression.
+    ForIn {
+        /// Loop binding initialized for each key.
+        kind: VarKind,
+        /// Binding name.
+        name: String,
+        /// Target expression.
+        object: Expr,
+        /// Loop body.
+        body: Box<Statement>,
+    },
+    /// A `switch` statement with ordered case clauses.
+    Switch {
+        /// Value compared against case expressions.
+        discriminant: Expr,
+        /// Ordered cases; `None` is the default clause.
+        cases: Vec<SwitchCase>,
+    },
+    /// A labeled statement.
+    Labeled {
+        /// Label name.
+        label: String,
+        /// Labeled body.
         body: Box<Statement>,
     },
     /// Named function declaration with an owned body.
@@ -356,10 +401,18 @@ pub enum Statement {
         finalizer: Option<Vec<Statement>>,
     },
     /// `break;`: leaves the innermost enclosing loop.
-    Break,
-    /// `continue;`: starts the next iteration of the innermost enclosing
-    /// loop. Labels are unsupported.
-    Continue,
+    Break(Option<String>),
+    /// `continue;`: starts the next iteration of the innermost enclosing loop.
+    Continue(Option<String>),
+}
+
+/// One `case` or `default` clause in a switch statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwitchCase {
+    /// Case expression, or `None` for the default clause.
+    pub test: Option<Expr>,
+    /// Statements executed after the clause is selected, including fallthrough.
+    pub consequent: Vec<Statement>,
 }
 
 /// The `catch` clause of a [`Statement::Try`].
