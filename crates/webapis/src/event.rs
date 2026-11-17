@@ -558,27 +558,7 @@ pub(crate) fn dispatch_event_at(
             );
         }
     } else {
-        invoke_listeners(
-            &document_target,
-            event,
-            &event_type,
-            target_object,
-            true,
-            2.0,
-        );
-        if !matches!(
-            event.get("__stopImmediatePropagation"),
-            Some(Value::Boolean(true))
-        ) {
-            invoke_listeners(
-                &document_target,
-                event,
-                &event_type,
-                target_object,
-                false,
-                2.0,
-            );
-        }
+        return dispatch_event_target(&document_target, target_object, arguments);
     }
 
     event.set("eventPhase", Value::Number(0.0));

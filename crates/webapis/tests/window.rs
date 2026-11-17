@@ -75,6 +75,46 @@ fn global_self_aliases_window() {
 }
 
 #[test]
+fn window_add_event_listener_dispatches_and_removes_callbacks() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var calls = ''; \
+             function listener(event) { calls += event.type + ':' + (event.target === window); } \
+             window.addEventListener('ready', listener); \
+             window.addEventListener('ready', listener); \
+             window.dispatchEvent({type: 'ready'}); \
+             window.removeEventListener('ready', listener); \
+             window.dispatchEvent({type: 'ready'}); \
+             calls",
+        ),
+        Ok(Value::String("ready:true".into()))
+    );
+}
+
+#[test]
+fn window_add_event_listener_supports_once_objects_and_abort_signals() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var calls = 0; var signal = {aborted: true}; \
+             var objectListener = {}; function objectHandler(event) { calls += 1; } \
+             objectListener.handleEvent = objectHandler; \
+             function abortedHandler() { calls += 100; } \
+             window.addEventListener('once', objectListener, {once: true}); \
+             window.addEventListener('aborted', abortedHandler, {signal: signal}); \
+             window.dispatchEvent({type: 'once'}); window.dispatchEvent({type: 'once'}); \
+             window.dispatchEvent({type: 'aborted'}); calls",
+        ),
+        Ok(Value::Number(1.0))
+    );
+}
+
+#[test]
 fn window_self_accepts_extra_arguments_without_changing_the_result() {
     let mut realm = Realm::new();
     register_window(&mut realm).unwrap();
@@ -158,6 +198,43 @@ fn window_navigator_accepts_extra_arguments_without_changing_the_result() {
 
     assert_eq!(
         realm.evaluate_script("window.navigator('ignored') === navigator"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_get_selection_is_null_without_an_associated_document() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.getSelection() === null"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_get_selection_returns_the_document_singleton_and_initial_empty_state() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    register_document(&mut realm, Document::new()).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "window.getSelection() === document.getSelection() && \
+             getSelection() === window.getSelection() && \
+             window.getSelection().anchorNode === null && \
+             window.getSelection().focusNode === null && \
+             window.getSelection().anchorOffset === 0 && \
+             window.getSelection().focusOffset === 0 && \
+             window.getSelection().isCollapsed === true && \
+             window.getSelection().rangeCount === 0 && \
+             window.getSelection().type === 'None' && \
+             window.getSelection().direction === 'none' && \
+             window.getSelection().toString() === '' && \
+             window.getSelection().getComposedRanges().length === 0 && \
+             window.getSelection().containsNode(null) === false"
+        ),
         Ok(Value::Boolean(true))
     );
 }
