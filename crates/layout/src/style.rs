@@ -7,6 +7,8 @@
 //! value. Lengths are resolved to CSS pixels here; percentages are kept
 //! because they resolve against the containing block during layout.
 
+use std::rc::Rc;
+
 use css::values::{LengthContext, parse_length, parse_percentage};
 use css::{CssColor, Declaration};
 
@@ -341,7 +343,26 @@ pub(crate) struct ComputedStyle {
     pub padding: Sides<Dimension>,
     pub width: Dimension,
     pub height: Dimension,
+    /// `min-width`; only replaced elements honor it so far.
+    pub min_width: Dimension,
+    /// `min-height`; only replaced elements honor it so far.
+    pub min_height: Dimension,
+    /// `max-width`, with `none` stored as [`Dimension::Auto`]; only replaced
+    /// elements honor it so far.
+    pub max_width: Dimension,
+    /// `max-height`, as for `max_width`.
+    pub max_height: Dimension,
     pub font_size: f32,
+    /// The computed `font-family` list, unquoted, in order of preference.
+    /// Empty means the user agent's default font.
+    pub font_families: Rc<[String]>,
+    /// The computed `font-weight`, from 1 to 1000.
+    pub font_weight: u16,
+    /// Whether the computed `font-style` is italic or oblique.
+    pub font_italic: bool,
+    /// The face [`crate::FontMetrics::select_font`] chose for the three
+    /// properties above. Set by the style map, which knows the fonts.
+    pub font: crate::FontId,
     pub color: CssColor,
     pub text_transform: TextTransform,
     pub text_align: TextAlign,
@@ -371,7 +392,18 @@ impl ComputedStyle {
             padding: zero,
             width: Dimension::Auto,
             height: Dimension::Auto,
+            min_width: Dimension::Px(0.0),
+            min_height: Dimension::Px(0.0),
+            max_width: Dimension::Auto,
+            max_height: Dimension::Auto,
             font_size: parent.map_or(css::values::MEDIUM_FONT_SIZE, |parent| parent.font_size),
+            font_families: parent.map_or_else(
+                || Rc::from(Vec::new()),
+                |parent| Rc::clone(&parent.font_families),
+            ),
+            font_weight: parent.map_or(400, |parent| parent.font_weight),
+            font_italic: parent.is_some_and(|parent| parent.font_italic),
+            font: parent.map_or(crate::FontId::DEFAULT, |parent| parent.font),
             color: parent.map_or_else(
                 || {
                     css::user_agent_default_color("color")
@@ -423,9 +455,27 @@ impl ComputedStyle {
                 ),
             }
         }
+        if let Some(value) = get("font-family") {
+            style.font_families = css::parse_font_family_list(value).into();
+        }
+        if let Some(value) = get("font-weight") {
+            match css::fonts::parse_font_weight(value) {
+                Some(weight) => style.font_weight = weight,
+                None => log::debug!("ignoring invalid font-weight value {value:?}; using 400"),
+            }
+        }
+        style.font_italic = get("font-style").is_some_and(css::fonts::is_italic);
         if let Some(value) = get("color") {
             match css::parse_color(value) {
                 Some(color) => style.color = color,
+                // Transparent text is laid out but paints nothing, as when a
+                // CSS animation fades text in from `transparent`.
+                None if value.eq_ignore_ascii_case("transparent") => {
+                    style.color = CssColor {
+                        a: 0,
+                        ..style.color
+                    };
+                }
                 None if is_no_color_keyword(value) => {}
                 None => log::debug!("ignoring invalid color value {value:?}; using the default"),
             }
@@ -495,6 +545,22 @@ impl ComputedStyle {
         style.padding = side("padding", false, false);
         style.width = dimension("width", true, false).unwrap_or(Dimension::Auto);
         style.height = dimension("height", true, false).unwrap_or(Dimension::Auto);
+        // `min-*: auto` computes to 0 outside flex and grid items, and
+        // `max-*: none` is stored as `Auto` (no maximum).
+        style.min_width = dimension("min-width", true, false)
+            .filter(|value| *value != Dimension::Auto)
+            .unwrap_or(Dimension::Px(0.0));
+        style.min_height = dimension("min-height", true, false)
+            .filter(|value| *value != Dimension::Auto)
+            .unwrap_or(Dimension::Px(0.0));
+        let max = |property: &str| {
+            if get(property).is_some_and(|value| value.eq_ignore_ascii_case("none")) {
+                return Dimension::Auto;
+            }
+            dimension(property, false, false).unwrap_or(Dimension::Auto)
+        };
+        style.max_width = max("max-width");
+        style.max_height = max("max-height");
         style.border_radius = Corners::from_array(
             ["top-left", "top-right", "bottom-right", "bottom-left"].map(|corner| {
                 let property = format!("border-{corner}-radius");

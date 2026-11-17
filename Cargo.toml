@@ -80,3 +80,42 @@ opt-level = 3
 
 [profile.dev.package.ttf-parser]
 opt-level = 3
+
+# Image decoding and SVG rasterizing run on page load and when an image is
+# first painted at a new size; unoptimized, a photo takes seconds to decode.
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
+[profile.dev.package.image-webp]
+opt-level = 3
+
+[profile.dev.package.gif]
+opt-level = 3
+
+[profile.dev.package.weezl]
+opt-level = 3
+
+[profile.dev.package.resvg]
+opt-level = 3
+
+[profile.dev.package.usvg]
+opt-level = 3
+
+# WOFF2 web fonts are brotli-compressed and decoded on page load.
+[profile.dev.package.wuff]
+opt-level = 3
+
+[profile.dev.package.brotli-decompressor]
+opt-level = 3

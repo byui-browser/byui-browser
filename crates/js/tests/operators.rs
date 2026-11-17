@@ -359,7 +359,13 @@ fn pathological_operands_do_not_panic() {
 
 #[test]
 fn unsupported_operator_syntax_is_a_syntax_error() {
-    for source in ["typeof 1", "+1", "1 ** 2", "x += 1", "1 ?? 2", "a++"] {
+    for source in [
+        "-1 ** 2",
+        "1 ?? 2 || 3",
+        "1 && 2 ?? 3",
+        "let x = 1; delete x",
+        "/a/",
+    ] {
         let error = run(source).expect_err(source);
         assert_eq!(error.category, JsErrorCategory::Syntax, "{source}");
     }

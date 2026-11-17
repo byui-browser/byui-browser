@@ -1,6 +1,6 @@
 //! Paint data types.
 
-pub use layout::{CornerRadii, CornerRadius, Rect};
+pub use layout::{CornerRadii, CornerRadius, FontId, ImageKey, Rect};
 
 /// An RGBA color with 8 bits per channel and straight (non-premultiplied)
 /// alpha.

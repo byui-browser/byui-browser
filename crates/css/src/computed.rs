@@ -4,9 +4,19 @@ use crate::color::{CssColor, parse_color};
 use crate::stylesheet::Declaration;
 use html::NodeID;
 
+/// The computed declarations of every element in a document.
+///
+/// Produced by [`crate::style_document`] and [`crate::style_document_at`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ComputedStyles {
+    /// Each element's computed declarations, in document order. Values are
+    /// text; `font-size` is always an absolute length in CSS pixels.
     pub styles: Vec<(NodeID, Vec<Declaration>)>,
+    /// How many CSS animations are delayed or still playing at the styled
+    /// moment, so styling a later moment can give different results. Zero
+    /// means the styles are stable until the document or stylesheets change;
+    /// a renderer can stop requesting animation frames.
+    pub running_animations: usize,
 }
 
 impl ComputedStyles {

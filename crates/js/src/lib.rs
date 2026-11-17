@@ -31,7 +31,9 @@ pub use vm::Vm;
 /// [`Value::Object`] and [`Value::Array`] are reference handles: cloning the value shares the same
 /// function or property table, and `==`/`===` compare them by identity.
 ///
-/// Unsupported: symbols, bigints, and other built-in object kinds.
+/// Symbols are currently represented by identity-bearing object handles rather
+/// than a distinct primitive variant. Bigints and other built-in object kinds
+/// remain unsupported.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// The `undefined` value.

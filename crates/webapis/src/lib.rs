@@ -10,6 +10,7 @@
 
 mod alert;
 mod console;
+mod crypto;
 mod custom_elements;
 mod document;
 mod dom_exception;
@@ -25,6 +26,7 @@ mod window;
 
 pub use alert::{AlertSink, alert, register_alert};
 pub use console::{ConsoleSink, print, register_console, register_print};
+pub use crypto::register_crypto;
 pub use custom_elements::CustomElementRegistry;
 pub use document::{
     Document, get_element_by_id, register_document, register_document_on_window,

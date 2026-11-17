@@ -11,11 +11,14 @@
 //! a rule whose selector list is invalid is dropped as a whole. A valid list is
 //! stored as one [`Rule`] per complex selector, all sharing the declarations.
 //!
+//! `@keyframes` blocks (and the `-webkit-`/`-moz-` aliases) are parsed into
+//! [`Keyframe`] rules per CSS Animations 1 §3.
+//!
 //! Limitations: nested style rules (CSS Nesting) are reported and dropped, and
 //! at-rules nested inside a style rule's block are skipped.
 
 use crate::selector::parse_selector_tokens;
-use crate::stylesheet::{AtRule, Declaration, ParseError, Rule, Selector, Stylesheet};
+use crate::stylesheet::{AtRule, Declaration, Keyframe, ParseError, Rule, Selector, Stylesheet};
 use crate::tokenizer::{Token, TokenKind, source_text, tokenize, trim_whitespace};
 
 /// Parse CSS and retain all valid rules while collecting recoverable errors.
@@ -90,6 +93,9 @@ const DECLARATION_AT_RULES: [&str; 6] = [
     "font-palette-values",
     "view-transition",
 ];
+
+/// At-rules whose block is a list of keyframe rules.
+const KEYFRAMES_AT_RULES: [&str; 3] = ["keyframes", "-webkit-keyframes", "-moz-keyframes"];
 
 struct Parser<'a> {
     source: &'a str,
@@ -238,6 +244,7 @@ impl<'a> Parser<'a> {
             prelude: source_text(self.source, prelude),
             rules: Vec::new(),
             declarations: Vec::new(),
+            keyframes: Vec::new(),
             block: block.map(|block| source_text(self.source, block)),
             name,
         };
@@ -248,6 +255,8 @@ impl<'a> Parser<'a> {
                 rule.rules = nested.rules;
             } else if DECLARATION_AT_RULES.contains(&rule.name.as_str()) {
                 rule.declarations = self.consume_declaration_list(block);
+            } else if KEYFRAMES_AT_RULES.contains(&rule.name.as_str()) {
+                rule.keyframes = self.consume_keyframe_list(block);
             }
         }
         rule
@@ -314,6 +323,55 @@ impl<'a> Parser<'a> {
                 declarations: declarations.clone(),
             });
         }
+    }
+
+    /// Consumes the keyframe rules of a `@keyframes` block (CSS Animations 1
+    /// §3). A keyframe rule with an invalid selector list is reported and
+    /// dropped; its neighbors are kept.
+    fn consume_keyframe_list(&mut self, tokens: &[Token<'a>]) -> Vec<Keyframe> {
+        let mut keyframes = Vec::new();
+        let mut index = 0;
+        while index < tokens.len() {
+            match &tokens[index].kind {
+                TokenKind::Whitespace | TokenKind::Semicolon => {
+                    index += 1;
+                    continue;
+                }
+                TokenKind::AtKeyword(name) => {
+                    log::debug!("skipping @{name} inside @keyframes");
+                    let mut ignored = Stylesheet::default();
+                    index = self.consume_at_rule(tokens, index, &mut ignored);
+                    continue;
+                }
+                _ => {}
+            }
+            let start = index;
+            while index < tokens.len() && tokens[index].kind != TokenKind::OpenCurly {
+                index = skip_component_value(tokens, index);
+            }
+            if index >= tokens.len() {
+                self.error(
+                    "unfinished keyframe rule; expected `{`",
+                    tokens[start].span.start,
+                );
+                break;
+            }
+            let end = skip_component_value(tokens, index);
+            if !closes_block(tokens, end) {
+                self.error("unclosed `{` in keyframe rule", tokens[index].span.start);
+            }
+            let block = block_contents(tokens, index, end);
+            let declarations = self.consume_declaration_list(block);
+            match parse_keyframe_selectors(&tokens[start..index]) {
+                Some(offsets) => keyframes.push(Keyframe {
+                    offsets,
+                    declarations,
+                }),
+                None => self.error("invalid keyframe selector", tokens[start].span.start),
+            }
+            index = end;
+        }
+        keyframes
     }
 
     /// §5.4.5 "consume a list of declarations".
@@ -413,6 +471,25 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Parses a `<keyframe-selector>#` list: `from`, `to`, or percentages from
+/// `0%` to `100%`, returned as fractions of an iteration.
+fn parse_keyframe_selectors(tokens: &[Token<'_>]) -> Option<Vec<f32>> {
+    split_top_level(tokens, |kind| *kind == TokenKind::Comma)
+        .into_iter()
+        .map(|selector| match trim_whitespace(selector) {
+            [token] => match &token.kind {
+                TokenKind::Ident(word) if word.eq_ignore_ascii_case("from") => Some(0.0),
+                TokenKind::Ident(word) if word.eq_ignore_ascii_case("to") => Some(1.0),
+                TokenKind::Percentage(percent) if (0.0..=100.0).contains(percent) => {
+                    Some((*percent / 100.0) as f32)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 /// Returns the tokens between a `{` at `open` and its closing `}`.
 fn block_contents<'t, 'a>(tokens: &'t [Token<'a>], open: usize, end: usize) -> &'t [Token<'a>] {
     let close = if closes_block(tokens, end) {
@@ -477,6 +554,27 @@ mod tests {
         let sheet = parse_stylesheet("@font-face { font-family: X; src: url(x.woff2) }");
         assert_eq!(sheet.at_rules[0].declarations.len(), 2);
         assert_eq!(sheet.at_rules[0].declarations[1].value, "url(x.woff2)");
+    }
+
+    #[test]
+    fn parses_keyframes_blocks() {
+        let (sheet, errors) = parse_stylesheet_with_errors(
+            "@keyframes slide { from { margin-left: 0 } 50%, 75% { margin-left: 10px } \
+             120% { color: red } TO { margin-left: 20px; color: blue } } p { color: red }",
+        );
+        let rule = &sheet.at_rules[0];
+        assert_eq!(rule.name, "keyframes");
+        assert_eq!(rule.prelude, "slide");
+        let offsets: Vec<_> = rule.keyframes.iter().map(|k| k.offsets.clone()).collect();
+        assert_eq!(offsets, vec![vec![0.0], vec![0.5, 0.75], vec![1.0]]);
+        assert_eq!(rule.keyframes[2].declarations.len(), 2);
+        // `120%` is out of range, so only that keyframe rule is dropped.
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].message, "invalid keyframe selector");
+        assert_eq!(sheet.rules.len(), 1);
+
+        let prefixed = parse_stylesheet("@-webkit-keyframes x { to { color: red } }");
+        assert_eq!(prefixed.at_rules[0].keyframes.len(), 1);
     }
 
     #[test]

@@ -4,7 +4,7 @@
 use html::{HTMLDocument, NodeID, NodeKind};
 
 use super::render::{Rendered, render};
-use super::{Area, AuditReport, Auditor, Evidence, Finding, PageScriptEngine, Usage, line_at};
+use super::{Area, AuditReport, Auditor, Evidence, Finding, PageScriptEngine, Usage};
 
 /// One `<script>` element, in the order `browser::Page::scripts` uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,8 +15,6 @@ pub(crate) struct ScriptSlot {
     pub src: Option<String>,
     /// The trimmed, lowercased `type` attribute, if any.
     pub kind: Option<String>,
-    /// The 1-based HTML line of the element.
-    pub line: usize,
 }
 
 impl ScriptSlot {
@@ -43,8 +41,7 @@ impl ScriptSlot {
 }
 
 /// What the audit knows about the page's markup.
-pub(crate) struct PageMap<'a> {
-    pub html: &'a str,
+pub(crate) struct PageMap {
     pub document: HTMLDocument,
     /// `<script>` elements in document order.
     pub scripts: Vec<ScriptSlot>,
@@ -53,8 +50,8 @@ pub(crate) struct PageMap<'a> {
     /// How many stylesheets the markup references; more than
     /// `sheet_labels.len()` means some failed to load.
     pub sheet_slots: usize,
-    /// `style` attribute values and their HTML lines.
-    pub inline_styles: Vec<(String, usize)>,
+    /// `style` attribute values found in the document.
+    pub inline_styles: Vec<String>,
 }
 
 /// The last path segment of a URL, without query or fragment.
@@ -76,16 +73,12 @@ fn file_name(url: &str) -> String {
 /// matches how the browser's loader collects scripts and stylesheets.
 pub(crate) fn elements(
     document: &HTMLDocument,
-) -> impl Iterator<Item = (NodeID, &html::ElementData, usize)> {
+) -> impl Iterator<Item = (NodeID, &html::ElementData)> {
     (0..)
         .map(NodeID::new)
         .map_while(move |id| document.node(id).map(|node| (id, node)))
         .filter_map(|(id, node)| match node.get_kind() {
-            NodeKind::Element(element) => Some((
-                id,
-                element,
-                node.get_span().map_or(0, |span| span.get_start()),
-            )),
+            NodeKind::Element(element) => Some((id, element)),
             _ => None,
         })
 }
@@ -98,20 +91,19 @@ pub(crate) fn attribute<'e>(element: &'e html::ElementData, name: &str) -> Optio
         .map(|attribute| attribute.get_value().as_str())
 }
 
-impl<'a> PageMap<'a> {
-    pub fn new(page: &super::PageSources<'a>) -> Self {
+impl PageMap {
+    pub fn new(page: &super::PageSources<'_>) -> Self {
         let document = html::parse_raw_html(page.html.to_owned());
         let mut scripts = Vec::new();
         let mut sheets = Vec::new();
         let mut inline_styles = Vec::new();
         let mut inline_scripts = 0;
         let mut style_elements = 0;
-        for (_, element, offset) in elements(&document) {
-            let line = line_at(page.html, offset);
+        for (_, element) in elements(&document) {
             if let Some(style) = attribute(element, "style")
                 && !style.trim().is_empty()
             {
-                inline_styles.push((style.to_owned(), line));
+                inline_styles.push(style.to_owned());
             }
             match element.get_name().as_str() {
                 "script" => {
@@ -128,7 +120,6 @@ impl<'a> PageMap<'a> {
                         src,
                         kind: attribute(element, "type")
                             .map(|kind| kind.trim().to_ascii_lowercase()),
-                        line,
                     });
                 }
                 "style" => {
@@ -158,7 +149,6 @@ impl<'a> PageMap<'a> {
                 .collect()
         };
         Self {
-            html: page.html,
             document,
             scripts,
             sheet_labels,
@@ -478,12 +468,12 @@ const ELEMENT_PROBES: &[ElementProbe] = &[
 /// Audits HTML elements and attributes that need engine behavior.
 pub(crate) fn audit<E: PageScriptEngine>(
     auditor: &Auditor<E>,
-    map: &PageMap<'_>,
+    map: &PageMap,
     report: &mut AuditReport,
 ) {
     let mut usage = Usage::default();
-    for (_, element, offset) in elements(&map.document) {
-        let location = || format!("HTML line {}", line_at(map.html, offset));
+    for (_, element) in elements(&map.document) {
+        let location = || "HTML markup".to_owned();
         usage.add(element.get_name(), location);
         if attribute(element, "hidden").is_some() {
             usage.add("[hidden]", location);

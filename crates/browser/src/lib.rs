@@ -287,6 +287,80 @@ pub struct Page {
     /// holding its inline text or the fetched body of its `src`. A `src` that
     /// failed to load is an empty entry, so entries stay aligned with elements.
     pub scripts: Vec<String>,
+    /// Other downloaded subresources, such as images.
+    pub resources: PageResources,
+}
+
+/// Subresources of a [`Page`] other than its stylesheets and scripts:
+/// images and web fonts.
+///
+/// Pages built by hand (tests, built-in pages) use
+/// `PageResources::default()`, which holds nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageResources {
+    /// One entry per distinct `<img src>` that downloaded successfully, in
+    /// document order. The list is shared, so cloning a page does not copy
+    /// image data, and shells can recognize the same page's images by
+    /// pointer (`Arc::ptr_eq`) to reuse decoded pictures.
+    pub images: Arc<[ImageResource]>,
+    /// One entry per `@font-face` rule whose font downloaded, in stylesheet
+    /// order. Shared like [`Self::images`].
+    pub fonts: Arc<[FontResource]>,
+}
+
+/// A web font downloaded for an `@font-face` rule. The bytes are still in
+/// their file format (WOFF2, WOFF, TrueType, OpenType); parsing is up to the
+/// renderer.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FontResource {
+    /// The rule's `font-family` descriptor, unquoted.
+    pub family: String,
+    /// The rule's inclusive `font-weight` range, such as `(400, 400)`.
+    pub weight: (u16, u16),
+    /// Whether the rule's `font-style` is italic or oblique.
+    pub italic: bool,
+    /// The URL the font was finally served from, after redirects.
+    pub url: String,
+    /// The response body.
+    pub bytes: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for FontResource {
+    /// Shows the size of the body instead of every byte.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FontResource")
+            .field("family", &self.family)
+            .field("weight", &self.weight)
+            .field("italic", &self.italic)
+            .field("url", &self.url)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// An image file downloaded for a page. The bytes are still encoded (PNG,
+/// JPEG, SVG, ...); decoding is up to the renderer.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ImageResource {
+    /// The `<img>` element's `src` attribute, trimmed but otherwise as
+    /// written. Layout identifies images by this text
+    /// (`layout::ImageKey::Src`).
+    pub src: String,
+    /// The URL the image was finally served from, after redirects.
+    pub url: String,
+    /// The response body.
+    pub bytes: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for ImageResource {
+    /// Shows the size of the body instead of every byte.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageResource")
+            .field("src", &self.src)
+            .field("url", &self.url)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
 }
 
 /// Returns the browser's default log file: `logs/browser.log` inside
@@ -764,6 +838,17 @@ impl PageSession {
         self.window.set("innerHeight", height.clone());
         let _ = self.realm.register_global_value("innerWidth", width);
         let _ = self.realm.register_global_value("innerHeight", height);
+        let ratio = match self.window.get("devicePixelRatio") {
+            Some(Value::Number(ratio)) => ratio,
+            _ => 1.0,
+        };
+        if let Some(Value::Function(update)) = self.window.get("__updateMediaQueries") {
+            let _ = update.call(&[
+                Value::Number(viewport.width as f64),
+                Value::Number(viewport.height as f64),
+                Value::Number(ratio),
+            ]);
+        }
     }
 
     /// Updates the output device scale visible as `window.devicePixelRatio`.
@@ -779,6 +864,21 @@ impl PageSession {
         }
         self.window
             .update_replaceable_read_only("devicePixelRatio", Value::Number(device_pixel_ratio));
+        let width = match self.window.get("innerWidth") {
+            Some(Value::Number(width)) => width,
+            _ => 0.0,
+        };
+        let height = match self.window.get("innerHeight") {
+            Some(Value::Number(height)) => height,
+            _ => 0.0,
+        };
+        if let Some(Value::Function(update)) = self.window.get("__updateMediaQueries") {
+            let _ = update.call(&[
+                Value::Number(width),
+                Value::Number(height),
+                Value::Number(device_pixel_ratio),
+            ]);
+        }
         Ok(())
     }
 
@@ -958,6 +1058,7 @@ mod tests {
             html: "<main>content</main>".into(),
             stylesheets: Vec::new(),
             scripts: Vec::new(),
+            resources: Default::default(),
         };
         let runtime = BrowserRuntime::in_memory();
         let controller = request_controller(None);

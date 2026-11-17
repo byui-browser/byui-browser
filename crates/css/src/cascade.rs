@@ -3,6 +3,7 @@
 //! Selector matching lives in [`crate::matching`]; the rule hash that limits
 //! which rules an element is tested against lives in [`crate::rule_index`].
 
+use crate::animation::{ElementContext, KeyframesRegistry, apply_animations};
 use crate::computed::{ComputedStyles, computed_style};
 use crate::matching::{ElementTree, attribute};
 use crate::parser::parse_declarations;
@@ -13,6 +14,7 @@ use crate::values;
 use html::{NodeID, NodeKind};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
 /// Cascade precedence for a declaration, compared lexicographically.
 ///
@@ -71,16 +73,35 @@ pub(crate) struct CascadeStats {
 /// pseudo-elements never match. Rules inside at-rules such as `@media` are
 /// not applied yet.
 ///
+/// CSS animations (`@keyframes` with `animation-*`) are sampled at the start
+/// of the document timeline; use [`style_document_at`] to style a later
+/// moment.
+///
 /// Cost: each stylesheet is compiled once per call, and each element is only
 /// tested against rules filed under its ID, classes, attribute names, and tag
 /// (plus rules with no such key), not against every rule.
 pub fn style_document(dom: &Dom, stylesheets: &[Stylesheet]) -> ComputedStyles {
-    style_document_with_stats(dom, stylesheets).0
+    style_document_at(dom, stylesheets, Duration::ZERO)
+}
+
+/// Styles the document like [`style_document`], with CSS animations sampled
+/// `time` after the origin of the document timeline.
+///
+/// Every animation starts at the timeline origin (plus its
+/// `animation-delay`), so callers pass the time elapsed since the page was
+/// first shown. Animated values override normal declarations but not
+/// `!important` ones, and they are inherited like other computed values.
+/// [`ComputedStyles::running_animations`] tells callers whether styling a
+/// later moment could produce different styles. See [`crate::animation`]
+/// for the supported features.
+pub fn style_document_at(dom: &Dom, stylesheets: &[Stylesheet], time: Duration) -> ComputedStyles {
+    style_document_with_stats(dom, stylesheets, time).0
 }
 
 pub(crate) fn style_document_with_stats(
     dom: &Dom,
     stylesheets: &[Stylesheet],
+    time: Duration,
 ) -> (ComputedStyles, CascadeStats) {
     log::debug!(
         "styling document: {} nodes, {} author stylesheets",
@@ -88,7 +109,11 @@ pub(crate) fn style_document_with_stats(
         stylesheets.len()
     );
     if log::log_enabled!(log::Level::Debug) {
-        let ignored_at_rules: usize = stylesheets.iter().map(|sheet| sheet.at_rules.len()).sum();
+        let ignored_at_rules = stylesheets
+            .iter()
+            .flat_map(|sheet| &sheet.at_rules)
+            .filter(|rule| rule.keyframes.is_empty())
+            .count();
         if ignored_at_rules > 0 {
             // Debug, not warn: the shell caches the rendered page but restyles
             // it on window resize and on page clicks (hit tests), so a warning
@@ -111,6 +136,9 @@ pub(crate) fn style_document_with_stats(
     for (position, sheet) in author_sheets.iter().enumerate() {
         index.add_sheet(sheet, position + 1, AUTHOR_NORMAL, AUTHOR_IMPORTANT);
     }
+    let keyframes = KeyframesRegistry::new(stylesheets);
+    let time = time.as_secs_f64();
+    let mut running_animations = 0;
     let tree = ElementTree::new(dom);
     let mut stats = CascadeStats {
         indexed_selectors: index.rules.len(),
@@ -201,6 +229,12 @@ pub(crate) fn style_document_with_stats(
             );
         }
 
+        // Animations do not override `!important` declarations.
+        let important: Vec<&str> = cascaded
+            .iter()
+            .filter(|(_, (priority, _))| priority.level >= AUTHOR_IMPORTANT)
+            .map(|(property, _)| *property)
+            .collect();
         let mut properties = BTreeMap::<String, String>::new();
         if let Some(parent) = parent {
             for declaration in parent {
@@ -246,6 +280,19 @@ pub(crate) fn style_document_with_stats(
             })
             .unwrap_or(values::MEDIUM_FONT_SIZE);
         let root_size = root_font_size.unwrap_or(values::MEDIUM_FONT_SIZE);
+        running_animations += apply_animations(
+            &keyframes,
+            &mut properties,
+            time,
+            &ElementContext {
+                parent: parent.map(Vec::as_slice),
+                parent_font_size,
+                // Before the root's own font size is known, `rem` in the
+                // root's animations uses the parent size, as for `em`.
+                root_font_size: root_font_size.unwrap_or(parent_font_size),
+                important: &important,
+            },
+        );
         let font_size = properties
             .get("font-size")
             .and_then(|value| values::compute_font_size(value, parent_font_size, root_size))
@@ -267,14 +314,20 @@ pub(crate) fn style_document_with_stats(
     }
     log::debug!(
         "styled document: {} elements, {} indexed selectors, {} selector checks ({} matched), \
-         {} longhand declarations considered",
+         {} longhand declarations considered, {running_animations} running animations",
         stats.elements,
         stats.indexed_selectors,
         stats.selectors_checked,
         stats.selectors_matched,
         stats.declarations_applied
     );
-    (ComputedStyles { styles: computed }, stats)
+    (
+        ComputedStyles {
+            styles: computed,
+            running_animations,
+        },
+        stats,
+    )
 }
 
 /// Records `declaration` for its property if it beats the current winner.
@@ -320,7 +373,7 @@ fn initial_color_value() -> String {
         .clone()
 }
 
-fn is_inherited_property(property: &str) -> bool {
+pub(crate) fn is_inherited_property(property: &str) -> bool {
     matches!(
         property,
         "color"
@@ -524,6 +577,131 @@ mod tests {
         assert_eq!(value("link", "color").as_deref(), Some("#0000ee"));
     }
 
+    fn animated(css: &str, html: &str, seconds: f64) -> (ComputedStyles, HTMLDocument) {
+        let document = html::parse_raw_html(html.into());
+        let styles = style_document_at(
+            &document,
+            &[parse_stylesheet(css)],
+            Duration::from_secs_f64(seconds),
+        );
+        (styles, document)
+    }
+
+    #[test]
+    fn keyframe_animations_are_sampled_over_time_and_inherited() {
+        let css = "@keyframes grow { from { width: 0; color: red } to { width: 100px; color: blue } } \
+                   #box { width: 7px; animation: grow 2s linear forwards }";
+        let html = "<div id='box'><span id='child'>x</span></div>";
+        let at = |seconds, id, property| {
+            let (styles, document) = animated(css, html, seconds);
+            (
+                computed(&styles, &document, id, property),
+                styles.running_animations,
+            )
+        };
+        assert_eq!(at(0.0, "box", "width"), (Some("0".into()), 1));
+        assert_eq!(at(0.5, "box", "width"), (Some("25px".into()), 1));
+        assert_eq!(
+            at(1.0, "box", "color"),
+            (Some("rgb(128, 0, 128)".into()), 1)
+        );
+        // Children inherit the animated color.
+        assert_eq!(
+            at(1.0, "child", "color"),
+            (Some("rgb(128, 0, 128)".into()), 1)
+        );
+        // `forwards` holds the last keyframe once the animation has finished.
+        assert_eq!(at(5.0, "box", "width"), (Some("100px".into()), 0));
+
+        // Without a fill mode the element returns to its own value.
+        let (styles, document) = animated(
+            "@keyframes grow { to { width: 100px } } #box { width: 7px; animation: grow 1s }",
+            html,
+            3.0,
+        );
+        assert_eq!(
+            computed(&styles, &document, "box", "width").as_deref(),
+            Some("7px")
+        );
+        assert_eq!(styles.running_animations, 0);
+    }
+
+    #[test]
+    fn missing_keyframes_use_the_element_value_and_important_wins() {
+        let css = "@keyframes slide { 50% { margin-left: 20px; padding-left: 20px } } \
+                   #box { margin-left: 10px; padding-left: 0 !important; \
+                          animation: slide 4s linear infinite }";
+        let (styles, document) = animated(css, "<p id='box'>x</p>", 1.0);
+        assert_eq!(
+            computed(&styles, &document, "box", "margin-left").as_deref(),
+            Some("15px")
+        );
+        assert_eq!(
+            computed(&styles, &document, "box", "padding-left").as_deref(),
+            Some("0")
+        );
+        // Infinite animations never stop running.
+        assert_eq!(styles.running_animations, 1);
+    }
+
+    #[test]
+    fn keyframe_timing_functions_ease_their_interval() {
+        let css = "@keyframes jump { from { width: 0; animation-timing-function: step-end } \
+                   50% { width: 50px } to { width: 100px } } \
+                   #box { animation: jump 2s linear }";
+        let width = |seconds| {
+            let (styles, document) = animated(css, "<div id='box'></div>", seconds);
+            computed(&styles, &document, "box", "width")
+        };
+        // The first interval holds its start value until it ends...
+        assert_eq!(width(0.9).as_deref(), Some("0"));
+        // ...and the second uses the animation's own `linear` easing.
+        assert_eq!(width(1.5).as_deref(), Some("75px"));
+    }
+
+    #[test]
+    fn later_animations_and_keyframes_rules_win() {
+        let css = "@keyframes a { to { width: 10px } } \
+                   @keyframes b { to { width: 20px } } \
+                   @keyframes b { to { height: 30px } } \
+                   #box { animation: a 1s forwards, b 1s forwards }";
+        let (styles, document) = animated(css, "<div id='box'></div>", 2.0);
+        // The second `@keyframes b` replaces the first, so only `a` sets width.
+        assert_eq!(
+            computed(&styles, &document, "box", "width").as_deref(),
+            Some("10px")
+        );
+        assert_eq!(
+            computed(&styles, &document, "box", "height").as_deref(),
+            Some("30px")
+        );
+    }
+
+    #[test]
+    fn inline_animations_and_delays_apply() {
+        let css = "@keyframes fade { from { background-color: transparent } }";
+        let html = "<div id='box' style='background-color: red; \
+                    animation: fade 1s linear 1s backwards'></div>";
+        let background = |seconds| {
+            let (styles, document) = animated(css, html, seconds);
+            computed(&styles, &document, "box", "background-color")
+        };
+        assert_eq!(background(0.0).as_deref(), Some("transparent"));
+        assert_eq!(background(1.5).as_deref(), Some("rgba(255, 0, 0, 0.5)"));
+        assert_eq!(background(3.0).as_deref(), Some("red"));
+    }
+
+    #[test]
+    fn animated_font_size_resolves_em_for_other_properties() {
+        let css = "@keyframes big { from { font-size: 10px } to { font-size: 30px } } \
+                   #box { width: 2em; animation: big 2s linear }";
+        let (styles, document) = animated(css, "<div id='box'></div>", 1.0);
+        assert_eq!(
+            computed(&styles, &document, "box", "font-size").as_deref(),
+            Some("20px")
+        );
+    }
+
     #[test]
     fn elements_are_only_tested_against_rules_that_could_match_them() {
         let mut css = String::new();
@@ -536,7 +714,8 @@ mod tests {
         }
         html.push_str("</div>");
         let document = html::parse_raw_html(html);
-        let (styles, stats) = style_document_with_stats(&document, &[parse_stylesheet(&css)]);
+        let (styles, stats) =
+            style_document_with_stats(&document, &[parse_stylesheet(&css)], Duration::ZERO);
         assert_eq!(
             computed(&styles, &document, "i42", "color").as_deref(),
             Some("blue")

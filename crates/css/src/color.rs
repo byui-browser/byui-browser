@@ -15,8 +15,12 @@ pub struct CssColor {
 
 /// Parses the solid color forms supported by the first renderer slice.
 ///
-/// Supports `#rgb`, `#rrggbb`, `rgb(r, g, b)` with integer channels, and
-/// common opaque named colors. Alpha and other CSS color forms return `None`.
+/// Supports `#rgb`, `#rrggbb`, common opaque named colors, and `rgb()` /
+/// `rgba()` with integer channels from 0 to 255 and an optional alpha. Both
+/// the legacy comma syntax (`rgba(1, 2, 3, 0.5)`) and the space syntax
+/// (`rgb(1 2 3 / 50%)`) are accepted; alpha is a number from 0 to 1 or a
+/// percentage. Other CSS color forms, including `transparent` and
+/// `currentcolor`, return `None`.
 pub fn parse_color(value: &str) -> Option<CssColor> {
     let value = value.trim();
     if let Some(hex) = value.strip_prefix('#') {
@@ -44,19 +48,11 @@ pub fn parse_color(value: &str) -> Option<CssColor> {
     }
     let lower = value.to_ascii_lowercase();
     if let Some(channels) = lower
-        .strip_prefix("rgb(")
+        .strip_prefix("rgba(")
+        .or_else(|| lower.strip_prefix("rgb("))
         .and_then(|rest| rest.strip_suffix(')'))
     {
-        let parts = channels.split(',').map(str::trim).collect::<Vec<_>>();
-        if let [r, g, b] = parts.as_slice() {
-            return Some(CssColor {
-                r: r.parse().ok()?,
-                g: g.parse().ok()?,
-                b: b.parse().ok()?,
-                a: 255,
-            });
-        }
-        return None;
+        return parse_rgb_channels(channels);
     }
     let (r, g, b, a) = match lower.as_str() {
         "black" => (0, 0, 0, 255),
@@ -80,6 +76,47 @@ pub fn parse_color(value: &str) -> Option<CssColor> {
         _ => return None,
     };
     Some(CssColor { r, g, b, a })
+}
+
+/// Parses the inside of `rgb(...)` or `rgba(...)`.
+fn parse_rgb_channels(channels: &str) -> Option<CssColor> {
+    let (rgb, alpha) = if channels.contains(',') {
+        let parts: Vec<_> = channels.split(',').map(str::trim).collect();
+        match parts.as_slice() {
+            [r, g, b] => ([*r, *g, *b], None),
+            [r, g, b, a] => ([*r, *g, *b], Some(*a)),
+            _ => return None,
+        }
+    } else {
+        let (rgb, alpha) = match channels.split_once('/') {
+            Some((rgb, alpha)) => (rgb, Some(alpha.trim())),
+            None => (channels, None),
+        };
+        let parts: Vec<_> = rgb.split_ascii_whitespace().collect();
+        let [r, g, b] = parts.as_slice() else {
+            return None;
+        };
+        ([*r, *g, *b], alpha)
+    };
+    let alpha = match alpha {
+        None => 255,
+        Some(text) => {
+            let fraction = match text.strip_suffix('%') {
+                Some(percent) => percent.trim().parse::<f32>().ok()? / 100.0,
+                None => text.parse::<f32>().ok()?,
+            };
+            if !fraction.is_finite() {
+                return None;
+            }
+            (fraction.clamp(0.0, 1.0) * 255.0).round() as u8
+        }
+    };
+    Some(CssColor {
+        r: rgb[0].parse().ok()?,
+        g: rgb[1].parse().ok()?,
+        b: rgb[2].parse().ok()?,
+        a: alpha,
+    })
 }
 
 #[cfg(test)]
@@ -115,6 +152,25 @@ mod tests {
                 a: 255
             })
         );
+        assert_eq!(
+            parse_color("rgba(18, 52, 86, 0.5)"),
+            Some(CssColor {
+                r: 18,
+                g: 52,
+                b: 86,
+                a: 128
+            })
+        );
+        assert_eq!(
+            parse_color("rgb(1 2 3 / 0%)"),
+            Some(CssColor {
+                r: 1,
+                g: 2,
+                b: 3,
+                a: 0
+            })
+        );
+        assert_eq!(parse_color("rgb(1, 2)"), None);
         assert_eq!(parse_color("transparent"), None);
         assert_eq!(parse_color("#ééé"), None);
         assert_eq!(parse_color("rgb(256, 0, 0)"), None);
