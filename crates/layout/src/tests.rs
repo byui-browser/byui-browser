@@ -135,6 +135,46 @@ fn flex_row_distributes_grow_space_and_places_the_gap() {
 }
 
 #[test]
+fn flex_basis_overrides_the_main_size_before_growth() {
+    let (document, tree) = lay_out(
+        "<body><div id='container'><div id='first'></div><div id='second'></div></div></body>",
+        "body { margin: 0 } #container { display: flex; width: 300px }\
+         #first, #second { width: 50px; flex-basis: 100px }",
+        800.0,
+    );
+    let first = box_for(&tree, &document, "first");
+    let second = box_for(&tree, &document, "second");
+    assert_eq!((first.rect.x, first.rect.width), (0.0, 100.0));
+    assert_eq!((second.rect.x, second.rect.width), (100.0, 100.0));
+}
+
+#[test]
+fn flex_shrink_distributes_negative_free_space_by_basis() {
+    let (document, tree) = lay_out(
+        "<body><div id='container'><div id='first'></div><div id='second'></div></div></body>",
+        "body { margin: 0 } #container { display: flex; width: 150px }\
+         #first, #second { width: 100px; flex-shrink: 1 }",
+        800.0,
+    );
+    let first = box_for(&tree, &document, "first");
+    let second = box_for(&tree, &document, "second");
+    assert_eq!((first.rect.x, first.rect.width), (0.0, 75.0));
+    assert_eq!((second.rect.x, second.rect.width), (75.0, 75.0));
+}
+
+#[test]
+fn flex_shrink_respects_the_automatic_min_content_width() {
+    let (document, tree) = lay_out(
+        "<body><div id='container'><div id='first'>unbreakable</div><div id='second'></div></div></body>",
+        "body { margin: 0 } #container { display: flex; width: 50px }\
+         #first, #second { width: 100px; flex-shrink: 1 }",
+        800.0,
+    );
+    let first = box_for(&tree, &document, "first");
+    assert_eq!(first.rect.width, 88.0);
+}
+
+#[test]
 fn parent_and_first_child_margins_collapse() {
     let (document, tree) = lay_out(
         "<html id='root'><body id='body'><h1 id='h'>T</h1></body></html>",
