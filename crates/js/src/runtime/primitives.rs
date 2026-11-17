@@ -114,200 +114,281 @@ pub(crate) fn get_number_property(key: &str) -> JsResult<Value> {
 }
 
 fn install_string_methods(prototype: &Object) {
-    set_method(prototype, "charAt", Arc::new(|args| {
-        let text = this_string()?;
-        let index = to_integer(args.first());
-        Ok(text
-            .chars()
-            .nth(index.max(0) as usize)
-            .map(|character| Value::String(character.to_string()))
-            .unwrap_or_else(|| Value::String(String::new())))
-    }));
-    set_method(prototype, "charCodeAt", Arc::new(|args| {
-        let text = this_string()?;
-        let index = to_integer(args.first());
-        Ok(match text.chars().nth(index.max(0) as usize) {
-            Some(character) => Value::Number(f64::from(character as u32)),
-            None => Value::Number(f64::NAN),
-        })
-    }));
-    set_method(prototype, "slice", Arc::new(|args| {
-        let text = this_string()?;
-        let chars: Vec<char> = text.chars().collect();
-        let length = chars.len() as i64;
-        let start = slice_index(args.first(), length);
-        let end = args
-            .get(1)
-            .map(|value| slice_index(Some(value), length))
-            .unwrap_or(length);
-        if end <= start {
-            return Ok(Value::String(String::new()));
-        }
-        Ok(Value::String(chars[start as usize..end as usize].iter().collect()))
-    }));
-    set_method(prototype, "substring", Arc::new(|args| {
-        let text = this_string()?;
-        let chars: Vec<char> = text.chars().collect();
-        let length = chars.len() as i64;
-        let mut start = to_integer(args.first()).clamp(0, length);
-        let mut end = args
-            .get(1)
-            .map(|value| to_integer(Some(value)).clamp(0, length))
-            .unwrap_or(length);
-        if start > end {
-            std::mem::swap(&mut start, &mut end);
-        }
-        Ok(Value::String(chars[start as usize..end as usize].iter().collect()))
-    }));
-    set_method(prototype, "indexOf", Arc::new(|args| {
-        let text = this_string()?;
-        let search = to_string_arg(args.first());
-        let from = to_integer(args.get(1)).max(0) as usize;
-        let chars: Vec<char> = text.chars().collect();
-        let needle: Vec<char> = search.chars().collect();
-        if needle.is_empty() {
-            return Ok(Value::Number(from.min(chars.len()) as f64));
-        }
-        let start = from.min(chars.len());
-        let found = chars[start..]
-            .windows(needle.len())
-            .position(|window| window == needle.as_slice())
-            .map(|relative| (start + relative) as f64)
-            .unwrap_or(-1.0);
-        Ok(Value::Number(found))
-    }));
-    set_method(prototype, "lastIndexOf", Arc::new(|args| {
-        let text = this_string()?;
-        let search = to_string_arg(args.first());
-        let chars: Vec<char> = text.chars().collect();
-        let needle: Vec<char> = search.chars().collect();
-        let from = args
-            .get(1)
-            .map(|value| to_integer(Some(value)))
-            .unwrap_or(chars.len() as i64)
-            .clamp(0, chars.len() as i64) as usize;
-        if needle.is_empty() {
-            return Ok(Value::Number(from.min(chars.len()) as f64));
-        }
-        if needle.len() > chars.len() {
-            return Ok(Value::Number(-1.0));
-        }
-        let last_start = from.min(chars.len().saturating_sub(needle.len()));
-        let found = (0..=last_start)
-            .rev()
-            .find(|&index| chars[index..index + needle.len()] == needle[..])
-            .map(|index| index as f64)
-            .unwrap_or(-1.0);
-        Ok(Value::Number(found))
-    }));
-    set_method(prototype, "includes", Arc::new(|args| {
-        let text = this_string()?;
-        let search = to_string_arg(args.first());
-        let from = to_integer(args.get(1)).max(0) as usize;
-        let haystack: String = text.chars().skip(from).collect();
-        Ok(Value::Boolean(haystack.contains(&search)))
-    }));
-    set_method(prototype, "startsWith", Arc::new(|args| {
-        let text = this_string()?;
-        let search = to_string_arg(args.first());
-        let from = to_integer(args.get(1)).max(0) as usize;
-        let haystack: String = text.chars().skip(from).collect();
-        Ok(Value::Boolean(haystack.starts_with(&search)))
-    }));
-    set_method(prototype, "endsWith", Arc::new(|args| {
-        let text = this_string()?;
-        let search = to_string_arg(args.first());
-        let end = args
-            .get(1)
-            .map(|value| to_integer(Some(value)).max(0) as usize)
-            .unwrap_or_else(|| text.chars().count())
-            .min(text.chars().count());
-        let haystack: String = text.chars().take(end).collect();
-        Ok(Value::Boolean(haystack.ends_with(&search)))
-    }));
-    set_method(prototype, "toLowerCase", Arc::new(|_| {
-        Ok(Value::String(this_string()?.to_lowercase()))
-    }));
-    set_method(prototype, "toUpperCase", Arc::new(|_| {
-        Ok(Value::String(this_string()?.to_uppercase()))
-    }));
-    set_method(prototype, "trim", Arc::new(|_| {
-        Ok(Value::String(this_string()?.trim().to_owned()))
-    }));
-    set_method(prototype, "trimStart", Arc::new(|_| {
-        Ok(Value::String(this_string()?.trim_start().to_owned()))
-    }));
-    set_method(prototype, "trimEnd", Arc::new(|_| {
-        Ok(Value::String(this_string()?.trim_end().to_owned()))
-    }));
-    set_method(prototype, "concat", Arc::new(|args| {
-        let mut text = this_string()?;
-        for argument in args {
-            text.push_str(&argument.to_string());
-        }
-        Ok(Value::String(text))
-    }));
-    set_method(prototype, "repeat", Arc::new(|args| {
-        let text = this_string()?;
-        let count = to_integer(args.first());
-        if count < 0 {
-            return Err(JsError::new("Invalid count value"));
-        }
-        Ok(Value::String(text.repeat(count as usize)))
-    }));
-    set_method(prototype, "split", Arc::new(|args| {
-        let text = this_string()?;
-        let separator = args.first().map(|value| value.to_string());
-        let limit = args
-            .get(1)
-            .and_then(|value| match value {
-                Value::Number(number) if *number >= 0.0 => Some(*number as usize),
-                _ => None,
+    set_method(
+        prototype,
+        "charAt",
+        Arc::new(|args| {
+            let text = this_string()?;
+            let index = to_integer(args.first());
+            Ok(text
+                .chars()
+                .nth(index.max(0) as usize)
+                .map(|character| Value::String(character.to_string()))
+                .unwrap_or_else(|| Value::String(String::new())))
+        }),
+    );
+    set_method(
+        prototype,
+        "charCodeAt",
+        Arc::new(|args| {
+            let text = this_string()?;
+            let index = to_integer(args.first());
+            Ok(match text.chars().nth(index.max(0) as usize) {
+                Some(character) => Value::Number(f64::from(character as u32)),
+                None => Value::Number(f64::NAN),
             })
-            .unwrap_or(usize::MAX);
-        let parts: Vec<String> = match separator.as_deref() {
-            None => vec![text],
-            Some("") => text.chars().map(|character| character.to_string()).collect(),
-            Some(separator) => text.split(separator).map(str::to_owned).collect(),
-        };
-        let array = Object::new();
-        let mut length = 0usize;
-        for part in parts.into_iter().take(limit) {
-            array.set(length.to_string(), Value::String(part));
-            length += 1;
-        }
-        array.set("length", Value::Number(length as f64));
-        Ok(Value::Array(array))
-    }));
-    set_method(prototype, "replace", Arc::new(|args| {
-        let text = this_string()?;
-        let search = to_string_arg(args.first());
-        let replacement = to_string_arg(args.get(1));
-        Ok(Value::String(text.replacen(&search, &replacement, 1)))
-    }));
-    set_method(prototype, "toString", Arc::new(|_| {
-        Ok(Value::String(this_string()?))
-    }));
-    set_method(prototype, "valueOf", Arc::new(|_| {
-        Ok(Value::String(this_string()?))
-    }));
+        }),
+    );
+    set_method(
+        prototype,
+        "slice",
+        Arc::new(|args| {
+            let text = this_string()?;
+            let chars: Vec<char> = text.chars().collect();
+            let length = chars.len() as i64;
+            let start = slice_index(args.first(), length);
+            let end = args
+                .get(1)
+                .map(|value| slice_index(Some(value), length))
+                .unwrap_or(length);
+            if end <= start {
+                return Ok(Value::String(String::new()));
+            }
+            Ok(Value::String(
+                chars[start as usize..end as usize].iter().collect(),
+            ))
+        }),
+    );
+    set_method(
+        prototype,
+        "substring",
+        Arc::new(|args| {
+            let text = this_string()?;
+            let chars: Vec<char> = text.chars().collect();
+            let length = chars.len() as i64;
+            let mut start = to_integer(args.first()).clamp(0, length);
+            let mut end = args
+                .get(1)
+                .map(|value| to_integer(Some(value)).clamp(0, length))
+                .unwrap_or(length);
+            if start > end {
+                std::mem::swap(&mut start, &mut end);
+            }
+            Ok(Value::String(
+                chars[start as usize..end as usize].iter().collect(),
+            ))
+        }),
+    );
+    set_method(
+        prototype,
+        "indexOf",
+        Arc::new(|args| {
+            let text = this_string()?;
+            let search = to_string_arg(args.first());
+            let from = to_integer(args.get(1)).max(0) as usize;
+            let chars: Vec<char> = text.chars().collect();
+            let needle: Vec<char> = search.chars().collect();
+            if needle.is_empty() {
+                return Ok(Value::Number(from.min(chars.len()) as f64));
+            }
+            let start = from.min(chars.len());
+            let found = chars[start..]
+                .windows(needle.len())
+                .position(|window| window == needle.as_slice())
+                .map(|relative| (start + relative) as f64)
+                .unwrap_or(-1.0);
+            Ok(Value::Number(found))
+        }),
+    );
+    set_method(
+        prototype,
+        "lastIndexOf",
+        Arc::new(|args| {
+            let text = this_string()?;
+            let search = to_string_arg(args.first());
+            let chars: Vec<char> = text.chars().collect();
+            let needle: Vec<char> = search.chars().collect();
+            let from = args
+                .get(1)
+                .map(|value| to_integer(Some(value)))
+                .unwrap_or(chars.len() as i64)
+                .clamp(0, chars.len() as i64) as usize;
+            if needle.is_empty() {
+                return Ok(Value::Number(from.min(chars.len()) as f64));
+            }
+            if needle.len() > chars.len() {
+                return Ok(Value::Number(-1.0));
+            }
+            let last_start = from.min(chars.len().saturating_sub(needle.len()));
+            let found = (0..=last_start)
+                .rev()
+                .find(|&index| chars[index..index + needle.len()] == needle[..])
+                .map(|index| index as f64)
+                .unwrap_or(-1.0);
+            Ok(Value::Number(found))
+        }),
+    );
+    set_method(
+        prototype,
+        "includes",
+        Arc::new(|args| {
+            let text = this_string()?;
+            let search = to_string_arg(args.first());
+            let from = to_integer(args.get(1)).max(0) as usize;
+            let haystack: String = text.chars().skip(from).collect();
+            Ok(Value::Boolean(haystack.contains(&search)))
+        }),
+    );
+    set_method(
+        prototype,
+        "startsWith",
+        Arc::new(|args| {
+            let text = this_string()?;
+            let search = to_string_arg(args.first());
+            let from = to_integer(args.get(1)).max(0) as usize;
+            let haystack: String = text.chars().skip(from).collect();
+            Ok(Value::Boolean(haystack.starts_with(&search)))
+        }),
+    );
+    set_method(
+        prototype,
+        "endsWith",
+        Arc::new(|args| {
+            let text = this_string()?;
+            let search = to_string_arg(args.first());
+            let end = args
+                .get(1)
+                .map(|value| to_integer(Some(value)).max(0) as usize)
+                .unwrap_or_else(|| text.chars().count())
+                .min(text.chars().count());
+            let haystack: String = text.chars().take(end).collect();
+            Ok(Value::Boolean(haystack.ends_with(&search)))
+        }),
+    );
+    set_method(
+        prototype,
+        "toLowerCase",
+        Arc::new(|_| Ok(Value::String(this_string()?.to_lowercase()))),
+    );
+    set_method(
+        prototype,
+        "toUpperCase",
+        Arc::new(|_| Ok(Value::String(this_string()?.to_uppercase()))),
+    );
+    set_method(
+        prototype,
+        "trim",
+        Arc::new(|_| Ok(Value::String(this_string()?.trim().to_owned()))),
+    );
+    set_method(
+        prototype,
+        "trimStart",
+        Arc::new(|_| Ok(Value::String(this_string()?.trim_start().to_owned()))),
+    );
+    set_method(
+        prototype,
+        "trimEnd",
+        Arc::new(|_| Ok(Value::String(this_string()?.trim_end().to_owned()))),
+    );
+    set_method(
+        prototype,
+        "concat",
+        Arc::new(|args| {
+            let mut text = this_string()?;
+            for argument in args {
+                text.push_str(&argument.to_string());
+            }
+            Ok(Value::String(text))
+        }),
+    );
+    set_method(
+        prototype,
+        "repeat",
+        Arc::new(|args| {
+            let text = this_string()?;
+            let count = to_integer(args.first());
+            if count < 0 {
+                return Err(JsError::new("Invalid count value"));
+            }
+            Ok(Value::String(text.repeat(count as usize)))
+        }),
+    );
+    set_method(
+        prototype,
+        "split",
+        Arc::new(|args| {
+            let text = this_string()?;
+            let separator = args.first().map(|value| value.to_string());
+            let limit = args
+                .get(1)
+                .and_then(|value| match value {
+                    Value::Number(number) if *number >= 0.0 => Some(*number as usize),
+                    _ => None,
+                })
+                .unwrap_or(usize::MAX);
+            let parts: Vec<String> = match separator.as_deref() {
+                None => vec![text],
+                Some("") => text
+                    .chars()
+                    .map(|character| character.to_string())
+                    .collect(),
+                Some(separator) => text.split(separator).map(str::to_owned).collect(),
+            };
+            let array = Object::new();
+            let mut length = 0usize;
+            for part in parts.into_iter().take(limit) {
+                array.set(length.to_string(), Value::String(part));
+                length += 1;
+            }
+            array.set("length", Value::Number(length as f64));
+            Ok(Value::Array(array))
+        }),
+    );
+    set_method(
+        prototype,
+        "replace",
+        Arc::new(|args| {
+            let text = this_string()?;
+            let search = to_string_arg(args.first());
+            let replacement = to_string_arg(args.get(1));
+            Ok(Value::String(text.replacen(&search, &replacement, 1)))
+        }),
+    );
+    set_method(
+        prototype,
+        "toString",
+        Arc::new(|_| Ok(Value::String(this_string()?))),
+    );
+    set_method(
+        prototype,
+        "valueOf",
+        Arc::new(|_| Ok(Value::String(this_string()?))),
+    );
 }
 
 fn install_number_methods(prototype: &Object) {
-    set_method(prototype, "toFixed", Arc::new(|args| {
-        let number = this_number()?;
-        let digits = to_integer(args.first()).clamp(0, 100) as usize;
-        if !number.is_finite() {
-            return Ok(Value::String(number_to_string(number)));
-        }
-        Ok(Value::String(format!("{number:.digits$}")))
-    }));
-    set_method(prototype, "toString", Arc::new(|_| {
-        Ok(Value::String(number_to_string(this_number()?)))
-    }));
-    set_method(prototype, "valueOf", Arc::new(|_| {
-        Ok(Value::Number(this_number()?))
-    }));
+    set_method(
+        prototype,
+        "toFixed",
+        Arc::new(|args| {
+            let number = this_number()?;
+            let digits = to_integer(args.first()).clamp(0, 100) as usize;
+            if !number.is_finite() {
+                return Ok(Value::String(number_to_string(number)));
+            }
+            Ok(Value::String(format!("{number:.digits$}")))
+        }),
+    );
+    set_method(
+        prototype,
+        "toString",
+        Arc::new(|_| Ok(Value::String(number_to_string(this_number()?)))),
+    );
+    set_method(
+        prototype,
+        "valueOf",
+        Arc::new(|_| Ok(Value::Number(this_number()?))),
+    );
 }
 
 fn set_method(object: &Object, name: &str, function: HostFunction) {

@@ -384,10 +384,7 @@ fn logical_assignment_only_stores_when_it_assigns() {
 fn compound_assignment_reports_reference_errors() {
     fails("missing += 1", "`missing` is not defined");
     fails("missing ||= 1", "`missing` is not defined");
-    fails(
-        "let n = 1; n.x += 1",
-        "Cannot set property `x` of a number",
-    );
+    fails("let n = 1; n.x += 1", "Cannot set property `x` of a number");
     fails(
         "let o = null; o.x ??= 1",
         "Cannot read property `x` of null",

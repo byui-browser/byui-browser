@@ -92,10 +92,7 @@ fn user_properties_on_the_prototype_are_visible_to_primitives() {
         value("String.prototype.tag = 'marked'; 'hi'.tag"),
         string("marked")
     );
-    assert_eq!(
-        value("Number.prototype.tag = 7; (1).tag"),
-        number(7.0)
-    );
+    assert_eq!(value("Number.prototype.tag = 7; (1).tag"), number(7.0));
 }
 
 #[test]

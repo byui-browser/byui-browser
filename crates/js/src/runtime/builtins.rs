@@ -67,8 +67,12 @@ fn reflect_namespace() -> Object {
 /// for its intentionally short-lived, non-persistent global environment.
 pub(crate) fn value(name: &str) -> Option<Value> {
     match name {
-        "String" => Some(Value::Function(super::primitives::string_constructor_value())),
-        "Number" => Some(Value::Function(super::primitives::number_constructor_value())),
+        "String" => Some(Value::Function(
+            super::primitives::string_constructor_value(),
+        )),
+        "Number" => Some(Value::Function(
+            super::primitives::number_constructor_value(),
+        )),
         "Map" => Some(Value::Function(map_constructor())),
         "Set" => Some(Value::Function(set_constructor())),
         "WeakMap" => Some(Value::Function(map_constructor())),
