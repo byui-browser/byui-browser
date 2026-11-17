@@ -710,7 +710,7 @@ impl Builder<'_> {
         let mut control = None;
         let (key, natural) = match (element.get_name().as_str(), element.get_namespace()) {
             ("input", html::Namespace::Html) => {
-                let kind = match attribute("type").map(str::trim) {
+                let kind = match attribute("type") {
                     Some(kind) if kind.eq_ignore_ascii_case("checkbox") => ControlKind::Checkbox,
                     Some(kind) if kind.eq_ignore_ascii_case("radio") => ControlKind::Radio,
                     _ => return None,

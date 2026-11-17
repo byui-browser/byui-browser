@@ -1769,7 +1769,8 @@ mod control_text {
 fn checkbox_and_radio_inputs_are_13px_replaced_boxes_with_ua_margins() {
     let (document, tree) = lay_out(
         "<body><p id=p>ab<input id=c type=checkbox checked>cd\
-         <input id=r type=RADIO disabled><input id=t type=text></p></body>",
+         <input id=r type=RADIO disabled><input id=t type=text>\
+         <input id=s type=' checkbox'></p></body>",
         "body { margin: 0 } p { margin: 0 }",
         400.0,
     );
@@ -1807,6 +1808,8 @@ fn checkbox_and_radio_inputs_are_13px_replaced_boxes_with_ua_margins() {
         })
     );
     assert_eq!(box_for(&tree, &document, "t").control, None);
+    // Enumerated attributes are not trimmed.
+    assert_eq!(box_for(&tree, &document, "s").control, None);
 }
 
 #[test]
