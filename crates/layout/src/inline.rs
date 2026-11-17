@@ -333,6 +333,13 @@ impl Context<'_> {
                     });
                     if *white_space == WhiteSpace::PreWrap {
                         for (is_space, run) in preserved_runs(text) {
+                            // Tab stops are not supported: a tab is one space.
+                            let run = if is_space {
+                                run.replace('\t', " ")
+                            } else {
+                                run.to_owned()
+                            };
+                            let run = run.as_str();
                             let width =
                                 self.fonts.font_text_width(style.font, run, style.font_size);
                             prepared.pieces.push(if is_space {

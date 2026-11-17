@@ -94,10 +94,11 @@ pub(crate) enum WhiteSpace {
     /// wrap opportunity and is removed at the start and end of a line.
     Collapse,
     /// `pre` without segment breaks: the run is one unbreakable piece with
-    /// its spaces kept. Used for single-line control text.
+    /// its spaces kept. Used for single-line control text; input values
+    /// arrive with each tab already replaced by one space.
     Pre,
     /// `pre-wrap` without segment breaks: spaces and tabs are kept (a tab is
-    /// drawn as written, not expanded to a tab stop), a soft wrap
+    /// drawn as one space, since tab stops are not supported), a soft wrap
     /// opportunity follows each run of them, and spaces at the end of a
     /// line hang (they do not count toward fitting and are not painted).
     /// Callers split segment breaks into forced breaks. Used for
@@ -850,6 +851,8 @@ impl Builder<'_> {
                     .unwrap_or_default()
                     .chars()
                     .filter(|character| !matches!(character, '\n' | '\r'))
+                    // Tab stops are not supported: a tab shows as one space.
+                    .map(|character| if character == '\t' { ' ' } else { character })
                     .collect();
                 let (text, text_style) = if value.is_empty() {
                     placeholder(true)

@@ -1612,4 +1612,12 @@ mod control_text {
         // The 19.2px line overflows the 9.2px box by 5px on each side.
         assert_close(input.lines[0].rect.y - input.rect.y, -5.0);
     }
+
+    #[test]
+    fn tabs_in_control_text_render_as_one_space() {
+        let html = "<p><textarea id='a'>a\tb</textarea><input id='b' value='c&#9;d'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["a b"]);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["c d"]);
+    }
 }
