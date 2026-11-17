@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use http::Method;
 
-use crate::api::{Headers, body::Body, cancellation::AbortSignal, error::RequestError};
+use crate::api::{
+    HeaderGuard, Headers, body::Body, cancellation::AbortSignal, error::RequestError,
+};
 
 use super::{
     CacheMode, FetchContext, InitiatorType, RedirectMode, Referrer, ReferrerPolicy, Request,
@@ -49,12 +51,14 @@ impl Request {
             priority: self.priority,
             duplex: self.duplex,
             context: self.context.clone(),
-            request_origin: self.request_origin.clone(),
             signal: self.signal.clone(),
-            url_list: self.url_list.clone(),
-            current_url: self.current_url.clone(),
-            redirect_count: self.redirect_count,
-            cache_partition: self.cache_partition.clone(),
+            execution: super::state::RequestExecution {
+                request_origin: self.execution.request_origin.clone(),
+                url_list: self.execution.url_list.clone(),
+                current_url: self.execution.current_url.clone(),
+                redirect_count: self.execution.redirect_count,
+                cache_partition: self.execution.cache_partition.clone(),
+            },
         }
     }
 
@@ -72,6 +76,19 @@ impl Request {
         } else {
             self.try_clone()
         }
+    }
+    /// Converts a bodyless clone into the internal CORS preflight request.
+    pub(crate) fn into_preflight(mut self) -> Self {
+        self.method = Method::OPTIONS;
+        self.headers = Headers::with_guard(HeaderGuard::None);
+        self.body = None;
+        self.context.mode = crate::RequestMode::Cors;
+        self.context.credentials = crate::CredentialsMode::SameOrigin;
+        self.cache_mode = CacheMode::NoStore;
+        self.redirect_mode = RedirectMode::Error;
+        self.integrity = None;
+        self.keepalive = false;
+        self
     }
     /// Creates a GET request with Fetch's default request state.
     pub fn get(url: impl Into<String>) -> Self {
@@ -93,12 +110,8 @@ impl Request {
             priority: RequestPriority::Auto,
             duplex: None,
             context: FetchContext::default(),
-            request_origin: None,
             signal: AbortSignal::new(),
-            url_list: Vec::new(),
-            current_url: None,
-            redirect_count: 0,
-            cache_partition: None,
+            execution: super::state::RequestExecution::default(),
         }
     }
     /// Creates a request after normalizing and validating its method.

@@ -10,7 +10,7 @@ use crate::api::{
     body::Body,
     config::Config,
     error::RequestError,
-    request::PreparedRequest,
+    request::TransportRequest,
     response::{InternalResponse, has_null_body},
 };
 
@@ -26,7 +26,7 @@ pub(crate) trait Transport: Send + Sync {
     /// returned internal response.
     fn send(
         &self,
-        request: PreparedRequest,
+        request: TransportRequest,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<InternalResponse, RequestError>> + Send>,
     >;
@@ -71,22 +71,22 @@ impl Transport for ReqwestTransport {
     /// Sends the prepared request and exposes its response body as a live stream.
     fn send(
         &self,
-        request: PreparedRequest,
+        request: TransportRequest,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<InternalResponse, RequestError>> + Send>,
     > {
         let client = self.client.clone();
         Box::pin(async move {
-            let PreparedRequest {
-                request,
+            let TransportRequest {
+                mut request,
                 headers: request_headers,
                 url,
             } = request;
-            if request.signal.is_aborted() {
+            if request.signal().is_aborted() {
                 return Err(RequestError::Aborted);
             }
-            let signal = request.signal.clone();
-            let context = request.context.clone();
+            let signal = request.signal().clone();
+            let context = request.context().clone();
             let mut headers = request_headers.to_reqwest();
             headers.remove(REFERER);
             if let Some(referrer) = request.referrer_value(&url) {
@@ -102,9 +102,9 @@ impl Transport for ReqwestTransport {
                     }
                 }
             }
-            let method = request.method.clone();
+            let method = request.method().clone();
             let mut builder = client.request(method.clone(), url).headers(headers);
-            if let Some(body) = request.body {
+            if let Some(body) = request.take_body() {
                 builder = builder.body(body.into_reqwest_body()?);
             }
             let response = tokio::select! {

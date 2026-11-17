@@ -6,15 +6,20 @@ use crate::api::error::RequestError;
 use super::{ReferrerPolicy, Request, ServiceWorkersMode};
 
 impl Request {
+    /// Records the cache partition selected during request preparation.
+    pub(crate) fn set_cache_partition(&mut self, partition: String) {
+        self.execution.cache_partition = Some(partition);
+    }
+
     /// Records the validated URL as the current and initial request URL.
     pub(crate) fn prepare_url(&mut self, url: Url) {
-        if self.url_list.is_empty() {
-            self.url_list.push(url.clone());
+        if self.execution.url_list.is_empty() {
+            self.execution.url_list.push(url.clone());
         }
-        if self.request_origin.is_none() {
-            self.request_origin = self.context.environment.origin.clone();
+        if self.execution.request_origin.is_none() {
+            self.execution.request_origin = self.context.environment.origin.clone();
         }
-        self.current_url = Some(url);
+        self.execution.current_url = Some(url);
     }
 
     pub(crate) fn follow_url(&mut self, url: Url) {
@@ -23,9 +28,9 @@ impl Request {
             self.id,
             crate::log_url::loggable(url.as_str())
         );
-        self.url_list.push(url.clone());
-        self.current_url = Some(url);
-        self.redirect_count += 1;
+        self.execution.url_list.push(url.clone());
+        self.execution.current_url = Some(url);
+        self.execution.redirect_count += 1;
     }
 
     pub(crate) fn rewrite_for_redirect(&mut self) -> Result<(), RequestError> {
@@ -63,7 +68,7 @@ impl Request {
         if let Some(policy) = redirect_referrer_policy(response_headers) {
             self.referrer_policy = policy;
         }
-        let crosses_origin = self.current_url.as_ref().is_some_and(|current| {
+        let crosses_origin = self.execution.current_url.as_ref().is_some_and(|current| {
             current.scheme() != next_url.scheme() || current.origin() != next_url.origin()
         });
         if crosses_origin {

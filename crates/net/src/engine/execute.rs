@@ -24,26 +24,24 @@ impl RequestController {
             request.method(),
             crate::log_url::loggable(request.url())
         );
-        let (request, validated_url) = self.prepare_request(request).inspect_err(|error| {
+        let (request, scheme) = self.prepare_request(request).inspect_err(|error| {
             log::debug!(
                 "fetch rejected during preparation: {}",
                 crate::log_url::loggable_error(error)
             );
         })?;
         self.observe(
-            &request,
+            &request.request,
             NetworkPhase::Prepared,
-            &validated_url.url,
+            &request.url,
             None,
             false,
         );
-        let url = validated_url.url;
-        let method = request.method().clone();
-        let request_id = request.id();
-        let redirect_count = request.redirect_count;
-        let result = self
-            .fetch_scheme(request, url.clone(), validated_url.scheme)
-            .await;
+        let url = request.url.clone();
+        let method = request.request.method().clone();
+        let request_id = request.request.id();
+        let redirect_count = request.request.redirect_count();
+        let result = self.fetch_scheme(request, scheme).await;
         match &result {
             Ok(response) => {
                 self.observe_parts(

@@ -4,21 +4,21 @@ use crate::{
     api::{
         error::RequestError,
         request::{
-            CredentialsMode, InitiatorType, Request, RequestDestination, ServiceWorkersMode,
+            CredentialsMode, InitiatorType, PreparedRequest, Request, RequestDestination,
+            ServiceWorkersMode,
         },
         services::ServiceWorkerDecision,
     },
     engine::RequestController,
-    policy::ValidatedUrl,
 };
 
 impl RequestController {
     /// Validates a request and resolves browser-owned services before execution.
     pub(crate) fn prepare_request(
         &self,
-        mut request: Request,
-    ) -> Result<(Request, ValidatedUrl), RequestError> {
-        if request.signal.is_aborted() {
+        request: Request,
+    ) -> Result<(PreparedRequest, crate::policy::FetchScheme), RequestError> {
+        if request.signal().is_aborted() {
             log::debug!(
                 "request aborted before preparation: {}",
                 crate::log_url::loggable(request.url())
@@ -36,13 +36,14 @@ impl RequestController {
                     crate::log_url::loggable_error(error)
                 );
             })?;
-        request.prepare_url(validated_url.url.clone());
+        let mut prepared = PreparedRequest::new(request, validated_url.url.clone());
+        let request = &mut prepared.request;
 
         if let Some(services) = &self.inner.services {
-            services.check_request(&request)?;
+            services.check_request(request)?;
             if validated_url.scheme != crate::policy::FetchScheme::File
-                && request.service_workers == ServiceWorkersMode::All
-                && services.service_worker(&request)? == ServiceWorkerDecision::Intercept
+                && request.service_workers_mode() == ServiceWorkersMode::All
+                && services.service_worker(request)? == ServiceWorkerDecision::Intercept
             {
                 log::warn!(
                     "service-worker interception is unsupported: {}",
@@ -52,10 +53,10 @@ impl RequestController {
                     "service-worker interception",
                 ));
             }
-        } else if request.context.environment.origin.is_some()
-            || request.context.credentials == CredentialsMode::Include
-            || request.destination != RequestDestination::Empty
-            || request.initiator != InitiatorType::Other
+        } else if request.environment().origin.is_some()
+            || request.credentials_mode() == CredentialsMode::Include
+            || request.destination() != RequestDestination::Empty
+            || request.initiator() != InitiatorType::Other
         {
             log::warn!(
                 "request needs browser services but none are installed: {}",
@@ -67,7 +68,7 @@ impl RequestController {
         if validated_url.scheme.is_http()
             && let Some(services) = &self.inner.services
         {
-            request.cache_partition = Some(services.cache_partition(&request)?);
+            request.set_cache_partition(services.cache_partition(request)?);
         }
         log::trace!(
             "request prepared: {} scheme={:?} cacheable={}",
@@ -75,6 +76,6 @@ impl RequestController {
             validated_url.scheme,
             request.is_cacheable_method()
         );
-        Ok((request, validated_url))
+        Ok((prepared, validated_url.scheme))
     }
 }

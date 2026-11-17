@@ -16,7 +16,7 @@ pub use context::{
 };
 pub use origin::{NetworkPartitionKey, Origin};
 pub(crate) use origin::{RedirectTaint, urls_are_same_origin, urls_are_same_site};
-pub(crate) use prepared::PreparedRequest;
+pub(crate) use prepared::{PreparedRequest, TransportRequest};
 pub use state::{Request, RequestDuplex, RequestPriority};
 
 #[cfg(test)]

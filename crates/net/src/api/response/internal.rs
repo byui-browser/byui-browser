@@ -3,7 +3,7 @@ use reqwest::{StatusCode, header::HeaderMap};
 use super::ResponseType;
 use crate::api::{
     body::Body,
-    request::{CredentialsMode, FetchContext, Origin, RequestMode},
+    request::{CredentialsMode, FetchContext, Origin, Request, RequestMode},
 };
 
 /// Complete response state retained inside the Fetch engine.
@@ -55,5 +55,17 @@ impl InternalResponse {
             from_cache,
             cookie_headers_processed,
         }
+    }
+
+    /// Applies the invariant request metadata shared by transport and cache responses.
+    pub(crate) fn apply_request_state(&mut self, request: &Request) {
+        self.url_list = request.url_list().iter().map(ToString::to_string).collect();
+        self.redirect_count = request.redirect_count();
+        self.origin = self
+            .url_list
+            .last()
+            .and_then(|url| reqwest::Url::parse(url).ok())
+            .and_then(|url| Origin::from_url(&url).ok());
+        self.request_origin = request.effective_origin().cloned();
     }
 }

@@ -5,7 +5,7 @@ use crate::{
         body::Body,
         diagnostics::NetworkPhase,
         error::RequestError,
-        request::{CacheMode, PreparedRequest, Request},
+        request::{CacheMode, PreparedRequest, Request, TransportRequest},
         response::{InternalResponse, Response, has_null_body},
     },
     cache::StoredResponse,
@@ -16,19 +16,19 @@ impl RequestController {
     /// Executes HTTP(S) exchanges and controller-owned redirects.
     pub(crate) async fn fetch_http(
         &self,
-        mut request: Request,
-        mut url: reqwest::Url,
+        prepared: PreparedRequest,
     ) -> Result<Response, RequestError> {
+        let (mut request, mut url) = prepared.into_parts();
         let mut response;
         loop {
-            if request.signal.is_aborted() {
+            if request.signal().is_aborted() {
                 log::debug!(
                     "request aborted before transport: {}",
                     crate::log_url::loggable(url.as_str())
                 );
                 return Err(RequestError::Aborted);
             }
-            if request.redirect_count > 0 {
+            if request.redirect_count() > 0 {
                 self.authorize_redirect_hop(&request)?;
             }
             request.reduce_referrer_for_target(&url);
@@ -38,7 +38,7 @@ impl RequestController {
                 .await?;
 
             let cacheable = request.is_cacheable_method();
-            let cache_lookup = match request.cache_mode {
+            let cache_lookup = match request.cache_mode() {
                 CacheMode::Default | CacheMode::OnlyIfCached => Some(false),
                 CacheMode::ForceCache => Some(true),
                 CacheMode::NoStore | CacheMode::Reload | CacheMode::NoCache => None,
@@ -68,19 +68,19 @@ impl RequestController {
                     let mut body = if has_null_body(request.method(), cached.status) {
                         Body::null()
                     } else {
-                        Body::once_with_signal(cached.body, request.signal.clone())
+                        Body::once_with_signal(cached.body, request.signal().clone())
                     };
                     body.set_response_metadata(&cached.headers, None);
                     let mut internal = InternalResponse::from_http_parts(
                         cached.status,
                         cached.headers,
                         cached.url,
-                        &request.context,
+                        request.context(),
                         body,
                         true,
                         cached.cookie_headers_processed,
                     );
-                    Self::set_response_redirect_state(&request, &mut internal);
+                    internal.apply_request_state(&request);
                     self.finalize_response(&request, &mut internal)
                         .inspect_err(|_| {
                             self.clear_preflight_cache_after_failure(&request, &url);
@@ -102,7 +102,7 @@ impl RequestController {
                         crate::log_url::loggable(url.as_str())
                     );
                 }
-                if request.cache_mode == CacheMode::OnlyIfCached {
+                if request.cache_mode() == CacheMode::OnlyIfCached {
                     log::debug!(
                         "only-if-cached request has no cache entry: {}",
                         crate::log_url::loggable(url.as_str())
@@ -126,7 +126,7 @@ impl RequestController {
             }
 
             let had_nonreplayable_body = request
-                .body
+                .body()
                 .as_ref()
                 .is_some_and(|body| !body.is_replayable());
             let attempt = request.for_transport()?;
@@ -134,7 +134,7 @@ impl RequestController {
                 .inner
                 .scheduler
                 .submit(
-                    PreparedRequest {
+                    TransportRequest {
                         request: attempt,
                         headers: transport_headers,
                         url: url.clone(),
@@ -145,7 +145,7 @@ impl RequestController {
                 .inspect_err(|_| {
                     self.clear_preflight_cache_after_failure(&request, &url);
                 })?;
-            Self::set_response_redirect_state(&request, &mut candidate);
+            candidate.apply_request_state(&request);
             let status = candidate.status.as_u16();
             log::debug!(
                 "transport response: {} {} -> {status}",
@@ -164,8 +164,8 @@ impl RequestController {
                 break;
             };
 
-            if request.redirect_mode == crate::RedirectMode::Manual {
-                candidate.redirect_count = request.redirect_count + 1;
+            if request.redirect_mode() == crate::RedirectMode::Manual {
+                candidate.redirect_count = request.redirect_count() + 1;
                 self.finalize_manual_redirect_response(&request, &mut candidate)?;
                 self.process_response_cookies(&request, &url, &mut candidate)?;
                 log::debug!(
@@ -176,7 +176,7 @@ impl RequestController {
                 return Ok(candidate.expose());
             }
 
-            if request.redirect_mode == crate::RedirectMode::Error {
+            if request.redirect_mode() == crate::RedirectMode::Error {
                 log::warn!(
                     "redirect {status} from {} refused by redirect mode error",
                     crate::log_url::loggable(url.as_str())
@@ -214,7 +214,7 @@ impl RequestController {
                     self.clear_preflight_cache_after_failure(&request, &url);
                 })?;
             self.process_response_cookies(&request, &url, &mut candidate)?;
-            if request.redirect_count >= 20 {
+            if request.redirect_count() >= 20 {
                 log::warn!(
                     "redirect limit reached at {}",
                     crate::log_url::loggable(url.as_str())
@@ -240,7 +240,7 @@ impl RequestController {
                 "following redirect {status}: {} -> {} (hop {})",
                 crate::log_url::loggable(url.as_str()),
                 crate::log_url::loggable(next_url.as_str()),
-                request.redirect_count + 1
+                request.redirect_count() + 1
             );
             self.observe(&request, NetworkPhase::Redirect, &url, Some(status), false);
             request.apply_redirect_policy(&next_url, &candidate.headers);
@@ -271,7 +271,7 @@ impl RequestController {
         );
         self.process_response_cookies(&request, &url, &mut response)?;
 
-        if request.is_cacheable_method() && request.cache_mode != CacheMode::NoStore {
+        if request.is_cacheable_method() && request.cache_mode() != CacheMode::NoStore {
             if response.body.is_null() {
                 log::trace!(
                     "storing null-body response in cache: {}",
@@ -324,18 +324,6 @@ impl RequestController {
             crate::Headers::generated_request_headers()
         };
         Ok((headers, generated))
-    }
-
-    /// Copies controller redirect state into a transport or cached response.
-    fn set_response_redirect_state(request: &Request, response: &mut InternalResponse) {
-        response.url_list = request.url_list.iter().map(ToString::to_string).collect();
-        response.redirect_count = request.redirect_count;
-        response.origin = response
-            .url_list
-            .last()
-            .and_then(|url| reqwest::Url::parse(url).ok())
-            .and_then(|url| crate::Origin::from_url(&url).ok());
-        response.request_origin = request.effective_origin().cloned();
     }
 
     /// Gives approved HTTP response cookies to browser-owned storage policy.

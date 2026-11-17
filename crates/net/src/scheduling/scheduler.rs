@@ -12,7 +12,7 @@ use crate::{
     api::{
         diagnostics::{NetworkEvent, NetworkPhase, SharedNetworkObserver},
         error::RequestError,
-        request::PreparedRequest,
+        request::TransportRequest,
         response::InternalResponse,
     },
     transport::Transport,
@@ -68,35 +68,35 @@ impl RequestScheduler {
     /// fully consumed or dropped.
     pub(crate) async fn submit(
         &self,
-        request: PreparedRequest,
+        request: TransportRequest,
         _priority: RequestPriority,
     ) -> Result<InternalResponse, RequestError> {
-        if request.request.signal.is_aborted() {
+        if request.request.signal().is_aborted() {
             return Err(RequestError::Aborted);
         }
         self.observe(&request, NetworkPhase::QueueStarted, None);
         log::trace!(
             "scheduler admitting {} {} ({} permits available)",
-            request.request.method,
+            request.request.method(),
             crate::log_url::loggable(request.url.as_str()),
             self.permits.available_permits()
         );
         let permit = self.permits.clone().acquire_owned();
         let permit = tokio::select! {
-            _ = request.request.signal.cancelled() => return Err(RequestError::Aborted),
+            _ = request.request.signal().cancelled() => return Err(RequestError::Aborted),
             permit = permit => permit.map_err(|_| {
                 log::error!("request scheduler is closed");
                 RequestError::SchedulerClosed
             })?,
         };
-        if request.request.signal.is_aborted() {
+        if request.request.signal().is_aborted() {
             return Err(RequestError::Aborted);
         }
         self.observe(&request, NetworkPhase::QueueAdmitted, None);
         self.observe(&request, NetworkPhase::TransportStarted, None);
-        let request_id = request.request.id;
+        let request_id = request.request.id();
         let url = request.url.to_string();
-        let redirect_count = request.request.redirect_count;
+        let redirect_count = request.request.redirect_count();
         let mut response = self.transport.send(request).await?;
         self.observe_parts(
             request_id,
@@ -109,11 +109,11 @@ impl RequestScheduler {
         Ok(response)
     }
 
-    fn observe(&self, request: &PreparedRequest, phase: NetworkPhase, status: Option<u16>) {
+    fn observe(&self, request: &TransportRequest, phase: NetworkPhase, status: Option<u16>) {
         self.observe_parts(
-            request.request.id,
+            request.request.id(),
             request.url.as_str(),
-            request.request.redirect_count,
+            request.request.redirect_count(),
             phase,
             status,
         );

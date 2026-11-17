@@ -11,7 +11,7 @@ use crate::{
     api::{
         error::RequestError,
         providers::{ProviderFuture, SchemeResource},
-        request::Request,
+        request::{PreparedRequest, Request},
         response::Response,
     },
     engine::RequestController,
@@ -74,21 +74,20 @@ impl RequestController {
     /// Dispatches a prepared request to its scheme-specific implementation.
     pub(crate) async fn fetch_scheme(
         &self,
-        request: Request,
-        url: reqwest::Url,
+        request: PreparedRequest,
         scheme: FetchScheme,
     ) -> Result<Response, RequestError> {
         log::debug!(
             "scheme handler chosen: {scheme:?} for {}",
-            crate::log_url::loggable(url.as_str())
+            crate::log_url::loggable(request.url.as_str())
         );
         match scheme {
-            FetchScheme::Http | FetchScheme::Https => self.fetch_http(request, url).await,
-            FetchScheme::Data => self.fetch_data(request, url).await,
-            FetchScheme::Blob => self.fetch_blob(request, url).await,
-            FetchScheme::File => self.fetch_file(request, url).await,
-            FetchScheme::Byui => self.fetch_byui(request, url).await,
-            FetchScheme::About => self.fetch_about(request, url).await,
+            FetchScheme::Http | FetchScheme::Https => self.fetch_http(request).await,
+            FetchScheme::Data => self.fetch_data(request).await,
+            FetchScheme::Blob => self.fetch_blob(request).await,
+            FetchScheme::File => self.fetch_file(request).await,
+            FetchScheme::Byui => self.fetch_byui(request).await,
+            FetchScheme::About => self.fetch_about(request).await,
         }
     }
 }

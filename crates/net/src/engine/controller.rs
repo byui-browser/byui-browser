@@ -172,7 +172,7 @@ impl RequestController {
             url.as_str(),
             status,
             from_cache,
-            request.redirect_count,
+            request.redirect_count(),
         );
     }
 

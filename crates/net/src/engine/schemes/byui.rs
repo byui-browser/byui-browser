@@ -1,9 +1,7 @@
 //! Browser-owned `byui:` page handling.
 
-use reqwest::Url;
-
 use crate::{
-    api::{error::RequestError, request::Request, response::Response},
+    api::{error::RequestError, request::PreparedRequest, response::Response},
     engine::RequestController,
     policy::FetchScheme,
 };
@@ -17,9 +15,9 @@ impl RequestController {
     /// page requests never use HTTP transport, cookies, or the HTTP cache.
     pub(crate) async fn fetch_byui(
         &self,
-        request: Request,
-        url: Url,
+        prepared: PreparedRequest,
     ) -> Result<Response, RequestError> {
+        let (request, url) = prepared.into_parts();
         super::require_read_method(&request, "byui scheme method")?;
         let provider = self.inner.providers.page().ok_or_else(|| {
             log::debug!(

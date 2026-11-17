@@ -1,9 +1,7 @@
 //! Browser-owned `file:` scheme handling.
 
-use reqwest::Url;
-
 use crate::{
-    api::{error::RequestError, request::Request, response::Response},
+    api::{error::RequestError, request::PreparedRequest, response::Response},
     engine::RequestController,
     policy::FetchScheme,
 };
@@ -18,9 +16,9 @@ impl RequestController {
     /// cookies, or the HTTP cache.
     pub(crate) async fn fetch_file(
         &self,
-        request: Request,
-        url: Url,
+        prepared: PreparedRequest,
     ) -> Result<Response, RequestError> {
+        let (request, url) = prepared.into_parts();
         super::require_read_method(&request, "file scheme method")?;
         let provider = self.inner.providers.file().ok_or_else(|| {
             log::debug!(
