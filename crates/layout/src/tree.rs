@@ -133,6 +133,10 @@ pub struct LayoutBox {
     /// Line boxes when the box establishes an inline formatting context, in
     /// order from top to bottom.
     pub lines: Vec<LineBox>,
+    /// Whether to draw a drop-down arrow: a small down chevron, vertically
+    /// centered near the right of the padding box. Set for single-choice
+    /// `<select>` elements, whose layout keeps the arrow area free of text.
+    pub select_arrow: bool,
     /// For [`BoxKind::Replaced`] boxes, the picture to draw in the content
     /// box; `None` for every other kind.
     pub image: Option<ImageKey>,
@@ -443,6 +447,7 @@ mod tests {
             placement: Placement::InFlow,
             children,
             lines: Vec::new(),
+            select_arrow: false,
             image: None,
             control: None,
         }

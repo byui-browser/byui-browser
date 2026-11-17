@@ -10,7 +10,9 @@
 //! itself from a [`ToggleControl`] on the box.
 //!
 //! Partial support: the sizes ignore scrollbars (`<textarea>`), list-box
-//! `<select>` elements are sized like drop-downs but `size` lines tall, and
+//! `<select>` elements are sized like drop-downs but `size` lines tall and
+//! still lay out their options as stacked blocks (no selection highlight or
+//! bold group labels), and
 //! checkbox, radio, `image`, `range`, `color` and `file` inputs get no
 //! natural size.
 
@@ -19,10 +21,11 @@ use html::{HTMLDocument, NodeID, NodeKind};
 use crate::box_tree::BlockBox;
 use crate::layout::Context;
 use crate::style::Dimension;
+use crate::tree::{LineBox, LineFragment};
 
 /// Room reserved beside a `<select>`'s widest option for its drop-down
 /// arrow, in CSS pixels.
-const SELECT_ARROW_ROOM: f32 = 20.0;
+pub(crate) const SELECT_ARROW_ROOM: f32 = 20.0;
 
 /// A form control whose `auto` size comes from its font.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,10 +35,32 @@ pub(crate) enum FormControl {
     /// A `<textarea>` of `cols` characters by `rows` lines.
     TextArea { cols: u32, rows: u32 },
     /// A `<select>` as wide as its widest option and `rows` lines tall.
-    Select { options: Vec<String>, rows: u32 },
+    Select {
+        /// The text of every option, in tree order.
+        options: Vec<String>,
+        /// How many lines tall the control is.
+        rows: u32,
+        /// For a single-choice drop-down (no `multiple`, `size` ≤ 1), the
+        /// text it shows; `None` for a list box. A drop-down without options
+        /// shows an empty string.
+        drop_down: Option<String>,
+    },
     /// A `<button>` or button-type `<input>`: at least one line tall, and
     /// otherwise sized from its contents.
     Button,
+}
+
+impl BlockBox {
+    /// Whether the box is a single-choice `<select>` drop-down.
+    pub(crate) fn is_drop_down(&self) -> bool {
+        matches!(
+            self.control,
+            Some(FormControl::Select {
+                drop_down: Some(_),
+                ..
+            })
+        )
+    }
 }
 
 /// The parsed value of a positive integer attribute, or `default`.
@@ -98,9 +123,19 @@ impl FormControl {
                     (0, false) => 1,
                     (size, _) => size,
                 };
-                let mut options = Vec::new();
-                collect_options(document, node, &mut options);
-                Some(Self::Select { options, rows })
+                let mut entries = Vec::new();
+                collect_options(document, node, false, &mut entries);
+                let drop_down = (size <= 1 && attribute("multiple").is_none()).then(|| {
+                    selected_entry(&entries)
+                        .map(|entry| entry.text.clone())
+                        .unwrap_or_default()
+                });
+                let options = entries.into_iter().map(|entry| entry.text).collect();
+                Some(Self::Select {
+                    options,
+                    rows,
+                    drop_down,
+                })
             }
             "button" => Some(Self::Button),
             _ => None,
@@ -108,9 +143,34 @@ impl FormControl {
     }
 }
 
-/// Appends the text of every `<option>` below `node` (including those in
-/// `<optgroup>`s) to `options`.
-fn collect_options(document: &HTMLDocument, node: NodeID, options: &mut Vec<String>) {
+/// One `<option>` of a `<select>`.
+struct OptionEntry {
+    /// The option's text with white space collapsed.
+    text: String,
+    /// Whether it has the `selected` attribute.
+    selected: bool,
+    /// Whether it or its `<optgroup>` has the `disabled` attribute.
+    disabled: bool,
+}
+
+/// The option a drop-down shows (HTML §4.10.7 selectedness): the last one
+/// marked `selected`, or else the first one that isn't disabled.
+fn selected_entry(entries: &[OptionEntry]) -> Option<&OptionEntry> {
+    entries
+        .iter()
+        .rev()
+        .find(|entry| entry.selected)
+        .or_else(|| entries.iter().find(|entry| !entry.disabled))
+}
+
+/// Appends every `<option>` below `node` (including those in `<optgroup>`s)
+/// to `options`. `disabled` is whether an enclosing group is disabled.
+fn collect_options(
+    document: &HTMLDocument,
+    node: NodeID,
+    disabled: bool,
+    options: &mut Vec<OptionEntry>,
+) {
     let Some(dom_node) = document.get_node(node) else {
         return;
     };
@@ -119,12 +179,23 @@ fn collect_options(document: &HTMLDocument, node: NodeID, options: &mut Vec<Stri
             continue;
         };
         if let NodeKind::Element(element) = child_node.get_kind() {
+            let has = |name: &str| {
+                element
+                    .get_attributes()
+                    .iter()
+                    .any(|attribute| attribute.get_name() == name)
+            };
+            let disabled = disabled || has("disabled");
             if element.get_name() == "option" {
                 let mut text = String::new();
                 collect_text(document, child, &mut text);
-                options.push(text.split_whitespace().collect::<Vec<_>>().join(" "));
+                options.push(OptionEntry {
+                    text: text.split_whitespace().collect::<Vec<_>>().join(" "),
+                    selected: has("selected"),
+                    disabled,
+                });
             } else {
-                collect_options(document, child, options);
+                collect_options(document, child, disabled, options);
             }
         }
     }
@@ -158,6 +229,43 @@ pub(crate) struct ControlSize {
 }
 
 impl Context<'_> {
+    /// Clips a drop-down's lines (laid out from x = 0 in its content box)
+    /// to `text_width`, dropping the characters that would run under the
+    /// arrow, and makes each line box `line_width` wide.
+    ///
+    /// Partial support: text is cut at whole characters rather than clipped
+    /// mid-glyph, since painting has no clip regions yet.
+    pub(crate) fn clip_lines(&self, lines: &mut [LineBox], text_width: f32, line_width: f32) {
+        for line in lines {
+            line.rect.width = line_width;
+            line.fragments.retain_mut(|fragment| match fragment {
+                LineFragment::Text(text) => {
+                    let room = text_width - text.rect.x;
+                    if text.rect.width <= room {
+                        return true;
+                    }
+                    let mut width = 0.0;
+                    let mut end = 0;
+                    for (index, character) in text.text.char_indices() {
+                        let advance = self
+                            .fonts
+                            .font_advance(text.font, character, text.font_size);
+                        if width + advance > room {
+                            break;
+                        }
+                        width += advance;
+                        end = index + character.len_utf8();
+                    }
+                    text.text.truncate(end);
+                    text.rect.width = width;
+                    end > 0
+                }
+                LineFragment::InlineBox(inline) => inline.rect.x < text_width,
+                LineFragment::Atomic(atomic) => atomic.rect.x < text_width,
+            });
+        }
+    }
+
     /// The natural content size of `block`'s form control, clamped by
     /// `min-*` / `max-*`, for each dimension whose property is `auto`.
     ///
@@ -182,7 +290,7 @@ impl Context<'_> {
             FormControl::TextArea { cols, rows } => {
                 (Some(*cols as f32 * character), Some(*rows as f32 * line))
             }
-            FormControl::Select { options, rows } => {
+            FormControl::Select { options, rows, .. } => {
                 let widest = options
                     .iter()
                     .map(|option| fonts.font_text_width(style.font, option, style.font_size))

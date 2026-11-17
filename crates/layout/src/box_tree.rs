@@ -360,14 +360,40 @@ impl Builder<'_> {
             style.display,
             is_root || flow_root
         );
+        let control = self.form_control_sizing(node);
+        let contents = match &control {
+            // A drop-down shows only its selected option's text, as one
+            // synthetic run; its options and groups generate no boxes, and
+            // it never shows `::before` / `::after` content.
+            Some(FormControl::Select {
+                drop_down: Some(text),
+                ..
+            }) => BlockContents::Inlines(
+                (!text.is_empty())
+                    .then(|| {
+                        BuildStats::bump(&self.stats.text_runs);
+                        let style = self.styles.for_text_parent(Some(node));
+                        InlineItem::Text {
+                            node,
+                            element: Some(node),
+                            text: style.text_transform.apply(text),
+                            style,
+                            white_space: WhiteSpace::Collapse,
+                        }
+                    })
+                    .into_iter()
+                    .collect(),
+            ),
+            _ => self.container_contents(Some(node), children, style),
+        };
         BlockBox {
             node: Some(node),
-            contents: self.container_contents(Some(node), children, style),
+            contents,
             style: Rc::clone(style),
             // Floats and absolutely positioned boxes establish a new block
             // formatting context (CSS 2.2 §9.4.1).
             establishes_bfc: is_root || flow_root || style.is_out_of_flow(),
-            control: self.form_control_sizing(node),
+            control,
             clips_contents: false,
             centers_lines: false,
         }

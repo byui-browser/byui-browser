@@ -113,6 +113,21 @@ fn paint(
                     if visible(&layout_box.rect) {
                         items.extend(decorations(scrolled(layout_box.rect), &layout_box.style));
                     }
+                    if layout_box.select_arrow && visible(&layout_box.rect) {
+                        // The arrow sits inside the borders, against the
+                        // padding box's right edge.
+                        let border = layout_box.style.border_width;
+                        let padding_box = layout::Rect {
+                            x: layout_box.rect.x + border.left,
+                            y: layout_box.rect.y + border.top,
+                            width: (layout_box.rect.width - border.horizontal()).max(0.0),
+                            height: (layout_box.rect.height - border.vertical()).max(0.0),
+                        };
+                        items.extend(select_arrow(
+                            scrolled(padding_box),
+                            layout_box.style.text_color.into(),
+                        ));
+                    }
                 }
             },
             PaintItem::InlineBox(inline) => {
@@ -472,6 +487,33 @@ fn borders(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<DisplayItem> {
 
 /// The background fill for a box's border box `rect`, rounded by its
 /// `border-radius` when that is non-zero.
+/// Width of a drop-down arrow chevron, in CSS pixels.
+const ARROW_WIDTH: f32 = 10.0;
+/// Rows (one CSS pixel each) in a drop-down arrow chevron.
+const ARROW_ROWS: usize = 5;
+/// Gap between the chevron and the right of the padding box, in CSS pixels.
+const ARROW_INSET: f32 = 6.0;
+
+/// A down chevron for a `<select>` whose padding box is `rect`, vertically
+/// centered, drawn as a pair of 2px strokes per row converging to the point.
+fn select_arrow(rect: layout::Rect, color: Color) -> Vec<DisplayItem> {
+    let left = rect.right() - ARROW_INSET - ARROW_WIDTH;
+    let top = rect.y + (rect.height - ARROW_ROWS as f32) / 2.0;
+    (0..ARROW_ROWS)
+        .flat_map(|row| {
+            let y = top + row as f32;
+            let inset = row as f32;
+            [left + inset, left + ARROW_WIDTH - 2.0 - inset].map(|x| layout::Rect {
+                x,
+                y,
+                width: 2.0,
+                height: 1.0,
+            })
+        })
+        .map(|rect| DisplayItem::FillRect { rect, color })
+        .collect()
+}
+
 fn background(rect: layout::Rect, style: &layout::BoxStyle, color: Color) -> DisplayItem {
     let radii = style.border_radius.resolve(rect);
     if radii.is_zero() {
@@ -716,6 +758,33 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item, DisplayItem::BoxShadow { .. }))
         );
+    }
+
+    #[test]
+    fn a_drop_down_select_paints_its_arrow_before_its_text() {
+        let list = paint(
+            "<body><select><option>One</option></select></body>",
+            "body { margin: 0 } select { padding: 0; margin: 0; font-size: 16px }",
+        );
+        let arrow: Vec<_> = list
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::FillRect { rect, .. } if rect.height == 1.0 => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(arrow.len(), 2 * ARROW_ROWS);
+        // "One" (24px) plus 20px of arrow room; one 19.2px line.
+        let right = arrow.iter().map(|rect| rect.right()).fold(0.0, f32::max);
+        let left = arrow.iter().map(|rect| rect.x).fold(f32::MAX, f32::min);
+        assert_eq!(right, 44.0 - ARROW_INSET);
+        assert_eq!(left, 44.0 - ARROW_INSET - ARROW_WIDTH);
+        assert!((arrow[0].y - (19.2 - 5.0) / 2.0).abs() < 1e-4);
+        assert!(matches!(
+            list.items.last(),
+            Some(DisplayItem::Text { text, .. }) if text == "One"
+        ));
     }
 
     #[test]
