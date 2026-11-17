@@ -163,6 +163,18 @@ fn flex_shrink_distributes_negative_free_space_by_basis() {
 }
 
 #[test]
+fn flex_shrink_respects_the_automatic_min_content_width() {
+    let (document, tree) = lay_out(
+        "<body><div id='container'><div id='first'>unbreakable</div><div id='second'></div></div></body>",
+        "body { margin: 0 } #container { display: flex; width: 50px }\
+         #first, #second { width: 100px; flex-shrink: 1 }",
+        800.0,
+    );
+    let first = box_for(&tree, &document, "first");
+    assert_eq!(first.rect.width, 88.0);
+}
+
+#[test]
 fn parent_and_first_child_margins_collapse() {
     let (document, tree) = lay_out(
         "<html id='root'><body id='body'><h1 id='h'>T</h1></body></html>",

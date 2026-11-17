@@ -41,7 +41,8 @@ pub(crate) struct Context<'a> {
 /// unsupported properties (including the `font` shorthand) use their initial
 /// values. The font properties choose a face through
 /// [`FontMetrics::select_font`], which measures each text run.
-/// Floats, positioning, borders, and min/max sizes are not implemented.
+/// Floats, positioning, and borders are not implemented. Min/max sizes apply
+/// to replaced elements; flex items also honor their main-axis minimum size.
 /// Content may overflow the viewport; the root box's rect stays viewport-sized.
 ///
 /// This lays out without images: every `<img>` is treated as broken. Use

@@ -344,10 +344,14 @@ pub(crate) struct ComputedStyle {
     pub padding: Sides<Dimension>,
     pub width: Dimension,
     pub height: Dimension,
-    /// `min-width`; only replaced elements honor it so far.
+    /// `min-width`; replaced elements and flex items honor it so far.
     pub min_width: Dimension,
-    /// `min-height`; only replaced elements honor it so far.
+    /// `min-height`; replaced elements and flex items honor it so far.
     pub min_height: Dimension,
+    /// Whether `min-width` was left at the flex item's automatic minimum.
+    pub min_width_auto: bool,
+    /// Whether `min-height` was left at the flex item's automatic minimum.
+    pub min_height_auto: bool,
     /// `max-width`, with `none` stored as [`Dimension::Auto`]; only replaced
     /// elements honor it so far.
     pub max_width: Dimension,
@@ -400,6 +404,8 @@ impl ComputedStyle {
             height: Dimension::Auto,
             min_width: Dimension::Px(0.0),
             min_height: Dimension::Px(0.0),
+            min_width_auto: true,
+            min_height_auto: true,
             max_width: Dimension::Auto,
             max_height: Dimension::Auto,
             font_size: parent.map_or(css::values::MEDIUM_FONT_SIZE, |parent| parent.font_size),
@@ -558,14 +564,19 @@ impl ComputedStyle {
         style.padding = side("padding", false, false);
         style.width = dimension("width", true, false).unwrap_or(Dimension::Auto);
         style.height = dimension("height", true, false).unwrap_or(Dimension::Auto);
-        // `min-*: auto` computes to 0 outside flex and grid items, and
-        // `max-*: none` is stored as `Auto` (no maximum).
+        // Store the numeric fallback here and retain whether the flex
+        // automatic minimum applies in the flags below. `max-*: none` is
+        // stored as `Auto` (no maximum).
         style.min_width = dimension("min-width", true, false)
             .filter(|value| *value != Dimension::Auto)
             .unwrap_or(Dimension::Px(0.0));
         style.min_height = dimension("min-height", true, false)
             .filter(|value| *value != Dimension::Auto)
             .unwrap_or(Dimension::Px(0.0));
+        style.min_width_auto =
+            get("min-width").is_none_or(|value| value.eq_ignore_ascii_case("auto"));
+        style.min_height_auto =
+            get("min-height").is_none_or(|value| value.eq_ignore_ascii_case("auto"));
         let max = |property: &str| {
             if get(property).is_some_and(|value| value.eq_ignore_ascii_case("none")) {
                 return Dimension::Auto;

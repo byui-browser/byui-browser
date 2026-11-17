@@ -460,6 +460,32 @@ impl Context<'_> {
                 })
             })
             .collect::<Vec<_>>();
+        let minimums = list
+            .iter()
+            .map(|item| {
+                if column {
+                    if item.style.min_height_auto {
+                        self.layout_block_level(
+                            item,
+                            ContainingBlock {
+                                width,
+                                height: None,
+                            },
+                        )
+                        .fragment
+                        .rect
+                        .height
+                    } else {
+                        item.style.min_height.resolve(height).unwrap_or(0.0)
+                    }
+                } else if item.style.min_width_auto {
+                    self.intrinsic_content_sizes(item).0
+                } else {
+                    item.style.min_width.resolve(Some(width)).unwrap_or(0.0)
+                }
+                .max(0.0)
+            })
+            .collect::<Vec<_>>();
         let grow: f32 = list.iter().map(|item| item.style.flex_grow).sum();
         let free = available - gaps - basis.iter().sum::<f32>();
         let shrink: f32 = list
@@ -469,12 +495,12 @@ impl Context<'_> {
             .sum();
         let mut cursor = 0.0;
         let mut cross = 0.0_f32;
-        for (source, base) in list.iter().zip(basis) {
+        for ((source, base), minimum) in list.iter().zip(basis).zip(minimums) {
             let item = source;
             let target = if free >= 0.0 && grow > 0.0 {
                 base + free * item.style.flex_grow / grow
             } else if free < 0.0 && shrink > 0.0 {
-                (base + free * item.style.flex_shrink * base.max(0.0) / shrink).max(0.0)
+                (base + free * item.style.flex_shrink * base.max(0.0) / shrink).max(minimum)
             } else {
                 base
             };
