@@ -804,7 +804,7 @@ impl App {
         let mut script_index = 0;
         let nodes = (0..)
             .map(html::NodeID::new)
-            .map_while(|id| document.node(id).map(|node| (id, node)));
+            .map_while(|id| document.get_node(id).map(|node| (id, node)));
         for (_id, node) in nodes {
             let html::NodeKind::Element(element) = node.get_kind() else {
                 continue;

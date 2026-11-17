@@ -253,7 +253,7 @@ where
     let mut image_sources: Vec<String> = Vec::new();
     let nodes = (0..)
         .map(html::NodeID::new)
-        .map_while(|id| document.node(id).map(|node| (id, node)));
+        .map_while(|id| document.get_node(id).map(|node| (id, node)));
     for (id, node) in nodes {
         let html::NodeKind::Element(element) = node.get_kind() else {
             continue;

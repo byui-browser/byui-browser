@@ -124,7 +124,7 @@ pub(crate) fn page_title(page: &browser::Page, address: &str) -> String {
         return "Welcome".into();
     }
     let document = html::parse_raw_html(page.html.clone());
-    if let Some((index,_))=document.nodes.iter().enumerate().find(|(_,node)| {
+    if let Some((index,_))=document.get_nodes().iter().enumerate().find(|(_,node)| {
         matches!(node.get_kind(),html::NodeKind::Element(element) if element.get_name().eq_ignore_ascii_case("title"))
     }) {
         let text=document.text_content(html::NodeID::new(index)).unwrap_or_default();

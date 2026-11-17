@@ -66,13 +66,11 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
             .is_some_and(|name| name.eq_ignore_ascii_case("!doctype"))
         {
             log::trace!("doctype at byte {open}");
-            let id = document.push_node(NodeKind::Doctype(
-                Doctype::new(
-                    Some(tag[8..].trim().to_ascii_lowercase()),
-                    None,
-                    None,
-                )
-            ));
+            let id = document.push_node(NodeKind::Doctype(Doctype::new(
+                Some(tag[8..].trim().to_ascii_lowercase()),
+                None,
+                None,
+            )));
             document.append_child(root, id);
             continue;
         }

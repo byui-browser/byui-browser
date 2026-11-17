@@ -334,7 +334,7 @@ fn linked_script_finds_page_elements_and_handles_their_clicks() {
     let document = html::parse_raw_html(page.html.clone());
     let button = document.get_element_by_id("btn").expect("#btn");
     let main = document
-        .node(button)
+        .get_node(button)
         .and_then(|node| node.get_parent())
         .expect("main");
     session

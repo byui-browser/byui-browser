@@ -1,4 +1,6 @@
-use html::{Attribute, Doctype, ElementData, HTMLDocument, Namespace, NodeKind, Query, parse_raw_html};
+use html::{
+    Attribute, Doctype, ElementData, HTMLDocument, Namespace, NodeKind, Query, parse_raw_html,
+};
 
 const SIMPLE_HTML: &str = include_str!("../../../tests/html/simple.html");
 const VALID_HTML: &str = include_str!("../../../tests/html/valid.html");
@@ -22,7 +24,7 @@ fn inner_html_serializes_markup_and_escapes_text_and_attributes() {
         vec![Attribute::new("title".into(), "A & \"B\"".into())],
     )));
     let text = document.push_node(NodeKind::Text("<hello & goodbye>".into()));
-    document.append_child(document.root, paragraph);
+    document.append_child(*document.get_root(), paragraph);
     document.append_child(paragraph, text);
 
     assert_eq!(
@@ -71,13 +73,16 @@ fn arena_nodes_are_connected_with_stable_ids() {
         vec![Attribute::new("class".into(), "intro".into())],
     )));
     let text = document.push_node(NodeKind::Text("Hello".into()));
-    document.append_child(document.root, paragraph);
+    document.append_child(*document.get_root(), paragraph);
     document.append_child(paragraph, text);
     assert_eq!(
         document.get_nodes()[paragraph.get()].get_parent(),
-        Some(document.get_root())
+        Some(*document.get_root())
     );
-    assert_eq!(document.nodes[paragraph.get()].get_children(), &vec![text]);
+    assert_eq!(
+        document.get_nodes()[paragraph.get()].get_children(),
+        &vec![text]
+    );
 }
 
 #[test]
@@ -107,7 +112,7 @@ fn parses_simple_fixture_into_typed_nodes_and_queries() {
             })
     ));
     assert!(document.get_nodes().iter().any(
-        |node| matches!(node.get_kind(), NodeKind::Doctype { name: Some(name), .. } if name == "html")
+        |node| matches!(node.get_kind(), NodeKind::Doctype(doctype) if doctype.get_name().as_deref() == Some("html"))
     ));
 }
 
@@ -115,7 +120,7 @@ fn parses_simple_fixture_into_typed_nodes_and_queries() {
 fn tokenizes_tags_text_doctypes_and_comments() {
     let document = parse_raw_html("<!doctype html><!-- note --><p>hi</p>".to_owned());
     assert!(document.get_nodes().iter().any(
-        |node| matches!(node.get_kind(), NodeKind::Doctype { name: Some(name), .. } if name == "html")
+        |node| matches!(node.get_kind(), NodeKind::Doctype(doctype) if doctype.get_name().as_deref() == Some("html"))
     ));
     assert!(
         document.get_nodes().iter().any(
@@ -142,7 +147,7 @@ fn builds_legacy_tree_without_pushing_void_elements() {
         )
         .collect::<Vec<_>>();
     assert_eq!(paragraphs.len(), 2);
-    assert_eq!(paragraphs[1].get_parent(), Some(document.get_root()));
+    assert_eq!(paragraphs[1].get_parent(), Some(*document.get_root()));
     assert_eq!(
         document
             .get_nodes()
@@ -254,7 +259,8 @@ fn class_list_mutations_update_the_element_attribute() {
         class_list.set_value("panel  wide wide").unwrap();
     }
 
-    let NodeKind::Element(element) = document.get_node(html::NodeID::new(1)).unwrap().get_kind() else {
+    let NodeKind::Element(element) = document.get_node(html::NodeID::new(1)).unwrap().get_kind()
+    else {
         panic!("expected element");
     };
     assert_eq!(
@@ -306,10 +312,12 @@ fn remove_detaches_a_node_but_preserves_its_subtree() {
 fn remove_of_detached_or_root_nodes_is_a_no_op() {
     let mut document = parse_raw_html("<div></div>".to_owned());
     let detached = document.push_node(NodeKind::Comment("detached".into()));
-    let children_before = document.nodes[document.root.get()].get_children().clone();
+    let children_before = document.get_nodes()[document.get_root().get()]
+        .get_children()
+        .clone();
 
     document.remove(detached);
-    document.remove(document.get_root());
+    document.remove(*document.get_root());
 
     assert_eq!(document.get_node(detached).unwrap().get_parent(), None);
     assert_eq!(
@@ -381,7 +389,7 @@ fn parse_5_nested_children_finds_the_text_node() {
     }
     assert_eq!(
         document.get_nodes()[current.get()].get_parent(),
-        Some(document.get_root())
+        Some(*document.get_root())
     );
 }
 
@@ -395,7 +403,7 @@ fn handles_empty_input_and_text_without_markup() {
     ));
 
     let text = parse_raw_html("plain text < and > signs".to_owned());
-    assert_eq!(text.text_content(text.get_root()), None);
+    assert_eq!(text.text_content(*text.get_root()), None);
 }
 
 #[test]
@@ -409,12 +417,12 @@ fn text_content_matches_dom_node_type_rules() {
     let first_text = document.push_node(NodeKind::Text("before".into()));
     let comment = document.push_node(NodeKind::Comment("ignored by elements".into()));
     let second_text = document.push_node(NodeKind::Text("after".into()));
-    let doctype = document.push_node(NodeKind::Doctype {
-        name: Some("html".into()),
-        public_id: None,
-        system_id: None,
-    });
-    document.append_child(document.root, element);
+    let doctype = document.push_node(NodeKind::Doctype(Doctype::new(
+        Some("html".into()),
+        None,
+        None,
+    )));
+    document.append_child(*document.get_root(), element);
     document.append_child(element, first_text);
     document.append_child(element, comment);
     document.append_child(element, second_text);
@@ -425,7 +433,7 @@ fn text_content_matches_dom_node_type_rules() {
         document.text_content(comment),
         Some("ignored by elements".into())
     );
-    assert_eq!(document.text_content(document.get_root()), None);
+    assert_eq!(document.text_content(*document.get_root()), None);
     assert_eq!(document.text_content(doctype), None);
     assert_eq!(document.text_content(html::NodeID::new(999)), None);
 }
@@ -477,14 +485,18 @@ fn preserves_void_element_siblings_and_does_not_push_void_nodes() {
                 )
             })
             .expect("void element child");
-        assert!(document.get_nodes()[node_id.get()].get_children().is_empty());
+        assert!(
+            document.get_nodes()[node_id.get()]
+                .get_children()
+                .is_empty()
+        );
     }
 }
 
 #[test]
 fn keeps_incomplete_tag_text_and_unterminated_attribute_values() {
     let incomplete = parse_raw_html("hello <p".to_owned());
-    assert_eq!(incomplete.text_content(incomplete.get_root()), None);
+    assert_eq!(incomplete.text_content(*incomplete.get_root()), None);
 
     let attributes = parse_raw_html("<input value='unfinished>".to_owned());
     let input = attributes.query("input").pop().expect("input");

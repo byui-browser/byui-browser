@@ -1,6 +1,4 @@
-use super::{
-    doctype::Doctype, element_data::ElementData,
-};
+use super::{doctype::Doctype, element_data::ElementData};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeKind {

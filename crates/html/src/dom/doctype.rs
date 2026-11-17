@@ -1,4 +1,3 @@
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Doctype {
     name: Option<String>,
@@ -8,7 +7,7 @@ pub struct Doctype {
 
 impl Doctype {
     /// Constructs Doctype and sets immutable values.
-    pub fn new(name : Option<String>, public_id : Option<String>, system_id : Option<String>) -> Self {
+    pub fn new(name: Option<String>, public_id: Option<String>, system_id: Option<String>) -> Self {
         Self {
             name,
             public_id,

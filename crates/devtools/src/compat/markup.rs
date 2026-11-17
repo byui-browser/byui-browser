@@ -76,7 +76,7 @@ pub(crate) fn elements(
 ) -> impl Iterator<Item = (NodeID, &html::ElementData)> {
     (0..)
         .map(NodeID::new)
-        .map_while(move |id| document.node(id).map(|node| (id, node)))
+        .map_while(move |id| document.get_node(id).map(|node| (id, node)))
         .filter_map(|(id, node)| match node.get_kind() {
             NodeKind::Element(element) => Some((id, element)),
             _ => None,
