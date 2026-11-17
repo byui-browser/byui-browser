@@ -9,14 +9,14 @@ use std::{
 
 use crate::crypto::register_crypto;
 use crate::custom_elements::CustomElementRegistry;
+use crate::event::{
+    EventTarget, EventTargetRef, add_event_listener_to_target, dispatch_event_target,
+    remove_event_listener_from_target,
+};
 use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
 use security::RendererSecurityContext;
 
-use crate::event::{
-    EventTargetRef, add_event_listener_target, dispatch_event_on_target,
-    remove_event_listener_target,
-};
 use crate::timer::{TimerId, TimerQueue};
 
 #[derive(Clone)]
@@ -417,8 +417,7 @@ fn invoke_popstate(window: &Object, event_target: &EventTargetRef, state: &Value
     event.set("target", Value::Object(window.clone()));
     event.set("currentTarget", Value::Object(window.clone()));
 
-    if let Err(error) =
-        dispatch_event_on_target(event_target, window, &[Value::Object(event.clone())])
+    if let Err(error) = dispatch_event_target(event_target, window, &[Value::Object(event.clone())])
     {
         log::warn!("popstate event dispatch failed: {error}");
     }
@@ -483,8 +482,7 @@ fn invoke_message(window: &Object, event_target: &EventTargetRef, data: Value, o
     event.set("target", Value::Object(window.clone()));
     event.set("currentTarget", Value::Object(window.clone()));
 
-    if let Err(error) =
-        dispatch_event_on_target(event_target, window, &[Value::Object(event.clone())])
+    if let Err(error) = dispatch_event_target(event_target, window, &[Value::Object(event.clone())])
     {
         log::warn!("message event dispatch failed: {error}");
     }
@@ -720,8 +718,8 @@ fn register_window_object(
     let timers = Arc::new(Mutex::new(WindowTimers::new()));
     let microtasks = Arc::new(Mutex::new(MicrotaskQueue::new()));
     let messages = Arc::new(Mutex::new(MessageQueue::new()));
+    let event_target: EventTargetRef = Arc::new(Mutex::new(EventTarget::default()));
     let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
-    let event_target: EventTargetRef = Arc::new(Mutex::new(crate::event::EventTarget::default()));
     let performance = Object::new();
     let performance_clock = Arc::new(PerformanceClock::new());
     let evaluator = realm.script_evaluator();
@@ -786,29 +784,6 @@ fn register_window_object(
     window.set("onmessage", Value::Null);
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__mediaQueryLists", Value::Object(Object::new()));
-
-    let window_for_dispatch = window.clone();
-    let event_target_for_dispatch = event_target.clone();
-    window.set_method(
-        "dispatchEvent",
-        Arc::new(move |arguments| {
-            dispatch_event_on_target(&event_target_for_dispatch, &window_for_dispatch, arguments)
-        }),
-    );
-    let event_target_for_add = event_target.clone();
-    window.set_method(
-        "addEventListener",
-        Arc::new(move |arguments| {
-            add_event_listener_target(&event_target_for_add, "window", arguments)
-        }),
-    );
-    let event_target_for_remove = event_target.clone();
-    window.set_method(
-        "removeEventListener",
-        Arc::new(move |arguments| {
-            remove_event_listener_target(&event_target_for_remove, "window", arguments)
-        }),
-    );
 
     let window_origin = Url::parse(initial_url)
         .map(|url| url.origin().ascii_serialization())
@@ -1172,6 +1147,31 @@ fn register_window_object(
         Arc::new(move |_| {
             let completed = drain_microtasks(&microtasks_for_pump, &evaluator_for_microtasks);
             Ok(Value::Number(completed as f64))
+        }),
+    );
+
+    let window_event_target = event_target.clone();
+    window.set_method(
+        "addEventListener",
+        Arc::new(move |arguments| {
+            add_event_listener_to_target(&window_event_target, arguments, "window")
+        }),
+    );
+
+    let window_event_target = event_target.clone();
+    window.set_method(
+        "removeEventListener",
+        Arc::new(move |arguments| {
+            remove_event_listener_from_target(&window_event_target, arguments)
+        }),
+    );
+
+    let dispatch_window_event_target = event_target.clone();
+    let dispatch_window = window.clone();
+    window.set_method(
+        "dispatchEvent",
+        Arc::new(move |arguments| {
+            dispatch_event_target(&dispatch_window_event_target, &dispatch_window, arguments)
         }),
     );
 
