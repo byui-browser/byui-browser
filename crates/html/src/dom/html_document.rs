@@ -175,7 +175,7 @@ impl HTMLDocument {
 
         if let Some(node) = self.get_mut_node(element) {
             let node_kind = node.get_mut_kind();
-            let mut element_data = match node_kind {
+            let element_data = match node_kind {
                 NodeKind::Element(element_data) => element_data,
                 _ => return Err(DomError::NotFound),
             };
@@ -267,7 +267,7 @@ impl HTMLDocument {
     /// node itself is included. Names are written as the parser stored them,
     /// which is ASCII lowercase, also for SVG content.
     pub fn outer_html(&self, id: NodeID) -> Option<String> {
-        self.node(id)?;
+        self.get_node(id)?;
         let mut output = String::new();
         self.serialize_node(id, &mut output, false);
         Some(output)
