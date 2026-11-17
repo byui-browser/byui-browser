@@ -9,6 +9,8 @@ type Values = Arc<Mutex<Vec<Value>>>;
 
 /// Installs the standard-library objects supported by the engine.
 pub(super) fn install(state: &super::GlobalState) {
+    super::primitives::install(state);
+
     state.install_host("Map", Value::Function(map_constructor()));
     state.install_host("Set", Value::Function(set_constructor()));
     state.install_host("WeakMap", Value::Function(map_constructor()));
@@ -65,6 +67,12 @@ fn reflect_namespace() -> Object {
 /// for its intentionally short-lived, non-persistent global environment.
 pub(crate) fn value(name: &str) -> Option<Value> {
     match name {
+        "String" => Some(Value::Function(
+            super::primitives::string_constructor_value(),
+        )),
+        "Number" => Some(Value::Function(
+            super::primitives::number_constructor_value(),
+        )),
         "Map" => Some(Value::Function(map_constructor())),
         "Set" => Some(Value::Function(set_constructor())),
         "WeakMap" => Some(Value::Function(map_constructor())),
