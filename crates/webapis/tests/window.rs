@@ -75,6 +75,46 @@ fn global_self_aliases_window() {
 }
 
 #[test]
+fn window_add_event_listener_dispatches_and_removes_callbacks() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var calls = ''; \
+             function listener(event) { calls += event.type + ':' + (event.target === window); } \
+             window.addEventListener('ready', listener); \
+             window.addEventListener('ready', listener); \
+             window.dispatchEvent({type: 'ready'}); \
+             window.removeEventListener('ready', listener); \
+             window.dispatchEvent({type: 'ready'}); \
+             calls",
+        ),
+        Ok(Value::String("ready:true".into()))
+    );
+}
+
+#[test]
+fn window_add_event_listener_supports_once_objects_and_abort_signals() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var calls = 0; var signal = {aborted: true}; \
+             var objectListener = {}; function objectHandler(event) { calls += 1; } \
+             objectListener.handleEvent = objectHandler; \
+             function abortedHandler() { calls += 100; } \
+             window.addEventListener('once', objectListener, {once: true}); \
+             window.addEventListener('aborted', abortedHandler, {signal: signal}); \
+             window.dispatchEvent({type: 'once'}); window.dispatchEvent({type: 'once'}); \
+             window.dispatchEvent({type: 'aborted'}); calls",
+        ),
+        Ok(Value::Number(1.0))
+    );
+}
+
+#[test]
 fn window_self_accepts_extra_arguments_without_changing_the_result() {
     let mut realm = Realm::new();
     register_window(&mut realm).unwrap();
