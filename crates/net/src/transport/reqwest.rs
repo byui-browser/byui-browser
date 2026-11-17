@@ -10,7 +10,7 @@ use crate::api::{
     body::Body,
     config::Config,
     error::RequestError,
-    request::TransportRequest,
+    request::ValidatedHop,
     response::{InternalResponse, has_null_body},
 };
 
@@ -26,7 +26,7 @@ pub(crate) trait Transport: Send + Sync {
     /// returned internal response.
     fn send(
         &self,
-        request: TransportRequest,
+        request: ValidatedHop,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<InternalResponse, RequestError>> + Send>,
     >;
@@ -71,13 +71,13 @@ impl Transport for ReqwestTransport {
     /// Sends the prepared request and exposes its response body as a live stream.
     fn send(
         &self,
-        request: TransportRequest,
+        request: ValidatedHop,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<InternalResponse, RequestError>> + Send>,
     > {
         let client = self.client.clone();
         Box::pin(async move {
-            let TransportRequest {
+            let ValidatedHop {
                 mut request,
                 headers: request_headers,
                 url,

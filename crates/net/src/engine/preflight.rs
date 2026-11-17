@@ -10,7 +10,7 @@ use crate::{
     api::{
         error::RequestError,
         headers::cors_unsafe_request_header_names,
-        request::{CredentialsMode, Request, RequestMode, TransportRequest},
+        request::{CredentialsMode, Request, RequestMode, ValidatedHop},
     },
     cache::PreflightPermissions,
     engine::RequestController,
@@ -67,11 +67,7 @@ impl RequestController {
             .inner
             .scheduler
             .submit(
-                TransportRequest {
-                    request: preflight,
-                    headers,
-                    url: url.clone(),
-                },
+                ValidatedHop::new(preflight, headers, url.clone()),
                 request.transport_priority(),
             )
             .await

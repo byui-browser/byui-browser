@@ -1,4 +1,4 @@
-use http::HeaderValue;
+use http::{HeaderName, HeaderValue};
 use url::Url;
 
 use super::{
@@ -22,6 +22,25 @@ fn preparation_initializes_execution_state_without_changing_caller_configuration
     assert_eq!(prepared.request.redirect_count(), 0);
     assert_eq!(prepared.request.method(), http::Method::POST);
     assert!(prepared.request.body().is_some());
+}
+
+#[test]
+fn validated_hop_keeps_approved_transport_inputs_together() {
+    let request = Request::get("https://example.test/resource");
+    let mut headers = crate::Headers::generated_request_headers();
+    headers
+        .insert_internal_header(
+            HeaderName::from_static("x-browser-policy"),
+            HeaderValue::from_static("approved"),
+        )
+        .unwrap();
+    let url = Url::parse("https://example.test/resource").unwrap();
+
+    let hop = super::ValidatedHop::new(request, headers.clone(), url.clone());
+
+    assert_eq!(hop.request.active_url(), "https://example.test/resource");
+    assert_eq!(hop.headers, headers);
+    assert_eq!(hop.url, url);
 }
 
 #[test]

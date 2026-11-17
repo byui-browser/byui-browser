@@ -12,7 +12,7 @@ use crate::{
     api::{
         diagnostics::{NetworkEvent, NetworkPhase, SharedNetworkObserver},
         error::RequestError,
-        request::TransportRequest,
+        request::ValidatedHop,
         response::InternalResponse,
     },
     transport::Transport,
@@ -68,7 +68,7 @@ impl RequestScheduler {
     /// fully consumed or dropped.
     pub(crate) async fn submit(
         &self,
-        request: TransportRequest,
+        request: ValidatedHop,
         _priority: RequestPriority,
     ) -> Result<InternalResponse, RequestError> {
         if request.request.signal().is_aborted() {
@@ -109,7 +109,7 @@ impl RequestScheduler {
         Ok(response)
     }
 
-    fn observe(&self, request: &TransportRequest, phase: NetworkPhase, status: Option<u16>) {
+    fn observe(&self, request: &ValidatedHop, phase: NetworkPhase, status: Option<u16>) {
         self.observe_parts(
             request.request.id(),
             request.url.as_str(),

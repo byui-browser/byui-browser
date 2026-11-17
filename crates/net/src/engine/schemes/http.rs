@@ -5,7 +5,7 @@ use crate::{
         body::Body,
         diagnostics::NetworkPhase,
         error::RequestError,
-        request::{CacheMode, PreparedRequest, Request, TransportRequest},
+        request::{CacheMode, PreparedRequest, Request, ValidatedHop},
         response::{InternalResponse, Response, has_null_body},
     },
     cache::StoredResponse,
@@ -134,11 +134,7 @@ impl RequestController {
                 .inner
                 .scheduler
                 .submit(
-                    TransportRequest {
-                        request: attempt,
-                        headers: transport_headers,
-                        url: url.clone(),
-                    },
+                    ValidatedHop::new(attempt, transport_headers, url.clone()),
                     request.transport_priority(),
                 )
                 .await
