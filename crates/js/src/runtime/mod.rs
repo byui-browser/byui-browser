@@ -930,6 +930,7 @@ impl Interpreter {
         statement: &Statement,
     ) -> JsResult<Completion> {
         match statement {
+            Statement::Empty => Ok(Completion::Normal(None)),
             Statement::Expression(expression) => {
                 Ok(Completion::Normal(Some(self.evaluate(expression, scope)?)))
             }
@@ -1003,13 +1004,20 @@ impl Interpreter {
                 let value = self.evaluate(expression, scope)?;
                 Err(JsError::rethrown(value))
             }
-            Statement::Break => Ok(Completion::Break),
-            Statement::Continue => Ok(Completion::Continue),
+            Statement::Break(_) => Ok(Completion::Break),
+            Statement::Continue(_) => Ok(Completion::Continue),
             Statement::Try {
                 block,
                 handler,
                 finalizer,
             } => self.execute_try(scope, block, handler.as_ref(), finalizer.as_deref()),
+            Statement::DoWhile { .. }
+            | Statement::ForOf { .. }
+            | Statement::ForIn { .. }
+            | Statement::Switch { .. }
+            | Statement::Labeled { .. } => {
+                Err(unsupported_here("additional control-flow statements"))
+            }
         }
     }
 
