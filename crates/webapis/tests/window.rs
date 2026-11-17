@@ -2,8 +2,8 @@ use js::{Realm, Value};
 use security::{Origin, RendererSecurityContext, StoragePermission};
 use std::{thread, time::Duration};
 use webapis::{
-    register_window, register_window_with_security_context, register_window_with_url,
-    register_window_with_url_and_device_pixel_ratio,
+    Document, register_document, register_window, register_window_with_security_context,
+    register_window_with_url, register_window_with_url_and_device_pixel_ratio,
 };
 
 #[test]
@@ -68,6 +68,43 @@ fn window_navigator_accepts_extra_arguments_without_changing_the_result() {
 
     assert_eq!(
         realm.evaluate_script("window.navigator('ignored') === navigator"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_get_selection_is_null_without_an_associated_document() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.getSelection() === null"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_get_selection_returns_the_document_singleton_and_initial_empty_state() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    register_document(&mut realm, Document::new()).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "window.getSelection() === document.getSelection() && \
+             getSelection() === window.getSelection() && \
+             window.getSelection().anchorNode === null && \
+             window.getSelection().focusNode === null && \
+             window.getSelection().anchorOffset === 0 && \
+             window.getSelection().focusOffset === 0 && \
+             window.getSelection().isCollapsed === true && \
+             window.getSelection().rangeCount === 0 && \
+             window.getSelection().type === 'None' && \
+             window.getSelection().direction === 'none' && \
+             window.getSelection().toString() === '' && \
+             window.getSelection().getComposedRanges().length === 0 && \
+             window.getSelection().containsNode(null) === false"
+        ),
         Ok(Value::Boolean(true))
     );
 }
