@@ -38,6 +38,7 @@ pub use element::{Element, get_attribute};
 pub use event::{
     abort_controller_constructor, add_event_listener, dispatch_click, dispatch_click_at,
     dispatch_click_at_live, dispatch_event, event_constructor, remove_event_listener,
+    report_window_error,
 };
 pub use fetch::{fetch, register_fetch, register_fetch_with_url};
 pub use location::{

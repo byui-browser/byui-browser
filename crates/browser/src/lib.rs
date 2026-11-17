@@ -25,7 +25,7 @@ use webapis::{
     AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, register_alert,
     register_console, register_fetch_with_url, register_location_with_navigation, register_print,
     register_shared_document_with_location, register_window_with_security_context,
-    register_window_with_url_device_pixel_ratio_and_viewport,
+    register_window_with_url_device_pixel_ratio_and_viewport, report_window_error,
 };
 
 pub mod byui_provider;
@@ -762,6 +762,7 @@ impl BrowserRuntime {
             match (result, checkpoint) {
                 (Ok(result), Ok(_)) => results.push(result),
                 (Err(error), _) => {
+                    let _ = report_window_error(&window, &error, initial_url);
                     log::warn!("page script failed: {error}");
                     return Err(error);
                 }
@@ -774,6 +775,7 @@ impl BrowserRuntime {
                 realm,
                 window,
                 document,
+                source_url: initial_url.to_owned(),
             },
             results,
         })
@@ -792,6 +794,7 @@ pub struct PageSession {
     window: js::Object,
     /// The live document scripts mutate, shared with the realm's bindings.
     document: Arc<Mutex<Document>>,
+    source_url: String,
 }
 
 impl PageSession {
@@ -805,7 +808,10 @@ impl PageSession {
         let result = self.realm.evaluate_script(source);
         let checkpoint = webapis::run_window_microtasks(&self.window);
         match (result, checkpoint) {
-            (Err(error), _) => Err(error),
+            (Err(error), _) => {
+                let _ = report_window_error(&self.window, &error, &self.source_url);
+                Err(error)
+            }
             (Ok(value), Ok(_)) => Ok(value),
             (Ok(_), Err(error)) => Err(error),
         }
