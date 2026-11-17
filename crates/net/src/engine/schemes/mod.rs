@@ -1,74 +1,15 @@
 //! Scheme-specific Fetch dispatch and handlers.
 
 mod about;
-mod blob;
-mod byui;
 mod data;
-mod file;
 mod http;
+mod provider;
 
 use crate::{
-    api::{
-        error::RequestError,
-        providers::{ProviderFuture, SchemeResource},
-        request::{PreparedRequest, Request},
-        response::Response,
-    },
+    api::{error::RequestError, request::PreparedRequest, response::Response},
     engine::RequestController,
     policy::FetchScheme,
 };
-
-/// Rejects methods that cannot retrieve an immutable provider-owned resource.
-///
-/// Provider-backed local schemes expose registered or browser-authorized
-/// resources; they do not implement mutation semantics. Enforce this before
-/// provider lookup so unsupported methods cannot trigger provider side effects.
-pub(super) fn require_read_method(
-    request: &Request,
-    feature: &'static str,
-) -> Result<(), RequestError> {
-    if matches!(
-        request.method(),
-        &reqwest::Method::GET | &reqwest::Method::HEAD
-    ) {
-        Ok(())
-    } else {
-        log::warn!(
-            "rejected {} request to provider-backed scheme: {feature}",
-            request.method()
-        );
-        Err(RequestError::UnsupportedFeature(feature))
-    }
-}
-
-/// Waits for a provider without allowing cancellation to leave its operation
-/// or any resources held by its future running in the background.
-async fn await_provider(
-    request: &Request,
-    operation: ProviderFuture<'_>,
-) -> Result<SchemeResource, RequestError> {
-    if request.signal().is_aborted() {
-        log::debug!("provider wait skipped: request already aborted");
-        return Err(RequestError::Aborted);
-    }
-    tokio::select! {
-        _ = request.signal().cancelled() => Err(RequestError::Aborted),
-        result = operation => result,
-    }
-}
-
-impl RequestController {
-    /// Applies cancellation and the shared finalization path to one provider operation.
-    pub(super) async fn finish_provider_request(
-        &self,
-        request: &Request,
-        scheme: FetchScheme,
-        operation: ProviderFuture<'_>,
-    ) -> Result<Response, RequestError> {
-        let resource = await_provider(request, operation).await?;
-        self.finalize_scheme_resource(request, resource, scheme)
-    }
-}
 
 impl RequestController {
     /// Dispatches a prepared request to its scheme-specific implementation.
@@ -84,9 +25,13 @@ impl RequestController {
         match scheme {
             FetchScheme::Http | FetchScheme::Https => self.fetch_http(request).await,
             FetchScheme::Data => self.fetch_data(request).await,
-            FetchScheme::Blob => self.fetch_blob(request).await,
-            FetchScheme::File => self.fetch_file(request).await,
-            FetchScheme::Byui => self.fetch_byui(request).await,
+            FetchScheme::Blob | FetchScheme::File | FetchScheme::Byui => {
+                self.fetch_provider_scheme(
+                    request,
+                    provider::ProviderScheme::for_fetch_scheme(scheme),
+                )
+                .await
+            }
             FetchScheme::About => self.fetch_about(request).await,
         }
     }
