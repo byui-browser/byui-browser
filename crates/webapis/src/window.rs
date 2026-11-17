@@ -748,6 +748,9 @@ fn register_window_object(
         "navigator",
         Arc::new(move |_| Ok(Value::Object(navigator_for_window.clone()))),
     );
+    // A Window without an associated Document has no selection. Document
+    // registration replaces this with the document's singleton Selection.
+    window.set_method("getSelection", Arc::new(|_| Ok(Value::Null)));
     window.set("customElements", Value::Object(custom_elements.clone()));
     // HTML's structured cloning API deep-copies primitives, plain objects,
     // and arrays, preserving cycles and repeated references. This runtime
@@ -1398,6 +1401,12 @@ fn register_window_object(
     )?;
     realm.register_global_value("customElements", Value::Object(custom_elements))?;
     realm.register_global_value("navigator", Value::Object(navigator))?;
+    realm.register_global_value(
+        "getSelection",
+        window
+            .get("getSelection")
+            .expect("getSelection should be installed on Window"),
+    )?;
     realm.register_global_value("performance", Value::Object(performance))?;
     realm.register_global_value("innerWidth", inner_width)?;
     realm.register_global_value("innerHeight", inner_height)?;
