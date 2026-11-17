@@ -589,7 +589,7 @@ mod tests {
         let page = browser::Page {
             url: "https://example.test/".into(),
             html: "<html><body><ul><li>x</li></ul><script>a</script></body></html>".into(),
-            stylesheets: vec![".x { box-shadow: 1px 1px #000; cursor: pointer }".into()],
+            stylesheets: vec![".x { text-shadow: 1px 1px #000; cursor: pointer }".into()],
             scripts: vec!["var t = /a+/.test('a'); var o = new IntersectionObserver(f);".into()],
             resources: Default::default(),
         };
@@ -603,7 +603,7 @@ mod tests {
         for expected in [
             "Regular expression literals",
             "IntersectionObserver",
-            "box-shadow",
+            "text-shadow",
             "List markers",
         ] {
             assert!(

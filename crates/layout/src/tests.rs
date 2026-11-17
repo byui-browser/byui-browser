@@ -860,3 +860,130 @@ mod fonts {
         assert_eq!(line.baseline, 16.0);
     }
 }
+
+mod box_sizing {
+    use super::*;
+
+    #[test]
+    fn border_box_width_and_height_include_the_padding() {
+        let (document, tree) = lay_out(
+            "<body><div id=c>x</div><div id=b>x</div></body>",
+            "body { margin: 0 } div { width: 100px; height: 50px; padding: 10px 20px } \
+             #b { box-sizing: border-box }",
+            800.0,
+        );
+        let content = box_for(&tree, &document, "c");
+        assert_eq!((content.rect.width, content.rect.height), (140.0, 70.0));
+        let border = box_for(&tree, &document, "b");
+        assert_eq!((border.rect.width, border.rect.height), (100.0, 50.0));
+        assert_eq!(
+            (border.content_rect().width, border.content_rect().height),
+            (60.0, 30.0)
+        );
+    }
+
+    #[test]
+    fn border_box_percentages_fill_the_container_exactly() {
+        let (document, tree) = lay_out(
+            "<body><div id=d>x</div></body>",
+            "body { margin: 0 } #d { box-sizing: border-box; width: 50%; padding: 0 5% }",
+            400.0,
+        );
+        // 50% of 400px, with the 5% (20px) side paddings inside it.
+        let div = box_for(&tree, &document, "d");
+        assert_eq!(div.rect.width, 200.0);
+        assert_eq!(div.content_rect().width, 160.0);
+    }
+
+    #[test]
+    fn padding_larger_than_a_border_box_leaves_an_empty_content_box() {
+        let (document, tree) = lay_out(
+            "<body><div id=d>x</div></body>",
+            "body { margin: 0 } #d { box-sizing: border-box; width: 10px; height: 10px; \
+             padding: 8px }",
+            400.0,
+        );
+        let div = box_for(&tree, &document, "d");
+        assert_eq!(div.content_rect().width, 0.0);
+        assert_eq!((div.rect.width, div.rect.height), (16.0, 16.0));
+    }
+
+    #[test]
+    fn border_box_inline_block_and_flex_items_are_sized_once() {
+        let (document, tree) = lay_out(
+            "<body><p><span id=i>x</span></p>\
+             <div id=f><div id=a>a</div><div id=b>b</div></div></body>",
+            "body { margin: 0 } p { margin: 0 } \
+             #i { display: inline-block; box-sizing: border-box; width: 60px; padding: 0 10px } \
+             #f { display: flex; width: 300px } \
+             #a, #b { box-sizing: border-box; width: 100px; padding: 0 10px } \
+             #b { flex-grow: 1 }",
+            400.0,
+        );
+        assert_eq!(box_for(&tree, &document, "i").rect.width, 60.0);
+        assert_eq!(box_for(&tree, &document, "a").rect.width, 100.0);
+        // #b takes the remaining 100px of free space on top of its 100px.
+        assert_eq!(box_for(&tree, &document, "b").rect.width, 200.0);
+    }
+
+    #[test]
+    fn flex_free_space_leaves_room_for_item_padding() {
+        let (document, tree) = lay_out(
+            "<body><div id=f><div id=a>a</div><div id=b>b</div></div></body>",
+            "body { margin: 0 } #f { display: flex; width: 300px } \
+             #a, #b { width: 100px; padding: 0 10px } #b { flex-grow: 1 }",
+            400.0,
+        );
+        // 240px of outer widths leave 60px for #b to grow by; the row fills
+        // the container exactly instead of overflowing by the padding.
+        assert_eq!(box_for(&tree, &document, "a").rect.width, 120.0);
+        let b = box_for(&tree, &document, "b");
+        assert_eq!(b.rect.width, 180.0);
+        assert_eq!(b.rect.right(), 300.0);
+    }
+
+    #[test]
+    fn border_box_flex_items_keep_padding_inside_their_cross_size() {
+        let (document, tree) = lay_out(
+            "<body><div id=r><div id=a>a</div></div><div id=c><div id=b>b</div></div></body>",
+            "body { margin: 0 } #r { display: flex; width: 300px } \
+             #c { display: flex; flex-direction: column; width: 300px } \
+             #a, #b { box-sizing: border-box; width: 100px; height: 100px; padding: 10px }",
+            400.0,
+        );
+        let a = box_for(&tree, &document, "a");
+        assert_eq!((a.rect.width, a.rect.height), (100.0, 100.0));
+        assert_eq!(box_for(&tree, &document, "r").rect.height, 100.0);
+        let b = box_for(&tree, &document, "b");
+        assert_eq!((b.rect.width, b.rect.height), (100.0, 100.0));
+    }
+
+    #[test]
+    fn invalid_box_sizing_is_content_box() {
+        let (document, tree) = lay_out(
+            "<body><div id=d>x</div></body>",
+            "body { margin: 0 } #d { box-sizing: padding-box; width: 100px; padding: 10px }",
+            400.0,
+        );
+        assert_eq!(box_for(&tree, &document, "d").rect.width, 120.0);
+    }
+}
+
+#[test]
+fn box_shadows_reach_the_box_style_in_order() {
+    let (document, tree) = lay_out(
+        "<body><div id=d>x</div><p id=p>y</p></body>",
+        "body { margin: 0 } #d { color: blue; box-shadow: 1px 2px 3px red, inset 0 0 4px }",
+        400.0,
+    );
+    let shadows = &box_for(&tree, &document, "d").style.box_shadow;
+    assert_eq!(shadows.len(), 2);
+    assert_eq!(
+        (shadows[0].offset_x, shadows[0].offset_y, shadows[0].blur),
+        (1.0, 2.0, 3.0)
+    );
+    assert!(shadows[1].inset);
+    // An omitted color is the element's `color`.
+    assert_eq!(shadows[1].color, css::parse_color("blue").unwrap());
+    assert!(box_for(&tree, &document, "p").style.box_shadow.is_empty());
+}
