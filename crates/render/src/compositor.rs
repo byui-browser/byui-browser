@@ -106,6 +106,12 @@ impl Compositor {
                     text,
                     rgba,
                 } => self.draw_text(&mut frame, *x, *baseline, *font_size, text, *rgba, None),
+                DisplayItem::StrokeLine {
+                    from,
+                    to,
+                    width,
+                    rgba,
+                } => self.stroke_line(&mut frame, *from, *to, *width, *rgba),
                 DisplayItem::BoxShadow {
                     left,
                     top,
@@ -491,22 +497,20 @@ impl Compositor {
                     log::trace!("no image store to draw {image:?}; use compose_page");
                     None
                 }
-                paint::DisplayItem::StrokeLine { .. } => None,
+                paint::DisplayItem::StrokeLine {
+                    from,
+                    to,
+                    width,
+                    color,
+                } => Some(DisplayItem::StrokeLine {
+                    from: *from,
+                    to: *to,
+                    width: *width,
+                    rgba: [color.r, color.g, color.b, color.a],
+                }),
             })
             .collect::<Vec<_>>();
-        let mut frame = self.compose(&items);
-        for item in &list.items {
-            if let paint::DisplayItem::StrokeLine {
-                from,
-                to,
-                width,
-                color,
-            } = item
-            {
-                self.stroke_line(&mut frame, *from, *to, *width, *color, 1.0);
-            }
-        }
-        frame
+        self.compose(&items)
     }
 
     /// Rasterizes a paint crate display list into a new frame, drawing text
@@ -683,7 +687,13 @@ impl Compositor {
                     to,
                     width,
                     color,
-                } => self.stroke_line(&mut frame, *from, *to, *width, *color, scale),
+                } => self.stroke_line(
+                    &mut frame,
+                    (from.0 * scale, from.1 * scale),
+                    (to.0 * scale, to.1 * scale),
+                    *width * scale,
+                    [color.r, color.g, color.b, color.a],
+                ),
                 paint::DisplayItem::Image { rect, image } => match images {
                     Some(images) => self.draw_image(&mut frame, images, image, rect, scale),
                     None => log::trace!("no image store to draw {image:?}"),
@@ -693,21 +703,18 @@ impl Compositor {
         frame
     }
 
-    /// Strokes the segment `from`-`to` (CSS pixels) with round caps, `width`
-    /// CSS pixels wide, at `scale` device pixels per CSS pixel. Edge pixels
-    /// are blended by their center's distance to the stroke's outline.
+    /// Strokes the segment `from`-`to` (device pixels) with round caps,
+    /// `width` device pixels wide. Edge pixels are blended by their center's
+    /// distance to the stroke's outline.
     fn stroke_line(
         &self,
         frame: &mut Frame,
-        from: (f32, f32),
-        to: (f32, f32),
+        (ax, ay): (f32, f32),
+        (bx, by): (f32, f32),
         width: f32,
-        color: paint::Color,
-        scale: f32,
+        rgba: [u8; 4],
     ) {
-        let (ax, ay) = (from.0 * scale, from.1 * scale);
-        let (bx, by) = (to.0 * scale, to.1 * scale);
-        let half = width.max(0.0) * scale / 2.0;
+        let half = width.max(0.0) / 2.0;
         if half <= 0.0 {
             return;
         }
@@ -728,9 +735,9 @@ impl Compositor {
                 };
                 let distance = (x - (ax + t * dx)).hypot(y - (ay + t * dy));
                 let coverage = (half - distance + 0.5).clamp(0.0, 1.0);
-                let alpha = (coverage * f32::from(color.a)).round() as u8;
+                let alpha = (coverage * f32::from(rgba[3])).round() as u8;
                 if alpha > 0 {
-                    self.put_pixel(frame, px, py, [color.r, color.g, color.b, alpha]);
+                    self.put_pixel(frame, px, py, [rgba[0], rgba[1], rgba[2], alpha]);
                 }
             }
         }
@@ -1136,6 +1143,68 @@ mod tests {
         assert_eq!(pixel(5, 5), [255, 0, 0, 255]);
         assert_eq!(pixel(5, 8), Compositor::CLEAR_COLOR);
         assert_eq!(pixel(0, 5), Compositor::CLEAR_COLOR);
+    }
+
+    #[test]
+    fn compose_paint_keeps_stroke_lines_in_paint_order() {
+        let color = |r, b| paint::Color { r, g: 0, b, a: 255 };
+        let list = paint::DisplayList {
+            items: vec![
+                paint::DisplayItem::StrokeLine {
+                    from: (2.0, 5.0),
+                    to: (8.0, 5.0),
+                    width: 2.0,
+                    color: color(255, 0),
+                },
+                paint::DisplayItem::FillRect {
+                    rect: paint::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 10.0,
+                        height: 10.0,
+                    },
+                    color: color(0, 255),
+                },
+            ],
+        };
+        let frame = Compositor::new(10, 10).compose_paint(&list);
+        let offset = ((5 * frame.width + 5) * 4) as usize;
+        assert_eq!(frame.pixels[offset..offset + 4], [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn stroke_lines_scale_to_device_pixels_and_clip_at_frame_edges() {
+        let list = paint::DisplayList {
+            items: vec![paint::DisplayItem::StrokeLine {
+                from: (1.0, 3.0),
+                to: (20.0, 3.0),
+                width: 1.0,
+                color: paint::Color {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+            }],
+        };
+        // The line runs off the right edge of the 10x10 device frame. This
+        // is the shell's path, with no fonts or images loaded.
+        let frame = Compositor::new(10, 10).compose_page(
+            &list,
+            &FontCollection::new(None),
+            &ImageStore::new(),
+            2.0,
+        );
+        let pixel = |x: u32, y: u32| -> [u8; 4] {
+            let offset = ((y * frame.width + x) * 4) as usize;
+            frame.pixels[offset..offset + 4].try_into().unwrap()
+        };
+        // CSS y 3 is device y 6; the 2-device-pixel line covers rows 5 and 6.
+        assert_eq!(pixel(5, 5), [255, 0, 0, 255]);
+        assert_eq!(pixel(5, 6), [255, 0, 0, 255]);
+        assert_eq!(pixel(9, 6), [255, 0, 0, 255]);
+        assert_eq!(pixel(5, 9), Compositor::CLEAR_COLOR);
+        assert_eq!(pixel(5, 2), Compositor::CLEAR_COLOR);
     }
 
     #[test]
