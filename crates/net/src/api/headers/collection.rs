@@ -5,10 +5,9 @@ use crate::api::{error::RequestError, request::CredentialsMode};
 use super::{
     HeaderGuard,
     cors::CorsExposure,
-    guard::{allowed_header, guard_transition_allowed},
-    validation::{
-        header_value_string, is_non_combinable, normalize_value, parse_name, parse_value,
-    },
+    guard::{allowed_header, guard_transition_allowed, is_fetch_owned_generated_header},
+    storage::HeaderStore,
+    validation::{header_value_string, normalize_value, parse_name, parse_value},
 };
 
 /// An ordered HTTP header collection with a Fetch mutation guard.
@@ -18,7 +17,7 @@ use super::{
 /// response headers are filtered, and exposed response headers are immutable.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Headers {
-    pub(in crate::api) entries: Vec<(HeaderName, HeaderValue)>,
+    store: HeaderStore,
     guard: HeaderGuard,
 }
 
@@ -78,7 +77,7 @@ impl Headers {
     /// Creates an empty collection with an internal Fetch guard.
     pub(crate) fn with_guard(guard: HeaderGuard) -> Self {
         Self {
-            entries: Vec::new(),
+            store: HeaderStore::default(),
             guard,
         }
     }
@@ -112,7 +111,7 @@ impl Headers {
         }
         self.guard = guard;
         if guard != HeaderGuard::Immutable {
-            self.entries.retain(|(name, value)| {
+            self.store.retain(|name, value| {
                 let keep = allowed_header(guard, name, value);
                 if !keep {
                     log::trace!("header {name} dropped by {guard:?} guard");
@@ -125,14 +124,14 @@ impl Headers {
 
     /// Returns whether the list contains no headers.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.store.is_empty()
     }
 
     /// Appends a header while preserving duplicate entries and insertion order.
     pub fn append(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), RequestError> {
         let value = normalize_value(value);
         self.check(&name, &value)?;
-        self.entries.push((name, value));
+        self.store.append(name, value);
         Ok(())
     }
 
@@ -147,8 +146,7 @@ impl Headers {
     pub fn set(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), RequestError> {
         let value = normalize_value(value);
         self.check(&name, &value)?;
-        self.entries.retain(|(existing, _)| existing != name);
-        self.entries.push((name, value));
+        self.store.replace(name, value);
         Ok(())
     }
 
@@ -171,7 +169,7 @@ impl Headers {
         }
         let name = HeaderName::try_from(name)
             .map_err(|_| RequestError::InvalidHeaderName(name.to_owned()))?;
-        self.entries.retain(|(existing, _)| existing != name);
+        self.store.delete(&name);
         Ok(())
     }
 
@@ -180,35 +178,17 @@ impl Headers {
     /// Duplicate ordinary fields are combined with `", "`. `Set-Cookie`
     /// values remain separate so cookie attributes are never comma-joined.
     pub fn iter(&self) -> impl Iterator<Item = (HeaderName, String)> + '_ {
-        self.combined_entries().into_iter()
+        self.store.combined_entries().into_iter()
     }
 
     /// Returns the combined value for a header name, if present.
     pub fn get(&self, name: &str) -> Option<String> {
-        let values: Vec<&HeaderValue> = self
-            .entries
-            .iter()
-            .filter(|(entry, _)| entry.as_str().eq_ignore_ascii_case(name))
-            .map(|(_, value)| value)
-            .collect();
-        if values.is_empty() {
-            None
-        } else if name.eq_ignore_ascii_case("set-cookie") {
-            values.first().map(|value| header_value_string(value))
-        } else {
-            Some(
-                values
-                    .iter()
-                    .map(|value| header_value_string(value))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )
-        }
+        self.store.get(name)
     }
 
     /// Returns each `Set-Cookie` value without combining cookie attributes.
     pub fn get_set_cookie(&self) -> Vec<String> {
-        self.entries
+        self.store
             .iter()
             .filter(|(name, _)| name.as_str().eq_ignore_ascii_case("set-cookie"))
             .map(|(_, value)| header_value_string(value))
@@ -217,12 +197,19 @@ impl Headers {
 
     /// Returns whether a header with this name is present.
     pub fn has(&self, name: &str) -> bool {
-        self.get(name).is_some()
+        self.store
+            .iter()
+            .any(|(entry, _)| entry.as_str().eq_ignore_ascii_case(name))
+    }
+
+    /// Returns whether an already parsed header name is present.
+    pub(crate) fn contains_name(&self, name: &HeaderName) -> bool {
+        self.store.contains_name(name)
     }
 
     /// Iterates over the raw ordered representation used by Fetch internals.
     pub(crate) fn iter_raw(&self) -> impl Iterator<Item = (&HeaderName, &HeaderValue)> {
-        self.entries.iter().map(|(name, value)| (name, value))
+        self.store.iter()
     }
 
     /// Copies transport headers into an immutable, filtered response list.
@@ -239,7 +226,7 @@ impl Headers {
                     .as_ref()
                     .is_none_or(|exposure| exposure.includes(name))
             {
-                list.entries.push((name.clone(), value.clone()));
+                list.store.append(name.clone(), value.clone());
             } else {
                 log::trace!("response header {name} hidden from caller");
             }
@@ -252,21 +239,15 @@ impl Headers {
     /// Copies all transport headers for trusted provider decisions.
     pub(crate) fn internal_response(headers: &HeaderMap) -> Self {
         let mut list = Self::with_guard(HeaderGuard::Immutable);
-        list.entries.extend(
-            headers
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone())),
-        );
+        for (name, value) in headers {
+            list.store.append(name.clone(), value.clone());
+        }
         list
     }
 
     /// Converts the list to the representation expected by the HTTP transport.
     pub(crate) fn to_reqwest(&self) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        for (name, value) in &self.entries {
-            headers.append(name.clone(), value.clone());
-        }
-        headers
+        self.store.to_header_map()
     }
 
     /// Validates a mutation against the current guard and Fetch header rules.
@@ -293,8 +274,7 @@ impl Headers {
             return Err(RequestError::ImmutableHeaders);
         }
         let value = normalize_value(value);
-        self.entries.retain(|(existing, _)| existing != name);
-        self.entries.push((name, value));
+        self.store.replace(name, value);
         Ok(())
     }
 
@@ -314,46 +294,6 @@ impl Headers {
     }
 
     pub(crate) fn remove_internal_header(&mut self, name: HeaderName) {
-        self.entries.retain(|(existing, _)| existing != name);
+        self.store.delete(&name);
     }
-
-    /// Combines ordinary duplicate values for the public iterator.
-    fn combined_entries(&self) -> Vec<(HeaderName, String)> {
-        let mut combined = Vec::new();
-        for (index, (name, value)) in self.entries.iter().enumerate() {
-            if is_non_combinable(name) {
-                combined.push((name.clone(), header_value_string(value)));
-                continue;
-            }
-            if self.entries[..index]
-                .iter()
-                .any(|(existing, _)| existing == name)
-            {
-                continue;
-            }
-            let value = self
-                .entries
-                .iter()
-                .filter(|(existing, _)| existing == name)
-                .map(|(_, value)| header_value_string(value))
-                .collect::<Vec<_>>()
-                .join(", ");
-            combined.push((name.clone(), value));
-        }
-        combined
-    }
-}
-
-/// Reports whether Fetch, rather than browser identity policy, owns a field.
-fn is_fetch_owned_generated_header(name: &HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "origin"
-            | "referer"
-            | "cookie"
-            | "content-type"
-            | "content-length"
-            | "access-control-request-headers"
-            | "access-control-request-method"
-    )
 }
