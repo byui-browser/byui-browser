@@ -2,7 +2,8 @@
 //!
 //! [`css::style_document`] produces cascaded, inherited declarations as text.
 //! This module parses `display`, box dimensions and edges, text colors, and
-//! `text-align`, `border-*-radius`, and the initial flex subset (`flex-direction`, `flex-grow`, and `gap`). Other
+//! `text-align`, `border-*-radius`, and the flex subset (`flex-direction`,
+//! `flex-grow`, `flex-shrink`, `flex-basis`, and `gap`). Other
 //! properties use their initial values. A missing or unparsable value falls back to the initial
 //! value. Lengths are resolved to CSS pixels here; percentages are kept
 //! because they resolve against the containing block during layout.
@@ -370,6 +371,11 @@ pub(crate) struct ComputedStyle {
     pub border_radius: BorderRadius,
     pub flex_column: bool,
     pub flex_grow: f32,
+    /// Flex base size before free-space distribution; `auto` uses the
+    /// corresponding main-size property or the item's intrinsic size.
+    pub flex_basis: Dimension,
+    /// The factor used to distribute negative free space among flex items.
+    pub flex_shrink: f32,
     pub gap: f32,
 }
 
@@ -417,6 +423,8 @@ impl ComputedStyle {
             border_radius: BorderRadius::default(),
             flex_column: false,
             flex_grow: 0.0,
+            flex_basis: Dimension::Auto,
+            flex_shrink: 1.0,
             gap: 0.0,
         }
     }
@@ -499,6 +507,10 @@ impl ComputedStyle {
             .and_then(|value| value.parse::<f32>().ok())
             .filter(|value| value.is_finite() && *value >= 0.0)
             .unwrap_or(0.0);
+        style.flex_shrink = get("flex-shrink")
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(1.0);
 
         let context = LengthContext {
             font_size: style.font_size,
@@ -535,6 +547,7 @@ impl ComputedStyle {
             }
             Some(parsed)
         };
+        style.flex_basis = dimension("flex-basis", true, false).unwrap_or(Dimension::Auto);
         let side = |prefix: &str, allow_auto: bool, allow_negative: bool| {
             Sides::from_array(["top", "right", "bottom", "left"].map(|side| {
                 dimension(&format!("{prefix}-{side}"), allow_auto, allow_negative)

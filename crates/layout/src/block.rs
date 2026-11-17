@@ -433,39 +433,51 @@ impl Context<'_> {
         let basis = list
             .iter()
             .map(|item| {
-                if column {
-                    item.style.height.resolve(height).unwrap_or_else(|| {
-                        self.layout_block_level(
-                            item,
-                            ContainingBlock {
-                                width,
-                                height: None,
-                            },
-                        )
-                        .fragment
-                        .rect
-                        .height
-                    })
-                } else {
+                let basis_size =
                     item.style
-                        .width
-                        .resolve(Some(width))
-                        .unwrap_or_else(|| self.intrinsic_content_sizes(item).1)
-                }
+                        .flex_basis
+                        .resolve(if column { height } else { Some(width) });
+                basis_size.unwrap_or_else(|| {
+                    if column {
+                        item.style.height.resolve(height).unwrap_or_else(|| {
+                            self.layout_block_level(
+                                item,
+                                ContainingBlock {
+                                    width,
+                                    height: None,
+                                },
+                            )
+                            .fragment
+                            .rect
+                            .height
+                        })
+                    } else {
+                        item.style
+                            .width
+                            .resolve(Some(width))
+                            .unwrap_or_else(|| self.intrinsic_content_sizes(item).1)
+                    }
+                })
             })
             .collect::<Vec<_>>();
         let grow: f32 = list.iter().map(|item| item.style.flex_grow).sum();
-        let free = (available - gaps - basis.iter().sum::<f32>()).max(0.0);
+        let free = available - gaps - basis.iter().sum::<f32>();
+        let shrink: f32 = list
+            .iter()
+            .zip(&basis)
+            .map(|(item, base)| item.style.flex_shrink * base.max(0.0))
+            .sum();
         let mut cursor = 0.0;
         let mut cross = 0.0_f32;
         for (source, base) in list.iter().zip(basis) {
             let item = source;
-            let share = if grow > 0.0 {
-                free * item.style.flex_grow / grow
+            let target = if free >= 0.0 && grow > 0.0 {
+                base + free * item.style.flex_grow / grow
+            } else if free < 0.0 && shrink > 0.0 {
+                (base + free * item.style.flex_shrink * base.max(0.0) / shrink).max(0.0)
             } else {
-                0.0
+                base
             };
-            let target = base + share;
             let mut item = item.clone();
             let mut computed = (*item.style).clone();
             if column {

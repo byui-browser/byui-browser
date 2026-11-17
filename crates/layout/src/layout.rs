@@ -31,8 +31,9 @@ pub(crate) struct Context<'a> {
 ///   (CSS Backgrounds 3 §2.11.2).
 ///
 /// `display:flex` and `display:inline-flex` use a single-line flex subset with
-/// `flex-direction:row|column`, `flex-grow`, and `gap`. Wrapping, shrinking,
-/// alignment, and anonymous flex items for mixed text are not implemented.
+/// `flex-direction:row|column`, `flex-basis`, `flex-grow`, `flex-shrink`, and
+/// `gap`. Wrapping, alignment, and anonymous flex items for mixed text are not
+/// implemented.
 /// Grid and table modes are preserved distinctly in computed display values,
 /// but still use ordinary flow layout. Other supported properties are
 /// margins, padding, `width`, `height`, `font-size`, `font-family`,
