@@ -5,6 +5,10 @@
 //! `height` as `auto` they take a natural content size measured from the
 //! control's own font, the way browsers size them.
 //!
+//! Checkbox and radio inputs are different: layout sizes them like
+//! replaced elements ([`CHECKBOX_RADIO_SIZE`]) and the painter draws them
+//! itself from a [`ToggleControl`] on the box.
+//!
 //! Partial support: the sizes ignore scrollbars (`<textarea>`), list-box
 //! `<select>` elements are sized like drop-downs but `size` lines tall, and
 //! checkbox, radio, `image`, `range`, `color` and `file` inputs get no
@@ -222,4 +226,34 @@ impl Context<'_> {
             },
         }
     }
+}
+
+/// The natural width and height of checkbox and radio controls, in CSS
+/// pixels (Chrome's default). Author `width` / `height` override it.
+pub const CHECKBOX_RADIO_SIZE: f32 = 13.0;
+
+/// Which control a [`ToggleControl`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ControlKind {
+    /// `<input type=checkbox>`: a rounded square.
+    Checkbox,
+    /// `<input type=radio>`: a circle.
+    Radio,
+}
+
+/// A form control drawn by the painter in its box's content box, stored on
+/// [`crate::LayoutBox::control`].
+///
+/// Partial support: `checked` and `disabled` reflect only the element's HTML
+/// attributes as parsed. Clicking does not toggle checkedness yet (that needs
+/// a checkedness state owned by the DOM / JS side), and `indeterminate` is
+/// not supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ToggleControl {
+    /// Checkbox or radio button.
+    pub kind: ControlKind,
+    /// Whether the element has the `checked` attribute.
+    pub checked: bool,
+    /// Whether the element has the `disabled` attribute.
+    pub disabled: bool,
 }

@@ -269,6 +269,7 @@ impl Context<'_> {
             children,
             lines,
             image: None,
+            control: None,
         }
     }
 
@@ -471,7 +472,11 @@ impl Context<'_> {
                 children,
                 lines,
                 image: match &block.contents {
-                    BlockContents::Replaced(replaced) => Some(replaced.key.clone()),
+                    BlockContents::Replaced(replaced) => replaced.key.clone(),
+                    _ => None,
+                },
+                control: match &block.contents {
+                    BlockContents::Replaced(replaced) => replaced.control,
                     _ => None,
                 },
             },

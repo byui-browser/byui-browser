@@ -1764,3 +1764,77 @@ mod control_text {
         assert_eq!(texts(box_for(&tree, &document, "b")), ["Go"]);
     }
 }
+
+#[test]
+fn checkbox_and_radio_inputs_are_13px_replaced_boxes_with_ua_margins() {
+    let (document, tree) = lay_out(
+        "<body><p id=p>ab<input id=c type=checkbox checked>cd\
+         <input id=r type=RADIO disabled><input id=t type=text></p></body>",
+        "body { margin: 0 } p { margin: 0 }",
+        400.0,
+    );
+    let checkbox = box_for(&tree, &document, "c");
+    assert_eq!(checkbox.kind, BoxKind::Replaced);
+    assert_eq!(checkbox.image, None);
+    assert_eq!(
+        checkbox.control,
+        Some(crate::ToggleControl {
+            kind: crate::ControlKind::Checkbox,
+            checked: true,
+            disabled: false,
+        })
+    );
+    assert_eq!((checkbox.rect.width, checkbox.rect.height), (13.0, 13.0));
+    // `margin: 3px 3px 3px 4px` from the user-agent stylesheet.
+    assert_eq!(
+        (
+            checkbox.margin.top,
+            checkbox.margin.right,
+            checkbox.margin.bottom,
+            checkbox.margin.left
+        ),
+        (3.0, 3.0, 3.0, 4.0)
+    );
+    // After "ab" (two 8px characters) and the 4px left margin.
+    assert_eq!(checkbox.rect.x, 20.0);
+    let radio = box_for(&tree, &document, "r");
+    assert_eq!(
+        radio.control,
+        Some(crate::ToggleControl {
+            kind: crate::ControlKind::Radio,
+            checked: false,
+            disabled: true,
+        })
+    );
+    assert_eq!(box_for(&tree, &document, "t").control, None);
+}
+
+#[test]
+fn checkbox_bottom_margin_edge_sits_on_the_baseline() {
+    let (document, tree) = lay_out(
+        "<body><p id=p>a<input id=c type=checkbox>b</p></body>",
+        "body { margin: 0 } p { margin: 0 }",
+        400.0,
+    );
+    let checkbox = box_for(&tree, &document, "c");
+    let line = &box_for(&tree, &document, "p").lines[0];
+    assert_close(
+        checkbox.rect.bottom() + checkbox.margin.bottom,
+        line.baseline,
+    );
+}
+
+#[test]
+fn author_width_and_height_override_the_control_size() {
+    let (document, tree) = lay_out(
+        "<body><input id=c type=checkbox width=50 style='width:30px;height:20px'>\
+         <input id=r type=radio width=50 height=50></body>",
+        "body { margin: 0 }",
+        400.0,
+    );
+    let checkbox = box_for(&tree, &document, "c");
+    assert_eq!((checkbox.rect.width, checkbox.rect.height), (30.0, 20.0));
+    // The `width` and `height` attributes do not apply to these inputs.
+    let radio = box_for(&tree, &document, "r");
+    assert_eq!((radio.rect.width, radio.rect.height), (13.0, 13.0));
+}
