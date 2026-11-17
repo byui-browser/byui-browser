@@ -1,7 +1,7 @@
 //! Public integration tests for CSS cascade and computed styles.
 
 use css::{
-    ComputedStyles, Declaration, StyleContext, parse_stylesheet, style_document,
+    ComputedStyles, Declaration, PseudoElement, StyleContext, parse_stylesheet, style_document,
     style_document_with_context,
 };
 use html::parse_raw_html;
@@ -175,5 +175,51 @@ fn viewport_context_applies_media_queries_and_viewport_font_sizes() {
     assert_eq!(
         value(&styles, &document, "target", "font-size").as_deref(),
         Some("16px")
+    );
+}
+
+#[test]
+fn before_and_after_get_their_own_inheriting_styles() {
+    let document = parse_raw_html(
+        "<div><h1 id='h' class='result'><span>FAIL</span></h1><p id='p'>x</p></div>".into(),
+    );
+    let sheet = parse_stylesheet(
+        "h1 { color: green; margin: 4px } \
+         .result::before { content: \"SUCCESS\" } \
+         h1:after { content: '!'; color: red; display: block }",
+    );
+    let styles = style_document(&document, &[sheet]);
+    let h1 = document.get_element_by_id("h").expect("h1");
+    let p = document.get_element_by_id("p").expect("p");
+    let value = |which, property: &str| {
+        styles
+            .pseudo_declarations_for(h1, which)?
+            .iter()
+            .find(|declaration| declaration.property == property)
+            .map(|declaration| declaration.value.clone())
+    };
+    assert_eq!(
+        value(PseudoElement::Before, "content").as_deref(),
+        Some("\"SUCCESS\"")
+    );
+    // Inherited from the h1; non-inherited margin is not.
+    assert_eq!(
+        value(PseudoElement::Before, "color").as_deref(),
+        Some("green")
+    );
+    assert_eq!(value(PseudoElement::Before, "margin-top"), None);
+    assert_eq!(value(PseudoElement::After, "color").as_deref(), Some("red"));
+    assert_eq!(
+        value(PseudoElement::After, "display").as_deref(),
+        Some("block")
+    );
+    // The element itself is not styled by its pseudo-element rules.
+    assert_eq!(styles.value_for(h1, "content"), None);
+    assert_eq!(styles.value_for(h1, "display"), Some("block"));
+    // Elements no rule targets have no pseudo-element styles.
+    assert!(
+        styles
+            .pseudo_declarations_for(p, PseudoElement::Before)
+            .is_none()
     );
 }
