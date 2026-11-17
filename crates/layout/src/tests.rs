@@ -1340,6 +1340,9 @@ mod form_controls {
         // Invalid and zero sizes fall back to 20.
         assert_close(size("<input id=x size=0>", CSS).0, 160.0);
         assert_close(size("<input id=x type=search size=abc>", CSS).0, 160.0);
+        assert_close(size("<input id=x size=5px>", CSS).0, 40.0);
+        assert_close(size("<input id=x size=' 5'>", CSS).0, 40.0);
+        assert_close(size("<textarea id=x cols=40abc></textarea>", CSS).0, 320.0);
     }
 
     #[test]
@@ -1382,6 +1385,23 @@ mod form_controls {
         assert_close(size("<input id=x type=submit>", CSS).1, LINE);
         // A button with text sizes from the text.
         assert_close(size("<button id=x>Go</button>", CSS).0, 16.0);
+    }
+
+    #[test]
+    fn controls_keep_their_default_size_in_flex_and_shrink_to_fit() {
+        let (width, height) = size("<div style=\"display:flex\"><input id=x></div>", CSS);
+        assert_close(width, 160.0);
+        assert_close(height, LINE);
+        let (width, _) = size(
+            "<span id=x style=\"display:inline-block\"><input></span>",
+            CSS,
+        );
+        assert_close(width, 160.0);
+        let (width, _) = size(
+            "<div style=\"display:flex\"><select id=x><option>One</option></select></div>",
+            CSS,
+        );
+        assert_close(width, 3.0 * 8.0 + 20.0);
     }
 
     #[test]

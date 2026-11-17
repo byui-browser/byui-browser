@@ -758,6 +758,9 @@ impl Context<'_> {
     /// The min-content and max-content widths of a block container's content
     /// box (CSS Sizing 3 §5).
     pub(crate) fn intrinsic_content_sizes(&self, block: &BlockBox) -> (f32, f32) {
+        if let Some(width) = self.control_size(block, None, None).width {
+            return (width, width);
+        }
         match &block.contents {
             BlockContents::Blocks(list) => list
                 .iter()
@@ -790,16 +793,12 @@ impl Context<'_> {
             + fixed(style.padding.right)
             + fixed(style.margin.left)
             + fixed(style.margin.right);
-        let control = self.control_size(block, None, None).width;
         let (min, max) = match style.width {
             Dimension::Px(_) => {
                 let width = style.content_width(None).unwrap_or(0.0);
                 (width, width)
             }
-            _ => control.map_or_else(
-                || self.intrinsic_content_sizes(block),
-                |width| (width, width),
-            ),
+            _ => self.intrinsic_content_sizes(block),
         };
         (min + outer, max + outer)
     }

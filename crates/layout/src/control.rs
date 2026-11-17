@@ -37,7 +37,15 @@ pub(crate) enum FormControl {
 /// The parsed value of a positive integer attribute, or `default`.
 fn positive(value: Option<&str>, default: u32) -> u32 {
     value
-        .and_then(|value| value.trim().parse::<u32>().ok())
+        .and_then(|value| {
+            // HTML's rules for parsing non-negative integers: leading
+            // ASCII digits after whitespace; anything after them is ignored.
+            let value = value.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            let end = value
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(value.len());
+            value[..end].parse::<u32>().ok()
+        })
         .filter(|&value| value > 0)
         .unwrap_or(default)
 }
