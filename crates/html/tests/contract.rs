@@ -16,16 +16,13 @@ fn arena_document_starts_with_a_document_root() {
 #[test]
 fn inner_html_serializes_markup_and_escapes_text_and_attributes() {
     let mut document = HTMLDocument::new();
-    let paragraph = document.push_node(
-        NodeKind::Element(html::ElementData::new(
-            "p".into(),
-            Namespace::Html,
-            vec![Attribute::new("title".into(), "A & \"B\"".into())],
-        )),
-        None,
-    );
-    let text = document.push_node(NodeKind::Text("<hello & goodbye>".into()), None);
-    document.append_child(document.get_root(), paragraph);
+    let paragraph = document.push_node(NodeKind::Element(html::ElementData::new(
+        "p".into(),
+        Namespace::Html,
+        vec![Attribute::new("title".into(), "A & \"B\"".into())],
+    )));
+    let text = document.push_node(NodeKind::Text("<hello & goodbye>".into()));
+    document.append_child(document.root, paragraph);
     document.append_child(paragraph, text);
 
     assert_eq!(
@@ -66,31 +63,21 @@ fn create_element_rejects_invalid_names() {
 }
 
 #[test]
-fn arena_nodes_are_connected_with_stable_ids_and_spans() {
+fn arena_nodes_are_connected_with_stable_ids() {
     let mut document = HTMLDocument::new();
-    let paragraph = document.push_node(
-        NodeKind::Element(ElementData::new(
-            "p".into(),
-            Namespace::Html,
-            vec![Attribute::new("class".into(), "intro".into())],
-        )),
-        None,
-    );
-    let text = document.push_node(
-        NodeKind::Text("Hello".into()),
-        Some(html::SourceSpan { start: 0, end: 5 }),
-    );
-    document.append_child(document.get_root(), paragraph);
+    let paragraph = document.push_node(NodeKind::Element(ElementData::new(
+        "p".into(),
+        Namespace::Html,
+        vec![Attribute::new("class".into(), "intro".into())],
+    )));
+    let text = document.push_node(NodeKind::Text("Hello".into()));
+    document.append_child(document.root, paragraph);
     document.append_child(paragraph, text);
     assert_eq!(
         document.get_nodes()[paragraph.get()].get_parent(),
         Some(document.get_root())
     );
-    assert_eq!(document.get_nodes()[paragraph.get()].get_children(), &vec![text]);
-    assert_eq!(
-        document.get_nodes()[text.get()].get_span(),
-        &Some(html::SourceSpan { start: 0, end: 5 })
-    );
+    assert_eq!(document.nodes[paragraph.get()].get_children(), &vec![text]);
 }
 
 #[test]
@@ -214,14 +201,11 @@ fn get_element_by_id_returns_the_first_matching_descendant_in_tree_order() {
 #[test]
 fn get_element_by_id_matches_exactly_and_ignores_detached_nodes() {
     let mut document = parse_raw_html("<div id='target'></div>".to_owned());
-    let detached = document.push_node(
-        NodeKind::Element(ElementData::new(
-            "span".into(),
-            Namespace::Html,
-            vec![Attribute::new("id".into(), "detached".into())],
-        )),
-        None,
-    );
+    let detached = document.push_node(NodeKind::Element(ElementData::new(
+        "span".into(),
+        Namespace::Html,
+        vec![Attribute::new("id".into(), "detached".into())],
+    )));
 
     assert_eq!(document.get_element_by_id("TARGET"), None);
     assert_eq!(document.get_element_by_id("detached"), None);
@@ -321,8 +305,8 @@ fn remove_detaches_a_node_but_preserves_its_subtree() {
 #[test]
 fn remove_of_detached_or_root_nodes_is_a_no_op() {
     let mut document = parse_raw_html("<div></div>".to_owned());
-    let detached = document.push_node(NodeKind::Comment("detached".into()), None);
-    let children_before = document.get_nodes()[document.get_root().get()].get_children().clone();
+    let detached = document.push_node(NodeKind::Comment("detached".into()));
+    let children_before = document.nodes[document.root.get()].get_children().clone();
 
     document.remove(detached);
     document.remove(document.get_root());
@@ -417,28 +401,20 @@ fn handles_empty_input_and_text_without_markup() {
 #[test]
 fn text_content_matches_dom_node_type_rules() {
     let mut document = HTMLDocument::new();
-    let element = document.push_node(
-        NodeKind::Element(ElementData::new(
-            "section".into(),
-            Namespace::Html,
-            Vec::new(),
-        )),
-        None,
-    );
-    let first_text = document.push_node(NodeKind::Text("before".into()), None);
-    let comment = document.push_node(NodeKind::Comment("ignored by elements".into()), None);
-    let second_text = document.push_node(NodeKind::Text("after".into()), None);
-    let doctype = document.push_node(
-        NodeKind::Doctype(
-            Doctype::new(
-                Some("html".into()),
-                None,
-                None,
-            )
-        ),
-        None,
-    );
-    document.append_child(document.get_root(), element);
+    let element = document.push_node(NodeKind::Element(ElementData::new(
+        "section".into(),
+        Namespace::Html,
+        Vec::new(),
+    )));
+    let first_text = document.push_node(NodeKind::Text("before".into()));
+    let comment = document.push_node(NodeKind::Comment("ignored by elements".into()));
+    let second_text = document.push_node(NodeKind::Text("after".into()));
+    let doctype = document.push_node(NodeKind::Doctype {
+        name: Some("html".into()),
+        public_id: None,
+        system_id: None,
+    });
+    document.append_child(document.root, element);
     document.append_child(element, first_text);
     document.append_child(element, comment);
     document.append_child(element, second_text);
@@ -532,4 +508,20 @@ fn extracts_inline_script_sources_in_document_order() {
         document.script_sources(),
         ["print()", "fetch('https://example.com')"]
     );
+}
+
+#[test]
+fn outer_html_serializes_one_subtree_including_the_node() {
+    let document = parse_raw_html(
+        "<p>before</p><svg id=s viewBox='0 0 1 1'><path d='M0 0'/><text>a &amp; b</text></svg>"
+            .to_owned(),
+    );
+    let svg = document.get_element_by_id("s").expect("svg element");
+    assert_eq!(
+        document.outer_html(svg).as_deref(),
+        Some(
+            "<svg id=\"s\" viewbox=\"0 0 1 1\"><path d=\"M0 0\"></path><text>a &amp; b</text></svg>"
+        )
+    );
+    assert_eq!(document.outer_html(html::NodeID::new(10_000)), None);
 }

@@ -6,7 +6,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -19,10 +19,13 @@ use security::{
 use storage::{
     OriginStorage, PersistentOriginStorage, SharedStorage, StorageError, shared_storage,
 };
-use webapis::local_storage::register_local_storage;
+use webapis::local_storage::register_local_storage_with_url;
+use webapis::session_storage::register_session_storage;
 use webapis::{
-    AlertSink, ConsoleSink, Document, register_alert, register_document, register_fetch,
-    register_print, register_window_with_security_context,
+    AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, register_alert,
+    register_console, register_fetch_with_url, register_location_with_navigation, register_print,
+    register_shared_document_with_location, register_window_with_security_context,
+    register_window_with_url_device_pixel_ratio_and_viewport,
 };
 
 pub mod byui_provider;
@@ -32,7 +35,7 @@ mod load;
 pub mod refresh;
 
 pub use load::{
-    LoadError, Navigation, PageLoader, error_page, load_page, normalize_address,
+    LoadError, Navigation, PageLoader, error_page, load_page, load_page_timed, normalize_address,
     security_context_for_url,
 };
 
@@ -219,6 +222,17 @@ impl FileAccessConfiguration {
 /// Browser services use a conservative no-cookie, no-worker default and
 /// permit requests carrying browser client context.
 pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<RequestController> {
+    request_controller_with_observer(file_access, None)
+}
+
+/// Builds a browser request controller and optionally reports network lifecycle events.
+///
+/// The observer is diagnostic-only and receives redacted URLs, never request
+/// or response bodies, headers, credentials, or errors.
+pub fn request_controller_with_observer(
+    file_access: Option<FileAccessConfiguration>,
+    observer: Option<Arc<dyn net::NetworkObserver>>,
+) -> Arc<RequestController> {
     let mut providers = SchemeProviders::new().with_page(byui_provider::provider());
     log::debug!(
         "building request controller (file provider: {})",
@@ -237,10 +251,15 @@ pub fn request_controller(file_access: Option<FileAccessConfiguration>) -> Arc<R
             file_access.content_policy,
         ));
     }
+    let builder = RequestController::builder(net::Config::default())
+        .with_fetch_services(Arc::new(fetch_services::BrowserFetchServices::default()))
+        .with_scheme_providers(providers);
+    let builder = match observer {
+        Some(observer) => builder.with_network_observer(observer),
+        None => builder,
+    };
     Arc::new(
-        RequestController::builder(net::Config::default())
-            .with_fetch_services(Arc::new(fetch_services::BrowserFetchServices::default()))
-            .with_scheme_providers(providers)
+        builder
             .build()
             .expect("network controller should initialize"),
     )
@@ -268,6 +287,109 @@ pub struct Page {
     /// holding its inline text or the fetched body of its `src`. A `src` that
     /// failed to load is an empty entry, so entries stay aligned with elements.
     pub scripts: Vec<String>,
+    /// Other downloaded subresources, such as images.
+    pub resources: PageResources,
+}
+
+/// Subresources of a [`Page`] other than its stylesheets and scripts:
+/// images and web fonts.
+///
+/// Pages built by hand (tests, built-in pages) use
+/// `PageResources::default()`, which holds nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageResources {
+    /// One entry per distinct `<img src>` that downloaded successfully, in
+    /// document order. The list is shared, so cloning a page does not copy
+    /// image data, and shells can recognize the same page's images by
+    /// pointer (`Arc::ptr_eq`) to reuse decoded pictures.
+    pub images: Arc<[ImageResource]>,
+    /// One entry per `@font-face` rule whose font downloaded, in stylesheet
+    /// order. Shared like [`Self::images`].
+    pub fonts: Arc<[FontResource]>,
+}
+
+/// A web font downloaded for an `@font-face` rule. The bytes are still in
+/// their file format (WOFF2, WOFF, TrueType, OpenType); parsing is up to the
+/// renderer.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FontResource {
+    /// The rule's `font-family` descriptor, unquoted.
+    pub family: String,
+    /// The rule's inclusive `font-weight` range, such as `(400, 400)`.
+    pub weight: (u16, u16),
+    /// Whether the rule's `font-style` is italic or oblique.
+    pub italic: bool,
+    /// The URL the font was finally served from, after redirects.
+    pub url: String,
+    /// The response body.
+    pub bytes: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for FontResource {
+    /// Shows the size of the body instead of every byte.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FontResource")
+            .field("family", &self.family)
+            .field("weight", &self.weight)
+            .field("italic", &self.italic)
+            .field("url", &self.url)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// An image file downloaded for a page. The bytes are still encoded (PNG,
+/// JPEG, SVG, ...); decoding is up to the renderer.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ImageResource {
+    /// The `<img>` element's `src` attribute, trimmed but otherwise as
+    /// written. Layout identifies images by this text
+    /// (`layout::ImageKey::Src`).
+    pub src: String,
+    /// The URL the image was finally served from, after redirects.
+    pub url: String,
+    /// The response body.
+    pub bytes: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for ImageResource {
+    /// Shows the size of the body instead of every byte.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageResource")
+            .field("src", &self.src)
+            .field("url", &self.url)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// Returns the browser's default log file: `logs/browser.log` inside
+/// [`application_data_directory`], e.g.
+/// `~/.local/share/byui-browser/logs/browser.log` on Linux.
+///
+/// The entry points pass this to
+/// `common::logging::init_from_command_line_with_default_file`, which writes
+/// it alongside standard error and keeps the previous run as
+/// `logs/browser.previous.log`. Fails only when the data directory cannot
+/// be determined (for example, no home directory); the folder itself is
+/// created when the log is opened.
+pub fn default_log_file() -> io::Result<PathBuf> {
+    Ok(application_data_directory()?
+        .join("logs")
+        .join("browser.log"))
+}
+
+/// One line for `--help` saying where the default log file goes, given the
+/// result of [`default_log_file`].
+pub fn log_file_help(default_log: Option<&Path>) -> String {
+    match default_log {
+        Some(path) => format!(
+            "Log file: {} (the run before is kept as {})",
+            path.display(),
+            common::logging::previous_log_path(path).display()
+        ),
+        None => "Log file: none (the data directory is unavailable)".to_owned(),
+    }
 }
 
 /// Returns the browser-owned application-data directory for the current OS.
@@ -385,12 +507,18 @@ impl BrowserRuntime {
         security_context: RendererSecurityContext,
     ) -> JsResult<Vec<Value>> {
         self.boot_page(
-            html_source,
-            None,
+            PageInput {
+                html_source,
+                scripts: None,
+                url: None,
+            },
+            Arc::new(|_, _| {}),
             console,
             alert_sink,
             controller,
             security_context,
+            1.0,
+            None,
         )
         .map(|booted| booted.results)
     }
@@ -410,12 +538,18 @@ impl BrowserRuntime {
         security_context: RendererSecurityContext,
     ) -> JsResult<PageSession> {
         self.boot_page(
-            html_source,
-            None,
+            PageInput {
+                html_source,
+                scripts: None,
+                url: None,
+            },
+            Arc::new(|_, _| {}),
             console,
             alert_sink,
             controller,
             security_context,
+            1.0,
+            None,
         )
         .map(|booted| booted.session)
     }
@@ -435,59 +569,211 @@ impl BrowserRuntime {
         controller: Arc<RequestController>,
         security_context: RendererSecurityContext,
     ) -> JsResult<PageSession> {
-        self.boot_page(
-            &page.html,
-            Some(&page.scripts),
+        self.open_page_with_device_pixel_ratio(
+            page,
             console,
             alert_sink,
             controller,
             security_context,
+            1.0,
         )
-        .map(|booted| booted.session)
     }
 
-    fn boot_page(
+    /// Opens a loaded page and routes its `Location` navigation requests to
+    /// `navigate`. The callback runs on the page script thread and should
+    /// enqueue work for the browser's navigation loop rather than load
+    /// synchronously.
+    pub fn open_page_with_navigation(
         &self,
-        html_source: &str,
-        scripts: Option<&[String]>,
+        page: &Page,
         console: Arc<dyn ConsoleSink>,
         alert_sink: Arc<dyn AlertSink>,
         controller: Arc<RequestController>,
         security_context: RendererSecurityContext,
+        navigate: LocationNavigate,
+    ) -> JsResult<PageSession> {
+        self.open_page_with_viewport_and_navigation(
+            page,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+            1.0,
+            None,
+            navigate,
+        )
+    }
+
+    /// Opens a loaded page with the output device scale, optional viewport,
+    /// and `Location` navigation handler exposed to its scripts.
+    ///
+    /// `device_pixel_ratio` is device pixels per CSS pixel and must be finite
+    /// and greater than zero. `viewport` is in CSS pixels; without one,
+    /// `window.innerWidth` and `window.innerHeight` are zero. `navigate` runs
+    /// on the page script thread and should enqueue work for the browser's
+    /// navigation loop rather than load synchronously.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_page_with_viewport_and_navigation(
+        &self,
+        page: &Page,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+        device_pixel_ratio: f64,
+        viewport: Option<ViewportSize>,
+        navigate: LocationNavigate,
+    ) -> JsResult<PageSession> {
+        self.boot_page(
+            PageInput {
+                html_source: &page.html,
+                scripts: Some(&page.scripts),
+                url: Some(&page.url),
+            },
+            navigate,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+            device_pixel_ratio,
+            viewport,
+        )
+        .map(|booted| booted.session)
+    }
+
+    /// Opens a loaded page with the current output device scale exposed to
+    /// its scripts as `window.devicePixelRatio`.
+    ///
+    /// `device_pixel_ratio` is the number of device pixels per CSS pixel. It
+    /// must be finite and greater than zero. Existing callers can continue to
+    /// use [`BrowserRuntime::open_page`], which supplies the default value of
+    /// `1.0`.
+    pub fn open_page_with_device_pixel_ratio(
+        &self,
+        page: &Page,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+        device_pixel_ratio: f64,
+    ) -> JsResult<PageSession> {
+        self.open_page_with_viewport_and_navigation(
+            page,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+            device_pixel_ratio,
+            None,
+            Arc::new(|_, _| {}),
+        )
+    }
+
+    /// Opens a loaded page with the output device scale and viewport
+    /// dimensions exposed to its scripts.
+    ///
+    /// `device_pixel_ratio` is device pixels per CSS pixel and must be finite
+    /// and greater than zero. `viewport` is expressed in CSS pixels and is the
+    /// values used for `window.innerWidth` and `window.innerHeight` by the
+    /// CSSOM View API.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_page_with_viewport(
+        &self,
+        page: &Page,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+        device_pixel_ratio: f64,
+        viewport: ViewportSize,
+    ) -> JsResult<PageSession> {
+        self.open_page_with_viewport_and_navigation(
+            page,
+            console,
+            alert_sink,
+            controller,
+            security_context,
+            device_pixel_ratio,
+            Some(viewport),
+            Arc::new(|_, _| {}),
+        )
+    }
+
+    // Keep the existing boot pipeline explicit: each argument is a distinct
+    // renderer service or trusted document input, and the optional URL is the
+    // only addition needed to seed the document's session history.
+    #[allow(clippy::too_many_arguments)]
+    fn boot_page(
+        &self,
+        input: PageInput<'_>,
+        navigate: LocationNavigate,
+        console: Arc<dyn ConsoleSink>,
+        alert_sink: Arc<dyn AlertSink>,
+        controller: Arc<RequestController>,
+        security_context: RendererSecurityContext,
+        device_pixel_ratio: f64,
+        viewport: Option<ViewportSize>,
     ) -> JsResult<BootedPage> {
-        log::trace!("booting page: {} bytes of html", html_source.len());
-        let html_document = html::parse_raw_html(html_source.to_owned());
-        let document = Document::from_html_document(&html_document);
-        let retained = document.clone();
+        log::trace!("booting page: {} bytes of html", input.html_source.len());
+        let html_document = html::parse_raw_html(input.html_source.to_owned());
+        // Scripts and this session share one document, so the shell can lay
+        // out what scripts changed.
+        let document = Arc::new(Mutex::new(Document::from_html_document(&html_document)));
         let mut realm = Realm::new();
         register_window_with_security_context(&mut realm, security_context.clone())?;
-        register_print(&mut realm, console)?;
+        register_print(&mut realm, Arc::clone(&console))?;
+        register_console(&mut realm, console)?;
         register_alert(&mut realm, alert_sink)?;
-        register_fetch(&mut realm, controller)?;
-        register_window_with_security_context(&mut realm, security_context.clone())?;
-        register_document(&mut realm, document)?;
-        register_local_storage(&mut realm, Arc::clone(&self.storage), security_context)?;
+        let initial_url = input
+            .url
+            .filter(|url| !url.is_empty())
+            .unwrap_or("about:blank");
+        let window = register_window_with_url_device_pixel_ratio_and_viewport(
+            &mut realm,
+            initial_url,
+            device_pixel_ratio,
+            viewport,
+        )?;
+        register_fetch_with_url(&mut realm, controller, Some(initial_url))?;
+        let document_url = net::Url::parse(initial_url)
+            .unwrap_or_else(|_| net::Url::parse("about:blank").expect("valid about:blank URL"));
+        // Installs the live `Location` accessor on the window registered above.
+        let location = register_location_with_navigation(&mut realm, document_url, navigate)?;
+        register_shared_document_with_location(&mut realm, Arc::clone(&document), location)?;
+        register_local_storage_with_url(
+            &mut realm,
+            Arc::clone(&self.storage),
+            security_context.clone(),
+            initial_url,
+        )?;
+        register_session_storage(&mut realm, security_context)?;
 
         // Without caller-supplied sources only inline script text is available.
-        let sources = match scripts {
+        let sources = match input.scripts {
             Some(scripts) => scripts.to_vec(),
             None => html_document.script_sources(),
         };
         log::debug!("evaluating {} page scripts", sources.len());
-        let results = sources
-            .iter()
-            .enumerate()
-            .map(|(index, source)| {
-                log::trace!("evaluating script {index}: {} bytes", source.len());
-                realm.evaluate_script(source)
-            })
-            .collect::<JsResult<Vec<_>>>()
-            .inspect_err(|error| log::warn!("page script failed: {error}"))?;
+        let mut results = Vec::with_capacity(sources.len());
+        for (index, source) in sources.iter().enumerate() {
+            log::trace!("evaluating script {index}: {} bytes", source.len());
+            let result = realm.evaluate_script(source);
+            let checkpoint = webapis::run_window_microtasks(&window);
+            match (result, checkpoint) {
+                (Ok(result), Ok(_)) => results.push(result),
+                (Err(error), _) => {
+                    log::warn!("page script failed: {error}");
+                    return Err(error);
+                }
+                (Ok(_), Err(error)) => return Err(error),
+            }
+        }
         log::debug!("evaluated {} page scripts", results.len());
         Ok(BootedPage {
             session: PageSession {
                 realm,
-                document: retained,
+                window,
+                document,
             },
             results,
         })
@@ -503,16 +789,124 @@ pub struct PageSession {
     /// Realm that evaluated the page. Listeners close over its globals.
     #[allow(dead_code)]
     realm: Realm,
-    document: Document,
+    window: js::Object,
+    /// The live document scripts mutate, shared with the realm's bindings.
+    document: Arc<Mutex<Document>>,
 }
 
 impl PageSession {
+    /// Evaluates one page script as a task and performs its microtask
+    /// checkpoint before returning.
+    ///
+    /// The checkpoint runs even when the script returns an error, matching
+    /// the event-loop rule that a completed script task is followed by a
+    /// microtask checkpoint.
+    pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
+        let result = self.realm.evaluate_script(source);
+        let checkpoint = webapis::run_window_microtasks(&self.window);
+        match (result, checkpoint) {
+            (Err(error), _) => Err(error),
+            (Ok(value), Ok(_)) => Ok(value),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    /// Returns the current live document serialization after script mutations.
+    pub fn document_html(&self) -> String {
+        self.document.lock().unwrap().inner_html()
+    }
+
+    /// Returns a copy of the live HTML tree, including script DOM changes.
+    ///
+    /// Node IDs match the ones [`Self::dispatch_click_at`] accepts, so a
+    /// shell can lay out this tree and keep hit testing against it. Compare
+    /// copies to find out whether a script task changed the DOM.
+    pub fn live_document(&self) -> html::HTMLDocument {
+        self.document
+            .lock()
+            .unwrap()
+            .html_document()
+            .cloned()
+            .unwrap_or_else(html::HTMLDocument::new)
+    }
+
+    /// Updates the viewport's vertical scroll offset exposed as
+    /// `window.scrollY` and `window.pageYOffset`.
+    ///
+    /// The value is in CSS pixels and is maintained by the browser shell.
+    /// Script assignment remains ineffective because both properties are
+    /// non-replaceable read-only host attributes.
+    pub fn set_scroll_y(&mut self, scroll_y: f64) {
+        let value = Value::Number(scroll_y.max(0.0));
+        self.window.update_read_only("scrollY", value.clone());
+        self.window.update_read_only("pageYOffset", value);
+    }
+
+    /// Updates the viewport dimensions exposed to this live page session.
+    ///
+    /// Dimensions are CSS pixels. This keeps `window.innerWidth`,
+    /// `window.innerHeight`, and their global aliases synchronized with the
+    /// current viewport.
+    pub fn set_viewport(&mut self, viewport: ViewportSize) {
+        let width = Value::Number(viewport.width as f64);
+        let height = Value::Number(viewport.height as f64);
+        self.window.set("innerWidth", width.clone());
+        self.window.set("innerHeight", height.clone());
+        let _ = self.realm.register_global_value("innerWidth", width);
+        let _ = self.realm.register_global_value("innerHeight", height);
+        let ratio = match self.window.get("devicePixelRatio") {
+            Some(Value::Number(ratio)) => ratio,
+            _ => 1.0,
+        };
+        if let Some(Value::Function(update)) = self.window.get("__updateMediaQueries") {
+            let _ = update.call(&[
+                Value::Number(viewport.width as f64),
+                Value::Number(viewport.height as f64),
+                Value::Number(ratio),
+            ]);
+        }
+    }
+
+    /// Updates the output device scale visible as `window.devicePixelRatio`.
+    ///
+    /// `device_pixel_ratio` is device pixels per CSS pixel and must be finite
+    /// and greater than zero. The update is visible to subsequent scripts
+    /// unless script assignment has replaced the Web IDL attribute.
+    pub fn set_device_pixel_ratio(&self, device_pixel_ratio: f64) -> JsResult<()> {
+        if !device_pixel_ratio.is_finite() || device_pixel_ratio <= 0.0 {
+            return Err(js::JsError::runtime(
+                "window.devicePixelRatio must be finite and greater than zero",
+            ));
+        }
+        self.window
+            .update_replaceable_read_only("devicePixelRatio", Value::Number(device_pixel_ratio));
+        let width = match self.window.get("innerWidth") {
+            Some(Value::Number(width)) => width,
+            _ => 0.0,
+        };
+        let height = match self.window.get("innerHeight") {
+            Some(Value::Number(height)) => height,
+            _ => 0.0,
+        };
+        if let Some(Value::Function(update)) = self.window.get("__updateMediaQueries") {
+            let _ = update.call(&[
+                Value::Number(width),
+                Value::Number(height),
+                Value::Number(device_pixel_ratio),
+            ]);
+        }
+        Ok(())
+    }
+
     /// Fires a `click` event at this session's document.
     ///
     /// Runs listeners registered with `document.addEventListener('click', ...)`.
     /// Element hit testing is not performed.
     pub fn dispatch_click(&self) -> JsResult<Value> {
-        webapis::dispatch_click(&self.document)
+        let document = self.document.lock().unwrap().clone();
+        let result = webapis::dispatch_click(&document);
+        webapis::run_window_microtasks(&self.window)?;
+        result
     }
 
     /// Fires a user `click` at the element containing `node`.
@@ -521,13 +915,46 @@ impl PageSession {
     /// bubbles from that element to the document, so both element and
     /// `document` listeners run.
     pub fn dispatch_click_at(&self, node: html::NodeID) -> JsResult<Value> {
-        webapis::dispatch_click_at(&self.document, node)
+        let result = webapis::dispatch_click_at_live(&self.document, node);
+        webapis::run_window_microtasks(&self.window)?;
+        result
+    }
+
+    /// Runs this page's elapsed `window.setInterval()` callbacks.
+    ///
+    /// Call this from the page/event-loop thread. The return value is the
+    /// number of interval callbacks delivered during this pump.
+    pub fn run_timers(&self) -> JsResult<usize> {
+        webapis::run_window_timers(&self.window)
+    }
+
+    /// Runs this page's queued microtasks to a stable queue.
+    ///
+    /// Call this from the page/event-loop thread after a JavaScript task or
+    /// other callback completes. Microtasks queued during the checkpoint are
+    /// included in the returned count.
+    pub fn run_microtasks(&self) -> JsResult<usize> {
+        webapis::run_window_microtasks(&self.window)
+    }
+
+    /// Runs this page's pending `window.requestAnimationFrame()` callbacks.
+    ///
+    /// Call this from the page/event-loop thread immediately before presenting
+    /// a frame. The return value is the number of callbacks delivered.
+    pub fn run_animation_frames(&self) -> JsResult<usize> {
+        webapis::run_window_animation_frames(&self.window)
     }
 }
 
 struct BootedPage {
     session: PageSession,
     results: Vec<Value>,
+}
+
+struct PageInput<'a> {
+    html_source: &'a str,
+    scripts: Option<&'a [String]>,
+    url: Option<&'a str>,
 }
 
 /// Loads the welcome page and resolves its local stylesheet and script links.
@@ -551,6 +978,32 @@ fn attribute<'a>(attributes: &'a [html::Attribute], name: &str) -> Option<&'a st
 mod tests {
     use super::*;
     use security::{Origin, RendererSecurityContext, StoragePermission};
+    use webapis::local_storage::register_local_storage;
+
+    struct TestConsole;
+
+    impl ConsoleSink for TestConsole {
+        fn log(&self, _message: &str) {}
+    }
+
+    struct TestAlert;
+
+    impl AlertSink for TestAlert {
+        fn alert(&self, _message: &str) {}
+    }
+
+    #[test]
+    fn default_log_file_lives_in_the_data_directory() {
+        // Both resolve from the same environment, so they agree whenever the
+        // data directory is available.
+        if let (Ok(log), Ok(data)) = (default_log_file(), application_data_directory()) {
+            assert_eq!(log, data.join("logs").join("browser.log"));
+        }
+        let help = log_file_help(Some(Path::new("/data/logs/browser.log")));
+        assert!(help.contains("/data/logs/browser.log"), "{help}");
+        assert!(help.contains("browser.previous.log"), "{help}");
+        assert!(log_file_help(None).contains("none"));
+    }
 
     fn storage_context() -> RendererSecurityContext {
         RendererSecurityContext::new(
@@ -566,7 +1019,7 @@ mod tests {
         assert!(page.html.contains("href=\"style.css\""));
         assert!(page.html.contains("src=\"script.js\""));
         assert!(page.stylesheets[0].contains("background-color"));
-        assert!(page.scripts[0].contains("btn.addEventListener('click', callback)"));
+        assert!(page.scripts[0].contains("linkTile('tile-ladder')"));
     }
 
     #[test]
@@ -613,6 +1066,53 @@ mod tests {
         );
         assert!(response.body.is_null());
         assert!(runtime.block_on(response.body.bytes()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn page_session_scroll_y_tracks_the_live_window_offset() {
+        let page = Page {
+            url: "https://example.com/scroll".into(),
+            html: "<main>content</main>".into(),
+            stylesheets: Vec::new(),
+            scripts: Vec::new(),
+            resources: Default::default(),
+        };
+        let runtime = BrowserRuntime::in_memory();
+        let controller = request_controller(None);
+        let mut session = runtime
+            .open_page_with_viewport(
+                &page,
+                Arc::new(TestConsole),
+                Arc::new(TestAlert),
+                controller,
+                storage_context(),
+                1.0,
+                ViewportSize {
+                    width: 800,
+                    height: 600,
+                },
+            )
+            .expect("page session should open");
+
+        assert_eq!(
+            session
+                .realm
+                .evaluate_script("window.scrollY === 0 && window.pageYOffset === 0"),
+            Ok(Value::Boolean(true))
+        );
+        session.set_scroll_y(123.5);
+        assert_eq!(
+            session
+                .realm
+                .evaluate_script("window.scrollY === 123.5 && window.pageYOffset === 123.5"),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            session.realm.evaluate_script(
+                "window.scrollY = 1; window.pageYOffset = 1; window.scrollY === 123.5 && window.pageYOffset === 123.5",
+            ),
+            Ok(Value::Boolean(true))
+        );
     }
 
     #[test]

@@ -12,5 +12,8 @@ mod painter;
 mod types;
 
 pub use display_list::{DisplayItem, DisplayList, build_display_list};
-pub use painter::{CANVAS_COLOR, paint_document, paint_document_scrolled};
-pub use types::{Color, PaintBox, Rect};
+pub use painter::{
+    CANVAS_COLOR, paint_document, paint_document_scrolled,
+    paint_document_scrolled_with_text_backgrounds,
+};
+pub use types::{Color, CornerRadii, CornerRadius, FontId, ImageKey, PaintBox, Rect};

@@ -487,10 +487,6 @@ fn property_access_on_non_objects_is_a_runtime_error() {
         ("(1).x", "Cannot read property `x` of a number"),
         ("'text'.length", "Cannot read property `length` of a string"),
         ("'text'[0]", "Cannot read property `0` of a string"),
-        (
-            "function f() {} f.name",
-            "Cannot read property `name` of a function",
-        ),
         ("let n = null; n.x = 1", "Cannot set property `x` of null"),
         (
             "let s = 's'; s['x'] = 1",
@@ -501,6 +497,7 @@ fn property_access_on_non_objects_is_a_runtime_error() {
         assert_eq!(error.category, JsErrorCategory::Runtime, "{source}");
         assert_eq!(error.message, message, "{source}");
     }
+    assert_eq!(eval("function f() {} f.name"), Ok(Value::Undefined));
     let error = eval("null.x = 1").unwrap_err();
     assert_eq!(error.context.as_deref(), Some("property assignment"));
 }

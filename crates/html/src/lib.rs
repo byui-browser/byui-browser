@@ -11,7 +11,7 @@ mod selector;
 
 pub use dom::{
     Attribute, Doctype, DOMTokenList, DomError, ElementData, HTMLDocument, Namespace, Node, NodeID,
-    NodeKind, SourceSpan,
+    NodeKind,
 };
 pub use parser::parse_raw_html;
 pub use selector::Query;

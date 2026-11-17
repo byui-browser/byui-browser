@@ -25,6 +25,8 @@ render = { workspace = true }
 js = { workspace = true }
 webapis = { workspace = true }
 net = { workspace = true }
+tao.workspace = true
+wry.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 storage = { workspace = true }
 security = { workspace = true }

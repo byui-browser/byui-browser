@@ -122,6 +122,19 @@ fn body_margin_offsets_blocks_that_fill_the_containing_block_width() {
 }
 
 #[test]
+fn flex_row_distributes_grow_space_and_places_the_gap() {
+    let (document, tree) = lay_out(
+        "<body><div id='container'><div id='first'></div><div id='second'></div></div></body>",
+        "body { margin: 0 } #container { display: flex; width: 300px; height: 100px; gap: 10px } #first, #second { width: 50px; flex-grow: 1 }",
+        800.0,
+    );
+    let first = box_for(&tree, &document, "first");
+    let second = box_for(&tree, &document, "second");
+    assert_eq!((first.rect.x, first.rect.width), (0.0, 145.0));
+    assert_eq!((second.rect.x, second.rect.width), (155.0, 145.0));
+}
+
+#[test]
 fn parent_and_first_child_margins_collapse() {
     let (document, tree) = lay_out(
         "<html id='root'><body id='body'><h1 id='h'>T</h1></body></html>",
@@ -263,6 +276,96 @@ fn text_wraps_at_spaces_and_trailing_spaces_are_removed() {
         paragraph.lines[0].baseline - paragraph.lines[0].rect.y,
         14.4,
     );
+}
+
+/// The x of every text fragment on each line of `layout_box`.
+fn text_xs(layout_box: &LayoutBox) -> Vec<Vec<f32>> {
+    layout_box
+        .lines
+        .iter()
+        .map(|line| {
+            line.fragments
+                .iter()
+                .filter_map(|fragment| match fragment {
+                    LineFragment::Text(text) => Some(text.rect.x),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn text_align_places_each_line_in_the_line_box() {
+    // "aaaa bbbb" is 72px and "cccc" 32px in a 100px line box.
+    for (align, first, second) in [
+        ("left", 0.0, 0.0),
+        ("start", 0.0, 0.0),
+        ("center", 14.0, 34.0),
+        ("right", 28.0, 68.0),
+        ("end", 28.0, 68.0),
+    ] {
+        let (document, tree) = lay_out(
+            "<body><p id='p'>aaaa bbbb cccc</p></body>",
+            &format!("body {{ margin: 0 }} p {{ text-align: {align} }}"),
+            100.0,
+        );
+        let paragraph = box_for(&tree, &document, "p");
+        assert_eq!(texts(paragraph), ["aaaa bbbb", "cccc"], "{align}");
+        assert_eq!(text_xs(paragraph), [[first], [second]], "{align}");
+    }
+}
+
+#[test]
+fn text_align_is_inherited_and_moves_inline_boxes_and_atomics() {
+    let (document, tree) = lay_out(
+        "<body><div><p id='p'><span id='s'>ab</span><b id='b'>x</b></p></div></body>",
+        "body { margin: 0 } div { text-align: center } \
+         b { display: inline-block; width: 20px }",
+        100.0,
+    );
+    let paragraph = box_for(&tree, &document, "p");
+    // 16px of text plus a 20px inline-block leaves 64px, 32px per side.
+    let line = &paragraph.lines[0];
+    let LineFragment::InlineBox(span) = &line.fragments[0] else {
+        panic!("expected the span first, got {:?}", line.fragments[0]);
+    };
+    assert_close(span.rect.x, 32.0);
+    assert_close(box_for(&tree, &document, "b").rect.x, 48.0);
+}
+
+#[test]
+fn text_align_start_aligns_lines_wider_than_the_line_box() {
+    let (document, tree) = lay_out(
+        "<body><p id='p'>abcdefghijklmnop</p></body>",
+        "body { margin: 0 } p { text-align: right }",
+        40.0,
+    );
+    assert_eq!(text_xs(box_for(&tree, &document, "p")), [[0.0]]);
+}
+
+#[test]
+fn justify_widens_spaces_except_on_the_last_line() {
+    let (document, tree) = lay_out(
+        "<body><p id='p'>aa bb cc dddddddd</p></body>",
+        "body { margin: 0 } p { text-align: justify }",
+        100.0,
+    );
+    let paragraph = box_for(&tree, &document, "p");
+    // "aa bb cc" is 64px wide; its two spaces share the other 36px, so each
+    // widened space splits the run and the last word ends at the right edge.
+    assert_eq!(texts(paragraph), ["aa bb cc", "dddddddd"]);
+    assert_eq!(text_xs(paragraph), [vec![0.0, 42.0, 84.0], vec![0.0]]);
+}
+
+#[test]
+fn match_parent_takes_the_parents_alignment() {
+    let (document, tree) = lay_out(
+        "<body><ul style='text-align: right'><li id='li'>ab</li></ul></body>",
+        "body { margin: 0 } ul { padding: 0; margin: 0 }",
+        100.0,
+    );
+    assert_eq!(text_xs(box_for(&tree, &document, "li")), [[84.0]]);
 }
 
 #[test]
@@ -457,4 +560,303 @@ fn scroll_height_covers_tall_content_and_never_undercuts_the_viewport() {
     assert_eq!(tall_box.rect.bottom(), 2008.0);
     // The body's bottom margin is part of the scrollable area.
     assert_eq!(tall.scroll_height(), 2016.0);
+}
+
+#[test]
+fn text_transform_changes_case_before_measurement() {
+    let (document, tree) = lay_out(
+        "<body><p id='u'>Hello world</p><p id='l'>Hello World</p><p id='c'>hello big-world</p></body>",
+        "body { margin: 0 } #u { text-transform: uppercase } \
+         #l { text-transform: lowercase } #c { text-transform: capitalize }",
+        800.0,
+    );
+    assert_eq!(texts(box_for(&tree, &document, "u")), ["HELLO WORLD"]);
+    assert_eq!(texts(box_for(&tree, &document, "l")), ["hello world"]);
+    assert_eq!(texts(box_for(&tree, &document, "c")), ["Hello Big-world"]);
+}
+
+#[test]
+fn text_transform_is_inherited_and_none_resets_it() {
+    let (document, tree) = lay_out(
+        "<body><div style='text-transform: uppercase'><p id='a'>shout</p>\
+         <p id='b' style='text-transform: none'>calm</p></div></body>",
+        "body { margin: 0 }",
+        800.0,
+    );
+    assert_eq!(texts(box_for(&tree, &document, "a")), ["SHOUT"]);
+    assert_eq!(texts(box_for(&tree, &document, "b")), ["calm"]);
+}
+
+#[test]
+fn unsupported_text_transform_values_leave_text_unchanged() {
+    let (document, tree) = lay_out(
+        "<body><p id='p' style='text-transform: full-width'>abc</p></body>",
+        "body { margin: 0 }",
+        800.0,
+    );
+    assert_eq!(texts(box_for(&tree, &document, "p")), ["abc"]);
+}
+
+#[test]
+fn transparent_text_is_laid_out_with_zero_alpha() {
+    let (document, tree) = lay_out(
+        "<body><p id='p' style='color: transparent'>hidden</p></body>",
+        "body { margin: 0 }",
+        800.0,
+    );
+    let paragraph = box_for(&tree, &document, "p");
+    let colors: Vec<_> = paragraph
+        .lines
+        .iter()
+        .flat_map(|line| &line.fragments)
+        .filter_map(|fragment| match fragment {
+            LineFragment::Text(text) => Some(text.color.a),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(colors, [0]);
+    assert_eq!(texts(paragraph), ["hidden"]);
+}
+
+mod images {
+    use super::*;
+    use crate::{ImageKey, ImageMetrics, layout_document_with_images};
+
+    /// Knows one 40×20 image, `cat.png`.
+    struct TestImages;
+
+    impl ImageMetrics for TestImages {
+        fn natural_size(&self, key: &ImageKey) -> Option<Size> {
+            (*key == ImageKey::Src("cat.png".into())).then_some(Size {
+                width: 40.0,
+                height: 20.0,
+            })
+        }
+    }
+
+    fn lay_out_images(html: &str, css: &str, width: f32) -> (HTMLDocument, LayoutTree) {
+        let document = html::parse_raw_html(html.to_owned());
+        let styles = css::style_document(&document, &[css::parse_stylesheet(css)]);
+        let tree = layout_document_with_images(
+            &document,
+            &styles,
+            Size {
+                width,
+                height: 600.0,
+            },
+            &TestFont,
+            &TestImages,
+        );
+        (document, tree)
+    }
+
+    #[test]
+    fn inline_image_sits_on_the_baseline_at_its_natural_size() {
+        let (document, tree) = lay_out_images(
+            "<body><p id=p>ab<img id=i src=' cat.png '>cd</p></body>",
+            "body { margin: 0 } p { margin: 0 }",
+            400.0,
+        );
+        let image = box_for(&tree, &document, "i");
+        assert_eq!(image.kind, BoxKind::Replaced);
+        assert_eq!(image.image, Some(ImageKey::Src("cat.png".into())));
+        assert_eq!((image.rect.width, image.rect.height), (40.0, 20.0));
+        // After "ab" (two 8px characters).
+        assert_eq!(image.rect.x, 16.0);
+        let paragraph = box_for(&tree, &document, "p");
+        let line = &paragraph.lines[0];
+        // The bottom margin edge of a replaced box is its baseline.
+        assert_eq!(image.rect.bottom(), line.baseline);
+        assert_eq!(texts(paragraph), ["abcd"]);
+    }
+
+    #[test]
+    fn block_image_is_centered_by_auto_margins_and_scaled_by_max_width() {
+        let (document, tree) = lay_out_images(
+            "<body><img id=a src=cat.png><img id=b src=cat.png></body>",
+            "body { margin: 0 } img { display: block; margin: 0 auto } \
+             #b { width: 400px; max-width: 100% }",
+            100.0,
+        );
+        let a = box_for(&tree, &document, "a");
+        assert_eq!((a.rect.x, a.rect.y, a.rect.width), (30.0, 0.0, 40.0));
+        let b = box_for(&tree, &document, "b");
+        // max-width wins over width; the height follows the ratio.
+        assert_eq!((b.rect.x, b.rect.y), (0.0, 20.0));
+        assert_eq!((b.rect.width, b.rect.height), (100.0, 50.0));
+    }
+
+    #[test]
+    fn width_and_height_attributes_size_the_image() {
+        let (document, tree) = lay_out_images(
+            "<body><img id=a src=cat.png width=80><img id=b src=cat.png width=10 height=30></body>",
+            "body { margin: 0 }",
+            400.0,
+        );
+        let a = box_for(&tree, &document, "a");
+        assert_eq!((a.rect.width, a.rect.height), (80.0, 40.0));
+        let b = box_for(&tree, &document, "b");
+        assert_eq!((b.rect.width, b.rect.height), (10.0, 30.0));
+    }
+
+    #[test]
+    fn broken_image_shows_its_alt_text_unless_sized() {
+        let (document, tree) = lay_out_images(
+            "<body><p id=p><img src=missing.png alt='A dog'></p>\
+             <p id=q><img id=sized src=missing.png alt=x width=12 height=7></p></body>",
+            "body { margin: 0 }",
+            400.0,
+        );
+        assert_eq!(texts(box_for(&tree, &document, "p")), ["A dog"]);
+        let sized = box_for(&tree, &document, "sized");
+        assert_eq!(sized.kind, BoxKind::Replaced);
+        assert_eq!((sized.rect.width, sized.rect.height), (12.0, 7.0));
+    }
+
+    #[test]
+    fn inline_svg_is_one_replaced_box_and_its_text_is_not_laid_out() {
+        let (document, tree) = lay_out_images(
+            "<body><div id=d><svg id=s viewBox='0 0 4 2'><text>hidden</text>\
+             <svg id=inner width=5 height=5></svg></svg></div>\
+             <div id=e><svg id=t width=24 height=12></svg></div></body>",
+            "body { margin: 0 } svg { display: block }",
+            200.0,
+        );
+        let svg = box_for(&tree, &document, "s");
+        assert_eq!(svg.kind, BoxKind::Replaced);
+        assert_eq!(svg.image, Some(ImageKey::InlineSvg(id(&document, "s"))));
+        // Only a ratio: the box fills the containing block's width.
+        assert_eq!((svg.rect.width, svg.rect.height), (200.0, 100.0));
+        assert!(find(&tree.root, id(&document, "inner")).is_none());
+        assert!(texts(box_for(&tree, &document, "d")).is_empty());
+        let sized = box_for(&tree, &document, "t");
+        assert_eq!((sized.rect.width, sized.rect.height), (24.0, 12.0));
+    }
+
+    #[test]
+    fn images_paint_after_backgrounds_and_are_hit_by_their_element() {
+        let (document, tree) = lay_out_images(
+            "<body><img id=i src=cat.png><div id=d>t</div></body>",
+            "body { margin: 0 } img { display: block } div { background-color: red }",
+            200.0,
+        );
+        let order = tree
+            .paint_order()
+            .into_iter()
+            .map(|item| match item {
+                PaintItem::BoxDecorations(layout_box) => format!("box {:?}", layout_box.kind),
+                PaintItem::InlineBox(_) => "inline".into(),
+                PaintItem::Text(text) => format!("text {}", text.text),
+                PaintItem::Image(layout_box) => format!("image {:?}", layout_box.image),
+            })
+            .collect::<Vec<_>>();
+        let image = order
+            .iter()
+            .position(|item| item.starts_with("image"))
+            .unwrap();
+        let last_box = order
+            .iter()
+            .rposition(|item| item.starts_with("box"))
+            .unwrap();
+        assert!(image > last_box, "{order:?}");
+        assert_eq!(tree.hit_test(5.0, 5.0), Some(id(&document, "i")));
+        assert_eq!(tree.hit_test(5.0, 25.0), Some(id(&document, "d")));
+    }
+
+    #[test]
+    fn layout_document_treats_every_image_as_broken() {
+        let (document, tree) = lay_out("<body><img id=i src=cat.png></body>", "", 200.0);
+        let image = box_for(&tree, &document, "i");
+        assert_eq!((image.rect.width, image.rect.height), (0.0, 0.0));
+    }
+}
+
+mod fonts {
+    use super::*;
+    use crate::FontId;
+
+    /// The test font, plus face 1 ("Wide") whose characters advance a whole
+    /// em and whose ascent is a full em.
+    struct TwoFaces;
+
+    impl FontMetrics for TwoFaces {
+        fn advance(&self, character: char, font_size: f32) -> f32 {
+            TestFont.advance(character, font_size)
+        }
+
+        fn vertical_metrics(&self, font_size: f32) -> VerticalMetrics {
+            TestFont.vertical_metrics(font_size)
+        }
+
+        fn select_font(&self, families: &[String], weight: u16, _italic: bool) -> FontId {
+            let wide = families.iter().any(|family| family == "Wide") && weight >= 600;
+            if wide { FontId(1) } else { FontId::DEFAULT }
+        }
+
+        fn font_advance(&self, font: FontId, character: char, font_size: f32) -> f32 {
+            match font {
+                FontId(1) => font_size,
+                _ => self.advance(character, font_size),
+            }
+        }
+
+        fn font_vertical_metrics(&self, font: FontId, font_size: f32) -> VerticalMetrics {
+            match font {
+                FontId(1) => VerticalMetrics {
+                    ascent: font_size,
+                    descent: 0.0,
+                    line_gap: 0.0,
+                },
+                _ => self.vertical_metrics(font_size),
+            }
+        }
+    }
+
+    #[test]
+    fn text_is_measured_with_the_face_selected_from_font_properties() {
+        let document = html::parse_raw_html(
+            "<body><p id=p>ab<span>cd</span></p><p id=q>ab</p></body>".to_owned(),
+        );
+        let styles = css::style_document(
+            &document,
+            &[css::parse_stylesheet(
+                "body { margin: 0 } p { margin: 0 } \
+                 #p { font-family: 'Missing', Wide, serif; font-weight: bold }",
+            )],
+        );
+        let tree = layout_document(
+            &document,
+            &styles,
+            Size {
+                width: 400.0,
+                height: 600.0,
+            },
+            &TwoFaces,
+        );
+        let fragments = |name: &str| -> Vec<(String, FontId, f32)> {
+            box_for(&tree, &document, name).lines[0]
+                .fragments
+                .iter()
+                .filter_map(|fragment| match fragment {
+                    LineFragment::Text(text) => {
+                        Some((text.text.clone(), text.font, text.rect.width))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        // The span inherits the paragraph's family and weight.
+        assert_eq!(
+            fragments("p"),
+            [
+                ("ab".to_owned(), FontId(1), 32.0),
+                ("cd".to_owned(), FontId(1), 32.0)
+            ]
+        );
+        assert_eq!(fragments("q"), [("ab".to_owned(), FontId::DEFAULT, 16.0)]);
+        // The wide face's ascent (16px) exceeds the strut's (12.8 + half
+        // leading 1.6), so it sets the baseline.
+        let line = &box_for(&tree, &document, "p").lines[0];
+        assert_eq!(line.baseline, 16.0);
+    }
 }

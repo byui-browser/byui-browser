@@ -16,11 +16,15 @@
 // it is compiled for tests alone; building it there would otherwise fail
 // `-D warnings` with dead-code errors.
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+mod compat_panel;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 mod content;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 mod context_menu;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 mod elements_panel;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+mod find_in_page;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 mod page_source;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
@@ -28,6 +32,12 @@ mod toolbar;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod app;
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+mod tab_alerts;
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+mod tab_strip;
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+mod tabs;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub use app::{Platform, run};

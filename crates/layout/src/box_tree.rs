@@ -6,10 +6,13 @@ use std::rc::Rc;
 
 use html::{HTMLDocument, NodeID, NodeKind};
 
-use crate::style::{ComputedStyle, Display, DisplayInside, DisplayOutside};
+use crate::replaced::{
+    ImageKey, ImageMetrics, NaturalSize, ReplacedBox, parse_dimension_attribute, view_box_ratio,
+};
+use crate::style::{ComputedStyle, Dimension, Display, DisplayInside, DisplayOutside};
 
 /// A block container box before layout.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct BlockBox {
     /// The generating element, or `None` for anonymous boxes and the initial
     /// containing block.
@@ -23,15 +26,18 @@ pub(crate) struct BlockBox {
 
 /// A block container holds either only block-level boxes or only inline-level
 /// content (CSS 2.2 §9.2.1.1).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum BlockContents {
     Blocks(Vec<BlockBox>),
     Inlines(Vec<InlineItem>),
+    /// The box is a replaced element (`<img>`, inline `<svg>`); its content
+    /// is a picture rather than child boxes.
+    Replaced(ReplacedBox),
 }
 
 /// Inline-level content of an inline formatting context, flattened in tree
 /// order. Inline boxes are bracketed by `Start` and `End`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum InlineItem {
     Text {
         node: NodeID,
@@ -67,6 +73,38 @@ pub(crate) struct StyleMap {
     initial: Rc<ComputedStyle>,
 }
 
+/// The computed `text-align` of `node`'s nearest element ancestor, for
+/// `match-parent`. Ancestors whose own value is `match-parent` defer to
+/// theirs in turn; the root falls back to `start`.
+fn parent_text_align(
+    document: &HTMLDocument,
+    styles: &css::ComputedStyles,
+    node: NodeID,
+) -> crate::style::TextAlign {
+    let mut current = document
+        .nodes
+        .get(node.get())
+        .and_then(|node| node.get_parent());
+    while let Some(ancestor) = current {
+        if let Some(declarations) = styles.declarations_for(ancestor) {
+            let value = declarations
+                .iter()
+                .find(|declaration| declaration.property == "text-align")
+                .map(|declaration| declaration.value.as_str());
+            let align =
+                crate::style::TextAlign::compute(value, || crate::style::TextAlign::MatchParent);
+            if align != crate::style::TextAlign::MatchParent {
+                return align;
+            }
+        }
+        current = document
+            .nodes
+            .get(ancestor.get())
+            .and_then(|node| node.get_parent());
+    }
+    crate::style::TextAlign::Start
+}
+
 impl StyleMap {
     /// Resolves every element's computed style. The root element's display is
     /// blockified (CSS Display 3 §2.8).
@@ -75,6 +113,7 @@ impl StyleMap {
         styles: &css::ComputedStyles,
         root: Option<NodeID>,
         viewport: crate::Size,
+        fonts: &dyn crate::FontMetrics,
     ) -> Self {
         let root_font_size = root
             .and_then(|root| styles.value_for(root, "font-size"))
@@ -90,11 +129,18 @@ impl StyleMap {
             .map(|index| {
                 let node = NodeID::new(index);
                 let declarations = styles.declarations_for(node)?;
-                let mut style =
-                    ComputedStyle::from_declarations(declarations, root_font_size, viewport);
+                let parent_text_align = || parent_text_align(document, styles, node);
+                let mut style = ComputedStyle::from_declarations(
+                    declarations,
+                    root_font_size,
+                    viewport,
+                    parent_text_align,
+                );
                 if Some(node) == root {
                     style.display = style.display.blockified();
                 }
+                style.font =
+                    fonts.select_font(&style.font_families, style.font_weight, style.font_italic);
                 Some(Rc::new(style))
             })
             .collect();
@@ -146,10 +192,12 @@ pub(crate) fn root_element(document: &HTMLDocument) -> Option<NodeID> {
 pub(crate) fn build_initial_containing_block(
     document: &HTMLDocument,
     styles: &StyleMap,
+    images: &dyn ImageMetrics,
 ) -> BlockBox {
     let builder = Builder {
         document,
         styles,
+        images,
         stats: BuildStats::default(),
     };
     let root = root_element(document);
@@ -201,6 +249,7 @@ impl BuildStats {
 struct Builder<'a> {
     document: &'a HTMLDocument,
     styles: &'a StyleMap,
+    images: &'a dyn ImageMetrics,
     stats: BuildStats,
 }
 
@@ -219,7 +268,10 @@ impl Builder<'_> {
         let flow_root = matches!(
             style.display,
             Display::Box {
-                inside: DisplayInside::FlowRoot,
+                inside: DisplayInside::FlowRoot
+                    | DisplayInside::Flex
+                    | DisplayInside::Grid
+                    | DisplayInside::Table,
                 ..
             }
         );
@@ -314,13 +366,14 @@ impl Builder<'_> {
         match dom_node.get_kind() {
             NodeKind::Text(text) => {
                 BuildStats::bump(&self.stats.text_runs);
+                let style = self.styles.for_text_parent(dom_node.get_parent());
                 levels.push(Level::Inline(InlineItem::Text {
                     node,
                     element: dom_node
                         .get_parent()
                         .filter(|parent| self.styles.get(*parent).is_some()),
-                    text: text.clone(),
-                    style: self.styles.for_text_parent(dom_node.get_parent()),
+                    text: style.text_transform.apply(text),
+                    style,
                 }));
             }
             NodeKind::Element(element) => {
@@ -332,6 +385,15 @@ impl Builder<'_> {
                     );
                     return;
                 };
+                if !matches!(style.display, Display::None | Display::Contents)
+                    && let Some(level) = self.replaced(node, element, style)
+                {
+                    match level {
+                        Level::Block(block) => split_inlines_around(block, levels, open_inlines),
+                        inline => levels.push(inline),
+                    }
+                    return;
+                }
                 match style.display {
                     Display::None => {
                         BuildStats::bump(&self.stats.skipped);
@@ -371,7 +433,11 @@ impl Builder<'_> {
                     }
                     Display::Box {
                         outside: DisplayOutside::Inline,
-                        inside: DisplayInside::FlowRoot,
+                        inside:
+                            DisplayInside::FlowRoot
+                            | DisplayInside::Flex
+                            | DisplayInside::Grid
+                            | DisplayInside::Table,
                     } => {
                         let atomic = self.block_box(node, style, false);
                         levels.push(Level::Inline(InlineItem::Atomic(atomic)));
@@ -382,24 +448,152 @@ impl Builder<'_> {
                     } => {
                         let is_root = dom_node.get_parent() == Some(self.document.root)
                             && root_element(self.document) == Some(node);
-                        // A block inside inline boxes splits them around it
-                        // (CSS 2.2 §9.2.1.1).
-                        for _ in open_inlines.iter() {
-                            levels.push(Level::Inline(InlineItem::End { end_edge: false }));
-                        }
-                        levels.push(Level::Block(self.block_box(node, style, is_root)));
-                        for (open, open_style) in open_inlines.iter() {
-                            levels.push(Level::Inline(InlineItem::Start {
-                                node: *open,
-                                style: Rc::clone(open_style),
-                                start_edge: false,
-                            }));
-                        }
+                        split_inlines_around(
+                            self.block_box(node, style, is_root),
+                            levels,
+                            open_inlines,
+                        );
                     }
                 }
             }
             _ => {}
         }
+    }
+}
+
+impl Builder<'_> {
+    /// The box for a replaced element (`<img>`, or an `<svg>` element that is
+    /// not inside another SVG element), or `None` for other elements.
+    ///
+    /// A broken `<img>` (no `src`, or one the embedder has no image for) with
+    /// a non-empty `alt` and no `width`/`height` is shown as its `alt` text
+    /// instead, like browsers do. Other broken images keep their specified
+    /// size and paint nothing.
+    fn replaced(
+        &self,
+        node: NodeID,
+        element: &html::ElementData,
+        style: &Rc<ComputedStyle>,
+    ) -> Option<Level> {
+        let attribute = |name: &str| {
+            element
+                .get_attributes()
+                .iter()
+                .find(|attribute| attribute.get_name() == name)
+                .map(|attribute| attribute.get_value().as_str())
+        };
+        let hint = |name: &str| attribute(name).map_or(Dimension::Auto, parse_dimension_attribute);
+        let (key, natural) = match (element.get_name().as_str(), element.get_namespace()) {
+            ("img", html::Namespace::Html) => {
+                let src = attribute("src").map(str::trim).unwrap_or_default();
+                let key = ImageKey::Src(src.to_owned());
+                let size = (!src.is_empty())
+                    .then(|| self.images.natural_size(&key))
+                    .flatten();
+                let natural = match size {
+                    Some(size) => NaturalSize::from_size(size),
+                    None => {
+                        let alt = attribute("alt").map(str::trim).unwrap_or_default();
+                        let sized = style.width != Dimension::Auto
+                            || style.height != Dimension::Auto
+                            || hint("width") != Dimension::Auto
+                            || hint("height") != Dimension::Auto;
+                        log::debug!("image {src:?} for node {node:?} is not available");
+                        if !alt.is_empty() && !sized {
+                            BuildStats::bump(&self.stats.text_runs);
+                            return Some(Level::Inline(InlineItem::Text {
+                                node,
+                                element: Some(node),
+                                text: style.text_transform.apply(alt),
+                                style: Rc::clone(style),
+                            }));
+                        }
+                        NaturalSize {
+                            width: Some(0.0),
+                            height: Some(0.0),
+                            ratio: None,
+                        }
+                    }
+                };
+                (key, natural)
+            }
+            ("svg", html::Namespace::Svg) => {
+                let nested = self
+                    .document
+                    .node(node)
+                    .and_then(|dom_node| dom_node.get_parent())
+                    .and_then(|parent| self.document.node(parent))
+                    .is_some_and(|parent| {
+                        matches!(
+                            parent.get_kind(),
+                            NodeKind::Element(parent) if *parent.get_namespace() == html::Namespace::Svg
+                        )
+                    });
+                if nested {
+                    return None;
+                }
+                // The parser lowercases attribute names, so `viewBox` is
+                // stored as `viewbox`.
+                let absolute = |name: &str| match hint(name) {
+                    Dimension::Px(px) => Some(px),
+                    _ => None,
+                };
+                let ratio = attribute("viewbox").and_then(view_box_ratio);
+                let natural = NaturalSize {
+                    width: absolute("width"),
+                    height: absolute("height"),
+                    ratio: ratio.or(match (absolute("width"), absolute("height")) {
+                        (Some(width), Some(height)) if height > 0.0 => Some(width / height),
+                        _ => None,
+                    }),
+                };
+                (ImageKey::InlineSvg(node), natural)
+            }
+            _ => return None,
+        };
+        BuildStats::bump(&self.stats.boxes);
+        log::trace!(
+            "replaced box for node {node:?} <{}>: {key:?}, natural {natural:?}",
+            element.get_name()
+        );
+        let block = BlockBox {
+            node: Some(node),
+            style: Rc::clone(style),
+            establishes_bfc: true,
+            contents: BlockContents::Replaced(ReplacedBox {
+                key,
+                natural,
+                width_hint: hint("width"),
+                height_hint: hint("height"),
+            }),
+        };
+        Some(match style.display {
+            Display::Box {
+                outside: DisplayOutside::Block,
+                ..
+            } => Level::Block(block),
+            _ => Level::Inline(InlineItem::Atomic(block)),
+        })
+    }
+}
+
+/// Pushes a block-level box. A block inside inline boxes splits them around
+/// it (CSS 2.2 §9.2.1.1).
+fn split_inlines_around(
+    block: BlockBox,
+    levels: &mut Vec<Level>,
+    open_inlines: &[(NodeID, Rc<ComputedStyle>)],
+) {
+    for _ in open_inlines {
+        levels.push(Level::Inline(InlineItem::End { end_edge: false }));
+    }
+    levels.push(Level::Block(block));
+    for (open, open_style) in open_inlines {
+        levels.push(Level::Inline(InlineItem::Start {
+            node: *open,
+            style: Rc::clone(open_style),
+            start_edge: false,
+        }));
     }
 }
 

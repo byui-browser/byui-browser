@@ -1,6 +1,17 @@
 //! Software compositor and rasterization.
 
-use crate::{BitmapFont, DisplayItem, Frame, OutlineFont, fonts::glyph};
+use crate::{
+    BitmapFont, DisplayItem, FontCollection, Frame, ImageStore, OutlineFont, fonts::glyph,
+};
+
+/// Which fonts [`Compositor::compose_scaled`] draws text with.
+#[derive(Clone, Copy)]
+enum FontChoice<'a> {
+    /// One font for every run.
+    Single(&'a OutlineFont),
+    /// The face each run's [`paint::FontId`] names.
+    Collection(&'a FontCollection),
+}
 
 /// A software compositor for a fixed device-pixel viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +67,19 @@ impl Compositor {
                         }
                     }
                 }
+                DisplayItem::FillRoundedRect {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    radii,
+                    rgba,
+                } => self.fill_rounded_rect(
+                    &mut frame,
+                    [*left, *top, *right, *bottom],
+                    *radii,
+                    *rgba,
+                ),
                 DisplayItem::Text {
                     x,
                     baseline,
@@ -66,6 +90,132 @@ impl Compositor {
             }
         }
         frame
+    }
+
+    /// Fills the rectangle `[left, top, right, bottom]` (device pixels) with
+    /// elliptical corners. Pixels on a curve are blended by the fraction of
+    /// a 4x4 grid of samples that falls inside the shape.
+    fn fill_rounded_rect(
+        &self,
+        frame: &mut Frame,
+        [left, top, right, bottom]: [f32; 4],
+        radii: [[f32; 2]; 4],
+        rgba: [u8; 4],
+    ) {
+        log::trace!("fill rounded rect ({left}, {top})-({right}, {bottom}) radii {radii:?}");
+        if right <= left || bottom <= top {
+            return;
+        }
+        // Each corner as (center x, center y, radius x, radius y, which
+        // side of the center the curve is on).
+        let [tl, tr, br, bl] = radii;
+        let corners = [
+            (left + tl[0], top + tl[1], tl, -1.0, -1.0),
+            (right - tr[0], top + tr[1], tr, 1.0, -1.0),
+            (right - br[0], bottom - br[1], br, 1.0, 1.0),
+            (left + bl[0], bottom - bl[1], bl, -1.0, 1.0),
+        ];
+        let inside = |x: f32, y: f32| {
+            corners.iter().all(|&(cx, cy, [rx, ry], sx, sy)| {
+                let (dx, dy) = ((x - cx) * sx, (y - cy) * sy);
+                if rx <= 0.0 || ry <= 0.0 || dx <= 0.0 || dy <= 0.0 {
+                    return true;
+                }
+                (dx / rx).powi(2) + (dy / ry).powi(2) <= 1.0
+            })
+        };
+        let in_corner = |px: f32, py: f32| {
+            corners.iter().any(|&(cx, cy, [rx, ry], sx, sy)| {
+                rx > 0.0
+                    && ry > 0.0
+                    && (if sx < 0.0 { px < cx } else { px + 1.0 > cx })
+                    && (if sy < 0.0 { py < cy } else { py + 1.0 > cy })
+            })
+        };
+        let range = |start: f32, end: f32, limit: u32| {
+            start.floor().clamp(0.0, limit as f32) as u32
+                ..end.ceil().clamp(0.0, limit as f32) as u32
+        };
+        const SAMPLES: u32 = 4;
+        for py in range(top, bottom, self.height) {
+            for px in range(left, right, self.width) {
+                let (x, y) = (px as f32, py as f32);
+                let coverage = if in_corner(x, y) {
+                    let mut hits = 0;
+                    for sy in 0..SAMPLES {
+                        for sx in 0..SAMPLES {
+                            let sample_x = x + (sx as f32 + 0.5) / SAMPLES as f32;
+                            let sample_y = y + (sy as f32 + 0.5) / SAMPLES as f32;
+                            if (left..right).contains(&sample_x)
+                                && (top..bottom).contains(&sample_y)
+                                && inside(sample_x, sample_y)
+                            {
+                                hits += 1;
+                            }
+                        }
+                    }
+                    hits as f32 / (SAMPLES * SAMPLES) as f32
+                } else {
+                    let center = (x + 0.5, y + 0.5);
+                    if (left..right).contains(&center.0) && (top..bottom).contains(&center.1) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                };
+                let alpha = (coverage * f32::from(rgba[3])).round() as u8;
+                if alpha > 0 {
+                    self.put_pixel(frame, px, py, [rgba[0], rgba[1], rgba[2], alpha]);
+                }
+            }
+        }
+    }
+
+    /// Converts a paint rounded rectangle to a device-pixel
+    /// [`DisplayItem::FillRoundedRect`] at `scale` device pixels per CSS
+    /// pixel. Edges snap to device pixel boundaries like
+    /// [`DisplayItem::FillRect`] edges; radii shrink again if snapping made
+    /// the rectangle too small for them.
+    fn rounded_rect_item(
+        rect: &paint::Rect,
+        radii: &paint::CornerRadii,
+        color: &paint::Color,
+        scale: f32,
+    ) -> DisplayItem {
+        let edge = |value: f32| (value * scale).round();
+        let (left, top, right, bottom) = (
+            edge(rect.x),
+            edge(rect.y),
+            edge(rect.right()),
+            edge(rect.bottom()),
+        );
+        let mut radii = radii
+            .scaled(scale)
+            .into_array()
+            .map(|radius| [radius.horizontal, radius.vertical]);
+        let (width, height) = ((right - left).max(0.0), (bottom - top).max(0.0));
+        let fit = |length: f32, a: f32, b: f32| {
+            if a + b > length {
+                length / (a + b)
+            } else {
+                1.0
+            }
+        };
+        let factor = fit(width, radii[0][0], radii[1][0])
+            .min(fit(width, radii[3][0], radii[2][0]))
+            .min(fit(height, radii[0][1], radii[3][1]))
+            .min(fit(height, radii[1][1], radii[2][1]));
+        for radius in radii.iter_mut().flatten() {
+            *radius *= factor;
+        }
+        DisplayItem::FillRoundedRect {
+            left,
+            top,
+            right,
+            bottom,
+            radii,
+            rgba: [color.r, color.g, color.b, color.a],
+        }
     }
 
     /// Draws text by sampling each scaled glyph bitmap at device-pixel
@@ -173,12 +323,16 @@ impl Compositor {
                         rgba: [color.r, color.g, color.b, color.a],
                     })
                 }
+                paint::DisplayItem::FillRoundedRect { rect, radii, color } => {
+                    Some(Self::rounded_rect_item(rect, radii, color, 1.0))
+                }
                 paint::DisplayItem::Text {
                     x,
                     baseline,
                     font_size,
                     text,
                     color,
+                    ..
                 } => Some(DisplayItem::Text {
                     x: x.round(),
                     baseline: baseline.round(),
@@ -186,6 +340,10 @@ impl Compositor {
                     text: text.clone(),
                     rgba: [color.r, color.g, color.b, color.a],
                 }),
+                paint::DisplayItem::Image { image, .. } => {
+                    log::trace!("no image store to draw {image:?}; use compose_page");
+                    None
+                }
             })
             .collect::<Vec<_>>();
         self.compose(&items)
@@ -200,14 +358,52 @@ impl Compositor {
     /// Lay the document out with the same `font` so text runs fit the
     /// widths layout measured. Rectangle edges round to the nearest device
     /// pixel boundary, and parts outside the frame are clipped.
+    ///
+    /// Every text run uses `font`, whatever its [`paint::FontId`].
+    /// [`paint::DisplayItem::Image`] items are skipped; use
+    /// [`Self::compose_page`] to draw them.
     pub fn compose_paint_with_font(
         &self,
         list: &paint::DisplayList,
         font: &OutlineFont,
         scale: f32,
     ) -> Frame {
+        self.compose_scaled(list, FontChoice::Single(font), None, scale)
+    }
+
+    /// Rasterizes a paint crate display list into a new frame, drawing
+    /// pictures from `images` and each text run with the face `fonts` has
+    /// for its [`paint::FontId`].
+    ///
+    /// This is [`Self::compose_paint_with_font`] plus images and web fonts.
+    /// Lay the document out with the same `fonts` so each run uses the face
+    /// layout measured. Runs whose face is the [`BitmapFont`] fallback (no
+    /// default outline font) are drawn with it, scaled to device pixels.
+    ///
+    /// Each [`paint::DisplayItem::Image`] is stretched to fill its rectangle,
+    /// whose edges snap to device pixel boundaries like rectangle fills. The
+    /// picture is resampled (bitmaps) or rasterized (SVG) at that device size
+    /// and blended over what is already drawn. Images missing from `images`
+    /// draw nothing.
+    pub fn compose_page(
+        &self,
+        list: &paint::DisplayList,
+        fonts: &FontCollection,
+        images: &ImageStore,
+        scale: f32,
+    ) -> Frame {
+        self.compose_scaled(list, FontChoice::Collection(fonts), Some(images), scale)
+    }
+
+    fn compose_scaled(
+        &self,
+        list: &paint::DisplayList,
+        fonts: FontChoice<'_>,
+        images: Option<&ImageStore>,
+        scale: f32,
+    ) -> Frame {
         log::debug!(
-            "compositing frame {}x{} with outline font from {} items at scale {scale}",
+            "compositing frame {}x{} from {} items at scale {scale}",
             self.width,
             self.height,
             list.items.len()
@@ -237,24 +433,115 @@ impl Compositor {
                         }
                     }
                 }
+                paint::DisplayItem::FillRoundedRect { rect, radii, color } => {
+                    if let DisplayItem::FillRoundedRect {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                        radii,
+                        rgba,
+                    } = Self::rounded_rect_item(rect, radii, color, scale)
+                    {
+                        self.fill_rounded_rect(&mut frame, [left, top, right, bottom], radii, rgba);
+                    }
+                }
                 paint::DisplayItem::Text {
                     x,
                     baseline,
                     font_size,
+                    font,
                     text,
                     color,
-                } => self.draw_outline_text(
-                    &mut frame,
-                    font,
-                    *font_size * scale,
-                    *x * scale,
-                    (*baseline * scale).round(),
-                    text,
-                    [color.r, color.g, color.b, color.a],
-                ),
+                } => {
+                    let rgba = [color.r, color.g, color.b, color.a];
+                    let outline = match fonts {
+                        FontChoice::Single(font) => Some(font),
+                        FontChoice::Collection(fonts) => fonts.outline(*font),
+                    };
+                    match outline {
+                        Some(font) => self.draw_outline_text(
+                            &mut frame,
+                            font,
+                            *font_size * scale,
+                            *x * scale,
+                            (*baseline * scale).round(),
+                            text,
+                            rgba,
+                        ),
+                        None => self.draw_text(
+                            &mut frame,
+                            (*x * scale).round(),
+                            (*baseline * scale).round(),
+                            *font_size * scale,
+                            text,
+                            rgba,
+                        ),
+                    }
+                }
+                paint::DisplayItem::Image { rect, image } => match images {
+                    Some(images) => self.draw_image(&mut frame, images, image, rect, scale),
+                    None => log::trace!("no image store to draw {image:?}"),
+                },
             }
         }
         frame
+    }
+
+    /// Draws `key`'s picture stretched over `rect` (CSS pixels) at `scale`
+    /// device pixels per CSS pixel.
+    fn draw_image(
+        &self,
+        frame: &mut Frame,
+        images: &ImageStore,
+        key: &paint::ImageKey,
+        rect: &paint::Rect,
+        scale: f32,
+    ) {
+        let edge = |value: f32| (value * scale).round();
+        let (left, top) = (edge(rect.x), edge(rect.y));
+        let (right, bottom) = (edge(rect.right()), edge(rect.bottom()));
+        if right <= left || bottom <= top {
+            return;
+        }
+        // Skip pictures entirely outside the frame before resampling them.
+        if right <= 0.0 || bottom <= 0.0 || left >= self.width as f32 || top >= self.height as f32 {
+            return;
+        }
+        let (width, height) = ((right - left) as u32, (bottom - top) as u32);
+        log::trace!("draw image {key:?} {width}x{height} at ({left}, {top})");
+        // Blends `sample(x, y)`, in picture pixels, over the visible part.
+        let blit = |frame: &mut Frame, sample: &dyn Fn(u32, u32) -> [u8; 4]| {
+            let columns = left.max(0.0) as u32..(right as u32).min(self.width);
+            for py in top.max(0.0) as u32..(bottom as u32).min(self.height) {
+                for px in columns.clone() {
+                    let pixel = sample(px - left as u32, py - top as u32);
+                    if pixel[3] > 0 {
+                        self.put_pixel(frame, px, py, pixel);
+                    }
+                }
+            }
+        };
+        if let Some(bitmap) = images.scaled(key, width, height) {
+            blit(frame, &|x, y| bitmap.pixel(x, y));
+        } else if let Some(bitmap) = images.original(key) {
+            // Too large to resample into the cache: sample the nearest
+            // source pixel directly.
+            let (sx, sy) = (
+                bitmap.width as f32 / width as f32,
+                bitmap.height as f32 / height as f32,
+            );
+            blit(frame, &|x, y| {
+                let source_x = ((x as f32 + 0.5) * sx) as u32;
+                let source_y = ((y as f32 + 0.5) * sy) as u32;
+                bitmap.pixel(
+                    source_x.min(bitmap.width - 1),
+                    source_y.min(bitmap.height - 1),
+                )
+            });
+        } else {
+            log::trace!("no picture for {key:?}; nothing drawn");
+        }
     }
 
     /// Draws `text` with `font` at an em size of `font_size` device pixels,
@@ -330,6 +617,60 @@ mod tests {
     }
 
     #[test]
+    fn rounded_rects_leave_corners_clear_and_fill_the_middle() {
+        let radius = paint::CornerRadius {
+            horizontal: 4.0,
+            vertical: 4.0,
+        };
+        let list = paint::DisplayList {
+            items: vec![paint::DisplayItem::FillRoundedRect {
+                rect: paint::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                },
+                radii: paint::CornerRadii::from_array([radius; 4]),
+                color: paint::Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+            }],
+        };
+        for scale in [1.0, 2.0] {
+            let size = (10.0 * scale) as u32;
+            let compositor = Compositor::new(size, size);
+            // `compose_paint_with_font` draws through the same helper, but
+            // needs a font file, so the scaled case calls it directly.
+            let frame = if scale == 1.0 {
+                compositor.compose_paint(&list)
+            } else {
+                let paint::DisplayItem::FillRoundedRect { rect, radii, color } = &list.items[0]
+                else {
+                    unreachable!()
+                };
+                compositor.compose(&[Compositor::rounded_rect_item(rect, radii, color, scale)])
+            };
+            let pixel = |x: u32, y: u32| {
+                let offset = ((y * size + x) * 4) as usize;
+                frame.pixels[offset..offset + 4].to_vec()
+            };
+            let last = size - 1;
+            for (x, y) in [(0, 0), (last, 0), (0, last), (last, last)] {
+                assert_eq!(pixel(x, y), Compositor::CLEAR_COLOR, "corner at {scale}x");
+            }
+            assert_eq!(pixel(size / 2, 0), [0, 0, 0, 255]);
+            assert_eq!(pixel(0, size / 2), [0, 0, 0, 255]);
+            assert_eq!(pixel(size / 2, size / 2), [0, 0, 0, 255]);
+            // A pixel the curve crosses is blended rather than hard-edged.
+            let edge = pixel(scale as u32, scale as u32);
+            assert!(edge[0] > 0 && edge[0] < 255, "anti-aliased edge {edge:?}");
+        }
+    }
+
+    #[test]
     fn text_at_ten_pixels_draws_unscaled_glyphs_above_the_baseline() {
         let frame = Compositor::new(8, 10).compose(&[DisplayItem::Text {
             x: 0.0,
@@ -360,7 +701,10 @@ mod tests {
         }]);
         let dark = frame
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
             .filter(|pixel| *pixel == [0, 0, 0, 255])
             .count();
         // `I` has 5 + 5 + 5 lit cells (two bars and a 5-row stem); at scale 2
@@ -385,6 +729,7 @@ mod tests {
                 x: 4.0,
                 baseline: 20.0,
                 font_size: 16.0,
+                font: paint::FontId::DEFAULT,
                 text: "Hi".into(),
                 color: black,
             }],
@@ -393,14 +738,25 @@ mod tests {
         let frame = Compositor::new(120, 60).compose_paint_with_font(&list, &font, scale);
         let inked: Vec<(u32, u32)> = frame
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
             .enumerate()
             .filter(|(_, pixel)| *pixel != Compositor::CLEAR_COLOR)
             .map(|(index, _)| (index as u32 % 120, index as u32 / 120))
             .collect();
         assert!(!inked.is_empty());
         // Anti-aliased edges produce partially covered (gray) pixels.
-        assert!(frame.pixels.chunks_exact(4).any(|p| p[0] > 0 && p[0] < 255));
+        assert!(
+            frame
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .any(|p| p[0] > 0 && p[0] < 255)
+        );
         // Ink stays within the run's measured advance and above the
         // baseline, both scaled to device pixels.
         let right = (4.0 + font.text_width("Hi", 16.0)) * scale;
@@ -435,7 +791,10 @@ mod tests {
         let frame = Compositor::new(8, 8).compose_paint_with_font(&list, &font, 2.0);
         let red = frame
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
             .filter(|pixel| *pixel == [255, 0, 0, 255])
             .count();
         assert_eq!(red, 4 * 2);
@@ -455,5 +814,123 @@ mod tests {
             rgba: [0, 0, 0, 128],
         }]);
         assert_eq!(&frame.pixels[..], [127, 127, 127, 255]);
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use crate::images::tests::png;
+
+    fn key(name: &str) -> paint::ImageKey {
+        paint::ImageKey::Src(name.into())
+    }
+
+    fn image_item(name: &str, x: f32, y: f32, width: f32, height: f32) -> paint::DisplayItem {
+        paint::DisplayItem::Image {
+            rect: paint::Rect {
+                x,
+                y,
+                width,
+                height,
+            },
+            image: key(name),
+        }
+    }
+
+    fn pixel(frame: &Frame, x: u32, y: u32) -> [u8; 4] {
+        let offset = ((y * frame.width + x) * 4) as usize;
+        frame.pixels[offset..offset + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn images_are_stretched_over_their_rect_at_device_scale() {
+        let mut images = ImageStore::new();
+        images.insert_encoded(key("red.png"), &png(1, 1, [255, 0, 0, 255]));
+        let list = paint::DisplayList {
+            items: vec![image_item("red.png", 1.0, 1.0, 2.0, 1.0)],
+        };
+        let frame =
+            Compositor::new(8, 8).compose_page(&list, &FontCollection::default(), &images, 2.0);
+        let red = frame
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| **pixel == [255, 0, 0, 255])
+            .count();
+        assert_eq!(red, 4 * 2);
+        assert_eq!(pixel(&frame, 2, 2), [255, 0, 0, 255]);
+        assert_eq!(pixel(&frame, 1, 1), Compositor::CLEAR_COLOR);
+    }
+
+    #[test]
+    fn translucent_images_blend_and_missing_images_draw_nothing() {
+        let mut images = ImageStore::new();
+        images.insert_encoded(key("veil.png"), &png(2, 2, [0, 0, 0, 128]));
+        let list = paint::DisplayList {
+            items: vec![
+                image_item("veil.png", 0.0, 0.0, 2.0, 2.0),
+                image_item("missing.png", 2.0, 0.0, 2.0, 2.0),
+            ],
+        };
+        let frame =
+            Compositor::new(4, 2).compose_page(&list, &FontCollection::default(), &images, 1.0);
+        assert_eq!(pixel(&frame, 0, 0), [127, 127, 127, 255]);
+        assert_eq!(pixel(&frame, 3, 1), Compositor::CLEAR_COLOR);
+    }
+
+    #[test]
+    fn partly_offscreen_images_are_clipped() {
+        let mut images = ImageStore::new();
+        images.insert_encoded(key("a.png"), &png(4, 4, [0, 0, 255, 255]));
+        let list = paint::DisplayList {
+            items: vec![image_item("a.png", -2.0, -2.0, 4.0, 4.0)],
+        };
+        let frame =
+            Compositor::new(4, 4).compose_page(&list, &FontCollection::default(), &images, 1.0);
+        assert_eq!(pixel(&frame, 0, 0), [0, 0, 255, 255]);
+        assert_eq!(pixel(&frame, 1, 1), [0, 0, 255, 255]);
+        assert_eq!(pixel(&frame, 2, 2), Compositor::CLEAR_COLOR);
+    }
+
+    #[test]
+    fn compose_page_without_a_font_matches_compose_paint_for_text_and_fills() {
+        let list = paint::DisplayList {
+            items: vec![
+                paint::DisplayItem::FillRect {
+                    rect: paint::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 5.0,
+                        height: 3.0,
+                    },
+                    color: paint::Color {
+                        r: 9,
+                        g: 9,
+                        b: 9,
+                        a: 255,
+                    },
+                },
+                paint::DisplayItem::Text {
+                    x: 1.2,
+                    baseline: 9.4,
+                    font_size: 10.0,
+                    font: paint::FontId::DEFAULT,
+                    text: "HI".into(),
+                    color: paint::Color {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    },
+                },
+            ],
+        };
+        let compositor = Compositor::new(16, 12);
+        assert_eq!(
+            compositor.compose_page(&list, &FontCollection::default(), &ImageStore::new(), 1.0),
+            compositor.compose_paint(&list)
+        );
     }
 }

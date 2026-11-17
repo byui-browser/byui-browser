@@ -240,14 +240,13 @@ impl CustomElementRegistry {
                     {
                         root.set_prototype(Some(prototype));
                     }
-                    if constructor.is_bytecode_function() {
-                        if let Value::Object(instance) | Value::Array(instance) =
+                    if constructor.is_bytecode_function()
+                        && let Value::Object(instance) | Value::Array(instance) =
                             constructor.construct(&[])?
-                        {
-                            for key in instance.keys() {
-                                if let Some(value) = instance.get_own(&key) {
-                                    root.set(key, value);
-                                }
+                    {
+                        for key in instance.keys() {
+                            if let Some(value) = instance.get_own(&key) {
+                                root.set(key, value);
                             }
                         }
                     }

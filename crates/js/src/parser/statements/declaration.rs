@@ -21,3 +21,23 @@ pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Statement> {
     parser.terminator("variable declaration")?;
     Ok(Statement::VariableDeclaration { kind, name, init })
 }
+
+pub(super) fn parse_for(parser: &mut Parser<'_>) -> ParseResult<Statement> {
+    let kind = match parser.advance() {
+        Some(Token::Var) => VarKind::Var,
+        Some(Token::Let) => VarKind::Let,
+        Some(Token::Const) => VarKind::Const,
+        _ => return Err(parser.error("Expected a declaration keyword", "for initializer")),
+    };
+    let name = parser.identifier("for initializer")?;
+    let init = if parser.consume(&Token::Assign) {
+        Some(parser.parse_expression(0)?)
+    } else {
+        None
+    };
+    if kind == VarKind::Const && init.is_none() {
+        return Err(parser.error("Constant requires an initializer", "for initializer"));
+    }
+    parser.expect(&Token::Semicolon, "for initializer")?;
+    Ok(Statement::VariableDeclaration { kind, name, init })
+}

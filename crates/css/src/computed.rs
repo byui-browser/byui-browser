@@ -6,7 +6,10 @@ use html::NodeID;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ComputedStyles {
+    /// Computed declarations in document order.
     pub styles: Vec<(NodeID, Vec<Declaration>)>,
+    /// Number of animations that may require a later restyle.
+    pub running_animations: usize,
 }
 
 impl ComputedStyles {

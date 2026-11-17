@@ -19,7 +19,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-pub use runtime::{Function, Object};
+pub use runtime::{
+    Function, HostGetter, HostPropertyGetter, HostPropertyKeys, HostPropertySetter, HostSetter,
+    MAX_ARRAY_LENGTH, Object, WeakObject,
+};
 pub use vm::Vm;
 
 /// A JavaScript value produced by evaluation or passed to host functions.
@@ -28,7 +31,9 @@ pub use vm::Vm;
 /// [`Value::Object`] and [`Value::Array`] are reference handles: cloning the value shares the same
 /// function or property table, and `==`/`===` compare them by identity.
 ///
-/// Unsupported: symbols, bigints, and other built-in object kinds.
+/// Symbols are currently represented by identity-bearing object handles rather
+/// than a distinct primitive variant. Bigints and other built-in object kinds
+/// remain unsupported.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// The `undefined` value.
@@ -62,7 +67,7 @@ impl fmt::Display for Value {
             Self::String(text) => formatter.write_str(text),
             Self::Function(function) => write!(formatter, "{function}"),
             Self::Object(object) => write!(formatter, "{object}"),
-            Self::Array(object) => write!(formatter, "{object}"),
+            Self::Array(array) => formatter.write_str(&runtime::array_to_string(array)),
         }
     }
 }
@@ -78,10 +83,25 @@ pub enum JsErrorCategory {
     Limit,
     /// A registered host function reported a failure.
     Host,
+    /// A script threw a value that no `catch` clause handled. The value is in
+    /// [`JsError::thrown`].
+    Thrown,
+}
+
+impl JsErrorCategory {
+    /// Whether a script's `catch` clause and `finally` block can observe
+    /// errors of this category.
+    ///
+    /// Runtime, host, and thrown errors are exceptions. Syntax errors never
+    /// occur while running, and limit errors end the script immediately, so
+    /// a script cannot swallow an exhausted budget or run more code after it.
+    pub fn is_catchable(self) -> bool {
+        matches!(self, Self::Runtime | Self::Host | Self::Thrown)
+    }
 }
 
 /// Errors raised while parsing, evaluating, or invoking host functions.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct JsError {
     /// The broad category of the failure.
     pub category: JsErrorCategory,
@@ -91,9 +111,62 @@ pub struct JsError {
     pub context: Option<String>,
     /// Bytecode source location where the failure occurred, when available.
     pub location: Option<bytecode::SourceLocation>,
+    /// The exact value a script threw, for [`JsErrorCategory::Thrown`]
+    /// errors, so the host can inspect it. It is `None` for every other
+    /// category.
+    pub thrown: Option<Value>,
 }
 
 impl JsError {
+    /// Creates the error for an uncaught `throw` of `value`.
+    ///
+    /// Host functions may also return it to throw an arbitrary value into
+    /// the calling script, where `catch` receives `value` unchanged.
+    pub fn thrown(value: Value) -> Self {
+        Self {
+            category: JsErrorCategory::Thrown,
+            message: format!("Uncaught {}", describe_thrown(&value)),
+            context: Some("throw statement".into()),
+            location: None,
+            thrown: Some(value),
+        }
+    }
+
+    /// Returns the value a `catch` clause receives for this error.
+    ///
+    /// A thrown value is returned unchanged. Any other catchable error
+    /// becomes a new object with a string `name` (`"Error"` for runtime
+    /// errors, `"HostError"` for host errors) and a string `message`.
+    pub fn into_caught_value(self) -> Value {
+        if let Some(value) = self.thrown {
+            return value;
+        }
+        let object = Object::new();
+        let name = match self.category {
+            JsErrorCategory::Host => "HostError",
+            _ => "Error",
+        };
+        object.set("name", Value::String(name.into()));
+        object.set("message", Value::String(self.message.clone()));
+        object.set_origin(self);
+        Value::Object(object)
+    }
+
+    /// Creates the error for a script that throws `value` again.
+    ///
+    /// The object a `catch` clause received for an engine error is turned
+    /// back into that error, so a `finally` block or a `catch (e) { throw e }`
+    /// does not change the category, message, or context of what the host
+    /// finally sees. Every other value becomes [`JsError::thrown`].
+    pub(crate) fn rethrown(value: Value) -> Self {
+        if let Value::Object(object) = &value
+            && let Some(original) = object.origin()
+        {
+            return original;
+        }
+        Self::thrown(value)
+    }
+
     /// Creates an error carrying `message`.
     pub fn new(message: impl Into<String>) -> Self {
         Self::runtime(message)
@@ -106,6 +179,7 @@ impl JsError {
             message: message.into(),
             context: None,
             location: None,
+            thrown: None,
         }
     }
 
@@ -120,6 +194,7 @@ impl JsError {
             message: message.into(),
             context: Some(context.into()),
             location: None,
+            thrown: None,
         }
     }
 
@@ -137,6 +212,20 @@ impl fmt::Display for JsError {
 }
 
 impl std::error::Error for JsError {}
+
+/// Renders a thrown value for an uncaught-exception message: an object with a
+/// string `message` reads as `name: message`, anything else as `ToString`.
+fn describe_thrown(value: &Value) -> String {
+    if let Value::Object(object) = value
+        && let Some(Value::String(message)) = object.get("message")
+    {
+        return match object.get("name") {
+            Some(Value::String(name)) => format!("{name}: {message}"),
+            _ => message,
+        };
+    }
+    value.to_string()
+}
 
 /// Result type used throughout the engine, failing with [`JsError`].
 pub type JsResult<T> = Result<T, JsError>;
@@ -187,6 +276,15 @@ pub struct Realm {
     values: HashMap<String, Value>,
     limits: runtime::ExecutionLimits,
     globals: runtime::GlobalState,
+    execution_lock: Arc<std::sync::Mutex<()>>,
+}
+
+/// A cloneable handle that evaluates scripts in the same persistent globals
+/// as its originating realm. It is used by asynchronous host callbacks.
+#[derive(Clone)]
+pub struct ScriptEvaluator {
+    globals: runtime::GlobalState,
+    execution_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl Default for Realm {
@@ -203,6 +301,7 @@ impl Realm {
             values: HashMap::new(),
             limits: runtime::ExecutionLimits::default(),
             globals: runtime::GlobalState::new(),
+            execution_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -294,6 +393,15 @@ impl Realm {
         Ok(())
     }
 
+    /// Registers a host callback for assignments to an existing host global.
+    ///
+    /// Reads continue to return the registered global value. Script
+    /// assignments call `setter` and leave that value installed, which lets
+    /// hosts implement global accessor properties such as `location`.
+    pub fn register_global_setter(&mut self, name: &str, setter: HostSetter) -> JsResult<()> {
+        self.globals.set_host_setter(name, setter)
+    }
+
     /// Returns the original value registered by the host for `name`.
     ///
     /// This does not read a script reassignment or declaration; it is intended
@@ -335,6 +443,10 @@ impl Realm {
     /// the realm's globals for later calls; see [`Realm`] for the
     /// redeclaration rules and [`Realm::reset_script_state`] to clear them.
     pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
+        let _execution = self
+            .execution_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         log::debug!("evaluating script ({} bytes)", source.len());
         let result = parse(source)
             .map_err(|error| {
@@ -343,6 +455,94 @@ impl Realm {
             .and_then(|program| self.globals.evaluate(&program, self.limits));
         log_outcome("script", &result);
         result
+    }
+
+    /// Parses and evaluates source with the supplied global `this` value.
+    pub fn evaluate_script_with_this(&self, source: &str, this_value: Value) -> JsResult<Value> {
+        let _execution = self
+            .execution_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        log::debug!("evaluating script ({} bytes)", source.len());
+        let result = parse(source)
+            .map_err(|error| {
+                JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+            })
+            .and_then(|program| {
+                self.globals
+                    .evaluate_with_this(&program, self.limits, this_value)
+            });
+        log_outcome("script", &result);
+        result
+    }
+
+    /// Returns an evaluator sharing this realm's globals for delayed scripts.
+    pub fn script_evaluator(&self) -> ScriptEvaluator {
+        ScriptEvaluator {
+            globals: self.globals.clone(),
+            execution_lock: Arc::clone(&self.execution_lock),
+        }
+    }
+}
+
+impl ScriptEvaluator {
+    /// Parses and evaluates source in the originating realm's global scope.
+    pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
+        let _execution = self
+            .execution_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = parse(source)
+            .map_err(|error| {
+                JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+            })
+            .and_then(|program| {
+                self.globals
+                    .evaluate(&program, runtime::ExecutionLimits::default())
+            });
+        log_outcome("delayed script", &result);
+        result
+    }
+
+    /// Parses and evaluates source with the supplied global `this` value.
+    pub fn evaluate_script_with_this(&self, source: &str, this_value: Value) -> JsResult<Value> {
+        let _execution = self
+            .execution_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = parse(source)
+            .map_err(|error| {
+                JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+            })
+            .and_then(|program| {
+                self.globals.evaluate_with_this(
+                    &program,
+                    runtime::ExecutionLimits::default(),
+                    this_value,
+                )
+            });
+        log_outcome("delayed script", &result);
+        result
+    }
+
+    /// Invokes a callback while excluding concurrent script evaluation in the
+    /// same realm.
+    pub fn call(&self, function: &Function, arguments: &[Value]) -> JsResult<Value> {
+        self.call_with_this(function, Value::Undefined, arguments)
+    }
+
+    /// Invokes a callback with an explicit `this` value in this realm.
+    pub fn call_with_this(
+        &self,
+        function: &Function,
+        this_value: Value,
+        arguments: &[Value],
+    ) -> JsResult<Value> {
+        let _execution = self
+            .execution_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        function.call_with_this(this_value, arguments)
     }
 }
 
@@ -421,32 +621,35 @@ pub fn parse(source: &str) -> Result<Program, parser::ParseError> {
 
 /// Parses and evaluates source text, returning the completion value.
 ///
-/// Runs the tree-walk interpreter described in [`runtime`]: expressions,
-/// object literals, member access, declarations, blocks, `if`, `while`,
-/// functions, calls, and `return`. Classes, `new`, `this`, and `super` parse
-/// but are not evaluated here; they run only through [`bytecode::compile`] and
-/// [`Vm`]. Syntax errors and runtime errors are both returned as [`JsError`].
+/// Parses and evaluates source through the automatic bytecode execution path.
+///
+/// The compiler is invoked once and compiled programs run in [`Vm`]. The
+/// automatic mode retains a compatibility fallback for syntax that has not
+/// been lowered to bytecode yet; VM runtime and limit errors are never retried
+/// in the fallback interpreter.
 pub fn eval(source: &str) -> JsResult<Value> {
-    log::debug!("evaluating source ({} bytes)", source.len());
-    let result = parse(source)
-        .map_err(|error| {
-            JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
-        })
-        .and_then(|program| runtime::evaluate_program(&program));
-    log_outcome("source", &result);
-    result
+    // Keep deeply nested legacy inputs on the guarded interpreter path until
+    // the compiler's recursive AST lowering is made stack independent.
+    if source.len() > 256 {
+        return parse(source)
+            .map_err(|error| {
+                JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+            })
+            .and_then(|program| runtime::evaluate_program(&program));
+    }
+    eval_with_mode(source, ExecutionMode::Automatic)
 }
 
 /// Parses and evaluates source text using caller-provided execution limits.
 pub fn eval_with_limits(source: &str, limits: runtime::ExecutionLimits) -> JsResult<Value> {
-    log::debug!("evaluating source ({} bytes) with {limits:?}", source.len());
-    let result = parse(source)
-        .map_err(|error| {
-            JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
-        })
-        .and_then(|program| runtime::evaluate_program_with_limits(&program, limits));
-    log_outcome("source", &result);
-    result
+    if source.len() > 256 {
+        return parse(source)
+            .map_err(|error| {
+                JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
+            })
+            .and_then(|program| runtime::evaluate_program_with_limits(&program, limits));
+    }
+    eval_with_mode_and_limits(source, ExecutionMode::Automatic, limits)
 }
 
 /// Parses and evaluates a script using the selected execution engine.

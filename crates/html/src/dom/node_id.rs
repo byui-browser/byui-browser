@@ -4,12 +4,12 @@ pub struct NodeID {
 }
 
 impl NodeID {
-    // Constructs NodeID and sets immutable id.
+    /// Constructs NodeID and sets immutable id.
     pub fn new(set_value: usize) -> Self {
         Self { id: set_value }
     }
 
-    // Gets id.
+    /// Gets id.
     pub const fn get(&self) -> usize {
         self.id
     }

@@ -55,6 +55,13 @@
 //!   (`-vv -v` is `info`).
 //! - `--log-file <path>` appends log lines to a file instead of standard
 //!   error, which is useful on Windows where the GUI has no console.
+//! - Programs that keep a log by default (the browser and its native shells)
+//!   pass a default log file to [`init_from_command_line_with_default_file`].
+//!   It is written **in addition to** standard error, so the terminal is
+//!   unchanged. Each launch moves the previous run's file aside (see
+//!   [`previous_log_path`]) and starts a fresh one, so at most two runs are
+//!   kept. `--no-log-file` turns it off, and `--log-file <path>` replaces it.
+//!   If it cannot be opened, logging continues on standard error only.
 //! - When no level option is given, the `BYUI_LOG` environment variable is
 //!   read as a spec instead.
 //!
@@ -73,7 +80,7 @@
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -134,6 +141,8 @@ Logging options:
   -q, -qq              Log only errors, or nothing at all (including
                        third-party crates).
   --log-file <path>    Append log lines to <path> instead of standard error.
+  --no-log-file        Do not write the default log file (the browser keeps
+                       one for each run; see below).
   -h, --help           Print this help and exit.
 
   When no level option is given, the BYUI_LOG environment variable is read
@@ -164,8 +173,19 @@ pub struct LogConfig {
     pub dependency_level: LevelFilter,
     /// Per-target overrides; the longest matching target wins.
     pub targets: Vec<TargetLevel>,
-    /// File to append log lines to; `None` writes to standard error.
+    /// File to append log lines to instead of standard error, from
+    /// `--log-file`. When set, [`LogConfig::default_file`] is not used.
     pub file: Option<PathBuf>,
+    /// Log file written alongside standard error when `file` is `None`.
+    ///
+    /// Never set from the command line: programs that keep a log by default
+    /// set it through [`init_from_command_line_with_default_file`]. [`init`]
+    /// moves an existing file aside to [`previous_log_path`] and starts a
+    /// fresh one; if that fails, logging continues on standard error only.
+    pub default_file: Option<PathBuf>,
+    /// Whether `--no-log-file` was given, which turns off
+    /// [`LogConfig::default_file`].
+    pub default_file_disabled: bool,
     /// Whether the command line asked for help (`-h` / `--help`). Callers
     /// should print their usage plus [`USAGE`] and exit.
     pub help_requested: bool,
@@ -181,6 +201,8 @@ impl Default for LogConfig {
             dependency_level: DEFAULT_DEPENDENCY_LEVEL,
             targets: Vec::new(),
             file: None,
+            default_file: None,
+            default_file_disabled: false,
             help_requested: false,
             dependency_level_explicit: false,
         }
@@ -274,6 +296,7 @@ impl LogConfig {
                     let path = option_value(args.next(), "--log-file")?;
                     config.file = Some(PathBuf::from(path));
                 }
+                "--no-log-file" => config.default_file_disabled = true,
                 "--verbose" => {
                     config.set_default_level(verbosity_level(1));
                     level_from_args = true;
@@ -492,9 +515,20 @@ impl std::error::Error for LogInitError {}
 /// runs are dropped. Each line looks like
 /// `[   0.042s DEBUG net::fetch] GET https://example.com -> 200`, where the
 /// time is seconds since `init` ran.
+///
+/// Where lines go:
+/// - `config.file` set (`--log-file`): that file only, appended to. Failing
+///   to open it is an error, because the user asked for it.
+/// - otherwise, `config.default_file` set and not disabled (and help not
+///   requested): standard error **and** that file, after moving the previous
+///   run's file aside. Failing to open it logs a warning and continues on
+///   standard error only, so a read-only data folder never stops the
+///   program.
+/// - otherwise: standard error only.
 pub fn init(config: LogConfig) -> Result<(), LogInitError> {
-    let sink = match &config.file {
-        Some(path) => Sink::File(Mutex::new(
+    let mut default_file_status = None;
+    let sink = match (&config.file, default_log_target(&config)) {
+        (Some(path), _) => Sink::File(Mutex::new(
             OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -504,7 +538,17 @@ pub fn init(config: LogConfig) -> Result<(), LogInitError> {
                     source,
                 })?,
         )),
-        None => Sink::Stderr,
+        (None, Some(path)) => match open_default_log_file(path) {
+            Ok(file) => {
+                default_file_status = Some(Ok(path.clone()));
+                Sink::StderrAndFile(Mutex::new(file))
+            }
+            Err(error) => {
+                default_file_status = Some(Err((path.clone(), error)));
+                Sink::Stderr
+            }
+        },
+        (None, None) => Sink::Stderr,
     };
     let max_level = config.max_level();
     log::set_boxed_logger(Box::new(Logger {
@@ -514,7 +558,66 @@ pub fn init(config: LogConfig) -> Result<(), LogInitError> {
     }))
     .map_err(|_| LogInitError::AlreadyInitialized)?;
     log::set_max_level(max_level);
+    match default_file_status {
+        Some(Ok(path)) => log::info!("writing log file {}", path.display()),
+        Some(Err((path, error))) => log::warn!(
+            "cannot write log file {}: {error}; logging to standard error only \
+             (--no-log-file turns the log file off)",
+            path.display()
+        ),
+        None => {}
+    }
     Ok(())
+}
+
+/// The default log file `init` should open, if any.
+fn default_log_target(config: &LogConfig) -> Option<&PathBuf> {
+    config
+        .default_file
+        .as_ref()
+        .filter(|_| !config.default_file_disabled && !config.help_requested)
+}
+
+/// Returns where the previous run's log is kept when a default log file
+/// starts fresh: `browser.log` becomes `browser.previous.log` in the same
+/// folder (a name without an extension gets `.previous` appended).
+pub fn previous_log_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map_or_else(|| "log".into(), |stem| stem.to_string_lossy().into_owned());
+    let name = match path.extension() {
+        Some(extension) => format!("{stem}.previous.{}", extension.to_string_lossy()),
+        None => format!("{stem}.previous"),
+    };
+    path.with_file_name(name)
+}
+
+/// Creates the log folder, moves last run's file to [`previous_log_path`]
+/// (replacing an older one), and opens a fresh file with a header line.
+///
+/// If the old file cannot be moved (on Windows, while another browser still
+/// has it open) the new run is appended to it instead, so nothing is lost.
+fn open_default_log_file(path: &Path) -> io::Result<File> {
+    if let Some(folder) = path
+        .parent()
+        .filter(|folder| !folder.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(folder)?;
+    }
+    if path.exists() {
+        let _ = std::fs::rename(path, previous_log_path(path));
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    writeln!(
+        file,
+        "# BYUI Browser {} log, started at unix time {started}, process {}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    )?;
+    Ok(file)
 }
 
 /// Parses logging options from the process's command line and
@@ -526,13 +629,22 @@ pub fn init(config: LogConfig) -> Result<(), LogInitError> {
 /// error and exits the process with status 2, because no logger exists yet
 /// to report it.
 pub fn init_from_command_line() -> CommandLine {
-    let (config, remaining) = match LogConfig::from_args(std::env::args().skip(1)) {
+    init_from_command_line_with_default_file(None)
+}
+
+/// Like [`init_from_command_line`], but also writes `default_file` (when
+/// `Some`) alongside standard error unless the command line says otherwise;
+/// see [`LogConfig::default_file`]. The browser passes its data folder's
+/// `logs/browser.log` here.
+pub fn init_from_command_line_with_default_file(default_file: Option<PathBuf>) -> CommandLine {
+    let (mut config, remaining) = match LogConfig::from_args(std::env::args().skip(1)) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("error: {error}\n\n{USAGE}");
             std::process::exit(2);
         }
     };
+    config.default_file = default_file;
     let help_requested = config.help_requested;
     let summary = format!("{config:?}");
     if let Err(error) = init(config) {
@@ -559,6 +671,20 @@ pub struct CommandLine {
 enum Sink {
     Stderr,
     File(Mutex<File>),
+    StderrAndFile(Mutex<File>),
+}
+
+impl Sink {
+    fn file(&self) -> Option<&Mutex<File>> {
+        match self {
+            Self::Stderr => None,
+            Self::File(file) | Self::StderrAndFile(file) => Some(file),
+        }
+    }
+
+    fn writes_stderr(&self) -> bool {
+        !matches!(self, Self::File(_))
+    }
 }
 
 struct Logger {
@@ -586,28 +712,24 @@ impl log::Log for Logger {
         );
         // A failed log write has nowhere better to be reported, so it is
         // ignored rather than allowed to disturb the browser.
-        match &self.sink {
-            Sink::Stderr => {
-                let _ = io::stderr().lock().write_all(line.as_bytes());
-            }
-            Sink::File(file) => {
-                if let Ok(mut file) = file.lock() {
-                    let _ = file.write_all(line.as_bytes());
-                }
-            }
+        if self.sink.writes_stderr() {
+            let _ = io::stderr().lock().write_all(line.as_bytes());
+        }
+        if let Some(file) = self.sink.file()
+            && let Ok(mut file) = file.lock()
+        {
+            let _ = file.write_all(line.as_bytes());
         }
     }
 
     fn flush(&self) {
-        match &self.sink {
-            Sink::Stderr => {
-                let _ = io::stderr().flush();
-            }
-            Sink::File(file) => {
-                if let Ok(mut file) = file.lock() {
-                    let _ = file.flush();
-                }
-            }
+        if self.sink.writes_stderr() {
+            let _ = io::stderr().flush();
+        }
+        if let Some(file) = self.sink.file()
+            && let Ok(mut file) = file.lock()
+        {
+            let _ = file.flush();
         }
     }
 }
@@ -859,6 +981,91 @@ mod tests {
             redact_credentials(plain),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    /// A fresh, empty folder under the system temp directory for one test.
+    fn temp_folder(test: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let folder = std::env::temp_dir().join(format!(
+            "byui-logging-{test}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        folder
+    }
+
+    #[test]
+    fn no_log_file_flag_is_consumed() {
+        let (config, rest) = parse(&["--no-log-file", "page.html"]);
+        assert!(config.default_file_disabled);
+        assert_eq!(rest, vec!["page.html"]);
+        assert!(!parse(&[]).0.default_file_disabled);
+    }
+
+    #[test]
+    fn previous_log_keeps_the_extension() {
+        assert_eq!(
+            previous_log_path(Path::new("/data/logs/browser.log")),
+            PathBuf::from("/data/logs/browser.previous.log")
+        );
+        assert_eq!(
+            previous_log_path(Path::new("trace")),
+            PathBuf::from("trace.previous")
+        );
+    }
+
+    #[test]
+    fn default_log_file_starts_fresh_and_keeps_one_previous_run() {
+        let folder = temp_folder("rotation");
+        let path = folder.join("logs").join("browser.log");
+        let previous = previous_log_path(&path);
+
+        // First run creates the missing `logs` folder and a header line.
+        let mut first = open_default_log_file(&path).unwrap();
+        writeln!(first, "run one").unwrap();
+        drop(first);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.starts_with("# BYUI Browser "), "{contents}");
+        assert!(contents.contains("run one"));
+        assert!(!previous.exists());
+
+        // Each later run moves the last one aside, replacing an older one.
+        for run in ["run two", "run three"] {
+            let mut file = open_default_log_file(&path).unwrap();
+            writeln!(file, "{run}").unwrap();
+        }
+        let current = std::fs::read_to_string(&path).unwrap();
+        let kept = std::fs::read_to_string(&previous).unwrap();
+        assert!(current.contains("run three") && !current.contains("run two"));
+        assert!(kept.contains("run two") && !kept.contains("run one"));
+
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn unwritable_default_log_folder_is_an_error_not_a_panic() {
+        let folder = temp_folder("unwritable");
+        // A file where the `logs` folder should be makes the folder
+        // impossible to create on every OS.
+        std::fs::write(folder.join("logs"), "not a folder").unwrap();
+        assert!(open_default_log_file(&folder.join("logs").join("browser.log")).is_err());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn default_log_file_is_skipped_when_disabled_or_for_help() {
+        let with_default = |args: &[&str]| {
+            let (mut config, _) = parse(args);
+            config.default_file = Some(PathBuf::from("browser.log"));
+            config
+        };
+        assert!(default_log_target(&with_default(&[])).is_some());
+        assert!(default_log_target(&with_default(&["--no-log-file"])).is_none());
+        // `--help` must not move last run's log aside.
+        assert!(default_log_target(&with_default(&["--help"])).is_none());
+        assert!(default_log_target(&LogConfig::default()).is_none());
     }
 
     #[test]

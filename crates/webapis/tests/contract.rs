@@ -1,11 +1,8 @@
 //! Public-contract tests for `webapis`.
 //!
-//! Run ignored tests with `cargo test -p webapis -- --ignored` to see the backlog.
-
 use webapis::TimerQueue;
 
 #[test]
-#[ignore = "TODO(webapis): timers not implemented"]
 fn timers_fire_in_due_order_not_insertion_order() {
     let mut queue = TimerQueue::new();
     let late = queue.schedule(100);

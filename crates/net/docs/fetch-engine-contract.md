@@ -2,7 +2,8 @@
 
 `net` is the reusable Rust Fetch engine. It owns request preparation, response
 tainting and exposure, body transport, cancellation, process-local scheduling,
-and coordination of cache, credential, security, and transport services. It does
+and coordination of cache, credential, security, transport, and lifecycle
+diagnostic services. It does
 not create JavaScript objects or promises. `webapis` owns that conversion; its
 current binding returns a string and is not yet a complete Fetch binding.
 
@@ -10,6 +11,18 @@ current binding returns a string and is not yet a complete Fetch binding.
 headers pass Fetch filtering. Its abort-aware `Body` holds the scheduler permit
 until it is consumed or dropped. Body errors may occur after headers. Callers
 cannot obtain the transport response.
+
+Controllers may install a [`NetworkObserver`] with
+`RequestController::builder(...).with_network_observer(...)`. The observer is
+shared by controller clones, receives best-effort non-failing events, and must
+be quick, non-blocking, and panic-free. The feed reports request preparation,
+cache and preflight decisions, queue start and admission, transport start and
+response headers, redirects, response finalization, and completion or failure
+for the relevant execution paths. The abort phase is reserved in the public
+enum but is not currently emitted by the controller's cancellation branch.
+Events contain request IDs, active URLs, timestamps, status when known, cache
+provenance, and redirect counts, but never bodies, credentials, or error
+strings.
 
 `Body` owns one source and reports one lifecycle state for helper locking,
 direct streaming, transport handoff, completion, failure, and abort. Nullness
@@ -120,7 +133,7 @@ work.
   and a response-header observation hook. `Set-Cookie` reaches only that
   trusted interface. Credential mode still decides whether the engine calls
   its credential methods.
-- CORS preflight, integrity, navigation fetch, keepalive lifetime, nondefault
+- Integrity, navigation fetch, keepalive lifetime, nondefault
   priority scheduling, and cache revalidation fail with `UnsupportedFeature`.
   Manual/error redirect modes are handled by the controller. A service-worker
   `Intercept` decision also
@@ -134,9 +147,15 @@ work.
 - `Default`, `NoStore`, `Reload`, `ForceCache`, and `OnlyIfCached` retain their
   documented process-local cache subset; `NoCache` fails until revalidation
   exists. Browser service providers choose the partition key. This cache is
-  neither durable nor a full Fetch HTTP cache.
-- Cache-only misses surface as Fetch network errors. Body stream transport
-  errors and aborts retain separate typed errors.
+  neither durable nor a full Fetch HTTP cache. Successful responses with a
+  positive `Cache-Control: max-age` are stored by method, normalized URL,
+  and partition; response `Vary` fields select among request-header variants,
+  and `Vary: *` responses are not stored. Cache hits still pass through the
+  normal response finalization and filtering path.
+- Cache-only misses and other pre-exposure failures can surface through
+  `RequestController::fetch_response` as Fetch network errors. Body stream
+  transport errors and aborts retain separate typed errors; `fetch` preserves
+  all typed Rust failures for callers that need diagnostics.
 
 `storage` owns durable cookie and cache data and network partition state.
 `security` owns cookie, CSP, mixed-content, CORP, MIME, authentication, and

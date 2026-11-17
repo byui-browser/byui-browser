@@ -1,6 +1,6 @@
 //! Display-list commands.
 
-use crate::{Color, PaintBox, Rect};
+use crate::{Color, CornerRadii, FontId, ImageKey, PaintBox, Rect};
 
 /// One ordered drawing command. Coordinates are CSS pixels.
 #[derive(Debug, Clone, PartialEq)]
@@ -12,6 +12,17 @@ pub enum DisplayItem {
         /// Opaque or translucent fill color.
         color: Color,
     },
+    /// Fills a rectangle with elliptical corners with an RGBA color.
+    ///
+    /// Painted for backgrounds of boxes with a non-zero `border-radius`.
+    FillRoundedRect {
+        /// Bounding rectangle to fill.
+        rect: Rect,
+        /// Corner radii in CSS pixels, already reduced to fit `rect`.
+        radii: CornerRadii,
+        /// Opaque or translucent fill color.
+        color: Color,
+    },
     /// Draws a run of text.
     Text {
         /// Left edge of the first glyph's advance.
@@ -20,10 +31,26 @@ pub enum DisplayItem {
         baseline: f32,
         /// Font size; the renderer scales its glyphs to it.
         font_size: f32,
+        /// The face layout measured the run with
+        /// ([`layout::TextFragment::font`]); [`FontId::DEFAULT`] for the
+        /// renderer's default font.
+        font: FontId,
         /// Text to draw.
         text: String,
         /// Text color.
         color: Color,
+    },
+    /// Draws a picture (a decoded bitmap or an SVG document) stretched to
+    /// fill `rect`.
+    ///
+    /// Painted for replaced elements such as `<img>` and inline `<svg>`. The
+    /// renderer looks `image` up in its image store and draws nothing when
+    /// it has no picture for it.
+    Image {
+        /// The replaced box's content box.
+        rect: Rect,
+        /// Which picture to draw.
+        image: ImageKey,
     },
 }
 

@@ -7,6 +7,8 @@
 /// A request sent by a renderer to the storage system.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageRequest {
+    /// Represents a request rejected during IPC validation.
+    Invalid,
     /// Read the value associated with `key`.
     GetItem {
         /// Storage key to look up.
@@ -63,6 +65,7 @@ mod tests {
     #[test]
     fn requests_can_describe_each_storage_operation() {
         let requests = [
+            StorageRequest::Invalid,
             StorageRequest::GetItem {
                 key: "theme".into(),
             },
@@ -77,7 +80,7 @@ mod tests {
             StorageRequest::Length,
         ];
 
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 6);
     }
 
     #[test]

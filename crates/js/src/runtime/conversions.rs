@@ -3,18 +3,33 @@
 use crate::Value;
 use crate::lexer::is_js_whitespace;
 
-/// `ToPrimitive`: functions and objects convert to their string form
-/// (`[object Object]` for objects, as there are no prototypes to supply
-/// `valueOf` or `toString`); primitives are kept.
+/// `ToPrimitive`: objects try their `valueOf` and `toString` methods, then
+/// fall back to `[object Object]`; primitives are kept.
 pub(super) fn to_primitive(value: &Value) -> Value {
     match value {
-        Value::Function(_) | Value::Object(_) | Value::Array(_) => Value::String(value.to_string()),
+        Value::Object(object) => {
+            for name in ["valueOf", "toString"] {
+                let Some(Value::Function(method)) = object.get(name) else {
+                    continue;
+                };
+                if let Ok(result) = method.call(&[])
+                    && !matches!(
+                        result,
+                        Value::Object(_) | Value::Function(_) | Value::Array(_)
+                    )
+                {
+                    return result;
+                }
+            }
+            Value::String("[object Object]".to_owned())
+        }
+        Value::Function(_) | Value::Array(_) => Value::String(value.to_string()),
         other => other.clone(),
     }
 }
 
 /// `ToBoolean`.
-pub(super) fn is_truthy(value: &Value) -> bool {
+pub(crate) fn is_truthy(value: &Value) -> bool {
     match value {
         Value::Undefined | Value::Null => false,
         Value::Boolean(value) => *value,

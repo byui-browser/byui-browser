@@ -46,7 +46,10 @@ fn parses_lays_out_paints_and_writes_a_simple_element_image() {
     assert!(
         frame
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
             .any(|pixel| pixel == [0, 0, 0, 255])
     );
 
@@ -81,7 +84,7 @@ fn nested_element_text_is_painted_once() {
         .into_iter()
         .filter_map(|item| match item {
             paint::DisplayItem::Text { text, .. } => Some(text),
-            paint::DisplayItem::FillRect { .. } => None,
+            _ => None,
         })
         .collect::<Vec<_>>();
 

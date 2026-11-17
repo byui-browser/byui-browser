@@ -162,6 +162,34 @@ fn body_consumption_propagates_a_post_header_transport_error() {
 }
 
 #[test]
+fn cors_approved_response_keeps_a_later_body_stream_failure_typed() {
+    let server = TestServer::start(1, |_| {
+        b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: https://client.test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nshort\r\n"
+            .to_vec()
+    });
+    let services = Arc::new(RecordingServices::new(false));
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(services.clone())
+        .build()
+        .unwrap();
+    let mut request = Request::get(server.url());
+    request.set_environment(
+        FetchEnvironment::from_url(reqwest::Url::parse("https://client.test/page").unwrap())
+            .unwrap(),
+    );
+
+    let error = runtime().block_on(async {
+        let response = controller.fetch(request).await.unwrap();
+        assert_eq!(response.response_type, net::ResponseType::Cors);
+        response.body.bytes().await.unwrap_err()
+    });
+
+    server.join();
+    assert!(matches!(error, RequestError::Transport(_)));
+    assert_eq!(services.response_checks.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn unsupported_schemes_are_rejected_without_network_io() {
     let controller = RequestController::builder(Config::default())
         .build()
@@ -344,18 +372,12 @@ fn unsupported_request_features_fail_before_browser_service_or_network_side_effe
     let mut navigation = Request::get("http://127.0.0.1:9/");
     navigation.set_mode(net::RequestMode::Navigate).unwrap();
 
-    let mut preflight = Request::new("http://127.0.0.1:9/", "PUT").unwrap();
-    preflight.set_environment(
-        FetchEnvironment::from_url(reqwest::Url::parse("https://client.test/").unwrap()).unwrap(),
-    );
-
     for (request, feature) in [
         (integrity, "subresource integrity"),
         (revalidation, "HTTP cache revalidation"),
         (priority, "priority scheduling"),
         (keepalive, "keepalive lifetime"),
         (navigation, "navigation fetch"),
-        (preflight, "CORS preflight"),
     ] {
         let services = Arc::new(RecordingServices::new(false));
         let controller = RequestController::builder(Config::default())

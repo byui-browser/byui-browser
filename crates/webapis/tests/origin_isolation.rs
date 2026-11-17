@@ -160,7 +160,7 @@ fn denied_context_cannot_read_storage() {
 
     assert_eq!(
         get_item(&mut denied, "key").unwrap_err().to_string(),
-        "localStorage read access denied"
+        "Uncaught SecurityError: localStorage read access denied"
     );
     assert_eq!(
         get_item(&mut allowed, "key"),
@@ -193,7 +193,7 @@ fn denied_context_cannot_write_storage() {
             )
             .unwrap_err()
             .to_string(),
-        "localStorage write access denied"
+        "Uncaught SecurityError: localStorage write access denied"
     );
     assert_eq!(
         get_item(&mut allowed, "key"),
