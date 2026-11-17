@@ -31,6 +31,7 @@ use crate::context_menu::{ContextMenu, MenuAction};
 use crate::elements_panel::{DockTab, ElementsPanel};
 use crate::find_in_page::{Action as FindAction, FindInPage};
 use crate::page_source::PageSource;
+use crate::site_info;
 use crate::toolbar::{self, Control};
 use devtools::performance::{EventCategory, PerformanceLog, TimelineEvent};
 
@@ -152,6 +153,7 @@ struct App {
     page_press: bool,
     find_pressed: Option<FindAction>,
     context_menu: Option<ContextMenu>,
+    site_info_open: bool,
     menu_pressed: Option<MenuAction>,
     source_font: Option<FontVec>,
     source_close_pressed: bool,
@@ -250,6 +252,7 @@ impl App {
             page_press: false,
             find_pressed: None,
             context_menu: None,
+            site_info_open: false,
             menu_pressed: None,
             source_font: None,
             source_close_pressed: false,
@@ -337,6 +340,7 @@ impl App {
 
     fn reset_tab_interaction(&mut self) {
         self.dismiss_context_menu();
+        self.dismiss_site_info();
         self.find_pressed = None;
         self.source_close_pressed = false;
         self.elements_close_pressed = false;
@@ -547,6 +551,7 @@ impl App {
 
     fn open_find(&mut self) {
         self.dismiss_context_menu();
+        self.dismiss_site_info();
         self.close_page_source();
         self.tab.chrome.address_focused = false;
         let find = self.tab.find.get_or_insert_with(FindInPage::default);
@@ -1524,6 +1529,48 @@ impl App {
         self.menu_pressed = None;
     }
 
+    fn site_info_popup(&self) -> Option<site_info::Popup> {
+        let window = self.window.as_ref()?;
+        let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+        site_info::Popup::new(size.width, size.height, self.platform.window_controls_inset)
+    }
+
+    fn site_info_url(&self) -> &str {
+        self.tab.loaded_page.as_ref().map_or("", |page| &page.url)
+    }
+
+    fn dismiss_site_info(&mut self) {
+        if std::mem::take(&mut self.site_info_open) {
+            self.frame_key = None;
+            self.redraw();
+        }
+    }
+
+    fn site_info_escape(&mut self, key: &Key) -> bool {
+        if self.site_info_open && *key == Key::Named(NamedKey::Escape) {
+            self.dismiss_site_info();
+            return true;
+        }
+        false
+    }
+
+    /// Clicks inside the popup never reach the page. Outside clicks dismiss
+    /// it and continue to their normal target, including tabs and the URL.
+    fn site_info_mouse_input(&mut self, popup: site_info::Popup, state: ElementState) -> bool {
+        if popup.contains(self.cursor) {
+            if state == ElementState::Pressed && popup.close_at(self.cursor) {
+                self.dismiss_site_info();
+            }
+            return true;
+        }
+        if state == ElementState::Pressed {
+            self.dismiss_site_info();
+            // The button also toggles the popup closed.
+            return self.tab.chrome.hovered == Some(Control::SiteInfo);
+        }
+        false
+    }
+
     /// Opens the toolbar overflow menu beneath the browser controls.
     fn open_overflow_menu(&mut self) {
         self.dismiss_context_menu();
@@ -1957,6 +2004,12 @@ impl App {
     }
 
     fn left_mouse_input(&mut self, state: ElementState) {
+        if self.site_info_open
+            && let Some(popup) = self.site_info_popup()
+            && self.site_info_mouse_input(popup, state)
+        {
+            return;
+        }
         if let Some(menu) = self.context_menu {
             match state {
                 ElementState::Pressed => {
@@ -2203,6 +2256,12 @@ impl App {
                 self.begin_address_edit()
             }
             Control::Menu => self.open_overflow_menu(),
+            Control::SiteInfo => {
+                self.dismiss_context_menu();
+                self.site_info_open = self.site_info_popup().is_some();
+                self.update_page_hover();
+                self.redraw();
+            }
         }
     }
 
@@ -2226,6 +2285,11 @@ impl App {
         let strip_entries = self.tab_entries();
         let strip = self.strip();
         let address = self.tab.address.clone();
+        let site_info = self
+            .site_info_open
+            .then(|| self.site_info_popup())
+            .flatten();
+        let site_info_url = site_info.map(|_| self.site_info_url().to_owned());
         let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
             return;
         };
@@ -2246,6 +2310,7 @@ impl App {
         let mut full = self.tab.find.is_some()
             || self.tab.page.is_none()
             || self.context_menu.is_some()
+            || site_info.is_some()
             || self.tab.page_source.is_some()
             || self.tab.elements.is_some();
         let page_size_changed = self.tab.page.as_ref().map(|(size, _)| *size) != card_size;
@@ -2402,6 +2467,16 @@ impl App {
                 self.font.as_ref(),
             );
         }
+        if let Some(popup) = site_info {
+            popup.draw(
+                &mut composed,
+                scale,
+                dark,
+                self.cursor,
+                self.font.as_ref(),
+                site_info_url.as_deref().unwrap_or_default(),
+            );
+        }
         if full {
             self.frame
                 .resize(size.width as usize * size.height as usize, 0);
@@ -2456,6 +2531,10 @@ impl App {
             self.redraw();
         }
         if self.context_menu.is_some()
+            || (self.site_info_open
+                && self
+                    .site_info_popup()
+                    .is_some_and(|p| p.contains(self.cursor)))
             || self.tab.page_source.is_some()
             || self
                 .tab
@@ -2503,7 +2582,7 @@ impl App {
                 if let Some(offset) = self.address_offset_under_pointer() {
                     self.press_address_at(offset);
                 }
-            } else {
+            } else if control != Control::SiteInfo {
                 self.tab.chrome.address_focused = false;
             }
             self.tab.chrome.pressed = Some(control);
@@ -2587,6 +2666,13 @@ impl App {
     /// Coordinates are logical pixels. A point on a toolbar control, including
     /// a disabled one, is not part of the page.
     fn pointer_is_on_page(&self, x: f64, y: f64) -> bool {
+        if self.site_info_open
+            && self
+                .site_info_popup()
+                .is_some_and(|p| p.contains(Some((x, y))))
+        {
+            return false;
+        }
         let Some(window) = &self.window else {
             return false;
         };
@@ -2795,7 +2881,10 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 log::trace!("key event: {:?}", event.state);
-                if event.state == ElementState::Pressed && self.tab_shortcut(&event.logical_key) {
+                if event.state == ElementState::Pressed
+                    && (self.site_info_escape(&event.logical_key)
+                        || self.tab_shortcut(&event.logical_key))
+                {
                     return;
                 }
                 if event.state == ElementState::Pressed && !self.tab.selector_state.keyboard_focus {
@@ -2842,6 +2931,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.tab.page = None;
                 }
                 self.dismiss_context_menu();
+                if self.site_info_open && self.site_info_popup().is_none() {
+                    self.dismiss_site_info();
+                }
                 self.resize_elements();
                 self.reveal_active_tab();
                 self.refresh_hover();
@@ -2878,10 +2970,22 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 if let Some(window) = &self.window {
                     let size = window.inner_size();
-                    self.open_context_menu(size.width, size.height, window.scale_factor());
+                    let scale = window.scale_factor();
+                    if self.site_info_open
+                        && self
+                            .site_info_popup()
+                            .is_some_and(|p| p.contains(self.cursor))
+                    {
+                        return;
+                    }
+                    self.dismiss_site_info();
+                    self.open_context_menu(size.width, size.height, scale);
                 }
             }
-            WindowEvent::Focused(false) => self.dismiss_context_menu(),
+            WindowEvent::Focused(false) => {
+                self.dismiss_context_menu();
+                self.dismiss_site_info();
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 let scale = self
                     .window
@@ -4453,6 +4557,74 @@ mod tab_tests {
             timeline: Vec::new(),
             network_events: Vec::new(),
         }
+    }
+
+    #[test]
+    fn site_info_tracks_the_displayed_document_and_resets_on_tab_switch() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let first = app.tab.id;
+        app.site_info_open = true;
+        assert_eq!(
+            site_info::labels(app.site_info_url()).1,
+            "Internal browser page"
+        );
+
+        // The request and the address being edited are both independent of
+        // the final URL of the document displayed in the tab.
+        let requested = "http://example.test/";
+        let destination = "https://redirected.test/page";
+        app.navigation_finished(
+            app.tab.navigation_id,
+            navigation(requested, Ok(fixture_page(destination, "Redirected"))),
+            NavigationBehavior::Auto,
+        );
+        app.begin_address_edit();
+        app.tab.address = "https://unsubmitted.test/".into();
+        assert!(app.site_info_open);
+        assert_eq!(
+            site_info::labels(app.site_info_url()),
+            ("redirected.test".into(), "URL scheme: HTTPS")
+        );
+
+        app.new_tab();
+        assert!(!app.site_info_open);
+        app.site_info_open = true;
+        app.switch_tab(first);
+        assert!(!app.site_info_open);
+        assert_eq!(app.site_info_url(), destination);
+    }
+
+    #[test]
+    fn site_info_dismissal_preserves_address_editing_and_find_state() {
+        let mut app = app();
+        let popup = site_info::Popup::new(800.0, 600.0, 0.0).unwrap();
+        app.tab.address = "https://draft.test/".into();
+        app.tab.chrome.address_focused = true;
+        app.tab.chrome.address_caret = 11;
+        app.tab.chrome.address_anchor = Some(8);
+        app.tab.find = Some(FindInPage::default());
+
+        app.site_info_open = true;
+        assert!(app.site_info_escape(&Key::Named(NamedKey::Escape)));
+        assert!(!app.site_info_open);
+
+        app.site_info_open = true;
+        app.cursor = Some(popup.close_center());
+        assert!(app.site_info_mouse_input(popup, ElementState::Pressed));
+        assert!(!app.site_info_open);
+
+        app.site_info_open = true;
+        app.cursor = Some((0.0, 0.0));
+        assert!(!app.site_info_mouse_input(popup, ElementState::Pressed));
+        assert!(!app.site_info_open);
+        assert!(app.tab.chrome.address_focused);
+        assert_eq!(
+            app.tab.chrome.address_selection(&app.tab.address),
+            Some((8, 11))
+        );
+        assert_eq!(app.tab.address, "https://draft.test/");
+        assert!(app.tab.find.is_some());
     }
 
     #[test]

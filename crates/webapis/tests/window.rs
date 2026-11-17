@@ -3,8 +3,54 @@ use security::{Origin, RendererSecurityContext, StoragePermission};
 use std::{thread, time::Duration};
 use webapis::{
     Document, register_document, register_window, register_window_with_security_context,
-    register_window_with_url, register_window_with_url_and_device_pixel_ratio,
+    register_window_with_url, register_window_with_url_and_device_pixel_ratio, run_window_messages,
 };
+
+#[test]
+fn post_message_queues_a_cloned_message_event() {
+    let mut realm = Realm::new();
+    let window = register_window_with_url(&mut realm, "https://example.test/page").unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var received = null; var source = null; var origin = null; \
+             window.addEventListener('message', (event) => { received = event.data; source = event.source; origin = event.origin; }); \
+             var payload = {nested: {value: 1}}; window.postMessage(payload, '/'); \
+             received === null"
+        ),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(run_window_messages(&window), Ok(1));
+    assert_eq!(
+        realm.evaluate_script(
+            "received !== null && received !== payload && received.nested.value === 1 && \
+             source === window && origin === 'https://example.test'"
+        ),
+        Ok(Value::Boolean(true))
+    );
+    realm.evaluate_script("payload.nested.value = 9").unwrap();
+    assert_eq!(
+        realm.evaluate_script("received.nested.value === 1"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn post_message_respects_target_origin_and_options() {
+    let mut realm = Realm::new();
+    let window = register_window_with_url(&mut realm, "https://example.test/page").unwrap();
+
+    realm
+        .evaluate_script(
+            "var calls = 0; window.addEventListener('message', () => calls++); \
+             window.postMessage('blocked', 'https://other.test'); \
+             window.postMessage('allowed', {targetOrigin: 'https://example.test'}); \
+             window.postMessage('wildcard', '*')",
+        )
+        .unwrap();
+    assert_eq!(run_window_messages(&window), Ok(2));
+    assert_eq!(realm.evaluate_script("calls"), Ok(Value::Number(2.0)));
+}
 
 #[test]
 fn window_self_returns_the_current_window_object() {
