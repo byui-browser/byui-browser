@@ -308,7 +308,15 @@ const ELEMENT_PROBES: &[ElementProbe] = &[
         uses: &["select"],
         feature: "<select>",
         expected: "A drop-down showing the selected option",
-        check: || visible_box("<select id=\"x\"><option>One</option></select>"),
+        check: || {
+            body("<select id=\"x\"><option>One</option><option selected>Two</option></select>")
+                .is_some_and(|page| {
+                    page.rect("x")
+                        .is_some_and(|rect| rect.width > 0.0 && rect.height > 0.0)
+                        && page.paints_text("Two")
+                        && !page.paints_text("One")
+                })
+        },
     },
     ElementProbe {
         uses: &["button"],
