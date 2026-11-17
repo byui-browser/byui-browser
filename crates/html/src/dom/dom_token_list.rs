@@ -28,7 +28,7 @@ impl<'document> DOMTokenList<'document> {
     /// Returns all class tokens in document order.
     pub fn tokens(&self) -> Vec<String> {
         let Some(NodeKind::Element(element)) =
-            self.document.node(self.element).map(|node| node.get_kind())
+            self.document.get_node(self.element).map(|node| node.get_kind())
         else {
             return Vec::new();
         };
@@ -138,7 +138,7 @@ impl<'document> DOMTokenList<'document> {
 
     fn class_attribute_value(&self) -> Option<String> {
         let Some(NodeKind::Element(element)) =
-            self.document.node(self.element).map(|node| node.get_kind())
+            self.document.get_node(self.element).map(|node| node.get_kind())
         else {
             return None;
         };
@@ -150,7 +150,7 @@ impl<'document> DOMTokenList<'document> {
     }
 
     fn write_attribute_value(&mut self, value: &str) -> Result<(), DomError> {
-        let Some(node) = self.document.node(self.element) else {
+        let Some(node) = self.document.get_node(self.element) else {
             log::debug!(
                 "classList write failed: node {} is not an element",
                 self.element.get()
@@ -163,7 +163,7 @@ impl<'document> DOMTokenList<'document> {
         };
         element.set_attribute(Attribute::new("class".to_owned(), value.to_owned()));
         self.document
-            .node_mut(self.element)
+            .get_mut_node(self.element)
             .expect("element was validated above")
             .set_kind(NodeKind::Element(element));
         Ok(())

@@ -1,5 +1,5 @@
 use crate::{
-    Attribute, ElementData, HTMLDocument, Namespace, NodeID, NodeKind, SourceSpan,
+    Attribute, Doctype, ElementData, HTMLDocument, Namespace, NodeID, NodeKind, SourceSpan,
     escape_characters::decode_html_entities,
 };
 
@@ -7,7 +7,7 @@ use crate::{
 pub fn parse_raw_html(raw: String) -> HTMLDocument {
     log::debug!("parsing html document: {} bytes", raw.len());
     let mut document = HTMLDocument::new();
-    let root = document.root;
+    let root = *document.get_root();
     let mut stack = Vec::<NodeID>::new();
     let mut cursor = 0;
 
@@ -71,11 +71,13 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
         {
             log::trace!("doctype at byte {open}");
             let id = document.push_node(
-                NodeKind::Doctype {
-                    name: Some(tag[8..].trim().to_ascii_lowercase()),
-                    public_id: None,
-                    system_id: None,
-                },
+                NodeKind::Doctype( 
+                    Doctype::new(
+                        Some(tag[8..].trim().to_ascii_lowercase()),
+                        None,
+                        None,
+                    )
+                ),
                 span,
             );
             document.append_child(root, id);
@@ -114,7 +116,7 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
             "math" => Namespace::MathMl,
             _ if stack.iter().any(|id| {
                 matches!(
-                    document.node(*id).map(|node| node.get_kind()),
+                    document.get_node(*id).map(|node| node.get_kind()),
                     Some(NodeKind::Element(element))
                         if *element.get_namespace() == Namespace::Svg
                 )
@@ -148,7 +150,7 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
     }
     log::debug!(
         "parsed html document: {} nodes, {} elements left open at eof",
-        document.nodes.len(),
+        document.get_nodes_count(),
         stack.len()
     );
     document
@@ -173,7 +175,7 @@ fn append_text(document: &mut HTMLDocument, parent: NodeID, text: &str, start: u
 }
 
 fn element_name(document: &HTMLDocument, id: NodeID) -> Option<&str> {
-    match document.node(id)?.get_kind() {
+    match document.get_node(id)?.get_kind() {
         NodeKind::Element(element) => Some(element.get_name()),
         _ => None,
     }

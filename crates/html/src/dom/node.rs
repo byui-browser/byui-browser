@@ -47,10 +47,34 @@ impl Node {
     pub fn set_children(&mut self, children_ids: Vec<NodeID>) {
         self.children = children_ids;
     }
+    // Only adds child id to children if not already listed.
+    pub fn add_child(&mut self, child_id: NodeID) {
+        if !self
+            .children
+            .iter()
+            .any(|id_ref| id_ref.get() == child_id.get())
+        {
+            self.children.push(child_id);
+        }
+    }
+    // Only removes child id from children if listed.
+    pub fn remove_child(&mut self, child_id: NodeID) {
+        if let Some(index) = self
+            .children
+            .iter()
+            .position(|id_ref| id_ref.get() == child_id.get())
+        {
+            self.children.remove(index);
+        }
+    }
 
     // Gets reference of node kind.
     pub fn get_kind(&self) -> &NodeKind {
         &self.kind
+    }
+    // Gets mutable reference of node kind.
+    pub fn get_mut_kind(&mut self) -> &mut NodeKind {
+        &mut self.kind
     }
     // Sets node kind.
     pub fn set_kind(&mut self, node_kind: NodeKind) {
