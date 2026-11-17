@@ -410,6 +410,8 @@ fn select_arrow(rect: layout::Rect, color: Color) -> Vec<DisplayItem> {
         .collect()
 }
 
+/// The background fill for a box's border box `rect`, rounded by its
+/// `border-radius` when that is non-zero.
 fn background(rect: layout::Rect, style: &layout::BoxStyle, color: Color) -> DisplayItem {
     let radii = style.border_radius.resolve(rect);
     if radii.is_zero() {
