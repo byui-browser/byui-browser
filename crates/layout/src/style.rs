@@ -2,7 +2,8 @@
 //!
 //! [`css::style_document`] produces cascaded, inherited declarations as text.
 //! This module parses `display`, box dimensions and edges, text colors, and
-//! `text-align`, `border-*-radius`, and the initial flex subset (`flex-direction`, `flex-grow`, and `gap`). Other
+//! `text-align`, `border-*-radius`, and the flex subset (`flex-direction`,
+//! `flex-grow`, `flex-shrink`, `flex-basis`, and `gap`). Other
 //! properties use their initial values. A missing or unparsable value falls back to the initial
 //! value. Lengths are resolved to CSS pixels here; percentages are kept
 //! because they resolve against the containing block during layout.
@@ -343,10 +344,14 @@ pub(crate) struct ComputedStyle {
     pub padding: Sides<Dimension>,
     pub width: Dimension,
     pub height: Dimension,
-    /// `min-width`; only replaced elements honor it so far.
+    /// `min-width`; replaced elements and flex items honor it so far.
     pub min_width: Dimension,
-    /// `min-height`; only replaced elements honor it so far.
+    /// `min-height`; replaced elements and flex items honor it so far.
     pub min_height: Dimension,
+    /// Whether `min-width` was left at the flex item's automatic minimum.
+    pub min_width_auto: bool,
+    /// Whether `min-height` was left at the flex item's automatic minimum.
+    pub min_height_auto: bool,
     /// `max-width`, with `none` stored as [`Dimension::Auto`]; only replaced
     /// elements honor it so far.
     pub max_width: Dimension,
@@ -370,6 +375,11 @@ pub(crate) struct ComputedStyle {
     pub border_radius: BorderRadius,
     pub flex_column: bool,
     pub flex_grow: f32,
+    /// Flex base size before free-space distribution; `auto` uses the
+    /// corresponding main-size property or the item's intrinsic size.
+    pub flex_basis: Dimension,
+    /// The factor used to distribute negative free space among flex items.
+    pub flex_shrink: f32,
     pub gap: f32,
     /// The text a `::before` / `::after` box holds, from the `content`
     /// property. `None` means no box is generated. Ignored on elements.
@@ -462,6 +472,8 @@ impl ComputedStyle {
             height: Dimension::Auto,
             min_width: Dimension::Px(0.0),
             min_height: Dimension::Px(0.0),
+            min_width_auto: true,
+            min_height_auto: true,
             max_width: Dimension::Auto,
             max_height: Dimension::Auto,
             font_size: parent.map_or(css::values::MEDIUM_FONT_SIZE, |parent| parent.font_size),
@@ -486,6 +498,8 @@ impl ComputedStyle {
             border_radius: BorderRadius::default(),
             flex_column: false,
             flex_grow: 0.0,
+            flex_basis: Dimension::Auto,
+            flex_shrink: 1.0,
             gap: 0.0,
         }
     }
@@ -569,6 +583,10 @@ impl ComputedStyle {
             .and_then(|value| value.parse::<f32>().ok())
             .filter(|value| value.is_finite() && *value >= 0.0)
             .unwrap_or(0.0);
+        style.flex_shrink = get("flex-shrink")
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(1.0);
 
         let context = LengthContext {
             font_size: style.font_size,
@@ -605,6 +623,7 @@ impl ComputedStyle {
             }
             Some(parsed)
         };
+        style.flex_basis = dimension("flex-basis", true, false).unwrap_or(Dimension::Auto);
         let side = |prefix: &str, allow_auto: bool, allow_negative: bool| {
             Sides::from_array(["top", "right", "bottom", "left"].map(|side| {
                 dimension(&format!("{prefix}-{side}"), allow_auto, allow_negative)
@@ -615,14 +634,19 @@ impl ComputedStyle {
         style.padding = side("padding", false, false);
         style.width = dimension("width", true, false).unwrap_or(Dimension::Auto);
         style.height = dimension("height", true, false).unwrap_or(Dimension::Auto);
-        // `min-*: auto` computes to 0 outside flex and grid items, and
-        // `max-*: none` is stored as `Auto` (no maximum).
+        // Store the numeric fallback here and retain whether the flex
+        // automatic minimum applies in the flags below. `max-*: none` is
+        // stored as `Auto` (no maximum).
         style.min_width = dimension("min-width", true, false)
             .filter(|value| *value != Dimension::Auto)
             .unwrap_or(Dimension::Px(0.0));
         style.min_height = dimension("min-height", true, false)
             .filter(|value| *value != Dimension::Auto)
             .unwrap_or(Dimension::Px(0.0));
+        style.min_width_auto =
+            get("min-width").is_none_or(|value| value.eq_ignore_ascii_case("auto"));
+        style.min_height_auto =
+            get("min-height").is_none_or(|value| value.eq_ignore_ascii_case("auto"));
         let max = |property: &str| {
             if get(property).is_some_and(|value| value.eq_ignore_ascii_case("none")) {
                 return Dimension::Auto;

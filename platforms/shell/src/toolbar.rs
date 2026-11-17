@@ -526,6 +526,8 @@ fn draw_address_field(
         palette.pressed
     } else if state.hovered == Some(Control::SiteInfo) {
         palette.hover
+    } else if state.dark {
+        palette.frame_top
     } else {
         palette.field_border
     };
@@ -623,7 +625,7 @@ fn draw_address_field(
             text_x * scale,
             baseline,
             clip_x * scale,
-            if state.address_focused {
+            if state.address_focused || state.dark {
                 palette.text
             } else {
                 palette.text_muted
@@ -876,6 +878,10 @@ pub(crate) struct Palette {
     pub(crate) text: Color,
     pub(crate) text_muted: Color,
     pub(crate) accent: Color,
+    pub(crate) on_accent: Color,
+    pub(crate) active_tab: Color,
+    pub(crate) panel: Color,
+    pub(crate) panel_border: Color,
     pub(crate) selection: Color,
 }
 
@@ -901,6 +907,10 @@ fn light() -> Palette {
         text_muted: rgba(0x6b, 0x72, 0x80, 255),
         // BYU–Idaho blue.
         accent: rgba(0x00, 0x6e, 0xb6, 255),
+        on_accent: Color::WHITE,
+        active_tab: Color::WHITE,
+        panel: rgba(0xf4, 0xf5, 0xf8, 255),
+        panel_border: rgba(15, 23, 42, 34),
         selection: rgba(0x00, 0x6e, 0xb6, 64),
     }
 }
@@ -911,16 +921,20 @@ fn dark() -> Palette {
         frame_bottom: rgba(0x1b, 0x1c, 0x20, 255),
         shadow: rgba(0, 0, 0, 40),
         card_border: rgba(255, 255, 255, 20),
-        icon: rgba(0xe2, 0xe5, 0xeb, 255),
-        icon_disabled: rgba(0xe2, 0xe5, 0xeb, 70),
+        icon: rgba(0xec, 0xef, 0xf5, 255),
+        icon_disabled: rgba(0x7b, 0x82, 0x90, 255),
         hover: rgba(255, 255, 255, 18),
         pressed: rgba(255, 255, 255, 32),
-        field: rgba(255, 255, 255, 16),
-        field_hover: rgba(255, 255, 255, 26),
-        field_border: rgba(255, 255, 255, 16),
+        field: rgba(0x30, 0x33, 0x3c, 255),
+        field_hover: rgba(0x39, 0x3d, 0x48, 255),
+        field_border: rgba(0x67, 0x70, 0x83, 255),
         text: rgba(0xec, 0xee, 0xf2, 255),
-        text_muted: rgba(0x96, 0x9c, 0xa8, 255),
+        text_muted: rgba(0xb0, 0xb8, 0xc7, 255),
         accent: rgba(0x4d, 0xa3, 0xff, 255),
+        on_accent: rgba(0x12, 0x1b, 0x29, 255),
+        active_tab: rgba(0x41, 0x49, 0x59, 255),
+        panel: rgba(0x29, 0x2c, 0x35, 255),
+        panel_border: rgba(0x6e, 0x77, 0x89, 255),
         selection: rgba(0x4d, 0xa3, 0xff, 96),
     }
 }
@@ -932,6 +946,46 @@ mod tests {
     fn pixel(pixmap: &Pixmap, x: u32, y: u32) -> [u8; 4] {
         let p = pixmap.pixel(x, y).expect("pixel in bounds");
         [p.red(), p.green(), p.blue(), p.alpha()]
+    }
+
+    #[test]
+    fn dark_palette_keeps_text_controls_and_focus_legible() {
+        fn luminance(color: Color) -> f32 {
+            let linear = |value: f32| {
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(color.red())
+                + 0.7152 * linear(color.green())
+                + 0.0722 * linear(color.blue())
+        }
+        let contrast = |a, b| {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        };
+        let dark = palette(true);
+        for (foreground, background) in [
+            (dark.text, dark.field_hover),
+            (dark.text, dark.active_tab),
+            (dark.text_muted, dark.panel),
+            (dark.on_accent, dark.accent),
+        ] {
+            assert!(contrast(foreground, background) >= 4.5);
+        }
+        for (foreground, background) in [
+            (dark.icon, dark.field_hover),
+            (dark.icon_disabled, dark.frame_top),
+            (dark.accent, dark.active_tab),
+            (dark.accent, dark.field_hover),
+            (dark.panel_border, dark.panel),
+        ] {
+            assert!(contrast(foreground, background) >= 3.0);
+        }
+        let light = palette(false);
+        assert!(contrast(light.on_accent, light.accent) >= 4.5);
     }
 
     #[cfg(target_os = "macos")]
