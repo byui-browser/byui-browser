@@ -8,7 +8,8 @@
 use crate::bytecode::{CallableKind, Chunk, FunctionTemplate, Instruction};
 use crate::runtime::{
     BytecodeCapture, ExecutionLimits, array_len, binary, builtins, copy_data_properties,
-    delete_property, get_array_property, is_nullish, is_truthy, non_object, set_array_property,
+    delete_property, get_array_property, is_nullish, is_truthy, non_object,
+    primitives_get_number_property, primitives_get_string_property, set_array_property,
     spread_values, to_property_key, unary,
 };
 use crate::{Function, JsError, JsErrorCategory, JsResult, Object, Value};
@@ -801,7 +802,7 @@ impl Vm {
         };
         let Some(template) = function.template().cloned() else {
             log::trace!("calling host function with {} arguments", arguments.len());
-            return match function.call_host(&arguments) {
+            return match function.call_host(&receiver, &arguments) {
                 Some(result) => {
                     self.push(result?);
                     Ok(false)
@@ -1198,8 +1199,9 @@ fn property_name(chunk: &Chunk, index: u16) -> JsResult<String> {
     }
 }
 
-/// Reads a property of an object, following its prototype chain, or an own
-/// property of a bytecode function such as a class's `prototype`.
+/// Reads a property of an object, array, string, or number, following
+/// prototype chains where they apply, or an own property of a host/bytecode
+/// function such as a constructor's `prototype`.
 ///
 /// A missing property reads as `undefined`. Reading a property of any other
 /// value is an error.
@@ -1207,9 +1209,9 @@ fn load_property(target: &Value, key: &str) -> JsResult<Value> {
     match target {
         Value::Object(object) => Ok(object.get_property(key)?.unwrap_or(Value::Undefined)),
         Value::Array(array) => Ok(get_array_property(array, key)),
-        Value::Function(function) if function.template().is_some() => {
-            Ok(function.get_own(key).unwrap_or(Value::Undefined))
-        }
+        Value::String(text) => primitives_get_string_property(text, key),
+        Value::Number(_) => primitives_get_number_property(key),
+        Value::Function(function) => Ok(function.get_own(key).unwrap_or(Value::Undefined)),
         _ => Err(non_object(target, "read", key, "property access")),
     }
 }

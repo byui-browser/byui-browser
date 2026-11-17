@@ -17,10 +17,12 @@
 //!
 //! Limitations:
 //! - Assigning to an undeclared name is an error, as in strict mode.
-//! - Member access works only on [`Object`] values. Reading a property of any
-//!   other value, including strings and functions, is a runtime error.
-//!   Reading a property an object does not have returns `undefined`, as in
-//!   JavaScript. Methods are called without `this`.
+//! - Member access works on objects, arrays, strings, and numbers. Strings
+//!   expose `length`, character indices, and `String.prototype` methods;
+//!   numbers expose `Number.prototype` methods (including `toFixed`).
+//!   Reading a property of `null`, `undefined`, a boolean, or a bare function
+//!   is a runtime error. Missing properties read as `undefined`. Method calls
+//!   whose callee is a member expression receive the object as `this`.
 //! - Classes, `new`, and `super` parse but are not evaluated here; they run
 //!   only through the bytecode compiler and [`crate::vm::Vm`].
 //! - There is no garbage collector yet. A function stored in the scope it
@@ -38,7 +40,9 @@ mod conversions;
 mod expressions;
 mod object;
 mod operators;
+mod primitives;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -59,6 +63,10 @@ pub use object::{
     WeakObject,
 };
 pub(crate) use operators::{binary, unary};
+pub(crate) use primitives::{
+    get_number_property as primitives_get_number_property,
+    get_string_property as primitives_get_string_property,
+};
 
 const STACK_OVERFLOW: &str = "Maximum call stack size exceeded";
 
@@ -175,13 +183,35 @@ fn is_declared(scope: &ScopeRef, name: &str) -> bool {
     with_binding(scope, name, |_| Ok(())).is_ok()
 }
 
-/// Reads `target[key]` for an object or array; any other value is an error.
+/// Reads `target[key]` for an object, array, string, or number; any other
+/// value is an error.
 fn read_member(target: &Value, key: &str) -> JsResult<Value> {
     match target {
         Value::Object(target) => Ok(target.get_property(key)?.unwrap_or(Value::Undefined)),
         Value::Array(target) => Ok(get_array_property(target, key)),
+        Value::String(text) => primitives::get_string_property(text, key),
+        Value::Number(_) => primitives::get_number_property(key),
         target => Err(non_object(target, "read", key, "property access")),
     }
+}
+
+thread_local! {
+    static HOST_THIS: RefCell<Value> = const { RefCell::new(Value::Undefined) };
+}
+
+/// Runs `body` with `this` visible to host functions through [`host_this`].
+pub(crate) fn with_host_this<T>(this: Value, body: impl FnOnce() -> T) -> T {
+    HOST_THIS.with(|slot| {
+        let previous = std::mem::replace(&mut *slot.borrow_mut(), this);
+        let result = body();
+        *slot.borrow_mut() = previous;
+        result
+    })
+}
+
+/// The `this` value for the host function currently running on this thread.
+pub(crate) fn host_this() -> Value {
+    HOST_THIS.with(|slot| slot.borrow().clone())
 }
 
 /// Writes `target[key] = value` for an object or array; any other value is
@@ -337,6 +367,8 @@ enum FunctionKind {
         name: String,
         function: HostFunction,
         constructor: Option<HostFunction>,
+        /// Own properties such as a constructor's `prototype`.
+        properties: Object,
     },
     /// A function compiled to bytecode; only the VM can run it.
     Bytecode {
@@ -360,6 +392,7 @@ impl Function {
             name: name.into(),
             function,
             constructor: None,
+            properties: Object::new(),
         }))
     }
 
@@ -375,6 +408,7 @@ impl Function {
             name: name.into(),
             function,
             constructor: Some(constructor),
+            properties: Object::new(),
         }))
     }
 
@@ -477,26 +511,29 @@ impl Function {
         }
     }
 
-    /// Reads an own property; only bytecode functions have any.
+    /// Reads an own property of a host or bytecode function.
     pub(crate) fn get_own(&self, key: &str) -> Option<Value> {
         match &*self.0 {
-            FunctionKind::Bytecode { properties, .. } => properties.get_own(key),
+            FunctionKind::Bytecode { properties, .. } | FunctionKind::Host { properties, .. } => {
+                properties.get_own(key)
+            }
             _ => None,
         }
     }
 
-    /// Returns an own property of a function, such as a class's `prototype`.
+    /// Returns an own property of a function, such as a constructor's
+    /// `prototype`.
     ///
-    /// Functions created by the bytecode VM expose own properties. Functions
-    /// created by the tree-walk evaluator or host API currently do not.
+    /// Host constructors and bytecode functions expose own properties. Script
+    /// functions created by the tree-walk evaluator do not.
     pub fn get_own_property(&self, key: &str) -> Option<Value> {
         self.get_own(key)
     }
 
-    /// Sets an own property on a bytecode function.
+    /// Sets an own property on a host or bytecode function.
     ///
-    /// Returns `false` for host and tree-walk functions, whose properties are
-    /// not currently modeled.
+    /// Returns `false` for tree-walk script functions, which do not model
+    /// own properties.
     pub fn set_own_property(&self, key: &str, value: Value) -> bool {
         self.set_own(key, value)
     }
@@ -545,10 +582,10 @@ impl Function {
     }
 
     /// Writes an own property, returning `false` for functions that cannot
-    /// hold properties (script and host functions).
+    /// hold properties (tree-walk script functions).
     pub(crate) fn set_own(&self, key: &str, value: Value) -> bool {
         match &*self.0 {
-            FunctionKind::Bytecode { properties, .. } => {
+            FunctionKind::Bytecode { properties, .. } | FunctionKind::Host { properties, .. } => {
                 properties.set(key, value);
                 true
             }
@@ -556,10 +593,17 @@ impl Function {
         }
     }
 
-    /// Calls a host function directly. Returns `None` for any other kind.
-    pub(crate) fn call_host(&self, arguments: &[Value]) -> Option<JsResult<Value>> {
+    /// Calls a host function with `receiver` as `this`. Returns `None` for any
+    /// other kind.
+    pub(crate) fn call_host(
+        &self,
+        receiver: &Value,
+        arguments: &[Value],
+    ) -> Option<JsResult<Value>> {
         match &*self.0 {
-            FunctionKind::Host { function, .. } => Some(function(arguments)),
+            FunctionKind::Host { function, .. } => {
+                Some(with_host_this(receiver.clone(), || function(arguments)))
+            }
             _ => None,
         }
     }
@@ -1207,9 +1251,9 @@ impl Interpreter {
                 }
             }
             Expr::Call { callee, arguments } => {
-                let function = self.evaluate(callee, scope)?;
+                let (function, receiver) = self.evaluate_callee(callee, scope)?;
                 let arguments = self.evaluate_arguments(arguments, scope)?;
-                self.call_value(function, callee, &arguments)
+                self.call_value_with_this(function, callee, receiver, &arguments)
             }
             Expr::Member { object, property } => {
                 let target = self.evaluate(object, scope)?;
@@ -1361,10 +1405,11 @@ impl Interpreter {
 
     /// Calls an already-evaluated callee, describing `callee` in the error
     /// when the value is not a function.
-    fn call_value(
+    fn call_value_with_this(
         &mut self,
         function: Value,
         callee: &Expr,
+        receiver: Value,
         arguments: &[Value],
     ) -> JsResult<Value> {
         let Value::Function(function) = function else {
@@ -1378,7 +1423,66 @@ impl Interpreter {
                 "function call",
             ));
         };
-        self.call(&function, arguments)
+        self.call_with_this(&function, receiver, arguments)
+    }
+
+    /// Evaluates a call's callee, returning the function value and the
+    /// receiver when the callee is a member expression.
+    fn evaluate_callee(&mut self, callee: &Expr, scope: &ScopeRef) -> JsResult<(Value, Value)> {
+        match callee {
+            Expr::Member { object, property } => {
+                let receiver = self.evaluate(object, scope)?;
+                let key = self.property_key(property, scope)?;
+                let function = read_member(&receiver, &key)?;
+                Ok((function, receiver))
+            }
+            Expr::OptionalMember { object, property } => {
+                let receiver = self.evaluate(object, scope)?;
+                if is_nullish(&receiver) {
+                    return Ok((Value::Undefined, Value::Undefined));
+                }
+                let key = self.property_key(property, scope)?;
+                let function = read_member(&receiver, &key)?;
+                Ok((function, receiver))
+            }
+            other => Ok((self.evaluate(other, scope)?, Value::Undefined)),
+        }
+    }
+
+    /// Like [`Self::evaluate_callee`], but for a link inside an optional chain:
+    /// returns `None` when a `?.` base was nullish.
+    fn evaluate_chain_callee(
+        &mut self,
+        callee: &Expr,
+        scope: &ScopeRef,
+    ) -> JsResult<Option<(Value, Value)>> {
+        match callee {
+            Expr::Member { object, property } => {
+                let Some(receiver) = self.evaluate_chain(object, scope)? else {
+                    return Ok(None);
+                };
+                let key = self.property_key(property, scope)?;
+                let function = read_member(&receiver, &key)?;
+                Ok(Some((function, receiver)))
+            }
+            Expr::OptionalMember { object, property } => {
+                let Some(receiver) = self.evaluate_chain(object, scope)? else {
+                    return Ok(None);
+                };
+                if is_nullish(&receiver) {
+                    return Ok(None);
+                }
+                let key = self.property_key(property, scope)?;
+                let function = read_member(&receiver, &key)?;
+                Ok(Some((function, receiver)))
+            }
+            other => {
+                let Some(function) = self.evaluate_chain(other, scope)? else {
+                    return Ok(None);
+                };
+                Ok(Some((function, Value::Undefined)))
+            }
+        }
     }
 
     /// Evaluates a link of an optional chain, returning `None` when a `?.`
@@ -1403,21 +1507,23 @@ impl Interpreter {
                 read_member(&target, &key).map(Some)
             }
             Expr::OptionalCall { callee, arguments } => {
-                let Some(function) = self.evaluate_chain(callee, scope)? else {
+                let Some((function, receiver)) = self.evaluate_chain_callee(callee, scope)? else {
                     return Ok(None);
                 };
                 if is_nullish(&function) {
                     return Ok(None);
                 }
                 let arguments = self.evaluate_arguments(arguments, scope)?;
-                self.call_value(function, callee, &arguments).map(Some)
+                self.call_value_with_this(function, callee, receiver, &arguments)
+                    .map(Some)
             }
             Expr::Call { callee, arguments } => {
-                let Some(function) = self.evaluate_chain(callee, scope)? else {
+                let Some((function, receiver)) = self.evaluate_chain_callee(callee, scope)? else {
                     return Ok(None);
                 };
                 let arguments = self.evaluate_arguments(arguments, scope)?;
-                self.call_value(function, callee, &arguments).map(Some)
+                self.call_value_with_this(function, callee, receiver, &arguments)
+                    .map(Some)
             }
             other => self.evaluate(other, scope).map(Some),
         }
@@ -1555,7 +1661,7 @@ impl Interpreter {
         match &*function.0 {
             FunctionKind::Host { function, .. } => {
                 log::trace!("calling host function with {} arguments", arguments.len());
-                function(arguments)
+                with_host_this(receiver, || function(arguments))
             }
             FunctionKind::Bytecode { .. } => {
                 log::debug!("tree-walk interpreter asked to call a bytecode function");

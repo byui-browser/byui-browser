@@ -239,7 +239,7 @@ fn update_reports_reference_errors() {
     fails("const c = 1; --c", "Assignment to constant `c`");
     fails("missing++", "`missing` is not defined");
     fails("++missing", "`missing` is not defined");
-    fails("let n = 1; n.x++", "Cannot read property `x` of a number");
+    fails("let n = 1; n.x++", "Cannot set property `x` of a number");
     fails("let o = null; o.x++", "Cannot read property `x` of null");
 }
 
@@ -386,7 +386,7 @@ fn compound_assignment_reports_reference_errors() {
     fails("missing ||= 1", "`missing` is not defined");
     fails(
         "let n = 1; n.x += 1",
-        "Cannot read property `x` of a number",
+        "Cannot set property `x` of a number",
     );
     fails(
         "let o = null; o.x ??= 1",
@@ -941,7 +941,7 @@ fn optional_chain_still_reports_non_nullish_errors() {
         "let o = { a: null }; o?.a.b",
         "Cannot read property `b` of null",
     );
-    fails("let n = 1; n?.a.b", "Cannot read property `a` of a number");
+    fails("let n = 1; n?.a.b", "Cannot read property `b` of undefined");
     fails("missing?.a", "`missing` is not defined");
     fails_at_run_time("let o = { f: 1 }; o.f?.()");
     fails_at_run_time("let o = { f: 1 }; o?.f()");
