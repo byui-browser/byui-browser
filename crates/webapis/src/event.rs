@@ -122,6 +122,22 @@ fn event_object(event_type: String, bubbles: bool, cancelable: bool) -> Object {
     event
 }
 
+pub(crate) fn error_event(
+    message: impl Into<String>,
+    filename: impl Into<String>,
+    lineno: usize,
+    colno: usize,
+    error: Value,
+) -> Object {
+    let event = event_object("error".into(), false, false);
+    event.set("message", Value::String(message.into()));
+    event.set("filename", Value::String(filename.into()));
+    event.set("lineno", Value::Number(lineno as f64));
+    event.set("colno", Value::Number(colno as f64));
+    event.set("error", error);
+    event
+}
+
 /// Implements the JavaScript `AbortController()` constructor used to cancel
 /// event listeners registered with its signal.
 pub fn abort_controller_constructor(_arguments: &[Value]) -> JsResult<Value> {
@@ -434,6 +450,11 @@ pub(crate) fn dispatch_event_target(
     event.set("__stopPropagation", Value::Boolean(false));
     event.set("__stopImmediatePropagation", Value::Boolean(false));
     invoke_listeners(target, event, &event_type, target_object, true, 2.0);
+    let handler_cancelled = if event_type == "error" {
+        invoke_window_error_handler(target_object, event)
+    } else {
+        false
+    };
     if !matches!(
         event.get("__stopImmediatePropagation"),
         Some(Value::Boolean(true))
@@ -442,10 +463,47 @@ pub(crate) fn dispatch_event_target(
     }
     event.set("eventPhase", Value::Number(0.0));
     event.set("currentTarget", Value::Null);
-    Ok(Value::Boolean(!matches!(
-        event.get("defaultPrevented"),
-        Some(Value::Boolean(true))
-    )))
+    Ok(Value::Boolean(
+        !handler_cancelled && !matches!(event.get("defaultPrevented"), Some(Value::Boolean(true))),
+    ))
+}
+
+fn invoke_window_error_handler(target: &Object, event: &Object) -> bool {
+    let Some(Value::Function(handler)) = target.get("onerror") else {
+        return false;
+    };
+    let arguments = [
+        event.get("message").unwrap_or(Value::Undefined),
+        event.get("filename").unwrap_or(Value::Undefined),
+        event.get("lineno").unwrap_or(Value::Undefined),
+        event.get("colno").unwrap_or(Value::Undefined),
+        event.get("error").unwrap_or(Value::Undefined),
+    ];
+    match handler.call(&arguments) {
+        Ok(Value::Boolean(true)) => true,
+        Ok(_) => false,
+        Err(error) => {
+            log::warn!("window.onerror handler threw: {error}");
+            false
+        }
+    }
+}
+
+/// Reports an uncaught script error to a Window's `onerror` handler.
+///
+/// The handler receives the HTML Standard's legacy `(message, source, line,
+/// column, error)` arguments. The original script error remains the returned
+/// host error; returning `true` only suppresses the event's default action.
+pub fn report_window_error(window: &Object, error: &js::JsError, source: &str) -> JsResult<Value> {
+    let value = error.clone().into_caught_value();
+    let (line, column) = error
+        .location
+        .map_or((0, 0), |location| (location.line, location.column));
+    let event = error_event(&error.message, source, line, column, value);
+    let Some(Value::Function(report)) = window.get("__reportError") else {
+        return Err(JsError::new("window error reporter is not installed"));
+    };
+    report.call(&[Value::Object(event)])
 }
 
 fn element_for_node(document: &Document, node: NodeID) -> Option<Element> {

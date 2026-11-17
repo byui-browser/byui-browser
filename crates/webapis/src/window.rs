@@ -785,6 +785,7 @@ fn register_window_object(
     window.set("innerHeight", inner_height.clone());
     window.set("onpopstate", Value::Null);
     window.set("onmessage", Value::Null);
+    window.set("onerror", Value::Null);
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__mediaQueryLists", Value::Object(Object::new()));
 
@@ -1175,6 +1176,15 @@ fn register_window_object(
         "dispatchEvent",
         Arc::new(move |arguments| {
             dispatch_event_target(&dispatch_window_event_target, &dispatch_window, arguments)
+        }),
+    );
+
+    let report_window_event_target = event_target.clone();
+    let report_window = window.clone();
+    window.set_method(
+        "__reportError",
+        Arc::new(move |arguments| {
+            dispatch_event_target(&report_window_event_target, &report_window, arguments)
         }),
     );
 

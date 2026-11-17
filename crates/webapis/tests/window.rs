@@ -1,10 +1,44 @@
-use js::{Realm, Value};
+use js::{JsError, Realm, Value};
 use security::{Origin, RendererSecurityContext, StoragePermission};
 use std::{thread, time::Duration};
 use webapis::{
     Document, register_document, register_window, register_window_with_security_context,
-    register_window_with_url, register_window_with_url_and_device_pixel_ratio, run_window_messages,
+    register_window_with_url, register_window_with_url_and_device_pixel_ratio, report_window_error,
+    run_window_messages,
 };
+
+#[test]
+fn window_onerror_receives_legacy_error_arguments_and_can_cancel_reporting() {
+    let mut realm = Realm::new();
+    let window = register_window_with_url(&mut realm, "https://example.test/page").unwrap();
+    realm
+        .evaluate_script(
+            "var observed = []; window.onerror = (message, source, line, column, error) => { \
+             observed = [message, source, line, column, error.name, error.message]; return true; }; \
+             window.addEventListener('error', (event) => { observed.push(event.type + ':' + event.message); });",
+        )
+        .unwrap();
+
+    let mut error = JsError::runtime("boom");
+    error.location = Some(js::bytecode::SourceLocation {
+        offset: 0,
+        line: 3,
+        column: 7,
+    });
+    assert_eq!(
+        report_window_error(&window, &error, "https://example.test/page.js"),
+        Ok(Value::Boolean(false))
+    );
+    assert_eq!(
+        realm.evaluate_script(
+            "observed.length === 7 && observed[0] === 'boom' && \
+             observed[1] === 'https://example.test/page.js' && observed[2] === 3 && \
+             observed[3] === 7 && observed[4] === 'Error' && observed[5] === 'boom' && \
+             observed[6] === 'error:boom'"
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
 
 #[test]
 fn post_message_queues_a_cloned_message_event() {

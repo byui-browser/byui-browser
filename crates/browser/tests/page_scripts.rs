@@ -149,6 +149,43 @@ fn page_session_script_evaluates_through_a_microtask_checkpoint() {
 }
 
 #[test]
+fn page_session_reports_uncaught_errors_to_window_onerror() {
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+    let session = BrowserRuntime::in_memory()
+        .open_page(
+            &browser::Page {
+                html: "<main></main>".into(),
+                url: "https://example.com/".into(),
+                scripts: Vec::new(),
+                stylesheets: Vec::new(),
+                resources: Default::default(),
+            },
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            security_context(),
+        )
+        .expect("page session should open");
+
+    session
+        .evaluate_script(
+            "var report = ''; window.onerror = (message, source, line, column, error) => { \
+             report = message + '|' + source + '|' + error; }; throw 'boom';",
+        )
+        .expect_err("the original uncaught script error remains observable");
+    assert_eq!(
+        session.evaluate_script("report"),
+        Ok(js::Value::String(
+            "Uncaught boom|https://example.com/|boom".into()
+        ))
+    );
+}
+
+#[test]
 fn html_script_history_survives_document_registration() {
     let controller = Arc::new(
         net::RequestController::builder(net::Config::default())
