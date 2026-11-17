@@ -9,6 +9,10 @@ use std::{
 
 use crate::crypto::register_crypto;
 use crate::custom_elements::CustomElementRegistry;
+use crate::event::{
+    EventTarget, EventTargetRef, add_event_listener_to_target, dispatch_event_target,
+    remove_event_listener_from_target,
+};
 use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
 use security::RendererSecurityContext;
@@ -728,6 +732,7 @@ fn register_window_object(
     let timers = Arc::new(Mutex::new(WindowTimers::new()));
     let microtasks = Arc::new(Mutex::new(MicrotaskQueue::new()));
     let messages = Arc::new(Mutex::new(MessageQueue::new()));
+    let event_target: EventTargetRef = Arc::new(Mutex::new(EventTarget::default()));
     let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
     let performance = Object::new();
     let performance_clock = Arc::new(PerformanceClock::new());
@@ -1166,14 +1171,16 @@ fn register_window_object(
     );
 
     let listeners_window = window.clone();
+    let window_event_target = event_target.clone();
     window.set_method(
         "addEventListener",
         Arc::new(move |arguments| {
-            let [Value::String(event_type), Value::Function(callback), ..] = arguments else {
+            let Some(Value::String(event_type)) = arguments.first() else {
                 return Err(JsError::runtime(
                     "window.addEventListener() expects an event type and callback",
                 ));
             };
+            let result = add_event_listener_to_target(&window_event_target, arguments, "window")?;
             if event_type == "popstate" || event_type == "storage" || event_type == "message" {
                 let list_name = if event_type == "popstate" {
                     "__popstateListeners"
@@ -1187,18 +1194,24 @@ fn register_window_object(
                     _ => return Ok(Value::Undefined),
                 };
                 let index = list.len();
-                list.set(index.to_string(), Value::Function(callback.clone()));
+                if let Some(Value::Function(callback)) = arguments.get(1) {
+                    list.set(index.to_string(), Value::Function(callback.clone()));
+                }
             }
-            Ok(Value::Undefined)
+            Ok(result)
         }),
     );
 
     let remove_window = window.clone();
+    let window_event_target = event_target.clone();
     window.set_method(
         "removeEventListener",
         Arc::new(move |arguments| {
-            let [Value::String(event_type), Value::Function(callback), ..] = arguments else {
-                return Ok(Value::Undefined);
+            let result = remove_event_listener_from_target(&window_event_target, arguments)?;
+            let (Some(Value::String(event_type)), Some(Value::Function(callback))) =
+                (arguments.first(), arguments.get(1))
+            else {
+                return Ok(result);
             };
             if (event_type == "popstate" || event_type == "storage" || event_type == "message")
                 && let Some(Value::Object(list)) = remove_window.get(if event_type == "popstate" {
@@ -1218,7 +1231,16 @@ fn register_window_object(
                     }
                 }
             }
-            Ok(Value::Undefined)
+            Ok(result)
+        }),
+    );
+
+    let dispatch_window_event_target = event_target.clone();
+    let dispatch_window = window.clone();
+    window.set_method(
+        "dispatchEvent",
+        Arc::new(move |arguments| {
+            dispatch_event_target(&dispatch_window_event_target, &dispatch_window, arguments)
         }),
     );
 

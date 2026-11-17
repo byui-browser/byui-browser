@@ -86,6 +86,50 @@ fn window_self_accepts_extra_arguments_without_changing_the_result() {
 }
 
 #[test]
+fn window_dispatch_event_runs_listeners_and_returns_cancellation_state() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    register_document(&mut realm, Document::new()).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var order = []; \
+             window.addEventListener('ready', (event) => { order.push('capture:' + event.eventPhase); }, true); \
+             window.addEventListener('ready', (event) => { order.push('bubble:' + (event.target === window)); }); \
+             var event = Event('ready', {cancelable: true}); \
+             window.dispatchEvent(event) && order.length === 2 && order[0] === 'capture:2' && order[1] === 'bubble:true' && \
+             event.currentTarget === null && event.eventPhase === 0"
+        ),
+        Ok(Value::Boolean(true))
+    );
+
+    assert_eq!(
+        realm.evaluate_script(
+            "window.addEventListener('cancel', (event) => event.preventDefault()); \
+             window.dispatchEvent(Event('cancel', {cancelable: true})) === false"
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_dispatch_event_honors_once_and_abort_signal() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    register_document(&mut realm, Document::new()).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var calls = 0; var controller = AbortController(); \
+             window.addEventListener('ready', () => calls++, {once: true}); \
+             window.addEventListener('ready', () => calls += 10, {signal: controller.signal}); \
+             controller.abort(); window.dispatchEvent(Event('ready')); window.dispatchEvent(Event('ready')); calls === 1"
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
 fn window_navigator_returns_the_global_navigator_object() {
     let mut realm = Realm::new();
     register_window(&mut realm).unwrap();
