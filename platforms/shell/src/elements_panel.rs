@@ -1204,16 +1204,17 @@ impl Colors {
     fn new(dark: bool) -> Self {
         let rgba = toolbar::rgba;
         if dark {
+            let palette = toolbar::palette(dark);
             Self {
-                background: rgba(0x1c, 0x1d, 0x21, 255),
-                header: rgba(0x25, 0x26, 0x2b, 255),
-                border: rgba(0x3a, 0x3c, 0x43, 255),
+                background: palette.panel,
+                header: palette.frame_top,
+                border: palette.panel_border,
                 separator: rgba(255, 255, 255, 18),
                 row_hover: rgba(255, 255, 255, 12),
                 guide: rgba(255, 255, 255, 16),
                 scrollbar: rgba(255, 255, 255, 60),
                 tag: rgba(0x6c, 0xb8, 0xf0, 255),
-                punctuation: rgba(0x7d, 0x85, 0x92, 255),
+                punctuation: palette.text_muted,
             }
         } else {
             Self {

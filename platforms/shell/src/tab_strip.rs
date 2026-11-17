@@ -107,7 +107,7 @@ impl Strip {
         for (action, rect) in &self.regions {
             if let Action::Select(id) = action {
                 paint.set_color(if *id == active {
-                    palette.field_hover
+                    palette.active_tab
                 } else {
                     palette.hover
                 });

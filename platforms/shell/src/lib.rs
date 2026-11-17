@@ -40,6 +40,8 @@ mod tab_alerts;
 mod tab_strip;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 mod tabs;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+mod theme_preference;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub use app::{Platform, run};
