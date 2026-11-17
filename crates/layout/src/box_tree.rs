@@ -844,6 +844,17 @@ impl Builder<'_> {
         let block = match element.get_name().as_str() {
             "input" => {
                 let kind = attribute("type").unwrap_or_default().to_ascii_lowercase();
+                if let Some(default_label) = button_input_default_label(&kind) {
+                    // The label is the value, even when empty, and never
+                    // wraps; line breaks are dropped as for text fields.
+                    let label: String = attribute("value")
+                        .unwrap_or(default_label)
+                        .chars()
+                        .filter(|character| !matches!(character, '\n' | '\r'))
+                        .map(|character| if character == '\t' { ' ' } else { character })
+                        .collect();
+                    return Some(level_for(self.control_text_box(node, style, &label, style)));
+                }
                 if !is_text_like_input_type(&kind) {
                     return None;
                 }
@@ -925,7 +936,7 @@ impl Builder<'_> {
     /// line with its spaces preserved (as [`WhiteSpace::Pre`]),
     /// centered vertically in the content box, and clipped to the padding
     /// box. Horizontal placement follows the control's `text-align`. Empty
-    /// `text` gives a box with no lines. `text-transform` is applied here.
+    /// `text` gives a box with no lines that is still one line tall. `text-transform` is applied here.
     ///
     /// Wrap the result with [`level_for`] (or `InlineItem::Atomic`) to place
     /// it.
@@ -963,6 +974,19 @@ pub(crate) const PLACEHOLDER_COLOR: css::CssColor = css::CssColor {
     b: 0x75,
     a: 255,
 };
+
+/// The label an `<input>` button with the lowercased `type` value `kind`
+/// shows when it has no `value` attribute: "Submit" for `submit`, "Reset"
+/// for `reset`, and no text for `button`. `None` for other types. The
+/// labels are not localized; `type=image` is not a labelled button here.
+fn button_input_default_label(kind: &str) -> Option<&'static str> {
+    match kind {
+        "submit" => Some("Submit"),
+        "reset" => Some("Reset"),
+        "button" => Some(""),
+        _ => None,
+    }
+}
 
 /// Whether an `<input>` with the lowercased `type` value `kind` is a text
 /// field. Missing, empty, and unknown types are `text` per HTML.

@@ -1684,4 +1684,43 @@ mod control_text {
         assert_eq!(texts(box_for(&tree, &document, "a")), ["a b"]);
         assert_eq!(texts(box_for(&tree, &document, "b")), ["c d"]);
     }
+
+    #[test]
+    fn button_inputs_show_default_labels() {
+        let html = "<p><input id='a' type='submit'><input id='b' type='RESET'>\
+            <input id='c' type='button'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["Submit"]);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["Reset"]);
+        let c = box_for(&tree, &document, "c");
+        assert!(texts(c).is_empty());
+        // No text, but the box keeps one line of height.
+        assert_close(c.content_rect().height, LINE);
+    }
+
+    #[test]
+    fn button_inputs_show_their_value_even_when_empty() {
+        let html = "<p><input id='a' type='submit' value='Google Search'>\
+            <input id='b' type='button' value='Lucky'>\
+            <input id='c' type='submit' value=''></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["Google Search"]);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["Lucky"]);
+        assert!(texts(box_for(&tree, &document, "c")).is_empty());
+    }
+
+    #[test]
+    fn button_input_label_is_centered_in_a_wide_box() {
+        let html = "<p><input id='a' type='submit' value='Wide' \
+            style='width: 200px; height: 39.2px'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let input = box_for(&tree, &document, "a");
+        let content = input.content_rect();
+        let LineFragment::Text(text) = &input.lines[0].fragments[0] else {
+            panic!("expected text");
+        };
+        assert_close(text.rect.width, 4.0 * 8.0);
+        assert_close(text.rect.x - content.x, (200.0 - 32.0) / 2.0);
+        assert_close(input.lines[0].rect.y - content.y, 10.0);
+    }
 }
