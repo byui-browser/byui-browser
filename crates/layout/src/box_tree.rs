@@ -9,6 +9,7 @@ use css::PseudoElement;
 
 use html::{HTMLDocument, NodeID, NodeKind};
 
+use crate::control::FormControl;
 use crate::replaced::{
     ImageKey, ImageMetrics, NaturalSize, ReplacedBox, parse_dimension_attribute, view_box_ratio,
 };
@@ -25,6 +26,8 @@ pub(crate) struct BlockBox {
     /// (CSS 2.2 §9.4.1), which stops margins collapsing through it.
     pub establishes_bfc: bool,
     pub contents: BlockContents,
+    /// The form control the box is, which gives `auto` sizes a default.
+    pub control: Option<FormControl>,
 }
 
 /// A block container holds either only block-level boxes or only inline-level
@@ -247,6 +250,7 @@ pub(crate) fn build_initial_containing_block(
         contents: builder.container_contents(None, children, &style),
         style,
         establishes_bfc: true,
+        control: None,
     };
     let stats = &builder.stats;
     log::debug!(
@@ -327,6 +331,12 @@ impl Builder<'_> {
             // Floats and absolutely positioned boxes establish a new block
             // formatting context (CSS 2.2 §9.4.1).
             establishes_bfc: is_root || flow_root || style.is_out_of_flow(),
+            control: match self.document.node(node).map(|node| node.get_kind()) {
+                Some(NodeKind::Element(element)) => {
+                    FormControl::for_element(self.document, node, element)
+                }
+                _ => None,
+            },
         }
     }
 
@@ -395,6 +405,7 @@ impl Builder<'_> {
                 style: Rc::new(ComputedStyle::anonymous(Some(style))),
                 establishes_bfc: false,
                 contents: BlockContents::Inlines(items),
+                control: None,
             });
         };
         for level in levels {
@@ -445,6 +456,7 @@ impl Builder<'_> {
                 style: Rc::clone(style),
                 establishes_bfc: true,
                 contents: BlockContents::Inlines(vec![text]),
+                control: None,
             })));
             return;
         }
@@ -464,6 +476,7 @@ impl Builder<'_> {
                     style: Rc::clone(style),
                     establishes_bfc: false,
                     contents: BlockContents::Inlines(vec![text]),
+                    control: None,
                 }));
                 for (open, open_style) in open_inlines {
                     levels.push(Level::Inline(InlineItem::Start {
@@ -717,6 +730,7 @@ impl Builder<'_> {
                 width_hint: hint("width"),
                 height_hint: hint("height"),
             }),
+            control: None,
         };
         Some(match style.display {
             Display::Box {

@@ -1312,3 +1312,80 @@ fn floats_paint_after_blocks_and_positioned_boxes_paint_last() {
     assert!(position("f") < text);
     assert!(text < position("r"));
 }
+
+mod form_controls {
+    use super::*;
+
+    /// Zeroes the UA padding and fixes the font so sizes are easy to check:
+    /// each character is 8px wide and a line is 19.2px tall.
+    const CSS: &str = "body { margin: 0 } input, textarea, select, button \
+                       { font-size: 16px; padding: 0; margin: 0; border: none }";
+
+    fn size(html: &str, css: &str) -> (f32, f32) {
+        let (document, tree) = lay_out(&format!("<body>{html}</body>"), css, 800.0);
+        let rect = box_for(&tree, &document, "x").rect;
+        (rect.width, rect.height)
+    }
+
+    #[test]
+    fn empty_text_input_is_twenty_characters_by_one_line() {
+        let (width, height) = size("<input id=x>", CSS);
+        assert_close(width, 160.0);
+        assert_close(height, LINE);
+    }
+
+    #[test]
+    fn input_size_attribute_sets_the_character_count() {
+        assert_close(size("<input id=x size=5>", CSS).0, 40.0);
+        // Invalid and zero sizes fall back to 20.
+        assert_close(size("<input id=x size=0>", CSS).0, 160.0);
+        assert_close(size("<input id=x type=search size=abc>", CSS).0, 160.0);
+    }
+
+    #[test]
+    fn author_sizes_and_limits_win_over_the_default() {
+        let css = format!("{CSS} #x {{ width: 300px; height: 40px }}");
+        assert_eq!(size("<input id=x>", &css), (300.0, 40.0));
+        let css = format!("{CSS} #x {{ max-width: 100px; min-height: 30px }}");
+        assert_eq!(size("<input id=x>", &css), (100.0, 30.0));
+        let css = format!("{CSS} #x {{ padding: 5px }}");
+        assert_eq!(size("<input id=x>", &css), (170.0, LINE + 10.0));
+        let css = format!("{CSS} #x {{ box-sizing: border-box; width: 100px; padding: 5px }}");
+        assert_close(size("<input id=x>", &css).0, 100.0);
+    }
+
+    #[test]
+    fn textarea_uses_cols_and_rows() {
+        let (width, height) = size("<textarea id=x></textarea>", CSS);
+        assert_close(width, 160.0);
+        assert_close(height, 2.0 * LINE);
+        let (width, height) = size("<textarea id=x cols=40 rows=4></textarea>", CSS);
+        assert_close(width, 320.0);
+        assert_close(height, 4.0 * LINE);
+    }
+
+    #[test]
+    fn select_fits_its_widest_option_plus_arrow_room() {
+        let (width, height) = size(
+            "<select id=x><option>One</option><option>Much longer option</option></select>",
+            CSS,
+        );
+        assert_close(width, 18.0 * 8.0 + 20.0);
+        assert_close(height, LINE);
+    }
+
+    #[test]
+    fn empty_button_is_one_line_tall() {
+        let (width, height) = size("<button id=x></button>", CSS);
+        assert_close(width, 0.0);
+        assert_close(height, LINE);
+        assert_close(size("<input id=x type=submit>", CSS).1, LINE);
+        // A button with text sizes from the text.
+        assert_close(size("<button id=x>Go</button>", CSS).0, 16.0);
+    }
+
+    #[test]
+    fn checkboxes_get_no_text_field_size() {
+        assert_close(size("<input id=x type=checkbox>", CSS).0, 0.0);
+    }
+}

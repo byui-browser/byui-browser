@@ -91,7 +91,9 @@ impl Context<'_> {
             BlockContents::Replaced(replaced) => {
                 Some(replaced.used_size(style, basis, cb.height).0)
             }
-            _ => style.content_width(basis),
+            _ => style
+                .content_width(basis)
+                .or(self.control_size(block, basis, cb.height).width),
         };
         let (left, width, right) = match used_width {
             None => {
@@ -169,7 +171,10 @@ impl Context<'_> {
             BlockContents::Replaced(replaced) => Some(replaced.used_size(style, basis, None).0),
             _ => None,
         };
-        let width = replaced_width.or(style.content_width(basis)).unwrap_or_else(|| {
+        let width = replaced_width
+            .or(style.content_width(basis))
+            .or(self.control_size(block, basis, None).width)
+            .unwrap_or_else(|| {
             let (min_content, max_content) = self.intrinsic_content_sizes(block);
             let available = cb_width - margin_left - margin_right - padding;
             let width = max_content.min(available.max(min_content));
@@ -289,11 +294,12 @@ impl Context<'_> {
         let margin_bottom = style.margin.bottom.resolve_or_zero(basis);
         // Percentage heights resolve only against a definite containing block
         // height; otherwise they behave as `auto` (CSS 2.2 §10.5).
+        let control = self.control_size(block, basis, cb.height);
         let specified_height = match &block.contents {
             BlockContents::Replaced(replaced) => {
                 Some(replaced.used_size(style, basis, cb.height).1)
             }
-            _ => style.content_height(basis, cb.height),
+            _ => style.content_height(basis, cb.height).or(control.height),
         };
 
         let edges = FlowEdges {
@@ -362,7 +368,7 @@ impl Context<'_> {
         {
             flow.height = flow.height.max(bottom);
         }
-        let content_height = specified_height.unwrap_or(flow.height);
+        let content_height = specified_height.unwrap_or(flow.height.max(control.min_height));
         if specified_height.is_none() {
             log::trace!(
                 "node {:?}: auto height resolved to {content_height}",
@@ -784,12 +790,16 @@ impl Context<'_> {
             + fixed(style.padding.right)
             + fixed(style.margin.left)
             + fixed(style.margin.right);
+        let control = self.control_size(block, None, None).width;
         let (min, max) = match style.width {
             Dimension::Px(_) => {
                 let width = style.content_width(None).unwrap_or(0.0);
                 (width, width)
             }
-            _ => self.intrinsic_content_sizes(block),
+            _ => control.map_or_else(
+                || self.intrinsic_content_sizes(block),
+                |width| (width, width),
+            ),
         };
         (min + outer, max + outer)
     }
