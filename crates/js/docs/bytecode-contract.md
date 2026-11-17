@@ -23,6 +23,16 @@ handler covers the instruction.
 | `Constant`, `Load*`, `LoadThis`, `LoadArgument`, `MakeFunction`, `NewObject` | `+1` | Push a value; loads may fail for invalid/uninitialized bindings. |
 | `Pop` | `-1` | Discard the top value. |
 | `Dup` | `+1` | Duplicate the top value. |
+| `Dup2` | `+2` | Duplicate the top two values in order: `[a, b]` becomes `[a, b, a, b]`. Underflows with fewer than two values. |
+| `MoveTop(n)` | `0` | Move the top value beneath the `n` values below it: with `n = 2`, `[a, b, c]` becomes `[c, a, b]`. Underflows when fewer than `n` values remain beneath it. |
+| `JumpIfNullish` | `0` | Branch when the top value is `null` or `undefined`, without consuming it. |
+| `DeleteProperty(name)` | `0` | Consume the object and push the boolean result of `delete`. |
+| `DeleteComputedProperty` | `-1` | Consume the key and object and push the boolean result of `delete`. |
+| `ArrayPush` | `-1` | Consume a value and append it to the array beneath it, which stays on the stack. The target must be an array. |
+| `ArrayExtend` | `-1` | Consume an array or string and append each element or character to the array beneath it, which stays on the stack. Any other source is a runtime error. |
+| `SpreadProperties` | `-1` | Consume a source value and copy its own enumerable properties onto the object beneath it, which stays on the stack. |
+| `CallSpread`, `NewSpread` | `-1` | Consume an argument array and the callee or constructor; push the result. |
+| `CallMethodSpread` | `-2` | Consume an argument array, the callee, and the receiver; push the result. |
 | `Swap` | `0` | Exchange the top two values. |
 | `Unary`, `LoadProperty`, `LoadSuperProperty` | `0` | Replace one value with one value. |
 | `Binary`, `LoadComputedProperty` | `-1` | Consume two values and push one. |
@@ -48,6 +58,18 @@ slot, jump, stack, scope, or handler references produce a runtime error rather
 than being trusted or causing an unchecked index access. Hand-built chunks
 must keep parallel `code` and `locations` entries aligned; missing location
 metadata is treated as absent.
+
+`Binary(In)` and `Binary(InstanceOf)` are fallible: a right operand that is not
+an object, array, or function (`in`), or not a constructor with an object
+`prototype` (`instanceof`), is a runtime error. `Unary(Plus)`, `Unary(Typeof)`,
+and `Unary(Void)` never fail. All other `Binary` operators still cannot fail.
+
+The compiler lowers each expression form to existing and new instructions; see
+[`docs/js/expression-forms.md`](../../../docs/js/expression-forms.md) for the
+source forms, their evaluation order, and what is deliberately unsupported.
+Optional chains use `JumpIfNullish` to reach a landing pad that pops the
+checked value (and a method receiver kept beneath it) and pushes `undefined`,
+so every path out of a chain leaves exactly one value.
 
 ## Function boundaries
 

@@ -75,7 +75,7 @@ fn binary_operators_agree_for_every_operand_pair() {
 fn unary_operators_agree_for_every_operand() {
     for operator in UNARY {
         for operand in OPERANDS {
-            assert_agree(&format!("{operator}{operand}"));
+            assert_agree(&format!("{operator} {operand}"));
         }
     }
 }

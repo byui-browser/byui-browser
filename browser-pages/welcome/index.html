@@ -1,13 +1,169 @@
 <!doctype html>
 <html>
   <head>
+    <title>Welcome to BYUI Browser</title>
     <link rel="stylesheet" href="style.css">
   </head>
   <body>
-    <main>
-      <span>Welcome to BYUI Browser!</span>
-      <button id="btn">Click Me</button>
-    </main>
+  <!-- The tree-* class picks which oak shows; script.js switches it. -->
+  <div id="page" class="page tree-green">
+    <div class="topbar">
+      <div class="brand">BYUI Browser</div>
+      <div class="spacer"></div>
+      <div class="toggle">
+        <span class="toggle-label">Oak</span>
+        <span id="pick-green" class="pick pick-green">Green</span>
+        <span id="pick-blue" class="pick pick-blue">Blue</span>
+      </div>
+    </div>
+
+    <div class="hero">
+      <!-- Stylized oaks drawn with shapes only: the engine's SVG renderer
+           cannot draw SVG text elements. -->
+      <svg class="oak oak-green" role="img" aria-label="A green oak tree with an acorn sprouting beside it" width="420" height="300" viewBox="0 0 420 300" xmlns="http://www.w3.org/2000/svg">
+        <ellipse cx="210" cy="282" rx="185" ry="14" fill="#dfeedd"/>
+        <!-- canopy back layer: wide, lobed oak crown -->
+        <g fill="#2e6b3a">
+          <circle cx="210" cy="70" r="58"/><circle cx="140" cy="84" r="50"/><circle cx="280" cy="84" r="50"/>
+          <circle cx="86" cy="118" r="44"/><circle cx="334" cy="118" r="44"/>
+          <circle cx="48" cy="152" r="30"/><circle cx="372" cy="152" r="30"/>
+          <circle cx="120" cy="140" r="40"/><circle cx="300" cy="140" r="40"/>
+        </g>
+        <!-- trunk, root flare and spreading limbs -->
+        <path d="M188 282 C192 256 194 230 192 206 C170 190 136 178 96 162 L102 152 C140 166 168 176 190 186
+                 C186 168 176 150 160 134 L170 126 C186 142 198 162 204 180 C212 160 226 144 248 132 L256 140
+                 C236 154 222 170 218 188 C246 178 280 166 318 154 L322 164 C284 178 252 192 224 206
+                 C222 232 226 258 234 282 C248 284 260 288 270 292 L150 292 C162 288 176 284 188 282 Z" fill="#6b4423"/>
+        <path d="M206 206 C208 234 210 258 214 282 L224 282 C220 256 218 230 216 206 Z" fill="#4e3118"/>
+        <!-- canopy middle layer (limbs show through the gaps) -->
+        <g fill="#3f8a4b">
+          <circle cx="210" cy="92" r="46"/><circle cx="160" cy="78" r="34"/><circle cx="262" cy="78" r="34"/>
+          <circle cx="108" cy="118" r="34"/><circle cx="312" cy="118" r="34"/>
+          <circle cx="66" cy="146" r="22"/><circle cx="354" cy="146" r="22"/>
+          <circle cx="210" cy="132" r="26"/>
+        </g>
+        <!-- highlights -->
+        <g fill="#5baa5e">
+          <circle cx="190" cy="66" r="20"/><circle cx="244" cy="72" r="14"/><circle cx="148" cy="70" r="14"/>
+          <circle cx="100" cy="106" r="14"/><circle cx="318" cy="106" r="16"/><circle cx="214" cy="104" r="12"/>
+        </g>
+        <!-- acorns -->
+        <g>
+          <ellipse cx="132" cy="168" rx="7" ry="9" fill="#b0702f"/><path d="M124 163 Q132 152 140 163 Z" fill="#5a3a1c"/>
+          <ellipse cx="292" cy="170" rx="7" ry="9" fill="#b0702f"/><path d="M284 165 Q292 154 300 165 Z" fill="#5a3a1c"/>
+          <ellipse cx="240" cy="160" rx="6" ry="8" fill="#b0702f"/><path d="M233 156 Q240 146 247 156 Z" fill="#5a3a1c"/>
+        </g>
+        <!-- the seed: an acorn on the ground with a new sprout -->
+        <g>
+          <ellipse cx="322" cy="276" rx="8" ry="10" fill="#b0702f"/><path d="M313 271 Q322 259 331 271 Z" fill="#5a3a1c"/>
+          <path d="M322 261 C322 252 326 246 332 242 L334 245 C328 249 326 254 326 261 Z" fill="#3f8a4b"/>
+          <ellipse cx="338" cy="240" rx="8" ry="4" fill="#5baa5e"/>
+        </g>
+      </svg>
+      <svg class="oak oak-blue" role="img" aria-label="A blue oak tree with an acorn sprouting beside it" width="420" height="300" viewBox="0 0 420 300" xmlns="http://www.w3.org/2000/svg">
+        <ellipse cx="210" cy="282" rx="185" ry="14" fill="#e3eef7"/>
+        <!-- canopy back layer: wide, lobed oak crown -->
+        <g fill="#004a80">
+          <circle cx="210" cy="70" r="58"/><circle cx="140" cy="84" r="50"/><circle cx="280" cy="84" r="50"/>
+          <circle cx="86" cy="118" r="44"/><circle cx="334" cy="118" r="44"/>
+          <circle cx="48" cy="152" r="30"/><circle cx="372" cy="152" r="30"/>
+          <circle cx="120" cy="140" r="40"/><circle cx="300" cy="140" r="40"/>
+        </g>
+        <!-- trunk, root flare and spreading limbs -->
+        <path d="M188 282 C192 256 194 230 192 206 C170 190 136 178 96 162 L102 152 C140 166 168 176 190 186
+                 C186 168 176 150 160 134 L170 126 C186 142 198 162 204 180 C212 160 226 144 248 132 L256 140
+                 C236 154 222 170 218 188 C246 178 280 166 318 154 L322 164 C284 178 252 192 224 206
+                 C222 232 226 258 234 282 C248 284 260 288 270 292 L150 292 C162 288 176 284 188 282 Z" fill="#0b2545"/>
+        <path d="M206 206 C208 234 210 258 214 282 L224 282 C220 256 218 230 216 206 Z" fill="#06172b"/>
+        <!-- canopy middle layer (limbs show through the gaps) -->
+        <g fill="#006eb6">
+          <circle cx="210" cy="92" r="46"/><circle cx="160" cy="78" r="34"/><circle cx="262" cy="78" r="34"/>
+          <circle cx="108" cy="118" r="34"/><circle cx="312" cy="118" r="34"/>
+          <circle cx="66" cy="146" r="22"/><circle cx="354" cy="146" r="22"/>
+          <circle cx="210" cy="132" r="26"/>
+        </g>
+        <!-- highlights -->
+        <g fill="#3f95d1">
+          <circle cx="190" cy="66" r="20"/><circle cx="244" cy="72" r="14"/><circle cx="148" cy="70" r="14"/>
+          <circle cx="100" cy="106" r="14"/><circle cx="318" cy="106" r="16"/><circle cx="214" cy="104" r="12"/>
+        </g>
+        <!-- acorns -->
+        <g>
+          <ellipse cx="132" cy="168" rx="7" ry="9" fill="#7fb8e3"/><path d="M124 163 Q132 152 140 163 Z" fill="#0b2545"/>
+          <ellipse cx="292" cy="170" rx="7" ry="9" fill="#7fb8e3"/><path d="M284 165 Q292 154 300 165 Z" fill="#0b2545"/>
+          <ellipse cx="240" cy="160" rx="6" ry="8" fill="#7fb8e3"/><path d="M233 156 Q240 146 247 156 Z" fill="#0b2545"/>
+        </g>
+        <!-- the seed: an acorn on the ground with a new sprout -->
+        <g>
+          <ellipse cx="322" cy="276" rx="8" ry="10" fill="#7fb8e3"/><path d="M313 271 Q322 259 331 271 Z" fill="#0b2545"/>
+          <path d="M322 261 C322 252 326 246 332 242 L334 245 C328 249 326 254 326 261 Z" fill="#006eb6"/>
+          <ellipse cx="338" cy="240" rx="8" ry="4" fill="#3f95d1"/>
+        </g>
+      </svg>
+      <h1>Welcome to BYUI Browser</h1>
+      <p class="tagline">A web browser built from scratch in Rust by BYU-Idaho students.</p>
+      <div class="quote">
+        <div>&ldquo;[Elder Bednar&rsquo;s &lsquo;acorns into mighty oaks&rsquo; quote goes here &mdash; exact wording to be confirmed]&rdquo;</div>
+        <div class="who">&mdash; Elder David A. Bednar</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="label">Quick links</div>
+      <!-- Each tile navigates to its data-href from script.js. -->
+      <div class="tiles">
+        <div id="tile-byui" class="tile" data-href="https://www.byui.edu/">
+          <div class="dot dot-byui"></div>
+          <div class="name">BYU-Idaho</div><div class="sub">byui.edu</div>
+        </div>
+        <div id="tile-canvas" class="tile" data-href="https://byui.instructure.com/">
+          <div class="dot dot-canvas"></div>
+          <div class="name">Canvas</div><div class="sub">Your courses</div>
+        </div>
+        <div id="tile-library" class="tile" data-href="https://library.byui.edu/">
+          <div class="dot dot-library"></div>
+          <div class="name">Library</div><div class="sub">McKay Library</div>
+        </div>
+        <div id="tile-email" class="tile" data-href="https://outlook.office.com/">
+          <div class="dot dot-email"></div>
+          <div class="name">Email</div><div class="sub">Student Outlook</div>
+        </div>
+        <div id="tile-code" class="tile" data-href="https://github.com/byui-browser/byui-browser">
+          <div class="dot dot-code"></div>
+          <div class="name">Our code</div><div class="sub">GitHub repository</div>
+        </div>
+        <div id="tile-ladder" class="tile" data-href="https://willpatbarr.github.io/byui-browser-ladder/">
+          <div class="dot dot-ladder"></div>
+          <div class="name">Ladder</div><div class="sub">Engine test site</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="cols">
+        <div class="card keys">
+          <div class="label">Keyboard shortcuts</div>
+          <div class="row"><span class="key">Ctrl + T</span><span class="what">New tab</span></div>
+          <div class="row"><span class="key">Ctrl + W</span><span class="what">Close tab</span></div>
+          <div class="row"><span class="key">Ctrl + 1&ndash;9</span><span class="what">Jump to a tab</span></div>
+          <div class="row"><span class="key">Ctrl + L</span><span class="what">Edit the address</span></div>
+          <div class="row"><span class="key">Ctrl + F</span><span class="what">Find on page</span></div>
+          <div class="row"><span class="key">Ctrl + + / &minus;</span><span class="what">Zoom in / out</span></div>
+        </div>
+        <div class="card about">
+          <div class="label">About this browser</div>
+          <p>Every part of BYUI Browser &mdash; the HTML parser, CSS engine, layout,
+             painting, networking, and JavaScript engine &mdash; is written by students
+             in Rust, without borrowing an existing browser engine.</p>
+          <p>This page is drawn by that engine. If the oak, the tiles, or the
+             shortcuts look wrong, something in the engine just broke.</p>
+          <p>Found a bug? Open an issue on our GitHub repository.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">BYUI Browser &middot; Fall 2026 &middot; Built by the BYU-Idaho browser team</div>
+  </div>
     <script src="script.js"></script>
   </body>
 </html>

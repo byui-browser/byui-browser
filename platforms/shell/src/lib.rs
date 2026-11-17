@@ -28,10 +28,18 @@ mod find_in_page;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 mod page_source;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+mod site_info;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 mod toolbar;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod app;
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+mod tab_alerts;
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+mod tab_strip;
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+mod tabs;
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub use app::{Platform, run};

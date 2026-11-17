@@ -11,7 +11,7 @@ pub(super) fn parse_throw(parser: &mut Parser<'_>) -> ParseResult<Statement> {
     if parser.line_terminator_before_current() {
         return Err(parser.error("Illegal newline after throw", "throw statement"));
     }
-    let value = parser.parse_expression(0)?;
+    let value = parser.parse_sequence()?;
     parser.terminator("throw statement")?;
     Ok(Statement::Throw(value))
 }

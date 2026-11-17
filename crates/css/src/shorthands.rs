@@ -23,6 +23,10 @@ const CSS_WIDE_KEYWORDS: [&str; 5] = ["inherit", "initial", "unset", "revert", "
 /// corner. A longhand gets `"<horizontal> <vertical>"`, or just the
 /// horizontal radius when there is no `/`. Values are not validated here.
 ///
+/// `animation` is expanded to the eight `animation-*` longhands, each a
+/// comma-separated list with one entry per animation (CSS Animations 1
+/// §3.10).
+///
 /// Other declarations are returned unchanged. An invalid shorthand value
 /// expands to nothing, matching CSS's rule that invalid declarations are
 /// dropped. CSS-wide keywords such as `inherit` are copied to every longhand.
@@ -31,6 +35,15 @@ pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
         "margin" => "margin",
         "padding" => "padding",
         "border-radius" => return expand_border_radius(&declaration.value),
+        "animation" => {
+            return crate::animation::expand_shorthand(&declaration.value).unwrap_or_else(|| {
+                log::debug!(
+                    "dropping invalid animation shorthand value `{}`",
+                    declaration.value
+                );
+                Vec::new()
+            });
+        }
         _ => return vec![declaration.clone()],
     };
     let parts = split_components(&declaration.value);
@@ -109,7 +122,7 @@ fn expand_border_radius(value: &str) -> Vec<Declaration> {
 
 /// Splits a value into whitespace-separated components, keeping parenthesized
 /// groups such as `calc(1px + 2px)` intact.
-fn split_components(value: &str) -> Vec<&str> {
+pub(crate) fn split_components(value: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0_usize;
     let mut start = None;

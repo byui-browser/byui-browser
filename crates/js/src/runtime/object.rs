@@ -435,6 +435,31 @@ impl Object {
         self.properties().retain(|(name, _)| name != key);
     }
 
+    /// Deletes an own property the way a script's `delete` does and returns
+    /// what the expression evaluates to: `true` when the property is gone
+    /// afterwards (including when it never existed), `false` when it is
+    /// read-only or a host accessor and was left in place.
+    pub(crate) fn delete_own(&self, key: &str) -> bool {
+        let read_only = self
+            .0
+            .read_only_properties
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(key);
+        let accessor = self
+            .0
+            .accessors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(name, _, _)| name == key);
+        if read_only || accessor {
+            return false;
+        }
+        self.remove(key);
+        true
+    }
+
     /// Returns whether the object itself, not its prototype chain, has a
     /// property named `key`.
     pub fn contains_key(&self, key: &str) -> bool {

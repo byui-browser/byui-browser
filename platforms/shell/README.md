@@ -14,7 +14,7 @@ much of the toolbar's left edge the system's window buttons cover) and calls
 On operating systems without a supported shell the crate still builds and runs
 its drawing tests, so workspace checks pass everywhere.
 
-The shared app owns `chrome::BrowserState` and records a successful navigation
+Each tab owns `chrome::BrowserState` and records a successful navigation
 after its document and resources load. The loaded document is retained
 separately from its rendered pixmap, so repainting, resizing, and Reload do not
 add visits. History lives in memory for this app session; the toolbar Back and
@@ -32,8 +32,10 @@ The address field is an editable shell surface: click it or press `Ctrl+L`,
 use normal text editing plus Backspace, press Enter to navigate, or Escape to
 restore the previous value. `Ctrl+R` triggers Reload. Submitted HTTP and HTTPS
 URLs remain in the address field while loading and are replaced by the loaded
-page or an error page when the request completes. Tabs, Back, Forward, and the
-menu remain staged until their browser services exist.
+page or an error page when the request completes. The tab strip opens, switches
+and closes independent tabs; toolbar Back/Forward uses the active tab history.
+The three-dot menu offers **Clear cache** for future page-load HTTP responses
+and CORS-preflight permissions, without changing tab contents or history.
 
 Run `cargo test -p browser refresh::tests` to verify fresh HTTP requests,
 internal pages, saved URLs, error reporting, and unchanged history.
@@ -47,9 +49,8 @@ on Windows to check that the existing welcome page and toolbar still work.
 
 Right-click inside the page card to open the shared desktop context menu.
 The menu lists **Back**, **Forward**, **Reload**, **View Page Source**, and **Inspect**.
-Back and Forward are enabled when session history allows the action. They
-traverse successful visits without adding a new history entry, and stay
-disabled at the ends of the history list.
+Context-menu Back and Forward remain disabled; the toolbar history controls
+traverse successful visits without adding new entries.
 Choose **Reload** to use the same asynchronous saved-URL fetch as the toolbar.
 The URL, status, and body appear in the launching terminal. History is unchanged.
 Click outside the popup or press Escape to dismiss it. Resize and focus loss also
@@ -64,8 +65,8 @@ Line numbers, a wrapped-row count, and a scroll-position indicator help with
 long documents (the indicator is not draggable). Wrapped text is cached until
 width changes, and resizing preserves the reading position where possible.
 Click the visible **Close** button, press Escape, or click the toolbar to close
-the panel and restore the cached page. Keyboard menu-item navigation and the
-three-dot menu remain future work. macOS and Windows use the same implementation.
+the panel and restore the cached page. Keyboard menu-item navigation remains
+future work; the three-dot menu provides Clear cache. macOS and Windows use the same implementation.
 
 For a manual demo, run `cargo run -p browser-macos`, right-click the welcome page,
 click Reload, and look for `Refresh byui://welcome`, `Status: 200`, and the HTML.
@@ -238,3 +239,92 @@ arrow buttons. Search inline/wrapped phrases on a long page; resize, zoom and
 scroll while checking alignment. Clear the query or close Find and check that all
 highlights disappear. Check webpage clicks and both system appearances. Native
 Windows/Linux visual checks remain pending.
+
+### Working desktop tabs
+
+The shared shell now owns independent tab states, using `chrome::TabManager` for
+IDs, ordering and selection. Click the tab-strip **+**, or press
+**Command-T** (macOS) / **Ctrl-T** (Windows/Linux) for a fresh `byui://welcome` tab.
+The rounded tab strip sits above the address toolbar. On macOS it reserves the
+left 72 logical pixels for native traffic-light controls. Tab widths adapt to the
+visible count, with measured title truncation and paging for overflow. Click a tab
+label to switch; the active tab has an accent underline and distinct background
+in both light and dark themes. Empty strip space can drag the window.
+Click its small centered **×** to close it. The **+** follows the last visible
+tab, with a 14-pixel icon, 28-pixel click target and circular hover feedback
+in both themes. The address toolbar has no duplicate **+** button. Closing the active tab selects its right neighbor,
+or its left neighbor if it was last. Closing the final tab opens a fresh welcome
+tab and keeps the window alive. Long strips page using **‹ / ›**; newly selected
+tabs are brought into view. Welcome-page aliases show **Welcome**. Other pages use their loaded HTML
+`<title>` with whitespace collapsed, falling back to a hostname (including a
+non-default port) or short URL/file name. Labels use measured, grapheme-safe
+ellipsis truncation; the address bar retains the full URL. Titles are cached per
+loaded document and update on successful/failed navigation, including background
+tabs; editing an address does not rename the old page. Live JavaScript changes to
+`document.title`, drag reordering, pinned tabs, restore-closed-tab shortcuts and
+session persistence across browser restarts are not implemented.
+
+Each `TabState` retains its loaded document, address editing state, in-memory visit
+history, scroll, zoom, JavaScript page session, Find query/selection/highlights,
+loading operation IDs/Refresh completion probe, source viewer and Elements dock.
+Console, Network and Performance data and native DevTools panel selections also
+belong to their tab; the native DevTools window/surface stays shared and follows
+the selected browser tab. Address selections are retained per tab, while switching
+cancels any pointer drag in progress.
+Switching moves this state without fetching again, recording a visit, or rerunning
+scripts. Window fonts, surface, storage/browser runtime, loader, Refresh service,
+auditor and event loop stay shared. Popups and pressed-pointer states are dismissed
+on switches, so a release cannot click the new tab's document. The source viewer
+and Find row sit below the strip; they never cover its tab controls.
+
+Navigation completions carry both tab and request IDs. Script navigation also
+carries a document generation, and audit results carry tab and audit IDs. Events
+for closed tabs, obsolete requests or replaced documents are ignored. Background
+loads update only their owner's state. New documents execute scripts after their
+first visible frame; background load completion does not activate the tab. A
+replaced document's old session is unloaded; simply switching never unloads it.
+Open DevTools views refresh to the new document without closing; an open source
+viewer refreshes its HTML snapshot. Main's native macOS toolbar/window-control
+setup and address drag-selection behavior are retained.
+Failed history loads keep the previous document and history position together.
+Navigating to a new page after going back truncates only that tab's forward history.
+Reload continues its existing console-only fetch behavior and history semantics,
+with completion polling for active and inactive tabs. Back/Forward uses the navigation history belonging to the selected tab.
+
+Alerts are still parented to the browser window. Alerts from inactive tabs wait
+until their owner is selected, rather than appearing over a different webpage.
+Navigation/tab closure/window shutdown releases queued waiting scripts, and late
+alerts from old documents or closed tabs are rejected. Existing viewport-height
+and live scroll bindings (PRs #340/#341) receive the active tab's actual viewport,
+scale and scroll position.
+
+CSS animation clocks and next-frame deadlines belong to each tab. Timelines start
+at the document's first layout and survive resize, zoom, Find, and tab switching.
+Hidden tabs keep elapsed wall-clock time but do no per-frame layout work and do not
+wake the UI for CSS animation frames; selecting one samples its current animation
+before drawing. New documents reset only their owner's clock. The event loop waits
+for the earliest visible animation frame or pending Reload poll from any tab.
+Animation relayout updates Find runs/highlights and clamps scroll when content
+shrinks. Page layouts retain their own decoded images/SVG and font collections;
+Find measurements use each text fragment's selected font from main's renderer.
+
+Manual macOS check (`cargo run -p browser-macos`):
+
+1. Open `https://example.com`, then use + and Command-T. Each new tab starts at
+   welcome. Switch back and confirm the original page/address remain.
+2. Change zoom, scroll a long page, and search a multiword phrase. Switch away and
+   back: position, zoom, query and highlights should be restored. Repeat with
+   Source or Inspect open. Check Reload and its terminal output in each tab.
+3. Open two slow local URLs and switch while requests are pending. Only the owner
+   should update; close a loading tab and confirm late results do not replace the
+   visible page. Check failure pages and the Loading... label remain tab-scoped.
+4. Click each welcome page's CLICK ME button, close the native alert, and confirm
+   the browser remains open. Close inactive and active tabs, then the final tab.
+5. Open many tabs, use ‹ / ›, resize and switch. Verify the active underline and
+   close/+ controls stay usable. Repeat in light/dark appearance.
+6. Load pages with CSS animations, images/SVG and web fonts in different tabs.
+   Search animated text, resize and zoom, switch away and back, and verify the
+   highlights follow the text and each page retains its own resources/timeline.
+
+Windows/Linux use the same implementation; native manual UI/alert checks remain
+pending. This is an in-process desktop tab implementation, not process isolation.

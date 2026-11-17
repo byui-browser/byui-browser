@@ -34,7 +34,7 @@ impl PageSource {
     /// line at the top where possible, then clamps to the new viewport.
     pub(crate) fn resize(&mut self, width: f64, height: f64) {
         let x = 16.0_f64.min(width / 4.0);
-        let y = 60.0_f64.min(height / 4.0);
+        let y = (crate::toolbar::PAGE_TOP + 8.0).min(height / 2.0);
         self.panel = Rect::from_xywh(
             x as f32,
             y as f32,

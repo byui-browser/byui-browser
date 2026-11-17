@@ -1,6 +1,17 @@
 //! Software compositor and rasterization.
 
-use crate::{BitmapFont, DisplayItem, Frame, OutlineFont, fonts::glyph};
+use crate::{
+    BitmapFont, DisplayItem, FontCollection, Frame, ImageStore, OutlineFont, fonts::glyph,
+};
+
+/// Which fonts [`Compositor::compose_scaled`] draws text with.
+#[derive(Clone, Copy)]
+enum FontChoice<'a> {
+    /// One font for every run.
+    Single(&'a OutlineFont),
+    /// The face each run's [`paint::FontId`] names.
+    Collection(&'a FontCollection),
+}
 
 /// A software compositor for a fixed device-pixel viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +332,7 @@ impl Compositor {
                     font_size,
                     text,
                     color,
+                    ..
                 } => Some(DisplayItem::Text {
                     x: x.round(),
                     baseline: baseline.round(),
@@ -328,6 +340,10 @@ impl Compositor {
                     text: text.clone(),
                     rgba: [color.r, color.g, color.b, color.a],
                 }),
+                paint::DisplayItem::Image { image, .. } => {
+                    log::trace!("no image store to draw {image:?}; use compose_page");
+                    None
+                }
             })
             .collect::<Vec<_>>();
         self.compose(&items)
@@ -342,14 +358,52 @@ impl Compositor {
     /// Lay the document out with the same `font` so text runs fit the
     /// widths layout measured. Rectangle edges round to the nearest device
     /// pixel boundary, and parts outside the frame are clipped.
+    ///
+    /// Every text run uses `font`, whatever its [`paint::FontId`].
+    /// [`paint::DisplayItem::Image`] items are skipped; use
+    /// [`Self::compose_page`] to draw them.
     pub fn compose_paint_with_font(
         &self,
         list: &paint::DisplayList,
         font: &OutlineFont,
         scale: f32,
     ) -> Frame {
+        self.compose_scaled(list, FontChoice::Single(font), None, scale)
+    }
+
+    /// Rasterizes a paint crate display list into a new frame, drawing
+    /// pictures from `images` and each text run with the face `fonts` has
+    /// for its [`paint::FontId`].
+    ///
+    /// This is [`Self::compose_paint_with_font`] plus images and web fonts.
+    /// Lay the document out with the same `fonts` so each run uses the face
+    /// layout measured. Runs whose face is the [`BitmapFont`] fallback (no
+    /// default outline font) are drawn with it, scaled to device pixels.
+    ///
+    /// Each [`paint::DisplayItem::Image`] is stretched to fill its rectangle,
+    /// whose edges snap to device pixel boundaries like rectangle fills. The
+    /// picture is resampled (bitmaps) or rasterized (SVG) at that device size
+    /// and blended over what is already drawn. Images missing from `images`
+    /// draw nothing.
+    pub fn compose_page(
+        &self,
+        list: &paint::DisplayList,
+        fonts: &FontCollection,
+        images: &ImageStore,
+        scale: f32,
+    ) -> Frame {
+        self.compose_scaled(list, FontChoice::Collection(fonts), Some(images), scale)
+    }
+
+    fn compose_scaled(
+        &self,
+        list: &paint::DisplayList,
+        fonts: FontChoice<'_>,
+        images: Option<&ImageStore>,
+        scale: f32,
+    ) -> Frame {
         log::debug!(
-            "compositing frame {}x{} with outline font from {} items at scale {scale}",
+            "compositing frame {}x{} from {} items at scale {scale}",
             self.width,
             self.height,
             list.items.len()
@@ -396,20 +450,98 @@ impl Compositor {
                     x,
                     baseline,
                     font_size,
+                    font,
                     text,
                     color,
-                } => self.draw_outline_text(
-                    &mut frame,
-                    font,
-                    *font_size * scale,
-                    *x * scale,
-                    (*baseline * scale).round(),
-                    text,
-                    [color.r, color.g, color.b, color.a],
-                ),
+                } => {
+                    let rgba = [color.r, color.g, color.b, color.a];
+                    let outline = match fonts {
+                        FontChoice::Single(font) => Some(font),
+                        FontChoice::Collection(fonts) => fonts.outline(*font),
+                    };
+                    match outline {
+                        Some(font) => self.draw_outline_text(
+                            &mut frame,
+                            font,
+                            *font_size * scale,
+                            *x * scale,
+                            (*baseline * scale).round(),
+                            text,
+                            rgba,
+                        ),
+                        None => self.draw_text(
+                            &mut frame,
+                            (*x * scale).round(),
+                            (*baseline * scale).round(),
+                            *font_size * scale,
+                            text,
+                            rgba,
+                        ),
+                    }
+                }
+                paint::DisplayItem::Image { rect, image } => match images {
+                    Some(images) => self.draw_image(&mut frame, images, image, rect, scale),
+                    None => log::trace!("no image store to draw {image:?}"),
+                },
             }
         }
         frame
+    }
+
+    /// Draws `key`'s picture stretched over `rect` (CSS pixels) at `scale`
+    /// device pixels per CSS pixel.
+    fn draw_image(
+        &self,
+        frame: &mut Frame,
+        images: &ImageStore,
+        key: &paint::ImageKey,
+        rect: &paint::Rect,
+        scale: f32,
+    ) {
+        let edge = |value: f32| (value * scale).round();
+        let (left, top) = (edge(rect.x), edge(rect.y));
+        let (right, bottom) = (edge(rect.right()), edge(rect.bottom()));
+        if right <= left || bottom <= top {
+            return;
+        }
+        // Skip pictures entirely outside the frame before resampling them.
+        if right <= 0.0 || bottom <= 0.0 || left >= self.width as f32 || top >= self.height as f32 {
+            return;
+        }
+        let (width, height) = ((right - left) as u32, (bottom - top) as u32);
+        log::trace!("draw image {key:?} {width}x{height} at ({left}, {top})");
+        // Blends `sample(x, y)`, in picture pixels, over the visible part.
+        let blit = |frame: &mut Frame, sample: &dyn Fn(u32, u32) -> [u8; 4]| {
+            let columns = left.max(0.0) as u32..(right as u32).min(self.width);
+            for py in top.max(0.0) as u32..(bottom as u32).min(self.height) {
+                for px in columns.clone() {
+                    let pixel = sample(px - left as u32, py - top as u32);
+                    if pixel[3] > 0 {
+                        self.put_pixel(frame, px, py, pixel);
+                    }
+                }
+            }
+        };
+        if let Some(bitmap) = images.scaled(key, width, height) {
+            blit(frame, &|x, y| bitmap.pixel(x, y));
+        } else if let Some(bitmap) = images.original(key) {
+            // Too large to resample into the cache: sample the nearest
+            // source pixel directly.
+            let (sx, sy) = (
+                bitmap.width as f32 / width as f32,
+                bitmap.height as f32 / height as f32,
+            );
+            blit(frame, &|x, y| {
+                let source_x = ((x as f32 + 0.5) * sx) as u32;
+                let source_y = ((y as f32 + 0.5) * sy) as u32;
+                bitmap.pixel(
+                    source_x.min(bitmap.width - 1),
+                    source_y.min(bitmap.height - 1),
+                )
+            });
+        } else {
+            log::trace!("no picture for {key:?}; nothing drawn");
+        }
     }
 
     /// Draws `text` with `font` at an em size of `font_size` device pixels,
@@ -597,6 +729,7 @@ mod tests {
                 x: 4.0,
                 baseline: 20.0,
                 font_size: 16.0,
+                font: paint::FontId::DEFAULT,
                 text: "Hi".into(),
                 color: black,
             }],
@@ -681,5 +814,123 @@ mod tests {
             rgba: [0, 0, 0, 128],
         }]);
         assert_eq!(&frame.pixels[..], [127, 127, 127, 255]);
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use crate::images::tests::png;
+
+    fn key(name: &str) -> paint::ImageKey {
+        paint::ImageKey::Src(name.into())
+    }
+
+    fn image_item(name: &str, x: f32, y: f32, width: f32, height: f32) -> paint::DisplayItem {
+        paint::DisplayItem::Image {
+            rect: paint::Rect {
+                x,
+                y,
+                width,
+                height,
+            },
+            image: key(name),
+        }
+    }
+
+    fn pixel(frame: &Frame, x: u32, y: u32) -> [u8; 4] {
+        let offset = ((y * frame.width + x) * 4) as usize;
+        frame.pixels[offset..offset + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn images_are_stretched_over_their_rect_at_device_scale() {
+        let mut images = ImageStore::new();
+        images.insert_encoded(key("red.png"), &png(1, 1, [255, 0, 0, 255]));
+        let list = paint::DisplayList {
+            items: vec![image_item("red.png", 1.0, 1.0, 2.0, 1.0)],
+        };
+        let frame =
+            Compositor::new(8, 8).compose_page(&list, &FontCollection::default(), &images, 2.0);
+        let red = frame
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| **pixel == [255, 0, 0, 255])
+            .count();
+        assert_eq!(red, 4 * 2);
+        assert_eq!(pixel(&frame, 2, 2), [255, 0, 0, 255]);
+        assert_eq!(pixel(&frame, 1, 1), Compositor::CLEAR_COLOR);
+    }
+
+    #[test]
+    fn translucent_images_blend_and_missing_images_draw_nothing() {
+        let mut images = ImageStore::new();
+        images.insert_encoded(key("veil.png"), &png(2, 2, [0, 0, 0, 128]));
+        let list = paint::DisplayList {
+            items: vec![
+                image_item("veil.png", 0.0, 0.0, 2.0, 2.0),
+                image_item("missing.png", 2.0, 0.0, 2.0, 2.0),
+            ],
+        };
+        let frame =
+            Compositor::new(4, 2).compose_page(&list, &FontCollection::default(), &images, 1.0);
+        assert_eq!(pixel(&frame, 0, 0), [127, 127, 127, 255]);
+        assert_eq!(pixel(&frame, 3, 1), Compositor::CLEAR_COLOR);
+    }
+
+    #[test]
+    fn partly_offscreen_images_are_clipped() {
+        let mut images = ImageStore::new();
+        images.insert_encoded(key("a.png"), &png(4, 4, [0, 0, 255, 255]));
+        let list = paint::DisplayList {
+            items: vec![image_item("a.png", -2.0, -2.0, 4.0, 4.0)],
+        };
+        let frame =
+            Compositor::new(4, 4).compose_page(&list, &FontCollection::default(), &images, 1.0);
+        assert_eq!(pixel(&frame, 0, 0), [0, 0, 255, 255]);
+        assert_eq!(pixel(&frame, 1, 1), [0, 0, 255, 255]);
+        assert_eq!(pixel(&frame, 2, 2), Compositor::CLEAR_COLOR);
+    }
+
+    #[test]
+    fn compose_page_without_a_font_matches_compose_paint_for_text_and_fills() {
+        let list = paint::DisplayList {
+            items: vec![
+                paint::DisplayItem::FillRect {
+                    rect: paint::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 5.0,
+                        height: 3.0,
+                    },
+                    color: paint::Color {
+                        r: 9,
+                        g: 9,
+                        b: 9,
+                        a: 255,
+                    },
+                },
+                paint::DisplayItem::Text {
+                    x: 1.2,
+                    baseline: 9.4,
+                    font_size: 10.0,
+                    font: paint::FontId::DEFAULT,
+                    text: "HI".into(),
+                    color: paint::Color {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    },
+                },
+            ],
+        };
+        let compositor = Compositor::new(16, 12);
+        assert_eq!(
+            compositor.compose_page(&list, &FontCollection::default(), &ImageStore::new(), 1.0),
+            compositor.compose_paint(&list)
+        );
     }
 }

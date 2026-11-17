@@ -7,6 +7,8 @@
 //! value. Lengths are resolved to CSS pixels here; percentages are kept
 //! because they resolve against the containing block during layout.
 
+use std::rc::Rc;
+
 use css::values::{LengthContext, parse_length, parse_percentage};
 use css::{CssColor, Declaration};
 
@@ -341,7 +343,26 @@ pub(crate) struct ComputedStyle {
     pub padding: Sides<Dimension>,
     pub width: Dimension,
     pub height: Dimension,
+    /// `min-width`; only replaced elements honor it so far.
+    pub min_width: Dimension,
+    /// `min-height`; only replaced elements honor it so far.
+    pub min_height: Dimension,
+    /// `max-width`, with `none` stored as [`Dimension::Auto`]; only replaced
+    /// elements honor it so far.
+    pub max_width: Dimension,
+    /// `max-height`, as for `max_width`.
+    pub max_height: Dimension,
     pub font_size: f32,
+    /// The computed `font-family` list, unquoted, in order of preference.
+    /// Empty means the user agent's default font.
+    pub font_families: Rc<[String]>,
+    /// The computed `font-weight`, from 1 to 1000.
+    pub font_weight: u16,
+    /// Whether the computed `font-style` is italic or oblique.
+    pub font_italic: bool,
+    /// The face [`crate::FontMetrics::select_font`] chose for the three
+    /// properties above. Set by the style map, which knows the fonts.
+    pub font: crate::FontId,
     pub color: CssColor,
     pub text_transform: TextTransform,
     pub text_align: TextAlign,
@@ -350,6 +371,74 @@ pub(crate) struct ComputedStyle {
     pub flex_column: bool,
     pub flex_grow: f32,
     pub gap: f32,
+    /// The text a `::before` / `::after` box holds, from the `content`
+    /// property. `None` means no box is generated. Ignored on elements.
+    pub content: Option<String>,
+}
+
+/// Parses a `content` value into the text a generated box holds.
+///
+/// Only quoted strings are supported; several strings are joined
+/// (`"a" "b"` is `ab`). `none`, `normal`, and values with nothing
+/// supported (`attr()`, counters, quotes, images) return `None`, so no box
+/// is generated. Unsupported parts beside strings are skipped.
+pub(crate) fn parse_content(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("normal") {
+        return None;
+    }
+    let mut text = String::new();
+    let mut found = false;
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '"' && character != '\'' {
+            continue;
+        }
+        let quote = character;
+        found = true;
+        while let Some(character) = chars.next() {
+            match character {
+                c if c == quote => break,
+                '\\' => match chars.peek().copied() {
+                    // An escaped newline continues the string.
+                    Some('\n') => {
+                        chars.next();
+                    }
+                    Some(hex) if hex.is_ascii_hexdigit() => {
+                        let mut code = 0_u32;
+                        for _ in 0..6 {
+                            match chars.peek().and_then(|digit| digit.to_digit(16)) {
+                                Some(digit) => {
+                                    code = code * 16 + digit;
+                                    chars.next();
+                                }
+                                None => break,
+                            }
+                        }
+                        // One white space after a hex escape is part of it.
+                        if chars.peek().is_some_and(|next| next.is_ascii_whitespace()) {
+                            chars.next();
+                        }
+                        text.push(
+                            char::from_u32(code)
+                                .filter(|c| *c != '\0')
+                                .unwrap_or('\u{FFFD}'),
+                        );
+                    }
+                    Some(escaped) => {
+                        text.push(escaped);
+                        chars.next();
+                    }
+                    None => {}
+                },
+                c => text.push(c),
+            }
+        }
+    }
+    if !found {
+        log::debug!("ignoring unsupported content value {value:?}");
+    }
+    found.then_some(text)
 }
 
 impl ComputedStyle {
@@ -371,7 +460,18 @@ impl ComputedStyle {
             padding: zero,
             width: Dimension::Auto,
             height: Dimension::Auto,
+            min_width: Dimension::Px(0.0),
+            min_height: Dimension::Px(0.0),
+            max_width: Dimension::Auto,
+            max_height: Dimension::Auto,
             font_size: parent.map_or(css::values::MEDIUM_FONT_SIZE, |parent| parent.font_size),
+            font_families: parent.map_or_else(
+                || Rc::from(Vec::new()),
+                |parent| Rc::clone(&parent.font_families),
+            ),
+            font_weight: parent.map_or(400, |parent| parent.font_weight),
+            font_italic: parent.is_some_and(|parent| parent.font_italic),
+            font: parent.map_or(crate::FontId::DEFAULT, |parent| parent.font),
             color: parent.map_or_else(
                 || {
                     css::user_agent_default_color("color")
@@ -382,6 +482,7 @@ impl ComputedStyle {
             text_transform: parent.map_or(TextTransform::None, |parent| parent.text_transform),
             text_align: parent.map_or(TextAlign::Start, |parent| parent.text_align),
             background_color: None,
+            content: None,
             border_radius: BorderRadius::default(),
             flex_column: false,
             flex_grow: 0.0,
@@ -407,6 +508,7 @@ impl ComputedStyle {
                 .map(|declaration| declaration.value.trim())
         };
         let mut style = Self::anonymous(None);
+        style.content = get("content").and_then(parse_content);
         style.display = match get("display") {
             Some(value) => Display::parse(value).unwrap_or_else(|| {
                 log::debug!("ignoring invalid display value {value:?}; using inline");
@@ -423,9 +525,27 @@ impl ComputedStyle {
                 ),
             }
         }
+        if let Some(value) = get("font-family") {
+            style.font_families = css::parse_font_family_list(value).into();
+        }
+        if let Some(value) = get("font-weight") {
+            match css::fonts::parse_font_weight(value) {
+                Some(weight) => style.font_weight = weight,
+                None => log::debug!("ignoring invalid font-weight value {value:?}; using 400"),
+            }
+        }
+        style.font_italic = get("font-style").is_some_and(css::fonts::is_italic);
         if let Some(value) = get("color") {
             match css::parse_color(value) {
                 Some(color) => style.color = color,
+                // Transparent text is laid out but paints nothing, as when a
+                // CSS animation fades text in from `transparent`.
+                None if value.eq_ignore_ascii_case("transparent") => {
+                    style.color = CssColor {
+                        a: 0,
+                        ..style.color
+                    };
+                }
                 None if is_no_color_keyword(value) => {}
                 None => log::debug!("ignoring invalid color value {value:?}; using the default"),
             }
@@ -495,6 +615,22 @@ impl ComputedStyle {
         style.padding = side("padding", false, false);
         style.width = dimension("width", true, false).unwrap_or(Dimension::Auto);
         style.height = dimension("height", true, false).unwrap_or(Dimension::Auto);
+        // `min-*: auto` computes to 0 outside flex and grid items, and
+        // `max-*: none` is stored as `Auto` (no maximum).
+        style.min_width = dimension("min-width", true, false)
+            .filter(|value| *value != Dimension::Auto)
+            .unwrap_or(Dimension::Px(0.0));
+        style.min_height = dimension("min-height", true, false)
+            .filter(|value| *value != Dimension::Auto)
+            .unwrap_or(Dimension::Px(0.0));
+        let max = |property: &str| {
+            if get(property).is_some_and(|value| value.eq_ignore_ascii_case("none")) {
+                return Dimension::Auto;
+            }
+            dimension(property, false, false).unwrap_or(Dimension::Auto)
+        };
+        style.max_width = max("max-width");
+        style.max_height = max("max-height");
         style.border_radius = Corners::from_array(
             ["top-left", "top-right", "bottom-right", "bottom-left"].map(|corner| {
                 let property = format!("border-{corner}-radius");
@@ -520,6 +656,19 @@ impl ComputedStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_strings_are_unquoted_and_unescaped() {
+        assert_eq!(parse_content("\"SUCCESS\"").as_deref(), Some("SUCCESS"));
+        assert_eq!(parse_content("'it\\'s'").as_deref(), Some("it's"));
+        assert_eq!(parse_content("\"\\201C x\"").as_deref(), Some("\u{201C}x"));
+        assert_eq!(parse_content("\"a\" \"b\"").as_deref(), Some("ab"));
+        assert_eq!(parse_content("\"\"").as_deref(), Some(""));
+        assert_eq!(parse_content("none"), None);
+        assert_eq!(parse_content("NORMAL"), None);
+        assert_eq!(parse_content("attr(title)"), None);
+        assert_eq!(parse_content("open-quote \"x\"").as_deref(), Some("x"));
+    }
     use crate::Size;
 
     fn style(declarations: &[(&str, &str)]) -> ComputedStyle {

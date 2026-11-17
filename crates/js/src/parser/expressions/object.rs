@@ -24,6 +24,16 @@ pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<(Expr, usize)> {
 
 /// Parses one `key: value` entry, or a shorthand `name` entry.
 fn property(parser: &mut Parser<'_>) -> ParseResult<(ObjectProperty, usize)> {
+    if parser.consume(&Token::Ellipsis) {
+        let (value, depth) = parser.parse_expression_with_depth(0)?;
+        return Ok((
+            ObjectProperty {
+                key: PropertyKey::Spread,
+                value,
+            },
+            depth,
+        ));
+    }
     if let Some(Token::Identifier(name)) = parser.peek() {
         let name = name.clone();
         parser.advance();

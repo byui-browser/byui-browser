@@ -56,7 +56,24 @@ pub fn register_document_with_location(
     document: Document,
     location: Object,
 ) -> JsResult<()> {
-    register_document_inner(realm, document, Some(location))
+    register_shared_document_with_location(realm, Arc::new(Mutex::new(document)), location)
+}
+
+/// Registers `document` like [`register_document_with_location`], keeping the
+/// caller's handle to the document that scripts mutate.
+///
+/// Script DOM changes made through `document` and the element objects it
+/// returns, such as `setAttribute()` or `appendChild()`, are applied to the
+/// shared document, so a browser shell can read the live tree back with
+/// [`Document::html_document`] and lay it out again. Element objects created
+/// for event targets by [`dispatch_click_at_live`](crate::dispatch_click_at_live)
+/// share it too.
+pub fn register_shared_document_with_location(
+    realm: &mut Realm,
+    document: Arc<Mutex<Document>>,
+    location: Object,
+) -> JsResult<()> {
+    register_shared_document(realm, document, Some(location))
 }
 
 fn register_document_inner(
@@ -64,9 +81,17 @@ fn register_document_inner(
     document: Document,
     location: Option<Object>,
 ) -> JsResult<()> {
+    register_shared_document(realm, Arc::new(Mutex::new(document)), location)
+}
+
+fn register_shared_document(
+    realm: &mut Realm,
+    shared_document: Arc<Mutex<Document>>,
+    location: Option<Object>,
+) -> JsResult<()> {
     log::debug!(
         "registering document bindings ({} elements)",
-        document.elements.len()
+        shared_document.lock().unwrap().elements.len()
     );
     let document_object = Object::new();
     if let Some(location) = location {
@@ -80,7 +105,6 @@ fn register_document_inner(
             })),
         );
     }
-    let shared_document = Arc::new(Mutex::new(document));
     let custom_elements_registry =
         realm
             .registered_global_value("customElements")
@@ -480,6 +504,17 @@ impl Document {
             custom_element_nodes: HashSet::new(),
             script_elements: HashMap::new(),
         }
+    }
+
+    /// Returns the HTML tree this document reads and mutates.
+    ///
+    /// Script DOM changes, such as `setAttribute()` and `appendChild()`, are
+    /// applied to this tree, and its node IDs are the ones event dispatch and
+    /// layout hit testing share. `None` only for a document that never had a
+    /// tree, which [`Document::new`] and [`Document::from_html_document`]
+    /// never produce.
+    pub fn html_document(&self) -> Option<&HTMLDocument> {
+        self.source_document.as_ref()
     }
 
     /// Returns this document node's DOM `textContent` value.
@@ -1156,14 +1191,11 @@ mod tests {
     #[test]
     fn document_append_child_adds_a_detached_element_and_returns_its_id() {
         let mut html_document = HTMLDocument::new();
-        let html_child = html_document.push_node(
-            NodeKind::Element(ElementData::new(
-                "main".into(),
-                Namespace::Html,
-                vec![Attribute::new("id".into(), "appended".into())],
-            )),
-            None,
-        );
+        let html_child = html_document.push_node(NodeKind::Element(ElementData::new(
+            "main".into(),
+            Namespace::Html,
+            vec![Attribute::new("id".into(), "appended".into())],
+        )));
         let mut document = Document::from_html_document(&html_document);
         let child = html_child;
 
@@ -1179,11 +1211,12 @@ mod tests {
     #[test]
     fn document_append_child_moves_a_child_from_its_old_parent() {
         let mut html_document = HTMLDocument::new();
-        let element = html_document.push_node(
-            NodeKind::Element(ElementData::new("main".into(), Namespace::Html, Vec::new())),
-            None,
-        );
-        let comment = html_document.push_node(NodeKind::Comment("move me".into()), None);
+        let element = html_document.push_node(NodeKind::Element(ElementData::new(
+            "main".into(),
+            Namespace::Html,
+            Vec::new(),
+        )));
+        let comment = html_document.push_node(NodeKind::Comment("move me".into()));
         html_document.append_child(html_document.root, element);
         html_document.append_child(element, comment);
         let mut document = Document::from_html_document(&html_document);
@@ -1205,18 +1238,16 @@ mod tests {
     #[test]
     fn document_append_child_rejects_invalid_hierarchy_without_mutating_the_tree() {
         let mut html_document = HTMLDocument::new();
-        let existing_element = html_document.push_node(
-            NodeKind::Element(ElementData::new("main".into(), Namespace::Html, Vec::new())),
-            None,
-        );
-        let second_element = html_document.push_node(
-            NodeKind::Element(ElementData::new(
-                "aside".into(),
-                Namespace::Html,
-                Vec::new(),
-            )),
-            None,
-        );
+        let existing_element = html_document.push_node(NodeKind::Element(ElementData::new(
+            "main".into(),
+            Namespace::Html,
+            Vec::new(),
+        )));
+        let second_element = html_document.push_node(NodeKind::Element(ElementData::new(
+            "aside".into(),
+            Namespace::Html,
+            Vec::new(),
+        )));
         html_document.append_child(html_document.root, existing_element);
         let mut document = Document::from_html_document(&html_document);
         let before = document.source_document.clone();

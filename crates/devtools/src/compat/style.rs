@@ -877,9 +877,8 @@ const SELECTORS: &[SelectorProbe] = &[
     },
 ];
 
-/// Pseudo-classes for interaction or history state. The style engine
-/// documents that these never match (see `css`'s matching module), and a
-/// static render cannot exercise them.
+/// Dynamic pseudo-classes that the static compatibility audit cannot exercise
+/// because it does not synthesize pointer or focus events.
 const INTERACTIVE_PSEUDO_CLASSES: &[&str] = &[
     "hover",
     "active",
@@ -902,7 +901,7 @@ struct Decl {
 /// attribute, and reports parse errors.
 fn collect(
     page: &PageSources<'_>,
-    map: &PageMap<'_>,
+    map: &PageMap,
     report: &mut AuditReport,
 ) -> (Vec<Decl>, Usage, Usage) {
     let mut declarations = Vec::new();
@@ -959,10 +958,10 @@ fn collect(
             push_declarations(&rule.declarations, text, &label);
         }
     }
-    for (style, line) in &map.inline_styles {
+    for style in &map.inline_styles {
         let sheet = css::parse_stylesheet(&format!("*{{{style}}}"));
         if let Some(rule) = sheet.rules.first() {
-            let label = format!("HTML line {line} (style attribute)");
+            let label = "HTML markup (style attribute)".to_owned();
             for declaration in &rule.declarations {
                 declarations.push(Decl {
                     property: declaration.property.clone(),
@@ -1095,7 +1094,7 @@ fn selector_features(selector: &str) -> Vec<String> {
 pub(crate) fn audit<E: PageScriptEngine>(
     auditor: &Auditor<E>,
     page: &PageSources<'_>,
-    map: &PageMap<'_>,
+    map: &PageMap,
     report: &mut AuditReport,
 ) {
     let (declarations, at_rules, selectors) = collect(page, map, report);
@@ -1383,8 +1382,8 @@ fn audit_selectors<E: PageScriptEngine>(
                 Finding::new(
                     Area::CssSelector,
                     format!(":{name}"),
-                    "The engine tracks no hover, focus, or history state, so these rules never \
-                     apply (documented in the css crate's matching module).",
+                    "The compatibility probe is static and does not synthesize pointer or focus \
+                     events; runtime interaction behavior is not verified here.",
                     Evidence::Documented,
                 )
                 .at(used),
@@ -1430,6 +1429,15 @@ mod tests {
             find_property(css, "justify-content").map(|o| line_at(css, o)),
             Some(1)
         );
+    }
+
+    #[test]
+    fn keyframes_probe_reports_animations_as_working() {
+        let probe = AT_RULES
+            .iter()
+            .find(|probe| probe.names.contains(&"keyframes"))
+            .expect("@keyframes probe");
+        assert!(matches!((probe.check)(), Outcome::Works));
     }
 
     #[test]

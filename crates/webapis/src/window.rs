@@ -4,9 +4,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicU32, Ordering},
     sync::{Arc, Mutex, PoisonError},
-    time::Instant,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::crypto::register_crypto;
 use crate::custom_elements::CustomElementRegistry;
 use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
@@ -32,6 +33,35 @@ struct AnimationFrameCallbacks {
     next_id: u32,
     callbacks: Vec<(u32, Function)>,
     time_origin: Instant,
+}
+
+/// The monotonic clock exposed through the High Resolution Time API.
+///
+/// `time_origin` is captured once for a Window, so `now()` remains a duration
+/// from the same navigation-specific origin even if the system wall clock is
+/// adjusted after the Window is created.
+struct PerformanceClock {
+    time_origin: Instant,
+    time_origin_timestamp_ms: f64,
+}
+
+impl PerformanceClock {
+    fn new() -> Self {
+        let time_origin = Instant::now();
+        let time_origin_timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs_f64()
+            * 1000.0;
+        Self {
+            time_origin,
+            time_origin_timestamp_ms,
+        }
+    }
+
+    fn now(&self) -> f64 {
+        self.time_origin.elapsed().as_secs_f64() * 1000.0
+    }
 }
 
 impl AnimationFrameCallbacks {
@@ -81,6 +111,10 @@ struct MicrotaskQueue {
     callbacks: VecDeque<Function>,
 }
 
+struct MessageQueue {
+    messages: VecDeque<Value>,
+}
+
 impl MicrotaskQueue {
     fn new() -> Self {
         Self {
@@ -94,6 +128,14 @@ impl MicrotaskQueue {
 
     fn dequeue(&mut self) -> Option<Function> {
         self.callbacks.pop_front()
+    }
+}
+
+impl MessageQueue {
+    fn new() -> Self {
+        Self {
+            messages: VecDeque::new(),
+        }
     }
 }
 
@@ -261,6 +303,77 @@ fn clone_for_storage(value: &Value) -> JsResult<Value> {
     }
 }
 
+fn data_clone_error(message: impl Into<String>) -> JsError {
+    let message = message.into();
+    let exception = Object::new();
+    exception.set("name", Value::String("DataCloneError".into()));
+    exception.set("message", Value::String(message));
+    exception.set("code", Value::Number(25.0));
+    JsError::thrown(Value::Object(exception))
+}
+
+fn type_error(message: impl Into<String>) -> JsError {
+    let exception = Object::new();
+    exception.set("name", Value::String("TypeError".into()));
+    exception.set("message", Value::String(message.into()));
+    JsError::thrown(Value::Object(exception))
+}
+
+fn structured_clone_value(value: &Value, memory: &mut Vec<(Object, Object)>) -> JsResult<Value> {
+    match value {
+        Value::Undefined
+        | Value::Null
+        | Value::Boolean(_)
+        | Value::Number(_)
+        | Value::String(_) => Ok(value.clone()),
+        Value::Function(_) => Err(data_clone_error("functions cannot be cloned")),
+        Value::Object(source) | Value::Array(source) => {
+            if let Some((_, cloned)) = memory.iter().find(|(original, _)| original == source) {
+                return Ok(if matches!(value, Value::Array(_)) {
+                    Value::Array(cloned.clone())
+                } else {
+                    Value::Object(cloned.clone())
+                });
+            }
+
+            let cloned = Object::new();
+            memory.push((source.clone(), cloned.clone()));
+            for key in source.keys() {
+                if let Some(property) = source.get_property(&key)? {
+                    cloned.set(key, structured_clone_value(&property, memory)?);
+                }
+            }
+            Ok(if matches!(value, Value::Array(_)) {
+                Value::Array(cloned)
+            } else {
+                Value::Object(cloned)
+            })
+        }
+    }
+}
+
+fn structured_clone(value: &Value, options: Option<&Value>) -> JsResult<Value> {
+    if let Some(Value::Object(options) | Value::Array(options)) = options
+        && let Some(transfer) = options.get_property("transfer")?
+    {
+        match transfer {
+            Value::Undefined | Value::Null => {}
+            Value::Array(transfer) => {
+                if transfer
+                    .get_own("length")
+                    .is_some_and(|length| matches!(length, Value::Number(number) if number > 0.0))
+                {
+                    return Err(data_clone_error(
+                        "transferring objects is not supported by this runtime",
+                    ));
+                }
+            }
+            _ => return Err(type_error("structuredClone transfer must be an array")),
+        }
+    }
+    structured_clone_value(value, &mut Vec::new())
+}
+
 fn resolve_history_url(base: &Url, requested: Option<&Value>) -> JsResult<Url> {
     let Some(requested) = requested else {
         return Ok(base.clone());
@@ -320,6 +433,78 @@ fn invoke_popstate(window: &Object, state: &Value) {
     }
 }
 
+fn message_target_origin(arguments: &[Value]) -> JsResult<String> {
+    let target = match arguments.get(1) {
+        None | Some(Value::Undefined) => "/".to_owned(),
+        Some(Value::String(target)) => target.clone(),
+        Some(Value::Object(options) | Value::Array(options)) => {
+            match options.get_property("targetOrigin")? {
+                None | Some(Value::Undefined) => "/".to_owned(),
+                Some(Value::String(target)) => target,
+                _ => return Err(type_error("targetOrigin must be a string")),
+            }
+        }
+        _ => {
+            return Err(type_error(
+                "targetOrigin must be a string or options object",
+            ));
+        }
+    };
+    if target == "*" || target == "/" || target == "null" {
+        return Ok(target);
+    }
+    let parsed = Url::parse(&target)
+        .map_err(|_| type_error("targetOrigin must be an origin, '*' or '/'"))?;
+    let origin = parsed.origin().ascii_serialization();
+    let origin_with_slash = format!("{origin}/");
+    if parsed.as_str() != origin && parsed.as_str() != origin_with_slash {
+        return Err(type_error("targetOrigin must be an origin, '*' or '/'"));
+    }
+    Ok(origin)
+}
+
+fn message_origin(window: &Object) -> String {
+    window
+        .get("__postMessageOrigin")
+        .and_then(|value| match value {
+            Value::String(origin) => Some(origin),
+            _ => None,
+        })
+        .unwrap_or_else(|| "null".into())
+}
+
+fn invoke_message(window: &Object, data: Value, origin: String) {
+    let event = Object::new();
+    event.set("type", Value::String("message".into()));
+    event.set("data", data);
+    event.set("origin", Value::String(origin));
+    event.set("source", Value::Object(window.clone()));
+    event.set("ports", Value::Array(Object::new()));
+    event.set("bubbles", Value::Boolean(false));
+    event.set("cancelable", Value::Boolean(false));
+    event.set("target", Value::Object(window.clone()));
+    event.set("currentTarget", Value::Object(window.clone()));
+
+    let mut callbacks = Vec::new();
+    if let Some(Value::Object(list)) = window.get("__messageListeners") {
+        for index in 0..list.len() {
+            if let Some(callback) = list.get(&index.to_string()) {
+                callbacks.push(callback);
+            }
+        }
+    }
+    if let Some(Value::Function(callback)) = window.get("onmessage") {
+        callbacks.push(Value::Function(callback));
+    }
+    for callback in callbacks {
+        if let Value::Function(callback) = callback
+            && let Err(error) = callback.call(&[Value::Object(event.clone())])
+        {
+            log::warn!("message listener threw: {error}");
+        }
+    }
+}
+
 /// The viewport dimensions exposed to a script-visible Window.
 ///
 /// Dimensions are CSS pixels, matching CSSOM View. A viewport is optional
@@ -331,6 +516,193 @@ pub struct ViewportSize {
     pub width: u32,
     /// The viewport height in CSS pixels.
     pub height: u32,
+}
+
+#[derive(Clone, Copy)]
+struct MediaState {
+    viewport: Option<ViewportSize>,
+    device_pixel_ratio: f64,
+    display_state: &'static str,
+    resizable: bool,
+}
+
+fn media_state(viewport: Option<ViewportSize>, device_pixel_ratio: f64) -> MediaState {
+    MediaState {
+        viewport,
+        device_pixel_ratio,
+        display_state: "normal",
+        resizable: true,
+    }
+}
+
+fn css_length(value: &str) -> Option<f64> {
+    value.trim().strip_suffix("px")?.trim().parse().ok()
+}
+
+fn css_resolution(value: &str) -> Option<f64> {
+    let value = value.trim();
+    if let Some(value) = value.strip_suffix("dppx") {
+        return value.trim().parse().ok();
+    }
+    if let Some(value) = value.strip_suffix("dpi") {
+        return value.trim().parse::<f64>().ok().map(|value| value / 96.0);
+    }
+    if let Some(value) = value.strip_suffix("dpcm") {
+        return value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| value * 2.54 / 96.0);
+    }
+    None
+}
+
+fn media_feature(feature: &str, state: MediaState) -> bool {
+    let Some((name, value)) = feature.split_once(':') else {
+        return feature.trim() == "resizable" && state.resizable;
+    };
+    let name = name.trim().to_ascii_lowercase();
+    let value = value.trim().to_ascii_lowercase();
+    let width = state.viewport.map_or(0.0, |viewport| viewport.width as f64);
+    let height = state
+        .viewport
+        .map_or(0.0, |viewport| viewport.height as f64);
+    match name.as_str() {
+        "width" => css_length(&value).is_some_and(|expected| width == expected),
+        "min-width" => css_length(&value).is_some_and(|expected| width >= expected),
+        "max-width" => css_length(&value).is_some_and(|expected| width <= expected),
+        "height" => css_length(&value).is_some_and(|expected| height == expected),
+        "min-height" => css_length(&value).is_some_and(|expected| height >= expected),
+        "max-height" => css_length(&value).is_some_and(|expected| height <= expected),
+        "resolution" => css_resolution(&value)
+            .is_some_and(|expected| (state.device_pixel_ratio - expected).abs() < f64::EPSILON),
+        "min-resolution" => {
+            css_resolution(&value).is_some_and(|expected| state.device_pixel_ratio >= expected)
+        }
+        "max-resolution" => {
+            css_resolution(&value).is_some_and(|expected| state.device_pixel_ratio <= expected)
+        }
+        "orientation" => match value.as_str() {
+            "portrait" => height >= width,
+            "landscape" => width > height,
+            _ => false,
+        },
+        "display-state" => value == state.display_state,
+        "resizable" => match value.as_str() {
+            "true" => state.resizable,
+            "false" => !state.resizable,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn media_query_matches(query: &str, state: MediaState) -> bool {
+    query.split(',').any(|query| {
+        let mut query = query.trim().to_ascii_lowercase();
+        let negated = query.strip_prefix("not ").is_some();
+        if negated {
+            query = query[4..].trim().to_owned();
+        }
+        if let Some(rest) = query.strip_prefix("only ") {
+            query = rest.trim().to_owned();
+        }
+        let mut parts = query.split(" and ");
+        let first = parts.next().unwrap_or_default().trim();
+        let (media_type, first_feature) = if first.starts_with('(') {
+            ("", Some(first))
+        } else {
+            (first, None)
+        };
+        let mut matches = media_type.is_empty() || media_type == "all" || media_type == "screen";
+        if media_type == "print" || (!media_type.is_empty() && !matches) {
+            matches = false;
+        }
+        for part in first_feature.into_iter().chain(parts) {
+            let feature = part
+                .trim()
+                .strip_prefix('(')
+                .and_then(|value| value.strip_suffix(')'));
+            matches &= feature.is_some_and(|feature| media_feature(feature.trim(), state));
+        }
+        if negated { !matches } else { matches }
+    })
+}
+
+fn media_query_list(query: &str, state: MediaState) -> Object {
+    let media = if query.trim().is_empty() {
+        "not all".to_owned()
+    } else {
+        query.trim().to_owned()
+    };
+    let list = Object::new();
+    list.set_read_only("media", Value::String(media.clone()));
+    list.set_read_only(
+        "matches",
+        Value::Boolean(media_query_matches(&media, state)),
+    );
+    list.set("__query", Value::String(media));
+    list.set("__listeners", Value::Object(Object::new()));
+    list.set("onchange", Value::Null);
+    list
+}
+
+fn dispatch_media_query_change(list: &Object, matches: bool) {
+    let media = list.get("media").unwrap_or(Value::String(String::new()));
+    let event = Object::new();
+    event.set("type", Value::String("change".into()));
+    event.set("media", media);
+    event.set("matches", Value::Boolean(matches));
+    event.set("bubbles", Value::Boolean(false));
+    event.set("cancelable", Value::Boolean(false));
+    event.set("target", Value::Object(list.clone()));
+    event.set("currentTarget", Value::Object(list.clone()));
+    let mut callbacks = Vec::new();
+    if let Some(Value::Object(listeners)) = list.get("__listeners") {
+        for index in 0..listeners.len() {
+            if let Some(callback) = listeners.get(&index.to_string()) {
+                callbacks.push(callback);
+            }
+        }
+    }
+    if let Some(callback) = list.get("onchange") {
+        callbacks.push(callback);
+    }
+    for callback in callbacks {
+        let result = match callback {
+            Value::Function(callback) => callback.call(&[Value::Object(event.clone())]),
+            Value::Object(callback) => match callback.get("handleEvent") {
+                Some(Value::Function(handle_event)) => {
+                    handle_event.call(&[Value::Object(event.clone())])
+                }
+                _ => Ok(Value::Undefined),
+            },
+            _ => Ok(Value::Undefined),
+        };
+        if let Err(error) = result {
+            log::warn!("MediaQueryList change listener threw: {error}");
+        }
+    }
+}
+
+fn update_media_query_lists(window: &Object, state: MediaState) {
+    let Some(Value::Object(lists)) = window.get("__mediaQueryLists") else {
+        return;
+    };
+    for index in 0..lists.len() {
+        let Some(Value::Object(list)) = lists.get(&index.to_string()) else {
+            continue;
+        };
+        let Some(Value::String(query)) = list.get("__query") else {
+            continue;
+        };
+        let matches = media_query_matches(&query, state);
+        let old_matches = matches!(list.get("matches"), Some(Value::Boolean(true)));
+        if matches != old_matches {
+            list.update_read_only("matches", Value::Boolean(matches));
+            dispatch_media_query_change(&list, matches);
+        }
+    }
 }
 
 fn register_window_object(
@@ -355,7 +727,10 @@ fn register_window_object(
     };
     let timers = Arc::new(Mutex::new(WindowTimers::new()));
     let microtasks = Arc::new(Mutex::new(MicrotaskQueue::new()));
+    let messages = Arc::new(Mutex::new(MessageQueue::new()));
     let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
+    let performance = Object::new();
+    let performance_clock = Arc::new(PerformanceClock::new());
     let evaluator = realm.script_evaluator();
     let timer_this = Value::Object(window.clone());
     let nesting_context = Arc::new(AtomicU32::new(0));
@@ -369,6 +744,32 @@ fn register_window_object(
         Arc::new(move |_| Ok(Value::Object(navigator_for_window.clone()))),
     );
     window.set("customElements", Value::Object(custom_elements.clone()));
+    // HTML's structured cloning API deep-copies primitives, plain objects,
+    // and arrays, preserving cycles and repeated references. This runtime
+    // does not represent the standard's built-in serializable types (such as
+    // Date, Map, Set, RegExp, or ArrayBuffer); functions and those values
+    // cannot be cloned. Empty transfer lists work, but transferring resources
+    // is unsupported because the runtime has no transferable value types.
+    window.set_method(
+        "structuredClone",
+        Arc::new(|arguments| {
+            let [value, options @ ..] = arguments else {
+                return Err(type_error("structuredClone() requires a value"));
+            };
+            structured_clone(value, options.first())
+        }),
+    );
+    register_crypto(realm, &window)?;
+    let performance_for_now = Arc::clone(&performance_clock);
+    performance.set_method(
+        "now",
+        Arc::new(move |_| Ok(Value::Number(performance_for_now.now()))),
+    );
+    performance.set_read_only(
+        "timeOrigin",
+        Value::Number(performance_clock.time_origin_timestamp_ms),
+    );
+    window.set_read_only("performance", Value::Object(performance.clone()));
     // CSSOM View exposes scrollX as a readonly number. The renderer does not
     // yet have document horizontal scrolling, so the initial offset is zero.
     window.set_read_only("scrollX", Value::Number(0.0));
@@ -389,9 +790,181 @@ fn register_window_object(
     let inner_height = Value::Number(viewport.map_or(0, |size| size.height) as f64);
     window.set("innerHeight", inner_height.clone());
     window.set("onpopstate", Value::Null);
+    window.set("onmessage", Value::Null);
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__popstateListeners", Value::Object(Object::new()));
+    window.set("__messageListeners", Value::Object(Object::new()));
     window.set("__storageListeners", Value::Object(Object::new()));
+    window.set("__mediaQueryLists", Value::Object(Object::new()));
+
+    let window_origin = Url::parse(initial_url)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|_| "null".into());
+    window.set("__postMessageOrigin", Value::String(window_origin));
+
+    let messages_for_post_message = Arc::clone(&messages);
+    let post_message_window = window.clone();
+    window.set_method(
+        "postMessage",
+        Arc::new(move |arguments| {
+            let target = message_target_origin(arguments)?;
+            let origin = message_origin(&post_message_window);
+            if target != "*" && target != "/" && target != origin {
+                return Ok(Value::Undefined);
+            }
+            let data = structured_clone(
+                arguments.first().unwrap_or(&Value::Undefined),
+                arguments.get(1),
+            )?;
+            messages_for_post_message
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .messages
+                .push_back(data);
+            Ok(Value::Undefined)
+        }),
+    );
+
+    let media_window = window.clone();
+    window.set_method(
+        "matchMedia",
+        Arc::new(move |arguments| {
+            let query = arguments.first().map_or_else(String::new, Value::to_string);
+            let current_viewport = match (
+                media_window.get("innerWidth"),
+                media_window.get("innerHeight"),
+            ) {
+                (Some(Value::Number(width)), Some(Value::Number(height))) => Some(ViewportSize {
+                    width: width.max(0.0) as u32,
+                    height: height.max(0.0) as u32,
+                }),
+                _ => None,
+            };
+            let current_ratio = match media_window.get("devicePixelRatio") {
+                Some(Value::Number(ratio)) => ratio,
+                _ => 1.0,
+            };
+            let list = media_query_list(&query, media_state(current_viewport, current_ratio));
+            let listeners = list
+                .get("__listeners")
+                .expect("MediaQueryList listeners should be installed");
+            list.set_method(
+                "addEventListener",
+                Arc::new({
+                    let list = list.clone();
+                    move |arguments| {
+                        let [Value::String(event_type), callback, ..] = arguments else {
+                            return Ok(Value::Undefined);
+                        };
+                        if event_type == "change"
+                            && matches!(callback, Value::Function(_) | Value::Object(_))
+                        {
+                            let listeners = list
+                                .get("__listeners")
+                                .and_then(|value| match value {
+                                    Value::Object(value) => Some(value),
+                                    _ => None,
+                                })
+                                .expect("MediaQueryList listeners should be installed");
+                            if !(0..listeners.len()).any(|index| {
+                                listeners
+                                    .get(&index.to_string())
+                                    .is_some_and(|value| value == *callback)
+                            }) {
+                                listeners.set(listeners.len().to_string(), callback.clone());
+                            }
+                        }
+                        Ok(Value::Undefined)
+                    }
+                }),
+            );
+            let list_for_remove = list.clone();
+            list.set_method(
+                "removeEventListener",
+                Arc::new(move |arguments| {
+                    let [Value::String(event_type), callback, ..] = arguments else {
+                        return Ok(Value::Undefined);
+                    };
+                    if event_type == "change"
+                        && let Some(Value::Object(listeners)) = list_for_remove.get("__listeners")
+                    {
+                        for index in 0..listeners.len() {
+                            if listeners
+                                .get(&index.to_string())
+                                .is_some_and(|value| value == *callback)
+                            {
+                                listeners.set(index.to_string(), Value::Undefined);
+                            }
+                        }
+                    }
+                    Ok(Value::Undefined)
+                }),
+            );
+            let list_for_add = list.clone();
+            list.set_method(
+                "addListener",
+                Arc::new(move |arguments| {
+                    if let Some(callback) = arguments.first()
+                        && let Some(Value::Function(add)) = list_for_add.get("addEventListener")
+                    {
+                        add.call(&[Value::String("change".into()), callback.clone()])?;
+                    }
+                    Ok(Value::Undefined)
+                }),
+            );
+            let list_for_remove_listener = list.clone();
+            list.set_method(
+                "removeListener",
+                Arc::new(move |arguments| {
+                    if let Some(callback) = arguments.first()
+                        && let Some(Value::Function(remove)) =
+                            list_for_remove_listener.get("removeEventListener")
+                    {
+                        remove.call(&[Value::String("change".into()), callback.clone()])?;
+                    }
+                    Ok(Value::Undefined)
+                }),
+            );
+            if let Value::Object(lists) =
+                media_window.get("__mediaQueryLists").expect("media lists")
+            {
+                lists.set(lists.len().to_string(), Value::Object(list.clone()));
+            }
+            drop(listeners);
+            Ok(Value::Object(list))
+        }),
+    );
+    let update_media_window = window.clone();
+    window.set_method(
+        "__updateMediaQueries",
+        Arc::new(move |arguments| {
+            let width = arguments.first().and_then(|value| match value {
+                Value::Number(value) => Some(*value as u32),
+                _ => None,
+            });
+            let height = arguments.get(1).and_then(|value| match value {
+                Value::Number(value) => Some(*value as u32),
+                _ => None,
+            });
+            let ratio = arguments
+                .get(2)
+                .and_then(|value| match value {
+                    Value::Number(value) => Some(*value),
+                    _ => None,
+                })
+                .unwrap_or(1.0);
+            update_media_query_lists(
+                &update_media_window,
+                media_state(
+                    width
+                        .zip(height)
+                        .map(|(width, height)| ViewportSize { width, height }),
+                    ratio,
+                ),
+            );
+            Ok(Value::Undefined)
+        }),
+    );
 
     let timers_for_timeout = Arc::clone(&timers);
     let nesting_for_timeout = Arc::clone(&nesting_context);
@@ -598,11 +1171,13 @@ fn register_window_object(
                     "window.addEventListener() expects an event type and callback",
                 ));
             };
-            if event_type == "popstate" || event_type == "storage" {
+            if event_type == "popstate" || event_type == "storage" || event_type == "message" {
                 let list_name = if event_type == "popstate" {
                     "__popstateListeners"
-                } else {
+                } else if event_type == "storage" {
                     "__storageListeners"
+                } else {
+                    "__messageListeners"
                 };
                 let list = match listeners_window.get(list_name) {
                     Some(Value::Object(list)) => list,
@@ -622,11 +1197,13 @@ fn register_window_object(
             let [Value::String(event_type), Value::Function(callback), ..] = arguments else {
                 return Ok(Value::Undefined);
             };
-            if (event_type == "popstate" || event_type == "storage")
+            if (event_type == "popstate" || event_type == "storage" || event_type == "message")
                 && let Some(Value::Object(list)) = remove_window.get(if event_type == "popstate" {
                     "__popstateListeners"
-                } else {
+                } else if event_type == "storage" {
                     "__storageListeners"
+                } else {
+                    "__messageListeners"
                 })
             {
                 for index in 0..list.len() {
@@ -639,6 +1216,29 @@ fn register_window_object(
                 }
             }
             Ok(Value::Undefined)
+        }),
+    );
+
+    let messages_for_pump = Arc::clone(&messages);
+    let microtasks_for_message = Arc::clone(&microtasks);
+    let evaluator_for_message = evaluator.clone();
+    let message_window = window.clone();
+    window.set_method(
+        "__runMessages",
+        Arc::new(move |_| {
+            let mut delivered = 0;
+            loop {
+                let message = messages_for_pump
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .messages
+                    .pop_front();
+                let Some(message) = message else { break };
+                invoke_message(&message_window, message, message_origin(&message_window));
+                drain_microtasks(&microtasks_for_message, &evaluator_for_message);
+                delivered += 1;
+            }
+            Ok(Value::Number(delivered as f64))
         }),
     );
 
@@ -768,10 +1368,23 @@ fn register_window_object(
 
     realm.register_global_value("window", Value::Object(window.clone()))?;
     realm.register_global_value("self", Value::Object(window.clone()))?;
+    realm.register_global_value(
+        "structuredClone",
+        window
+            .get("structuredClone")
+            .expect("structuredClone should be installed on Window"),
+    )?;
     realm.register_global_value("customElements", Value::Object(custom_elements))?;
     realm.register_global_value("navigator", Value::Object(navigator))?;
+    realm.register_global_value("performance", Value::Object(performance))?;
     realm.register_global_value("innerWidth", inner_width)?;
     realm.register_global_value("innerHeight", inner_height)?;
+    realm.register_global_value(
+        "matchMedia",
+        window
+            .get("matchMedia")
+            .expect("matchMedia should be installed on Window"),
+    )?;
     realm.register_global_value(
         "setInterval",
         window
@@ -848,6 +1461,25 @@ pub fn run_window_microtasks(window: &Object) -> JsResult<usize> {
     }
 }
 
+/// Delivers queued `message` events for a Window.
+///
+/// `postMessage()` queues delivery so scripts can install listeners before the
+/// event is dispatched. Browser integrations should call this from the owning
+/// page/event-loop thread at a task checkpoint. The return value is the number
+/// of messages delivered.
+pub fn run_window_messages(window: &Object) -> JsResult<usize> {
+    let Some(Value::Function(pump)) = window.get("__runMessages") else {
+        return Err(JsError::runtime("window message pump is not installed"));
+    };
+    match pump.call(&[]) {
+        Ok(Value::Number(delivered)) => Ok(delivered as usize),
+        Ok(_) => Err(JsError::runtime(
+            "window message pump returned a non-number",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
 /// Runs the pending `window.requestAnimationFrame()` callbacks for one frame.
 ///
 /// Browser integrations call this from the owning page/event-loop thread
@@ -887,6 +1519,10 @@ pub fn register_window_with_security_context(
     let window = register_window_object(realm, "about:blank", 1.0, None)?;
     let serialized_origin = security_context.origin().ascii_serialization();
     window.set("origin", Value::String(serialized_origin.clone()));
+    window.set(
+        "__postMessageOrigin",
+        Value::String(serialized_origin.clone()),
+    );
     realm.register_global_value("origin", Value::String(serialized_origin))?;
     Ok(())
 }

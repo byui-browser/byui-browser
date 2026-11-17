@@ -28,7 +28,7 @@ pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Statement> {
         Some(Token::Try) => exceptions::parse_try(parser),
         Some(Token::Break | Token::Continue) => exceptions::parse_jump(parser),
         _ => {
-            let expression = parser.parse_expression(0)?;
+            let expression = parser.parse_sequence()?;
             parser.terminator("expression statement")?;
             Ok(Statement::Expression(expression))
         }

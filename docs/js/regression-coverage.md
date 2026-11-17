@@ -8,6 +8,7 @@ APIs: `js::eval`, `js::parse`, and `js::Realm::evaluate_script`.
 | File | Covers |
 |---|---|
 | `crates/js/tests/regression.rs` | Arithmetic precedence, literals, truthiness, comparisons, short-circuiting, declarations, assignment, control flow, functions, returns, recursion, syntax errors, runtime errors, host-function calls, and unsupported syntax |
+| `crates/js/tests/expressions.rs` | Conditional, comma, update, compound and logical assignment, `??`, `typeof`/`void`/`delete`, `in`/`instanceof`, `**`, template literals, spread, and optional chaining. Runs each form through the interpreter and the VM and compares values, errors, and side effects; also covers the lexer, parser, emitted bytecode, new-instruction stack effects, and malformed bytecode. See [expression-forms.md](expression-forms.md). |
 | `crates/js/tests/contract.rs` | Source-level contract for string literals and structured syntax errors. These tests were previously `#[ignore]`d. |
 | `crates/webapis/tests/print_binding.rs` | End to end: JavaScript `print()` reaches `webapis::print` through a `Realm` global and writes to an injected `ConsoleSink` |
 
@@ -30,11 +31,10 @@ these features is implemented, update or remove the matching case in
 ### Rejected while parsing (`JsErrorCategory::Syntax`)
 
 - Array literals.
-- `++`/`--` and compound assignment (`+=` and similar).
-- Unary `+` and `typeof`.
+- Update and compound assignment on anything but a variable or member, `delete name`, `-a ** b`, `??` mixed with `||`/`&&`, regular-expression literals, and tagged templates. The rest of the expression forms (`++`, `+=`, `typeof`, `?:`, `?.`, `??`, templates, spread, ...) are supported; see [expression-forms.md](expression-forms.md).
 - Function expressions and arrow functions. Only function declarations are
   supported.
-- Template literals.
+- Unterminated template literals.
 - `for` loops.
 - Declaring several variables in one statement (`let a = 1, b = 2;`).
 - Empty statements (`;`, `1;;`).

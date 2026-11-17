@@ -1139,7 +1139,7 @@ impl ScriptTokens {
 pub(crate) fn audit<E: PageScriptEngine>(
     auditor: &Auditor<E>,
     page: &PageSources<'_>,
-    map: &PageMap<'_>,
+    map: &PageMap,
     script_error: Option<&str>,
     report: &mut AuditReport,
 ) {
@@ -1201,7 +1201,7 @@ pub(crate) fn audit<E: PageScriptEngine>(
 
 fn audit_execution(
     page: &PageSources<'_>,
-    map: &PageMap<'_>,
+    map: &PageMap,
     script_error: Option<&str>,
     report: &mut AuditReport,
 ) {
@@ -1222,7 +1222,7 @@ fn audit_execution(
             .get(index)
             .map(String::as_str)
             .unwrap_or_default();
-        let location = Some(format!("HTML line {}", slot.line));
+        let location = Some("HTML markup".to_owned());
         if let Some(src) = &slot.src
             && source.is_empty()
         {

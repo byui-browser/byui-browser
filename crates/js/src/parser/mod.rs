@@ -98,7 +98,7 @@ pub(crate) fn parse_program_with_line_terminators(
 pub fn parse(tokens: &[Token]) -> ParseResult<Expr> {
     with_engine_stack(|| {
         let mut parser = Parser::new(tokens, &[]);
-        let expression = parser.parse_expression(0)?;
+        let expression = parser.parse_sequence()?;
         if parser.peek().is_some() {
             return Err(parser.error("Unexpected token after expression", "expression"));
         }
@@ -224,6 +224,32 @@ impl<'tokens> Parser<'tokens> {
         self.nested("expression", |parser| {
             expressions::parse(parser, minimum_precedence)
         })
+    }
+
+    /// Parses a full expression, including the comma operator.
+    ///
+    /// Call arguments, array elements, object values, and declaration
+    /// initializers use [`Parser::parse_expression`] instead, because a comma
+    /// separates them.
+    fn parse_sequence(&mut self) -> ParseResult<Expr> {
+        self.parse_sequence_with_depth()
+            .map(|(expression, _)| expression)
+    }
+
+    /// Like [`Parser::parse_sequence`], also reporting the tree depth.
+    fn parse_sequence_with_depth(&mut self) -> ParseResult<(Expr, usize)> {
+        let (first, mut depth) = self.parse_expression_with_depth(0)?;
+        if self.peek() != Some(&Token::Comma) {
+            return Ok((first, depth));
+        }
+        let mut operands = vec![first];
+        while self.consume(&Token::Comma) {
+            let (operand, operand_depth) = self.parse_expression_with_depth(0)?;
+            depth = depth.max(operand_depth);
+            operands.push(operand);
+        }
+        let depth = self.node_depth(depth + 1, "comma expression")?;
+        Ok((Expr::Sequence(operands), depth))
     }
 
     /// Validates the depth of a node about to be built from its children.

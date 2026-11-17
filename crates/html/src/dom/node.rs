@@ -1,32 +1,25 @@
-use super::{node_id::NodeID, node_kind::NodeKind, source_span::SourceSpan};
+use super::{node_id::NodeID, node_kind::NodeKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     parent: Option<NodeID>,
     children: Vec<NodeID>,
     kind: NodeKind,
-    span: Option<SourceSpan>,
 }
 
 impl Default for Node {
     fn default() -> Self {
-        Self::new(Option::None, vec![], NodeKind::None, Option::None)
+        Self::new(Option::None, vec![], NodeKind::None)
     }
 }
 
 impl Node {
     /// Constructs node
-    pub fn new(
-        parent: Option<NodeID>,
-        children: Vec<NodeID>,
-        kind: NodeKind,
-        span: Option<SourceSpan>,
-    ) -> Self {
+    pub fn new(parent: Option<NodeID>, children: Vec<NodeID>, kind: NodeKind) -> Self {
         Self {
             parent,
             children,
             kind,
-            span,
         }
     }
 
@@ -55,14 +48,5 @@ impl Node {
     /// Sets node kind.
     pub fn set_kind(&mut self, node_kind: NodeKind) {
         self.kind = node_kind;
-    }
-
-    /// Gets reference of span.
-    pub fn get_span(&self) -> &Option<SourceSpan> {
-        &self.span
-    }
-    /// Sets span.
-    pub fn set_span(&mut self, span: Option<SourceSpan>) {
-        self.span = span;
     }
 }
