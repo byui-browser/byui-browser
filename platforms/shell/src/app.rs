@@ -27,11 +27,12 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
 use crate::compat_panel::{CompatState, ShellAuditor, ShellScriptEngine};
-use crate::context_menu::{ContextMenu, MenuAction};
+use crate::context_menu::{Appearance, ContextMenu, MenuAction};
 use crate::elements_panel::{DockTab, ElementsPanel};
 use crate::find_in_page::{Action as FindAction, FindInPage};
 use crate::page_source::PageSource;
 use crate::site_info;
+use crate::theme_preference;
 use crate::toolbar::{self, Control};
 use devtools::performance::{EventCategory, PerformanceLog, TimelineEvent};
 
@@ -153,6 +154,9 @@ struct App {
     page_press: bool,
     find_pressed: Option<FindAction>,
     context_menu: Option<ContextMenu>,
+    appearance: Appearance,
+    appearance_path: Option<PathBuf>,
+    system_dark: Option<bool>,
     site_info_open: bool,
     menu_pressed: Option<MenuAction>,
     source_font: Option<FontVec>,
@@ -212,11 +216,24 @@ impl App {
         let root = browser::application_data_directory()
             .expect("application data directory should be available");
         let runtime =
-            browser::BrowserRuntime::open(root).expect("browser storage should initialize");
-        Self::with_runtime(platform, runtime)
+            browser::BrowserRuntime::open(&root).expect("browser storage should initialize");
+        Self::with_runtime(platform, runtime, Some(root.join("appearance")))
     }
 
-    fn with_runtime(platform: Platform, runtime: browser::BrowserRuntime) -> Self {
+    fn with_runtime(
+        platform: Platform,
+        runtime: browser::BrowserRuntime,
+        appearance_path: Option<PathBuf>,
+    ) -> Self {
+        let appearance = appearance_path
+            .as_deref()
+            .map_or(Appearance::System, |path| {
+                theme_preference::load(path)
+                    .inspect_err(|error| {
+                        log::warn!("could not load appearance preference: {error}")
+                    })
+                    .unwrap_or_default()
+            });
         let refresh = browser::refresh::RefreshClient::new()
             .map_err(|error| {
                 log::error!("refresh initialization failed: {error}");
@@ -226,6 +243,8 @@ impl App {
         let id = tabs.open("byui://welcome");
         let alerts = Arc::new(PageAlerts::new());
         alerts.set_document(id, 0);
+        let mut tab = TabState::new(id, platform.window_controls_inset);
+        tab.chrome.dark = appearance.is_dark(None);
         Self {
             refresh,
             platform,
@@ -236,7 +255,7 @@ impl App {
             devtools_cursor: None,
             address_press: None,
             font: None,
-            tab: TabState::new(id, platform.window_controls_inset),
+            tab,
             tabs,
             inactive: HashMap::new(),
             tab_pressed: None,
@@ -252,6 +271,9 @@ impl App {
             page_press: false,
             find_pressed: None,
             context_menu: None,
+            appearance,
+            appearance_path,
+            system_dark: None,
             site_info_open: false,
             menu_pressed: None,
             source_font: None,
@@ -346,9 +368,7 @@ impl App {
         self.elements_close_pressed = false;
         self.page_press = false;
         self.tab_pressed = None;
-        if let Some(window) = &self.window {
-            self.tab.chrome.dark = window.theme() == Some(Theme::Dark);
-        }
+        self.tab.chrome.dark = self.appearance_dark();
         self.tab.chrome.hovered = None;
         self.tab.chrome.pressed = None;
         self.last_toolbar_click = None;
@@ -658,6 +678,38 @@ impl App {
         true
     }
 
+    fn appearance_dark(&self) -> bool {
+        self.appearance.is_dark(self.system_dark)
+    }
+
+    fn set_appearance(&mut self, appearance: Appearance) {
+        self.appearance = appearance;
+        self.apply_appearance();
+        if let Some(path) = &self.appearance_path
+            && let Err(error) = theme_preference::save(path, appearance)
+        {
+            log::warn!("could not save appearance preference: {error}");
+        }
+    }
+
+    fn set_system_appearance(&mut self, theme: Option<Theme>) {
+        self.system_dark = theme.map(|theme| theme == Theme::Dark);
+        self.apply_appearance();
+    }
+
+    fn apply_appearance(&mut self) {
+        let dark = self.appearance_dark();
+        if self.tab.chrome.dark != dark {
+            self.tab.chrome.dark = dark;
+            self.frame_key = None;
+            if self.tab.find.is_some() {
+                // Find highlights are painted into the page bitmap.
+                self.tab.page = None;
+            }
+        }
+        self.redraw();
+    }
+
     fn redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -753,29 +805,7 @@ impl App {
         let Some(mut pixmap) = Pixmap::new(size.width.max(1), size.height.max(1)) else {
             return;
         };
-        let dark = window.theme() != Some(Theme::Light);
-        let background = if dark {
-            tiny_skia::Color::from_rgba8(17, 24, 39, 255)
-        } else {
-            tiny_skia::Color::from_rgba8(249, 250, 251, 255)
-        };
-        pixmap.fill(background);
-        if let Some(panel) = &mut self.tab.devtools_panel {
-            sync_devtools_panel(
-                panel,
-                &self.tab.network_log,
-                &self.tab.console,
-                &self.tab.performance,
-            );
-            panel.draw(
-                &mut pixmap,
-                scale,
-                dark,
-                self.devtools_cursor,
-                self.font.as_ref(),
-                self.source_font.as_ref(),
-            );
-        }
+        self.draw_devtools(&mut pixmap, scale);
         let Some(surface) = &mut self.devtools_surface else {
             return;
         };
@@ -789,6 +819,32 @@ impl App {
         }
         if let Err(error) = buffer.present() {
             log::warn!("failed to present DevTools window: {error}");
+        }
+    }
+
+    fn draw_devtools(&mut self, pixmap: &mut Pixmap, scale: f64) {
+        let dark = self.appearance_dark();
+        let background = if dark {
+            toolbar::palette(dark).panel
+        } else {
+            tiny_skia::Color::from_rgba8(249, 250, 251, 255)
+        };
+        pixmap.fill(background);
+        if let Some(panel) = &mut self.tab.devtools_panel {
+            sync_devtools_panel(
+                panel,
+                &self.tab.network_log,
+                &self.tab.console,
+                &self.tab.performance,
+            );
+            panel.draw(
+                pixmap,
+                scale,
+                dark,
+                self.devtools_cursor,
+                self.font.as_ref(),
+                self.source_font.as_ref(),
+            );
         }
     }
 
@@ -1585,6 +1641,19 @@ impl App {
         self.redraw();
     }
 
+    fn open_appearance_menu(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+        self.context_menu = Some(ContextMenu::appearance(
+            size.width,
+            size.height,
+            self.appearance,
+        ));
+        self.redraw();
+    }
+
     /// Clears the network state shared by all future page navigations.
     fn clear_cache(&mut self) {
         let Some(loader) = &self.loader else {
@@ -2032,6 +2101,10 @@ impl App {
                     match action {
                         Some(MenuAction::Reload) => self.activate(Control::Reload),
                         Some(MenuAction::ClearCache) => self.clear_cache(),
+                        Some(MenuAction::OpenAppearance) => self.open_appearance_menu(),
+                        Some(MenuAction::SetAppearance(appearance)) => {
+                            self.set_appearance(appearance)
+                        }
                         Some(MenuAction::PageSource) => self.show_page_source(),
                         Some(MenuAction::Inspect) => self.show_elements(),
                         Some(MenuAction::Compatibility) => self.show_compatibility(),
@@ -2285,6 +2358,7 @@ impl App {
         let strip_entries = self.tab_entries();
         let strip = self.strip();
         let address = self.tab.address.clone();
+        let dark = self.appearance_dark();
         let site_info = self
             .site_info_open
             .then(|| self.site_info_popup())
@@ -2302,7 +2376,6 @@ impl App {
         };
         let scale = window.scale_factor();
         let page_scale = scale * self.tab.page_zoom;
-        let dark = window.theme() == Some(Theme::Dark);
         self.tab.chrome.dark = dark;
         let card =
             toolbar::page_rect_with_find(size.width, size.height, scale, self.tab.find.is_some());
@@ -2455,6 +2528,7 @@ impl App {
             source.draw(
                 &mut composed,
                 scale,
+                dark,
                 self.source_font.as_ref().or(self.font.as_ref()),
             );
         }
@@ -2726,8 +2800,9 @@ impl ApplicationHandler<UserEvent> for App {
             );
             self.font = toolbar::load_ui_font((self.platform.ui_font_files)());
             self.source_font = crate::page_source::load_font();
-            window.request_redraw();
+            let theme = window.theme();
             self.window = Some(window);
+            self.set_system_appearance(theme);
         }
     }
 
@@ -2902,9 +2977,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.key_input(event);
             }
-            WindowEvent::Resized(_)
-            | WindowEvent::ScaleFactorChanged { .. }
-            | WindowEvent::ThemeChanged(_) => {
+            WindowEvent::ThemeChanged(theme) => self.set_system_appearance(Some(theme)),
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.sync_platform_window();
                 if log::log_enabled!(log::Level::Debug) {
                     match &event {
@@ -2913,9 +2987,6 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                             log::trace!("scale factor changed: {scale_factor}")
-                        }
-                        WindowEvent::ThemeChanged(theme) => {
-                            log::debug!("theme changed: {theme:?}")
                         }
                         _ => {}
                     }
@@ -2926,9 +2997,6 @@ impl ApplicationHandler<UserEvent> for App {
                     self.tab
                         .page_events
                         .set_device_pixel_ratio(window.scale_factor() * self.tab.page_zoom);
-                }
-                if matches!(event, WindowEvent::ThemeChanged(_)) && self.tab.find.is_some() {
-                    self.tab.page = None;
                 }
                 self.dismiss_context_menu();
                 if self.site_info_open && self.site_info_popup().is_none() {
@@ -3396,6 +3464,7 @@ mod tests {
                 window_controls_inset: 0.0,
             },
             browser::BrowserRuntime::in_memory(),
+            None,
         )
     }
 
@@ -4524,6 +4593,10 @@ mod tests {
 mod tab_tests {
     use super::*;
     fn app() -> App {
+        app_with_appearance_path(None)
+    }
+
+    fn app_with_appearance_path(path: Option<PathBuf>) -> App {
         App::with_runtime(
             Platform {
                 configure_window: |attributes| attributes,
@@ -4534,6 +4607,7 @@ mod tab_tests {
                 window_controls_inset: 0.0,
             },
             browser::BrowserRuntime::in_memory(),
+            path,
         )
     }
 
@@ -4557,6 +4631,128 @@ mod tab_tests {
             timeline: Vec::new(),
             network_events: Vec::new(),
         }
+    }
+
+    #[test]
+    fn appearance_survives_restart_and_recovers_from_preference_errors() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("byui-appearance-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("appearance");
+        let mut app = app_with_appearance_path(Some(path.clone()));
+        assert_eq!(app.appearance, Appearance::System);
+
+        for choice in [Appearance::Dark, Appearance::Light, Appearance::System] {
+            app.set_appearance(choice);
+            let mut reopened = app_with_appearance_path(Some(path.clone()));
+            assert_eq!(reopened.appearance, choice);
+            assert_eq!(reopened.tab.chrome.dark, choice == Appearance::Dark);
+            reopened.set_system_appearance(Some(Theme::Dark));
+            assert_eq!(reopened.tab.chrome.dark, choice != Appearance::Light);
+        }
+
+        std::fs::write(&path, "unknown").unwrap();
+        let recovered = app_with_appearance_path(Some(path.clone()));
+        assert_eq!(recovered.appearance, Appearance::System);
+        assert!(!recovered.tab.chrome.dark);
+
+        // A directory at the destination forces replacement to fail.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        app.set_appearance(Appearance::Dark);
+        assert!(app.tab.chrome.dark);
+        assert_eq!(app.appearance, Appearance::Dark);
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn appearance_menu_selects_each_mode_and_system_updates_respect_overrides() {
+        let mut app = app();
+        assert_eq!(app.appearance, Appearance::System);
+        assert!(!app.tab.chrome.dark);
+        app.set_system_appearance(Some(Theme::Dark));
+        assert!(app.tab.chrome.dark);
+
+        for (index, mode, dark) in [
+            (1, Appearance::Light, false),
+            (2, Appearance::Dark, true),
+            (0, Appearance::System, false),
+        ] {
+            app.set_system_appearance(Some(Theme::Light));
+            let menu = ContextMenu::appearance(800.0, 600.0, app.appearance);
+            app.context_menu = Some(menu);
+            app.cursor = Some(menu.item_center(index));
+            app.left_mouse_input(ElementState::Pressed);
+            app.left_mouse_input(ElementState::Released);
+            assert_eq!(app.appearance, mode);
+            assert_eq!(app.tab.chrome.dark, dark);
+            assert!(app.context_menu.is_none());
+            if mode == Appearance::Light {
+                app.set_system_appearance(Some(Theme::Dark));
+                assert!(!app.tab.chrome.dark);
+            }
+            if mode == Appearance::Dark {
+                app.set_system_appearance(None);
+                assert!(app.tab.chrome.dark);
+            }
+        }
+        app.set_system_appearance(Some(Theme::Dark));
+        assert!(app.tab.chrome.dark);
+        app.set_system_appearance(None);
+        assert!(!app.tab.chrome.dark);
+    }
+
+    #[test]
+    fn appearance_repaints_find_highlights_and_keeps_the_current_query() {
+        let mut app = app();
+        app.tab.page = Some(((1, 1), Pixmap::new(1, 1).unwrap()));
+        app.set_appearance(Appearance::Dark);
+        assert!(app.tab.page.is_some());
+
+        let mut find = FindInPage::default();
+        find.insert("welcome");
+        app.tab.find = Some(find);
+        app.set_appearance(Appearance::Light);
+        assert!(app.tab.page.is_none());
+        assert_eq!(app.tab.find.as_ref().unwrap().query, "welcome");
+    }
+
+    #[test]
+    fn appearance_updates_open_devtools_and_survives_tab_switching_without_navigation() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let first = app.tab.id;
+        app.ensure_devtools_panel();
+        let page = app.tab.loaded_page.clone();
+        let document = app.tab.document_id;
+        let navigation = app.tab.navigation_id;
+        app.tab.scripts_evaluated = true;
+        let mut light = Pixmap::new(800, 600).unwrap();
+        let mut dark = Pixmap::new(800, 600).unwrap();
+
+        app.draw_devtools(&mut light, 1.0);
+        app.set_appearance(Appearance::Dark);
+        app.draw_devtools(&mut dark, 1.0);
+        assert_ne!(light.data(), dark.data());
+        assert!(app.tab.devtools_panel.is_some());
+        assert_eq!(app.tab.loaded_page, page);
+        assert_eq!(app.tab.document_id, document);
+        assert_eq!(app.tab.navigation_id, navigation);
+        assert!(app.tab.scripts_evaluated);
+
+        app.new_tab();
+        assert!(app.tab.chrome.dark);
+        app.switch_tab(first);
+        assert!(app.tab.chrome.dark);
+        assert_eq!(app.appearance, Appearance::Dark);
+        assert_eq!(app.tab.loaded_page, page);
+        assert!(app.tab.devtools_panel.is_some());
     }
 
     #[test]

@@ -78,8 +78,8 @@ impl Popup {
         if let Some(surface) =
             toolbar::rounded_rect(rect.x(), rect.y(), rect.width(), rect.height(), 9.0)
         {
-            toolbar::fill(frame, &surface, palette.frame_top, transform);
-            toolbar::stroke(frame, &surface, palette.field_border, 1.0, transform);
+            toolbar::fill(frame, &surface, palette.panel, transform);
+            toolbar::stroke(frame, &surface, palette.panel_border, 1.0, transform);
         }
         let close = self.close;
         if self.close_at(cursor)
