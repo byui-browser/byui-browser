@@ -41,8 +41,21 @@ pub(crate) struct Context<'a> {
 /// unsupported properties (including the `font` shorthand) use their initial
 /// values. The font properties choose a face through
 /// [`FontMetrics::select_font`], which measures each text run.
-/// Floats, positioning, and borders are not implemented. Min/max sizes apply
-/// to replaced elements; flex items also honor their main-axis minimum size.
+/// - Floats (`float: left|right`, CSS 2.2 §9.5): shrink-to-fit boxes placed
+///   as high as possible and stacked beside or below earlier floats; line
+///   boxes in the same block formatting context shorten beside them, and
+///   formatting context roots grow to contain them (§10.6.7). `clear` is not
+///   supported, and in-flow formatting context roots do not avoid floats.
+/// - Positioning (`position` with `top`, `right`, `bottom`, `left`, and the
+///   `inset` shorthand, CSS 2.2 §9.3 and §10.3.7/§10.6.4): `relative` shifts
+///   a box after layout; `absolute` places it against the padding box of the
+///   nearest positioned ancestor block box (or the viewport), falling back to
+///   its static position for `auto` insets; `fixed` places it against the
+///   viewport. `sticky` stays at its in-flow position. `z-index` is not
+///   supported; see [`LayoutTree::paint_order`] for stacking.
+///
+/// Borders are not implemented. Min/max sizes apply to replaced elements;
+/// flex items also honor their main-axis minimum size.
 /// Content may overflow the viewport; the root box's rect stays viewport-sized.
 ///
 /// This lays out without images: every `<img>` is treated as broken. Use

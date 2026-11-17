@@ -16,7 +16,8 @@ const CSS_WIDE_KEYWORDS: [&str; 5] = ["inherit", "initial", "unset", "revert", "
 /// Expands one declaration into the longhand declarations it sets.
 ///
 /// The box shorthands `margin` and `padding` are expanded using the
-/// one-to-four value rule. `border-radius` is expanded to the four
+/// one-to-four value rule, as is `inset`, which sets the `top`, `right`,
+/// `bottom`, and `left` longhands (CSS Positioned Layout 3 §3.1). `border-radius` is expanded to the four
 /// `border-*-radius` longhands (CSS Backgrounds 3 §5.1): the values before an
 /// optional `/` are the horizontal radii and the values after it the vertical
 /// radii, each following the one-to-four value rule starting at the top-left
@@ -34,6 +35,7 @@ pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
     let prefix = match declaration.property.as_str() {
         "margin" => "margin",
         "padding" => "padding",
+        "inset" => "inset",
         "border-radius" => return expand_border_radius(&declaration.value),
         "animation" => {
             return crate::animation::expand_shorthand(&declaration.value).unwrap_or_else(|| {
@@ -59,7 +61,12 @@ pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
         .iter()
         .zip(sides)
         .map(|(side, value)| Declaration {
-            property: format!("{prefix}-{side}"),
+            // `inset` sets the bare side properties.
+            property: if prefix == "inset" {
+                (*side).to_owned()
+            } else {
+                format!("{prefix}-{side}")
+            },
             value: value.to_owned(),
         })
         .collect()
@@ -172,6 +179,15 @@ mod tests {
             ]
         );
         assert_eq!(expanded("padding", "1px 2px 3px 4px 5px"), []);
+        assert_eq!(
+            expanded("inset", "0 auto"),
+            [
+                ("top".into(), "0".into()),
+                ("right".into(), "auto".into()),
+                ("bottom".into(), "0".into()),
+                ("left".into(), "auto".into()),
+            ]
+        );
         assert_eq!(expanded("color", "red"), [("color".into(), "red".into())]);
     }
 

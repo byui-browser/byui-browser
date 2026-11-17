@@ -7,7 +7,10 @@ use js::Value;
 
 use super::markup::PageMap;
 use super::scan::{Tok, Token, tokenize};
-use super::{Area, AuditReport, Auditor, Evidence, Finding, PageScriptEngine, PageSources, Usage};
+use super::{
+    Area, AuditReport, Auditor, Evidence, Finding, PageScriptEngine, PageSources, SourcePreview,
+    Usage,
+};
 
 /// The document every JavaScript probe runs in. `#probe` gives element
 /// probes something to find.
@@ -1174,6 +1177,7 @@ pub(crate) fn audit<E: PageScriptEngine>(
         }
         let label = map.script_label(index);
         let outcome = std::panic::catch_unwind(|| js::parse(source).err());
+        let mut preview = None;
         let error = match outcome {
             Ok(None) => continue,
             Ok(Some(error)) => {
@@ -1181,6 +1185,9 @@ pub(crate) fn audit<E: PageScriptEngine>(
                     .line
                     .map(|line| format!(" at line {line}"))
                     .unwrap_or_default();
+                preview = error
+                    .line
+                    .and_then(|line| SourcePreview::new(&label, source, line, error.column));
                 format!("The engine stops parsing{at}: {}.", error.message)
             }
             Err(_) => "The engine's parser crashed on this script.".to_owned(),
@@ -1192,8 +1199,10 @@ pub(crate) fn audit<E: PageScriptEngine>(
             Evidence::Probed,
         );
         finding.location = Some(label);
+        finding.preview = preview;
         report.findings.push(finding);
     }
+    link_run_error(report);
 
     audit_syntax(auditor, &scripts, report);
     audit_apis(auditor, &scripts, report);
@@ -1256,8 +1265,40 @@ fn audit_execution(
         };
         let mut finding = Finding::new(Area::ScriptExecution, feature, detail, Evidence::Observed);
         finding.location = location;
+        finding.preview = SourcePreview::new(&slot.label, source, 1, None);
         report.findings.push(finding);
     }
+}
+
+/// Gives the observed "Page scripts stopped" finding the preview of the parse
+/// failure it most likely is: the run error names a line and column but not
+/// the script, so the first unparsable script failing at that same spot is
+/// used. Run errors that are not parse errors keep no preview.
+fn link_run_error(report: &mut AuditReport) {
+    let Some(stopped) = report
+        .findings
+        .iter()
+        .position(|finding| finding.evidence == Evidence::Observed && finding.location.is_none())
+    else {
+        return;
+    };
+    let Some((line, column)) = line_and_column(&report.findings[stopped].detail) else {
+        return;
+    };
+    report.findings[stopped].preview = report
+        .findings
+        .iter()
+        .filter_map(|finding| finding.preview.as_ref())
+        .find(|preview| preview.line == line && preview.column == Some(column))
+        .cloned();
+}
+
+/// The `(line N, column M)` an engine error message mentions.
+fn line_and_column(message: &str) -> Option<(usize, usize)> {
+    let rest = &message[message.find("(line ")? + "(line ".len()..];
+    let (line, rest) = rest.split_once(", column ")?;
+    let column = rest.split(')').next()?;
+    Some((line.trim().parse().ok()?, column.trim().parse().ok()?))
 }
 
 fn audit_syntax<E: PageScriptEngine>(

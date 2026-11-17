@@ -9,17 +9,22 @@
 //! `white-space`, `line-height`, and `vertical-align` values, as well as
 //! bidirectional text, `text-align-last`, and hyphenation, are not
 //! implemented.
+//!
+//! Line boxes are shortened by floats beside them (CSS 2.2 §9.5). A float
+//! met in the middle of a line is placed beside that line when it fits next
+//! to the content already on it, and below the line otherwise.
 
 use std::ops::Range;
 
 use html::NodeID;
 
 use crate::Rect;
-use crate::block::BlockResult;
+use crate::block::{BlockResult, ContainingBlock};
 use crate::box_tree::{BlockBox, InlineItem, is_document_white_space};
 use crate::layout::Context;
-use crate::style::{ComputedStyle, TextAlign};
-use crate::tree::{InlineBoxFragment, LayoutBox, LineBox, LineFragment, TextFragment};
+use crate::positioned::{FloatScope, PendingAbsolute, relative_offset};
+use crate::style::{ComputedStyle, Position, TextAlign};
+use crate::tree::{InlineBoxFragment, LayoutBox, LineBox, LineFragment, Placement, TextFragment};
 
 /// Tolerance for floating-point error when testing whether content fits.
 const FIT_EPSILON: f32 = 0.001;
@@ -44,6 +49,19 @@ enum Piece {
     Atomic(usize),
     /// A forced line break.
     ForcedBreak,
+    /// Floated or absolutely positioned box `outs[index]`; it takes no room
+    /// in the line.
+    OutOfFlow(usize),
+}
+
+/// The result of laying out an inline formatting context, in the
+/// container's content-box coordinates.
+pub(crate) struct InlineResult {
+    pub lines: Vec<LineBox>,
+    /// Floats placed while laying out the lines.
+    pub floats: Vec<LayoutBox>,
+    /// Absolutely positioned boxes still looking for their containing block.
+    pub absolutes: Vec<PendingAbsolute>,
 }
 
 struct TextSource<'a> {
@@ -80,6 +98,7 @@ struct Prepared<'a> {
     sources: Vec<TextSource<'a>>,
     boxes: Vec<InlineBoxInfo<'a>>,
     atomics: Vec<AtomicInfo>,
+    outs: Vec<&'a BlockBox>,
 }
 
 /// Content between two soft wrap opportunities; it cannot be split.
@@ -112,24 +131,91 @@ impl Context<'_> {
     ///
     /// `container` provides the strut: every non-empty line is at least as
     /// tall as the container's font and line height.
+    ///
+    /// Lines are broken one at a time (greedily) into the space `floats`
+    /// leaves at their height, estimated as the strut's height. A line whose
+    /// first unbreakable chunk does not fit beside floats moves down below
+    /// the float that is in the way.
     pub(crate) fn layout_inline(
         &self,
         items: &[InlineItem],
         container: &ComputedStyle,
         available_width: f32,
-    ) -> Vec<LineBox> {
+        floats: &mut FloatScope<'_>,
+    ) -> InlineResult {
         let mut prepared = self.prepare(items, Some(available_width));
         let chunks = chunk(&prepared);
-        let mut lines = Vec::new();
+        let mut result = InlineResult {
+            lines: Vec::new(),
+            floats: Vec::new(),
+            absolutes: Vec::new(),
+        };
+        let strut = {
+            let metrics = self
+                .fonts
+                .font_vertical_metrics(container.font, container.font_size);
+            metrics.ascent + metrics.descent + metrics.line_gap
+        };
+        let mut placed = vec![false; prepared.outs.len()];
         let mut open = Vec::new();
         let mut y = 0.0;
-        let ranges = break_lines(&chunks, available_width);
-        let count = ranges.len();
-        for (number, range) in ranges.into_iter().enumerate() {
+        let mut next = 0;
+        while next < chunks.len() {
+            let (mut band_x, mut band_width) = floats.line_band(y, strut, available_width);
+            let mut width = 0.0_f32;
+            let mut end = next;
+            while end < chunks.len() {
+                let chunk = &chunks[end];
+                if end > next
+                    && width + chunk.width - chunk.trailing_space > band_width + FIT_EPSILON
+                {
+                    break;
+                }
+                for index in chunk.pieces.clone() {
+                    let Piece::OutOfFlow(out) = prepared.pieces[index] else {
+                        continue;
+                    };
+                    let block = prepared.outs[out];
+                    if placed[out] || !block.style.is_floated() {
+                        continue;
+                    }
+                    placed[out] = true;
+                    // A float goes beside the current line if it fits next
+                    // to the content already there, and below it otherwise.
+                    let (min, _) = self.intrinsic_outer_sizes(block);
+                    let min_y = if width + min <= band_width + FIT_EPSILON {
+                        y
+                    } else {
+                        y + strut
+                    };
+                    let (fragment, nested) =
+                        self.layout_float(block, available_width, floats, min_y);
+                    result.floats.push(fragment);
+                    result.absolutes.extend(nested);
+                    (band_x, band_width) = floats.line_band(y, strut, available_width);
+                }
+                width += chunk.width;
+                end += 1;
+                if chunk.forced_break {
+                    break;
+                }
+            }
+            let first = &chunks[next];
+            if end == next + 1
+                && first.width - first.trailing_space > band_width + FIT_EPSILON
+                && band_width + FIT_EPSILON < available_width
+                && let Some(below) = floats.next_line_edge(y, strut, available_width)
+            {
+                log::trace!("line at y {y} does not fit beside floats; moving to y {below}");
+                y = below;
+                continue;
+            }
+            let range = first.pieces.start..chunks[end - 1].pieces.end;
+            next = end;
             log::trace!("line break: pieces {}..{}", range.start, range.end);
             // `justify` leaves the last line and lines ended by a forced
             // break start-aligned (CSS Text 3 §7.2, `text-align-last: auto`).
-            let ends_paragraph = number + 1 == count
+            let ends_paragraph = next == chunks.len()
                 || range
                     .clone()
                     .rev()
@@ -138,28 +224,36 @@ impl Context<'_> {
                 TextAlign::Justify if ends_paragraph => TextAlign::Start,
                 align => align,
             };
-            if let Some(line) = self.build_line(
+            let mut absolutes = Vec::new();
+            let line = self.build_line(
                 range,
                 &mut prepared,
                 &mut open,
                 container,
                 align,
-                available_width,
+                band_width,
                 y,
-            ) {
+                &mut absolutes,
+            );
+            for mut absolute in absolutes {
+                absolute.translate(band_x, 0.0);
+                result.absolutes.push(absolute);
+            }
+            if let Some(mut line) = line {
+                line.translate(band_x, 0.0);
                 log::trace!(
                     "line {} at y {}: height {}, baseline {}, {} fragments",
-                    lines.len(),
+                    result.lines.len(),
                     line.rect.y,
                     line.rect.height,
                     line.baseline,
                     line.fragments.len()
                 );
                 y = line.rect.bottom();
-                lines.push(line);
+                result.lines.push(line);
             }
         }
-        lines
+        result
     }
 
     /// The min-content and max-content widths of an inline formatting
@@ -173,6 +267,17 @@ impl Context<'_> {
         let mut min = 0.0_f32;
         let mut max = 0.0_f32;
         let mut line = 0.0_f32;
+        // Floats sit beside the lines, so at most they all fit side by side.
+        let mut floats = 0.0_f32;
+        for block in prepared
+            .outs
+            .iter()
+            .filter(|block| block.style.is_floated())
+        {
+            let (float_min, float_max) = self.intrinsic_outer_sizes(block);
+            min = min.max(float_min);
+            floats += float_max;
+        }
         for chunk in chunk(&prepared) {
             min = min.max(chunk.min_width - chunk.trailing_space);
             line += chunk.width;
@@ -181,7 +286,7 @@ impl Context<'_> {
                 line = 0.0;
             }
         }
-        (min, max)
+        (min, max + floats)
     }
 
     /// Converts inline items to pieces, collapsing white space
@@ -199,6 +304,7 @@ impl Context<'_> {
             sources: Vec::new(),
             boxes: Vec::new(),
             atomics: Vec::new(),
+            outs: Vec::new(),
         };
         let mut after_space = true;
         let mut stack = Vec::new();
@@ -291,6 +397,11 @@ impl Context<'_> {
                     prepared.pieces.push(Piece::ForcedBreak);
                     after_space = true;
                 }
+                // Out-of-flow boxes do not affect white-space collapsing.
+                InlineItem::OutOfFlow(block) => {
+                    prepared.pieces.push(Piece::OutOfFlow(prepared.outs.len()));
+                    prepared.outs.push(block);
+                }
             }
         }
         prepared
@@ -330,6 +441,11 @@ impl Context<'_> {
     /// wider than the line is start-aligned. For `justify`, the free space is
     /// shared equally by the line's spaces; a text run is split after each
     /// widened space so its glyphs stay where layout put them.
+    ///
+    /// Absolutely positioned boxes in the range are pushed onto `absolutes`
+    /// at their static position, as are those of atomic inlines. A box that
+    /// was inline-level sits where it occurs in the line; one that was
+    /// block-level sits below the line if content precedes it.
     #[allow(clippy::too_many_arguments)]
     fn build_line(
         &self,
@@ -340,9 +456,14 @@ impl Context<'_> {
         align: TextAlign,
         available_width: f32,
         y: f32,
+        absolutes: &mut Vec<PendingAbsolute>,
     ) -> Option<LineBox> {
-        let is_content =
-            |piece: &Piece| !matches!(piece, Piece::Start(_) | Piece::End(_) | Piece::Space { .. });
+        let is_content = |piece: &Piece| {
+            !matches!(
+                piece,
+                Piece::Start(_) | Piece::End(_) | Piece::Space { .. } | Piece::OutOfFlow(_)
+            )
+        };
         let first_content = range
             .clone()
             .find(|index| is_content(&prepared.pieces[*index]))
@@ -377,7 +498,7 @@ impl Context<'_> {
                 Piece::Atomic(atomic_index) => {
                     (width + prepared.atomics[*atomic_index].width, spaces)
                 }
-                Piece::ForcedBreak => (width, spaces),
+                Piece::ForcedBreak | Piece::OutOfFlow(_) => (width, spaces),
             },
         );
         let free_space = (available_width - natural_width).max(0.0);
@@ -396,6 +517,13 @@ impl Context<'_> {
         // (box index, fragment index, start x), innermost last.
         let mut active: Vec<(usize, usize, f32)> = Vec::new();
         let mut atomics_on_line: Vec<(usize, usize)> = Vec::new();
+        // Relative offsets and pending absolutes of the line's atomics, by
+        // fragment index.
+        let mut atomic_extras: Vec<(usize, (f32, f32), Vec<PendingAbsolute>)> = Vec::new();
+        // (box index, first fragment, end fragment) of each inline box part.
+        let mut box_ranges: Vec<(usize, usize, usize)> = Vec::new();
+        // (out index, x, follows content) of absolutely positioned boxes.
+        let mut statics: Vec<(usize, f32, bool)> = Vec::new();
         let mut boxes_on_line = Vec::new();
         let mut has_content = false;
         let mut x = 0.0_f32;
@@ -422,8 +550,9 @@ impl Context<'_> {
                     let info = &prepared.boxes[*box_index];
                     has_content |= info.margin_end != 0.0 || info.padding_end != 0.0;
                     x += info.padding_end;
-                    if let Some((_, fragment, start)) = active.pop() {
+                    if let Some((index, fragment, start)) = active.pop() {
                         set_horizontal_extent(&mut fragments[fragment], start, x);
+                        box_ranges.push((index, fragment, fragments.len()));
                     }
                     x += info.margin_end;
                     open.pop();
@@ -447,22 +576,35 @@ impl Context<'_> {
                     has_content = true;
                     atomics_on_line.push((*atomic_index, fragments.len()));
                     let info = &mut prepared.atomics[*atomic_index];
-                    let mut fragment = info
+                    let result = info
                         .result
                         .take()
-                        .expect("atomic inlines are laid out once")
-                        .fragment;
+                        .expect("atomic inlines are laid out once");
+                    atomic_extras.push((fragments.len(), result.relative, result.absolutes));
+                    let mut fragment = result.fragment;
                     fragment.translate(x + fragment.margin.left, 0.0);
                     fragments.push(LineFragment::Atomic(fragment));
                     x += info.width;
                 }
                 Piece::ForcedBreak => has_content = true,
+                Piece::OutOfFlow(out) => {
+                    if prepared.outs[*out].style.is_absolutely_positioned() {
+                        statics.push((*out, x, has_content));
+                    }
+                }
             }
         }
-        for (_, fragment, start) in active.drain(..) {
+        for (index, fragment, start) in active.drain(..) {
             set_horizontal_extent(&mut fragments[fragment], start, x);
+            box_ranges.push((index, fragment, fragments.len()));
         }
+        let pending = |out: usize, x: f32, y: f32| PendingAbsolute {
+            block: prepared.outs[out].clone(),
+            x,
+            y,
+        };
         if !has_content {
+            absolutes.extend(statics.into_iter().map(|(out, x, _)| pending(out, x, y)));
             return None;
         }
         if offset > 0.0 {
@@ -549,6 +691,38 @@ impl Context<'_> {
                 atomic.translate(0.0, top);
             }
         }
+        for (fragment, (dx, dy), nested) in atomic_extras {
+            if let LineFragment::Atomic(atomic) = &mut fragments[fragment] {
+                atomic.translate(dx, dy);
+                for mut absolute in nested {
+                    absolute.translate(atomic.rect.x, atomic.rect.y);
+                    absolutes.push(absolute);
+                }
+            }
+        }
+        // Relatively positioned inline boxes move with their content.
+        let cb = ContainingBlock {
+            width: available_width,
+            height: None,
+        };
+        for (box_index, start, end) in box_ranges {
+            let style = prepared.boxes[box_index].style;
+            if style.position != Position::Relative {
+                continue;
+            }
+            let (dx, dy) = relative_offset(style, cb);
+            for fragment in &mut fragments[start..end] {
+                translate_fragment(fragment, dx, dy);
+            }
+        }
+        let bottom = y + above + below;
+        absolutes.extend(statics.into_iter().map(|(out, x, follows_content)| {
+            if follows_content && !prepared.outs[out].style.blockified_from_inline {
+                pending(out, 0.0, bottom)
+            } else {
+                pending(out, x + offset, y)
+            }
+        }));
         Some(LineBox {
             rect: Rect {
                 x: 0.0,
@@ -605,6 +779,18 @@ impl Context<'_> {
     }
 }
 
+/// Moves one line fragment by `dx`, `dy`.
+fn translate_fragment(fragment: &mut LineFragment, dx: f32, dy: f32) {
+    match fragment {
+        LineFragment::InlineBox(inline) => inline.rect = inline.rect.translate(dx, dy),
+        LineFragment::Text(text) => {
+            text.rect = text.rect.translate(dx, dy);
+            text.baseline += dy;
+        }
+        LineFragment::Atomic(atomic) => atomic.translate(dx, dy),
+    }
+}
+
 fn set_horizontal_extent(fragment: &mut LineFragment, start: f32, end: f32) {
     if let LineFragment::InlineBox(inline) = fragment {
         inline.rect.x = start;
@@ -636,7 +822,7 @@ fn chunk(prepared: &Prepared<'_>) -> Vec<Chunk> {
                 let info = &prepared.atomics[*atomic];
                 (info.width, info.min_width)
             }
-            Piece::ForcedBreak => (0.0, 0.0),
+            Piece::ForcedBreak | Piece::OutOfFlow(_) => (0.0, 0.0),
         };
         let starts_content = matches!(
             piece,
@@ -668,40 +854,13 @@ fn chunk(prepared: &Prepared<'_>) -> Vec<Chunk> {
                 ));
                 opportunity = false;
             }
-            Piece::Start(_) | Piece::End(_) => {}
+            Piece::Start(_) | Piece::End(_) | Piece::OutOfFlow(_) => {}
         }
     }
     if !current.pieces.is_empty() {
         chunks.push(current);
     }
     chunks
-}
-
-/// Greedy line breaking: a chunk moves to a new line when it would overflow a
-/// non-empty line. Trailing spaces do not count toward fitting because they
-/// are removed at the end of a line. A chunk wider than the line overflows it.
-fn break_lines(chunks: &[Chunk], available_width: f32) -> Vec<Range<usize>> {
-    let mut lines = Vec::new();
-    let mut line: Option<Range<usize>> = None;
-    let mut width = 0.0;
-    for chunk in chunks {
-        if let Some(current) = &line
-            && width + chunk.width - chunk.trailing_space > available_width + FIT_EPSILON
-        {
-            lines.push(current.clone());
-            line = None;
-            width = 0.0;
-        }
-        let current = line.get_or_insert(chunk.pieces.start..chunk.pieces.start);
-        current.end = chunk.pieces.end;
-        width += chunk.width;
-        if chunk.forced_break {
-            lines.extend(line.take());
-            width = 0.0;
-        }
-    }
-    lines.extend(line);
-    lines
 }
 
 /// The baseline of the last line box inside a box, relative to the same
@@ -711,6 +870,7 @@ fn last_baseline(layout_box: &LayoutBox) -> Option<f32> {
         .children
         .iter()
         .rev()
+        .filter(|child| child.placement == Placement::InFlow)
         .find_map(last_baseline)
         .or_else(|| layout_box.lines.last().map(|line| line.baseline))
 }

@@ -31,6 +31,8 @@ pub(crate) struct BlockBox {
 /// content (CSS 2.2 §9.2.1.1).
 #[derive(Debug, Clone)]
 pub(crate) enum BlockContents {
+    /// Block-level children. Floated and absolutely positioned children
+    /// appear here in tree order too; layout takes them out of flow.
     Blocks(Vec<BlockBox>),
     Inlines(Vec<InlineItem>),
     /// The box is a replaced element (`<img>`, inline `<svg>`); its content
@@ -62,6 +64,9 @@ pub(crate) enum InlineItem {
     Atomic(BlockBox),
     /// A forced line break from a `<br>` element.
     ForcedBreak,
+    /// A floated or absolutely positioned box. It takes no space in the line;
+    /// layout places it out of flow from this point (CSS 2.2 §9.5, §9.6).
+    OutOfFlow(BlockBox),
 }
 
 /// Either kind of child produced while walking a block container's children.
@@ -319,7 +324,9 @@ impl Builder<'_> {
             node: Some(node),
             contents: self.container_contents(Some(node), children, style),
             style: Rc::clone(style),
-            establishes_bfc: is_root || flow_root,
+            // Floats and absolutely positioned boxes establish a new block
+            // formatting context (CSS 2.2 §9.4.1).
+            establishes_bfc: is_root || flow_root || style.is_out_of_flow(),
         }
     }
 
@@ -359,13 +366,21 @@ impl Builder<'_> {
         let mut run = Vec::new();
         let flush = |run: &mut Vec<InlineItem>, blocks: &mut Vec<BlockBox>| {
             let items = std::mem::take(run);
-            if items.iter().all(is_collapsible_whitespace) {
+            if items
+                .iter()
+                .all(|item| is_collapsible_whitespace(item) || is_out_of_flow(item))
+            {
+                // Out-of-flow boxes between blocks need no anonymous wrapper.
+                let count = items.len();
+                blocks.extend(items.into_iter().filter_map(|item| match item {
+                    InlineItem::OutOfFlow(block) => Some(block),
+                    _ => None,
+                }));
                 // White space that would be collapsed away generates no
                 // anonymous inline boxes (CSS 2.2 §9.2.2.1).
-                if !items.is_empty() {
+                if count > 0 {
                     log::trace!(
-                        "dropped whitespace-only inline run of {} items between blocks",
-                        items.len()
+                        "dropped whitespace-only inline run of {count} items between blocks"
                     );
                 }
                 return;
@@ -422,6 +437,17 @@ impl Builder<'_> {
             text: style.text_transform.apply(content),
             style: Rc::clone(style),
         };
+        if style.is_out_of_flow() && style.display != Display::None {
+            log::trace!("out-of-flow {which:?} box for node {owner:?}");
+            BuildStats::bump(&self.stats.boxes);
+            levels.push(Level::Inline(InlineItem::OutOfFlow(BlockBox {
+                node: None,
+                style: Rc::clone(style),
+                establishes_bfc: true,
+                contents: BlockContents::Inlines(vec![text]),
+            })));
+            return;
+        }
         match style.display {
             Display::None => {}
             Display::Box {
@@ -491,13 +517,28 @@ impl Builder<'_> {
                     );
                     return;
                 };
-                if !matches!(style.display, Display::None | Display::Contents)
-                    && let Some(level) = self.replaced(node, element, style)
-                {
+                let boxed = !matches!(style.display, Display::None | Display::Contents);
+                if boxed && let Some(level) = self.replaced(node, element, style) {
                     match level {
+                        Level::Block(block) | Level::Inline(InlineItem::Atomic(block))
+                            if style.is_out_of_flow() =>
+                        {
+                            levels.push(Level::Inline(InlineItem::OutOfFlow(block)));
+                        }
                         Level::Block(block) => split_inlines_around(block, levels, open_inlines),
                         inline => levels.push(inline),
                     }
+                    return;
+                }
+                if boxed && style.is_out_of_flow() {
+                    log::trace!(
+                        "node {node:?} <{}>: out of flow (position {:?}, float {:?})",
+                        element.get_name(),
+                        style.position,
+                        style.float
+                    );
+                    let block = self.block_box(node, style, false);
+                    levels.push(Level::Inline(InlineItem::OutOfFlow(block)));
                     return;
                 }
                 match style.display {
@@ -716,6 +757,11 @@ fn is_collapsible_whitespace(item: &InlineItem) -> bool {
         InlineItem::Text { text, .. } => text.chars().all(is_document_white_space),
         _ => false,
     }
+}
+
+/// Whether an item is a floated or absolutely positioned box.
+fn is_out_of_flow(item: &InlineItem) -> bool {
+    matches!(item, InlineItem::OutOfFlow(_))
 }
 
 /// Document white space for CSS Text 3 §4: space, tab, and segment breaks.

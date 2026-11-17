@@ -15,6 +15,7 @@ use crate::{HostFunction, JsError, JsResult, Value};
 pub(super) fn install(state: &super::GlobalState) {
     state.install_host("String", Value::Function(string_constructor()));
     state.install_host("Number", Value::Function(number_constructor()));
+    super::global_functions::install(state);
 }
 
 /// The shared `String.prototype` object.

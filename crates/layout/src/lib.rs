@@ -18,6 +18,7 @@ mod fonts;
 mod geometry;
 mod inline;
 mod layout;
+mod positioned;
 mod radius;
 mod rectangle;
 mod replaced;
@@ -32,7 +33,7 @@ pub use rectangle::create_rectangle;
 pub use replaced::{ImageKey, ImageMetrics, NoImages};
 pub use tree::{
     BoxKind, BoxStyle, InlineBoxFragment, LayoutBox, LayoutTree, LineBox, LineFragment, PaintItem,
-    TextFragment,
+    Placement, TextFragment,
 };
 
 #[cfg(test)]
