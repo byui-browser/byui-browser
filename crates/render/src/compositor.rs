@@ -13,18 +13,22 @@ enum FontChoice<'a> {
     Collection(&'a FontCollection),
 }
 
-/// Spans of frame pixels saved by [`Compositor::save_outside`]: each entry
-/// is a byte offset into [`Frame::pixels`] and the bytes found there.
-struct SavedPixels {
-    pixels: Vec<(usize, Vec<u8>)>,
+/// A clip rectangle in device pixels: a pixel `(x, y)` may be drawn when
+/// `left <= x < right` and `top <= y < bottom`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PixelBounds {
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
 }
 
-impl SavedPixels {
-    /// Writes the saved bytes back, undoing any drawing over them.
-    fn restore(self, frame: &mut Frame) {
-        for (offset, bytes) in self.pixels {
-            frame.pixels[offset..offset + bytes.len()].copy_from_slice(&bytes);
-        }
+impl PixelBounds {
+    /// Whether text clipped to `bounds` (if any) may draw pixel `(x, y)`.
+    fn allows(bounds: Option<Self>, x: u32, y: u32) -> bool {
+        bounds.is_none_or(|bounds| {
+            (bounds.left..bounds.right).contains(&x) && (bounds.top..bounds.bottom).contains(&y)
+        })
     }
 }
 
@@ -101,7 +105,7 @@ impl Compositor {
                     font_size,
                     text,
                     rgba,
-                } => self.draw_text(&mut frame, *x, *baseline, *font_size, text, *rgba),
+                } => self.draw_text(&mut frame, *x, *baseline, *font_size, text, *rgba, None),
                 DisplayItem::BoxShadow {
                     left,
                     top,
@@ -351,6 +355,7 @@ impl Compositor {
 
     /// Draws text by sampling each scaled glyph bitmap at device-pixel
     /// centers (nearest-neighbor scaling).
+    #[allow(clippy::too_many_arguments)]
     fn draw_text(
         &self,
         frame: &mut Frame,
@@ -359,6 +364,7 @@ impl Compositor {
         font_size: f32,
         text: &str,
         rgba: [u8; 4],
+        clip: Option<PixelBounds>,
     ) {
         let scale = BitmapFont::scale(font_size);
         if scale <= 0.0 {
@@ -387,7 +393,9 @@ impl Compositor {
                             continue;
                         }
                         let bit = BitmapFont::GLYPH_WIDTH - 1 - column as u32;
-                        if glyph[row as usize] & (1 << bit) != 0 {
+                        if glyph[row as usize] & (1 << bit) != 0
+                            && PixelBounds::allows(clip, px, py)
+                        {
                             self.put_pixel(frame, px, py, rgba);
                         }
                     }
@@ -397,41 +405,6 @@ impl Compositor {
             }
             cell_x += BitmapFont::ADVANCE * scale;
         }
-    }
-
-    /// Saves the pixels a text run at `baseline` with `font_size` (CSS
-    /// pixels) could touch outside `clip` (CSS pixels), so they can be put
-    /// back after drawing the run. This is how text clipping is done: draw,
-    /// then restore. Only rows within two font sizes of the baseline are
-    /// saved, which covers every glyph's ascent and descent.
-    fn save_outside(
-        &self,
-        frame: &Frame,
-        clip: &paint::Rect,
-        baseline: f32,
-        font_size: f32,
-        scale: f32,
-    ) -> SavedPixels {
-        let device =
-            |value: f32, limit: u32| (value * scale).round().clamp(0.0, limit as f32) as u32;
-        let rows = device(baseline - 2.0 * font_size, self.height)
-            ..device(baseline + 2.0 * font_size, self.height);
-        let inside_x = device(clip.x, self.width)..device(clip.right(), self.width);
-        let inside_y = device(clip.y, self.height)..device(clip.bottom(), self.height);
-        let mut pixels = Vec::new();
-        for y in rows {
-            let row = (y * self.width) as usize * 4;
-            if inside_y.contains(&y) {
-                for span in [0..inside_x.start, inside_x.end..self.width] {
-                    let range = row + span.start as usize * 4..row + span.end as usize * 4;
-                    pixels.push((range.start, frame.pixels[range].to_vec()));
-                }
-            } else {
-                let range = row..row + self.width as usize * 4;
-                pixels.push((range.start, frame.pixels[range].to_vec()));
-            }
-        }
-        SavedPixels { pixels }
     }
 
     fn put_pixel(&self, frame: &mut Frame, x: u32, y: u32, rgba: [u8; 4]) {
@@ -654,9 +627,17 @@ impl Compositor {
                     color,
                     clip,
                 } => {
-                    let saved = clip
-                        .as_ref()
-                        .map(|clip| self.save_outside(&frame, clip, *baseline, *font_size, scale));
+                    let clip = clip.map(|clip| {
+                        let edge = |value: f32, limit: u32| {
+                            (value * scale).round().clamp(0.0, limit as f32) as u32
+                        };
+                        PixelBounds {
+                            left: edge(clip.x, self.width),
+                            top: edge(clip.y, self.height),
+                            right: edge(clip.right(), self.width),
+                            bottom: edge(clip.bottom(), self.height),
+                        }
+                    });
                     let rgba = [color.r, color.g, color.b, color.a];
                     let outline = match fonts {
                         FontChoice::Single(font) => Some(font),
@@ -671,6 +652,7 @@ impl Compositor {
                             (*baseline * scale).round(),
                             text,
                             rgba,
+                            clip,
                         ),
                         None => self.draw_text(
                             &mut frame,
@@ -679,10 +661,8 @@ impl Compositor {
                             *font_size * scale,
                             text,
                             rgba,
+                            clip,
                         ),
-                    }
-                    if let Some(saved) = saved {
-                        saved.restore(&mut frame);
                     }
                 }
                 paint::DisplayItem::Image { rect, image } => match images {
@@ -763,6 +743,7 @@ impl Compositor {
         baseline: f32,
         text: &str,
         rgba: [u8; 4],
+        clip: Option<PixelBounds>,
     ) {
         use ab_glyph::{Font, ScaleFont};
         if font_size <= 0.0 {
@@ -788,7 +769,7 @@ impl Compositor {
             outline.draw(|gx, gy, coverage| {
                 let px = bounds.min.x as i64 + i64::from(gx);
                 let py = bounds.min.y as i64 + i64::from(gy);
-                if px < 0 || py < 0 {
+                if px < 0 || py < 0 || !PixelBounds::allows(clip, px as u32, py as u32) {
                     return;
                 }
                 let alpha = (coverage.clamp(0.0, 1.0) * f32::from(rgba[3])).round() as u8;
@@ -1211,51 +1192,95 @@ mod image_tests {
         );
     }
 
-    #[test]
-    fn clipped_text_paints_nothing_outside_its_clip() {
-        let text = |clip| paint::DisplayList {
-            items: vec![paint::DisplayItem::Text {
-                x: 0.0,
-                baseline: 10.0,
-                font_size: 10.0,
-                font: paint::FontId::DEFAULT,
-                text: "HHHH".into(),
-                color: paint::Color {
-                    r: 0,
-                    g: 0,
-                    b: 0,
-                    a: 255,
+    /// A grey background wider than the clip, then "HHHH" clipped to
+    /// `0..12` x `0..16` CSS pixels.
+    fn clipped_text_list(clip: Option<paint::Rect>) -> paint::DisplayList {
+        paint::DisplayList {
+            items: vec![
+                paint::DisplayItem::FillRect {
+                    rect: paint::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 40.0,
+                        height: 16.0,
+                    },
+                    color: paint::Color {
+                        r: 200,
+                        g: 200,
+                        b: 200,
+                        a: 255,
+                    },
                 },
-                clip,
-            }],
-        };
-        let compose = |list: &paint::DisplayList| {
-            Compositor::new(40, 16).compose_page(
-                list,
-                &FontCollection::default(),
-                &ImageStore::new(),
-                1.0,
-            )
-        };
-        let inked = |frame: &Frame, columns: std::ops::Range<u32>| {
-            columns
-                .flat_map(|x| (0..16).map(move |y| (x, y)))
-                .any(|(x, y)| pixel(frame, x, y) != Compositor::CLEAR_COLOR)
-        };
-        let unclipped = compose(&text(None));
-        let clipped = compose(&text(Some(paint::Rect {
-            x: 0.0,
-            y: 0.0,
-            width: 12.0,
-            height: 16.0,
-        })));
-        assert!(inked(&unclipped, 12..40));
-        assert!(!inked(&clipped, 12..40));
-        assert!(inked(&clipped, 0..12));
-        for y in 0..16 {
-            for x in 0..12 {
-                assert_eq!(pixel(&clipped, x, y), pixel(&unclipped, x, y));
+                paint::DisplayItem::Text {
+                    x: 0.0,
+                    baseline: 12.0,
+                    font_size: 12.0,
+                    font: paint::FontId::DEFAULT,
+                    text: "HHHH".into(),
+                    color: paint::Color {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    },
+                    clip,
+                },
+            ],
+        }
+    }
+
+    const TEXT_CLIP: paint::Rect = paint::Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 12.0,
+        height: 16.0,
+    };
+
+    /// Checks a clipped frame against an unclipped one at `scale`: outside
+    /// the clip only the background remains; inside, both frames match.
+    fn assert_clipped(unclipped: &Frame, clipped: &Frame, scale: u32) {
+        let edge = TEXT_CLIP.right() as u32 * scale;
+        let grey = [200, 200, 200, 255];
+        let ink_past_edge = (edge..40 * scale)
+            .flat_map(|x| (0..16 * scale).map(move |y| (x, y)))
+            .any(|(x, y)| pixel(unclipped, x, y) != grey);
+        assert!(ink_past_edge, "the unclipped text reaches past the clip");
+        for y in 0..16 * scale {
+            for x in 0..40 * scale {
+                if x < edge {
+                    assert_eq!(pixel(clipped, x, y), pixel(unclipped, x, y), "({x}, {y})");
+                } else {
+                    assert_eq!(pixel(clipped, x, y), grey, "({x}, {y})");
+                }
             }
         }
+        let ink_inside = (0..edge)
+            .flat_map(|x| (0..16 * scale).map(move |y| (x, y)))
+            .any(|(x, y)| pixel(clipped, x, y) != grey);
+        assert!(ink_inside, "text inside the clip is drawn");
+    }
+
+    #[test]
+    fn clipped_text_paints_nothing_outside_its_clip() {
+        let compose = |clip| {
+            Compositor::new(80, 32).compose_page(
+                &clipped_text_list(clip),
+                &FontCollection::default(),
+                &ImageStore::new(),
+                2.0,
+            )
+        };
+        assert_clipped(&compose(None), &compose(Some(TEXT_CLIP)), 2);
+    }
+
+    #[test]
+    fn clipped_outline_text_paints_nothing_outside_its_clip() {
+        let Some(font) = crate::fonts::tests::system_font() else {
+            return;
+        };
+        let compose = |clip| {
+            Compositor::new(80, 32).compose_paint_with_font(&clipped_text_list(clip), &font, 2.0)
+        };
+        assert_clipped(&compose(None), &compose(Some(TEXT_CLIP)), 2);
     }
 }

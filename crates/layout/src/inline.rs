@@ -21,7 +21,7 @@ use html::NodeID;
 
 use crate::Rect;
 use crate::block::{BlockResult, ContainingBlock};
-use crate::box_tree::{BlockBox, InlineItem, is_document_white_space};
+use crate::box_tree::{BlockBox, InlineItem, WhiteSpace, is_document_white_space};
 use crate::layout::Context;
 use crate::positioned::{FloatScope, PendingAbsolute, relative_offset};
 use crate::style::{ComputedStyle, Position, TextAlign};
@@ -39,9 +39,16 @@ enum Piece {
         text: String,
         width: f32,
     },
-    /// A collapsible space that survived white-space collapsing. A soft wrap
-    /// opportunity follows it.
-    Space { source: usize, width: f32 },
+    /// White space followed by a soft wrap opportunity. With `text: None`
+    /// it is a collapsible space that survived white-space collapsing,
+    /// removed at the start and end of a line. With `Some` it is a
+    /// preserved run (`pre-wrap`) drawn as written, kept at the start of a
+    /// line and hanging (not drawn) at its end.
+    Space {
+        source: usize,
+        width: f32,
+        text: Option<String>,
+    },
     /// The start of inline box `boxes[index]`.
     Start(usize),
     /// The end of inline box `boxes[index]`.
@@ -316,7 +323,7 @@ impl Context<'_> {
                     element,
                     text,
                     style,
-                    preserve,
+                    white_space,
                 } => {
                     let source = prepared.sources.len();
                     prepared.sources.push(TextSource {
@@ -324,7 +331,28 @@ impl Context<'_> {
                         element: *element,
                         style,
                     });
-                    if *preserve {
+                    if *white_space == WhiteSpace::PreWrap {
+                        for (is_space, run) in preserved_runs(text) {
+                            let width =
+                                self.fonts.font_text_width(style.font, run, style.font_size);
+                            prepared.pieces.push(if is_space {
+                                Piece::Space {
+                                    source,
+                                    width,
+                                    text: Some(run.to_owned()),
+                                }
+                            } else {
+                                Piece::Word {
+                                    source,
+                                    text: run.to_owned(),
+                                    width,
+                                }
+                            });
+                        }
+                        after_space = false;
+                        continue;
+                    }
+                    if *white_space == WhiteSpace::Pre {
                         // One unbreakable run with its spaces kept.
                         if !text.is_empty() {
                             prepared.pieces.push(Piece::Word {
@@ -357,6 +385,7 @@ impl Context<'_> {
                                         " ",
                                         style.font_size,
                                     ),
+                                    text: None,
                                 });
                                 after_space = true;
                             }
@@ -496,9 +525,11 @@ impl Context<'_> {
             .map_or(range.start, |index| index + 1);
         // Collapsible spaces at the start and end of a line are removed
         // (CSS Text 3 §4.1.2).
-        let kept = |index: usize| {
-            !matches!(prepared.pieces[index], Piece::Space { .. })
-                || (first_content..last_content).contains(&index)
+        // Preserved spaces are kept at the start but hang at the end.
+        let kept = |index: usize| match prepared.pieces[index] {
+            Piece::Space { text: None, .. } => (first_content..last_content).contains(&index),
+            Piece::Space { text: Some(_), .. } => index < last_content,
+            _ => true,
         };
 
         // The width of the line's content before alignment, and how many
@@ -587,8 +618,13 @@ impl Context<'_> {
                     self.push_text(&mut fragments, &prepared.sources[*source], text, x, *width);
                     x += width;
                 }
-                Piece::Space { source, width } => {
-                    self.push_text(&mut fragments, &prepared.sources[*source], " ", x, *width);
+                Piece::Space {
+                    source,
+                    width,
+                    text,
+                } => {
+                    let text = text.as_deref().unwrap_or(" ");
+                    self.push_text(&mut fragments, &prepared.sources[*source], text, x, *width);
                     // The gap after a widened space keeps the next word out
                     // of this text run.
                     x += width + space_extra;
@@ -895,4 +931,21 @@ fn last_baseline(layout_box: &LayoutBox) -> Option<f32> {
         .filter(|child| child.placement == Placement::InFlow)
         .find_map(last_baseline)
         .or_else(|| layout_box.lines.last().map(|line| line.baseline))
+}
+
+/// Splits `pre-wrap` text into alternating runs of spaces and tabs (`true`)
+/// and other characters (`false`).
+fn preserved_runs(text: &str) -> impl Iterator<Item = (bool, &str)> {
+    let is_space = |character: char| matches!(character, ' ' | '\t');
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        let first = rest.chars().next()?;
+        let space = is_space(first);
+        let end = rest
+            .find(|character| is_space(character) != space)
+            .unwrap_or(rest.len());
+        let (run, remaining) = rest.split_at(end);
+        rest = remaining;
+        Some((space, run))
+    })
 }

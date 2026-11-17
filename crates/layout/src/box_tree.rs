@@ -61,11 +61,10 @@ pub(crate) enum InlineItem {
         element: Option<NodeID>,
         text: String,
         style: Rc<ComputedStyle>,
-        /// When `true`, the text is one unbreakable run whose spaces are
-        /// kept as written (like `white-space: pre` without segment breaks).
-        /// Used for text the user agent draws inside form controls; DOM text
-        /// is `false` and collapses as `white-space: normal`.
-        preserve: bool,
+        /// How the run's white space is processed. DOM text is
+        /// [`WhiteSpace::Collapse`]; text the user agent draws inside form
+        /// controls uses the other modes.
+        white_space: WhiteSpace,
     },
     /// The start of an inline box. `start_edge` is `false` on the
     /// continuation after a block-level box split the inline box.
@@ -84,6 +83,26 @@ pub(crate) enum InlineItem {
     /// A floated or absolutely positioned box. It takes no space in the line;
     /// layout places it out of flow from this point (CSS 2.2 §9.5, §9.6).
     OutOfFlow(BlockBox),
+}
+
+/// White-space processing for one text run (a subset of CSS Text 3 §3's
+/// `white-space`). The `white-space` property itself is not supported yet:
+/// DOM text always collapses, and only form controls pick another mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WhiteSpace {
+    /// `normal`: runs of white space collapse to one space, which is a soft
+    /// wrap opportunity and is removed at the start and end of a line.
+    Collapse,
+    /// `pre` without segment breaks: the run is one unbreakable piece with
+    /// its spaces kept. Used for single-line control text.
+    Pre,
+    /// `pre-wrap` without segment breaks: spaces and tabs are kept (a tab is
+    /// drawn as written, not expanded to a tab stop), a soft wrap
+    /// opportunity follows each run of them, and spaces at the end of a
+    /// line hang (they do not count toward fitting and are not painted).
+    /// Callers split segment breaks into forced breaks. Used for
+    /// `<textarea>` text.
+    PreWrap,
 }
 
 /// Either kind of child produced while walking a block container's children.
@@ -473,7 +492,7 @@ impl Builder<'_> {
             element: Some(owner),
             text: style.text_transform.apply(content),
             style: Rc::clone(style),
-            preserve: false,
+            white_space: WhiteSpace::Collapse,
         };
         if style.is_out_of_flow() && style.display != Display::None {
             log::trace!("out-of-flow {which:?} box for node {owner:?}");
@@ -550,7 +569,7 @@ impl Builder<'_> {
                         .filter(|parent| self.styles.get(*parent).is_some()),
                     text: style.text_transform.apply(text),
                     style,
-                    preserve: false,
+                    white_space: WhiteSpace::Collapse,
                 }));
             }
             NodeKind::Element(element) => {
@@ -709,7 +728,7 @@ impl Builder<'_> {
                                 element: Some(node),
                                 text: style.text_transform.apply(alt),
                                 style: Rc::clone(style),
-                                preserve: false,
+                                white_space: WhiteSpace::Collapse,
                             }));
                         }
                         NaturalSize {
@@ -785,8 +804,9 @@ impl Builder<'_> {
     ///   `value` attribute with line breaks removed, or, when it is missing
     ///   or empty, their `placeholder` in [`PLACEHOLDER_COLOR`]. A `password`
     ///   input shows one `•` per character of its value instead.
-    /// - `<textarea>` shows its child text with line breaks kept, or its
-    ///   `placeholder` when it has no text.
+    /// - `<textarea>` shows its child text, or its `placeholder` when it has
+    ///   no text, as `white-space: pre-wrap` ([`WhiteSpace::PreWrap`]): line
+    ///   breaks and spaces are kept and long lines wrap.
     ///
     /// Other input types (buttons, checkboxes, dates, …) return `None` and
     /// keep their empty inline-block box. Values changed at runtime, the
@@ -807,11 +827,12 @@ impl Builder<'_> {
                 .find(|attribute| attribute.get_name() == name)
                 .map(|attribute| attribute.get_value().as_str())
         };
-        let placeholder = || {
+        // Inputs drop line breaks from the placeholder; textareas keep them.
+        let placeholder = |single_line: bool| {
             let text: String = attribute("placeholder")
                 .unwrap_or_default()
                 .chars()
-                .filter(|character| !matches!(character, '\n' | '\r'))
+                .filter(|character| !single_line || !matches!(character, '\n' | '\r'))
                 .collect();
             let style = Rc::new(ComputedStyle {
                 color: PLACEHOLDER_COLOR,
@@ -831,7 +852,7 @@ impl Builder<'_> {
                     .filter(|character| !matches!(character, '\n' | '\r'))
                     .collect();
                 let (text, text_style) = if value.is_empty() {
-                    placeholder()
+                    placeholder(true)
                 } else if kind == "password" {
                     ("\u{2022}".repeat(value.chars().count()), Rc::clone(style))
                 } else {
@@ -853,18 +874,23 @@ impl Builder<'_> {
                         text.push_str(data);
                     }
                 }
-                let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 let (text, text_style) = if text.is_empty() {
-                    placeholder()
+                    placeholder(false)
                 } else {
                     (text, Rc::clone(style))
                 };
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 let mut items = Vec::new();
                 for (index, line) in text.split('\n').enumerate() {
                     if index > 0 {
                         items.push(InlineItem::ForcedBreak);
                     }
-                    items.extend(control_text_item(node, line, &text_style));
+                    items.extend(control_text_item(
+                        node,
+                        line,
+                        &text_style,
+                        WhiteSpace::PreWrap,
+                    ));
                 }
                 BuildStats::bump(&self.stats.boxes);
                 BlockBox {
@@ -893,7 +919,7 @@ impl Builder<'_> {
     /// `style` is the control's computed style and sizes the box;
     /// `text_style` styles the text run, so callers can recolor it (as
     /// placeholders do) without changing the box. The text is kept on one
-    /// line with its spaces preserved (see [`InlineItem::Text::preserve`]),
+    /// line with its spaces preserved (as [`WhiteSpace::Pre`]),
     /// centered vertically in the content box, and clipped to the padding
     /// box. Horizontal placement follows the control's `text-align`. Empty
     /// `text` gives a box with no lines. `text-transform` is applied here.
@@ -916,7 +942,7 @@ impl Builder<'_> {
             centers_lines: true,
             control: self.form_control_sizing(node),
             contents: BlockContents::Inlines(
-                control_text_item(node, text, text_style)
+                control_text_item(node, text, text_style, WhiteSpace::Pre)
                     .inspect(|_| BuildStats::bump(&self.stats.text_runs))
                     .into_iter()
                     .collect(),
@@ -958,16 +984,21 @@ fn is_text_like_input_type(kind: &str) -> bool {
     )
 }
 
-/// One preserved text run for user-agent-drawn control text, or `None` when
+/// One text run for user-agent-drawn control text, or `None` when
 /// `text` is empty. The run's `node` and `element` are the control, which is
 /// also its hit-test target.
-fn control_text_item(node: NodeID, text: &str, style: &Rc<ComputedStyle>) -> Option<InlineItem> {
+fn control_text_item(
+    node: NodeID,
+    text: &str,
+    style: &Rc<ComputedStyle>,
+    white_space: WhiteSpace,
+) -> Option<InlineItem> {
     (!text.is_empty()).then(|| InlineItem::Text {
         node,
         element: Some(node),
         text: style.text_transform.apply(text),
         style: Rc::clone(style),
-        preserve: true,
+        white_space,
     })
 }
 

@@ -1580,4 +1580,36 @@ mod control_text {
         assert_eq!(texts(b), ["Write here"]);
         assert_eq!(text_color(b).r, 0x75);
     }
+
+    #[test]
+    fn textarea_text_wraps_like_pre_wrap() {
+        // 100px fits 12 characters. Leading spaces are kept, the space a
+        // line wraps after hangs, and runs of spaces are not collapsed.
+        let html = "<p><textarea id='a' style='width: 100px'>  aaaa bbbb cccc  dd</textarea></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let a = box_for(&tree, &document, "a");
+        assert_eq!(texts(a), ["  aaaa bbbb", "cccc  dd"]);
+        let first = &a.lines[0].fragments;
+        let LineFragment::Text(text) = &first[0] else {
+            panic!("expected text");
+        };
+        assert_close(text.rect.x - a.content_rect().x, 0.0);
+        assert_close(text.rect.width, 11.0 * 8.0);
+    }
+
+    #[test]
+    fn textarea_placeholder_keeps_line_breaks() {
+        let html = "<p><textarea id='a' placeholder='one&#10;two'></textarea></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["one", "two"]);
+    }
+
+    #[test]
+    fn text_in_a_control_shorter_than_its_line_stays_centered() {
+        let html = "<p><input id='a' style='height: 9.2px' value='x'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let input = box_for(&tree, &document, "a");
+        // The 19.2px line overflows the 9.2px box by 5px on each side.
+        assert_close(input.lines[0].rect.y - input.rect.y, -5.0);
+    }
 }

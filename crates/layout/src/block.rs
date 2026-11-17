@@ -384,9 +384,10 @@ impl Context<'_> {
             child.translate(padding.left, padding.top);
         }
         // Single-line controls center their text vertically (CSS Basic UI
-        // leaves this to the user agent; Chrome centers it).
+        // leaves this to the user agent; Chrome centers it). In a box shorter
+        // than its line the text overflows both edges equally and is clipped.
         let line_offset = if block.centers_lines {
-            ((content_height - flow.height) / 2.0).max(0.0)
+            (content_height - flow.height) / 2.0
         } else {
             0.0
         };
