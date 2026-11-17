@@ -69,6 +69,16 @@ impl PermissionPolicy {
         }
     }
 
+    /// Returns the recorded decision for `origin` and `permission`.
+    ///
+    /// Unlike [`Self::check`], this distinguishes an unrecorded decision from
+    /// an explicit denial. Browser defaults can use the absence of a decision
+    /// without weakening fail-closed permission checks elsewhere.
+    #[must_use]
+    pub fn decision(&self, origin: &Origin, permission: PermissionKind) -> Option<PermissionState> {
+        self.decisions.get(&(origin.clone(), permission)).copied()
+    }
+
     /// Grants `permission` to `origin` for the lifetime of this policy.
     pub fn grant(&mut self, origin: Origin, permission: PermissionKind) {
         log::debug!(
@@ -168,6 +178,21 @@ mod tests {
         assert_eq!(
             policy.check(&site, PermissionKind::Cookies),
             PermissionState::Denied
+        );
+    }
+
+    #[test]
+    fn decision_distinguishes_missing_from_explicit_denial() {
+        let site = origin("https", "example.com", 443);
+        let mut policy = PermissionPolicy::new();
+
+        assert_eq!(policy.decision(&site, PermissionKind::Storage), None);
+
+        policy.deny(site.clone(), PermissionKind::Storage);
+
+        assert_eq!(
+            policy.decision(&site, PermissionKind::Storage),
+            Some(PermissionState::Denied)
         );
     }
 }

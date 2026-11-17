@@ -1,7 +1,10 @@
 use std::sync::{Arc, Mutex};
 
-use browser::BrowserRuntime;
-use security::{Origin, RendererSecurityContext, StoragePermission};
+use browser::{BrowserRuntime, security_context_for_url_with_policy};
+use security::{
+    Origin, RendererSecurityContext, StoragePermission,
+    permissions::{PermissionKind, PermissionPolicy},
+};
 use webapis::{AlertSink, ConsoleSink};
 
 #[derive(Default)]
@@ -60,6 +63,36 @@ fn html_script_reaches_registered_web_api() {
         ["JS API Team Rocks!"]
     );
     assert!(alert.messages.lock().unwrap().is_empty());
+}
+
+#[test]
+fn policy_context_controls_runtime_local_storage() {
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+    let mut policy = PermissionPolicy::new();
+    policy.deny(
+        Origin::new("https", "example.com", None),
+        PermissionKind::Storage,
+    );
+    let context = security_context_for_url_with_policy("https://example.com/", &policy);
+
+    let error = BrowserRuntime::in_memory()
+        .evaluate_page_scripts(
+            "<script>localStorage.setItem('key', 'value')</script>",
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            context,
+        )
+        .expect_err("explicit storage denial should reach localStorage");
+
+    assert_eq!(
+        error.to_string(),
+        "Uncaught SecurityError: localStorage write access denied"
+    );
 }
 
 #[test]
