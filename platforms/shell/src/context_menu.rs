@@ -1,9 +1,28 @@
 //! Shared popup menus for page and browser-chrome actions.
 
 use ab_glyph::FontVec;
-use tiny_skia::{Color, PathBuilder, Pixmap, Rect, Transform};
+use tiny_skia::{PathBuilder, Pixmap, Rect, Transform};
 
 use crate::toolbar;
+
+/// Window-wide appearance choice, independent of the active tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    pub(crate) fn is_dark(self, system_dark: Option<bool>) -> bool {
+        match self {
+            Self::System => system_dark.unwrap_or(false),
+            Self::Light => false,
+            Self::Dark => true,
+        }
+    }
+}
 
 /// Independent actions offered by browser popup menus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11,6 +30,8 @@ pub(crate) enum MenuAction {
     Reload,
     /// Removes the in-memory network cache used by future page loads.
     ClearCache,
+    OpenAppearance,
+    SetAppearance(Appearance),
     PageSource,
     Inspect,
     /// Opens the DevTools dock on its Compatibility tab.
@@ -30,7 +51,19 @@ const PAGE_MENU_ITEMS: [MenuItem; 6] = [
     ("Audit Compatibility", Some(MenuAction::Compatibility)),
 ];
 
-const OVERFLOW_MENU_ITEMS: [MenuItem; 1] = [("Clear cache", Some(MenuAction::ClearCache))];
+const OVERFLOW_MENU_ITEMS: [MenuItem; 2] = [
+    ("Clear cache", Some(MenuAction::ClearCache)),
+    ("Appearance…", Some(MenuAction::OpenAppearance)),
+];
+
+const APPEARANCE_ITEMS: [MenuItem; 3] = [
+    (
+        "System",
+        Some(MenuAction::SetAppearance(Appearance::System)),
+    ),
+    ("Light", Some(MenuAction::SetAppearance(Appearance::Light))),
+    ("Dark", Some(MenuAction::SetAppearance(Appearance::Dark))),
+];
 
 /// Index of the first item after the separator that splits navigation
 /// (Back, Forward, Reload) from developer tools (Source, Inspect, Audit).
@@ -54,6 +87,7 @@ pub(crate) struct ContextMenu {
     height: f64,
     items: &'static [MenuItem],
     second_group: Option<usize>,
+    checked: Option<MenuAction>,
 }
 
 impl ContextMenu {
@@ -74,6 +108,20 @@ impl ContextMenu {
         )
     }
 
+    /// Replaces the overflow list with the appearance choices and a checkmark.
+    pub(crate) fn appearance(width: f64, height: f64, current: Appearance) -> Self {
+        let mut menu = Self::with_items(
+            width - WIDTH - 8.0,
+            toolbar::PAGE_TOP,
+            width,
+            height,
+            &APPEARANCE_ITEMS,
+            None,
+        );
+        menu.checked = Some(MenuAction::SetAppearance(current));
+        menu
+    }
+
     fn with_items(
         x: f64,
         y: f64,
@@ -91,6 +139,7 @@ impl ContextMenu {
             height: menu_height,
             items,
             second_group,
+            checked: None,
         }
     }
 
@@ -178,11 +227,7 @@ impl ContextMenu {
             }
         }
         let (surface, border, separator) = if dark {
-            (
-                rgba(0x2a, 0x2b, 0x31, 255),
-                rgba(255, 255, 255, 30),
-                rgba(255, 255, 255, 22),
-            )
+            (palette.panel, palette.panel_border, rgba(255, 255, 255, 22))
         } else {
             (
                 rgba(255, 255, 255, 255),
@@ -228,15 +273,26 @@ impl ContextMenu {
             {
                 toolbar::fill(frame, &path, palette.accent, transform);
             }
-            let Some(font) = font else {
-                continue;
-            };
             let color = if selected {
-                Color::WHITE
+                palette.on_accent
             } else if action.is_none() {
                 palette.icon_disabled
             } else {
                 palette.text
+            };
+            if action.is_some() && action == self.checked {
+                let mark_x = x + w - 24.0;
+                let mark_y = top + ROW as f32 / 2.0;
+                let mut mark = PathBuilder::new();
+                mark.move_to(mark_x, mark_y);
+                mark.line_to(mark_x + 3.0, mark_y + 3.0);
+                mark.line_to(mark_x + 9.0, mark_y - 3.0);
+                if let Some(path) = mark.finish() {
+                    toolbar::stroke(frame, &path, color, 1.6, transform);
+                }
+            }
+            let Some(font) = font else {
+                continue;
             };
             toolbar::draw_text(
                 frame,
@@ -291,6 +347,25 @@ mod tests {
             assert!(menu.y + menu.height <= height);
             // The popup must not cover the toolbar button that opened it.
             assert!(!menu.contains(Some((width - 30.0, crate::tab_strip::HEIGHT + 26.0))));
+        }
+    }
+
+    #[test]
+    fn appearance_is_in_overflow_and_marks_only_the_current_choice() {
+        let overflow = ContextMenu::overflow(420.0, 280.0);
+        assert_eq!(
+            overflow.action_at(Some(overflow.item_center(1))),
+            Some(MenuAction::OpenAppearance)
+        );
+        let mut frames = Vec::new();
+        for appearance in [Appearance::System, Appearance::Light, Appearance::Dark] {
+            let menu = ContextMenu::appearance(420.0, 280.0, appearance);
+            assert_eq!(menu.checked, Some(MenuAction::SetAppearance(appearance)));
+            assert!(menu.y + menu.height <= 280.0);
+            let mut frame = Pixmap::new(420, 280).unwrap();
+            menu.draw(&mut frame, 1.0, false, None, None);
+            assert!(!frames.iter().any(|previous| previous == &frame));
+            frames.push(frame);
         }
     }
 
