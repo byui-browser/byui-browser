@@ -109,6 +109,45 @@ fn global_self_aliases_window() {
 }
 
 #[test]
+fn window_onload_and_load_listeners_receive_the_window_load_event_in_order() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    webapis::register_document(&mut realm, webapis::Document::new()).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.onload === null"),
+        Ok(Value::Boolean(true))
+    );
+    realm
+        .evaluate_script(
+            "var order = ''; \
+             function first(event) { order = order + 'a'; \
+               window.firstEventMatches = this === window && event.type === 'load' && \
+                 event.target === document && event.currentTarget === window && \
+                 event.bubbles === false && event.cancelable === false; } \
+             function handler(event) { order = order + 'b'; } \
+             function last(event) { order = order + 'c'; } \
+             window.addEventListener('load', first); window.onload = handler; \
+             window.addEventListener('load', last); window.onload === handler",
+        )
+        .unwrap();
+
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    webapis::dispatch_window_load(&window).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("order === 'abc' && window.firstEventMatches"),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(
+        realm.evaluate_script("window.onload = null; window.onload === null"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
 fn window_add_event_listener_dispatches_and_removes_callbacks() {
     let mut realm = Realm::new();
     register_window(&mut realm).unwrap();
@@ -125,6 +164,28 @@ fn window_add_event_listener_dispatches_and_removes_callbacks() {
              calls",
         ),
         Ok(Value::String("ready:true".into()))
+    );
+}
+
+#[test]
+fn clearing_window_onload_deactivates_the_handler() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    realm
+        .evaluate_script(
+            "var calls = 0; function handler(event) { calls = calls + 1; } \
+             window.onload = handler; window.onload = null",
+        )
+        .unwrap();
+
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    webapis::dispatch_window_load(&window).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("calls === 0 && window.onload === null"),
+        Ok(Value::Boolean(true))
     );
 }
 

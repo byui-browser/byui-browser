@@ -354,13 +354,19 @@ pub(crate) fn remove_event_listener_from_target(
     Ok(Value::Undefined)
 }
 
+/// Calls one listener. Function listeners run with `this` bound to the
+/// event's current target; `handleEvent` runs with `this` bound to its object.
 fn invoke_event_listener(callback: &Value, event: &Object) -> JsResult<Value> {
     match callback {
-        Value::Function(callback) => callback.call(&[Value::Object(event.clone())]),
+        Value::Function(callback) => callback.call_with_this(
+            event.get("currentTarget").unwrap_or(Value::Undefined),
+            &[Value::Object(event.clone())],
+        ),
         Value::Object(callback) => match callback.get("handleEvent") {
-            Some(Value::Function(handle_event)) => {
-                handle_event.call(&[Value::Object(event.clone())])
-            }
+            Some(Value::Function(handle_event)) => handle_event.call_with_this(
+                Value::Object(callback.clone()),
+                &[Value::Object(event.clone())],
+            ),
             _ => Err(JsError::new(
                 "event listener object has no handleEvent method",
             )),
@@ -437,6 +443,23 @@ pub(crate) fn dispatch_event_target(
     target_object: &Object,
     arguments: &[Value],
 ) -> JsResult<Value> {
+    dispatch_event_target_with_target(
+        target,
+        target_object,
+        Value::Object(target_object.clone()),
+        arguments,
+    )
+}
+
+/// Dispatches an event on a standalone EventTarget while reporting a
+/// different `event.target`, such as the Window `load` event whose target is
+/// the Document.
+pub(crate) fn dispatch_event_target_with_target(
+    target: &EventTargetRef,
+    target_object: &Object,
+    event_target_value: Value,
+    arguments: &[Value],
+) -> JsResult<Value> {
     let [Value::Object(event)] = arguments else {
         return Err(JsError::new("dispatchEvent() expects one Event object"));
     };
@@ -444,7 +467,7 @@ pub(crate) fn dispatch_event_target(
         return Err(JsError::new("dispatchEvent() expects an Event object"));
     };
 
-    event.set("target", Value::Object(target_object.clone()));
+    event.set("target", event_target_value);
     event.set("currentTarget", Value::Object(target_object.clone()));
     event.set("eventPhase", Value::Number(2.0));
     event.set("__stopPropagation", Value::Boolean(false));

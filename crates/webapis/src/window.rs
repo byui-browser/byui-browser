@@ -11,7 +11,7 @@ use crate::crypto::register_crypto;
 use crate::custom_elements::CustomElementRegistry;
 use crate::event::{
     EventTarget, EventTargetRef, add_event_listener_to_target, dispatch_event_target,
-    remove_event_listener_from_target,
+    dispatch_event_target_with_target, event_constructor, remove_event_listener_from_target,
 };
 use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
@@ -31,6 +31,47 @@ struct TimerCallback {
     arguments: Vec<Value>,
     repeat: bool,
     nesting_level: u32,
+}
+
+/// Per-Window state for the page `load` event.
+#[derive(Default)]
+struct WindowLoadState {
+    /// The current `window.onload` event handler, if any.
+    onload: Option<Function>,
+    /// Whether the load event has already been dispatched.
+    fired: bool,
+}
+
+fn dispatch_load_event(
+    window: &Object,
+    event_target: &EventTargetRef,
+    state: &Mutex<WindowLoadState>,
+) -> JsResult<()> {
+    {
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.fired {
+            return Ok(());
+        }
+        state.fired = true;
+    }
+
+    let options = Object::new();
+    options.set("bubbles", Value::Boolean(false));
+    options.set("cancelable", Value::Boolean(false));
+    let Value::Object(event) =
+        event_constructor(&[Value::String("load".into()), Value::Object(options)])?
+    else {
+        return Err(JsError::runtime(
+            "load event constructor returned a non-object",
+        ));
+    };
+    // HTML: the Window's load event targets the Document.
+    let target = window
+        .get("document")
+        .filter(|value| matches!(value, Value::Object(_) | Value::Array(_)))
+        .unwrap_or_else(|| Value::Object(window.clone()));
+    dispatch_event_target_with_target(event_target, window, target, &[Value::Object(event)])?;
+    Ok(())
 }
 
 struct AnimationFrameCallbacks {
@@ -720,6 +761,7 @@ fn register_window_object(
     let messages = Arc::new(Mutex::new(MessageQueue::new()));
     let event_target: EventTargetRef = Arc::new(Mutex::new(EventTarget::default()));
     let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
+    let load_state = Arc::new(Mutex::new(WindowLoadState::default()));
     let performance = Object::new();
     let performance_clock = Arc::new(PerformanceClock::new());
     let evaluator = realm.script_evaluator();
@@ -786,8 +828,90 @@ fn register_window_object(
     window.set("onpopstate", Value::Null);
     window.set("onmessage", Value::Null);
     window.set("onerror", Value::Null);
+    // The `onload` event handler is backed by one stable listener on the
+    // Window's EventTarget, so it runs in registration order alongside
+    // `addEventListener("load", ...)` listeners.
+    let onload_listener = {
+        let window = window.clone();
+        let load_state = Arc::clone(&load_state);
+        Function::from_host(
+            "onload",
+            Arc::new(move |arguments| {
+                let handler = load_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .onload
+                    .clone();
+                match handler {
+                    Some(handler) => {
+                        handler.call_with_this(Value::Object(window.clone()), arguments)
+                    }
+                    None => Ok(Value::Undefined),
+                }
+            }),
+        )
+    };
+    let load_state_for_get = Arc::clone(&load_state);
+    let load_state_for_set = Arc::clone(&load_state);
+    let onload_event_target = event_target.clone();
+    window.define_accessor(
+        "onload",
+        Arc::new(move || {
+            let state = load_state_for_get
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(state.onload.clone().map_or(Value::Null, Value::Function))
+        }),
+        Some(Arc::new(move |value| {
+            let handler = match value {
+                Value::Null | Value::Undefined => None,
+                Value::Function(handler) => Some(handler),
+                _ => return Err(type_error("window.onload must be a function or null")),
+            };
+            let had_handler = {
+                let mut state = load_state_for_set
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let had_handler = state.onload.is_some();
+                state.onload = handler.clone();
+                had_handler
+            };
+            let listener_arguments = [
+                Value::String("load".into()),
+                Value::Function(onload_listener.clone()),
+            ];
+            match (had_handler, handler.is_some()) {
+                (false, true) => {
+                    add_event_listener_to_target(
+                        &onload_event_target,
+                        &listener_arguments,
+                        "window",
+                    )?;
+                }
+                (true, false) => {
+                    remove_event_listener_from_target(&onload_event_target, &listener_arguments)?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })),
+    );
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__mediaQueryLists", Value::Object(Object::new()));
+    let load_window = window.clone();
+    let load_state_for_dispatch = Arc::clone(&load_state);
+    let load_dispatch_event_target = event_target.clone();
+    window.set_method(
+        "__dispatchLoad",
+        Arc::new(move |_| {
+            dispatch_load_event(
+                &load_window,
+                &load_dispatch_event_target,
+                &load_state_for_dispatch,
+            )?;
+            Ok(Value::Undefined)
+        }),
+    );
 
     let window_origin = Url::parse(initial_url)
         .map(|url| url.origin().ascii_serialization())
@@ -1435,6 +1559,21 @@ pub fn run_window_timers(window: &Object) -> JsResult<usize> {
         Ok(_) => Err(JsError::runtime("window timer pump returned a non-number")),
         Err(error) => Err(error),
     }
+}
+
+/// Dispatches the page's `load` event on its `Window` and runs the resulting
+/// microtask checkpoint. Browser integrations should call this once after
+/// page scripts and resources have finished loading.
+///
+/// `window.onload` and `window.addEventListener("load", ...)` listeners run
+/// in registration order. The event fires at most once per Window; later
+/// calls are no-ops apart from the microtask checkpoint.
+pub fn dispatch_window_load(window: &Object) -> JsResult<()> {
+    let Some(Value::Function(dispatch)) = window.get("__dispatchLoad") else {
+        return Err(JsError::runtime("window load dispatcher is not installed"));
+    };
+    dispatch.call(&[])?;
+    run_window_microtasks(window).map(|_| ())
 }
 
 /// Runs the Window's microtask checkpoint.
