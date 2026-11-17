@@ -13,6 +13,10 @@ use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
 use security::RendererSecurityContext;
 
+use crate::event::{
+    EventTargetRef, add_event_listener_target, dispatch_event_on_target,
+    remove_event_listener_target,
+};
 use crate::timer::{TimerId, TimerQueue};
 
 #[derive(Clone)]
@@ -392,7 +396,7 @@ fn sync_history_properties(history: &Object, location: &Object, session: &Sessio
     );
 }
 
-fn invoke_popstate(window: &Object, state: &Value) {
+fn invoke_popstate(window: &Object, event_target: &EventTargetRef, state: &Value) {
     let event = Object::new();
     event.set("type", Value::String("popstate".into()));
     event.set("state", state.clone());
@@ -401,22 +405,16 @@ fn invoke_popstate(window: &Object, state: &Value) {
     event.set("target", Value::Object(window.clone()));
     event.set("currentTarget", Value::Object(window.clone()));
 
-    let mut callbacks = Vec::new();
-    if let Some(Value::Object(list)) = window.get("__popstateListeners") {
-        for index in 0..list.len() {
-            if let Some(callback) = list.get(&index.to_string()) {
-                callbacks.push(callback);
-            }
-        }
+    if let Err(error) =
+        dispatch_event_on_target(event_target, window, &[Value::Object(event.clone())])
+    {
+        log::warn!("popstate event dispatch failed: {error}");
     }
     if let Some(Value::Function(callback)) = window.get("onpopstate") {
-        callbacks.push(Value::Function(callback));
-    }
-    for callback in callbacks {
-        if let Value::Function(callback) = callback
-            && let Err(error) = callback.call(&[Value::Object(event.clone())])
-        {
-            log::warn!("popstate listener threw: {error}");
+        event.set("currentTarget", Value::Object(window.clone()));
+        event.set("eventPhase", Value::Number(2.0));
+        if let Err(error) = callback.call(&[Value::Object(event.clone())]) {
+            log::warn!("popstate event handler threw: {error}");
         }
     }
 }
@@ -644,6 +642,7 @@ fn register_window_object(
     let timers = Arc::new(Mutex::new(WindowTimers::new()));
     let microtasks = Arc::new(Mutex::new(MicrotaskQueue::new()));
     let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
+    let event_target: EventTargetRef = Arc::new(Mutex::new(crate::event::EventTarget::default()));
     let performance = Object::new();
     let performance_clock = Arc::new(PerformanceClock::new());
     let evaluator = realm.script_evaluator();
@@ -706,9 +705,30 @@ fn register_window_object(
     window.set("innerHeight", inner_height.clone());
     window.set("onpopstate", Value::Null);
     history.set("scrollRestoration", Value::String("auto".into()));
-    window.set("__popstateListeners", Value::Object(Object::new()));
-    window.set("__storageListeners", Value::Object(Object::new()));
     window.set("__mediaQueryLists", Value::Object(Object::new()));
+
+    let window_for_dispatch = window.clone();
+    let event_target_for_dispatch = event_target.clone();
+    window.set_method(
+        "dispatchEvent",
+        Arc::new(move |arguments| {
+            dispatch_event_on_target(&event_target_for_dispatch, &window_for_dispatch, arguments)
+        }),
+    );
+    let event_target_for_add = event_target.clone();
+    window.set_method(
+        "addEventListener",
+        Arc::new(move |arguments| {
+            add_event_listener_target(&event_target_for_add, "window", arguments)
+        }),
+    );
+    let event_target_for_remove = event_target.clone();
+    window.set_method(
+        "removeEventListener",
+        Arc::new(move |arguments| {
+            remove_event_listener_target(&event_target_for_remove, "window", arguments)
+        }),
+    );
 
     let media_window = window.clone();
     window.set_method(
@@ -1047,59 +1067,6 @@ fn register_window_object(
         }),
     );
 
-    let listeners_window = window.clone();
-    window.set_method(
-        "addEventListener",
-        Arc::new(move |arguments| {
-            let [Value::String(event_type), Value::Function(callback), ..] = arguments else {
-                return Err(JsError::runtime(
-                    "window.addEventListener() expects an event type and callback",
-                ));
-            };
-            if event_type == "popstate" || event_type == "storage" {
-                let list_name = if event_type == "popstate" {
-                    "__popstateListeners"
-                } else {
-                    "__storageListeners"
-                };
-                let list = match listeners_window.get(list_name) {
-                    Some(Value::Object(list)) => list,
-                    _ => return Ok(Value::Undefined),
-                };
-                let index = list.len();
-                list.set(index.to_string(), Value::Function(callback.clone()));
-            }
-            Ok(Value::Undefined)
-        }),
-    );
-
-    let remove_window = window.clone();
-    window.set_method(
-        "removeEventListener",
-        Arc::new(move |arguments| {
-            let [Value::String(event_type), Value::Function(callback), ..] = arguments else {
-                return Ok(Value::Undefined);
-            };
-            if (event_type == "popstate" || event_type == "storage")
-                && let Some(Value::Object(list)) = remove_window.get(if event_type == "popstate" {
-                    "__popstateListeners"
-                } else {
-                    "__storageListeners"
-                })
-            {
-                for index in 0..list.len() {
-                    if list
-                        .get(&index.to_string())
-                        .is_some_and(|value| value == Value::Function(callback.clone()))
-                    {
-                        list.set(index.to_string(), Value::Undefined);
-                    }
-                }
-            }
-            Ok(Value::Undefined)
-        }),
-    );
-
     let history_for_window = history.clone();
     window.set_method(
         "history",
@@ -1118,6 +1085,7 @@ fn register_window_object(
     let history_for_back = history.clone();
     let location_for_back = location.clone();
     let window_for_back = window.clone();
+    let event_target_for_back = event_target.clone();
     let session_for_back = Arc::clone(&session);
     history.set_method(
         "back",
@@ -1126,7 +1094,11 @@ fn register_window_object(
             if session.current > 0 {
                 session.current -= 1;
                 sync_history_properties(&history_for_back, &location_for_back, &session);
-                invoke_popstate(&window_for_back, &session.current().state);
+                invoke_popstate(
+                    &window_for_back,
+                    &event_target_for_back,
+                    &session.current().state,
+                );
             }
             Ok(Value::Undefined)
         }),
@@ -1135,6 +1107,7 @@ fn register_window_object(
     let history_for_forward = history.clone();
     let location_for_forward = location.clone();
     let window_for_forward = window.clone();
+    let event_target_for_forward = event_target.clone();
     let session_for_forward = Arc::clone(&session);
     history.set_method(
         "forward",
@@ -1143,7 +1116,11 @@ fn register_window_object(
             if session.current + 1 < session.entries.len() {
                 session.current += 1;
                 sync_history_properties(&history_for_forward, &location_for_forward, &session);
-                invoke_popstate(&window_for_forward, &session.current().state);
+                invoke_popstate(
+                    &window_for_forward,
+                    &event_target_for_forward,
+                    &session.current().state,
+                );
             }
             Ok(Value::Undefined)
         }),
@@ -1152,6 +1129,7 @@ fn register_window_object(
     let history_for_go = history.clone();
     let location_for_go = location.clone();
     let window_for_go = window.clone();
+    let event_target_for_go = event_target.clone();
     let session_for_go = Arc::clone(&session);
     history.set_method(
         "go",
@@ -1168,7 +1146,11 @@ fn register_window_object(
             if target != session.current {
                 session.current = target;
                 sync_history_properties(&history_for_go, &location_for_go, &session);
-                invoke_popstate(&window_for_go, &session.current().state);
+                invoke_popstate(
+                    &window_for_go,
+                    &event_target_for_go,
+                    &session.current().state,
+                );
             }
             Ok(Value::Undefined)
         }),
