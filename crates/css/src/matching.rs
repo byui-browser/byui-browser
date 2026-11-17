@@ -6,7 +6,10 @@
 //! usual browser strategy (Selectors 4 §17).
 //!
 //! Dynamic interaction pseudo-classes read [`SelectorState`]. History-dependent
-//! pseudo-classes such as `:visited` and pseudo-elements remain unsupported.
+//! pseudo-classes such as `:visited` never match. Pseudo-elements never match
+//! the element itself: the rule compiler splits a trailing `::before` /
+//! `::after` off before matching, so those rules match the originating element
+//! and are cascaded separately; other pseudo-elements remain unsupported.
 //! Unknown pseudo-classes never match. Namespace prefixes other than `*` and
 //! the default match nothing, because `@namespace` is not supported.
 
