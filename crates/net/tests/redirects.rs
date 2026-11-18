@@ -436,6 +436,36 @@ fn redirect_rejects_a_non_http_target_before_dispatch() {
 }
 
 #[test]
+fn redirect_response_is_finalized_before_target_policy_rejection() {
+    let server = TestServer::start(1, |_| {
+        b"HTTP/1.1 302 Found\r\nLocation: data:text/plain,blocked\r\nSet-Cookie: redirect=approved\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    });
+    let services = Arc::new(RedirectServices::default());
+    let controller = RequestController::builder(Config::default())
+        .with_browser_capabilities(services.clone())
+        .build()
+        .unwrap();
+    let mut request = Request::get(server.url());
+    request.set_environment(
+        FetchEnvironment::from_url(reqwest::Url::parse(&server.url()).unwrap()).unwrap(),
+    );
+    request.set_credentials_mode(CredentialsMode::Include);
+
+    let error = runtime().block_on(controller.fetch(request)).unwrap_err();
+
+    server.join();
+    assert!(matches!(error, RequestError::RedirectFailure));
+    assert_eq!(
+        *services.responses.lock().unwrap(),
+        vec![(302, ResponseType::Basic, 0)]
+    );
+    assert_eq!(
+        *services.stored_cookies.lock().unwrap(),
+        vec![vec!["redirect=approved".to_owned()]]
+    );
+}
+
+#[test]
 fn redirect_rejects_embedded_credentials_before_following() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 302 Found\r\nLocation: http://user:secret@127.0.0.1:9/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()

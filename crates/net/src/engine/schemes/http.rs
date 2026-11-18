@@ -169,6 +169,16 @@ impl RequestController {
                 );
                 RequestError::RedirectFailure
             })?;
+
+            self.finalize_http_response(
+                &request,
+                &url,
+                &mut candidate,
+                ResponseFinalization::Standard,
+            )
+            .inspect_err(|_| {
+                self.clear_preflight_cache_after_failure(&request, &url);
+            })?;
             self.inner
                 .policy
                 .validate_redirect_location(&next_url)
@@ -180,16 +190,6 @@ impl RequestController {
                         crate::log_url::loggable_error(error)
                     );
                 })?;
-
-            self.finalize_http_response(
-                &request,
-                &url,
-                &mut candidate,
-                ResponseFinalization::Standard,
-            )
-            .inspect_err(|_| {
-                self.clear_preflight_cache_after_failure(&request, &url);
-            })?;
             if request.redirect_count() >= 20 {
                 log::warn!(
                     "redirect limit reached at {}",
