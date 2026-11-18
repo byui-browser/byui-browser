@@ -88,14 +88,14 @@ impl RequestController {
         if response.cookie_headers_processed || !request.credentials_allowed(url) {
             return Ok(());
         }
-        if let Some(services) = &self.inner.services {
+        if let Some(cookies) = &self.inner.cookies {
             let values: Vec<http::HeaderValue> = response
                 .headers
                 .get_all(http::header::SET_COOKIE)
                 .iter()
                 .cloned()
                 .collect();
-            services.store_set_cookie(request, &values)?;
+            cookies.store_set_cookie(request, &values)?;
             response.cookie_headers_processed = true;
         }
         Ok(())
@@ -107,7 +107,7 @@ impl RequestController {
         request: &Request,
         response: &InternalResponse,
     ) -> Result<(), RequestError> {
-        if let Some(services) = &self.inner.services {
+        if let Some(policy) = &self.inner.response_policy {
             let info = ResponseInfo {
                 status: response.status.as_u16(),
                 status_text: response.status_text.clone(),
@@ -120,16 +120,14 @@ impl RequestController {
                 redirect_count: response.redirect_count,
                 from_cache: response.from_cache,
             };
-            services
-                .check_response(request, &info)
-                .inspect_err(|error| {
-                    log::warn!(
-                        "response rejected by browser services: {} ({})",
-                        crate::log_url::loggable(request.url()),
-                        crate::log_url::loggable_error(error)
-                    );
-                })?;
-            services.response_headers(request, &info);
+            policy.check_response(request, &info).inspect_err(|error| {
+                log::warn!(
+                    "response rejected by browser services: {} ({})",
+                    crate::log_url::loggable(request.url()),
+                    crate::log_url::loggable_error(error)
+                );
+            })?;
+            policy.response_headers(request, &info);
         }
         Ok(())
     }

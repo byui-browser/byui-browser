@@ -84,7 +84,7 @@ impl Headers {
 
     /// Creates a header collection for browser-owned generated request fields.
     ///
-    /// This constructor is intended for [`crate::FetchServices`] implementations
+    /// This constructor is intended for [`crate::RequestPolicyService`] implementations
     /// that generate headers such as Fetch Metadata fields, which ordinary
     /// callers are forbidden from setting. The controller accepts this list
     /// only through its internal transport channel and protects Fetch-owned

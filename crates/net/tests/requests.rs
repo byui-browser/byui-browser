@@ -4,8 +4,9 @@ mod common;
 
 use common::{TestServer, runtime};
 use net::{
-    Body, Config, FetchEnvironment, FetchServices, Request, RequestController, RequestError,
-    ResponseInfo, SchemeProviders, ServiceWorkerDecision,
+    Body, CachePartitionService, Config, CookieService, FetchEnvironment, Request,
+    RequestController, RequestError, RequestPolicyService, ResponseInfo, ResponsePolicyService,
+    SchemeProviders, ServiceWorkerDecision, ServiceWorkerService,
 };
 use std::sync::{
     Arc,
@@ -14,15 +15,19 @@ use std::sync::{
 
 struct NoopServices;
 
-impl FetchServices for NoopServices {
+impl RequestPolicyService for NoopServices {
     fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
         panic!("builder must not invoke services")
     }
+}
 
+impl ResponsePolicyService for NoopServices {
     fn check_response(&self, _request: &Request, _info: &ResponseInfo) -> Result<(), RequestError> {
         panic!("builder must not invoke services")
     }
+}
 
+impl CookieService for NoopServices {
     fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
         panic!("builder must not invoke services")
     }
@@ -34,11 +39,15 @@ impl FetchServices for NoopServices {
     ) -> Result<(), RequestError> {
         panic!("builder must not invoke services")
     }
+}
 
+impl ServiceWorkerService for NoopServices {
     fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
         panic!("builder must not invoke services")
     }
+}
 
+impl CachePartitionService for NoopServices {
     fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
         panic!("builder must not invoke services")
     }
@@ -82,17 +91,21 @@ impl RecordingServices {
     }
 }
 
-impl FetchServices for RecordingServices {
+impl RequestPolicyService for RecordingServices {
     fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
         self.request_checks.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+}
 
+impl ResponsePolicyService for RecordingServices {
     fn check_response(&self, _request: &Request, _info: &ResponseInfo) -> Result<(), RequestError> {
         self.response_checks.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+}
 
+impl CookieService for RecordingServices {
     fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
         self.cookie_reads.fetch_add(1, Ordering::SeqCst);
         Ok(None)
@@ -106,7 +119,9 @@ impl FetchServices for RecordingServices {
         self.cookie_writes.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+}
 
+impl ServiceWorkerService for RecordingServices {
     fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
         self.worker_checks.fetch_add(1, Ordering::SeqCst);
         Ok(if self.intercept {
@@ -115,7 +130,9 @@ impl FetchServices for RecordingServices {
             ServiceWorkerDecision::Network
         })
     }
+}
 
+impl CachePartitionService for RecordingServices {
     fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
         self.cache_partitions.fetch_add(1, Ordering::SeqCst);
         Ok("recording".into())
@@ -127,8 +144,17 @@ fn controller_builder_supports_all_capability_combinations() {
     RequestController::builder(Config::default())
         .build()
         .unwrap();
+    let capabilities = Arc::new(NoopServices);
     RequestController::builder(Config::default())
-        .with_fetch_services(Arc::new(NoopServices))
+        .with_request_policy(capabilities.clone())
+        .with_response_policy(capabilities.clone())
+        .with_cookie_service(capabilities.clone())
+        .with_service_worker_service(capabilities.clone())
+        .with_cache_partition_service(capabilities.clone())
+        .build()
+        .unwrap();
+    RequestController::builder(Config::default())
+        .with_browser_capabilities(capabilities.clone())
         .build()
         .unwrap();
     RequestController::builder(Config::default())
@@ -136,7 +162,7 @@ fn controller_builder_supports_all_capability_combinations() {
         .build()
         .unwrap();
     RequestController::builder(Config::default())
-        .with_fetch_services(Arc::new(NoopServices))
+        .with_browser_capabilities(capabilities)
         .with_scheme_providers(SchemeProviders::new())
         .build()
         .unwrap();
@@ -169,7 +195,7 @@ fn cors_approved_response_keeps_a_later_body_stream_failure_typed() {
     });
     let services = Arc::new(RecordingServices::new(false));
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(services.clone())
+        .with_browser_capabilities(services.clone())
         .build()
         .unwrap();
     let mut request = Request::get(server.url());
@@ -271,7 +297,7 @@ fn non_cacheable_post_requests_are_sent_each_time() {
 }
 
 #[test]
-fn browser_context_without_services_fails_before_network_io() {
+fn browser_context_without_request_policy_fails_before_network_io() {
     let mut request = Request::get("https://remote.test/data");
     request.set_environment(
         FetchEnvironment::from_url(reqwest::Url::parse("https://client.test/").unwrap()).unwrap(),
@@ -286,17 +312,79 @@ fn browser_context_without_services_fails_before_network_io() {
         .unwrap_err();
     assert!(matches!(
         error,
-        RequestError::UnsupportedFeature("browser services")
+        RequestError::UnsupportedFeature("request policy service")
     ));
+}
+
+#[test]
+fn browser_context_fails_closed_when_a_required_capability_is_missing() {
+    let capabilities = Arc::new(NoopServices);
+    let controllers = [
+        (
+            RequestController::builder(Config::default())
+                .with_request_policy(capabilities.clone())
+                .with_cookie_service(capabilities.clone())
+                .with_service_worker_service(capabilities.clone())
+                .with_cache_partition_service(capabilities.clone())
+                .build()
+                .unwrap(),
+            "response policy service",
+        ),
+        (
+            RequestController::builder(Config::default())
+                .with_request_policy(capabilities.clone())
+                .with_response_policy(capabilities.clone())
+                .with_service_worker_service(capabilities.clone())
+                .with_cache_partition_service(capabilities.clone())
+                .build()
+                .unwrap(),
+            "cookie service",
+        ),
+        (
+            RequestController::builder(Config::default())
+                .with_request_policy(capabilities.clone())
+                .with_response_policy(capabilities.clone())
+                .with_cookie_service(capabilities.clone())
+                .with_service_worker_service(capabilities.clone())
+                .build()
+                .unwrap(),
+            "cache partition service",
+        ),
+        (
+            RequestController::builder(Config::default())
+                .with_request_policy(capabilities.clone())
+                .with_response_policy(capabilities.clone())
+                .with_cookie_service(capabilities.clone())
+                .with_cache_partition_service(capabilities)
+                .build()
+                .unwrap(),
+            "service-worker service",
+        ),
+    ];
+
+    for (controller, missing) in controllers {
+        let mut request = Request::get("http://127.0.0.1:9/");
+        request.set_environment(
+            FetchEnvironment::from_url(reqwest::Url::parse("https://client.test/").unwrap())
+                .unwrap(),
+        );
+        let error = runtime().block_on(controller.fetch(request)).unwrap_err();
+        assert!(
+            matches!(&error, RequestError::UnsupportedFeature(feature) if *feature == missing),
+            "missing {missing} returned {error:?}"
+        );
+    }
 }
 
 #[test]
 fn cached_browser_response_is_rechecked_before_exposure() {
     struct RejectCached;
-    impl FetchServices for RejectCached {
+    impl RequestPolicyService for RejectCached {
         fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
             Ok(())
         }
+    }
+    impl ResponsePolicyService for RejectCached {
         fn check_response(
             &self,
             _request: &Request,
@@ -308,6 +396,8 @@ fn cached_browser_response_is_rechecked_before_exposure() {
                 Ok(())
             }
         }
+    }
+    impl CookieService for RejectCached {
         fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
             Ok(None)
         }
@@ -318,12 +408,16 @@ fn cached_browser_response_is_rechecked_before_exposure() {
         ) -> Result<(), RequestError> {
             Ok(())
         }
+    }
+    impl ServiceWorkerService for RejectCached {
         fn service_worker(
             &self,
             _request: &Request,
         ) -> Result<ServiceWorkerDecision, RequestError> {
             Ok(ServiceWorkerDecision::Network)
         }
+    }
+    impl CachePartitionService for RejectCached {
         fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
             Ok("cache-check".into())
         }
@@ -333,7 +427,7 @@ fn cached_browser_response_is_rechecked_before_exposure() {
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
     });
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(std::sync::Arc::new(RejectCached))
+        .with_browser_capabilities(std::sync::Arc::new(RejectCached))
         .build()
         .unwrap();
     let mut request = Request::get(server.url());
@@ -362,11 +456,13 @@ fn rejected_http_response_does_not_store_cookies_or_enter_cache() {
         cookie_writes: AtomicUsize,
     }
 
-    impl FetchServices for RejectFirstResponse {
+    impl RequestPolicyService for RejectFirstResponse {
         fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
             Ok(())
         }
+    }
 
+    impl ResponsePolicyService for RejectFirstResponse {
         fn check_response(
             &self,
             _request: &Request,
@@ -378,7 +474,9 @@ fn rejected_http_response_does_not_store_cookies_or_enter_cache() {
                 Ok(())
             }
         }
+    }
 
+    impl CookieService for RejectFirstResponse {
         fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
             Ok(None)
         }
@@ -391,14 +489,18 @@ fn rejected_http_response_does_not_store_cookies_or_enter_cache() {
             self.cookie_writes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
 
+    impl ServiceWorkerService for RejectFirstResponse {
         fn service_worker(
             &self,
             _request: &Request,
         ) -> Result<ServiceWorkerDecision, RequestError> {
             Ok(ServiceWorkerDecision::Network)
         }
+    }
 
+    impl CachePartitionService for RejectFirstResponse {
         fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
             Ok("response-rejection".into())
         }
@@ -415,7 +517,7 @@ fn rejected_http_response_does_not_store_cookies_or_enter_cache() {
         cookie_writes: AtomicUsize::new(0),
     });
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(services.clone())
+        .with_browser_capabilities(services.clone())
         .build()
         .unwrap();
     let mut request = Request::get(server.url());
@@ -465,7 +567,7 @@ fn unsupported_request_features_fail_before_browser_service_or_network_side_effe
     ] {
         let services = Arc::new(RecordingServices::new(false));
         let controller = RequestController::builder(Config::default())
-            .with_fetch_services(services.clone())
+            .with_browser_capabilities(services.clone())
             .build()
             .unwrap();
 
@@ -484,7 +586,7 @@ fn unsupported_request_features_fail_before_browser_service_or_network_side_effe
 fn service_worker_interception_fails_before_cache_cookie_or_transport_work() {
     let services = Arc::new(RecordingServices::new(true));
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(services.clone())
+        .with_browser_capabilities(services.clone())
         .build()
         .unwrap();
 
@@ -512,7 +614,7 @@ fn relative_urls_resolve_against_the_client_environment_and_invalid_joins_fail()
     });
     let services = Arc::new(RecordingServices::new(false));
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(services)
+        .with_browser_capabilities(services)
         .build()
         .unwrap();
     let environment = FetchEnvironment::from_url(
@@ -553,7 +655,7 @@ fn same_origin_mode_rejects_a_cross_origin_http_response_before_exposure() {
     });
     let services = Arc::new(RecordingServices::new(false));
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(services)
+        .with_browser_capabilities(services)
         .build()
         .unwrap();
     let port = reqwest::Url::parse(&server.url()).unwrap().port().unwrap();

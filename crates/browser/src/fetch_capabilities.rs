@@ -1,6 +1,9 @@
 //! Conservative browser-owned services used by the Fetch controller.
 
-use net::{FetchServices, Request, RequestError, ResponseInfo, ServiceWorkerDecision};
+use net::{
+    CachePartitionService, CookieService, Request, RequestError, RequestPolicyService,
+    ResponseInfo, ResponsePolicyService, ServiceWorkerDecision, ServiceWorkerService,
+};
 
 /// Browser-owned Fetch policy defaults for the current composition slice.
 ///
@@ -10,11 +13,11 @@ use net::{FetchServices, Request, RequestError, ResponseInfo, ServiceWorkerDecis
 /// and always continues on the network path. The cache partition is an
 /// explicit process-local browser partition, not a durable cache identity.
 #[derive(Clone, Debug)]
-pub struct BrowserFetchServices {
+pub struct BrowserFetchCapabilities {
     cache_partition: String,
 }
 
-impl BrowserFetchServices {
+impl BrowserFetchCapabilities {
     /// Creates browser services using `cache_partition` for process-local HTTP
     /// response and CORS-preflight cache isolation.
     pub fn new(cache_partition: impl Into<String>) -> Self {
@@ -24,22 +27,26 @@ impl BrowserFetchServices {
     }
 }
 
-impl Default for BrowserFetchServices {
+impl Default for BrowserFetchCapabilities {
     /// Creates services for the browser's default process-local partition.
     fn default() -> Self {
         Self::new("browser-default")
     }
 }
 
-impl FetchServices for BrowserFetchServices {
+impl RequestPolicyService for BrowserFetchCapabilities {
     fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl ResponsePolicyService for BrowserFetchCapabilities {
     fn check_response(&self, _request: &Request, _info: &ResponseInfo) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl CookieService for BrowserFetchCapabilities {
     fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
         Ok(None)
     }
@@ -51,11 +58,15 @@ impl FetchServices for BrowserFetchServices {
     ) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl ServiceWorkerService for BrowserFetchCapabilities {
     fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
         Ok(ServiceWorkerDecision::Network)
     }
+}
 
+impl CachePartitionService for BrowserFetchCapabilities {
     fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
         Ok(self.cache_partition.clone())
     }

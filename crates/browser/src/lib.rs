@@ -29,7 +29,7 @@ use webapis::{
 };
 
 pub mod byui_provider;
-pub mod fetch_services;
+pub mod fetch_capabilities;
 pub mod file_provider;
 mod load;
 pub mod refresh;
@@ -251,8 +251,9 @@ pub fn request_controller_with_observer(
             file_access.content_policy,
         ));
     }
+    let capabilities = Arc::new(fetch_capabilities::BrowserFetchCapabilities::default());
     let builder = RequestController::builder(net::Config::default())
-        .with_fetch_services(Arc::new(fetch_services::BrowserFetchServices::default()))
+        .with_browser_capabilities(capabilities)
         .with_scheme_providers(providers);
     let builder = match observer {
         Some(observer) => builder.with_network_observer(observer),

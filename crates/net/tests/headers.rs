@@ -6,9 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use common::{TestServer, runtime};
 use net::{
-    Body, CacheMode, Config, CredentialsMode, FetchEnvironment, FetchServices, Referrer,
-    ReferrerPolicy, Request, RequestController, RequestError, RequestMode, ResponseInfo,
-    ResponseType, ServiceWorkerDecision,
+    Body, CacheMode, CachePartitionService, Config, CookieService, CredentialsMode,
+    FetchEnvironment, Referrer, ReferrerPolicy, Request, RequestController, RequestError,
+    RequestMode, RequestPolicyService, ResponseInfo, ResponsePolicyService, ResponseType,
+    ServiceWorkerDecision, ServiceWorkerService,
 };
 use reqwest::{
     StatusCode,
@@ -17,15 +18,19 @@ use reqwest::{
 
 struct TestServices;
 
-impl FetchServices for TestServices {
+impl RequestPolicyService for TestServices {
     fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl ResponsePolicyService for TestServices {
     fn check_response(&self, _request: &Request, _info: &ResponseInfo) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl CookieService for TestServices {
     fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
         Ok(None)
     }
@@ -37,11 +42,15 @@ impl FetchServices for TestServices {
     ) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl ServiceWorkerService for TestServices {
     fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
         Ok(ServiceWorkerDecision::Network)
     }
+}
 
+impl CachePartitionService for TestServices {
     fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
         Ok("test-partition".into())
     }
@@ -86,20 +95,12 @@ fn fetch_sends_headers_and_body_to_a_local_server() {
 fn generated_request_header_channels_do_not_mutate_caller_headers() {
     struct ChannelServices;
 
-    impl FetchServices for ChannelServices {
+    impl RequestPolicyService for ChannelServices {
         fn check_request(&self, request: &Request) -> Result<(), RequestError> {
             assert!(!request.headers().has("origin"));
             assert!(!request.headers().has("referer"));
             assert!(!request.headers().has("cookie"));
             assert!(!request.headers().has("content-type"));
-            Ok(())
-        }
-
-        fn check_response(
-            &self,
-            _request: &Request,
-            _info: &ResponseInfo,
-        ) -> Result<(), RequestError> {
             Ok(())
         }
 
@@ -110,7 +111,19 @@ fn generated_request_header_channels_do_not_mutate_caller_headers() {
         ) -> Result<net::Headers, RequestError> {
             net::Headers::try_from_strings([("accept-language", "en-US")])
         }
+    }
 
+    impl ResponsePolicyService for ChannelServices {
+        fn check_response(
+            &self,
+            _request: &Request,
+            _info: &ResponseInfo,
+        ) -> Result<(), RequestError> {
+            Ok(())
+        }
+    }
+
+    impl CookieService for ChannelServices {
         fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
             Ok(Some("sid=internal".into()))
         }
@@ -122,14 +135,18 @@ fn generated_request_header_channels_do_not_mutate_caller_headers() {
         ) -> Result<(), RequestError> {
             Ok(())
         }
+    }
 
+    impl ServiceWorkerService for ChannelServices {
         fn service_worker(
             &self,
             _request: &Request,
         ) -> Result<ServiceWorkerDecision, RequestError> {
             Ok(ServiceWorkerDecision::Network)
         }
+    }
 
+    impl CachePartitionService for ChannelServices {
         fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
             Ok("header-channel-test".into())
         }
@@ -160,7 +177,7 @@ fn generated_request_header_channels_do_not_mutate_caller_headers() {
     assert!(request.headers().is_empty());
 
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(Arc::new(ChannelServices))
+        .with_browser_capabilities(Arc::new(ChannelServices))
         .build()
         .unwrap();
     let response = runtime()
@@ -205,7 +222,7 @@ fn cross_origin_fetch_exposes_only_cors_allowed_headers() {
     let response = runtime()
         .block_on(
             RequestController::builder(Config::default())
-                .with_fetch_services(Arc::new(TestServices))
+                .with_browser_capabilities(Arc::new(TestServices))
                 .build()
                 .unwrap()
                 .fetch(request),
@@ -233,7 +250,7 @@ fn cross_origin_no_cors_fetch_is_opaque() {
     let response = runtime()
         .block_on(
             RequestController::builder(Config::default())
-                .with_fetch_services(Arc::new(TestServices))
+                .with_browser_capabilities(Arc::new(TestServices))
                 .build()
                 .unwrap()
                 .fetch(request),
@@ -251,11 +268,13 @@ fn cross_origin_no_cors_fetch_is_opaque() {
 fn browser_services_own_cookie_and_raw_response_header_decisions() {
     struct CookieServices(Arc<Mutex<Vec<String>>>);
 
-    impl FetchServices for CookieServices {
+    impl RequestPolicyService for CookieServices {
         fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
             Ok(())
         }
+    }
 
+    impl ResponsePolicyService for CookieServices {
         fn check_response(
             &self,
             _request: &Request,
@@ -265,7 +284,9 @@ fn browser_services_own_cookie_and_raw_response_header_decisions() {
             assert_eq!(info.headers.get_set_cookie(), ["sid=new", "theme=dark"]);
             Ok(())
         }
+    }
 
+    impl CookieService for CookieServices {
         fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
             Ok(Some("sid=old".into()))
         }
@@ -282,14 +303,18 @@ fn browser_services_own_cookie_and_raw_response_header_decisions() {
             );
             Ok(())
         }
+    }
 
+    impl ServiceWorkerService for CookieServices {
         fn service_worker(
             &self,
             _request: &Request,
         ) -> Result<ServiceWorkerDecision, RequestError> {
             Ok(ServiceWorkerDecision::Network)
         }
+    }
 
+    impl CachePartitionService for CookieServices {
         fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
             Ok("cookie-test".into())
         }
@@ -309,7 +334,7 @@ fn browser_services_own_cookie_and_raw_response_header_decisions() {
     let response = runtime()
         .block_on(
             RequestController::builder(Config::default())
-                .with_fetch_services(services)
+                .with_browser_capabilities(services)
                 .build()
                 .unwrap()
                 .fetch(request),

@@ -160,16 +160,19 @@ Run `Set-Cookie` processing and cache insertion only after this pipeline succeed
 
 ### 6. Split browser capabilities after lifecycle stabilization
 
-Keep the existing `FetchServices` trait stable during the internal refactor. Once call phases are explicit, split it along ownership boundaries such as:
+Implemented: the former aggregate service trait has been replaced by focused
+public capability traits, with independent controller-builder setters and an
+optional convenience setter for implementations that own every capability:
 
-- request policy;
-- response policy;
-- cookies;
-- service workers;
-- cache partitioning; and
-- network observation.
+- `RequestPolicyService` owns request authorization and generated headers;
+- `ResponsePolicyService` owns response authorization and diagnostics;
+- `CookieService` owns HTTP cookie selection and storage;
+- `ServiceWorkerService` owns the initial interception decision; and
+- `CachePartitionService` owns HTTP and preflight cache isolation.
 
-This avoids designing the public interface around the current accidental call locations. The browser no-op implementation can then be replaced capability by capability.
+`NetworkObserver` remains a separate non-failing diagnostics boundary. The
+browser currently uses one concrete value for the five focused traits, but the
+public API permits each capability to have a different owner and lifetime.
 
 ## Regression coverage
 
@@ -196,7 +199,7 @@ The existing service-recording tests in `crates/net/tests/requests.rs`, prefligh
 4. Centralize response finalization and post-approval effects.
 5. Add call-count and ordering regression tests.
 6. Replace browser no-op services one capability at a time.
-7. Split `FetchServices` after the lifecycle is stable.
+7. Split browser capabilities after the lifecycle is stable.
 8. Run formatting, focused `net` and browser tests, workspace tests, and clippy with warnings denied.
 
 This work should precede or accompany the browser credential and policy integrations described in `fetch-engine-implementation-plan.md`, because those integrations will otherwise add more policy decisions to already-distributed call paths.

@@ -296,9 +296,9 @@ impl RequestController {
             return Err(RequestError::Aborted);
         }
         if request.redirect_count() > 0
-            && let Some(services) = &self.inner.services
+            && let Some(policy) = &self.inner.request_policy
         {
-            services.check_request(request)?;
+            policy.check_request(request)?;
         }
         request.reduce_referrer_for_target(url);
         let (headers, generated_headers) = self.transport_headers(request, url)?;
@@ -330,8 +330,8 @@ impl RequestController {
         transport_headers: &mut crate::Headers,
     ) -> Result<(), RequestError> {
         if request.credentials_allowed(url)
-            && let Some(services) = &self.inner.services
-            && let Some(cookie) = services.cookie_header(request)?
+            && let Some(cookies) = &self.inner.cookies
+            && let Some(cookie) = cookies.cookie_header(request)?
         {
             let value = http::HeaderValue::from_str(&cookie).map_err(|_| {
                 log::warn!(
@@ -352,8 +352,8 @@ impl RequestController {
         url: &reqwest::Url,
     ) -> Result<(crate::Headers, crate::Headers), RequestError> {
         let mut headers = request.fetch_headers(url)?;
-        let generated = if let Some(services) = &self.inner.services {
-            let generated = services.generated_request_headers(request, url)?;
+        let generated = if let Some(policy) = &self.inner.request_policy {
+            let generated = policy.generated_request_headers(request, url)?;
             headers.merge_generated_request_headers(&generated)?;
             generated
         } else {

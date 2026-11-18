@@ -9,9 +9,10 @@ use std::sync::{
 
 use common::{TestServer, collect_body, runtime};
 use net::{
-    Body, Config, CredentialsMode, FetchEnvironment, FetchServices, HeaderName, HeaderValue,
-    RedirectMode, Request, RequestController, RequestError, ResponseInfo, ResponseType,
-    ServiceWorkerDecision,
+    Body, CachePartitionService, Config, CookieService, CredentialsMode, FetchEnvironment,
+    HeaderName, HeaderValue, RedirectMode, Request, RequestController, RequestError,
+    RequestPolicyService, ResponseInfo, ResponsePolicyService, ResponseType, ServiceWorkerDecision,
+    ServiceWorkerService,
 };
 
 #[derive(Default)]
@@ -22,7 +23,7 @@ struct RedirectServices {
     worker_checks: AtomicUsize,
 }
 
-impl FetchServices for RedirectServices {
+impl RequestPolicyService for RedirectServices {
     fn check_request(&self, request: &Request) -> Result<(), RequestError> {
         self.request_urls
             .lock()
@@ -30,7 +31,9 @@ impl FetchServices for RedirectServices {
             .push(request.active_url().to_owned());
         Ok(())
     }
+}
 
+impl ResponsePolicyService for RedirectServices {
     fn check_response(&self, _request: &Request, info: &ResponseInfo) -> Result<(), RequestError> {
         self.responses
             .lock()
@@ -38,7 +41,9 @@ impl FetchServices for RedirectServices {
             .push((info.status, info.response_type, info.redirect_count));
         Ok(())
     }
+}
 
+impl CookieService for RedirectServices {
     fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
         Ok(None)
     }
@@ -56,12 +61,16 @@ impl FetchServices for RedirectServices {
         );
         Ok(())
     }
+}
 
+impl ServiceWorkerService for RedirectServices {
     fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
         self.worker_checks.fetch_add(1, Ordering::SeqCst);
         Ok(ServiceWorkerDecision::Network)
     }
+}
 
+impl CachePartitionService for RedirectServices {
     fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
         Ok("redirect-tests".into())
     }
@@ -454,7 +463,7 @@ fn each_redirect_response_runs_policy_and_cookie_processing() {
     });
     let services = Arc::new(RedirectServices::default());
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(services.clone())
+        .with_browser_capabilities(services.clone())
         .build()
         .unwrap();
     let mut request = Request::get(format!("{}/start", server.url()));
@@ -492,7 +501,7 @@ fn manual_redirect_runs_common_approval_as_opaque_redirect() {
     });
     let services = Arc::new(RedirectServices::default());
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(services.clone())
+        .with_browser_capabilities(services.clone())
         .build()
         .unwrap();
     let mut request = Request::get(server.url());
@@ -518,7 +527,7 @@ fn manual_cross_origin_redirect_is_opaque_without_cors_approval() {
     });
     let services = Arc::new(RedirectServices::default());
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(services.clone())
+        .with_browser_capabilities(services.clone())
         .build()
         .unwrap();
     let mut request = Request::get(server.url());
@@ -544,7 +553,7 @@ fn error_redirect_does_not_run_response_policy_or_store_cookies() {
     });
     let services = Arc::new(RedirectServices::default());
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(services.clone())
+        .with_browser_capabilities(services.clone())
         .build()
         .unwrap();
     let mut request = Request::get(server.url());
@@ -568,7 +577,7 @@ fn cors_rejects_an_unapproved_redirect_response_before_following() {
         b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
     });
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(Arc::new(RedirectServices::default()))
+        .with_browser_capabilities(Arc::new(RedirectServices::default()))
         .build()
         .unwrap();
     let mut request = Request::get(server.url());
@@ -600,7 +609,7 @@ fn first_cross_origin_redirect_preserves_the_request_origin() {
         .into_bytes()
     });
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(Arc::new(RedirectServices::default()))
+        .with_browser_capabilities(Arc::new(RedirectServices::default()))
         .build()
         .unwrap();
     let mut request = Request::get(source.url());
@@ -633,7 +642,7 @@ fn redirect_taint_serializes_the_origin_as_null() {
         .into_bytes()
     });
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(Arc::new(RedirectServices::default()))
+        .with_browser_capabilities(Arc::new(RedirectServices::default()))
         .build()
         .unwrap();
     let mut request = Request::get(source.url());
@@ -661,7 +670,7 @@ fn redirect_response_referrer_policy_applies_to_the_next_hop() {
         }
     });
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(Arc::new(RedirectServices::default()))
+        .with_browser_capabilities(Arc::new(RedirectServices::default()))
         .build()
         .unwrap();
     let mut request = Request::get(format!("{}/start", server.url()));
@@ -691,7 +700,7 @@ fn redirect_policy_cannot_restore_referrer_detail_removed_on_an_earlier_hop() {
         }
     });
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(Arc::new(RedirectServices::default()))
+        .with_browser_capabilities(Arc::new(RedirectServices::default()))
         .build()
         .unwrap();
     let mut request = Request::get(format!("{}/start", server.url()));
@@ -759,7 +768,7 @@ fn same_origin_mode_blocks_a_cross_origin_redirect_before_transport() {
         b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
     });
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(Arc::new(RedirectServices::default()))
+        .with_browser_capabilities(Arc::new(RedirectServices::default()))
         .build()
         .unwrap();
     let mut request = Request::get(server.url());
@@ -778,11 +787,13 @@ fn same_origin_mode_blocks_a_cross_origin_redirect_before_transport() {
 fn network_redirects_bypass_service_worker_reinterception() {
     struct InterceptSecond(AtomicUsize);
 
-    impl FetchServices for InterceptSecond {
+    impl RequestPolicyService for InterceptSecond {
         fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
             Ok(())
         }
+    }
 
+    impl ResponsePolicyService for InterceptSecond {
         fn check_response(
             &self,
             _request: &Request,
@@ -790,7 +801,9 @@ fn network_redirects_bypass_service_worker_reinterception() {
         ) -> Result<(), RequestError> {
             Ok(())
         }
+    }
 
+    impl CookieService for InterceptSecond {
         fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
             Ok(None)
         }
@@ -802,7 +815,9 @@ fn network_redirects_bypass_service_worker_reinterception() {
         ) -> Result<(), RequestError> {
             Ok(())
         }
+    }
 
+    impl ServiceWorkerService for InterceptSecond {
         fn service_worker(
             &self,
             _request: &Request,
@@ -814,7 +829,9 @@ fn network_redirects_bypass_service_worker_reinterception() {
                 ServiceWorkerDecision::Intercept
             })
         }
+    }
 
+    impl CachePartitionService for InterceptSecond {
         fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
             Ok("worker-redirect".into())
         }
@@ -829,7 +846,7 @@ fn network_redirects_bypass_service_worker_reinterception() {
     });
     let services = Arc::new(InterceptSecond(AtomicUsize::new(0)));
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(services.clone())
+        .with_browser_capabilities(services.clone())
         .build()
         .unwrap();
     let mut request = Request::get(format!("{}/start", server.url()));

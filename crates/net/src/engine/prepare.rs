@@ -38,12 +38,43 @@ impl RequestController {
             })?;
         let mut prepared = PreparedRequest::new(request, validated_url.url.clone());
         let request = &mut prepared.request;
+        let requires_browser_capabilities = request.environment().origin.is_some()
+            || request.credentials_mode() == CredentialsMode::Include
+            || request.destination() != RequestDestination::Empty
+            || request.initiator() != InitiatorType::Other;
 
-        if let Some(services) = &self.inner.services {
-            services.check_request(request)?;
+        if requires_browser_capabilities && self.inner.request_policy.is_none() {
+            return Err(missing_capability(request, "request policy service"));
+        }
+        if requires_browser_capabilities && self.inner.response_policy.is_none() {
+            return Err(missing_capability(request, "response policy service"));
+        }
+        if requires_browser_capabilities
+            && validated_url.scheme.is_http()
+            && self.inner.cookies.is_none()
+        {
+            return Err(missing_capability(request, "cookie service"));
+        }
+        if requires_browser_capabilities
+            && validated_url.scheme.is_http()
+            && self.inner.cache_partitions.is_none()
+        {
+            return Err(missing_capability(request, "cache partition service"));
+        }
+        if requires_browser_capabilities
+            && validated_url.scheme != crate::policy::FetchScheme::File
+            && request.service_workers_mode() == ServiceWorkersMode::All
+            && self.inner.service_workers.is_none()
+        {
+            return Err(missing_capability(request, "service-worker service"));
+        }
+
+        if let Some(policy) = &self.inner.request_policy {
+            policy.check_request(request)?;
             if validated_url.scheme != crate::policy::FetchScheme::File
                 && request.service_workers_mode() == ServiceWorkersMode::All
-                && services.service_worker(request)? == ServiceWorkerDecision::Intercept
+                && let Some(service_workers) = &self.inner.service_workers
+                && service_workers.service_worker(request)? == ServiceWorkerDecision::Intercept
             {
                 log::warn!(
                     "service-worker interception is unsupported: {}",
@@ -53,22 +84,12 @@ impl RequestController {
                     "service-worker interception",
                 ));
             }
-        } else if request.environment().origin.is_some()
-            || request.credentials_mode() == CredentialsMode::Include
-            || request.destination() != RequestDestination::Empty
-            || request.initiator() != InitiatorType::Other
-        {
-            log::warn!(
-                "request needs browser services but none are installed: {}",
-                crate::log_url::loggable(request.url())
-            );
-            return Err(RequestError::UnsupportedFeature("browser services"));
         }
 
         if validated_url.scheme.is_http()
-            && let Some(services) = &self.inner.services
+            && let Some(cache_partitions) = &self.inner.cache_partitions
         {
-            request.set_cache_partition(services.cache_partition(request)?);
+            request.set_cache_partition(cache_partitions.cache_partition(request)?);
         }
         log::trace!(
             "request prepared: {} scheme={:?} cacheable={}",
@@ -78,4 +99,13 @@ impl RequestController {
         );
         Ok((prepared, validated_url.scheme))
     }
+}
+
+/// Builds the fail-closed error for an absent browser capability.
+fn missing_capability(request: &Request, capability: &'static str) -> RequestError {
+    log::warn!(
+        "request needs {capability}, but none is installed: {}",
+        crate::log_url::loggable(request.url())
+    );
+    RequestError::UnsupportedFeature(capability)
 }
