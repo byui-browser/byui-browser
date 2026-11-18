@@ -494,6 +494,141 @@ fn each_redirect_response_runs_policy_and_cookie_processing() {
 }
 
 #[test]
+fn redirect_hops_rebuild_headers_and_preserve_policy_ordering() {
+    struct OrderedServices {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl OrderedServices {
+        fn record(&self, event: impl Into<String>) {
+            self.events.lock().unwrap().push(event.into());
+        }
+    }
+
+    impl RequestPolicyService for OrderedServices {
+        fn check_request(&self, request: &Request) -> Result<(), RequestError> {
+            self.record(format!("authorize:{}", request.active_url()));
+            Ok(())
+        }
+
+        fn generated_request_headers(
+            &self,
+            _request: &Request,
+            target: &net::Url,
+        ) -> Result<net::Headers, RequestError> {
+            self.record(format!("headers:{}", target.path()));
+            let mut headers = net::Headers::generated_request_headers();
+            headers.set_str("sec-fetch-mode", &format!("hop-{}", &target.path()[1..]))?;
+            Ok(headers)
+        }
+    }
+
+    impl ResponsePolicyService for OrderedServices {
+        fn check_response(
+            &self,
+            _request: &Request,
+            info: &ResponseInfo,
+        ) -> Result<(), RequestError> {
+            self.record(format!("approve:{}", info.status));
+            Ok(())
+        }
+    }
+
+    impl CookieService for OrderedServices {
+        fn cookie_header(&self, request: &Request) -> Result<Option<String>, RequestError> {
+            self.record(format!("cookies:{}", request.active_url()));
+            Ok(None)
+        }
+
+        fn store_set_cookie(
+            &self,
+            request: &Request,
+            _values: &[net::HeaderValue],
+        ) -> Result<(), RequestError> {
+            self.record(format!("store-cookies:{}", request.active_url()));
+            Ok(())
+        }
+    }
+
+    impl ServiceWorkerService for OrderedServices {
+        fn service_worker(&self, request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
+            self.record(format!("worker:{}", request.active_url()));
+            Ok(ServiceWorkerDecision::Network)
+        }
+    }
+
+    impl CachePartitionService for OrderedServices {
+        fn cache_partition(&self, request: &Request) -> Result<String, RequestError> {
+            self.record(format!("partition:{}", request.active_url()));
+            Ok("ordered-redirect-test".into())
+        }
+    }
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let server_events = events.clone();
+    let server = TestServer::start(2, move |wire_request| {
+        let (path, status, body) = if wire_request.starts_with("GET /start HTTP") {
+            ("/start", "302 Found", "")
+        } else {
+            ("/next", "200 OK", "ok")
+        };
+        assert!(wire_request.contains(&format!("sec-fetch-mode: hop-{}", &path[1..])));
+        server_events
+            .lock()
+            .unwrap()
+            .push(format!("transport:{path}"));
+        if path == "/start" {
+            format!(
+                "HTTP/1.1 {status}\r\nLocation: /next\r\nSet-Cookie: first=one\r\nContent-Length: 0\r\nConnection: close\r\n\r\n{body}"
+            )
+            .into_bytes()
+        } else {
+            format!(
+                "HTTP/1.1 {status}\r\nSet-Cookie: second=two\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{body}"
+            )
+            .into_bytes()
+        }
+    });
+    let services = Arc::new(OrderedServices {
+        events: events.clone(),
+    });
+    let controller = RequestController::builder(Config::default())
+        .with_browser_capabilities(services)
+        .build()
+        .unwrap();
+    let mut request = Request::get(format!("{}/start", server.url()));
+    request.set_environment(
+        FetchEnvironment::from_url(reqwest::Url::parse(&server.url()).unwrap()).unwrap(),
+    );
+    request.set_credentials_mode(CredentialsMode::Include);
+
+    let response = runtime().block_on(controller.fetch(request)).unwrap();
+    assert_eq!(runtime().block_on(collect_body(response)).unwrap(), b"ok");
+    let base = server.url();
+    server.join();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            format!("authorize:{base}/start"),
+            format!("worker:{base}/start"),
+            format!("partition:{base}/start"),
+            "headers:/start".into(),
+            format!("cookies:{base}/start"),
+            "transport:/start".into(),
+            "approve:302".into(),
+            format!("store-cookies:{base}/start"),
+            format!("authorize:{base}/next"),
+            "headers:/next".into(),
+            format!("cookies:{base}/next"),
+            "transport:/next".into(),
+            "approve:200".into(),
+            format!("store-cookies:{base}/next"),
+        ]
+    );
+}
+
+#[test]
 fn manual_redirect_runs_common_approval_as_opaque_redirect() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
