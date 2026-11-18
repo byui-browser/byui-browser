@@ -10,7 +10,7 @@ use std::{
 use crate::crypto::register_crypto;
 use crate::custom_elements::CustomElementRegistry;
 use crate::event::{
-    EventTarget, EventTargetRef, add_event_listener_to_target, dispatch_event_target,
+    EventTarget, EventTargetRef, add_event_listener_to_target, dispatch_event_target, event_object,
     remove_event_listener_from_target,
 };
 use js::{Function, JsError, JsResult, Object, Realm, Value};
@@ -477,36 +477,37 @@ fn message_origin(window: &Object) -> String {
         .unwrap_or_else(|| "null".into())
 }
 
-fn invoke_message(window: &Object, data: Value, origin: String) {
-    let event = Object::new();
-    event.set("type", Value::String("message".into()));
+fn invoke_message(window: &Object, event_target: &EventTargetRef, data: Value, origin: String) {
+    let event = event_object("message".into(), false, false);
     event.set("data", data);
     event.set("origin", Value::String(origin));
     event.set("source", Value::Object(window.clone()));
+    event.set("lastEventId", Value::String(String::new()));
     event.set("ports", Value::Array(Object::new()));
-    event.set("bubbles", Value::Boolean(false));
-    event.set("cancelable", Value::Boolean(false));
     event.set("target", Value::Object(window.clone()));
     event.set("currentTarget", Value::Object(window.clone()));
 
-    let mut callbacks = Vec::new();
-    if let Some(Value::Object(list)) = window.get("__messageListeners") {
-        for index in 0..list.len() {
-            if let Some(callback) = list.get(&index.to_string()) {
-                callbacks.push(callback);
-            }
+    if let Err(error) = dispatch_event_target(event_target, window, &[Value::Object(event.clone())])
+    {
+        log::warn!("message listener dispatch failed: {error}");
+    }
+
+    if !matches!(
+        event.get("__stopImmediatePropagation"),
+        Some(Value::Boolean(true))
+    ) && let Some(Value::Function(callback)) = window.get("onmessage")
+    {
+        event.set("currentTarget", Value::Object(window.clone()));
+        event.set("eventPhase", Value::Number(2.0));
+        if let Err(error) = callback.call_with_this(
+            Value::Object(window.clone()),
+            &[Value::Object(event.clone())],
+        ) {
+            log::warn!("message event handler threw: {error}");
         }
     }
-    if let Some(Value::Function(callback)) = window.get("onmessage") {
-        callbacks.push(Value::Function(callback));
-    }
-    for callback in callbacks {
-        if let Value::Function(callback) = callback
-            && let Err(error) = callback.call(&[Value::Object(event.clone())])
-        {
-            log::warn!("message listener threw: {error}");
-        }
-    }
+    event.set("eventPhase", Value::Number(0.0));
+    event.set("currentTarget", Value::Null);
 }
 
 /// The viewport dimensions exposed to a script-visible Window.
@@ -801,7 +802,6 @@ fn register_window_object(
     window.set("onmessage", Value::Null);
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__popstateListeners", Value::Object(Object::new()));
-    window.set("__messageListeners", Value::Object(Object::new()));
     window.set("__storageListeners", Value::Object(Object::new()));
     window.set("__mediaQueryLists", Value::Object(Object::new()));
 
@@ -1181,13 +1181,11 @@ fn register_window_object(
                 ));
             };
             let result = add_event_listener_to_target(&window_event_target, arguments, "window")?;
-            if event_type == "popstate" || event_type == "storage" || event_type == "message" {
+            if event_type == "popstate" || event_type == "storage" {
                 let list_name = if event_type == "popstate" {
                     "__popstateListeners"
-                } else if event_type == "storage" {
-                    "__storageListeners"
                 } else {
-                    "__messageListeners"
+                    "__storageListeners"
                 };
                 let list = match listeners_window.get(list_name) {
                     Some(Value::Object(list)) => list,
@@ -1213,13 +1211,11 @@ fn register_window_object(
             else {
                 return Ok(result);
             };
-            if (event_type == "popstate" || event_type == "storage" || event_type == "message")
+            if (event_type == "popstate" || event_type == "storage")
                 && let Some(Value::Object(list)) = remove_window.get(if event_type == "popstate" {
                     "__popstateListeners"
-                } else if event_type == "storage" {
-                    "__storageListeners"
                 } else {
-                    "__messageListeners"
+                    "__storageListeners"
                 })
             {
                 for index in 0..list.len() {
@@ -1248,6 +1244,7 @@ fn register_window_object(
     let microtasks_for_message = Arc::clone(&microtasks);
     let evaluator_for_message = evaluator.clone();
     let message_window = window.clone();
+    let message_event_target = event_target.clone();
     window.set_method(
         "__runMessages",
         Arc::new(move |_| {
@@ -1259,7 +1256,12 @@ fn register_window_object(
                     .messages
                     .pop_front();
                 let Some(message) = message else { break };
-                invoke_message(&message_window, message, message_origin(&message_window));
+                invoke_message(
+                    &message_window,
+                    &message_event_target,
+                    message,
+                    message_origin(&message_window),
+                );
                 drain_microtasks(&microtasks_for_message, &evaluator_for_message);
                 delivered += 1;
             }
