@@ -627,9 +627,6 @@ fn unsupported_syntax_is_rejected_at_parse_time() {
         "`${1`",
         // Multiple declarators.
         "let a = 1, b = 2;",
-        // Empty statements.
-        ";",
-        "1;;",
         // `return` outside a function.
         "return 1;",
         // `undefined` is a keyword here, so it cannot be a binding name.

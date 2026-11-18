@@ -1,18 +1,22 @@
 //! Typed computed values for the properties layout consumes.
 //!
 //! [`css::style_document`] produces cascaded, inherited declarations as text.
-//! This module parses `display`, box dimensions and edges, text colors, and
-//! `text-align`, `border-*-radius`, and the initial flex subset (`flex-direction`, `flex-grow`, and `gap`). Other
+//! This module parses `display`, box dimensions and edges, `box-sizing`, text
+//! colors, `text-align`, `border-*-radius`, `box-shadow`, `position`, `float`,
+//! the inset properties (`top`, `right`, `bottom`, `left`), and the flex subset
+//! (`flex-direction`, `flex-grow`, `flex-shrink`, `flex-basis`, and `gap`). Other
 //! properties use their initial values. A missing or unparsable value falls back to the initial
 //! value. Lengths are resolved to CSS pixels here; percentages are kept
 //! because they resolve against the containing block during layout.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use css::values::{LengthContext, parse_length, parse_percentage};
 use css::{CssColor, Declaration};
 
-use crate::{BorderRadius, CornerRadius, Corners, LengthPercentage, Sides};
+use crate::shadow::parse_box_shadow;
+use crate::{BorderRadius, BoxShadow, CornerRadius, Corners, LengthPercentage, Sides};
 
 /// The outer display type: how a box participates in its parent's formatting
 /// context (CSS Display 3 §2.1).
@@ -186,6 +190,57 @@ impl Display {
     }
 }
 
+/// The computed `position` value (CSS Positioned Layout 3 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Position {
+    /// Normal flow; the inset properties do not apply.
+    #[default]
+    Static,
+    /// Laid out in flow, then shifted by its insets.
+    Relative,
+    /// Out of flow, placed against the nearest positioned ancestor.
+    Absolute,
+    /// Out of flow, placed against the viewport.
+    Fixed,
+    /// Laid out in flow. Scroll-dependent sticking is not implemented, so it
+    /// behaves as `relative` with zero offsets.
+    Sticky,
+}
+
+impl Position {
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "static" => Some(Self::Static),
+            "relative" => Some(Self::Relative),
+            "absolute" => Some(Self::Absolute),
+            "fixed" => Some(Self::Fixed),
+            "sticky" | "-webkit-sticky" => Some(Self::Sticky),
+            _ => None,
+        }
+    }
+}
+
+/// The computed `float` value (CSS 2.2 §9.5.1). Text is always
+/// left-to-right, so `inline-start` is `left` and `inline-end` is `right`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Float {
+    #[default]
+    None,
+    Left,
+    Right,
+}
+
+impl Float {
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "left" | "inline-start" => Some(Self::Left),
+            "right" | "inline-end" => Some(Self::Right),
+            _ => None,
+        }
+    }
+}
+
 /// A `<length-percentage>` or `auto`, with lengths resolved to CSS pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Dimension {
@@ -335,18 +390,52 @@ impl TextAlign {
     }
 }
 
+/// The computed `box-sizing`: which box `width`, `height`, and their `min-*`
+/// and `max-*` limits size (CSS Box Sizing 3 §4.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum BoxSizing {
+    /// The sizes are the content box's.
+    #[default]
+    ContentBox,
+    /// The sizes are the border box's, so padding (and borders, once
+    /// supported) is subtracted to get the content size.
+    BorderBox,
+}
+
+impl BoxSizing {
+    /// Parses a `box-sizing` value, ignoring ASCII case.
+    fn parse(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("content-box") {
+            Some(Self::ContentBox)
+        } else if value.eq_ignore_ascii_case("border-box") {
+            Some(Self::BorderBox)
+        } else {
+            None
+        }
+    }
+}
+
 /// The values layout reads from one element's computed style.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ComputedStyle {
     pub display: Display,
     pub margin: Sides<Dimension>,
     pub padding: Sides<Dimension>,
+    /// `width`, measuring the box chosen by `box_sizing`; read the content
+    /// width through [`ComputedStyle::content_width`].
     pub width: Dimension,
+    /// `height`, as for `width`; see [`ComputedStyle::content_height`].
     pub height: Dimension,
-    /// `min-width`; only replaced elements honor it so far.
+    /// Which box `width`, `height`, and their limits measure.
+    pub box_sizing: BoxSizing,
+    /// `min-width`; replaced elements and flex items honor it so far.
     pub min_width: Dimension,
-    /// `min-height`; only replaced elements honor it so far.
+    /// `min-height`; replaced elements and flex items honor it so far.
     pub min_height: Dimension,
+    /// Whether `min-width` was left at the flex item's automatic minimum.
+    pub min_width_auto: bool,
+    /// Whether `min-height` was left at the flex item's automatic minimum.
+    pub min_height_auto: bool,
     /// `max-width`, with `none` stored as [`Dimension::Auto`]; only replaced
     /// elements honor it so far.
     pub max_width: Dimension,
@@ -368,9 +457,117 @@ pub(crate) struct ComputedStyle {
     pub text_align: TextAlign,
     pub background_color: Option<CssColor>,
     pub border_radius: BorderRadius,
+    /// The computed `box-shadow` list, first (topmost) shadow first.
+    pub box_shadow: Arc<[BoxShadow]>,
     pub flex_column: bool,
     pub flex_grow: f32,
+    /// Flex base size before free-space distribution; `auto` uses the
+    /// corresponding main-size property or the item's intrinsic size.
+    pub flex_basis: Dimension,
+    /// The factor used to distribute negative free space among flex items.
+    pub flex_shrink: f32,
     pub gap: f32,
+    /// The text a `::before` / `::after` box holds, from the `content`
+    /// property. `None` means no box is generated. Ignored on elements.
+    pub content: Option<String>,
+    pub position: Position,
+    /// The computed `float`; always [`Float::None`] for absolutely
+    /// positioned boxes (CSS 2.2 §9.7).
+    pub float: Float,
+    /// The `top`, `right`, `bottom`, and `left` insets; `auto` by default.
+    pub inset: Sides<Dimension>,
+    /// Whether the specified `display` was inline-level before floating or
+    /// absolute positioning blockified it. It decides an absolutely
+    /// positioned box's static position inside a line.
+    pub blockified_from_inline: bool,
+}
+
+impl ComputedStyle {
+    /// Whether the box is taken out of flow by `position: absolute|fixed`.
+    pub(crate) fn is_absolutely_positioned(&self) -> bool {
+        matches!(self.position, Position::Absolute | Position::Fixed)
+    }
+
+    /// Whether the box is floated.
+    pub(crate) fn is_floated(&self) -> bool {
+        self.float != Float::None
+    }
+
+    /// Whether the box is floated or absolutely positioned.
+    pub(crate) fn is_out_of_flow(&self) -> bool {
+        self.is_floated() || self.is_absolutely_positioned()
+    }
+
+    /// Whether `position` is anything but `static`, which makes the box the
+    /// containing block of absolutely positioned descendants.
+    pub(crate) fn is_positioned(&self) -> bool {
+        self.position != Position::Static
+    }
+}
+
+/// Parses a `content` value into the text a generated box holds.
+///
+/// Only quoted strings are supported; several strings are joined
+/// (`"a" "b"` is `ab`). `none`, `normal`, and values with nothing
+/// supported (`attr()`, counters, quotes, images) return `None`, so no box
+/// is generated. Unsupported parts beside strings are skipped.
+pub(crate) fn parse_content(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("normal") {
+        return None;
+    }
+    let mut text = String::new();
+    let mut found = false;
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '"' && character != '\'' {
+            continue;
+        }
+        let quote = character;
+        found = true;
+        while let Some(character) = chars.next() {
+            match character {
+                c if c == quote => break,
+                '\\' => match chars.peek().copied() {
+                    // An escaped newline continues the string.
+                    Some('\n') => {
+                        chars.next();
+                    }
+                    Some(hex) if hex.is_ascii_hexdigit() => {
+                        let mut code = 0_u32;
+                        for _ in 0..6 {
+                            match chars.peek().and_then(|digit| digit.to_digit(16)) {
+                                Some(digit) => {
+                                    code = code * 16 + digit;
+                                    chars.next();
+                                }
+                                None => break,
+                            }
+                        }
+                        // One white space after a hex escape is part of it.
+                        if chars.peek().is_some_and(|next| next.is_ascii_whitespace()) {
+                            chars.next();
+                        }
+                        text.push(
+                            char::from_u32(code)
+                                .filter(|c| *c != '\0')
+                                .unwrap_or('\u{FFFD}'),
+                        );
+                    }
+                    Some(escaped) => {
+                        text.push(escaped);
+                        chars.next();
+                    }
+                    None => {}
+                },
+                c => text.push(c),
+            }
+        }
+    }
+    if !found {
+        log::debug!("ignoring unsupported content value {value:?}");
+    }
+    found.then_some(text)
 }
 
 impl ComputedStyle {
@@ -392,8 +589,11 @@ impl ComputedStyle {
             padding: zero,
             width: Dimension::Auto,
             height: Dimension::Auto,
+            box_sizing: BoxSizing::ContentBox,
             min_width: Dimension::Px(0.0),
             min_height: Dimension::Px(0.0),
+            min_width_auto: true,
+            min_height_auto: true,
             max_width: Dimension::Auto,
             max_height: Dimension::Auto,
             font_size: parent.map_or(css::values::MEDIUM_FONT_SIZE, |parent| parent.font_size),
@@ -414,10 +614,18 @@ impl ComputedStyle {
             text_transform: parent.map_or(TextTransform::None, |parent| parent.text_transform),
             text_align: parent.map_or(TextAlign::Start, |parent| parent.text_align),
             background_color: None,
+            content: None,
             border_radius: BorderRadius::default(),
+            box_shadow: Arc::from(Vec::new()),
             flex_column: false,
             flex_grow: 0.0,
+            flex_basis: Dimension::Auto,
+            flex_shrink: 1.0,
             gap: 0.0,
+            position: Position::Static,
+            float: Float::None,
+            inset: Sides::from_array([Dimension::Auto; 4]),
+            blockified_from_inline: false,
         }
     }
 
@@ -439,6 +647,7 @@ impl ComputedStyle {
                 .map(|declaration| declaration.value.trim())
         };
         let mut style = Self::anonymous(None);
+        style.content = get("content").and_then(parse_content);
         style.display = match get("display") {
             Some(value) => Display::parse(value).unwrap_or_else(|| {
                 log::debug!("ignoring invalid display value {value:?}; using inline");
@@ -487,6 +696,35 @@ impl ComputedStyle {
             }
         }
         style.text_align = TextAlign::compute(get("text-align"), parent_text_align);
+        if let Some(value) = get("position") {
+            match Position::parse(value) {
+                Some(position) => style.position = position,
+                None if is_css_wide_keyword(value) => {}
+                None => log::debug!("ignoring invalid position value {value:?}; using static"),
+            }
+        }
+        if let Some(value) = get("float") {
+            match Float::parse(value) {
+                Some(float) => style.float = float,
+                None if is_css_wide_keyword(value) => {}
+                None => log::debug!("ignoring invalid float value {value:?}; using none"),
+            }
+        }
+        // CSS 2.2 §9.7: absolute positioning wins over floating, and both
+        // blockify the display type. `display: contents` generates no box,
+        // so there is nothing to blockify.
+        if style.is_absolutely_positioned() {
+            style.float = Float::None;
+        }
+        if style.is_out_of_flow()
+            && let Display::Box { outside, inside } = style.display
+        {
+            style.blockified_from_inline = outside == DisplayOutside::Inline;
+            style.display = Display::Box {
+                outside: DisplayOutside::Block,
+                inside,
+            };
+        }
         if let Some(value) = get("background-color") {
             style.background_color = css::parse_color(value);
             if style.background_color.is_none() && !is_no_color_keyword(value) {
@@ -499,6 +737,10 @@ impl ComputedStyle {
             .and_then(|value| value.parse::<f32>().ok())
             .filter(|value| value.is_finite() && *value >= 0.0)
             .unwrap_or(0.0);
+        style.flex_shrink = get("flex-shrink")
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(1.0);
 
         let context = LengthContext {
             font_size: style.font_size,
@@ -535,6 +777,7 @@ impl ComputedStyle {
             }
             Some(parsed)
         };
+        style.flex_basis = dimension("flex-basis", true, false).unwrap_or(Dimension::Auto);
         let side = |prefix: &str, allow_auto: bool, allow_negative: bool| {
             Sides::from_array(["top", "right", "bottom", "left"].map(|side| {
                 dimension(&format!("{prefix}-{side}"), allow_auto, allow_negative)
@@ -542,17 +785,26 @@ impl ComputedStyle {
             }))
         };
         style.margin = side("margin", true, true);
+        style.inset = Sides::from_array(
+            ["top", "right", "bottom", "left"]
+                .map(|property| dimension(property, true, true).unwrap_or(Dimension::Auto)),
+        );
         style.padding = side("padding", false, false);
         style.width = dimension("width", true, false).unwrap_or(Dimension::Auto);
         style.height = dimension("height", true, false).unwrap_or(Dimension::Auto);
-        // `min-*: auto` computes to 0 outside flex and grid items, and
-        // `max-*: none` is stored as `Auto` (no maximum).
+        // Store the numeric fallback here and retain whether the flex
+        // automatic minimum applies in the flags below. `max-*: none` is
+        // stored as `Auto` (no maximum).
         style.min_width = dimension("min-width", true, false)
             .filter(|value| *value != Dimension::Auto)
             .unwrap_or(Dimension::Px(0.0));
         style.min_height = dimension("min-height", true, false)
             .filter(|value| *value != Dimension::Auto)
             .unwrap_or(Dimension::Px(0.0));
+        style.min_width_auto =
+            get("min-width").is_none_or(|value| value.eq_ignore_ascii_case("auto"));
+        style.min_height_auto =
+            get("min-height").is_none_or(|value| value.eq_ignore_ascii_case("auto"));
         let max = |property: &str| {
             if get(property).is_some_and(|value| value.eq_ignore_ascii_case("none")) {
                 return Dimension::Auto;
@@ -579,13 +831,101 @@ impl ComputedStyle {
             .and_then(|value| parse_length(value).map(|length| length.to_px(&context)))
             .filter(|value| value.is_finite() && *value >= 0.0)
             .unwrap_or(0.0);
+        if let Some(value) = get("box-sizing") {
+            match BoxSizing::parse(value) {
+                Some(sizing) => style.box_sizing = sizing,
+                None if is_css_wide_keyword(value) => {}
+                None => {
+                    log::debug!("ignoring invalid box-sizing value {value:?}; using content-box")
+                }
+            }
+        }
+        if let Some(value) = get("box-shadow") {
+            match parse_box_shadow(value, &context, style.color) {
+                Some(shadows) => style.box_shadow = shadows.into(),
+                None if is_css_wide_keyword(value) => {}
+                None => log::debug!("ignoring invalid box-shadow value {value:?}; using none"),
+            }
+        }
         style
+    }
+
+    /// The used content-box width for a `width` (or `min-width` /
+    /// `max-width`) value `size` resolved against `cb_width`.
+    ///
+    /// With `box-sizing: border-box` the horizontal padding is subtracted,
+    /// never going below zero. Returns `None` when `size` is `auto` or an
+    /// unresolvable percentage.
+    pub(crate) fn content_width_for(&self, size: Dimension, cb_width: Option<f32>) -> Option<f32> {
+        let width = size.resolve(cb_width)?;
+        Some(match self.box_sizing {
+            BoxSizing::ContentBox => width,
+            BoxSizing::BorderBox => (width
+                - self
+                    .padding
+                    .map(|value| value.resolve_or_zero(cb_width))
+                    .horizontal())
+            .max(0.0),
+        })
+    }
+
+    /// The used content-box height for a `height` (or `min-height` /
+    /// `max-height`) value `size` resolved against `cb_height`.
+    ///
+    /// Padding percentages resolve against `cb_width`, as in CSS. With
+    /// `box-sizing: border-box` the vertical padding is subtracted, never
+    /// going below zero.
+    pub(crate) fn content_height_for(
+        &self,
+        size: Dimension,
+        cb_width: Option<f32>,
+        cb_height: Option<f32>,
+    ) -> Option<f32> {
+        let height = size.resolve(cb_height)?;
+        Some(match self.box_sizing {
+            BoxSizing::ContentBox => height,
+            BoxSizing::BorderBox => (height
+                - self
+                    .padding
+                    .map(|value| value.resolve_or_zero(cb_width))
+                    .vertical())
+            .max(0.0),
+        })
+    }
+
+    /// The used content-box width from `width`; see
+    /// [`ComputedStyle::content_width_for`].
+    pub(crate) fn content_width(&self, cb_width: Option<f32>) -> Option<f32> {
+        self.content_width_for(self.width, cb_width)
+    }
+
+    /// The used content-box height from `height`; see
+    /// [`ComputedStyle::content_height_for`].
+    pub(crate) fn content_height(
+        &self,
+        cb_width: Option<f32>,
+        cb_height: Option<f32>,
+    ) -> Option<f32> {
+        self.content_height_for(self.height, cb_width, cb_height)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_strings_are_unquoted_and_unescaped() {
+        assert_eq!(parse_content("\"SUCCESS\"").as_deref(), Some("SUCCESS"));
+        assert_eq!(parse_content("'it\\'s'").as_deref(), Some("it's"));
+        assert_eq!(parse_content("\"\\201C x\"").as_deref(), Some("\u{201C}x"));
+        assert_eq!(parse_content("\"a\" \"b\"").as_deref(), Some("ab"));
+        assert_eq!(parse_content("\"\"").as_deref(), Some(""));
+        assert_eq!(parse_content("none"), None);
+        assert_eq!(parse_content("NORMAL"), None);
+        assert_eq!(parse_content("attr(title)"), None);
+        assert_eq!(parse_content("open-quote \"x\"").as_deref(), Some("x"));
+    }
     use crate::Size;
 
     fn style(declarations: &[(&str, &str)]) -> ComputedStyle {
@@ -703,6 +1043,50 @@ mod tests {
         );
         assert_eq!(radius.bottom_right, CornerRadius::default());
         assert_eq!(radius.bottom_left, CornerRadius::default());
+    }
+
+    #[test]
+    fn position_float_and_insets_parse_and_blockify() {
+        let plain = style(&[]);
+        assert_eq!(plain.position, Position::Static);
+        assert_eq!(plain.float, Float::None);
+        assert_eq!(plain.inset.top, Dimension::Auto);
+
+        let absolute = style(&[
+            ("position", "ABSOLUTE"),
+            ("float", "left"),
+            ("top", "-5px"),
+            ("left", "10%"),
+        ]);
+        assert_eq!(absolute.position, Position::Absolute);
+        assert_eq!(absolute.float, Float::None);
+        assert_eq!(absolute.inset.top, Dimension::Px(-5.0));
+        assert_eq!(absolute.inset.left, Dimension::Percent(10.0));
+        assert_eq!(absolute.inset.right, Dimension::Auto);
+        assert!(absolute.blockified_from_inline);
+        assert!(matches!(
+            absolute.display,
+            Display::Box {
+                outside: DisplayOutside::Block,
+                ..
+            }
+        ));
+
+        let floated = style(&[("display", "inline-block"), ("float", "inline-end")]);
+        assert_eq!(floated.float, Float::Right);
+        assert_eq!(
+            floated.display,
+            Display::Box {
+                outside: DisplayOutside::Block,
+                inside: DisplayInside::FlowRoot
+            }
+        );
+        assert_eq!(style(&[("position", "bogus")]).position, Position::Static);
+        assert_eq!(style(&[("float", "middle")]).float, Float::None);
+        assert_eq!(
+            style(&[("position", "-webkit-sticky")]).position,
+            Position::Sticky
+        );
     }
 
     #[test]

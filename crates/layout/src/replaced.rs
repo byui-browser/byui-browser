@@ -110,19 +110,16 @@ impl ReplacedBox {
             Dimension::Auto => hint,
             other => other,
         };
-        let width = pick(style.width, self.width_hint).resolve(cb_width);
-        let height = pick(style.height, self.height_hint).resolve(cb_height);
-        let min_width = style.min_width.resolve_or_zero(cb_width);
-        let min_height = style.min_height.resolve_or_zero(cb_height);
+        // Every size is converted to the content box per `box-sizing`.
+        let content_width = |size: Dimension| style.content_width_for(size, cb_width);
+        let content_height = |size: Dimension| style.content_height_for(size, cb_width, cb_height);
+        let width = content_width(pick(style.width, self.width_hint));
+        let height = content_height(pick(style.height, self.height_hint));
+        let min_width = content_width(style.min_width).unwrap_or(0.0);
+        let min_height = content_height(style.min_height).unwrap_or(0.0);
         // `max-*: none` is stored as `Auto`, which resolves to `None`.
-        let max_width = style
-            .max_width
-            .resolve(cb_width)
-            .map(|max| max.max(min_width));
-        let max_height = style
-            .max_height
-            .resolve(cb_height)
-            .map(|max| max.max(min_height));
+        let max_width = content_width(style.max_width).map(|max| max.max(min_width));
+        let max_height = content_height(style.max_height).map(|max| max.max(min_height));
         let clamp = |value: f32, min: f32, max: Option<f32>| {
             max.map_or(value, |max| value.min(max)).max(min)
         };
@@ -283,6 +280,25 @@ mod tests {
         let mut style = ComputedStyle::anonymous(None);
         style.width = Dimension::Px(60.0);
         assert_eq!(image.used_size(&style, Some(500.0), None), (60.0, 30.0));
+    }
+
+    #[test]
+    fn border_box_sizes_subtract_padding_before_keeping_the_ratio() {
+        let mut style = ComputedStyle::anonymous(None);
+        style.box_sizing = crate::style::BoxSizing::BorderBox;
+        style.padding = crate::Sides::from_array([Dimension::Px(5.0); 4]);
+        style.width = Dimension::Px(90.0);
+        // 90px border box minus 10px of padding is an 80px content box.
+        assert_eq!(
+            replaced(bitmap(40.0, 20.0)).used_size(&style, Some(500.0), None),
+            (80.0, 40.0)
+        );
+        style.width = Dimension::Auto;
+        style.max_width = Dimension::Px(30.0);
+        assert_eq!(
+            replaced(bitmap(40.0, 20.0)).used_size(&style, Some(500.0), None),
+            (20.0, 10.0)
+        );
     }
 
     #[test]

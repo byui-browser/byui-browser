@@ -229,14 +229,10 @@ impl LocalStorage {
             );
             event.set("url", Value::String(self.document_url.clone()));
             event.set("storageArea", Value::Object(storage_area));
-            if let Some(Value::Object(listeners)) = window.get("__storageListeners") {
-                for listener_name in listeners.keys() {
-                    if let Some(Value::Function(listener)) = listeners.get(&listener_name)
-                        && let Err(error) = listener.call(&[Value::Object(event.clone())])
-                    {
-                        log::warn!("storage event listener threw: {error}");
-                    }
-                }
+            if let Some(Value::Function(dispatch)) = window.get("dispatchEvent")
+                && let Err(error) = dispatch.call(&[Value::Object(event)])
+            {
+                log::warn!("storage event dispatch failed: {error}");
             }
         }
     }

@@ -66,7 +66,11 @@ long documents (the indicator is not draggable). Wrapped text is cached until
 width changes, and resizing preserves the reading position where possible.
 Click the visible **Close** button, press Escape, or click the toolbar to close
 the panel and restore the cached page. Keyboard menu-item navigation remains
-future work; the three-dot menu provides Clear cache. macOS and Windows use the same implementation.
+future work. The three-dot menu provides **Clear cache** and **Appearance**.
+The browser saves the selected System, Light, or Dark appearance in its
+application-data directory and restores it on startup. System follows the OS
+appearance when available and uses Light otherwise. The native desktop shells
+share this implementation.
 
 For a manual demo, run `cargo run -p browser-macos`, right-click the welcome page,
 click Reload, and look for `Refresh byui://welcome`, `Status: 200`, and the HTML.

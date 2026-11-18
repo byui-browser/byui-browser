@@ -183,14 +183,19 @@ impl ElementsPanel {
     pub(crate) fn set_tab(&mut self, tab: DockTab) {
         self.tab = tab;
         self.network_view.close_menu();
+        self.compat.close_preview();
         self.offset = self.offset.min(self.max_offset());
     }
 
     /// Handles a primary click inside the panel body (not on a tab or the
     /// close button). A click closes an open column menu, choosing the item
     /// under the pointer; on the Network tab a click on a column heading
-    /// sorts by that column. Returns whether anything changed.
+    /// sorts by that column. A click also closes the Compatibility code
+    /// preview. Returns whether anything changed.
     pub(crate) fn click(&mut self, cursor: Option<(f64, f64)>) -> bool {
+        if self.compat.close_preview() {
+            return true;
+        }
         if self.network_view.menu_open() {
             if let Some(column) = self.network_view.menu_item_at(cursor) {
                 self.network_view.toggle(column);
@@ -209,9 +214,13 @@ impl ElementsPanel {
     }
 
     /// Handles a secondary (right) click. On the Network table it opens the
-    /// column menu at the pointer; elsewhere it closes the menu. Returns
-    /// whether anything changed.
+    /// column menu at the pointer; on a Compatibility finding it previews
+    /// the code that fails; elsewhere it closes the menu. Returns whether
+    /// anything changed.
     pub(crate) fn context_click(&mut self, cursor: Option<(f64, f64)>) -> bool {
+        if self.tab == DockTab::Compatibility {
+            return self.compat.context_click(cursor);
+        }
         if self.tab == DockTab::Network
             && let (Some(table), Some(bounds), Some(point)) =
                 (self.network_table(), self.bounds, cursor)
@@ -223,10 +232,10 @@ impl ElementsPanel {
         self.network_view.close_menu()
     }
 
-    /// Closes the column menu, if open, so Escape dismisses it before the
-    /// panel. Returns whether it was open.
+    /// Closes the column menu or the Compatibility code preview, if open, so
+    /// Escape dismisses it before the panel. Returns whether one was open.
     pub(crate) fn dismiss_menu(&mut self) -> bool {
-        self.network_view.close_menu()
+        self.compat.close_preview() | self.network_view.close_menu()
     }
 
     /// The Network table's area: below the tab strip, inside the panel.
@@ -1204,16 +1213,17 @@ impl Colors {
     fn new(dark: bool) -> Self {
         let rgba = toolbar::rgba;
         if dark {
+            let palette = toolbar::palette(dark);
             Self {
-                background: rgba(0x1c, 0x1d, 0x21, 255),
-                header: rgba(0x25, 0x26, 0x2b, 255),
-                border: rgba(0x3a, 0x3c, 0x43, 255),
+                background: palette.panel,
+                header: palette.frame_top,
+                border: palette.panel_border,
                 separator: rgba(255, 255, 255, 18),
                 row_hover: rgba(255, 255, 255, 12),
                 guide: rgba(255, 255, 255, 16),
                 scrollbar: rgba(255, 255, 255, 60),
                 tag: rgba(0x6c, 0xb8, 0xf0, 255),
-                punctuation: rgba(0x7d, 0x85, 0x92, 255),
+                punctuation: palette.text_muted,
             }
         } else {
             Self {

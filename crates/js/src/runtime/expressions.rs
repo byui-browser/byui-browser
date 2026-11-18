@@ -25,6 +25,8 @@ pub(crate) fn has_property(target: &Value, key: &str) -> JsResult<bool> {
             Ok(array.get_property(key)?.is_some() || matches!(key, "push" | "pop"))
         }
         Value::Function(function) => Ok(function.get_own(key).is_some()),
+        // Primitives throw in JavaScript; property *reads* still consult
+        // String.prototype / Number.prototype, but `in` does not.
         other => Err(JsError::with_context(
             JsErrorCategory::Runtime,
             format!("Cannot use 'in' operator to search for `{key}` in `{other}`"),

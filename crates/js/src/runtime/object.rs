@@ -45,10 +45,13 @@ pub type HostPropertyKeys = Arc<dyn Fn() -> JsResult<Vec<String>> + Send + Sync>
 /// not an own property: it is not listed by [`Object::keys`], and it reads as
 /// missing once the class has been dropped.
 ///
-/// Limitations: there is no built-in `Object.prototype`, property attributes,
-/// or symbol keys. As with functions, there is no garbage collector, so an
-/// object that refers to itself (directly or through other objects) is never
-/// freed.
+/// Limitations: there is no built-in `Object.prototype` on ordinary objects
+/// created with [`Object::new`], property attributes beyond read-only /
+/// replaceable / host accessors, or symbol keys. String and number primitives
+/// still resolve methods through the shared `String.prototype` and
+/// `Number.prototype` objects. As with functions, there is no garbage
+/// collector, so an object that refers to itself (directly or through other
+/// objects) is never freed.
 #[derive(Clone, Default)]
 pub struct Object(Arc<ObjectData>);
 
@@ -422,8 +425,8 @@ impl Object {
     }
 
     /// Stores a host function under `name` as a method that scripts can call
-    /// as `object.name(...)`. The function receives only the call's
-    /// arguments; it is not given the object as `this`.
+    /// as `object.name(...)`. When the call goes through a member expression,
+    /// the engine binds the object as `this` for that host function.
     pub fn set_method(&self, name: impl Into<String>, function: HostFunction) {
         let name = name.into();
         let function = Function::from_host(name.clone(), function);

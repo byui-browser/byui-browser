@@ -3,16 +3,18 @@
 //! All coordinates are absolute CSS pixels with the origin at the top-left of
 //! the initial containing block (the viewport).
 
+use std::sync::Arc;
+
 use css::CssColor;
 use html::NodeID;
 
-use crate::{BorderRadius, Edges, ImageKey, Rect};
+use crate::{BorderRadius, BoxShadow, Edges, ImageKey, Rect};
 
 /// Paint-relevant computed values for a box or inline box fragment.
 ///
-/// Colors and corner radii are painted today; borders and other decorations
-/// are not supported yet.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Colors, corner radii, and outer box shadows are painted today; borders,
+/// inset shadows, and other decorations are not supported yet.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoxStyle {
     /// The background color, or `None` when it is transparent or unsupported.
     pub background_color: Option<CssColor>,
@@ -21,6 +23,9 @@ pub struct BoxStyle {
     /// The computed `border-*-radius` values. The background is clipped to
     /// the rounded border box; resolve them with [`BorderRadius::resolve`].
     pub border_radius: BorderRadius,
+    /// The computed `box-shadow` list, first (topmost) shadow first; empty
+    /// for `none`. Shadows follow the rounded border box.
+    pub box_shadow: Arc<[BoxShadow]>,
 }
 
 impl Default for BoxStyle {
@@ -30,6 +35,7 @@ impl Default for BoxStyle {
             text_color: css::user_agent_default_color("color")
                 .expect("user-agent stylesheet must define html color"),
             border_radius: BorderRadius::default(),
+            box_shadow: Arc::from(Vec::new()),
         }
     }
 }
@@ -55,6 +61,42 @@ pub enum BoxKind {
     Replaced,
 }
 
+/// How a box takes part in layout: its positioning scheme (CSS 2.2 §9.3).
+///
+/// Paint order depends on it: floats paint after in-flow block backgrounds,
+/// and positioned boxes paint after all in-flow content (CSS 2.2 Appendix E).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Placement {
+    /// Normal flow with `position: static`.
+    #[default]
+    InFlow,
+    /// A floated box (`float: left` or `right`), out of flow.
+    Float,
+    /// `position: relative`: laid out in flow, then shifted by its insets.
+    Relative,
+    /// `position: sticky`. Scroll-dependent sticking is not implemented, so
+    /// the box stays at its in-flow position.
+    Sticky,
+    /// `position: absolute`: out of flow, placed against the padding box of
+    /// the nearest positioned ancestor block box, or the viewport.
+    Absolute,
+    /// `position: fixed`: out of flow, placed against the viewport. The box
+    /// is laid out like an absolutely positioned child of the initial
+    /// containing block; keeping it in place while scrolling is up to the
+    /// embedder.
+    Fixed,
+}
+
+impl Placement {
+    /// Whether the box is positioned (`position` other than `static`).
+    pub fn is_positioned(self) -> bool {
+        matches!(
+            self,
+            Self::Relative | Self::Sticky | Self::Absolute | Self::Fixed
+        )
+    }
+}
+
 /// A box fragment: a block container laid out with the CSS box model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayoutBox {
@@ -73,8 +115,11 @@ pub struct LayoutBox {
     pub padding: Edges,
     /// Paint-relevant computed values.
     pub style: BoxStyle,
-    /// Block-level child boxes, in tree order. Empty when the box contains
-    /// inline content.
+    /// The box's positioning scheme.
+    pub placement: Placement,
+    /// Block-level child boxes, in tree order, followed by floats and
+    /// absolutely positioned boxes this box contains. A box with inline
+    /// content has only floats and absolutely positioned children.
     pub children: Vec<LayoutBox>,
     /// Line boxes when the box establishes an inline formatting context, in
     /// order from top to bottom.
@@ -217,9 +262,12 @@ impl LayoutTree {
     /// tree order, then the inline content of every line box in tree order.
     /// The picture of a block-level replaced box is painted at its place in
     /// that last step, as CSS 2.2 Appendix E step 7 says.
-    /// Atomic inlines are painted as if they created a stacking context, at
-    /// their place in the line. Positioned boxes, floats, and `z-index` are
-    /// not supported yet, so there are no other layers.
+    /// Floats are painted atomically after the block backgrounds and before
+    /// inline content; positioned boxes are painted atomically, in tree order,
+    /// after everything else in their parent's stacking layer. Atomic inlines
+    /// are painted as if they created a stacking context, at their place in
+    /// the line. `z-index` is not supported, so positioned boxes never paint
+    /// below in-flow content.
     pub fn paint_order(&self) -> Vec<PaintItem<'_>> {
         let mut items = Vec::new();
         paint_atomically(&self.root, &mut items);
@@ -288,18 +336,47 @@ fn lowest_edge(layout_box: &LayoutBox) -> f32 {
     lines.chain(children).fold(own, f32::max)
 }
 
+/// Paints a box and its descendants as one layer: block backgrounds, then
+/// floats, then inline content, then positioned descendants.
 fn paint_atomically<'a>(layout_box: &'a LayoutBox, items: &mut Vec<PaintItem<'a>>) {
     items.push(PaintItem::BoxDecorations(layout_box));
+    let mut layers = Layers::default();
     for child in &layout_box.children {
-        push_block_decorations(child, items);
+        push_block_decorations(child, items, &mut layers);
+    }
+    for float in layers.floats {
+        paint_atomically(float, items);
     }
     push_inline_content(layout_box, items);
+    for positioned in layers.positioned {
+        paint_atomically(positioned, items);
+    }
 }
 
-fn push_block_decorations<'a>(layout_box: &'a LayoutBox, items: &mut Vec<PaintItem<'a>>) {
+/// Floats and positioned boxes found while painting in-flow blocks; each is
+/// painted later as a whole.
+#[derive(Default)]
+struct Layers<'a> {
+    floats: Vec<&'a LayoutBox>,
+    positioned: Vec<&'a LayoutBox>,
+}
+
+fn push_block_decorations<'a>(
+    layout_box: &'a LayoutBox,
+    items: &mut Vec<PaintItem<'a>>,
+    layers: &mut Layers<'a>,
+) {
+    if layout_box.placement.is_positioned() {
+        layers.positioned.push(layout_box);
+        return;
+    }
+    if layout_box.placement == Placement::Float {
+        layers.floats.push(layout_box);
+        return;
+    }
     items.push(PaintItem::BoxDecorations(layout_box));
     for child in &layout_box.children {
-        push_block_decorations(child, items);
+        push_block_decorations(child, items, layers);
     }
 }
 
@@ -317,7 +394,9 @@ fn push_inline_content<'a>(layout_box: &'a LayoutBox, items: &mut Vec<PaintItem<
         }
     }
     for child in &layout_box.children {
-        push_inline_content(child, items);
+        if child.placement == Placement::InFlow {
+            push_inline_content(child, items);
+        }
     }
 }
 
@@ -337,6 +416,7 @@ mod tests {
             margin: Edges::default(),
             padding: Edges::default(),
             style: BoxStyle::default(),
+            placement: Placement::InFlow,
             children,
             lines: Vec::new(),
             image: None,

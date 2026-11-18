@@ -185,10 +185,10 @@ impl FindInPage {
     pub fn highlight_ranges(&self, dark: bool) -> Vec<(SourceRange, paint::Color)> {
         let ordinary = if dark {
             paint::Color {
-                r: 150,
-                g: 120,
-                b: 0,
-                a: 125,
+                r: 230,
+                g: 190,
+                b: 15,
+                a: 95,
             }
         } else {
             paint::Color {
@@ -201,9 +201,9 @@ impl FindInPage {
         let selected = if dark {
             paint::Color {
                 r: 255,
-                g: 150,
-                b: 40,
-                a: 180,
+                g: 128,
+                b: 36,
+                a: 125,
             }
         } else {
             paint::Color {
@@ -338,7 +338,7 @@ impl FindInPage {
         let width = pixmap.width() as f32 / scale;
         let palette = toolbar::palette(dark);
         let mut paint = Paint::default();
-        paint.set_color(palette.field);
+        paint.set_color(if dark { palette.panel } else { palette.field });
         let bar = Rect::from_xywh(0.0, toolbar::PAGE_TOP as f32, width, HEIGHT).unwrap();
         pixmap.fill_path(
             &PathBuilder::from_rect(bar),
@@ -349,7 +349,7 @@ impl FindInPage {
         );
         for (action, rect) in Self::regions(width) {
             paint.set_color(if action == Action::Field {
-                palette.hover
+                if dark { palette.field } else { palette.hover }
             } else {
                 palette.field
             });
@@ -360,6 +360,19 @@ impl FindInPage {
                 Transform::from_scale(scale, scale),
                 None,
             );
+            if dark && action == Action::Field {
+                toolbar::stroke(
+                    pixmap,
+                    &PathBuilder::from_rect(rect),
+                    if self.focused {
+                        palette.accent
+                    } else {
+                        palette.field_border
+                    },
+                    1.0,
+                    Transform::from_scale(scale, scale),
+                );
+            }
             if let Some(font) = font {
                 let size = 13.0 * scale;
                 let metrics = font.as_scaled(ab_glyph::PxScale::from(size));
@@ -393,6 +406,8 @@ impl FindInPage {
                     .unwrap();
                     field.fill(if self.selected && self.focused {
                         palette.selection
+                    } else if dark {
+                        palette.field
                     } else {
                         palette.hover
                     });

@@ -66,15 +66,12 @@ pub(crate) struct TabState {
 }
 
 impl TabState {
-    pub fn new(id: TabId, inset: f32) -> Self {
+    pub fn new(id: TabId) -> Self {
         Self {
             id,
             document_id: 0,
             title: "Welcome".into(),
-            chrome: ChromeState {
-                window_controls_inset: inset,
-                ..ChromeState::default()
-            },
+            chrome: ChromeState::default(),
             browser_state: BrowserState::new(),
             address: "byui://welcome".into(),
             address_before_edit: "byui://welcome".into(),

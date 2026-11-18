@@ -122,6 +122,22 @@ fn event_object(event_type: String, bubbles: bool, cancelable: bool) -> Object {
     event
 }
 
+pub(crate) fn error_event(
+    message: impl Into<String>,
+    filename: impl Into<String>,
+    lineno: usize,
+    colno: usize,
+    error: Value,
+) -> Object {
+    let event = event_object("error".into(), false, false);
+    event.set("message", Value::String(message.into()));
+    event.set("filename", Value::String(filename.into()));
+    event.set("lineno", Value::Number(lineno as f64));
+    event.set("colno", Value::Number(colno as f64));
+    event.set("error", error);
+    event
+}
+
 /// Implements the JavaScript `AbortController()` constructor used to cancel
 /// event listeners registered with its signal.
 pub fn abort_controller_constructor(_arguments: &[Value]) -> JsResult<Value> {
@@ -194,16 +210,16 @@ fn event_target_for(document: &Document, node: Option<NodeID>) -> EventTargetRef
     }
 }
 
-pub(crate) fn add_event_listener_at(
-    document: &Document,
-    node: Option<NodeID>,
+/// Registers a listener on an arbitrary EventTarget.
+pub(crate) fn add_event_listener_to_target(
+    target_ref: &EventTargetRef,
     arguments: &[Value],
+    target_name: &str,
 ) -> JsResult<Value> {
     let [event_type, callback, options @ ..] = arguments else {
-        log::debug!("addEventListener() called with too few arguments");
-        return Err(JsError::new(
-            "document.addEventListener() expects a type and callback",
-        ));
+        return Err(JsError::new(format!(
+            "{target_name}.addEventListener() expects a type and callback"
+        )));
     };
 
     let event_type = event_type.to_string();
@@ -214,15 +230,13 @@ pub(crate) fn add_event_listener_at(
             Value::Object(callback)
                 if matches!(callback.get("handleEvent"), Some(Value::Function(_))) => {}
             Value::Object(_) => {
-                log::debug!("addEventListener({event_type}) callback object has no handleEvent");
                 return Err(JsError::new(
-                    "document.addEventListener() callback object must define handleEvent",
+                    "event listener object must define handleEvent",
                 ));
             }
             _ => {
-                log::debug!("addEventListener({event_type}) callback has an unsupported type");
                 return Err(JsError::new(
-                    "document.addEventListener() callback must be a function, object, or null",
+                    "event listener callback must be a function, object, or null",
                 ));
             }
         }
@@ -240,34 +254,19 @@ pub(crate) fn add_event_listener_at(
         .as_ref()
         .and_then(|signal| signal.get("aborted"))
         .is_some_and(|aborted| javascript_truthy(&aborted))
+        || is_null_callback
     {
-        log::debug!("addEventListener({event_type}) ignored: signal already aborted");
-        return Ok(Value::Undefined);
-    }
-    if is_null_callback {
-        log::debug!("addEventListener({event_type}) ignored: null callback");
         return Ok(Value::Undefined);
     }
 
-    let target_ref = event_target_for(document, node);
-    let mut target = lock_event_target(&target_ref);
+    let mut target = lock_event_target(target_ref);
     if target.listeners().iter().any(|listener| {
         listener.event_type == event_type
             && listener.capture == capture
             && listener.callback == *callback
     }) {
-        log::debug!("addEventListener({event_type}) ignored: duplicate listener");
         return Ok(Value::Undefined);
     }
-
-    log::debug!(
-        "addEventListener({event_type}) on {} (capture: {capture}, once: {once})",
-        if node.is_some() {
-            "element"
-        } else {
-            "document"
-        }
-    );
     target.listeners_mut().push(EventListener {
         event_type,
         callback: callback.clone(),
@@ -277,6 +276,22 @@ pub(crate) fn add_event_listener_at(
         signal,
     });
     Ok(Value::Undefined)
+}
+
+pub(crate) fn add_event_listener_at(
+    document: &Document,
+    node: Option<NodeID>,
+    arguments: &[Value],
+) -> JsResult<Value> {
+    add_event_listener_to_target(
+        &event_target_for(document, node),
+        arguments,
+        if node.is_some() {
+            "element"
+        } else {
+            "document"
+        },
+    )
 }
 
 /// Implements `EventTarget.removeEventListener()` for the document target.
@@ -292,7 +307,7 @@ pub(crate) fn remove_event_listener_at(
     node: Option<NodeID>,
     arguments: &[Value],
 ) -> JsResult<Value> {
-    let [event_type, callback, options @ ..] = arguments else {
+    let [event_type, callback, _options @ ..] = arguments else {
         log::debug!("removeEventListener() called with too few arguments");
         return Err(JsError::new(
             "document.removeEventListener() expects a type and callback",
@@ -308,29 +323,50 @@ pub(crate) fn remove_event_listener_at(
             "document.removeEventListener() callback must be a function, object, or null",
         ));
     }
+    remove_event_listener_from_target(&event_target_for(document, node), arguments)
+}
+
+pub(crate) fn remove_event_listener_from_target(
+    target_ref: &EventTargetRef,
+    arguments: &[Value],
+) -> JsResult<Value> {
+    let [event_type, callback, options @ ..] = arguments else {
+        return Err(JsError::new(
+            "removeEventListener() expects a type and callback",
+        ));
+    };
+    let event_type = event_type.to_string();
+    if matches!(callback, Value::Null | Value::Undefined) {
+        return Ok(Value::Undefined);
+    }
+    if !matches!(callback, Value::Function(_) | Value::Object(_)) {
+        return Err(JsError::new(
+            "event listener callback must be a function, object, or null",
+        ));
+    }
     let (capture, _, _, _) = event_listener_options(options.first());
-    let target_ref = event_target_for(document, node);
-    let mut target = lock_event_target(&target_ref);
-    let before = target.listeners().len();
+    let mut target = lock_event_target(target_ref);
     target.listeners_mut().retain(|listener| {
         !(listener.event_type == event_type
             && listener.capture == capture
             && listener.callback == *callback)
     });
-    log::debug!(
-        "removeEventListener({event_type}) removed {} listeners",
-        before - target.listeners().len()
-    );
     Ok(Value::Undefined)
 }
 
+/// Calls one listener. Function listeners run with `this` bound to the
+/// event's current target; `handleEvent` runs with `this` bound to its object.
 fn invoke_event_listener(callback: &Value, event: &Object) -> JsResult<Value> {
     match callback {
-        Value::Function(callback) => callback.call(&[Value::Object(event.clone())]),
+        Value::Function(callback) => callback.call_with_this(
+            event.get("currentTarget").unwrap_or(Value::Undefined),
+            &[Value::Object(event.clone())],
+        ),
         Value::Object(callback) => match callback.get("handleEvent") {
-            Some(Value::Function(handle_event)) => {
-                handle_event.call(&[Value::Object(event.clone())])
-            }
+            Some(Value::Function(handle_event)) => handle_event.call_with_this(
+                Value::Object(callback.clone()),
+                &[Value::Object(event.clone())],
+            ),
             _ => Err(JsError::new(
                 "event listener object has no handleEvent method",
             )),
@@ -399,6 +435,98 @@ fn invoke_listeners(
         }
         event.set("__passiveListener", Value::Boolean(false));
     }
+}
+
+/// Dispatches an event on a standalone EventTarget, such as Window.
+pub(crate) fn dispatch_event_target(
+    target: &EventTargetRef,
+    target_object: &Object,
+    arguments: &[Value],
+) -> JsResult<Value> {
+    dispatch_event_target_with_target(
+        target,
+        target_object,
+        Value::Object(target_object.clone()),
+        arguments,
+    )
+}
+
+/// Dispatches an event on a standalone EventTarget while reporting a
+/// different `event.target`, such as the Window `load` event whose target is
+/// the Document.
+pub(crate) fn dispatch_event_target_with_target(
+    target: &EventTargetRef,
+    target_object: &Object,
+    event_target_value: Value,
+    arguments: &[Value],
+) -> JsResult<Value> {
+    let [Value::Object(event)] = arguments else {
+        return Err(JsError::new("dispatchEvent() expects one Event object"));
+    };
+    let Some(Value::String(event_type)) = event.get("type") else {
+        return Err(JsError::new("dispatchEvent() expects an Event object"));
+    };
+
+    event.set("target", event_target_value);
+    event.set("currentTarget", Value::Object(target_object.clone()));
+    event.set("eventPhase", Value::Number(2.0));
+    event.set("__stopPropagation", Value::Boolean(false));
+    event.set("__stopImmediatePropagation", Value::Boolean(false));
+    invoke_listeners(target, event, &event_type, target_object, true, 2.0);
+    let handler_cancelled = if event_type == "error" {
+        invoke_window_error_handler(target_object, event)
+    } else {
+        false
+    };
+    if !matches!(
+        event.get("__stopImmediatePropagation"),
+        Some(Value::Boolean(true))
+    ) {
+        invoke_listeners(target, event, &event_type, target_object, false, 2.0);
+    }
+    event.set("eventPhase", Value::Number(0.0));
+    event.set("currentTarget", Value::Null);
+    Ok(Value::Boolean(
+        !handler_cancelled && !matches!(event.get("defaultPrevented"), Some(Value::Boolean(true))),
+    ))
+}
+
+fn invoke_window_error_handler(target: &Object, event: &Object) -> bool {
+    let Some(Value::Function(handler)) = target.get("onerror") else {
+        return false;
+    };
+    let arguments = [
+        event.get("message").unwrap_or(Value::Undefined),
+        event.get("filename").unwrap_or(Value::Undefined),
+        event.get("lineno").unwrap_or(Value::Undefined),
+        event.get("colno").unwrap_or(Value::Undefined),
+        event.get("error").unwrap_or(Value::Undefined),
+    ];
+    match handler.call(&arguments) {
+        Ok(Value::Boolean(true)) => true,
+        Ok(_) => false,
+        Err(error) => {
+            log::warn!("window.onerror handler threw: {error}");
+            false
+        }
+    }
+}
+
+/// Reports an uncaught script error to a Window's `onerror` handler.
+///
+/// The handler receives the HTML Standard's legacy `(message, source, line,
+/// column, error)` arguments. The original script error remains the returned
+/// host error; returning `true` only suppresses the event's default action.
+pub fn report_window_error(window: &Object, error: &js::JsError, source: &str) -> JsResult<Value> {
+    let value = error.clone().into_caught_value();
+    let (line, column) = error
+        .location
+        .map_or((0, 0), |location| (location.line, location.column));
+    let event = error_event(&error.message, source, line, column, value);
+    let Some(Value::Function(report)) = window.get("__reportError") else {
+        return Err(JsError::new("window error reporter is not installed"));
+    };
+    report.call(&[Value::Object(event)])
 }
 
 fn element_for_node(document: &Document, node: NodeID) -> Option<Element> {
@@ -511,27 +639,7 @@ pub(crate) fn dispatch_event_at(
             );
         }
     } else {
-        invoke_listeners(
-            &document_target,
-            event,
-            &event_type,
-            target_object,
-            true,
-            2.0,
-        );
-        if !matches!(
-            event.get("__stopImmediatePropagation"),
-            Some(Value::Boolean(true))
-        ) {
-            invoke_listeners(
-                &document_target,
-                event,
-                &event_type,
-                target_object,
-                false,
-                2.0,
-            );
-        }
+        return dispatch_event_target(&document_target, target_object, arguments);
     }
 
     event.set("eventPhase", Value::Number(0.0));
