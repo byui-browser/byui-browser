@@ -138,6 +138,15 @@ Preserve and document the current service-worker rule:
 
 ### 5. Unify response finalization
 
+Implemented: all response sources pass through `finalize_response`, which
+classifies CORS exposure, applies generic response validation, invokes browser
+approval and diagnostics, and only then permits public exposure. HTTP
+responses use `finalize_http_response` to make the required post-approval
+ordering explicit: `Set-Cookie` storage runs after approval, while cache
+storage occurs after approval and, for streaming bodies, after successful body
+completion. Cached and local-scheme responses use the same core finalization
+boundary but bypass HTTP-only storage effects.
+
 Make every response-producing path call one finalization pipeline responsible for:
 
 1. response metadata construction;

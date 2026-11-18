@@ -134,12 +134,12 @@ impl RequestController {
 
             if request.redirect_mode() == crate::RedirectMode::Manual {
                 candidate.redirect_count = request.redirect_count() + 1;
-                self.finalize_response(
+                self.finalize_http_response(
                     &request,
+                    &url,
                     &mut candidate,
                     ResponseFinalization::ManualRedirect,
                 )?;
-                self.process_response_cookies(&request, &url, &mut candidate)?;
                 log::debug!(
                     "manual redirect {status} returned as opaque from {}",
                     crate::log_url::loggable(url.as_str())
@@ -181,11 +181,15 @@ impl RequestController {
                     );
                 })?;
 
-            self.finalize_response(&request, &mut candidate, ResponseFinalization::Standard)
-                .inspect_err(|_| {
-                    self.clear_preflight_cache_after_failure(&request, &url);
-                })?;
-            self.process_response_cookies(&request, &url, &mut candidate)?;
+            self.finalize_http_response(
+                &request,
+                &url,
+                &mut candidate,
+                ResponseFinalization::Standard,
+            )
+            .inspect_err(|_| {
+                self.clear_preflight_cache_after_failure(&request, &url);
+            })?;
             if request.redirect_count() >= 20 {
                 log::warn!(
                     "redirect limit reached at {}",
@@ -226,10 +230,15 @@ impl RequestController {
             url = next_url;
         }
 
-        self.finalize_response(&request, &mut response, ResponseFinalization::Standard)
-            .inspect_err(|_| {
-                self.clear_preflight_cache_after_failure(&request, &url);
-            })?;
+        self.finalize_http_response(
+            &request,
+            &url,
+            &mut response,
+            ResponseFinalization::Standard,
+        )
+        .inspect_err(|_| {
+            self.clear_preflight_cache_after_failure(&request, &url);
+        })?;
         self.observe(
             &request,
             NetworkPhase::ResponseFinalized,
@@ -237,8 +246,6 @@ impl RequestController {
             Some(response.status.as_u16()),
             response.from_cache,
         );
-        self.process_response_cookies(&request, &url, &mut response)?;
-
         if request.is_cacheable_method() && request.cache_mode() != CacheMode::NoStore {
             if response.body.is_null() {
                 log::trace!(
@@ -353,28 +360,5 @@ impl RequestController {
             crate::Headers::generated_request_headers()
         };
         Ok((headers, generated))
-    }
-
-    /// Gives approved HTTP response cookies to browser-owned storage policy.
-    fn process_response_cookies(
-        &self,
-        request: &Request,
-        url: &reqwest::Url,
-        response: &mut InternalResponse,
-    ) -> Result<(), RequestError> {
-        if response.cookie_headers_processed || !request.credentials_allowed(url) {
-            return Ok(());
-        }
-        if let Some(services) = &self.inner.services {
-            let values: Vec<http::HeaderValue> = response
-                .headers
-                .get_all(http::header::SET_COOKIE)
-                .iter()
-                .cloned()
-                .collect();
-            services.store_set_cookie(request, &values)?;
-            response.cookie_headers_processed = true;
-        }
-        Ok(())
     }
 }

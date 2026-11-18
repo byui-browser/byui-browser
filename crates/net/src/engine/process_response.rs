@@ -49,6 +49,23 @@ impl RequestController {
         self.approve_response(request, response)
     }
 
+    /// Finalizes one HTTP response before any HTTP-only post-processing.
+    ///
+    /// Cookie storage belongs immediately after the shared approval boundary:
+    /// a denied response must not mutate browser storage. Cache insertion is
+    /// deliberately left to the HTTP handler because a streaming body is only
+    /// cacheable after its caller has consumed it successfully.
+    pub(crate) fn finalize_http_response(
+        &self,
+        request: &Request,
+        url: &reqwest::Url,
+        response: &mut InternalResponse,
+        finalization: ResponseFinalization,
+    ) -> Result<(), RequestError> {
+        self.finalize_response(request, response, finalization)?;
+        self.process_response_cookies(request, url, response)
+    }
+
     /// Converts and finalizes a scheme-owned resource through the common path.
     pub(crate) fn finalize_scheme_resource(
         &self,
@@ -59,6 +76,29 @@ impl RequestController {
         let mut response = InternalResponse::from_scheme_resource(resource, request, scheme)?;
         self.finalize_response(request, &mut response, ResponseFinalization::Standard)?;
         Ok(response.expose())
+    }
+
+    /// Gives approved HTTP response cookies to browser-owned storage policy.
+    fn process_response_cookies(
+        &self,
+        request: &Request,
+        url: &reqwest::Url,
+        response: &mut InternalResponse,
+    ) -> Result<(), RequestError> {
+        if response.cookie_headers_processed || !request.credentials_allowed(url) {
+            return Ok(());
+        }
+        if let Some(services) = &self.inner.services {
+            let values: Vec<http::HeaderValue> = response
+                .headers
+                .get_all(http::header::SET_COOKIE)
+                .iter()
+                .cloned()
+                .collect();
+            services.store_set_cookie(request, &values)?;
+            response.cookie_headers_processed = true;
+        }
+        Ok(())
     }
 
     /// Gives browser-owned services the final opportunity to approve a response.

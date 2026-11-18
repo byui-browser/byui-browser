@@ -356,6 +356,90 @@ fn cached_browser_response_is_rechecked_before_exposure() {
 }
 
 #[test]
+fn rejected_http_response_does_not_store_cookies_or_enter_cache() {
+    struct RejectFirstResponse {
+        response_checks: AtomicUsize,
+        cookie_writes: AtomicUsize,
+    }
+
+    impl FetchServices for RejectFirstResponse {
+        fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
+            Ok(())
+        }
+
+        fn check_response(
+            &self,
+            _request: &Request,
+            _info: &ResponseInfo,
+        ) -> Result<(), RequestError> {
+            if self.response_checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(RequestError::UnsupportedFeature("response policy"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
+            Ok(None)
+        }
+
+        fn store_set_cookie(
+            &self,
+            _request: &Request,
+            _values: &[net::HeaderValue],
+        ) -> Result<(), RequestError> {
+            self.cookie_writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn service_worker(
+            &self,
+            _request: &Request,
+        ) -> Result<ServiceWorkerDecision, RequestError> {
+            Ok(ServiceWorkerDecision::Network)
+        }
+
+        fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
+            Ok("response-rejection".into())
+        }
+    }
+
+    let network_hits = Arc::new(AtomicUsize::new(0));
+    let observed_hits = network_hits.clone();
+    let server = TestServer::start(2, move |_| {
+        observed_hits.fetch_add(1, Ordering::SeqCst);
+        b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nSet-Cookie: sid=accepted\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+    });
+    let services = Arc::new(RejectFirstResponse {
+        response_checks: AtomicUsize::new(0),
+        cookie_writes: AtomicUsize::new(0),
+    });
+    let controller = RequestController::builder(Config::default())
+        .with_fetch_services(services.clone())
+        .build()
+        .unwrap();
+    let mut request = Request::get(server.url());
+    request.set_environment(
+        FetchEnvironment::from_url(reqwest::Url::parse(&server.url()).unwrap()).unwrap(),
+    );
+    request.set_credentials_mode(net::CredentialsMode::Include);
+
+    let first = runtime().block_on(controller.fetch(request.try_clone().unwrap()));
+    assert!(matches!(
+        first,
+        Err(RequestError::UnsupportedFeature("response policy"))
+    ));
+
+    let response = runtime().block_on(controller.fetch(request)).unwrap();
+    assert_eq!(runtime().block_on(response.body.bytes()).unwrap(), b"ok");
+    server.join();
+
+    assert_eq!(network_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(services.response_checks.load(Ordering::SeqCst), 2);
+    assert_eq!(services.cookie_writes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn unsupported_request_features_fail_before_browser_service_or_network_side_effects() {
     let mut integrity = Request::get("http://127.0.0.1:9/");
     integrity.set_integrity(Some("sha256-example".into()));
