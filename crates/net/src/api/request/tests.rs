@@ -1,10 +1,47 @@
-use http::HeaderValue;
+use http::{HeaderName, HeaderValue};
 use url::Url;
 
 use super::{
     CredentialsMode, Origin, RedirectTaint, Referrer, ReferrerPolicy, Request, RequestMode,
 };
 use crate::api::{body::Body, error::RequestError};
+
+#[test]
+fn preparation_initializes_execution_state_without_changing_caller_configuration() {
+    let mut request = Request::new("relative/path", "POST").unwrap();
+    request
+        .set_body(Some(Body::from_bytes(b"payload".to_vec())))
+        .unwrap();
+    let initial = Url::parse("https://example.test/relative/path").unwrap();
+
+    let prepared = super::PreparedRequest::new(request, initial.clone());
+
+    assert_eq!(prepared.request.url(), "relative/path");
+    assert_eq!(prepared.request.current_url(), Some(&initial));
+    assert_eq!(prepared.request.url_list(), std::slice::from_ref(&initial));
+    assert_eq!(prepared.request.redirect_count(), 0);
+    assert_eq!(prepared.request.method(), http::Method::POST);
+    assert!(prepared.request.body().is_some());
+}
+
+#[test]
+fn validated_hop_keeps_approved_transport_inputs_together() {
+    let request = Request::get("https://example.test/resource");
+    let mut headers = crate::Headers::generated_request_headers();
+    headers
+        .insert_internal_header(
+            HeaderName::from_static("x-browser-policy"),
+            HeaderValue::from_static("approved"),
+        )
+        .unwrap();
+    let url = Url::parse("https://example.test/resource").unwrap();
+
+    let hop = super::ValidatedHop::new(request, headers.clone(), url.clone());
+
+    assert_eq!(hop.request.active_url(), "https://example.test/resource");
+    assert_eq!(hop.headers, headers);
+    assert_eq!(hop.url, url);
+}
 
 #[test]
 fn credentials_mode_respects_tuple_and_opaque_origins() {
@@ -29,8 +66,8 @@ fn credentials_mode_respects_tuple_and_opaque_origins() {
 #[test]
 fn redirect_taint_is_derived_from_the_complete_url_list() {
     let mut request = Request::get("https://app.example.test/start");
-    request.request_origin = Some(Origin::parse("https://app.example.test").unwrap());
-    request.url_list = vec![Url::parse("https://app.example.test/start").unwrap()];
+    request.execution.request_origin = Some(Origin::parse("https://app.example.test").unwrap());
+    request.execution.url_list = vec![Url::parse("https://app.example.test/start").unwrap()];
 
     assert_eq!(request.redirect_taint(), RedirectTaint::SameOrigin);
     assert_eq!(
@@ -39,22 +76,26 @@ fn redirect_taint_is_derived_from_the_complete_url_list() {
     );
 
     request
+        .execution
         .url_list
         .push(Url::parse("https://api.example.test/next").unwrap());
     assert_eq!(request.redirect_taint(), RedirectTaint::SameOrigin);
 
     request
+        .execution
         .url_list
         .push(Url::parse("https://cdn.example.test/asset").unwrap());
     assert_eq!(request.redirect_taint(), RedirectTaint::SameSite);
     assert_eq!(request.serialized_origin().as_deref(), Some("null"));
 
     request
+        .execution
         .url_list
         .push(Url::parse("https://remote.test/final").unwrap());
     assert_eq!(request.redirect_taint(), RedirectTaint::SameSite);
 
     request
+        .execution
         .url_list
         .push(Url::parse("https://other.test/final").unwrap());
     assert_eq!(request.redirect_taint(), RedirectTaint::CrossSite);
@@ -64,8 +105,8 @@ fn redirect_taint_is_derived_from_the_complete_url_list() {
 #[test]
 fn redirect_taint_does_not_reset_when_a_chain_returns_to_its_origin() {
     let mut request = Request::get("https://app.example.test/start");
-    request.request_origin = Some(Origin::parse("https://app.example.test").unwrap());
-    request.url_list = [
+    request.execution.request_origin = Some(Origin::parse("https://app.example.test").unwrap());
+    request.execution.url_list = [
         "https://app.example.test/start",
         "https://remote.test/middle",
         "https://app.example.test/final",

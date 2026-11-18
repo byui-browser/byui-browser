@@ -33,11 +33,11 @@ fn get_request_has_expected_defaults() {
     // without requiring callers to initialize every field manually.
     let request = Request::get("https://example.com");
 
-    assert_eq!(request.method, Method::GET);
-    assert_eq!(request.url, "https://example.com");
-    assert!(request.headers.is_empty());
-    assert!(request.body.is_none());
-    assert_eq!(request.cache_mode, CacheMode::Default);
+    assert_eq!(request.method(), Method::GET);
+    assert_eq!(request.url(), "https://example.com");
+    assert!(request.headers().is_empty());
+    assert!(request.body().is_none());
+    assert_eq!(request.cache_mode(), CacheMode::Default);
 }
 
 #[test]
@@ -52,22 +52,27 @@ fn custom_request_preserves_headers_and_body() {
             HeaderValue::from_static("application/json"),
         )
         .unwrap();
-    let request = Request {
-        method: Method::POST,
-        url: "https://example.com/api".into(),
-        headers,
-        body: Some(Body::from_bytes(br#"{"ok":true}"#.to_vec())),
-        cache_mode: CacheMode::NoStore,
-        ..Request::get("https://example.com/api")
-    };
+    let mut request = Request::new("https://example.com/api", "POST").unwrap();
+    for (name, value) in headers.iter() {
+        request
+            .append_header(name.clone(), value.parse().unwrap())
+            .unwrap();
+    }
+    request
+        .set_body(Some(Body::from_bytes(br#"{"ok":true}"#.to_vec())))
+        .unwrap();
+    request.set_cache_mode(CacheMode::NoStore);
 
-    assert_eq!(request.method, Method::POST);
-    assert_eq!(request.headers.iter().next().unwrap().1, "application/json");
+    assert_eq!(request.method(), Method::POST);
     assert_eq!(
-        request.body,
-        Some(Body::from_bytes(br#"{"ok":true}"#.to_vec()))
+        request.headers().iter().next().unwrap().1,
+        "application/json"
     );
-    assert_eq!(request.cache_mode, CacheMode::NoStore);
+    assert_eq!(
+        request.body().unwrap(),
+        &Body::from_bytes(br#"{"ok":true}"#.to_vec())
+    );
+    assert_eq!(request.cache_mode(), CacheMode::NoStore);
 }
 
 #[test]
@@ -108,7 +113,7 @@ fn an_aborted_request_fails_before_network_work() {
         .expect("controller should initialize");
     let controller = AbortController::new();
     let mut request = Request::get("http://127.0.0.1:1");
-    request.signal = controller.signal();
+    request.set_signal(controller.signal());
     controller.abort();
 
     let error = runtime.block_on(client.fetch(request)).unwrap_err();
@@ -126,7 +131,7 @@ fn only_if_cached_reports_a_cache_miss_without_network_access() {
         .build()
         .expect("controller should initialize");
     let mut request = Request::get("http://127.0.0.1:1");
-    request.cache_mode = CacheMode::OnlyIfCached;
+    request.set_cache_mode(CacheMode::OnlyIfCached);
 
     let error = runtime.block_on(client.fetch(request)).unwrap_err();
 
@@ -141,7 +146,7 @@ fn fetch_response_normalizes_cache_misses_to_network_error_response() {
         .build()
         .expect("controller should initialize");
     let mut request = Request::get("http://127.0.0.1:1");
-    request.cache_mode = CacheMode::OnlyIfCached;
+    request.set_cache_mode(CacheMode::OnlyIfCached);
 
     let response = runtime
         .block_on(client.fetch_response(request))

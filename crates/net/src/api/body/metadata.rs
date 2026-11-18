@@ -63,15 +63,12 @@ impl Body {
     /// Adds inferred body metadata to an internal transport header channel.
     pub(crate) fn apply_metadata(&self, headers: &mut Headers) -> Result<(), RequestError> {
         if let Some(content_type) = self.content_type()
-            && !headers.entries.iter().any(|(name, _)| name == CONTENT_TYPE)
+            && !headers.contains_name(&CONTENT_TYPE)
         {
             headers.insert_internal_header(CONTENT_TYPE, content_type)?;
         }
         if let Some(length) = self.length()
-            && !headers
-                .entries
-                .iter()
-                .any(|(name, _)| name == CONTENT_LENGTH)
+            && !headers.contains_name(&CONTENT_LENGTH)
         {
             let value = HeaderValue::from_str(&length.to_string())
                 .map_err(|_| RequestError::InvalidHeaderValue("content-length".into()))?;

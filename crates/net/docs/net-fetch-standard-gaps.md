@@ -15,7 +15,7 @@ compiled implementation.
 
 This report compares `crates/net` with the [WHATWG Fetch Living Standard](https://fetch.spec.whatwg.org/), last updated 2026-10-19. It evaluates the networking crate as a browser-facing Fetch implementation, not merely as an HTTP client. A field or enum is counted as implemented only when it changes observable behavior at the appropriate policy boundary.
 
-The crate currently provides an HTTP(S) transport with a Fetch-shaped request model: environment-based relative URL resolution, structured HTTP(S) origins, guarded ordered request headers, replayable and one-shot request bodies, automatic body metadata and `Origin`/`Referer` preparation, filtered streamed responses, controller-owned redirect handling, abort signaling, connection pooling, keepalive body-size checking before rejecting unsupported keepalive execution, and a small in-memory cache. Browser-context requests require a `FetchServices` provider. The crate is not yet Fetch-compatible for the full request/response algorithms. The dispatcher recognizes
+The crate currently provides an HTTP(S) transport with a Fetch-shaped request model: environment-based relative URL resolution, structured HTTP(S) origins, guarded ordered request headers, replayable and one-shot request bodies, automatic body metadata and `Origin`/`Referer` preparation, filtered streamed responses, controller-owned redirect handling, abort signaling, connection pooling, keepalive body-size checking before rejecting unsupported keepalive execution, and a small in-memory cache. Browser-context requests require a `RequestPolicyService`. The crate is not yet Fetch-compatible for the full request/response algorithms. The dispatcher recognizes
 `http`, `https`, `data`, `blob`, `file`, `byui`, and `about`. `data:` is
 engine-owned and currently decodes percent-encoded and base64 payloads;
 `blob:`, `file:`, and `byui:` resolve through installed browser-owned providers
@@ -35,11 +35,11 @@ cancellation branch does not emit that phase.
 | URL and scheme fetch        | HTTP(S), relative URLs, `data:`, provider-backed `blob:`, authorized `file:`, `byui:`, and `about:blank` fetch work; other `about:` URLs are rejected                                                                                            | Medium       |
 | Request headers and methods | Method validation, request/no-CORS guards, internal generated-header channels, and response filtering exist; later redirect/header rules remain                                                                                                  | Medium       |
 | Request and response bodies | Authoritative buffered/streaming `Body`, helpers, metadata, fallible cloning, bounded teeing, and null-body handling exist in the committed slice; JavaScript conversion, keepalive lifetime, and the in-progress body ownership refactor remain | Medium       |
-| Credentials and cookies     | `FetchServices` exposes cookie selection/storage hooks, but the current browser service selects no cookies and stores none; matching, persistence, and policy remain provider work                                                               | Critical     |
+| Credentials and cookies     | `CookieService` exposes selection/storage hooks, but the current browser capability selects no cookies and stores none; matching, persistence, and policy remain provider work                                                               | Critical     |
 | CORS and response tainting  | Simple and preflighted CORS checks, URL-list-derived redirect taint, a partitioned preflight cache, and filtered views exist on every HTTP redirect hop; browser-generated headers participate in the same per-hop preflight decision, while browser policy values remain partial | High         |
 | Redirects                   | Controller follows validated HTTP(S) redirects with per-hop policy, credentials, origin/referrer transitions, cache lookup, and `follow`, `error`, and `manual` modes; broader browser subsystems remain partial                                  | Medium       |
 | HTTP cache                  | Process-local max-age cache with provider-supplied partition keys and `Vary`-aware request-header variants; full matching/revalidation is absent                                                                                              | High         |
-| Fetch policy integrations   | Browser-context requests require `FetchServices`; CSP, mixed content, CORP, SRI, and worker interception remain provider/later-step work                                                                                                         | Critical     |
+| Fetch policy integrations   | Browser-context requests require `RequestPolicyService`; CSP, mixed content, CORP, SRI, and worker interception remain provider/later-step work                                                                                                         | Critical     |
 | Cancellation and lifecycle  | Basic abort signal and broad best-effort lifecycle observer events work, but Fetch controller state, abort reasons, body timing, and abort-event reporting are absent                                                               | Medium       |
 | Fetch API surface           | Rust `Request`, filtered `Response`, guarded `Headers`, shared `Body`, response cloning, and body helpers exist; complete JavaScript bindings remain                                                                                             | High         |
 | Scheduling and transport    | HTTP/2, compression, pooling, priority mapping, and lifecycle diagnostics are available; scheduler ordering, body timing, and HTTP/3 are absent                                                                                          | Low/Medium   |
@@ -119,7 +119,7 @@ add aggregate keepalive quotas when keepalive lifetime support is integrated.
 
 ### 4. Credentials, cookies, and authentication
 
-**Evidence:** [`FetchServices`](../src/api/services.rs) supplies cookie selection and storage decisions for browser-context requests. The controller calls those methods only when the credentials mode permits credentials. The engine itself has no durable cookie store. `FetchEnvironment` carries an optional `NetworkPartitionKey`, while the provider supplies the process-local cache partition key.
+**Evidence:** [`CookieService`](../src/api/services.rs) supplies cookie selection and storage decisions for browser-context requests. The controller calls those methods only when the credentials mode permits credentials. The engine itself has no durable cookie store. `FetchEnvironment` carries an optional `NetworkPartitionKey`, while `CachePartitionService` supplies the process-local cache partition key.
 
 Fetch credentials include cookies, TLS client certificates, and HTTP authentication entries. The engine delegates cookie matching, persistence, and policy to its provider; it does not implement those rules. TLS client certificate selection and HTTP authentication entries are still absent. `omit`, `same-origin`, and `include` now determine whether provider credential methods are invoked.
 
@@ -191,7 +191,7 @@ The referrer-policy enum and explicit/client referrer reduction logic are presen
 
 ### 9. Security and browser integration hooks
 
-**Evidence:** Browser-context requests require [`FetchServices`](../src/api/services.rs) request and response decisions. Integrity, navigation fetch, and keepalive lifetime are rejected before transport. A provider may authorize destination/initiator context and return a service-worker network decision; an interception decision fails closed until worker responses are supported.
+**Evidence:** Browser-context requests require [`RequestPolicyService`](../src/api/services.rs), while response authorization and service-worker decisions use their own focused capabilities. Integrity, navigation fetch, and keepalive lifetime are rejected before transport. A provider may authorize destination/initiator context and return a service-worker network decision; an interception decision fails closed until worker responses are supported.
 
 The Fetch Standard coordinates with other web-platform policies. Remaining integrations include:
 
@@ -215,7 +215,7 @@ sandbox policy plus registered `byui:` page lookup. Blob registry and
 revocation ownership are intentionally deferred. The browser executable now installs its browser-owned
 `byui:` provider and concrete authorized `file:` provider through
 `RequestController::builder`, and also installs the browser's current
-`BrowserFetchServices` implementation. Blob registry/lifetime ownership and
+`BrowserFetchCapabilities` implementation. Blob registry/lifetime ownership and
 durable browser policy remain outside `net`. Provider errors, provider-assigned origins, metadata
 validation, exact-once provider selection, and cancellation/lifetime behavior
 are implemented for the blob, file, and page paths and covered by focused
@@ -226,7 +226,7 @@ keepalive request currently fails with `UnsupportedFeature` before network I/O,
 including an in-quota request, until lifetime handling exists. Integrity still
 fails explicitly. Navigation is currently permitted only for the authorized
 `file:` provider path; other navigation fetches fail explicitly. The browser's
-current `BrowserFetchServices` is deliberately conservative: it supplies no
+current `BrowserFetchCapabilities` is deliberately conservative: it supplies no
 cookies, ignores `Set-Cookie`, and always selects the network path for service
 workers. Browser policy, durable cookie/cache state, worker-network,
 diagnostics, and scheme-provider inputs remain outside this crate.
@@ -285,7 +285,7 @@ validates scheme-compatible URLs, provider metadata, and origin policy before
 exposure. The handlers invoke only their matching installed providers, while
 the engine-owned `about:blank` handler invokes none. Other `about:` URLs are
 rejected. The browser installs its `byui:` and authorized `file:` providers
-plus its current `FetchServices` implementation. Blob storage/registry
+plus its current focused browser capability implementation. Blob storage/registry
 ownership and durable policy services remain outside `net`.
 Provider resolution and streams observe request cancellation, and focused
 tests cover pending-resolution abort, stream abort/failure, and unread or

@@ -12,18 +12,21 @@ use std::{
 
 use common::{TestServer, runtime};
 use net::{
-    Body, Config, CredentialsMode, FetchEnvironment, FetchServices, HeaderName, HeaderValue,
-    Request, RequestController, RequestError, ResponseInfo, ServiceWorkerDecision,
+    Body, CachePartitionService, Config, CookieService, CredentialsMode, FetchEnvironment,
+    HeaderName, HeaderValue, Request, RequestController, RequestError, RequestPolicyService,
+    ResponseInfo, ResponsePolicyService, ServiceWorkerDecision, ServiceWorkerService,
 };
 
 /// Browser services used to supply an isolated cache partition without credentials.
 struct TestServices;
 
-impl FetchServices for TestServices {
+impl RequestPolicyService for TestServices {
     fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl ResponsePolicyService for TestServices {
     fn check_response(
         &self,
         _request: &Request,
@@ -31,7 +34,9 @@ impl FetchServices for TestServices {
     ) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl CookieService for TestServices {
     fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
         Ok(None)
     }
@@ -43,11 +48,15 @@ impl FetchServices for TestServices {
     ) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl ServiceWorkerService for TestServices {
     fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
         Ok(ServiceWorkerDecision::Network)
     }
+}
 
+impl CachePartitionService for TestServices {
     fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
         Ok("preflight-tests".into())
     }
@@ -56,16 +65,8 @@ impl FetchServices for TestServices {
 /// Browser services that add a forbidden Fetch Metadata field per HTTP hop.
 struct MetadataServices;
 
-impl FetchServices for MetadataServices {
+impl RequestPolicyService for MetadataServices {
     fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
-        Ok(())
-    }
-
-    fn check_response(
-        &self,
-        _request: &Request,
-        _response: &ResponseInfo,
-    ) -> Result<(), RequestError> {
         Ok(())
     }
 
@@ -78,7 +79,19 @@ impl FetchServices for MetadataServices {
         headers.set_str("sec-fetch-mode", "cors")?;
         Ok(headers)
     }
+}
 
+impl ResponsePolicyService for MetadataServices {
+    fn check_response(
+        &self,
+        _request: &Request,
+        _response: &ResponseInfo,
+    ) -> Result<(), RequestError> {
+        Ok(())
+    }
+}
+
+impl CookieService for MetadataServices {
     fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
         Ok(None)
     }
@@ -90,11 +103,15 @@ impl FetchServices for MetadataServices {
     ) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl ServiceWorkerService for MetadataServices {
     fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
         Ok(ServiceWorkerDecision::Network)
     }
+}
 
+impl CachePartitionService for MetadataServices {
     fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
         Ok("metadata-preflight".into())
     }
@@ -103,11 +120,13 @@ impl FetchServices for MetadataServices {
 /// Services that prove cookies are reserved for the original credentialed request.
 struct CookieServices;
 
-impl FetchServices for CookieServices {
+impl RequestPolicyService for CookieServices {
     fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl ResponsePolicyService for CookieServices {
     fn check_response(
         &self,
         _request: &Request,
@@ -115,7 +134,9 @@ impl FetchServices for CookieServices {
     ) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl CookieService for CookieServices {
     fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
         Ok(Some("session=secret".into()))
     }
@@ -127,11 +148,15 @@ impl FetchServices for CookieServices {
     ) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl ServiceWorkerService for CookieServices {
     fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
         Ok(ServiceWorkerDecision::Network)
     }
+}
 
+impl CachePartitionService for CookieServices {
     fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
         Ok("credentialed-preflight".into())
     }
@@ -143,11 +168,13 @@ struct RecordingCookieServices {
     writes: Arc<AtomicUsize>,
 }
 
-impl FetchServices for RecordingCookieServices {
+impl RequestPolicyService for RecordingCookieServices {
     fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl ResponsePolicyService for RecordingCookieServices {
     fn check_response(
         &self,
         _request: &Request,
@@ -155,7 +182,9 @@ impl FetchServices for RecordingCookieServices {
     ) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl CookieService for RecordingCookieServices {
     fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         Ok(Some("session=must-not-leak".into()))
@@ -169,11 +198,15 @@ impl FetchServices for RecordingCookieServices {
         self.writes.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+}
 
+impl ServiceWorkerService for RecordingCookieServices {
     fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
         Ok(ServiceWorkerDecision::Network)
     }
+}
 
+impl CachePartitionService for RecordingCookieServices {
     fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
         Ok("cross-origin-cookie-tests".into())
     }
@@ -204,7 +237,7 @@ fn request(url: String) -> Request {
 /// Builds a controller with the browser context required by cross-origin requests.
 fn controller() -> RequestController {
     RequestController::builder(Config::default())
-        .with_fetch_services(Arc::new(TestServices))
+        .with_browser_capabilities(Arc::new(TestServices))
         .build()
         .unwrap()
 }
@@ -278,7 +311,7 @@ fn browser_generated_headers_participate_in_cors_preflight() {
         FetchEnvironment::from_url(reqwest::Url::parse("https://client.test/").unwrap()).unwrap(),
     );
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(Arc::new(MetadataServices))
+        .with_browser_capabilities(Arc::new(MetadataServices))
         .build()
         .unwrap();
 
@@ -359,7 +392,7 @@ fn credentialed_preflight_requires_credential_approval_but_sends_no_cookie() {
         }
     });
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(Arc::new(CookieServices))
+        .with_browser_capabilities(Arc::new(CookieServices))
         .build()
         .unwrap();
     let mut request = request(server.url());
@@ -443,7 +476,7 @@ fn cross_origin_same_origin_credentials_never_reach_cookie_services() {
     let reads = Arc::new(AtomicUsize::new(0));
     let writes = Arc::new(AtomicUsize::new(0));
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(Arc::new(RecordingCookieServices {
+        .with_browser_capabilities(Arc::new(RecordingCookieServices {
             reads: Arc::clone(&reads),
             writes: Arc::clone(&writes),
         }))
@@ -713,7 +746,7 @@ fn configured_max_age_cap_forces_expired_permissions_to_preflight_again() {
         max_preflight_cache_age: Duration::ZERO,
         ..Config::default()
     })
-    .with_fetch_services(Arc::new(TestServices))
+    .with_browser_capabilities(Arc::new(TestServices))
     .build()
     .unwrap();
 

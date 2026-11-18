@@ -50,7 +50,7 @@ impl ResponseCache {
         let Some(cached) = entries.get(&key) else {
             log::trace!(
                 "cache lookup found no entry for {} {}",
-                request.method,
+                request.method(),
                 crate::log_url::loggable(url.as_str())
             );
             return None;
@@ -61,7 +61,7 @@ impl ResponseCache {
             entry
                 .vary_headers
                 .iter()
-                .all(|(name, original_value)| request.headers.get(name) == *original_value)
+                .all(|(name, original_value)| request.headers().get(name) == *original_value)
         }) else {
             log::trace!("cache miss: no matching Vary response");
             return None;
@@ -70,7 +70,7 @@ impl ResponseCache {
         if !usable {
             log::trace!(
                 "cache entry expired for {} {}",
-                request.method,
+                request.method(),
                 crate::log_url::loggable(url.as_str())
             );
         }
@@ -107,7 +107,7 @@ impl ResponseCache {
         };
         log::debug!(
             "cache store: {} {} ({} bytes, ttl {}s)",
-            request.method,
+            request.method(),
             crate::log_url::loggable(url.as_str()),
             response.body.len(),
             ttl.as_secs()
@@ -189,13 +189,13 @@ impl CachedResponse {
 pub(crate) fn cache_key(request: &Request, url: &Url) -> String {
     let mut url = url.clone();
     url.set_fragment(None);
-    match request.cache_partition.as_deref() {
+    match request.cache_partition() {
         Some(partition) => format!(
             "browser:{}:{partition} {} {url}",
             partition.len(),
-            request.method
+            request.method()
         ),
-        None => format!("standalone {} {url}", request.method),
+        None => format!("standalone {} {url}", request.method()),
     }
 }
 
@@ -224,7 +224,7 @@ fn capture_vary_headers(
     vary_header_names(response_headers)
         .into_iter()
         .map(|name| {
-            let value = request.headers.get(&name);
+            let value = request.headers().get(&name);
             (name, value)
         })
         .collect()
@@ -277,7 +277,9 @@ mod tests {
 
         // Original request asks for English.
         let mut english = Request::get(url.as_str());
-        english.headers.set_str("Accept-Language", "en").unwrap();
+        english
+            .set_header("Accept-Language".parse().unwrap(), "en".parse().unwrap())
+            .unwrap();
 
         // Server says the response varies by language.
         let mut headers = HeaderMap::new();
@@ -299,7 +301,9 @@ mod tests {
 
         // Different language should produce a cache miss.
         let mut spanish = Request::get(url.as_str());
-        spanish.headers.set_str("Accept-Language", "es").unwrap();
+        spanish
+            .set_header("Accept-Language".parse().unwrap(), "es".parse().unwrap())
+            .unwrap();
 
         assert!(cache.get(&spanish, &url).is_none());
     }
@@ -360,12 +364,12 @@ mod tests {
         let response = StoredResponse {
             status: StatusCode::NOT_FOUND,
             headers,
-            url: request.url.clone(),
+            url: request.url().to_owned(),
             body: b"missing".to_vec(),
             cookie_headers_processed: false,
         };
 
-        let url = Url::parse(&request.url).unwrap();
+        let url = Url::parse(request.url()).unwrap();
         cache.insert(&request, &url, &response);
 
         assert!(cache.get(&request, &url).is_none());
@@ -376,9 +380,9 @@ mod tests {
     fn cache_key_distinguishes_http_methods() {
         let get = Request::get("https://example.test/resource");
         let mut head = get.try_clone().unwrap();
-        head.method = reqwest::Method::HEAD;
+        head.set_method("HEAD").unwrap();
 
-        let url = Url::parse(&get.url).unwrap();
+        let url = Url::parse(get.url()).unwrap();
         assert_ne!(cache_key(&get, &url), cache_key(&head, &url));
     }
 
@@ -387,9 +391,9 @@ mod tests {
     fn browser_cache_partitions_do_not_share_entries() {
         let url = Url::parse("https://example.test/resource").unwrap();
         let mut first = Request::get(url.as_str());
-        first.cache_partition = Some("site-a".into());
+        first.set_cache_partition("site-a".into());
         let mut second = first.try_clone().unwrap();
-        second.cache_partition = Some("site-b".into());
+        second.set_cache_partition("site-b".into());
         assert_ne!(cache_key(&first, &url), cache_key(&second, &url));
         assert_ne!(
             cache_key(&first, &url),
@@ -402,8 +406,8 @@ mod tests {
     fn cache_key_ignores_url_fragments() {
         let with_fragment = Request::get("https://example.test/resource#section");
         let without_fragment = Request::get("https://example.test/resource");
-        let with_fragment_url = Url::parse(&with_fragment.url).unwrap();
-        let without_fragment_url = Url::parse(&without_fragment.url).unwrap();
+        let with_fragment_url = Url::parse(with_fragment.url()).unwrap();
+        let without_fragment_url = Url::parse(without_fragment.url()).unwrap();
 
         assert_eq!(
             cache_key(&with_fragment, &with_fragment_url),
@@ -416,8 +420,8 @@ mod tests {
     fn cache_key_uses_normalized_url_strings() {
         let uppercase = Request::get("HTTP://EXAMPLE.TEST/resource");
         let normalized = Request::get("http://example.test/resource");
-        let uppercase_url = Url::parse(&uppercase.url).unwrap();
-        let normalized_url = Url::parse(&normalized.url).unwrap();
+        let uppercase_url = Url::parse(uppercase.url()).unwrap();
+        let normalized_url = Url::parse(normalized.url()).unwrap();
 
         assert_eq!(
             cache_key(&uppercase, &uppercase_url),
@@ -433,20 +437,20 @@ mod tests {
         let response = StoredResponse {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
-            url: request.url.clone(),
+            url: request.url().to_owned(),
             body: b"stale".to_vec(),
             cookie_headers_processed: false,
         };
         let cached = CachedResponse::from_response(&request, &response, Duration::ZERO);
 
         cache.entries.write().unwrap().insert(
-            cache_key(&request, &Url::parse(&request.url).unwrap()),
+            cache_key(&request, &Url::parse(request.url()).unwrap()),
             vec![cached],
         );
 
         assert!(
             cache
-                .get(&request, &Url::parse(&request.url).unwrap())
+                .get(&request, &Url::parse(request.url()).unwrap())
                 .is_none()
         );
     }
@@ -458,20 +462,20 @@ mod tests {
         let response = StoredResponse {
             status: StatusCode::FOUND,
             headers: HeaderMap::new(),
-            url: request.url.clone(),
+            url: request.url().to_owned(),
             body: b"stale".to_vec(),
             cookie_headers_processed: false,
         };
         let cached = CachedResponse::from_response(&request, &response, Duration::ZERO);
 
         cache.entries.write().unwrap().insert(
-            cache_key(&request, &Url::parse(&request.url).unwrap()),
+            cache_key(&request, &Url::parse(request.url()).unwrap()),
             vec![cached],
         );
 
         assert!(
             cache
-                .get(&request, &Url::parse(&request.url).unwrap())
+                .get(&request, &Url::parse(request.url()).unwrap())
                 .is_none()
         );
     }
@@ -483,10 +487,14 @@ mod tests {
 
         // Create requests for two different languages.
         let mut english = Request::get(url.as_str());
-        english.headers.set_str("Accept-Language", "en").unwrap();
+        english
+            .set_header("Accept-Language".parse().unwrap(), "en".parse().unwrap())
+            .unwrap();
 
         let mut spanish = Request::get(url.as_str());
-        spanish.headers.set_str("Accept-Language", "es").unwrap();
+        spanish
+            .set_header("Accept-Language".parse().unwrap(), "es".parse().unwrap())
+            .unwrap();
 
         // Both responses vary by the Accept-Language header.
         let mut headers = HeaderMap::new();
@@ -549,8 +557,12 @@ mod tests {
         let url = Url::parse("https://example.test/page").unwrap();
 
         let mut request = Request::get(url.as_str());
-        request.headers.set_str("Accept-Language", "en").unwrap();
-        request.headers.set_str("Accept", "text/html").unwrap();
+        request
+            .set_header("Accept-Language".parse().unwrap(), "en".parse().unwrap())
+            .unwrap();
+        request
+            .set_header("Accept".parse().unwrap(), "text/html".parse().unwrap())
+            .unwrap();
 
         let mut language_headers = HeaderMap::new();
         language_headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
