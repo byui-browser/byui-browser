@@ -9,7 +9,10 @@ use crate::{
         response::{InternalResponse, Response, has_null_body},
     },
     cache::StoredResponse,
-    engine::{RequestController, cache_capture::with_cache_capture},
+    engine::{
+        RequestController, cache_capture::with_cache_capture,
+        process_response::ResponseFinalization,
+    },
 };
 
 impl RequestController {
@@ -67,7 +70,7 @@ impl RequestController {
                         cached.cookie_headers_processed,
                     );
                     internal.apply_request_state(&request);
-                    self.finalize_response(&request, &mut internal)
+                    self.finalize_response(&request, &mut internal, ResponseFinalization::Standard)
                         .inspect_err(|_| {
                             self.clear_preflight_cache_after_failure(&request, &url);
                         })?;
@@ -131,7 +134,11 @@ impl RequestController {
 
             if request.redirect_mode() == crate::RedirectMode::Manual {
                 candidate.redirect_count = request.redirect_count() + 1;
-                self.finalize_manual_redirect_response(&request, &mut candidate)?;
+                self.finalize_response(
+                    &request,
+                    &mut candidate,
+                    ResponseFinalization::ManualRedirect,
+                )?;
                 self.process_response_cookies(&request, &url, &mut candidate)?;
                 log::debug!(
                     "manual redirect {status} returned as opaque from {}",
@@ -174,7 +181,7 @@ impl RequestController {
                     );
                 })?;
 
-            self.finalize_response(&request, &mut candidate)
+            self.finalize_response(&request, &mut candidate, ResponseFinalization::Standard)
                 .inspect_err(|_| {
                     self.clear_preflight_cache_after_failure(&request, &url);
                 })?;
@@ -198,9 +205,6 @@ impl RequestController {
                 );
                 return Err(RequestError::RedirectFailure);
             }
-            if rewrite_to_get {
-                request.rewrite_for_redirect()?;
-            }
             log::debug!(
                 "following redirect {status}: {} -> {} (hop {})",
                 crate::log_url::loggable(url.as_str()),
@@ -208,8 +212,7 @@ impl RequestController {
                 request.redirect_count() + 1
             );
             self.observe(&request, NetworkPhase::Redirect, &url, Some(status), false);
-            request.apply_redirect_policy(&next_url, &candidate.headers);
-            request.follow_url(next_url.clone());
+            request.transition_to_redirect(next_url.clone(), &candidate.headers, rewrite_to_get)?;
             self.inner
                 .policy
                 .validate_redirect_target(&request, &next_url)
@@ -223,7 +226,7 @@ impl RequestController {
             url = next_url;
         }
 
-        self.finalize_response(&request, &mut response)
+        self.finalize_response(&request, &mut response, ResponseFinalization::Standard)
             .inspect_err(|_| {
                 self.clear_preflight_cache_after_failure(&request, &url);
             })?;

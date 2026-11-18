@@ -49,6 +49,25 @@ impl Request {
         Ok(())
     }
 
+    /// Applies the complete state transition for one followed network redirect.
+    ///
+    /// The redirect response must be finalized before this is called. The
+    /// caller validates the resulting target after the transition and before
+    /// starting the next HTTP hop.
+    pub(crate) fn transition_to_redirect(
+        &mut self,
+        next_url: Url,
+        response_headers: &http::HeaderMap,
+        rewrite_to_get: bool,
+    ) -> Result<(), RequestError> {
+        if rewrite_to_get {
+            self.rewrite_for_redirect()?;
+        }
+        self.apply_redirect_policy(&next_url, response_headers);
+        self.follow_url(next_url);
+        Ok(())
+    }
+
     pub(crate) fn strip_sensitive_redirect_headers(&mut self) {
         log::trace!("stripping sensitive headers for cross-origin redirect");
         for name in [

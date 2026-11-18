@@ -8,6 +8,19 @@ use crate::{
     engine::RequestController,
 };
 
+/// Exposure class selected while finalizing one internal response.
+///
+/// Normal responses are classified by CORS policy. A manual redirect is
+/// deliberately opaque, but otherwise follows the same validation, browser
+/// authorization, diagnostics, and exposure boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResponseFinalization {
+    /// Classify the response using the ordinary CORS policy.
+    Standard,
+    /// Finalize a manual redirect as an opaque redirect response.
+    ManualRedirect,
+}
+
 impl RequestController {
     /// Applies shared response policy before public response exposure.
     ///
@@ -17,33 +30,16 @@ impl RequestController {
         &self,
         request: &Request,
         response: &mut InternalResponse,
+        finalization: ResponseFinalization,
     ) -> Result<(), RequestError> {
-        self.finalize_response_with_type(request, response, None)
-    }
-
-    /// Applies shared policy to a manual redirect before exposing its opaque view.
-    pub(crate) fn finalize_manual_redirect_response(
-        &self,
-        request: &Request,
-        response: &mut InternalResponse,
-    ) -> Result<(), RequestError> {
-        // A manual redirect is intentionally opaque. It must still reach
-        // browser-owned response policy, but running the CORS exposure check
-        // first would turn a hidden cross-origin redirect into CorsDenied.
-        response.response_type = crate::api::response::ResponseType::OpaqueRedirect;
-        crate::policy::validate_response(request, response)?;
-        self.approve_response(request, response)
-    }
-
-    /// Runs CORS validation and optionally replaces the public response class.
-    fn finalize_response_with_type(
-        &self,
-        request: &Request,
-        response: &mut InternalResponse,
-        exposed_type: Option<crate::api::response::ResponseType>,
-    ) -> Result<(), RequestError> {
-        let classified_type = self.inner.cors.response_type(request, response)?;
-        response.response_type = exposed_type.unwrap_or(classified_type);
+        response.response_type = match finalization {
+            ResponseFinalization::Standard => self.inner.cors.response_type(request, response)?,
+            // Do not perform CORS classification first: Fetch must hide a
+            // manual cross-origin redirect instead of rejecting it.
+            ResponseFinalization::ManualRedirect => {
+                crate::api::response::ResponseType::OpaqueRedirect
+            }
+        };
         log::trace!(
             "response type classified: {:?} for {}",
             response.response_type,
@@ -61,7 +57,7 @@ impl RequestController {
         scheme: crate::policy::FetchScheme,
     ) -> Result<crate::api::response::Response, RequestError> {
         let mut response = InternalResponse::from_scheme_resource(resource, request, scheme)?;
-        self.finalize_response(request, &mut response)?;
+        self.finalize_response(request, &mut response, ResponseFinalization::Standard)?;
         Ok(response.expose())
     }
 
