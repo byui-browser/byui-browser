@@ -643,7 +643,8 @@ fn unsupported_syntax_is_rejected_at_parse_time() {
 /// see `tests/exceptions.rs`.)
 #[test]
 fn unsupported_keywords_and_globals_fail_at_run_time() {
-    for (source, message) in [("undeclared = 1", "`undeclared` is not defined")] {
-        assert_eq!(runtime_error(source).message, message, "{source}");
-    }
+    assert_eq!(
+        runtime_error("undeclared = 1").message,
+        "`undeclared` is not defined"
+    );
 }
