@@ -5,6 +5,7 @@
 //! origin of the box being laid out; the parent translates them into place.
 
 use crate::box_tree::{BlockBox, BlockContents};
+use crate::control::SELECT_ARROW_ROOM;
 use crate::layout::Context;
 use std::sync::Arc;
 
@@ -268,7 +269,9 @@ impl Context<'_> {
             placement: Placement::InFlow,
             children,
             lines,
+            select_arrow: false,
             image: None,
+            control: None,
         }
     }
 
@@ -341,12 +344,49 @@ impl Context<'_> {
                     )
                 }
             }
+            BlockContents::Inlines(items) if block.is_drop_down() => {
+                // One unbroken line beside the arrow; text that doesn't fit
+                // is clipped where the arrow area starts.
+                let text_width = (content_width - SELECT_ARROW_ROOM).max(0.0);
+                let (_, max_content) = self.inline_intrinsic_sizes(items, style);
+                let inline =
+                    self.layout_inline(items, style, text_width.max(max_content), &mut floats);
+                lines = inline.lines;
+                children.extend(inline.floats);
+                self.clip_lines(&mut lines, text_width, content_width);
+                FlowResult {
+                    height: lines.last().map_or(0.0, |line| line.rect.bottom()),
+                    margin_top: edges.own_top,
+                    margin_bottom: edges.own_bottom,
+                    has_content: !lines.is_empty(),
+                    absolutes: inline.absolutes,
+                }
+            }
             BlockContents::Inlines(items) => {
                 let inline = self.layout_inline(items, style, content_width, &mut floats);
                 lines = inline.lines;
                 children.extend(inline.floats);
+                if lines.is_empty() && block.centers_lines {
+                    // A single-line control with no text (an empty field or
+                    // `<input type=button>`) keeps one empty strut line, so
+                    // it is one line tall and has a baseline to align by.
+                    let metrics = self
+                        .fonts
+                        .font_vertical_metrics(style.font, style.font_size);
+                    lines.push(LineBox {
+                        rect: Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: content_width,
+                            height: metrics.ascent + metrics.descent + metrics.line_gap,
+                        },
+                        baseline: metrics.ascent + metrics.line_gap / 2.0,
+                        fragments: Vec::new(),
+                    });
+                }
+                let height = lines.last().map_or(0.0, |line| line.rect.bottom());
                 FlowResult {
-                    height: lines.last().map_or(0.0, |line| line.rect.bottom()),
+                    height,
                     margin_top: edges.own_top,
                     margin_bottom: edges.own_bottom,
                     has_content: !lines.is_empty(),
@@ -451,8 +491,13 @@ impl Context<'_> {
                 placement: placement(style),
                 children,
                 lines,
+                select_arrow: block.is_drop_down(),
                 image: match &block.contents {
-                    BlockContents::Replaced(replaced) => Some(replaced.key.clone()),
+                    BlockContents::Replaced(replaced) => replaced.key.clone(),
+                    _ => None,
+                },
+                control: match &block.contents {
+                    BlockContents::Replaced(replaced) => replaced.control,
                     _ => None,
                 },
             },
