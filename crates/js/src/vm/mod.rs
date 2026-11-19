@@ -16,7 +16,7 @@ use crate::{Function, JsError, JsErrorCategory, JsResult, Object, Value};
 use std::sync::{Arc, Mutex};
 
 /// Executes a [`Chunk`] using an owned operand stack.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Vm {
     stack: Vec<Value>,
     /// The running frame.
@@ -29,6 +29,8 @@ pub struct Vm {
     steps_remaining: u64,
     loop_iterations_remaining: u64,
     call_depth_limit: usize,
+    globals: Option<crate::runtime::GlobalState>,
+    persistent_globals: bool,
 }
 
 /// An active exception handler registered by [`Instruction::EnterTry`].
@@ -64,6 +66,9 @@ struct Frame {
     callee: Option<Function>,
     /// The constructor `new` was applied to, for constructor frames.
     new_target: Option<Function>,
+    /// Normal script functions called as methods intentionally expose no
+    /// receiver in the tree-walk compatibility semantics.
+    method_without_receiver: bool,
     mode: ReturnMode,
 }
 
@@ -147,6 +152,25 @@ impl Vm {
         receiver: Value,
         arguments: &[Value],
     ) -> JsResult<Value> {
+        Self::call_function_in(function, receiver, arguments, None)
+    }
+
+    /// Calls a bytecode function while retaining the supplied realm globals.
+    pub(crate) fn call_function_with_globals(
+        function: Function,
+        receiver: Value,
+        arguments: &[Value],
+        globals: crate::runtime::GlobalState,
+    ) -> JsResult<Value> {
+        Self::call_function_in(function, receiver, arguments, Some(globals))
+    }
+
+    fn call_function_in(
+        function: Function,
+        receiver: Value,
+        arguments: &[Value],
+        globals: Option<crate::runtime::GlobalState>,
+    ) -> JsResult<Value> {
         let argument_count = u16::try_from(arguments.len())
             .map_err(|_| JsError::runtime("too many function arguments"))?;
         let mut constants = Vec::with_capacity(arguments.len() + 2);
@@ -170,7 +194,16 @@ impl Vm {
             names: Vec::new(),
             functions: Vec::new(),
         };
-        Self::new().execute(&chunk)
+        let mut vm = Self::new();
+        match globals {
+            Some(globals) => vm.execute_with_globals_and_this(
+                &chunk,
+                ExecutionLimits::default(),
+                globals,
+                Value::Undefined,
+            ),
+            None => vm.execute(&chunk),
+        }
     }
 
     /// Executes `chunk` and returns its completion value.
@@ -189,6 +222,27 @@ impl Vm {
         chunk: &Chunk,
         limits: ExecutionLimits,
     ) -> JsResult<Value> {
+        self.execute_with_limits_and_globals(chunk, limits, None, Value::Undefined)
+    }
+
+    /// Executes `chunk` with persistent globals and a top-level receiver.
+    pub(crate) fn execute_with_globals_and_this(
+        &mut self,
+        chunk: &Chunk,
+        limits: ExecutionLimits,
+        globals: crate::runtime::GlobalState,
+        this_value: Value,
+    ) -> JsResult<Value> {
+        self.execute_with_limits_and_globals(chunk, limits, Some(globals), this_value)
+    }
+
+    fn execute_with_limits_and_globals(
+        &mut self,
+        chunk: &Chunk,
+        limits: ExecutionLimits,
+        globals: Option<crate::runtime::GlobalState>,
+        this_value: Value,
+    ) -> JsResult<Value> {
         log::debug!(
             "executing chunk ({} instructions, {} functions)",
             chunk.code.len(),
@@ -199,12 +253,14 @@ impl Vm {
         self.handlers.clear();
         self.frame = Frame {
             chunk: Arc::new(chunk.clone()),
-            this: Some(Value::Undefined),
+            this: Some(this_value),
             ..Frame::default()
         };
         self.steps_remaining = limits.step_limit;
         self.loop_iterations_remaining = limits.loop_iteration_limit;
         self.call_depth_limit = usize::try_from(limits.call_depth_limit).unwrap_or(usize::MAX);
+        self.globals = globals;
+        self.persistent_globals = self.globals.is_some();
         let result = self.run();
         match &result {
             Ok(_) => log::debug!("chunk finished with {} steps left", self.steps_remaining),
@@ -215,6 +271,8 @@ impl Vm {
         self.callers.clear();
         self.handlers.clear();
         self.frame = Frame::default();
+        self.globals = None;
+        self.persistent_globals = false;
         result
     }
 
@@ -551,12 +609,23 @@ impl Vm {
                     self.push(value);
                 }
                 Instruction::LoadThis => {
-                    let this = self.frame.this.clone().ok_or_else(|| {
-                        JsError::new(
+                    if let Some(this) = self.frame.this.clone() {
+                        self.push(this);
+                    } else if self.frame.method_without_receiver {
+                        return Err(JsError::new("`this` is not defined"));
+                    } else if self
+                        .frame
+                        .callee
+                        .as_ref()
+                        .and_then(Function::template)
+                        .is_some_and(|template| template.kind == CallableKind::DerivedConstructor)
+                    {
+                        return Err(JsError::new(
                             "Must call super constructor in derived class before accessing `this`",
-                        )
-                    })?;
-                    self.push(this);
+                        ));
+                    } else {
+                        self.push(Value::Undefined);
+                    }
                 }
                 Instruction::LoadArgument(index) => {
                     let argument = self
@@ -644,6 +713,23 @@ impl Vm {
                     let arguments = self.pop_arguments(count)?;
                     let callee = self.pop()?;
                     let receiver = self.pop()?;
+                    switched = self.call(callee, receiver, arguments, instruction_pointer)?;
+                }
+                Instruction::CallMethodNamed { count, name } => {
+                    let arguments = self.pop_arguments(count)?;
+                    let callee = self.pop()?;
+                    let receiver = self.pop()?;
+                    if !matches!(callee, Value::Function(_)) {
+                        let name = match chunk.constants.get(usize::from(name)) {
+                            Some(Value::String(name)) => name,
+                            _ => return Err(JsError::runtime("bytecode property name is invalid")),
+                        };
+                        return Err(JsError::with_context(
+                            JsErrorCategory::Runtime,
+                            format!("`object.{name}` is not a function"),
+                            "function call",
+                        ));
+                    }
                     switched = self.call(callee, receiver, arguments, instruction_pointer)?;
                 }
                 Instruction::New(count) => {
@@ -768,13 +854,23 @@ impl Vm {
                         .ok_or_else(|| JsError::runtime("bytecode scope underflow"))?;
                 }
                 Instruction::DeclareGlobal { slot, kind, name } => {
-                    self.declare(Target::Global, slot, kind, name, &chunk)?;
+                    if let Some(globals) = &self.globals {
+                        let name = self.binding_name(name, &chunk)?;
+                        globals.bytecode_declare(name, kind)?;
+                    } else {
+                        self.declare(Target::Global, slot, kind, name, &chunk)?;
+                    }
                 }
                 Instruction::DeclareLocal { slot, kind, name } => {
                     self.declare(Target::Local(0), slot, kind, name, &chunk)?;
                 }
                 Instruction::LoadGlobal { slot, name } => {
-                    let value = self.load(Target::Global, slot, name, &chunk)?;
+                    let value = if let Some(globals) = &self.globals {
+                        let name = self.binding_name(name, &chunk)?;
+                        globals.bytecode_load(name)?
+                    } else {
+                        self.load(Target::Global, slot, name, &chunk)?
+                    };
                     self.push(value);
                 }
                 Instruction::LoadLocal { depth, slot, name } => {
@@ -783,7 +879,12 @@ impl Vm {
                 }
                 Instruction::InitializeGlobal { slot, name } => {
                     let value = self.pop()?;
-                    self.initialize(Target::Global, slot, value, name, &chunk)?;
+                    if let Some(globals) = &self.globals {
+                        let name = self.binding_name(name, &chunk)?;
+                        globals.bytecode_initialize(name, value)?;
+                    } else {
+                        self.initialize(Target::Global, slot, value, name, &chunk)?;
+                    }
                 }
                 Instruction::InitializeLocal { depth, slot, name } => {
                     let value = self.pop()?;
@@ -791,7 +892,12 @@ impl Vm {
                 }
                 Instruction::StoreGlobal { slot, name } => {
                     let value = self.peek()?.clone();
-                    self.store(Target::Global, slot, value, name, &chunk)?;
+                    if let Some(globals) = &self.globals {
+                        let name = self.binding_name(name, &chunk)?;
+                        globals.bytecode_store(name, value)?;
+                    } else {
+                        self.store(Target::Global, slot, value, name, &chunk)?;
+                    }
                 }
                 Instruction::StoreLocal { depth, slot, name } => {
                     let value = self.peek()?.clone();
@@ -799,6 +905,12 @@ impl Vm {
                 }
                 Instruction::LoadUnresolved { name } => {
                     let name = self.binding_name(name, &chunk)?;
+                    if let Some(globals) = &self.globals
+                        && globals.bytecode_has(name)
+                    {
+                        self.push(globals.bytecode_load(name)?);
+                        continue;
+                    }
                     if let Some(value) = builtins::value(name) {
                         self.push(value);
                         continue;
@@ -807,6 +919,11 @@ impl Vm {
                 }
                 Instruction::StoreUnresolved { name } => {
                     let name = self.binding_name(name, &chunk)?;
+                    if let Some(globals) = &self.globals {
+                        let value = self.peek()?.clone();
+                        globals.bytecode_store(name, value)?;
+                        continue;
+                    }
                     return Err(JsError::new(format!("`{name}` is not defined")));
                 }
             }
@@ -878,6 +995,17 @@ impl Vm {
     ) -> JsResult<bool> {
         let Value::Function(function) = callee else {
             log::debug!("call target is not a function");
+            if let Some(name) = self
+                .globals
+                .as_ref()
+                .and_then(|globals| globals.bytecode_name_for_value(&callee))
+            {
+                return Err(JsError::with_context(
+                    JsErrorCategory::Runtime,
+                    format!("`{name}` is not a function"),
+                    "function call",
+                ));
+            }
             return Err(JsError::with_context(
                 JsErrorCategory::Runtime,
                 format!("`{callee}` is not a function"),
@@ -915,10 +1043,18 @@ impl Vm {
                 "function call",
             ));
         }
+        let method_without_receiver = template.kind == CallableKind::Function
+            && self
+                .globals
+                .as_ref()
+                .and_then(|globals| globals.host_global_name(&receiver))
+                .is_some_and(|name| name == "object");
         let call_receiver = if template.kind == CallableKind::Arrow {
-            function.lexical_this().unwrap_or(Value::Undefined)
+            Some(function.lexical_this().unwrap_or(Value::Undefined))
+        } else if template.kind == CallableKind::Function {
+            (!method_without_receiver).then_some(receiver)
         } else {
-            receiver
+            Some(receiver)
         };
         let captures = function
             .captures()
@@ -927,7 +1063,8 @@ impl Vm {
         self.enter(
             Frame {
                 chunk: Arc::clone(&template.chunk),
-                this: Some(call_receiver),
+                this: call_receiver,
+                method_without_receiver,
                 arguments,
                 callee: Some(function),
                 captures,
@@ -1065,7 +1202,11 @@ impl Vm {
             return Err(JsError::with_context(
                 crate::JsErrorCategory::Limit,
                 "Script exceeded the loop iteration limit",
-                "bytecode loop iteration",
+                if self.persistent_globals {
+                    "while loop iteration"
+                } else {
+                    "bytecode loop iteration"
+                },
             ));
         }
         self.loop_iterations_remaining -= 1;

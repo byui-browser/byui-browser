@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use html::NodeID;
-use js::{JsError, JsResult, Object, Value};
+use js::{JsError, JsResult, Object, ScriptEvaluator, Value};
 
 use crate::document::Document;
 use crate::element::{Element, element_object};
@@ -21,6 +21,7 @@ struct EventListener {
 #[derive(Debug, Default)]
 pub(crate) struct EventTarget {
     listeners: Vec<EventListener>,
+    pub(crate) evaluator: Option<ScriptEvaluator>,
 }
 
 pub(crate) type EventTargetRef = Arc<Mutex<EventTarget>>;
@@ -37,6 +38,10 @@ impl EventTarget {
 
 fn lock_event_target(target: &Mutex<EventTarget>) -> MutexGuard<'_, EventTarget> {
     target.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn event_evaluator(target: &EventTargetRef) -> Option<ScriptEvaluator> {
+    lock_event_target(target).evaluator.clone()
 }
 
 fn javascript_truthy(value: &Value) -> bool {
@@ -381,16 +386,38 @@ pub(crate) fn remove_event_listener_from_target(
 
 /// Calls one listener. Function listeners run with `this` bound to the
 /// event's current target; `handleEvent` runs with `this` bound to its object.
-fn invoke_event_listener(callback: &Value, event: &Object) -> JsResult<Value> {
+fn invoke_event_listener(
+    evaluator: Option<&ScriptEvaluator>,
+    callback: &Value,
+    event: &Object,
+) -> JsResult<Value> {
+    let current_target = event.get("currentTarget").unwrap_or(Value::Undefined);
     match callback {
-        Value::Function(callback) => callback.call_with_this(
-            event.get("currentTarget").unwrap_or(Value::Undefined),
-            &[Value::Object(event.clone())],
+        Value::Function(callback) => evaluator.map_or_else(
+            || callback.call_with_this(current_target.clone(), &[Value::Object(event.clone())]),
+            |evaluator| {
+                evaluator.call_with_this_reentrant(
+                    callback,
+                    current_target.clone(),
+                    &[Value::Object(event.clone())],
+                )
+            },
         ),
         Value::Object(callback) => match callback.get("handleEvent") {
-            Some(Value::Function(handle_event)) => handle_event.call_with_this(
-                Value::Object(callback.clone()),
-                &[Value::Object(event.clone())],
+            Some(Value::Function(handle_event)) => evaluator.map_or_else(
+                || {
+                    handle_event.call_with_this(
+                        Value::Object(callback.clone()),
+                        &[Value::Object(event.clone())],
+                    )
+                },
+                |evaluator| {
+                    evaluator.call_with_this_reentrant(
+                        &handle_event,
+                        Value::Object(callback.clone()),
+                        &[Value::Object(event.clone())],
+                    )
+                },
             ),
             _ => Err(JsError::new(
                 "event listener object has no handleEvent method",
@@ -409,6 +436,7 @@ pub(crate) fn dispatch_event_with_target(
 }
 
 fn invoke_listeners(
+    evaluator: Option<&ScriptEvaluator>,
     target: &EventTargetRef,
     event: &Object,
     event_type: &str,
@@ -455,7 +483,7 @@ fn invoke_listeners(
             "__passiveListener",
             Value::Boolean(listener.passive.unwrap_or(false)),
         );
-        if let Err(error) = invoke_event_listener(&listener.callback, event) {
+        if let Err(error) = invoke_event_listener(evaluator, &listener.callback, event) {
             log::warn!("{event_type} listener threw: {error}");
         }
         event.set("__passiveListener", Value::Boolean(false));
@@ -497,9 +525,18 @@ pub(crate) fn dispatch_event_target_with_target(
     event.set("eventPhase", Value::Number(2.0));
     event.set("__stopPropagation", Value::Boolean(false));
     event.set("__stopImmediatePropagation", Value::Boolean(false));
-    invoke_listeners(target, event, &event_type, target_object, true, 2.0);
+    let evaluator = event_evaluator(target);
+    invoke_listeners(
+        evaluator.as_ref(),
+        target,
+        event,
+        &event_type,
+        target_object,
+        true,
+        2.0,
+    );
     let handler_cancelled = if event_type == "error" {
-        invoke_window_error_handler(target_object, event)
+        invoke_window_error_handler(evaluator.as_ref(), target_object, event)
     } else {
         false
     };
@@ -507,7 +544,15 @@ pub(crate) fn dispatch_event_target_with_target(
         event.get("__stopImmediatePropagation"),
         Some(Value::Boolean(true))
     ) {
-        invoke_listeners(target, event, &event_type, target_object, false, 2.0);
+        invoke_listeners(
+            evaluator.as_ref(),
+            target,
+            event,
+            &event_type,
+            target_object,
+            false,
+            2.0,
+        );
     }
     event.set("eventPhase", Value::Number(0.0));
     event.set("currentTarget", Value::Null);
@@ -516,7 +561,11 @@ pub(crate) fn dispatch_event_target_with_target(
     ))
 }
 
-fn invoke_window_error_handler(target: &Object, event: &Object) -> bool {
+fn invoke_window_error_handler(
+    evaluator: Option<&ScriptEvaluator>,
+    target: &Object,
+    event: &Object,
+) -> bool {
     let Some(Value::Function(handler)) = target.get("onerror") else {
         return false;
     };
@@ -527,7 +576,12 @@ fn invoke_window_error_handler(target: &Object, event: &Object) -> bool {
         event.get("colno").unwrap_or(Value::Undefined),
         event.get("error").unwrap_or(Value::Undefined),
     ];
-    match handler.call(&arguments) {
+    match evaluator.map_or_else(
+        || handler.call_with_this(Value::Object(target.clone()), &arguments),
+        |evaluator| {
+            evaluator.call_with_this_reentrant(&handler, Value::Object(target.clone()), &arguments)
+        },
+    ) {
         Ok(Value::Boolean(true)) => true,
         Ok(_) => false,
         Err(error) => {
@@ -614,6 +668,7 @@ pub(crate) fn dispatch_event_at(
     let document_target = document.event_target.clone();
     if node.is_some() {
         invoke_listeners(
+            event_evaluator(&document_target).as_ref(),
             &document_target,
             event,
             &event_type,
@@ -628,17 +683,41 @@ pub(crate) fn dispatch_event_at(
             if let Some(element) = element_for_node(document, *ancestor) {
                 let target = event_target_for(document, Some(*ancestor));
                 let object = element_object(element, Arc::new(Mutex::new(document.clone())));
-                invoke_listeners(&target, event, &event_type, &object, true, 1.0);
+                invoke_listeners(
+                    event_evaluator(&document_target).as_ref(),
+                    &target,
+                    event,
+                    &event_type,
+                    &object,
+                    true,
+                    1.0,
+                );
             }
         }
         if let Some(target_node) = node {
             let target = event_target_for(document, Some(target_node));
-            invoke_listeners(&target, event, &event_type, target_object, true, 2.0);
+            invoke_listeners(
+                event_evaluator(&document_target).as_ref(),
+                &target,
+                event,
+                &event_type,
+                target_object,
+                true,
+                2.0,
+            );
             if !matches!(
                 event.get("__stopImmediatePropagation"),
                 Some(Value::Boolean(true))
             ) {
-                invoke_listeners(&target, event, &event_type, target_object, false, 2.0);
+                invoke_listeners(
+                    event_evaluator(&document_target).as_ref(),
+                    &target,
+                    event,
+                    &event_type,
+                    target_object,
+                    false,
+                    2.0,
+                );
             }
         }
         if matches!(event.get("bubbles"), Some(Value::Boolean(true)))
@@ -651,10 +730,19 @@ pub(crate) fn dispatch_event_at(
                 if let Some(element) = element_for_node(document, *ancestor) {
                     let target = event_target_for(document, Some(*ancestor));
                     let object = element_object(element, Arc::new(Mutex::new(document.clone())));
-                    invoke_listeners(&target, event, &event_type, &object, false, 3.0);
+                    invoke_listeners(
+                        event_evaluator(&document_target).as_ref(),
+                        &target,
+                        event,
+                        &event_type,
+                        &object,
+                        false,
+                        3.0,
+                    );
                 }
             }
             invoke_listeners(
+                event_evaluator(&document_target).as_ref(),
                 &document_target,
                 event,
                 &event_type,
@@ -664,7 +752,29 @@ pub(crate) fn dispatch_event_at(
             );
         }
     } else {
-        return dispatch_event_target(&document_target, target_object, arguments);
+        invoke_listeners(
+            event_evaluator(&document_target).as_ref(),
+            &document_target,
+            event,
+            &event_type,
+            target_object,
+            true,
+            2.0,
+        );
+        if !matches!(
+            event.get("__stopImmediatePropagation"),
+            Some(Value::Boolean(true))
+        ) {
+            invoke_listeners(
+                event_evaluator(&document_target).as_ref(),
+                &document_target,
+                event,
+                &event_type,
+                target_object,
+                false,
+                2.0,
+            );
+        }
     }
 
     event.set("eventPhase", Value::Number(0.0));

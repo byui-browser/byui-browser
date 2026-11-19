@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use css::{ComputedStyles, parse_stylesheet, style_document};
 use html::{DOMTokenList, HTMLDocument, NodeID, NodeKind};
-use js::{JsError, JsResult, Object, Realm, Value};
+use js::{JsError, JsResult, Object, Realm, ScriptEvaluator, Value};
 
 use crate::custom_elements::CustomElementRegistry;
 use crate::dom_exception::DomException;
@@ -129,6 +129,12 @@ fn register_shared_document(
     shared_document: Arc<Mutex<Document>>,
     location: Option<Object>,
 ) -> JsResult<()> {
+    let evaluator = realm.script_evaluator();
+    {
+        let document = shared_document.lock().unwrap();
+        document.event_target.lock().unwrap().evaluator = Some(evaluator.clone());
+    }
+    shared_document.lock().unwrap().event_evaluator = Some(evaluator);
     log::debug!(
         "registering document bindings ({} elements)",
         shared_document.lock().unwrap().elements.len()
@@ -161,7 +167,8 @@ fn register_shared_document(
     let custom_elements_registry = match custom_elements_registry {
         Some(registry) => registry,
         None => {
-            let registry = CustomElementRegistry::new().object();
+            let registry =
+                CustomElementRegistry::new_with_evaluator(Some(realm.script_evaluator())).object();
             realm.register_global_value("customElements", Value::Object(registry.clone()))?;
             registry
         }
@@ -329,14 +336,16 @@ fn register_shared_document(
             let child_id = NodeID::new(child_id as usize);
             let was_connected = append_document.lock().unwrap().is_connected(child_id);
             if was_connected {
-                invoke_lifecycle_callback(child, "disconnectedCallback");
+                let evaluator = append_document.lock().unwrap().event_evaluator.clone();
+                invoke_lifecycle_callback(child, "disconnectedCallback", evaluator.as_ref());
             }
             append_document
                 .lock()
                 .unwrap()
                 .append_child(child_id)
                 .map_err(|error| JsError::new(error.to_string()))?;
-            invoke_lifecycle_callback(child, "connectedCallback");
+            let evaluator = append_document.lock().unwrap().event_evaluator.clone();
+            invoke_lifecycle_callback(child, "connectedCallback", evaluator.as_ref());
             Ok(Value::Object(child.clone()))
         }),
     );
@@ -555,6 +564,7 @@ pub struct Document {
     /// The JavaScript `document` object and `customElements` registry this
     /// document is registered with, once a realm exposes it to scripts.
     script_bindings: Option<ScriptBindings>,
+    pub(crate) event_evaluator: Option<ScriptEvaluator>,
 }
 
 /// JavaScript objects that element bindings need to reach from a document:
@@ -596,6 +606,7 @@ impl Document {
             script_elements: HashMap::new(),
             focused: None,
             script_bindings: None,
+            event_evaluator: None,
         }
     }
 
@@ -630,6 +641,7 @@ impl Document {
             script_elements: HashMap::new(),
             focused: None,
             script_bindings: None,
+            event_evaluator: None,
         }
     }
 
@@ -1161,10 +1173,18 @@ pub(crate) fn script_element_object(
     };
     if let Some(attributes) = attributes {
         for (name, value) in attributes {
-            invoke_attribute_changed_callback(&object, &name, None, Some(value));
+            let evaluator = document.lock().unwrap().event_evaluator.clone();
+            invoke_attribute_changed_callback(
+                &object,
+                &name,
+                None,
+                Some(value),
+                evaluator.as_ref(),
+            );
         }
         if connected {
-            invoke_lifecycle_callback(&object, "connectedCallback");
+            let evaluator = document.lock().unwrap().event_evaluator.clone();
+            invoke_lifecycle_callback(&object, "connectedCallback", evaluator.as_ref());
         }
     }
     Ok(object)

@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use html::{Attribute, Namespace, NodeID};
-use js::{JsError, JsResult, Object, Value};
+use js::{JsError, JsResult, Object, ScriptEvaluator, Value};
 
 use crate::document::{Document, script_element_object};
 use crate::event::{add_event_listener_at, dispatch_event_at, remove_event_listener_at};
@@ -141,11 +141,17 @@ pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -
                 .unwrap()
                 .element_snapshot(node)
                 .and_then(|element| element.get_attribute(qualified_name).map(str::to_owned));
+            let evaluator = set_attribute_document
+                .lock()
+                .unwrap()
+                .event_evaluator
+                .clone();
             invoke_attribute_changed_callback(
                 &set_attribute_target,
                 qualified_name,
                 old_value,
                 new_value,
+                evaluator.as_ref(),
             );
             Ok(Value::Undefined)
         }),
@@ -162,14 +168,15 @@ pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -
             };
             let child_id = html::NodeID::new(child_id as usize);
             let was_connected = append_document.lock().unwrap().is_connected(child_id);
+            let evaluator = append_document.lock().unwrap().event_evaluator.clone();
             if was_connected {
-                invoke_lifecycle_callback(child, "disconnectedCallback");
+                invoke_lifecycle_callback(child, "disconnectedCallback", evaluator.as_ref());
             }
             append_document
                 .lock()
                 .unwrap()
                 .append_child_to(node, child_id)?;
-            invoke_lifecycle_callback(child, "connectedCallback");
+            invoke_lifecycle_callback(child, "connectedCallback", evaluator.as_ref());
             Ok(Value::Object(child.clone()))
         }),
     );
@@ -179,9 +186,14 @@ pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -
         "remove",
         Arc::new(move |_| {
             let was_connected = remove_document.lock().unwrap().is_connected(node);
+            let evaluator = remove_document.lock().unwrap().event_evaluator.clone();
             remove_document.lock().unwrap().remove(node);
             if was_connected {
-                invoke_lifecycle_callback(&remove_target, "disconnectedCallback");
+                invoke_lifecycle_callback(
+                    &remove_target,
+                    "disconnectedCallback",
+                    evaluator.as_ref(),
+                );
             }
             Ok(Value::Undefined)
         }),
@@ -545,18 +557,19 @@ fn mutate_tree(
             .map(|((object, _), was)| (was, connected(&document, object)))
             .collect::<Vec<_>>()
     };
+    let evaluator = document.lock().unwrap().event_evaluator.clone();
     for ((object, is_inserted), (was_connected, is_connected)) in
         tracked.into_iter().zip(connections)
     {
         if is_inserted {
             if was_connected {
-                invoke_lifecycle_callback(object, "disconnectedCallback");
+                invoke_lifecycle_callback(object, "disconnectedCallback", evaluator.as_ref());
             }
             if is_connected {
-                invoke_lifecycle_callback(object, "connectedCallback");
+                invoke_lifecycle_callback(object, "connectedCallback", evaluator.as_ref());
             }
         } else if was_connected && !is_connected {
-            invoke_lifecycle_callback(object, "disconnectedCallback");
+            invoke_lifecycle_callback(object, "disconnectedCallback", evaluator.as_ref());
         }
     }
     Ok(())
@@ -587,9 +600,18 @@ pub(super) fn thrown_exception(name: &str, message: &str) -> JsError {
     JsError::thrown(Value::Object(exception))
 }
 
-pub(crate) fn invoke_lifecycle_callback(element: &Object, name: &str) {
+pub(crate) fn invoke_lifecycle_callback(
+    element: &Object,
+    name: &str,
+    evaluator: Option<&ScriptEvaluator>,
+) {
     if let Some(Value::Function(callback)) = element.get(name) {
-        let _ = callback.call_with_this(Value::Object(element.clone()), &[]);
+        let _ = evaluator.map_or_else(
+            || callback.call_with_this(Value::Object(element.clone()), &[]),
+            |evaluator| {
+                evaluator.call_with_this_reentrant(&callback, Value::Object(element.clone()), &[])
+            },
+        );
     }
 }
 
@@ -598,6 +620,7 @@ pub(crate) fn invoke_attribute_changed_callback(
     name: &str,
     old_value: Option<String>,
     new_value: Option<String>,
+    evaluator: Option<&ScriptEvaluator>,
 ) {
     let Some(prototype) = element.prototype() else {
         return;
@@ -621,13 +644,20 @@ pub(crate) fn invoke_attribute_changed_callback(
     let Some(Value::Function(callback)) = element.get("attributeChangedCallback") else {
         return;
     };
-    let _ = callback.call_with_this(
-        Value::Object(element.clone()),
-        &[
-            Value::String(name.to_owned()),
-            old_value.map_or(Value::Null, Value::String),
-            new_value.map_or(Value::Null, Value::String),
-        ],
+    let arguments = [
+        Value::String(name.to_owned()),
+        old_value.map_or(Value::Null, Value::String),
+        new_value.map_or(Value::Null, Value::String),
+    ];
+    let _ = evaluator.map_or_else(
+        || callback.call_with_this(Value::Object(element.clone()), &arguments),
+        |evaluator| {
+            evaluator.call_with_this_reentrant(
+                &callback,
+                Value::Object(element.clone()),
+                &arguments,
+            )
+        },
     );
 }
 
