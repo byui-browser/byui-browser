@@ -370,11 +370,13 @@ impl Context<'_> {
                         node: *node,
                         style,
                         margin_start: edge(style.margin.left),
-                        padding_start: edge(style.padding.left),
+                        padding_start: (edge(style.padding.left) + style.borders.border_width.left),
                         padding_end: 0.0,
                         margin_end: 0.0,
-                        padding_top: style.padding.top.resolve_or_zero(cb_width),
-                        padding_bottom: style.padding.bottom.resolve_or_zero(cb_width),
+                        padding_top: (style.padding.top.resolve_or_zero(cb_width)
+                            + style.borders.border_width.top),
+                        padding_bottom: (style.padding.bottom.resolve_or_zero(cb_width)
+                            + style.borders.border_width.bottom),
                     });
                 }
                 InlineItem::End { end_edge } => {
@@ -383,7 +385,8 @@ impl Context<'_> {
                     };
                     let info = &mut prepared.boxes[index];
                     if *end_edge {
-                        info.padding_end = info.style.padding.right.resolve_or_zero(cb_width);
+                        info.padding_end = info.style.padding.right.resolve_or_zero(cb_width)
+                            + info.style.borders.border_width.right;
                         info.margin_end = info.style.margin.right.resolve_or_zero(cb_width);
                     }
                     prepared.pieces.push(Piece::End(index));

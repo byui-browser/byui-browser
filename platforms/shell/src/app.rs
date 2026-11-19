@@ -2125,6 +2125,19 @@ impl App {
     }
 
     fn left_mouse_input(&mut self, state: ElementState) {
+        let previous_tab = self.tab.elements.as_ref().map(ElementsPanel::tab);
+        if let Some(panel) = &mut self.tab.elements
+            && panel.dock_mouse(self.cursor, state == ElementState::Pressed)
+        {
+            let tab = panel.tab();
+            if previous_tab != Some(tab) {
+                self.select_dock_tab(tab);
+            }
+            self.page_press = false;
+            self.redraw();
+            return;
+        }
+
         if self.site_info_open
             && let Some(popup) = self.site_info_popup()
             && self.site_info_mouse_input(popup, state)
@@ -2642,6 +2655,19 @@ impl App {
         let Some(window) = &self.window else {
             return;
         };
+        if let Some(panel) = &mut self.tab.elements {
+            let dragged = panel.drag_to(x, y);
+            if let Some(icon) = panel.resize_cursor(Some((x, y))) {
+                window.set_cursor(icon);
+                self.cursor = Some((x, y));
+                self.tab.chrome.hovered = None;
+                if dragged {
+                    self.redraw();
+                }
+                return;
+            }
+            window.set_cursor(CursorIcon::Default);
+        }
         let scale = window.scale_factor();
         let width = window.inner_size().to_logical::<f64>(scale).width;
         // Leaving the inspector must repaint it once to clear row and
@@ -3117,6 +3143,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::Focused(false) => {
+                if let Some(panel) = &mut self.tab.elements {
+                    panel.dock_mouse(None, false);
+                }
                 self.dismiss_context_menu();
                 self.dismiss_site_info();
             }
@@ -3997,6 +4026,36 @@ mod tests {
     }
 
     #[test]
+    fn narrow_dock_selector_switches_tabs_and_runs_compatibility_audit() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.show_elements();
+        app.tab.elements.as_mut().unwrap().resize(360.0, 600.0);
+        app.cursor = Some(
+            app.tab
+                .elements
+                .as_ref()
+                .unwrap()
+                .tab_center(DockTab::Elements),
+        );
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        app.cursor = Some(
+            app.tab
+                .elements
+                .as_ref()
+                .unwrap()
+                .tab_choice_center(DockTab::Compatibility),
+        );
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        let panel = app.tab.elements.as_ref().unwrap();
+        assert_eq!(panel.tab(), DockTab::Compatibility);
+        assert!(matches!(panel.compat.state(), CompatState::Ready(_)));
+        assert!(!app.page_press);
+    }
+
+    #[test]
     fn dock_tabs_switch_on_click_and_audit_only_once() {
         let mut app = app();
         app.ensure_welcome_loaded();
@@ -4006,7 +4065,13 @@ mod tests {
         assert_eq!(panel.tab(), DockTab::Elements);
         assert_eq!(*panel.compat.state(), CompatState::Idle);
         // The second header tab starts after the 84px Elements tab.
-        app.cursor = Some((8.0 + 6.0 + 84.0 + 40.0, 340.0));
+        app.cursor = Some(
+            app.tab
+                .elements
+                .as_ref()
+                .unwrap()
+                .tab_center(DockTab::Compatibility),
+        );
         app.left_mouse_input(ElementState::Pressed);
         app.left_mouse_input(ElementState::Released);
         assert!(
@@ -4018,7 +4083,13 @@ mod tests {
             DockTab::Compatibility
         );
         let first = app.tab.audit_id;
-        app.cursor = Some((8.0 + 6.0 + 20.0, 340.0));
+        app.cursor = Some(
+            app.tab
+                .elements
+                .as_ref()
+                .unwrap()
+                .tab_center(DockTab::Elements),
+        );
         app.left_mouse_input(ElementState::Pressed);
         app.left_mouse_input(ElementState::Released);
         assert_eq!(app.tab.elements.as_ref().unwrap().tab(), DockTab::Elements);
@@ -4065,7 +4136,7 @@ mod tests {
             if escape {
                 app.key_pressed(&Key::Named(NamedKey::Escape));
             } else {
-                app.cursor = Some((770.0, 340.0));
+                app.cursor = Some(app.tab.elements.as_ref().unwrap().close_center());
                 app.left_mouse_input(ElementState::Pressed);
                 assert!(app.tab.elements.is_some());
                 app.left_mouse_input(ElementState::Released);

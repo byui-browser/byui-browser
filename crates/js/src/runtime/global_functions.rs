@@ -1,5 +1,5 @@
 //! Numeric global functions: `parseInt`, `parseFloat`, `isNaN`, and
-//! `isFinite` (ECMAScript §19.2).
+//! `isFinite`, plus `encodeURIComponent` (ECMAScript §19.2).
 //!
 //! Arguments are converted the way the specification requires: the parsing
 //! functions apply `ToString` (after `ToPrimitive`) and the predicates apply
@@ -20,9 +20,15 @@ use crate::Value;
 use crate::lexer::is_js_whitespace;
 
 /// The global function names this module provides.
-const NAMES: &[&str] = &["parseInt", "parseFloat", "isNaN", "isFinite"];
+const NAMES: &[&str] = &[
+    "parseInt",
+    "parseFloat",
+    "isNaN",
+    "isFinite",
+    "encodeURIComponent",
+];
 
-/// Installs `parseInt`, `parseFloat`, `isNaN`, and `isFinite` as globals.
+/// Installs numeric globals and `encodeURIComponent`.
 pub(super) fn install(state: &super::GlobalState) {
     for name in NAMES {
         if let Some(function) = value(name) {
@@ -54,9 +60,33 @@ pub(super) fn value(name: &str) -> Option<Value> {
             "isFinite",
             Arc::new(|args| Ok(Value::Boolean(argument_number(args).is_finite()))),
         ),
+        "encodeURIComponent" => Function::from_host(
+            "encodeURIComponent",
+            Arc::new(|args| Ok(Value::String(encode_uri_component(&argument_string(args))))),
+        ),
         _ => return None,
     };
     Some(Value::Function(function))
+}
+
+/// Encodes a URI component as uppercase hexadecimal escapes of UTF-8 bytes.
+///
+/// Only ASCII letters, digits, and `-_.!~*'()` pass through. Rust strings
+/// cannot contain lone UTF-16 surrogates, so the ECMAScript URIError case
+/// cannot reach this function; the lexer rejects those inputs earlier.
+fn encode_uri_component(input: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut output = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
+            output.push(char::from(byte));
+        } else {
+            output.push('%');
+            output.push(char::from(HEX[usize::from(byte >> 4)]));
+            output.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+    }
+    output
 }
 
 /// `ToString(args[0])`, where a missing argument is `undefined`.

@@ -259,16 +259,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "browser-macos"
-version = "0.1.0"
-dependencies = [
- "browser-shell",
- "objc2 0.6.5",
- "objc2-app-kit 0.3.2",
- "winit",
-]
-
-[[package]]
 name = "browser-shell"
 version = "0.1.0"
 dependencies = [
@@ -318,6 +308,16 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+
+[[package]]
+name = "byui-browser"
+version = "0.1.0"
+dependencies = [
+ "browser-shell",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "winit",
+]
 
 [[package]]
 name = "byui-browser-windows"

@@ -1,6 +1,6 @@
 //! Window, toolbar, and page rendering shared by the native shells.
 //!
-//! The platform crates (`browser-macos`, `browser-linux`,
+//! The platform crates (`byui-browser`, `browser-linux`,
 //! `byui-browser-windows`) stay thin: each
 //! describes how its window should look through `Platform` and calls `run`.
 //! Everything else, from the winit event loop to the software-painted

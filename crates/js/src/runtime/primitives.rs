@@ -4,6 +4,8 @@
 //! `length` and character indices). Property reads fall through to
 //! [`string_prototype`] or [`number_prototype`], which hold the common methods.
 //! Method calls receive the primitive as `this` through [`super::with_host_this`].
+//! `Number.isNaN` and `Number.isFinite` inspect numeric primitives without
+//! coercing other values, unlike the global `isNaN` and `isFinite` functions.
 
 use std::sync::{Arc, OnceLock};
 
@@ -86,7 +88,31 @@ fn number_constructor() -> Function {
     );
     function.set_own("prototype", Value::Object(number_prototype()));
     number_prototype().set_read_only("constructor", Value::Function(function.clone()));
+    // These predicates deliberately do not apply ToNumber.
+    for (name, predicate) in [
+        ("isNaN", f64::is_nan as fn(f64) -> bool),
+        ("isFinite", f64::is_finite as fn(f64) -> bool),
+        ("isSafeInteger", is_safe_integer as fn(f64) -> bool),
+    ] {
+        let method = Function::from_host(
+            name,
+            Arc::new(move |args| {
+                Ok(Value::Boolean(
+                    matches!(args.first(), Some(Value::Number(value)) if predicate(*value)),
+                ))
+            }),
+        );
+        method.set_own("length", Value::Number(1.0));
+        function.set_own(name, Value::Function(method));
+    }
+
     function
+}
+
+// The largest integer exactly and uniquely representable by an IEEE-754
+// double is 2^53 - 1. This predicate never coerces non-number arguments.
+fn is_safe_integer(value: f64) -> bool {
+    value.is_finite() && value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_991.0
 }
 
 /// Reads a property of a string primitive: `length`, a character index, or a

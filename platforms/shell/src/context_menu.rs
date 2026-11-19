@@ -5,6 +5,31 @@ use tiny_skia::{PathBuilder, Pixmap, Rect, Transform};
 
 use crate::toolbar;
 
+/// Paints a broad, softly fading menu shadow in logical pixels.
+///
+/// The same neutral shadow works over both light and dark content. Half-pixel
+/// layers approximate a blurred edge without a tight, dark outline.
+pub(crate) fn draw_menu_shadow(frame: &mut Pixmap, rect: Option<Rect>, radius: f32, scale: f32) {
+    let Some(rect) = rect else { return };
+    let transform = Transform::from_scale(scale, scale);
+    for layer in (1..=48).rev() {
+        let spread = layer as f32 * 0.5;
+        // Integrating these fading layers produces a smooth falloff, with
+        // a faint ambient shadow and only a slight downward offset.
+        let alpha = 0.004 * (-(spread * spread) / 128.0).exp();
+        if let Some(path) = toolbar::rounded_rect(
+            rect.x() - spread,
+            rect.y() - spread + 2.0,
+            rect.width() + 2.0 * spread,
+            rect.height() + 2.0 * spread,
+            radius + spread,
+        ) {
+            let color = tiny_skia::Color::from_rgba(0.0, 0.0, 0.0, alpha).unwrap();
+            toolbar::fill(frame, &path, color, transform);
+        }
+    }
+}
+
 /// Window-wide appearance choice, independent of the active tab.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Appearance {
@@ -211,21 +236,7 @@ impl ContextMenu {
             self.height as f32,
         );
 
-        // tiny-skia has no blur: stack translucent rounded rects that grow
-        // outward and drop slightly, approximating a soft drop shadow.
-        let shadow_alpha = if dark { 12 } else { 4 };
-        for spread in (1..=6).rev() {
-            let spread = spread as f32;
-            if let Some(path) = toolbar::rounded_rect(
-                x - spread,
-                y - spread + 3.0,
-                w + 2.0 * spread,
-                h + 2.0 * spread,
-                RADIUS + spread,
-            ) {
-                toolbar::fill(frame, &path, rgba(0, 0, 0, shadow_alpha), transform);
-            }
-        }
+        draw_menu_shadow(frame, Rect::from_xywh(x, y, w, h), RADIUS, s);
         let (surface, border, separator) = if dark {
             (palette.panel, palette.panel_border, rgba(255, 255, 255, 22))
         } else {

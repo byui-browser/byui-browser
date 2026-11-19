@@ -12,8 +12,8 @@ use crate::{BorderRadius, BoxShadow, Edges, ImageKey, Rect};
 
 /// Paint-relevant computed values for a box or inline box fragment.
 ///
-/// Colors, corner radii, and outer box shadows are painted today; borders,
-/// inset shadows, and other decorations are not supported yet.
+/// Colors, borders, corner radii, and outer box shadows are painted today;
+/// Inset shadows, and other decorations are not supported yet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoxStyle {
     /// The background color, or `None` when it is transparent or unsupported.
@@ -23,6 +23,13 @@ pub struct BoxStyle {
     /// The computed `border-*-radius` values. The background is clipped to
     /// the rounded border box; resolve them with [`BorderRadius::resolve`].
     pub border_radius: BorderRadius,
+    /// Used border widths in CSS pixels, zero for hidden or absent borders.
+    pub border_width: Edges,
+    /// Per-side border colors, with currentcolor resolved.
+    pub border_color: crate::Sides<CssColor>,
+    /// Per-side CSS styles. Dashed, dotted, and double are painted;
+    /// relief styles currently use a solid fill. Border corners are square.
+    pub border_style: crate::Sides<String>,
     /// The computed `box-shadow` list, first (topmost) shadow first; empty
     /// for `none`. Shadows follow the rounded border box.
     pub box_shadow: Arc<[BoxShadow]>,
@@ -35,6 +42,9 @@ impl Default for BoxStyle {
             text_color: css::user_agent_default_color("color")
                 .expect("user-agent stylesheet must define html color"),
             border_radius: BorderRadius::default(),
+            border_width: Edges::default(),
+            border_color: crate::Sides::from_array([css::parse_color("black").unwrap(); 4]),
+            border_style: crate::Sides::from_array(std::array::from_fn(|_| "none".to_owned())),
             box_shadow: Arc::from(Vec::new()),
         }
     }
@@ -110,8 +120,7 @@ pub struct LayoutBox {
     /// Used margin widths. Vertical margins are the box's own margins before
     /// collapsing.
     pub margin: Edges,
-    /// Used padding widths. Borders are not supported yet, so the border box
-    /// and the padding box coincide.
+    /// Used padding widths in CSS pixels.
     pub padding: Edges,
     /// Paint-relevant computed values.
     pub style: BoxStyle,
@@ -130,13 +139,19 @@ pub struct LayoutBox {
 }
 
 impl LayoutBox {
-    /// The content box: the border box minus the padding.
+    /// The content box: the border box minus borders and padding.
     pub fn content_rect(&self) -> Rect {
         Rect {
-            x: self.rect.x + self.padding.left,
-            y: self.rect.y + self.padding.top,
-            width: self.rect.width - self.padding.horizontal(),
-            height: self.rect.height - self.padding.vertical(),
+            x: self.rect.x + self.padding.left + self.style.border_width.left,
+            y: self.rect.y + self.padding.top + self.style.border_width.top,
+            width: (self.rect.width
+                - self.padding.horizontal()
+                - self.style.border_width.horizontal())
+            .max(0.0),
+            height: (self.rect.height
+                - self.padding.vertical()
+                - self.style.border_width.vertical())
+            .max(0.0),
         }
     }
 

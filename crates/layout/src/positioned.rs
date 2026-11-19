@@ -354,7 +354,7 @@ impl Context<'_> {
         let block = &pending.block;
         let style = &block.style;
         let basis = Some(cb.width);
-        let padding = style.padding.map(|value| value.resolve_or_zero(basis));
+        let padding = style.outer_edges(basis);
         let inset_left = style.inset.left.resolve(Some(cb.width));
         let inset_right = style.inset.right.resolve(Some(cb.width));
         let inset_top = style.inset.top.resolve(Some(cb.height));

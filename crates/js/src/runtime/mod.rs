@@ -193,6 +193,7 @@ fn read_member(target: &Value, key: &str) -> JsResult<Value> {
         Value::Array(target) => Ok(get_array_property(target, key)),
         Value::String(text) => primitives::get_string_property(text, key),
         Value::Number(_) => primitives::get_number_property(key),
+        Value::Function(function) => Ok(function.get_own(key).unwrap_or(Value::Undefined)),
         target => Err(non_object(target, "read", key, "property access")),
     }
 }
@@ -222,6 +223,7 @@ fn write_member(target: &Value, key: String, value: Value) -> JsResult<()> {
     match target {
         Value::Object(target) => target.set_property(key, value),
         Value::Array(target) => set_array_property(target, &key, value),
+        Value::Function(function) if function.set_own(&key, value.clone()) => Ok(()),
         target => Err(non_object(target, "set", &key, "property assignment")),
     }
 }

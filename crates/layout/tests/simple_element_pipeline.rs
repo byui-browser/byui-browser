@@ -90,3 +90,46 @@ fn nested_element_text_is_painted_once() {
 
     assert_eq!(text_items, vec!["Hi"]);
 }
+
+#[test]
+fn css_borders_size_boxes_and_reach_screen_pixels() {
+    let document = parse_raw_html("<html><body><div></div></body></html>".to_owned());
+    let styles = css::style_document(
+        &document,
+        &[css::parse_stylesheet(
+            "body { margin: 0 } div { width: 30px; height: 24px; box-sizing: border-box;
+         background: white; background-color: white; color: red; border: 2px solid;
+         border-top: 3px solid blue; border-right-color: green;
+         border-bottom: 4px solid black; border-left: 5px solid red; }",
+        )],
+    );
+    let tree = layout_document(
+        &document,
+        &styles,
+        Size {
+            width: 50.0,
+            height: 50.0,
+        },
+        &BitmapFont,
+    );
+    let list = paint::paint_document(&tree);
+    let frame = render::Compositor::new(50, 50).compose_paint(&list);
+    let pixel = |x: usize, y: usize| &frame.pixels[(y * 50 + x) * 4..(y * 50 + x) * 4 + 4];
+    assert_eq!(pixel(15, 1), [0, 0, 255, 255]);
+    assert_eq!(pixel(29, 10), [0, 128, 0, 255]);
+    assert_eq!(pixel(15, 23), [0, 0, 0, 255]);
+    assert_eq!(pixel(2, 10), [255, 0, 0, 255]);
+    assert_eq!(pixel(15, 10), [255, 255, 255, 255]);
+    assert_eq!(pixel(31, 10), [255, 255, 255, 255]);
+    let element = tree
+        .root
+        .children
+        .iter()
+        .flat_map(|b| &b.children)
+        .flat_map(|b| &b.children)
+        .next()
+        .unwrap();
+    assert_eq!(element.rect.width, 30.0);
+    assert_eq!(element.content_rect().width, 23.0);
+    assert_eq!(element.content_rect().height, 17.0);
+}

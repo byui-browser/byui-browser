@@ -109,6 +109,9 @@ fn paint(
                             color.into(),
                         ));
                     }
+                    if visible(&layout_box.rect) {
+                        items.extend(borders(scrolled(layout_box.rect), &layout_box.style));
+                    }
                 }
             },
             PaintItem::InlineBox(inline) => {
@@ -125,6 +128,9 @@ fn paint(
                         &inline.style,
                         color.into(),
                     ));
+                }
+                if visible(&inline.rect) {
+                    items.extend(borders(scrolled(inline.rect), &inline.style));
                 }
             }
             PaintItem::Text(text) => {
@@ -251,6 +257,105 @@ fn shadows(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<Shadow> {
         .collect()
 }
 
+// Square border strips. Patterns are anchored to the outer edge of each side.
+fn borders(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<DisplayItem> {
+    let w = style.border_width;
+    let mut items = Vec::new();
+    for (r, color, line, horizontal) in [
+        (
+            layout::Rect {
+                height: w.top.min(rect.height),
+                ..rect
+            },
+            style.border_color.top,
+            &style.border_style.top,
+            true,
+        ),
+        (
+            layout::Rect {
+                x: rect.right() - w.right.min(rect.width),
+                width: w.right.min(rect.width),
+                ..rect
+            },
+            style.border_color.right,
+            &style.border_style.right,
+            false,
+        ),
+        (
+            layout::Rect {
+                y: rect.bottom() - w.bottom.min(rect.height),
+                height: w.bottom.min(rect.height),
+                ..rect
+            },
+            style.border_color.bottom,
+            &style.border_style.bottom,
+            true,
+        ),
+        (
+            layout::Rect {
+                width: w.left.min(rect.width),
+                ..rect
+            },
+            style.border_color.left,
+            &style.border_style.left,
+            false,
+        ),
+    ] {
+        let thickness = if horizontal { r.height } else { r.width };
+        let length = if horizontal { r.width } else { r.height };
+        if thickness <= 0.0 || length <= 0.0 {
+            continue;
+        }
+        let mut fill = |rect| {
+            items.push(DisplayItem::FillRect {
+                rect,
+                color: color.into(),
+            })
+        };
+        if line == "dashed" || line == "dotted" {
+            let dash = thickness * if line == "dashed" { 3.0 } else { 1.0 };
+            let mut offset = 0.0;
+            while offset < length {
+                let size = dash.min(length - offset);
+                fill(if horizontal {
+                    layout::Rect {
+                        x: r.x + offset,
+                        width: size,
+                        ..r
+                    }
+                } else {
+                    layout::Rect {
+                        y: r.y + offset,
+                        height: size,
+                        ..r
+                    }
+                });
+                offset += dash * 2.0;
+            }
+        } else if line == "double" && thickness >= 3.0 {
+            let third = thickness / 3.0;
+            for offset in [0.0, thickness - third] {
+                fill(if horizontal {
+                    layout::Rect {
+                        y: r.y + offset,
+                        height: third,
+                        ..r
+                    }
+                } else {
+                    layout::Rect {
+                        x: r.x + offset,
+                        width: third,
+                        ..r
+                    }
+                });
+            }
+        } else {
+            fill(r);
+        }
+    }
+    items
+}
+
 /// The background fill for a box's border box `rect`, rounded by its
 /// `border-radius` when that is non-zero.
 fn background(rect: layout::Rect, style: &layout::BoxStyle, color: Color) -> DisplayItem {
@@ -296,6 +401,31 @@ mod tests {
             &TestFont,
         );
         paint_document(&tree)
+    }
+
+    #[test]
+    fn patterned_and_partial_borders_paint_supported_geometry() {
+        for (line, expected) in [
+            ("solid", 4),
+            ("inset", 4),
+            ("double", 8),
+            ("dashed", 8),
+            ("dotted", 24),
+        ] {
+            let list = paint(
+                "<div></div>",
+                &format!(
+                    "body {{ margin: 0 }} div {{ width: 30px; height: 30px; border: 3px {line} red; border-radius: 8px }}"
+                ),
+            );
+            let strips = list.items.iter().filter(|item| matches!(item, DisplayItem::FillRect { color, .. } if *color == Color::from(css::parse_color("red").unwrap()))).count();
+            assert_eq!(strips, expected, "{line}");
+        }
+        let list = paint(
+            "<div></div>",
+            "div { border: 4px solid red; border-style: none }",
+        );
+        assert!(!list.items.iter().any(|item| matches!(item, DisplayItem::FillRect { color, .. } if *color == Color::from(css::parse_color("red").unwrap()))));
     }
 
     #[test]
