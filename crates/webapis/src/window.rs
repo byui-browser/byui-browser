@@ -57,6 +57,13 @@ struct WindowHashchangeState {
     handler: Option<Function>,
 }
 
+/// Per-Window state for the `scroll` event handler attribute.
+#[derive(Default)]
+struct WindowScrollState {
+    /// The current `window.onscroll` event handler, if any.
+    handler: Option<Function>,
+}
+
 /// Per-Window state for the `resize` event handler attribute.
 #[derive(Default)]
 struct WindowResizeState {
@@ -815,6 +822,7 @@ fn register_window_object(
     let event_target: EventTargetRef = Arc::new(Mutex::new(EventTarget::default()));
     let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
     let load_state = Arc::new(Mutex::new(WindowLoadState::default()));
+    let scroll_state = Arc::new(Mutex::new(WindowScrollState::default()));
     let resize_state = Arc::new(Mutex::new(WindowResizeState::default()));
     let click_state = Arc::new(Mutex::new(WindowClickState::default()));
     let performance = Object::new();
@@ -1094,6 +1102,74 @@ fn register_window_object(
             Ok(())
         })),
     );
+    // CSSOM View's `window.onscroll` is an event handler IDL attribute. Keep
+    // one stable listener so it participates in registration order with
+    // `addEventListener("scroll", ...)` listeners.
+    let onscroll_listener = {
+        let window = window.clone();
+        let scroll_state = Arc::clone(&scroll_state);
+        Function::from_host(
+            "onscroll",
+            Arc::new(move |arguments| {
+                let handler = scroll_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .handler
+                    .clone();
+                match handler {
+                    Some(handler) => {
+                        handler.call_with_this(Value::Object(window.clone()), arguments)
+                    }
+                    None => Ok(Value::Undefined),
+                }
+            }),
+        )
+    };
+    let scroll_state_for_get = Arc::clone(&scroll_state);
+    let scroll_state_for_set = Arc::clone(&scroll_state);
+    let onscroll_event_target = event_target.clone();
+    window.define_accessor(
+        "onscroll",
+        Arc::new(move || {
+            let state = scroll_state_for_get
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(state.handler.clone().map_or(Value::Null, Value::Function))
+        }),
+        Some(Arc::new(move |value| {
+            let handler = match value {
+                Value::Null | Value::Undefined => None,
+                Value::Function(handler) => Some(handler),
+                _ => return Err(type_error("window.onscroll must be a function or null")),
+            };
+            let had_handler = {
+                let mut state = scroll_state_for_set
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let had_handler = state.handler.is_some();
+                state.handler = handler.clone();
+                had_handler
+            };
+            let listener_arguments = [
+                Value::String("scroll".into()),
+                Value::Function(onscroll_listener.clone()),
+            ];
+            match (had_handler, handler.is_some()) {
+                (false, true) => {
+                    add_event_listener_to_target(
+                        &onscroll_event_target,
+                        &listener_arguments,
+                        "window",
+                    )?;
+                }
+                (true, false) => {
+                    remove_event_listener_from_target(&onscroll_event_target, &listener_arguments)?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })),
+    );
     // `window.onresize` is an event handler IDL attribute. Keep its handler
     // in private state and expose one stable event listener so it participates
     // in Window listener ordering.
@@ -1159,7 +1235,6 @@ fn register_window_object(
             Ok(())
         })),
     );
-
     // `window.onclick` is an event handler IDL attribute. Keep its handler
     // in private state and expose one stable bubble-phase listener so it
     // participates in Window listener ordering.
@@ -1660,6 +1735,21 @@ fn register_window_object(
         }),
     );
 
+    let scroll_window_event_target = event_target.clone();
+    let scroll_window = window.clone();
+    window.set_method(
+        "__dispatchScroll",
+        Arc::new(move |_| {
+            let event = event_object("scroll".into(), false, false);
+            dispatch_event_target(
+                &scroll_window_event_target,
+                &scroll_window,
+                &[Value::Object(event)],
+            )?;
+            Ok(Value::Undefined)
+        }),
+    );
+
     let messages_for_pump = Arc::clone(&messages);
     let microtasks_for_message = Arc::clone(&microtasks);
     let evaluator_for_message = evaluator.clone();
@@ -2149,6 +2239,23 @@ pub fn run_window_hashchange_events(window: &Object) -> JsResult<usize> {
         )),
         Err(error) => Err(error),
     }
+}
+
+/// Dispatches a viewport `scroll` event on a Window and runs its microtask
+/// checkpoint.
+///
+/// Browser integrations should call this after the viewport's scroll offset
+/// changes. The event is non-bubbling and non-cancelable, as required by
+/// CSSOM View. The return value is `Ok(())` after all synchronous listeners
+/// and queued microtasks have run.
+pub fn dispatch_window_scroll(window: &Object) -> JsResult<()> {
+    let Some(Value::Function(dispatch)) = window.get("__dispatchScroll") else {
+        return Err(JsError::runtime(
+            "window scroll dispatcher is not installed",
+        ));
+    };
+    dispatch.call(&[])?;
+    run_window_microtasks(window).map(|_| ())
 }
 
 /// Runs the pending `window.requestAnimationFrame()` callbacks for one frame.
