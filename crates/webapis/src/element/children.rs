@@ -106,7 +106,7 @@ fn element_children(document: &Arc<Mutex<Document>>, parent: NodeID) -> Vec<Node
     let Some(source) = document.html_document() else {
         return Vec::new();
     };
-    let Some(node) = source.node(parent) else {
+    let Some(node) = source.get_node(parent) else {
         return Vec::new();
     };
     node.get_children()
@@ -114,7 +114,7 @@ fn element_children(document: &Arc<Mutex<Document>>, parent: NodeID) -> Vec<Node
         .copied()
         .filter(|&child| {
             source
-                .node(child)
+                .get_node(child)
                 .is_some_and(|child| matches!(child.get_kind(), NodeKind::Element(_)))
         })
         .collect()
@@ -138,7 +138,8 @@ fn named_child(document: &Arc<Mutex<Document>>, parent: NodeID, name: &str) -> O
     let document = document.lock().unwrap();
     let source = document.html_document()?;
     children.into_iter().find(|&child| {
-        let Some(NodeKind::Element(data)) = source.node(child).map(|node| node.get_kind()) else {
+        let Some(NodeKind::Element(data)) = source.get_node(child).map(|node| node.get_kind())
+        else {
             return false;
         };
         data.get_attributes().iter().any(|attribute| {

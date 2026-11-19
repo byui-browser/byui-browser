@@ -129,7 +129,7 @@ fn parent_text_align(
     node: NodeID,
 ) -> crate::style::TextAlign {
     let mut current = document
-        .nodes
+        .get_nodes()
         .get(node.get())
         .and_then(|node| node.get_parent());
     while let Some(ancestor) = current {
@@ -145,7 +145,7 @@ fn parent_text_align(
             }
         }
         current = document
-            .nodes
+            .get_nodes()
             .get(ancestor.get())
             .and_then(|node| node.get_parent());
     }
@@ -172,7 +172,7 @@ impl StyleMap {
                 )
             })
             .unwrap_or(css::values::MEDIUM_FONT_SIZE);
-        let resolved: Vec<Option<Rc<ComputedStyle>>> = (0..document.nodes.len())
+        let resolved: Vec<Option<Rc<ComputedStyle>>> = (0..document.get_nodes_count())
             .map(|index| {
                 let node = NodeID::new(index);
                 let declarations = styles.declarations_for(node)?;
@@ -241,13 +241,13 @@ impl StyleMap {
 /// Returns the document element: the first element child of the document.
 pub(crate) fn root_element(document: &HTMLDocument) -> Option<NodeID> {
     document
-        .node(document.root)?
+        .get_node(*document.get_root())?
         .get_children()
         .iter()
         .copied()
         .find(|child| {
             matches!(
-                document.node(*child).map(|node| node.get_kind()),
+                document.get_node(*child).map(|node| node.get_kind()),
                 Some(NodeKind::Element(_))
             )
         })
@@ -276,7 +276,7 @@ pub(crate) fn build_initial_containing_block(
     }
     let style = Rc::clone(styles.initial());
     let children = document
-        .node(document.root)
+        .get_node(*document.get_root())
         .map(|node| node.get_children().as_slice())
         .unwrap_or_default();
     let block = BlockBox {
@@ -329,7 +329,7 @@ struct Builder<'a> {
 impl Builder<'_> {
     /// The tag name of an element node, or `""` for other nodes.
     fn tag(&self, node: NodeID) -> &str {
-        match self.document.node(node).map(|node| node.get_kind()) {
+        match self.document.get_node(node).map(|node| node.get_kind()) {
             Some(NodeKind::Element(element)) => element.get_name(),
             _ => "",
         }
@@ -350,7 +350,7 @@ impl Builder<'_> {
         );
         let children = self
             .document
-            .node(node)
+            .get_node(node)
             .map(|node| node.get_children().as_slice())
             .unwrap_or_default();
         BuildStats::bump(&self.stats.boxes);
@@ -376,7 +376,7 @@ impl Builder<'_> {
     /// The form control `node` is, which gives its `auto` sizes a default;
     /// `None` for other nodes.
     fn form_control_sizing(&self, node: NodeID) -> Option<FormControl> {
-        match self.document.node(node).map(|node| node.get_kind()) {
+        match self.document.get_node(node).map(|node| node.get_kind()) {
             Some(NodeKind::Element(element)) => {
                 FormControl::for_element(self.document, node, element)
             }
@@ -556,7 +556,7 @@ impl Builder<'_> {
         levels: &mut Vec<Level>,
         open_inlines: &mut Vec<(NodeID, Rc<ComputedStyle>)>,
     ) {
-        let Some(dom_node) = self.document.node(node) else {
+        let Some(dom_node) = self.document.get_node(node) else {
             return;
         };
         match dom_node.get_kind() {
@@ -669,7 +669,7 @@ impl Builder<'_> {
                         outside: DisplayOutside::Block,
                         ..
                     } => {
-                        let is_root = dom_node.get_parent() == Some(self.document.root)
+                        let is_root = dom_node.get_parent() == Some(*self.document.get_root())
                             && root_element(self.document) == Some(node);
                         split_inlines_around(
                             self.block_box(node, style, is_root),
@@ -744,9 +744,9 @@ impl Builder<'_> {
             ("svg", html::Namespace::Svg) => {
                 let nested = self
                     .document
-                    .node(node)
+                    .get_node(node)
                     .and_then(|dom_node| dom_node.get_parent())
-                    .and_then(|parent| self.document.node(parent))
+                    .and_then(|parent| self.document.get_node(parent))
                     .is_some_and(|parent| {
                         matches!(
                             parent.get_kind(),
@@ -867,12 +867,12 @@ impl Builder<'_> {
                 let mut text = String::new();
                 for child in self
                     .document
-                    .node(node)
+                    .get_node(node)
                     .map(|dom_node| dom_node.get_children().as_slice())
                     .unwrap_or_default()
                 {
                     if let Some(NodeKind::Text(data)) =
-                        self.document.node(*child).map(|child| child.get_kind())
+                        self.document.get_node(*child).map(|child| child.get_kind())
                     {
                         text.push_str(data);
                     }

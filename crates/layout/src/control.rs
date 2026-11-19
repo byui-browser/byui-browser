@@ -107,11 +107,11 @@ impl FormControl {
 /// Appends the text of every `<option>` below `node` (including those in
 /// `<optgroup>`s) to `options`.
 fn collect_options(document: &HTMLDocument, node: NodeID, options: &mut Vec<String>) {
-    let Some(dom_node) = document.node(node) else {
+    let Some(dom_node) = document.get_node(node) else {
         return;
     };
     for &child in dom_node.get_children() {
-        let Some(child_node) = document.node(child) else {
+        let Some(child_node) = document.get_node(child) else {
             continue;
         };
         if let NodeKind::Element(element) = child_node.get_kind() {
@@ -127,11 +127,11 @@ fn collect_options(document: &HTMLDocument, node: NodeID, options: &mut Vec<Stri
 }
 
 fn collect_text(document: &HTMLDocument, node: NodeID, text: &mut String) {
-    let Some(dom_node) = document.node(node) else {
+    let Some(dom_node) = document.get_node(node) else {
         return;
     };
     for &child in dom_node.get_children() {
-        match document.node(child).map(|child| child.get_kind()) {
+        match document.get_node(child).map(|child| child.get_kind()) {
             Some(NodeKind::Text(value)) => text.push_str(value),
             Some(NodeKind::Element(_)) => collect_text(document, child, text),
             _ => {}

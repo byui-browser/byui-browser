@@ -155,7 +155,7 @@ fn style_document_with_stats_context(
 ) -> (ComputedStyles, CascadeStats) {
     log::debug!(
         "styling document: {} nodes, {} author stylesheets",
-        dom.nodes.len(),
+        dom.get_nodes().len(),
         stylesheets.len()
     );
     if log::log_enabled!(log::Level::Debug) {
@@ -203,7 +203,7 @@ fn style_document_with_stats_context(
     let mut root_font_size = None;
     let mut candidates = Vec::new();
     let initial_color = initial_color_value();
-    for (node_index, node) in dom.nodes.iter().enumerate() {
+    for (node_index, node) in dom.get_nodes().iter().enumerate() {
         let NodeKind::Element(element) = node.get_kind() else {
             continue;
         };

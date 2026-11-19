@@ -85,7 +85,7 @@ fn main() {
         "stylesheet: {} bytes, {} rules; document: {} nodes",
         css.len(),
         sheet.rules.len(),
-        dom.nodes.len()
+        dom.get_nodes().len()
     );
     println!("parse:   {parse:?}");
     println!(

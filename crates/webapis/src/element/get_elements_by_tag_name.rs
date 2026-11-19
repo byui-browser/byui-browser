@@ -74,11 +74,11 @@ pub(crate) fn matching_descendants(
     let lowercase = qualified_name.to_ascii_lowercase();
     let mut matches = Vec::new();
     let mut stack: Vec<NodeID> = source
-        .node(root)
+        .get_node(root)
         .map(|node| node.get_children().iter().rev().copied().collect())
         .unwrap_or_default();
     while let Some(id) = stack.pop() {
-        let Some(node) = source.node(id) else {
+        let Some(node) = source.get_node(id) else {
             continue;
         };
         if let NodeKind::Element(data) = node.get_kind() {
@@ -287,7 +287,7 @@ mod tests {
         let div = element(&mut source, "div", Namespace::Html, Some("root"));
         let svg = element(&mut source, "svg", Namespace::Svg, None);
         let foreign = element(&mut source, "foreignObject", Namespace::Svg, None);
-        let root = source.root;
+        let root = *source.get_root();
         source.append_child(root, div);
         source.append_child(div, svg);
         source.append_child(svg, foreign);

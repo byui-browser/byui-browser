@@ -5,6 +5,7 @@ pub mod node;
 pub mod node_id;
 pub mod node_kind;
 
+pub mod doctype;
 pub mod element_data;
 
 pub mod attribute;
@@ -15,7 +16,7 @@ pub mod dom_token_list;
 
 pub use dom_token_list::DOMTokenList;
 pub use {
-    attribute::Attribute, dom_error::DomError, element_data::ElementData,
+    attribute::Attribute, doctype::Doctype, dom_error::DomError, element_data::ElementData,
     html_document::HTMLDocument, namespace::Namespace, node::Node, node_id::NodeID,
     node_kind::NodeKind,
 };
