@@ -120,6 +120,18 @@ Cache hits must create an independent public body view and must pass through
 the same response filtering and provider authorization decisions as network
 responses.
 
+#### First cache-foundation slice
+
+`net` owns the transport-independent HTTP-cache algorithm and response
+capture; browser and storage layers own durable persistence and provide
+partition identity through a replaceable boundary. Keep the initial backend
+process-local while later slices add complete cache identity, bounded eviction,
+freshness, revalidation, and invalidation. Cache entries own one
+`StoredResponse` representation rather than mirroring its fields in
+`CachedResponse`; immutable buffered body bytes may be shared with each
+independent public body view, while headers remain independently owned for
+response filtering.
+
 ### 5. Harden redirects and transport
 
 Add explicit transport configuration and tests for decoded-body limits,

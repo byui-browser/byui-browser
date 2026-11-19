@@ -57,7 +57,7 @@ impl RequestController {
                     let mut body = if has_null_body(request.method(), cached.status) {
                         Body::null()
                     } else {
-                        Body::once_with_signal(cached.body, request.signal().clone())
+                        Body::once_bytes_with_signal(cached.body, request.signal().clone())
                     };
                     body.set_response_metadata(&cached.headers, None);
                     let mut internal = InternalResponse::from_http_parts(
@@ -255,11 +255,11 @@ impl RequestController {
                 self.inner.cache.insert(
                     &request,
                     &url,
-                    &StoredResponse {
+                    StoredResponse {
                         status: response.status,
                         headers: response.headers.clone(),
                         url: response.url_list.last().cloned().unwrap_or_default(),
-                        body: Vec::new(),
+                        body: bytes::Bytes::new(),
                         cookie_headers_processed: response.cookie_headers_processed,
                     },
                 );

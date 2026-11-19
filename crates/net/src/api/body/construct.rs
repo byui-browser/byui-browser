@@ -133,12 +133,16 @@ impl Body {
 
     /// Creates a single buffered response body that observes cancellation.
     pub(crate) fn once_with_signal(body: Vec<u8>, signal: AbortSignal) -> Self {
+        Self::once_bytes_with_signal(Bytes::from(body), signal)
+    }
+
+    /// Creates a single immutable buffered response body that observes cancellation.
+    ///
+    /// The bytes are shared with immutable owners such as the response cache.
+    pub(crate) fn once_bytes_with_signal(body: Bytes, signal: AbortSignal) -> Self {
         let length = body.len() as u64;
-        Self::from_stream_with_signal(
-            futures_util::stream::once(async move { Ok(Bytes::from(body)) }),
-            signal,
-        )
-        .with_length(Some(length))
+        Self::from_stream_with_signal(futures_util::stream::once(async move { Ok(body) }), signal)
+            .with_length(Some(length))
     }
 
     /// Creates a single response body from immutable static bytes without copying them.

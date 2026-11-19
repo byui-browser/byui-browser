@@ -1,5 +1,6 @@
 //! Cache insertion after successful streamed-body consumption.
 
+use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 
 use crate::{
@@ -82,11 +83,11 @@ pub(crate) fn with_cache_capture(
                         capture.cache.insert(
                             &capture.request,
                             &capture.request_url,
-                            &StoredResponse {
+                            StoredResponse {
                                 status: capture.status,
                                 headers: capture.headers,
                                 url: capture.url,
-                                body: collected,
+                                body: Bytes::from(collected),
                                 cookie_headers_processed: capture.cookie_headers_processed,
                             },
                         );

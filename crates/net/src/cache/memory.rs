@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use reqwest::{
     StatusCode, Url,
     header::{CACHE_CONTROL, HeaderMap},
@@ -19,7 +20,9 @@ pub(crate) struct StoredResponse {
     pub(crate) status: StatusCode,
     pub(crate) headers: HeaderMap,
     pub(crate) url: String,
-    pub(crate) body: Vec<u8>,
+    /// Immutable buffered bytes. Cloning this value shares the allocation so a
+    /// cache hit can create an independent body reader without copying it.
+    pub(crate) body: Bytes,
     pub(crate) cookie_headers_processed: bool,
 }
 
@@ -78,7 +81,7 @@ impl ResponseCache {
     }
 
     /// Stores a successful response when its headers provide a positive TTL.
-    pub(crate) fn insert(&self, request: &Request, url: &Url, response: &StoredResponse) {
+    pub(crate) fn insert(&self, request: &Request, url: &Url, response: StoredResponse) {
         if !response.status.is_success() {
             log::trace!(
                 "cache store skipped for {}: status {} is not successful",
@@ -143,45 +146,38 @@ impl ResponseCache {
     }
 }
 
-/// Cached copy of a response and the time at which it becomes stale.
+/// Cache metadata paired with the one owned stored response representation.
+///
+/// `StoredResponse` is moved into this entry on insertion. This intentionally
+/// avoids a second header/body representation while the cache retains it.
 #[derive(Clone, Debug)]
 pub(crate) struct CachedResponse {
-    status: StatusCode,
-    headers: HeaderMap,
-    url: String,
-    body: Vec<u8>,
-    cookie_headers_processed: bool,
+    response: StoredResponse,
     pub(crate) expires_at: Instant,
     vary_headers: Vec<(String, Option<String>)>,
 }
 
 impl CachedResponse {
-    /// Copies a response into the cache with a caller-supplied lifetime.
+    /// Moves a response into the cache with a caller-supplied lifetime.
     pub(crate) fn from_response(
         request: &Request,
-        response: &StoredResponse,
+        response: StoredResponse,
         ttl: Duration,
     ) -> Self {
+        let vary_headers = capture_vary_headers(request, &response.headers);
         Self {
-            status: response.status,
-            headers: response.headers.clone(),
-            url: response.url.clone(),
-            body: response.body.clone(),
-            cookie_headers_processed: response.cookie_headers_processed,
+            response,
             expires_at: Instant::now() + ttl,
-            vary_headers: capture_vary_headers(request, &response.headers),
+            vary_headers,
         }
     }
 
-    /// Reconstructs a public response and marks it as cache-served.
+    /// Reconstructs a response for finalization.
+    ///
+    /// Headers remain independently owned for response filtering, while the
+    /// immutable body bytes share their backing allocation with the cache.
     pub(crate) fn as_response(&self) -> StoredResponse {
-        StoredResponse {
-            status: self.status,
-            headers: self.headers.clone(),
-            url: self.url.clone(),
-            body: self.body.clone(),
-            cookie_headers_processed: self.cookie_headers_processed,
-        }
+        self.response.clone()
     }
 }
 
@@ -290,11 +286,11 @@ mod tests {
             status: StatusCode::OK,
             headers,
             url: url.to_string(),
-            body: b"Hello".to_vec(),
+            body: Bytes::from_static(b"Hello"),
             cookie_headers_processed: false,
         };
 
-        cache.insert(&english, &url, &response);
+        cache.insert(&english, &url, response);
 
         // Same language should produce a cache hit.
         assert!(cache.get(&english, &url).is_some());
@@ -322,11 +318,11 @@ mod tests {
             status: StatusCode::OK,
             headers,
             url: url.to_string(),
-            body: b"Hello".to_vec(),
+            body: Bytes::from_static(b"Hello"),
             cookie_headers_processed: false,
         };
 
-        cache.insert(&request, &url, &response);
+        cache.insert(&request, &url, response);
 
         // Vary: * responses must not be stored.
         assert!(cache.get(&request, &url).is_none());
@@ -365,12 +361,12 @@ mod tests {
             status: StatusCode::NOT_FOUND,
             headers,
             url: request.url().to_owned(),
-            body: b"missing".to_vec(),
+            body: Bytes::from_static(b"missing"),
             cookie_headers_processed: false,
         };
 
         let url = Url::parse(request.url()).unwrap();
-        cache.insert(&request, &url, &response);
+        cache.insert(&request, &url, response);
 
         assert!(cache.get(&request, &url).is_none());
     }
@@ -438,10 +434,10 @@ mod tests {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
             url: request.url().to_owned(),
-            body: b"stale".to_vec(),
+            body: Bytes::from_static(b"stale"),
             cookie_headers_processed: false,
         };
-        let cached = CachedResponse::from_response(&request, &response, Duration::ZERO);
+        let cached = CachedResponse::from_response(&request, response, Duration::ZERO);
 
         cache.entries.write().unwrap().insert(
             cache_key(&request, &Url::parse(request.url()).unwrap()),
@@ -463,10 +459,10 @@ mod tests {
             status: StatusCode::FOUND,
             headers: HeaderMap::new(),
             url: request.url().to_owned(),
-            body: b"stale".to_vec(),
+            body: Bytes::from_static(b"stale"),
             cookie_headers_processed: false,
         };
-        let cached = CachedResponse::from_response(&request, &response, Duration::ZERO);
+        let cached = CachedResponse::from_response(&request, response, Duration::ZERO);
 
         cache.entries.write().unwrap().insert(
             cache_key(&request, &Url::parse(request.url()).unwrap()),
@@ -505,7 +501,7 @@ mod tests {
             status: StatusCode::OK,
             headers: headers.clone(),
             url: url.to_string(),
-            body: b"Hello".to_vec(),
+            body: Bytes::from_static(b"Hello"),
             cookie_headers_processed: false,
         };
 
@@ -513,31 +509,34 @@ mod tests {
             status: StatusCode::OK,
             headers,
             url: url.to_string(),
-            body: b"Hola".to_vec(),
+            body: Bytes::from_static(b"Hola"),
             cookie_headers_processed: false,
         };
 
         // Store both responses under the same URL.
-        cache.insert(&english, &url, &english_response);
-        cache.insert(&spanish, &url, &spanish_response);
+        cache.insert(&english, &url, english_response.clone());
+        cache.insert(&spanish, &url, spanish_response);
 
         // Each language should retrieve its own response.
-        assert_eq!(cache.get(&english, &url).unwrap().body, b"Hello");
-        assert_eq!(cache.get(&spanish, &url).unwrap().body, b"Hola");
+        assert_eq!(cache.get(&english, &url).unwrap().body.as_ref(), b"Hello");
+        assert_eq!(cache.get(&spanish, &url).unwrap().body.as_ref(), b"Hola");
 
         // Update the English response with new content.
         let updated_english_response = StoredResponse {
-            body: b"Hello again".to_vec(),
+            body: Bytes::from_static(b"Hello again"),
             ..english_response.clone()
         };
 
-        cache.insert(&english, &url, &updated_english_response);
+        cache.insert(&english, &url, updated_english_response);
 
         // English should return the updated response.
-        assert_eq!(cache.get(&english, &url).unwrap().body, b"Hello again");
+        assert_eq!(
+            cache.get(&english, &url).unwrap().body.as_ref(),
+            b"Hello again"
+        );
 
         // Spanish should still return its original response.
-        assert_eq!(cache.get(&spanish, &url).unwrap().body, b"Hola");
+        assert_eq!(cache.get(&spanish, &url).unwrap().body.as_ref(), b"Hola");
     }
 
     #[test]
@@ -572,11 +571,11 @@ mod tests {
             status: StatusCode::OK,
             headers: language_headers,
             url: url.to_string(),
-            body: b"English response".to_vec(),
+            body: Bytes::from_static(b"English response"),
             cookie_headers_processed: false,
         };
 
-        cache.insert(&request, &url, &language_response);
+        cache.insert(&request, &url, language_response.clone());
 
         let mut encoding_headers = HeaderMap::new();
         encoding_headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
@@ -584,11 +583,11 @@ mod tests {
 
         let encoding_response = StoredResponse {
             headers: encoding_headers,
-            body: b"Gzip response".to_vec(),
+            body: Bytes::from_static(b"Gzip response"),
             ..language_response.clone()
         };
 
-        cache.insert(&request, &url, &encoding_response);
+        cache.insert(&request, &url, encoding_response);
 
         // The cache should contain only the new Vary rule.
         let key = cache_key(&request, &url);
@@ -596,6 +595,35 @@ mod tests {
         let variants = entries.get(&key).unwrap();
 
         assert_eq!(variants.len(), 1);
-        assert_eq!(variants[0].body, b"Gzip response");
+        assert_eq!(variants[0].response.body.as_ref(), b"Gzip response");
+    }
+
+    #[test]
+    /// Verifies a cache hit shares immutable body storage with its cache entry.
+    fn cache_hits_share_immutable_body_bytes() {
+        let cache = ResponseCache::default();
+        let request = Request::get("https://example.test/shared-body");
+        let url = Url::parse(request.url()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+
+        cache.insert(
+            &request,
+            &url,
+            StoredResponse {
+                status: StatusCode::OK,
+                headers,
+                url: url.to_string(),
+                body: Bytes::from(vec![1_u8; 1024]),
+                cookie_headers_processed: false,
+            },
+        );
+
+        let hit = cache.get(&request, &url).unwrap();
+        let entries = cache.entries.read().unwrap();
+        let cached = &entries[&cache_key(&request, &url)][0];
+
+        assert_eq!(hit.body.as_ref(), cached.response.body.as_ref());
+        assert_eq!(hit.body.as_ptr(), cached.response.body.as_ptr());
     }
 }

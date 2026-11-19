@@ -151,7 +151,11 @@ work.
   positive `Cache-Control: max-age` are stored by method, normalized URL,
   and partition; response `Vary` fields select among request-header variants,
   and `Vary: *` responses are not stored. Cache hits still pass through the
-  normal response finalization and filtering path.
+   normal response finalization and filtering path. `net` owns the
+   transport-independent cache algorithm and capture boundary; browser/storage
+   integrations provide partition identity and may replace process-local
+   persistence later. Each entry owns one stored response representation, and
+   immutable cached body bytes are shared only with independent public readers.
 - Cache-only misses and other pre-exposure failures can surface through
   `RequestController::fetch_response` as Fetch network errors. Body stream
   transport errors and aborts retain separate typed errors; `fetch` preserves
