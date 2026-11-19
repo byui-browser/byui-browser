@@ -2,7 +2,10 @@
 //! (CSS Display 3 §2, CSS 2.2 §9.2).
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
+
+use css::PseudoElement;
 
 use html::{HTMLDocument, NodeID, NodeKind};
 
@@ -28,6 +31,8 @@ pub(crate) struct BlockBox {
 /// content (CSS 2.2 §9.2.1.1).
 #[derive(Debug, Clone)]
 pub(crate) enum BlockContents {
+    /// Block-level children. Floated and absolutely positioned children
+    /// appear here in tree order too; layout takes them out of flow.
     Blocks(Vec<BlockBox>),
     Inlines(Vec<InlineItem>),
     /// The box is a replaced element (`<img>`, inline `<svg>`); its content
@@ -59,6 +64,9 @@ pub(crate) enum InlineItem {
     Atomic(BlockBox),
     /// A forced line break from a `<br>` element.
     ForcedBreak,
+    /// A floated or absolutely positioned box. It takes no space in the line;
+    /// layout places it out of flow from this point (CSS 2.2 §9.5, §9.6).
+    OutOfFlow(BlockBox),
 }
 
 /// Either kind of child produced while walking a block container's children.
@@ -70,6 +78,8 @@ enum Level {
 /// Computed styles for every element, indexed by DOM arena index.
 pub(crate) struct StyleMap {
     styles: Vec<Option<Rc<ComputedStyle>>>,
+    /// `::before` / `::after` styles, keyed by originating element index.
+    pseudo: HashMap<(usize, PseudoElement), Rc<ComputedStyle>>,
     initial: Rc<ComputedStyle>,
 }
 
@@ -125,7 +135,7 @@ impl StyleMap {
                 )
             })
             .unwrap_or(css::values::MEDIUM_FONT_SIZE);
-        let resolved = (0..document.get_nodes().len())
+        let resolved: Vec<Option<Rc<ComputedStyle>>> = (0..document.get_nodes_count())
             .map(|index| {
                 let node = NodeID::new(index);
                 let declarations = styles.declarations_for(node)?;
@@ -144,14 +154,37 @@ impl StyleMap {
                 Some(Rc::new(style))
             })
             .collect();
+        let mut pseudo = HashMap::new();
+        for (index, owner) in resolved.iter().enumerate() {
+            let Some(owner) = owner else { continue };
+            for which in [PseudoElement::Before, PseudoElement::After] {
+                let Some(declarations) = styles.pseudo_declarations_for(NodeID::new(index), which)
+                else {
+                    continue;
+                };
+                let style = ComputedStyle::from_declarations(
+                    declarations,
+                    root_font_size,
+                    viewport,
+                    || owner.text_align,
+                );
+                pseudo.insert((index, which), Rc::new(style));
+            }
+        }
         Self {
             styles: resolved,
+            pseudo,
             initial: Rc::new(ComputedStyle::anonymous(None)),
         }
     }
 
     pub(crate) fn get(&self, node: NodeID) -> Option<&Rc<ComputedStyle>> {
         self.styles.get(node.get())?.as_ref()
+    }
+
+    /// The style of `owner`'s `::before` or `::after`, if a rule targets it.
+    fn pseudo(&self, owner: NodeID, which: PseudoElement) -> Option<&Rc<ComputedStyle>> {
+        self.pseudo.get(&(owner.get(), which))
     }
 
     /// The style text inherits: its parent element's style, or initial values
@@ -211,7 +244,7 @@ pub(crate) fn build_initial_containing_block(
         .unwrap_or_default();
     let block = BlockBox {
         node: None,
-        contents: builder.container_contents(children, &style),
+        contents: builder.container_contents(None, children, &style),
         style,
         establishes_bfc: true,
     };
@@ -289,19 +322,34 @@ impl Builder<'_> {
         );
         BlockBox {
             node: Some(node),
-            contents: self.container_contents(children, style),
+            contents: self.container_contents(Some(node), children, style),
             style: Rc::clone(style),
-            establishes_bfc: is_root || flow_root,
+            // Floats and absolutely positioned boxes establish a new block
+            // formatting context (CSS 2.2 §9.4.1).
+            establishes_bfc: is_root || flow_root || style.is_out_of_flow(),
         }
     }
 
     /// Boxes a block container's children, wrapping inline-level runs in
     /// anonymous block boxes when block-level siblings exist.
-    fn container_contents(&self, children: &[NodeID], style: &Rc<ComputedStyle>) -> BlockContents {
+    /// `owner` is the element whose children these are, which may also
+    /// generate `::before` / `::after` content around them.
+    fn container_contents(
+        &self,
+        owner: Option<NodeID>,
+        children: &[NodeID],
+        style: &Rc<ComputedStyle>,
+    ) -> BlockContents {
         let mut levels = Vec::new();
         let mut open_inlines = Vec::new();
+        if let Some(owner) = owner {
+            self.generated(owner, PseudoElement::Before, &mut levels, &open_inlines);
+        }
         for child in children {
             self.collect(*child, &mut levels, &mut open_inlines);
+        }
+        if let Some(owner) = owner {
+            self.generated(owner, PseudoElement::After, &mut levels, &open_inlines);
         }
         if !levels.iter().any(|level| matches!(level, Level::Block(_))) {
             return BlockContents::Inlines(
@@ -318,13 +366,21 @@ impl Builder<'_> {
         let mut run = Vec::new();
         let flush = |run: &mut Vec<InlineItem>, blocks: &mut Vec<BlockBox>| {
             let items = std::mem::take(run);
-            if items.iter().all(is_collapsible_whitespace) {
+            if items
+                .iter()
+                .all(|item| is_collapsible_whitespace(item) || is_out_of_flow(item))
+            {
+                // Out-of-flow boxes between blocks need no anonymous wrapper.
+                let count = items.len();
+                blocks.extend(items.into_iter().filter_map(|item| match item {
+                    InlineItem::OutOfFlow(block) => Some(block),
+                    _ => None,
+                }));
                 // White space that would be collapsed away generates no
                 // anonymous inline boxes (CSS 2.2 §9.2.2.1).
-                if !items.is_empty() {
+                if count > 0 {
                     log::trace!(
-                        "dropped whitespace-only inline run of {} items between blocks",
-                        items.len()
+                        "dropped whitespace-only inline run of {count} items between blocks"
                     );
                 }
                 return;
@@ -352,6 +408,82 @@ impl Builder<'_> {
         }
         flush(&mut run, &mut blocks);
         BlockContents::Blocks(blocks)
+    }
+
+    /// Boxes `owner`'s `::before` or `::after`, if it has a style with
+    /// supported `content` (CSS Generated Content 3 §2).
+    ///
+    /// The generated text is attributed to `owner`, so hit tests and text
+    /// search treat it as part of the element. A block-level pseudo-element
+    /// becomes an anonymous-style block box holding the text; any other
+    /// display other than `none` is boxed as an inline box (inline-block,
+    /// flex, and grid pseudo-elements are not supported yet).
+    fn generated(
+        &self,
+        owner: NodeID,
+        which: PseudoElement,
+        levels: &mut Vec<Level>,
+        open_inlines: &[(NodeID, Rc<ComputedStyle>)],
+    ) {
+        let Some(style) = self.styles.pseudo(owner, which) else {
+            return;
+        };
+        let Some(content) = &style.content else {
+            return;
+        };
+        let text = InlineItem::Text {
+            node: owner,
+            element: Some(owner),
+            text: style.text_transform.apply(content),
+            style: Rc::clone(style),
+        };
+        if style.is_out_of_flow() && style.display != Display::None {
+            log::trace!("out-of-flow {which:?} box for node {owner:?}");
+            BuildStats::bump(&self.stats.boxes);
+            levels.push(Level::Inline(InlineItem::OutOfFlow(BlockBox {
+                node: None,
+                style: Rc::clone(style),
+                establishes_bfc: true,
+                contents: BlockContents::Inlines(vec![text]),
+            })));
+            return;
+        }
+        match style.display {
+            Display::None => {}
+            Display::Box {
+                outside: DisplayOutside::Block,
+                ..
+            } => {
+                BuildStats::bump(&self.stats.boxes);
+                log::trace!("block {which:?} box for node {owner:?}");
+                for _ in open_inlines {
+                    levels.push(Level::Inline(InlineItem::End { end_edge: false }));
+                }
+                levels.push(Level::Block(BlockBox {
+                    node: None,
+                    style: Rc::clone(style),
+                    establishes_bfc: false,
+                    contents: BlockContents::Inlines(vec![text]),
+                }));
+                for (open, open_style) in open_inlines {
+                    levels.push(Level::Inline(InlineItem::Start {
+                        node: *open,
+                        style: Rc::clone(open_style),
+                        start_edge: false,
+                    }));
+                }
+            }
+            _ => {
+                log::trace!("inline {which:?} box for node {owner:?}");
+                levels.push(Level::Inline(InlineItem::Start {
+                    node: owner,
+                    style: Rc::clone(style),
+                    start_edge: true,
+                }));
+                levels.push(Level::Inline(text));
+                levels.push(Level::Inline(InlineItem::End { end_edge: true }));
+            }
+        }
     }
 
     fn collect(
@@ -385,13 +517,28 @@ impl Builder<'_> {
                     );
                     return;
                 };
-                if !matches!(style.display, Display::None | Display::Contents)
-                    && let Some(level) = self.replaced(node, element, style)
-                {
+                let boxed = !matches!(style.display, Display::None | Display::Contents);
+                if boxed && let Some(level) = self.replaced(node, element, style) {
                     match level {
+                        Level::Block(block) | Level::Inline(InlineItem::Atomic(block))
+                            if style.is_out_of_flow() =>
+                        {
+                            levels.push(Level::Inline(InlineItem::OutOfFlow(block)));
+                        }
                         Level::Block(block) => split_inlines_around(block, levels, open_inlines),
                         inline => levels.push(inline),
                     }
+                    return;
+                }
+                if boxed && style.is_out_of_flow() {
+                    log::trace!(
+                        "node {node:?} <{}>: out of flow (position {:?}, float {:?})",
+                        element.get_name(),
+                        style.position,
+                        style.float
+                    );
+                    let block = self.block_box(node, style, false);
+                    levels.push(Level::Inline(InlineItem::OutOfFlow(block)));
                     return;
                 }
                 match style.display {
@@ -407,9 +554,11 @@ impl Builder<'_> {
                             "node {node:?} <{}>: display contents, boxing children in its place",
                             element.get_name()
                         );
+                        self.generated(node, PseudoElement::Before, levels, open_inlines);
                         for child in dom_node.get_children() {
                             self.collect(*child, levels, open_inlines);
                         }
+                        self.generated(node, PseudoElement::After, levels, open_inlines);
                     }
                     Display::Box {
                         outside: DisplayOutside::Inline,
@@ -425,9 +574,11 @@ impl Builder<'_> {
                             start_edge: true,
                         }));
                         open_inlines.push((node, Rc::clone(style)));
+                        self.generated(node, PseudoElement::Before, levels, open_inlines);
                         for child in dom_node.get_children() {
                             self.collect(*child, levels, open_inlines);
                         }
+                        self.generated(node, PseudoElement::After, levels, open_inlines);
                         open_inlines.pop();
                         levels.push(Level::Inline(InlineItem::End { end_edge: true }));
                     }
@@ -606,6 +757,11 @@ fn is_collapsible_whitespace(item: &InlineItem) -> bool {
         InlineItem::Text { text, .. } => text.chars().all(is_document_white_space),
         _ => false,
     }
+}
+
+/// Whether an item is a floated or absolutely positioned box.
+fn is_out_of_flow(item: &InlineItem) -> bool {
+    matches!(item, InlineItem::OutOfFlow(_))
 }
 
 /// Document white space for CSS Text 3 §4: space, tab, and segment breaks.

@@ -25,18 +25,18 @@ use webapis::{
     AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, register_alert,
     register_console, register_fetch_with_url, register_location_with_navigation, register_print,
     register_shared_document_with_location, register_window_with_security_context,
-    register_window_with_url_device_pixel_ratio_and_viewport,
+    register_window_with_url_device_pixel_ratio_and_viewport, report_window_error,
 };
 
 pub mod byui_provider;
-pub mod fetch_services;
+pub mod fetch_capabilities;
 pub mod file_provider;
 mod load;
 pub mod refresh;
 
 pub use load::{
     LoadError, Navigation, PageLoader, error_page, load_page, load_page_timed, normalize_address,
-    security_context_for_url,
+    security_context_for_url, security_context_for_url_with_policy,
 };
 
 /// Browser-owned resource limits for one local-file session.
@@ -251,8 +251,9 @@ pub fn request_controller_with_observer(
             file_access.content_policy,
         ));
     }
+    let capabilities = Arc::new(fetch_capabilities::BrowserFetchCapabilities::default());
     let builder = RequestController::builder(net::Config::default())
-        .with_fetch_services(Arc::new(fetch_services::BrowserFetchServices::default()))
+        .with_browser_capabilities(capabilities)
         .with_scheme_providers(providers);
     let builder = match observer {
         Some(observer) => builder.with_network_observer(observer),
@@ -759,9 +760,11 @@ impl BrowserRuntime {
             log::trace!("evaluating script {index}: {} bytes", source.len());
             let result = realm.evaluate_script(source);
             let checkpoint = webapis::run_window_microtasks(&window);
-            match (result, checkpoint) {
+            let hashchange_checkpoint = webapis::run_window_hashchange_events(&window);
+            match (result, checkpoint.and(hashchange_checkpoint)) {
                 (Ok(result), Ok(_)) => results.push(result),
                 (Err(error), _) => {
+                    let _ = report_window_error(&window, &error, initial_url);
                     log::warn!("page script failed: {error}");
                     return Err(error);
                 }
@@ -769,11 +772,13 @@ impl BrowserRuntime {
             }
         }
         log::debug!("evaluated {} page scripts", results.len());
+        webapis::dispatch_window_load(&window)?;
         Ok(BootedPage {
             session: PageSession {
                 realm,
                 window,
                 document,
+                source_url: initial_url.to_owned(),
             },
             results,
         })
@@ -792,6 +797,7 @@ pub struct PageSession {
     window: js::Object,
     /// The live document scripts mutate, shared with the realm's bindings.
     document: Arc<Mutex<Document>>,
+    source_url: String,
 }
 
 impl PageSession {
@@ -804,8 +810,12 @@ impl PageSession {
     pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
         let result = self.realm.evaluate_script(source);
         let checkpoint = webapis::run_window_microtasks(&self.window);
-        match (result, checkpoint) {
-            (Err(error), _) => Err(error),
+        let hashchange_checkpoint = webapis::run_window_hashchange_events(&self.window);
+        match (result, checkpoint.and(hashchange_checkpoint)) {
+            (Err(error), _) => {
+                let _ = report_window_error(&self.window, &error, &self.source_url);
+                Err(error)
+            }
             (Ok(value), Ok(_)) => Ok(value),
             (Ok(_), Err(error)) => Err(error),
         }
@@ -906,6 +916,7 @@ impl PageSession {
         let document = self.document.lock().unwrap().clone();
         let result = webapis::dispatch_click(&document);
         webapis::run_window_microtasks(&self.window)?;
+        webapis::run_window_hashchange_events(&self.window)?;
         result
     }
 
@@ -917,6 +928,7 @@ impl PageSession {
     pub fn dispatch_click_at(&self, node: html::NodeID) -> JsResult<Value> {
         let result = webapis::dispatch_click_at_live(&self.document, node);
         webapis::run_window_microtasks(&self.window)?;
+        webapis::run_window_hashchange_events(&self.window)?;
         result
     }
 

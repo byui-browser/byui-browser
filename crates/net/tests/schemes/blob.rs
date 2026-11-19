@@ -176,7 +176,7 @@ fn controller(provider: Arc<dyn BlobProvider>) -> (RequestController, Arc<Record
         .with_page(Arc::new(UnreachableProvider));
     (
         RequestController::builder(Config::default())
-            .with_fetch_services(services.clone())
+            .with_browser_capabilities(services.clone())
             .with_scheme_providers(providers)
             .build()
             .unwrap(),
@@ -414,4 +414,15 @@ fn blob_provider_failures_are_typed_and_do_not_expose_a_response() {
         );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
+}
+
+#[test]
+fn blob_requests_without_a_provider_fail_before_side_effects() {
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+    let error = runtime()
+        .block_on(controller.fetch(Request::get("blob:https://creator.test/object-1")))
+        .unwrap_err();
+    assert!(matches!(error, RequestError::MissingProvider("blob")));
 }

@@ -13,7 +13,10 @@ use devtools::performance::{EventCategory, TimelineEvent};
 
 use futures_util::future::join_all;
 use net::{NetworkEvent, NetworkObserver, Request, RequestController, Url};
-use security::{Origin, RendererSecurityContext, StoragePermission};
+use security::{
+    Origin, RendererSecurityContext, StoragePermission,
+    permissions::{PermissionKind, PermissionPolicy, PermissionState},
+};
 
 use crate::{FontResource, ImageResource, Page, PageResources, attribute};
 
@@ -557,13 +560,31 @@ fn escape_html(text: &str) -> String {
 /// `data:`, hostless) gets an opaque origin with storage denied, which
 /// matches no real origin.
 pub fn security_context_for_url(url: &str) -> RendererSecurityContext {
+    security_context_for_url_with_policy(url, &PermissionPolicy::new())
+}
+
+/// Derives a renderer security context for `url`, applying explicit policy
+/// decisions for origin-scoped storage.
+///
+/// Valid top-level `http`, `https`, and hostful `byui` documents receive
+/// storage access when the policy has no recorded storage decision. An
+/// explicit [`PermissionState::Denied`] decision overrides that default.
+/// Opaque and unsafe documents remain denied regardless of policy decisions.
+pub fn security_context_for_url_with_policy(
+    url: &str,
+    policy: &PermissionPolicy,
+) -> RendererSecurityContext {
     if let Ok(url) = Url::parse(url)
         && matches!(url.scheme(), "http" | "https" | "byui")
         && let Some(host) = url.host_str()
     {
         let origin = Origin::new(url.scheme(), host, url.port());
-        log::debug!("security context derived: origin {origin:?}, storage allowed");
-        return RendererSecurityContext::new(origin, StoragePermission::Allowed);
+        let storage_permission = match policy.decision(&origin, PermissionKind::Storage) {
+            Some(PermissionState::Denied) => StoragePermission::Denied,
+            Some(PermissionState::Granted) | None => StoragePermission::Allowed,
+        };
+        log::debug!("security context derived: origin {origin:?}, storage {storage_permission:?}");
+        return RendererSecurityContext::new(origin, storage_permission);
     }
     log::debug!("security context derived: opaque origin, storage denied");
     RendererSecurityContext::new(Origin::new("opaque", "", None), StoragePermission::Denied)
@@ -1014,6 +1035,46 @@ mod tests {
             assert!(!context.can_read_storage() && !context.can_write_storage());
             assert_eq!(context.origin().scheme(), "opaque");
         }
+    }
+
+    #[test]
+    fn normal_documents_get_storage_by_default() {
+        let policy = PermissionPolicy::new();
+
+        for url in [
+            "http://example.com/",
+            "https://example.com/",
+            "byui://welcome/page",
+        ] {
+            let context = security_context_for_url_with_policy(url, &policy);
+            assert!(context.can_read_storage());
+            assert!(context.can_write_storage());
+        }
+    }
+
+    #[test]
+    fn explicit_storage_denial_is_applied_to_the_renderer_context() {
+        let origin = Origin::new("https", "example.com", None);
+        let mut policy = PermissionPolicy::new();
+        policy.deny(origin, PermissionKind::Storage);
+
+        let context = security_context_for_url_with_policy("https://example.com/page", &policy);
+
+        assert!(!context.can_read_storage());
+        assert!(!context.can_write_storage());
+    }
+
+    #[test]
+    fn unsafe_documents_remain_denied_even_when_policy_grants_storage() {
+        let opaque = Origin::new("opaque", "", None);
+        let mut policy = PermissionPolicy::new();
+        policy.grant(opaque, PermissionKind::Storage);
+
+        let context = security_context_for_url_with_policy("data:text/html,hello", &policy);
+
+        assert_eq!(context.origin().scheme(), "opaque");
+        assert!(!context.can_read_storage());
+        assert!(!context.can_write_storage());
     }
 
     #[test]

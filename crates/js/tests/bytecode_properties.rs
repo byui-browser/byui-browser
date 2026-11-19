@@ -107,12 +107,20 @@ fn writes_match_the_evaluator() {
 
 #[test]
 fn property_errors_match_the_evaluator() {
-    for template in ["$.a.b", "$.a['b']", "$.a.b = 1", "$.missing.deeper"] {
+    // `$.a` is a number: reads consult Number.prototype (missing → undefined),
+    // but writes to a primitive still fail.
+    for template in ["$.a.b = 1", "$.missing.deeper"] {
         let vm = run_vm(template, &fixture()).expect_err(template);
         let evaluator = run_evaluator(template, &fixture()).expect_err(template);
         assert_eq!(vm.category, JsErrorCategory::Runtime, "`{template}`");
         assert_eq!(vm.category, evaluator.category, "`{template}`");
         assert_eq!(vm.context, evaluator.context, "`{template}`");
+    }
+    for template in ["$.a.b", "$.a['b']"] {
+        let vm = run_vm(template, &fixture()).expect(template);
+        let evaluator = run_evaluator(template, &fixture()).expect(template);
+        assert_eq!(vm, Value::Undefined, "`{template}`");
+        assert_eq!(vm, evaluator, "`{template}`");
     }
 }
 
@@ -127,9 +135,7 @@ fn missing_properties_are_undefined_and_non_object_errors_describe_the_property(
     );
     assert_eq!(missing.context.as_deref(), Some("property access"));
 
-    let read = run_vm("$.a.b", &fixture()).unwrap_err();
-    assert_eq!(read.message, "Cannot read property `b` of a number");
-    assert_eq!(read.context.as_deref(), Some("property access"));
+    assert_eq!(run_vm("$.a.b", &fixture()), Ok(Value::Undefined));
 
     let write = run_vm("$.a.b = 1", &fixture()).unwrap_err();
     assert_eq!(write.message, "Cannot set property `b` of a number");
@@ -138,9 +144,24 @@ fn missing_properties_are_undefined_and_non_object_errors_describe_the_property(
 
 #[test]
 fn non_object_targets_match_the_evaluator() {
+    for source in ["'text'.length", "'text'[0]", "(1).toFixed"] {
+        let vm = Vm::new()
+            .execute(&compile_source(source))
+            .unwrap_or_else(|error| panic!("`{source}` should succeed: {error:?}"));
+        let evaluator =
+            eval(source).unwrap_or_else(|error| panic!("`{source}` should succeed: {error:?}"));
+        assert_eq!(vm, evaluator, "`{source}`");
+    }
+    assert_eq!(
+        Vm::new().execute(&compile_source("'text'.length")),
+        Ok(Value::Number(4.0))
+    );
+    assert_eq!(
+        Vm::new().execute(&compile_source("'text'[0]")),
+        Ok(Value::String("t".into()))
+    );
+
     for source in [
-        "'text'.length",
-        "'text'[0]",
         "null.a",
         "undefined.a",
         "true.a",

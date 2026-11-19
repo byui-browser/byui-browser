@@ -8,8 +8,8 @@
 use html::{HTMLDocument, NodeID};
 
 use crate::{
-    BoxKind, FontMetrics, LayoutBox, LayoutTree, LineFragment, PaintItem, Size, VerticalMetrics,
-    layout_document,
+    BoxKind, FontMetrics, LayoutBox, LayoutTree, LineFragment, PaintItem, Placement, Size,
+    VerticalMetrics, layout_document,
 };
 
 struct TestFont;
@@ -132,6 +132,46 @@ fn flex_row_distributes_grow_space_and_places_the_gap() {
     let second = box_for(&tree, &document, "second");
     assert_eq!((first.rect.x, first.rect.width), (0.0, 145.0));
     assert_eq!((second.rect.x, second.rect.width), (155.0, 145.0));
+}
+
+#[test]
+fn flex_basis_overrides_the_main_size_before_growth() {
+    let (document, tree) = lay_out(
+        "<body><div id='container'><div id='first'></div><div id='second'></div></div></body>",
+        "body { margin: 0 } #container { display: flex; width: 300px }\
+         #first, #second { width: 50px; flex-basis: 100px }",
+        800.0,
+    );
+    let first = box_for(&tree, &document, "first");
+    let second = box_for(&tree, &document, "second");
+    assert_eq!((first.rect.x, first.rect.width), (0.0, 100.0));
+    assert_eq!((second.rect.x, second.rect.width), (100.0, 100.0));
+}
+
+#[test]
+fn flex_shrink_distributes_negative_free_space_by_basis() {
+    let (document, tree) = lay_out(
+        "<body><div id='container'><div id='first'></div><div id='second'></div></div></body>",
+        "body { margin: 0 } #container { display: flex; width: 150px }\
+         #first, #second { width: 100px; flex-shrink: 1 }",
+        800.0,
+    );
+    let first = box_for(&tree, &document, "first");
+    let second = box_for(&tree, &document, "second");
+    assert_eq!((first.rect.x, first.rect.width), (0.0, 75.0));
+    assert_eq!((second.rect.x, second.rect.width), (75.0, 75.0));
+}
+
+#[test]
+fn flex_shrink_respects_the_automatic_min_content_width() {
+    let (document, tree) = lay_out(
+        "<body><div id='container'><div id='first'>unbreakable</div><div id='second'></div></div></body>",
+        "body { margin: 0 } #container { display: flex; width: 50px }\
+         #first, #second { width: 100px; flex-shrink: 1 }",
+        800.0,
+    );
+    let first = box_for(&tree, &document, "first");
+    assert_eq!(first.rect.width, 88.0);
 }
 
 #[test]
@@ -859,4 +899,416 @@ mod fonts {
         let line = &box_for(&tree, &document, "p").lines[0];
         assert_eq!(line.baseline, 16.0);
     }
+}
+
+mod box_sizing {
+    use super::*;
+
+    #[test]
+    fn border_box_width_and_height_include_the_padding() {
+        let (document, tree) = lay_out(
+            "<body><div id=c>x</div><div id=b>x</div></body>",
+            "body { margin: 0 } div { width: 100px; height: 50px; padding: 10px 20px } \
+             #b { box-sizing: border-box }",
+            800.0,
+        );
+        let content = box_for(&tree, &document, "c");
+        assert_eq!((content.rect.width, content.rect.height), (140.0, 70.0));
+        let border = box_for(&tree, &document, "b");
+        assert_eq!((border.rect.width, border.rect.height), (100.0, 50.0));
+        assert_eq!(
+            (border.content_rect().width, border.content_rect().height),
+            (60.0, 30.0)
+        );
+    }
+
+    #[test]
+    fn border_box_percentages_fill_the_container_exactly() {
+        let (document, tree) = lay_out(
+            "<body><div id=d>x</div></body>",
+            "body { margin: 0 } #d { box-sizing: border-box; width: 50%; padding: 0 5% }",
+            400.0,
+        );
+        // 50% of 400px, with the 5% (20px) side paddings inside it.
+        let div = box_for(&tree, &document, "d");
+        assert_eq!(div.rect.width, 200.0);
+        assert_eq!(div.content_rect().width, 160.0);
+    }
+
+    #[test]
+    fn padding_larger_than_a_border_box_leaves_an_empty_content_box() {
+        let (document, tree) = lay_out(
+            "<body><div id=d>x</div></body>",
+            "body { margin: 0 } #d { box-sizing: border-box; width: 10px; height: 10px; \
+             padding: 8px }",
+            400.0,
+        );
+        let div = box_for(&tree, &document, "d");
+        assert_eq!(div.content_rect().width, 0.0);
+        assert_eq!((div.rect.width, div.rect.height), (16.0, 16.0));
+    }
+
+    #[test]
+    fn border_box_inline_block_and_flex_items_are_sized_once() {
+        let (document, tree) = lay_out(
+            "<body><p><span id=i>x</span></p>\
+             <div id=f><div id=a>a</div><div id=b>b</div></div></body>",
+            "body { margin: 0 } p { margin: 0 } \
+             #i { display: inline-block; box-sizing: border-box; width: 60px; padding: 0 10px } \
+             #f { display: flex; width: 300px } \
+             #a, #b { box-sizing: border-box; width: 100px; padding: 0 10px } \
+             #b { flex-grow: 1 }",
+            400.0,
+        );
+        assert_eq!(box_for(&tree, &document, "i").rect.width, 60.0);
+        assert_eq!(box_for(&tree, &document, "a").rect.width, 100.0);
+        // #b takes the remaining 100px of free space on top of its 100px.
+        assert_eq!(box_for(&tree, &document, "b").rect.width, 200.0);
+    }
+
+    #[test]
+    fn flex_free_space_leaves_room_for_item_padding() {
+        let (document, tree) = lay_out(
+            "<body><div id=f><div id=a>a</div><div id=b>b</div></div></body>",
+            "body { margin: 0 } #f { display: flex; width: 300px } \
+             #a, #b { width: 100px; padding: 0 10px } #b { flex-grow: 1 }",
+            400.0,
+        );
+        // 240px of outer widths leave 60px for #b to grow by; the row fills
+        // the container exactly instead of overflowing by the padding.
+        assert_eq!(box_for(&tree, &document, "a").rect.width, 120.0);
+        let b = box_for(&tree, &document, "b");
+        assert_eq!(b.rect.width, 180.0);
+        assert_eq!(b.rect.right(), 300.0);
+    }
+
+    #[test]
+    fn border_box_flex_items_keep_padding_inside_their_cross_size() {
+        let (document, tree) = lay_out(
+            "<body><div id=r><div id=a>a</div></div><div id=c><div id=b>b</div></div></body>",
+            "body { margin: 0 } #r { display: flex; width: 300px } \
+             #c { display: flex; flex-direction: column; width: 300px } \
+             #a, #b { box-sizing: border-box; width: 100px; height: 100px; padding: 10px }",
+            400.0,
+        );
+        let a = box_for(&tree, &document, "a");
+        assert_eq!((a.rect.width, a.rect.height), (100.0, 100.0));
+        assert_eq!(box_for(&tree, &document, "r").rect.height, 100.0);
+        let b = box_for(&tree, &document, "b");
+        assert_eq!((b.rect.width, b.rect.height), (100.0, 100.0));
+    }
+
+    #[test]
+    fn invalid_box_sizing_is_content_box() {
+        let (document, tree) = lay_out(
+            "<body><div id=d>x</div></body>",
+            "body { margin: 0 } #d { box-sizing: padding-box; width: 100px; padding: 10px }",
+            400.0,
+        );
+        assert_eq!(box_for(&tree, &document, "d").rect.width, 120.0);
+    }
+}
+
+#[test]
+fn box_shadows_reach_the_box_style_in_order() {
+    let (document, tree) = lay_out(
+        "<body><div id=d>x</div><p id=p>y</p></body>",
+        "body { margin: 0 } #d { color: blue; box-shadow: 1px 2px 3px red, inset 0 0 4px }",
+        400.0,
+    );
+    let shadows = &box_for(&tree, &document, "d").style.box_shadow;
+    assert_eq!(shadows.len(), 2);
+    assert_eq!(
+        (shadows[0].offset_x, shadows[0].offset_y, shadows[0].blur),
+        (1.0, 2.0, 3.0)
+    );
+    assert!(shadows[1].inset);
+    // An omitted color is the element's `color`.
+    assert_eq!(shadows[1].color, css::parse_color("blue").unwrap());
+    assert!(box_for(&tree, &document, "p").style.box_shadow.is_empty());
+}
+
+#[test]
+fn ladder_l2_before_content_replaces_hidden_fail_text() {
+    let (document, tree) = lay_out(
+        "<body><h1 id='h' class='result'><span class='fail'>FAIL</span></h1></body>",
+        "body { margin: 0 } .fail { display: none } .result::before { content: \"SUCCESS\" }",
+        800.0,
+    );
+    assert_eq!(texts(box_for(&tree, &document, "h")), ["SUCCESS"]);
+}
+
+#[test]
+fn before_and_after_wrap_the_element_children_inline() {
+    let (document, tree) = lay_out(
+        "<body><p id='p'>middle</p></body>",
+        "body { margin: 0 } p::before { content: '[' } p:after { content: \"]\" }",
+        800.0,
+    );
+    assert_eq!(texts(box_for(&tree, &document, "p")), ["[middle]"]);
+}
+
+#[test]
+fn content_none_or_missing_generates_no_box() {
+    let (document, tree) = lay_out(
+        "<body><p id='a'>a</p><p id='b'>b</p><p id='c'>c</p></body>",
+        "body { margin: 0 } #a::before { content: none } #b::before { color: red } \
+         #c::before { content: 'x'; display: none }",
+        800.0,
+    );
+    assert_eq!(texts(box_for(&tree, &document, "a")), ["a"]);
+    assert_eq!(texts(box_for(&tree, &document, "b")), ["b"]);
+    assert_eq!(texts(box_for(&tree, &document, "c")), ["c"]);
+}
+
+#[test]
+fn block_after_content_gets_its_own_line_box() {
+    let (document, tree) = lay_out(
+        "<body><div id='d'>text</div></body>",
+        "body { margin: 0 } #d::after { content: 'below'; display: block }",
+        800.0,
+    );
+    let div = box_for(&tree, &document, "d");
+    assert_eq!(div.children.len(), 2);
+    assert_eq!(texts(&div.children[1]), ["below"]);
+    assert!(div.children[1].rect.y > div.children[0].rect.y);
+}
+
+#[test]
+fn generated_content_is_text_transformed() {
+    let (_, tree) = lay_out(
+        "<body><p>x</p></body>",
+        "body { margin: 0 } p::before { content: 'ok '; text-transform: uppercase }",
+        800.0,
+    );
+    let texts = tree
+        .paint_order()
+        .into_iter()
+        .filter_map(|item| match item {
+            PaintItem::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(texts.iter().any(|text| text.starts_with("OK")), "{texts:?}");
+}
+
+#[test]
+fn relative_position_shifts_the_box_but_not_its_siblings() {
+    let (document, tree) = lay_out(
+        "<body><div id='a'>x</div><div id='b'>x</div><div id='c'>x</div></body>",
+        "body { margin: 0 } #a { position: relative; right: 4px; bottom: 6px } \
+         #b { position: relative; top: 10px; bottom: 99px; left: 5px; right: 99px }",
+        800.0,
+    );
+    let a = box_for(&tree, &document, "a");
+    let b = box_for(&tree, &document, "b");
+    let c = box_for(&tree, &document, "c");
+    assert_eq!((a.rect.x, a.rect.y), (-4.0, -6.0));
+    assert_eq!(a.placement, Placement::Relative);
+    assert_eq!(b.rect.x, 5.0);
+    assert_close(b.rect.y, LINE + 10.0);
+    // Text moves with its box.
+    assert_close(b.lines[0].rect.y, LINE + 10.0);
+    assert_close(c.rect.y, 2.0 * LINE);
+}
+
+#[test]
+fn absolute_boxes_use_the_nearest_positioned_ancestor_and_leave_the_flow() {
+    let html = "<body><div id='p'><div id='a'>abs</div><div id='n'>next</div></div></body>";
+    let base = "body { margin: 0 } \
+                #p { position: relative; margin-top: 20px; padding: 10px; width: 200px; height: 100px }";
+    let (document, tree) = lay_out(
+        html,
+        &format!("{base} #a {{ position: absolute; top: 5px; left: 7px }}"),
+        800.0,
+    );
+    let a = box_for(&tree, &document, "a");
+    let n = box_for(&tree, &document, "n");
+    assert_eq!(a.placement, Placement::Absolute);
+    // Shrink-to-fit: "abs" is three 8px characters.
+    assert_eq!((a.rect.x, a.rect.y, a.rect.width), (7.0, 25.0, 24.0));
+    assert_eq!((n.rect.x, n.rect.y), (10.0, 30.0));
+
+    let (document, tree) = lay_out(
+        html,
+        &format!(
+            "{base} #a {{ position: absolute; right: 10px; bottom: 10px; width: 50px; height: 20px }}"
+        ),
+        800.0,
+    );
+    let a = box_for(&tree, &document, "a");
+    // The padding box is 220x120 at (0, 20).
+    assert_eq!((a.rect.x, a.rect.y), (160.0, 110.0));
+
+    let (document, tree) = lay_out(
+        html,
+        &format!("{base} #a {{ position: absolute; inset: 0 }}"),
+        800.0,
+    );
+    let a = box_for(&tree, &document, "a");
+    assert_eq!(
+        (a.rect.x, a.rect.y, a.rect.width, a.rect.height),
+        (0.0, 20.0, 220.0, 120.0)
+    );
+
+    let (document, tree) = lay_out(
+        html,
+        &format!(
+            "{base} #a {{ position: absolute; left: 0; right: 0; width: 100px; margin: 0 auto }}"
+        ),
+        800.0,
+    );
+    assert_eq!(box_for(&tree, &document, "a").rect.x, 60.0);
+}
+
+#[test]
+fn absolute_boxes_honor_border_box_sizing() {
+    let html = "<body><div id='p'><div id='a'></div></div></body>";
+    let base = "body { margin: 0 } \
+                #p { position: relative; margin-top: 20px; padding: 10px; width: 200px; height: 100px }";
+    // `width`/`height` measure the border box, so padding stays inside them.
+    let (document, tree) = lay_out(
+        html,
+        &format!(
+            "{base} #a {{ position: absolute; box-sizing: border-box; right: 10px; \
+             bottom: 10px; width: 50px; height: 20px; padding: 5px }}"
+        ),
+        800.0,
+    );
+    let a = box_for(&tree, &document, "a");
+    assert_eq!(
+        (a.rect.x, a.rect.y, a.rect.width, a.rect.height),
+        (160.0, 110.0, 50.0, 20.0)
+    );
+
+    // A height taken from both insets still fills the containing block.
+    let (document, tree) = lay_out(
+        html,
+        &format!(
+            "{base} #a {{ position: absolute; box-sizing: border-box; top: 0; bottom: 0; \
+             left: 0; width: 40px; padding: 5px }}"
+        ),
+        800.0,
+    );
+    let a = box_for(&tree, &document, "a");
+    assert_eq!(
+        (a.rect.x, a.rect.y, a.rect.width, a.rect.height),
+        (0.0, 20.0, 40.0, 120.0)
+    );
+}
+
+#[test]
+fn absolute_boxes_without_insets_sit_at_their_static_position() {
+    let (document, tree) = lay_out(
+        "<body><div id='first'>one</div><div id='a'>abs</div><div id='n'>next</div>\
+         <p id='line'>ab<span id='s'>x</span></p></body>",
+        "body { margin: 0 } p { margin: 0 } #a { position: absolute } \
+         #s { position: absolute }",
+        800.0,
+    );
+    let a = box_for(&tree, &document, "a");
+    let n = box_for(&tree, &document, "n");
+    assert_close(a.rect.y, LINE);
+    assert_eq!(a.rect.x, 0.0);
+    assert_close(n.rect.y, LINE);
+    // An inline-level box keeps its place in the line.
+    let s = box_for(&tree, &document, "s");
+    assert_eq!(s.rect.x, 16.0);
+    assert_close(s.rect.y, 2.0 * LINE);
+}
+
+#[test]
+fn fixed_boxes_are_placed_against_the_viewport() {
+    let (document, tree) = lay_out(
+        "<body><div id='p'><div id='f'>x</div></div></body>",
+        "#p { position: relative; margin: 40px } \
+         #f { position: fixed; top: 5px; left: 5px; width: 10px; height: 10px }",
+        800.0,
+    );
+    let f = box_for(&tree, &document, "f");
+    assert_eq!(f.placement, Placement::Fixed);
+    assert_eq!((f.rect.x, f.rect.y), (5.0, 5.0));
+}
+
+#[test]
+fn line_boxes_shorten_beside_floats() {
+    let (document, tree) = lay_out(
+        "<body><div id='c'><div id='f'></div>aaaa bbbb cccc dddd</div></body>",
+        "body { margin: 0 } #c { width: 100px } #f { float: left; width: 50px; height: 30px }",
+        800.0,
+    );
+    let c = box_for(&tree, &document, "c");
+    let f = box_for(&tree, &document, "f");
+    assert_eq!(f.placement, Placement::Float);
+    assert_eq!(
+        (f.rect.x, f.rect.y, f.rect.width, f.rect.height),
+        (0.0, 0.0, 50.0, 30.0)
+    );
+    assert_eq!(texts(c), ["aaaa", "bbbb", "cccc dddd"]);
+    let starts = c.lines.iter().map(|line| line.rect.x).collect::<Vec<_>>();
+    assert_eq!(starts, [50.0, 50.0, 0.0]);
+    // Floats do not make a non-root parent taller.
+    assert_close(c.rect.height, 3.0 * LINE);
+
+    let (document, tree) = lay_out(
+        "<body><div id='c'><div id='f'></div>ab</div></body>",
+        "body { margin: 0 } #c { width: 100px } #f { float: right; width: 30px; height: 10px }",
+        800.0,
+    );
+    assert_eq!(box_for(&tree, &document, "f").rect.x, 70.0);
+    assert_eq!(box_for(&tree, &document, "c").lines[0].rect.x, 0.0);
+}
+
+#[test]
+fn floats_stack_move_down_and_shorten_lines_in_later_blocks() {
+    let (document, tree) = lay_out(
+        "<body><div id='c'><div id='f1'></div><div id='f2'></div><div id='t'>hi</div></div></body>",
+        "body { margin: 0 } #c { width: 100px; display: flow-root } \
+         #f1, #f2 { float: left; width: 60px; height: 30px }",
+        800.0,
+    );
+    let f1 = box_for(&tree, &document, "f1");
+    let f2 = box_for(&tree, &document, "f2");
+    let t = box_for(&tree, &document, "t");
+    assert_eq!((f1.rect.x, f1.rect.y), (0.0, 0.0));
+    // There is no room beside the first float, so the second goes below.
+    assert_eq!((f2.rect.x, f2.rect.y), (0.0, 30.0));
+    // The block's own box ignores floats, but its line box avoids them.
+    assert_eq!(t.rect.x, 0.0);
+    assert_eq!(t.lines[0].rect.x, 60.0);
+    // A formatting context root grows to contain its floats.
+    assert_eq!(box_for(&tree, &document, "c").rect.height, 60.0);
+}
+
+#[test]
+fn floats_paint_after_blocks_and_positioned_boxes_paint_last() {
+    let (document, tree) = lay_out(
+        "<body><div id='r'></div><div id='a'><div id='f'></div>text</div></body>",
+        "#r { position: relative; height: 5px } #f { float: left; width: 5px; height: 5px }",
+        800.0,
+    );
+    let order = tree
+        .paint_order()
+        .into_iter()
+        .map(|item| match item {
+            PaintItem::BoxDecorations(layout_box) => layout_box.node,
+            PaintItem::Text(_) => None,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let position = |name: &str| {
+        let node = Some(id(&document, name));
+        order
+            .iter()
+            .position(|item| *item == node)
+            .expect("painted")
+    };
+    let text = tree
+        .paint_order()
+        .iter()
+        .position(|item| matches!(item, PaintItem::Text(_)))
+        .expect("text painted");
+    assert!(position("a") < position("f"));
+    assert!(position("f") < text);
+    assert!(text < position("r"));
 }

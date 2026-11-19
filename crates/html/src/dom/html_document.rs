@@ -222,6 +222,47 @@ impl HTMLDocument {
         Ok(())
     }
 
+    /// Removes an element's attribute using the DOM `removeAttribute` rules.
+    ///
+    /// HTML attribute names are matched after ASCII lowercasing. Other
+    /// namespaces match `qualified_name` exactly. Returns `true` when an
+    /// attribute was removed. A missing attribute returns `Ok(false)` and
+    /// leaves the element unchanged. Names that are not valid attribute local
+    /// names return [`DomError::InvalidCharacter`], and a node that is missing
+    /// or not an element returns [`DomError::NotFound`].
+    pub fn remove_attribute(
+        &mut self,
+        element: NodeID,
+        qualified_name: &str,
+    ) -> Result<bool, DomError> {
+        if !is_valid_attribute_local_name(qualified_name) {
+            log::debug!(
+                "remove_attribute on node {} rejected invalid attribute name {qualified_name:?}",
+                element.get()
+            );
+            return Err(DomError::InvalidCharacter);
+        }
+
+        let node = self.node(element).ok_or(DomError::NotFound)?;
+        let mut element_data = match node.get_kind() {
+            NodeKind::Element(element_data) => element_data.clone(),
+            _ => return Err(DomError::NotFound),
+        };
+        let name = match element_data.get_namespace() {
+            Namespace::Html => qualified_name.to_ascii_lowercase(),
+            Namespace::Svg | Namespace::MathMl => qualified_name.to_owned(),
+        };
+        if element_data.get_attribute(name.clone()).is_none() {
+            return Ok(false);
+        }
+        log::trace!("remove attribute {name:?} on node {}", element.get());
+        element_data.remove_attribute(name);
+        self.node_mut(element)
+            .expect("element was validated above")
+            .set_kind(NodeKind::Element(element_data));
+        Ok(true)
+    }
+
     /// Returns the DOM `textContent` value for a node.
     ///
     /// Element nodes return the concatenation of descendant text nodes in tree

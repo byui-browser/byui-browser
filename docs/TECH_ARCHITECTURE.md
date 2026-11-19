@@ -57,7 +57,7 @@ browser/
 │   ├── security/              # Sandboxing, process isolation helpers, CSP, etc.
 │   ├── chrome/                # Browser UI (or platform shells)
 │   ├── devtools/              # DevTools protocol + UI
-│   └── browser/               # Top-level binary that wires everything
+│   └── browser/               # Page loading and script hosting
 ├── platforms/                 # Optional thin native shells (macOS AppKit, Windows, GTK)
 └── tests/                     # Integration + web-platform-tests subset
 ```

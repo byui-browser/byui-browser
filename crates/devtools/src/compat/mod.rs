@@ -145,6 +145,81 @@ pub struct Finding {
     pub location: Option<String>,
     /// How the audit reached its conclusion.
     pub evidence: Evidence,
+    /// The page source around [`Self::location`], when the audit could find
+    /// it. `None` for findings without a line in a loaded script or
+    /// stylesheet, such as HTML elements or `style` attributes.
+    pub preview: Option<SourcePreview>,
+}
+
+/// A few lines of page source around the place a finding points at, for
+/// showing the code that fails.
+///
+/// Lines are cut to a window of at most [`SourcePreview::MAX_COLUMNS`]
+/// characters so a minified file's single huge line stays small; the window
+/// is centered on [`Self::column`] when it is known. Tabs are shown as single
+/// spaces so columns stay character-accurate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcePreview {
+    /// The script or stylesheet label, such as `app.js` or `<style> #2`.
+    pub source: String,
+    /// The one-based line number of `lines[0]`.
+    pub first_line: usize,
+    /// The excerpt, one entry per source line, without line terminators.
+    pub lines: Vec<String>,
+    /// The one-based line number the finding points at.
+    pub line: usize,
+    /// The one-based character column within `line`, when known (parse
+    /// errors know it; detected feature uses only know the line).
+    pub column: Option<usize>,
+    /// The one-based character column of each entry's first character:
+    /// greater than 1 when the start of long lines was cut off.
+    pub first_column: usize,
+}
+
+impl SourcePreview {
+    /// Source lines shown before and after the focus line.
+    pub const CONTEXT_LINES: usize = 3;
+    /// The widest excerpt kept per line, in characters.
+    pub const MAX_COLUMNS: usize = 240;
+
+    /// An excerpt of `text` (labelled `source`) around one-based `line`, or
+    /// `None` when `text` has no such line.
+    pub fn new(source: &str, text: &str, line: usize, column: Option<usize>) -> Option<Self> {
+        let all: Vec<&str> = text.lines().collect();
+        if line == 0 || line > all.len() {
+            return None;
+        }
+        let first_line = line.saturating_sub(Self::CONTEXT_LINES).max(1);
+        let last_line = (line + Self::CONTEXT_LINES).min(all.len());
+        let first_column = column.map_or(1, |column| {
+            column.saturating_sub(Self::MAX_COLUMNS / 2).max(1)
+        });
+        let lines = all[first_line - 1..last_line]
+            .iter()
+            .map(|text| {
+                text.chars()
+                    .skip(first_column - 1)
+                    .take(Self::MAX_COLUMNS)
+                    .map(|c| if c == '\t' { ' ' } else { c })
+                    .collect()
+            })
+            .collect();
+        Some(Self {
+            source: source.to_owned(),
+            first_line,
+            lines,
+            line,
+            column,
+            first_column,
+        })
+    }
+
+    /// The focus line's text within the excerpt.
+    pub fn focus(&self) -> &str {
+        self.lines
+            .get(self.line - self.first_line)
+            .map_or("", String::as_str)
+    }
 }
 
 /// The result of auditing one page.
@@ -236,6 +311,7 @@ impl<E: PageScriptEngine> Auditor<E> {
         script::audit(self, page, &map, script_error, &mut report);
         markup::audit(self, &map, &mut report);
         style::audit(self, page, &map, &mut report);
+        attach_previews(page, &map, &mut report);
         report.findings.sort_by(|a, b| {
             a.area
                 .cmp(&b.area)
@@ -347,6 +423,7 @@ impl Finding {
             occurrences: 1,
             location: None,
             evidence,
+            preview: None,
         }
     }
 
@@ -354,6 +431,44 @@ impl Finding {
         self.occurrences = usage.count.max(1);
         self.location = usage.location.clone();
         self
+    }
+}
+
+/// Gives every finding located at `label:line` in a loaded script or
+/// stylesheet a [`SourcePreview`]. Findings that already have one keep it.
+fn attach_previews(page: &PageSources<'_>, map: &markup::PageMap, report: &mut AuditReport) {
+    let scripts = page
+        .scripts
+        .iter()
+        .enumerate()
+        .map(|(index, text)| (map.script_label(index), text));
+    let sheets = page.stylesheets.iter().enumerate().map(|(index, text)| {
+        let label = map
+            .sheet_labels
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| format!("stylesheet #{}", index + 1));
+        (label, text)
+    });
+    let sources: Vec<(String, &String)> = scripts.chain(sheets).collect();
+    for finding in &mut report.findings {
+        if finding.preview.is_some() {
+            continue;
+        }
+        let Some((label, line)) = finding
+            .location
+            .as_deref()
+            .and_then(|location| location.rsplit_once(':'))
+            .and_then(|(label, line)| Some((label, line.parse::<usize>().ok()?)))
+        else {
+            continue;
+        };
+        // Labels are file names, so two scripts can share one; the first
+        // with that line wins.
+        finding.preview = sources
+            .iter()
+            .filter(|(known, _)| known == label)
+            .find_map(|(_, text)| SourcePreview::new(label, text, line, None));
     }
 }
 

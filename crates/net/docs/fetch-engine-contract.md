@@ -85,7 +85,7 @@ mutation and guard-loosening attempts return stable typed errors.
 Caller request headers remain separate from the transport header channel.
 Generated body metadata, `Origin`, `Referer`, and cookies are added only while
 preparing the transport request. Internal response headers retain every field
-for `FetchServices`, while public basic responses remove cookie fields and CORS
+for response-policy and cookie capabilities, while public basic responses remove cookie fields and CORS
 responses expose only safelisted or valid explicitly exposed fields. The CORS
 wildcard exposes non-cookie fields only when credentials mode is not `Include`;
 malformed exposure metadata exposes no additional fields. Opaque,
@@ -123,16 +123,16 @@ work.
   byte and streaming bodies observe the same abort signal; aborting, failing,
   or discarding a body drops its provider stream. Providers must release their
   own handles, tasks, and other resources when those futures or streams drop.
-- `RequestController::builder` is the construction API. Its optional
-  `with_fetch_services` and `with_scheme_providers` setters compose browser
-  services and local-scheme capabilities. A controller without services is for
-  standalone requests without client context. A request carrying browser
-  client context requires browser-owned `FetchServices`; local schemes require
-  their matching provider. That interface supplies security decisions, credential
-  selection and storage, a service-worker network decision, a cache partition,
-  and a response-header observation hook. `Set-Cookie` reaches only that
-  trusted interface. Credential mode still decides whether the engine calls
-  its credential methods.
+- `RequestController::builder` is the construction API. Its focused policy,
+  cookie, service-worker, and cache-partition setters compose browser
+  capabilities; `with_scheme_providers` composes local-scheme capabilities. A
+  controller without request policy is for standalone requests without client
+  context. A request carrying browser client context requires a browser-owned
+  `RequestPolicyService`; the other focused traits supply response decisions,
+  credential selection and storage, a service-worker network decision, a cache
+  partition, and a response-header observation hook. `Set-Cookie` reaches only
+  the trusted cookie capability. Credential mode still decides whether the
+  engine invokes it.
 - Integrity, navigation fetch, keepalive lifetime, nondefault
   priority scheduling, and cache revalidation fail with `UnsupportedFeature`.
   Manual/error redirect modes are handled by the controller. A service-worker
@@ -161,7 +161,7 @@ work.
 `security` owns cookie, CSP, mixed-content, CORP, MIME, authentication, and
 certificate decisions. Browser and service-worker crates own interception,
 navigation/client context, and lifecycle. Diagnostics and timing consumers
-own reporting. They supply decisions through `FetchServices`; none of their
+own reporting. They supply decisions through focused capability traits; none of their
 databases belong here. Complete interception, persistence, and diagnostics
 lifecycles remain work for their later plan steps.
 

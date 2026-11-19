@@ -17,6 +17,12 @@ pub type HostPropertyGetter = Arc<dyn Fn(&str) -> JsResult<Option<Value>> + Send
 pub type HostPropertySetter = Arc<dyn Fn(&str, Value) -> JsResult<bool> + Send + Sync>;
 /// A thread-safe host hook for dynamic JavaScript property names.
 pub type HostPropertyKeys = Arc<dyn Fn() -> JsResult<Vec<String>> + Send + Sync>;
+/// A thread-safe host hook for deleting a dynamic JavaScript property.
+///
+/// `Ok(Some(deleted))` completes the deletion: `deleted` is the value of the
+/// `delete` expression. `Ok(None)` leaves deletion to the ordinary
+/// own-property rules.
+pub type HostPropertyDeleter = Arc<dyn Fn(&str) -> JsResult<Option<bool>> + Send + Sync>;
 
 /// A JavaScript object value: a table of owned string keys to owned values.
 ///
@@ -45,10 +51,13 @@ pub type HostPropertyKeys = Arc<dyn Fn() -> JsResult<Vec<String>> + Send + Sync>
 /// not an own property: it is not listed by [`Object::keys`], and it reads as
 /// missing once the class has been dropped.
 ///
-/// Limitations: there is no built-in `Object.prototype`, property attributes,
-/// or symbol keys. As with functions, there is no garbage collector, so an
-/// object that refers to itself (directly or through other objects) is never
-/// freed.
+/// Limitations: there is no built-in `Object.prototype` on ordinary objects
+/// created with [`Object::new`], property attributes beyond read-only /
+/// replaceable / host accessors, or symbol keys. String and number primitives
+/// still resolve methods through the shared `String.prototype` and
+/// `Number.prototype` objects. As with functions, there is no garbage
+/// collector, so an object that refers to itself (directly or through other
+/// objects) is never freed.
 #[derive(Clone, Default)]
 pub struct Object(Arc<ObjectData>);
 
@@ -63,6 +72,7 @@ struct ObjectData {
     property_getter: Mutex<Option<HostPropertyGetter>>,
     property_setter: Mutex<Option<HostPropertySetter>>,
     property_keys: Mutex<Option<HostPropertyKeys>>,
+    property_deleter: Mutex<Option<HostPropertyDeleter>>,
     /// For the object a `catch` clause receives for an engine error: the
     /// error itself, restored if the object is thrown again unchanged.
     origin: Mutex<Option<crate::JsError>>,
@@ -290,6 +300,19 @@ impl Object {
             .unwrap_or_else(PoisonError::into_inner) = Some(keys);
     }
 
+    /// Installs a hook that runs before ordinary own-property deletion.
+    ///
+    /// The hook can remove host-backed state, such as a `data-*` attribute
+    /// behind `Element.dataset`, and report whether `delete` succeeded.
+    /// Returning `Ok(None)` from the hook keeps the default deletion rules.
+    pub fn set_property_deleter(&self, deleter: HostPropertyDeleter) {
+        *self
+            .0
+            .property_deleter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(deleter);
+    }
+
     /// Returns a clone of the value stored under `key` on this object
     /// itself, ignoring the prototype chain.
     pub fn get_own(&self, key: &str) -> Option<Value> {
@@ -422,8 +445,8 @@ impl Object {
     }
 
     /// Stores a host function under `name` as a method that scripts can call
-    /// as `object.name(...)`. The function receives only the call's
-    /// arguments; it is not given the object as `this`.
+    /// as `object.name(...)`. When the call goes through a member expression,
+    /// the engine binds the object as `this` for that host function.
     pub fn set_method(&self, name: impl Into<String>, function: HostFunction) {
         let name = name.into();
         let function = Function::from_host(name.clone(), function);
@@ -439,7 +462,17 @@ impl Object {
     /// what the expression evaluates to: `true` when the property is gone
     /// afterwards (including when it never existed), `false` when it is
     /// read-only or a host accessor and was left in place.
-    pub(crate) fn delete_own(&self, key: &str) -> bool {
+    pub(crate) fn delete_own(&self, key: &str) -> JsResult<bool> {
+        if let Some(deleter) = self
+            .0
+            .property_deleter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            && let Some(deleted) = deleter(key)?
+        {
+            return Ok(deleted);
+        }
         let read_only = self
             .0
             .read_only_properties
@@ -454,10 +487,10 @@ impl Object {
             .iter()
             .any(|(name, _, _)| name == key);
         if read_only || accessor {
-            return false;
+            return Ok(false);
         }
         self.remove(key);
-        true
+        Ok(true)
     }
 
     /// Returns whether the object itself, not its prototype chain, has a

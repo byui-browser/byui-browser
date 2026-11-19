@@ -10,9 +10,7 @@ use crate::{
     api::{
         error::RequestError,
         headers::cors_unsafe_request_header_names,
-        request::{
-            CacheMode, CredentialsMode, PreparedRequest, RedirectMode, Request, RequestMode,
-        },
+        request::{CredentialsMode, Request, RequestMode, ValidatedHop},
     },
     cache::PreflightPermissions,
     engine::RequestController,
@@ -33,7 +31,7 @@ impl RequestController {
             }
         }
         unsafe_names.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        if request.context.mode != RequestMode::Cors
+        if request.mode() != RequestMode::Cors
             || request.effective_origin().is_none()
             || request.has_same_origin_target(url)
             || (!request.requires_cors_preflight()? && unsafe_names.is_empty())
@@ -57,16 +55,7 @@ impl RequestController {
         self.observe(request, NetworkPhase::PreflightCacheMiss, url, None, false);
 
         let headers = preflight_headers(request, &unsafe_names)?;
-        let mut preflight = request.clone_without_body();
-        preflight.method = Method::OPTIONS;
-        preflight.headers = Headers::with_guard(HeaderGuard::None);
-        preflight.body = None;
-        preflight.context.mode = RequestMode::Cors;
-        preflight.context.credentials = CredentialsMode::SameOrigin;
-        preflight.cache_mode = CacheMode::NoStore;
-        preflight.redirect_mode = RedirectMode::Error;
-        preflight.integrity = None;
-        preflight.keepalive = false;
+        let preflight = request.clone_without_body().into_preflight();
 
         log::debug!(
             "sending cors preflight: {} {}",
@@ -78,11 +67,7 @@ impl RequestController {
             .inner
             .scheduler
             .submit(
-                PreparedRequest {
-                    request: preflight,
-                    headers,
-                    url: url.clone(),
-                },
+                ValidatedHop::new(preflight, headers, url.clone()),
                 request.transport_priority(),
             )
             .await
@@ -131,7 +116,7 @@ impl RequestController {
         request: &Request,
         url: &reqwest::Url,
     ) {
-        if request.context.mode == RequestMode::Cors
+        if request.mode() == RequestMode::Cors
             && request.effective_origin().is_some()
             && !request.has_same_origin_target(url)
         {
@@ -239,7 +224,7 @@ fn validate_permissions(
     unsafe_names: &[HeaderName],
     permissions: &PreflightPermissions,
 ) -> Result<(), RequestError> {
-    let include_credentials = request.context.credentials == CredentialsMode::Include;
+    let include_credentials = request.credentials_mode() == CredentialsMode::Include;
     let method_is_safe = matches!(
         request.method(),
         &Method::GET | &Method::HEAD | &Method::POST

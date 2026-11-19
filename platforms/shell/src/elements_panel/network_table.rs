@@ -474,20 +474,7 @@ impl NetworkView {
         let rgba = toolbar::rgba;
         let transform = Transform::from_scale(s, s);
         let (x, y, w, h) = (rect.x(), rect.y(), rect.width(), rect.height());
-        // Same layered soft shadow and surface as the page context menu.
-        let shadow_alpha = if dark { 12 } else { 4 };
-        for spread in (1..=6).rev() {
-            let spread = spread as f32;
-            if let Some(path) = toolbar::rounded_rect(
-                x - spread,
-                y - spread + 3.0,
-                w + 2.0 * spread,
-                h + 2.0 * spread,
-                8.0 + spread,
-            ) {
-                toolbar::fill(frame, &path, rgba(0, 0, 0, shadow_alpha), transform);
-            }
-        }
+        crate::context_menu::draw_menu_shadow(frame, Some(rect), 8.0, s);
         let (surface, border) = if dark {
             (rgba(0x2a, 0x2b, 0x31, 255), rgba(255, 255, 255, 30))
         } else {

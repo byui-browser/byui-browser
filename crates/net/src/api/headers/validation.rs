@@ -32,6 +32,11 @@ pub(super) fn header_value_string(value: &HeaderValue) -> String {
     String::from_utf8_lossy(value.as_bytes()).into_owned()
 }
 
+/// Appends a validated header value to an existing public string.
+pub(super) fn append_header_value_string(output: &mut String, value: &HeaderValue) {
+    output.push_str(&String::from_utf8_lossy(value.as_bytes()));
+}
+
 /// Identifies response headers that must retain separate entries.
 pub(super) fn is_non_combinable(name: &HeaderName) -> bool {
     matches!(name.as_str(), "set-cookie" | "set-cookie2")

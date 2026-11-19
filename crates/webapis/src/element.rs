@@ -5,8 +5,29 @@ use std::sync::{Arc, Mutex};
 use html::{Attribute, Namespace, NodeID};
 use js::{JsError, JsResult, Object, Value};
 
-use crate::document::Document;
+use crate::document::{Document, script_element_object};
 use crate::event::{add_event_listener_at, dispatch_event_at, remove_event_listener_at};
+use crate::node_tree::NodeInput;
+
+// One submodule per Element API; each installs its members on the wrapper.
+mod append;
+mod children;
+mod class_list;
+mod class_name;
+mod closest;
+mod compare_document_position;
+mod contains;
+mod dataset;
+mod first_child;
+mod focus;
+mod get_elements_by_class_name;
+pub(crate) mod get_elements_by_tag_name;
+mod has_attribute;
+mod node_type;
+mod node_view;
+mod parent_element;
+mod parent_node;
+mod query_selector;
 
 /// Script-visible view of a DOM element.
 // NOT AUTHORITATIVE: placeholder from the Scrum of Scrums team. Reshape the
@@ -193,7 +214,377 @@ pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -
             dispatch_event_at(&document, Some(dispatch_node), &dispatch_target, arguments)
         }),
     );
+    define_element_properties(&object, &element, &document);
+    define_tree_methods(&object, node, &document);
+    append::install(&object, &element, &document);
+    children::install(&object, &element, &document);
+    class_list::install(&object, &element, &document);
+    class_name::install(&object, &element, &document);
+    closest::install(&object, &element, &document);
+    compare_document_position::install(&object, &element, &document);
+    contains::install(&object, &element, &document);
+    dataset::install(&object, &element, &document);
+    first_child::install(&object, &element, &document);
+    focus::install(&object, &element, &document);
+    get_elements_by_class_name::install(&object, &element, &document);
+    get_elements_by_tag_name::install(&object, &element, &document);
+    has_attribute::install(&object, &element, &document);
+    node_type::install(&object, &element, &document);
+    parent_element::install(&object, &element, &document);
+    parent_node::install(&object, &element, &document);
+    query_selector::install(&object, &element, &document);
     object
+}
+
+/// Defines `tagName`, `attributes`, `outerHTML`, `clientWidth`,
+/// `clientHeight`, `ownerDocument`, and `querySelectorAll` on an element
+/// wrapper.
+fn define_element_properties(object: &Object, element: &Element, document: &Arc<Mutex<Document>>) {
+    let node = element.node;
+    // An element's qualified name never changes, so `tagName` is a constant:
+    // the HTML-uppercased qualified name for HTML elements, as-is otherwise.
+    let tag_name = match element.namespace {
+        Namespace::Html => element.local_name.to_ascii_uppercase(),
+        Namespace::Svg | Namespace::MathMl => element.local_name.clone(),
+    };
+    object.set_read_only("tagName", Value::String(tag_name));
+
+    let attributes_document = document.clone();
+    let attributes_owner = object.clone();
+    object.define_accessor(
+        "attributes",
+        Arc::new(move || {
+            let element = attributes_document.lock().unwrap().element_snapshot(node);
+            let attributes = element
+                .map(|element| element.attributes)
+                .unwrap_or_default();
+            Ok(Value::Array(named_node_map(&attributes, &attributes_owner)))
+        }),
+        None,
+    );
+
+    let outer_html_document = document.clone();
+    object.define_accessor(
+        "outerHTML",
+        Arc::new(move || {
+            let html = outer_html_document.lock().unwrap().outer_html(node);
+            Ok(Value::String(html.unwrap_or_default()))
+        }),
+        Some(Arc::new(|_| {
+            log::debug!("Element.outerHTML setter is not supported");
+            Err(JsError::new(
+                "NotSupportedError: setting Element.outerHTML is not supported yet",
+            ))
+        })),
+    );
+
+    for (property, height) in [("clientWidth", false), ("clientHeight", true)] {
+        let client_document = document.clone();
+        object.define_accessor(
+            property,
+            Arc::new(move || {
+                let size = client_document.lock().unwrap().client_size(node);
+                Ok(Value::Number(if height { size.height } else { size.width }))
+            }),
+            None,
+        );
+    }
+
+    let owner_document = document.clone();
+    object.define_accessor(
+        "ownerDocument",
+        Arc::new(move || {
+            let bindings = owner_document.lock().unwrap().script_bindings();
+            Ok(bindings.map_or(Value::Null, |bindings| Value::Object(bindings.document)))
+        }),
+        None,
+    );
+
+    let query_document = document.clone();
+    object.set_method(
+        "querySelectorAll",
+        Arc::new(move |arguments| {
+            let Some(selector) = arguments.first() else {
+                return Err(JsError::new(
+                    "TypeError: Element.querySelectorAll() expects a selector string",
+                ));
+            };
+            let selector = selector.to_string();
+            let matches = query_document
+                .lock()
+                .unwrap()
+                .query_selector_all_within(node, &selector)
+                .map_err(|error| JsError::new(format!("SyntaxError: {error}")))?;
+            // A static array stands in for the static `NodeList`.
+            let list = Object::new();
+            for (index, matched) in matches.iter().enumerate() {
+                list.set(index.to_string(), wrap_element(&query_document, *matched)?);
+            }
+            list.set("length", Value::Number(matches.len() as f64));
+            Ok(Value::Array(list))
+        }),
+    );
+}
+
+/// Defines `removeChild`, `replaceChild`, `replaceChildren`, and `before`.
+fn define_tree_methods(object: &Object, node: NodeID, document: &Arc<Mutex<Document>>) {
+    let remove_child_document = document.clone();
+    object.set_method(
+        "removeChild",
+        Arc::new(move |arguments| {
+            let Some((child, child_object)) = arguments.first().and_then(node_argument) else {
+                return Err(JsError::new(
+                    "TypeError: Element.removeChild() expects a Node",
+                ));
+            };
+            mutate_tree(
+                &remove_child_document,
+                &[],
+                std::slice::from_ref(&child_object),
+                |document| document.remove_child(node, child).map(|_| ()),
+            )?;
+            Ok(Value::Object(child_object))
+        }),
+    );
+
+    let replace_child_document = document.clone();
+    object.set_method(
+        "replaceChild",
+        Arc::new(move |arguments| {
+            let (Some((new_node, new_object)), Some((child, child_object))) = (
+                arguments.first().and_then(node_argument),
+                arguments.get(1).and_then(node_argument),
+            ) else {
+                return Err(JsError::new(
+                    "TypeError: Element.replaceChild() expects two Nodes",
+                ));
+            };
+            if new_node == child {
+                // Replacing a child with itself changes nothing, so no
+                // lifecycle callbacks run.
+                replace_child_document
+                    .lock()
+                    .unwrap()
+                    .replace_child(node, new_node, child)
+                    .map_err(|error| JsError::new(error.to_string()))?;
+                return Ok(Value::Object(child_object));
+            }
+            mutate_tree(
+                &replace_child_document,
+                &[new_object],
+                std::slice::from_ref(&child_object),
+                |document| document.replace_child(node, new_node, child).map(|_| ()),
+            )?;
+            Ok(Value::Object(child_object))
+        }),
+    );
+
+    let replace_children_document = document.clone();
+    object.set_method(
+        "replaceChildren",
+        Arc::new(move |arguments| {
+            let (inputs, inserted) = node_inputs(arguments);
+            let removed: Vec<Object> = {
+                let document = replace_children_document.lock().unwrap();
+                let children = document
+                    .html_document()
+                    .and_then(|source| source.node(node))
+                    .map(|data| data.get_children().clone())
+                    .unwrap_or_default();
+                children
+                    .into_iter()
+                    .filter_map(|child| document.cached_script_element(child))
+                    .collect()
+            };
+            mutate_tree(
+                &replace_children_document,
+                &inserted,
+                &removed,
+                |document| document.replace_children(node, &inputs),
+            )?;
+            Ok(Value::Undefined)
+        }),
+    );
+
+    let before_document = document.clone();
+    object.set_method(
+        "before",
+        Arc::new(move |arguments| {
+            let (inputs, inserted) = node_inputs(arguments);
+            mutate_tree(&before_document, &inserted, &[], |document| {
+                document.before(node, &inputs)
+            })?;
+            Ok(Value::Undefined)
+        }),
+    );
+}
+
+/// Builds a static `NamedNodeMap` snapshot: indexed `Attr`-like objects with
+/// `length`, `item(index)`, and `getNamedItem(name)`.
+///
+/// Limitation: the DOM's map is live and its `Attr` nodes are shared objects;
+/// this snapshot does not reflect later attribute changes, and writing an
+/// `Attr`'s `value` does not change the element.
+fn named_node_map(attributes: &[Attribute], owner: &Object) -> Object {
+    let map = Object::new();
+    let attrs: Vec<Object> = attributes
+        .iter()
+        .map(|attribute| {
+            let attr = Object::new();
+            attr.set("name", Value::String(attribute.get_name().clone()));
+            attr.set("localName", Value::String(attribute.get_name().clone()));
+            attr.set("value", Value::String(attribute.get_value().clone()));
+            attr.set("namespaceURI", Value::Null);
+            attr.set("prefix", Value::Null);
+            attr.set("specified", Value::Boolean(true));
+            attr.set("ownerElement", Value::Object(owner.clone()));
+            attr
+        })
+        .collect();
+    for (index, attr) in attrs.iter().enumerate() {
+        map.set(index.to_string(), Value::Object(attr.clone()));
+    }
+    map.set("length", Value::Number(attrs.len() as f64));
+    let item_attrs = attrs.clone();
+    map.set_method(
+        "item",
+        Arc::new(move |arguments| {
+            let index = match arguments.first() {
+                Some(Value::Number(index)) if *index >= 0.0 => *index as usize,
+                _ => return Ok(Value::Null),
+            };
+            Ok(item_attrs
+                .get(index)
+                .map_or(Value::Null, |attr| Value::Object(attr.clone())))
+        }),
+    );
+    map.set_method(
+        "getNamedItem",
+        Arc::new(move |arguments| {
+            let Some(name) = arguments.first() else {
+                return Ok(Value::Null);
+            };
+            // HTML attribute names are stored lowercased, so lookups are
+            // ASCII case-insensitive like getAttribute().
+            let name = name.to_string().to_ascii_lowercase();
+            Ok(attrs
+                .iter()
+                .find(|attr| matches!(attr.get("name"), Some(Value::String(n)) if n == name))
+                .map_or(Value::Null, |attr| Value::Object(attr.clone())))
+        }),
+    );
+    map
+}
+
+/// Returns the node ID and wrapper of a script `Node` argument.
+pub(crate) fn node_argument(value: &Value) -> Option<(NodeID, Object)> {
+    let (Value::Object(object) | Value::Array(object)) = value else {
+        return None;
+    };
+    let Some(Value::Number(id)) = object.get("__nodeId") else {
+        return None;
+    };
+    Some((NodeID::new(id as usize), object.clone()))
+}
+
+/// Converts `(Node or DOMString)...` arguments: element wrappers become node
+/// inputs, and every other value is converted to a string for a new text node.
+fn node_inputs(arguments: &[Value]) -> (Vec<NodeInput>, Vec<Object>) {
+    let mut inputs = Vec::new();
+    let mut objects = Vec::new();
+    for argument in arguments {
+        match node_argument(argument) {
+            Some((id, object)) => {
+                inputs.push(NodeInput::Node(id));
+                objects.push(object);
+            }
+            None => inputs.push(NodeInput::Text(argument.to_string())),
+        }
+    }
+    (inputs, objects)
+}
+
+/// Runs a tree mutation and then reports connection changes to custom
+/// element callbacks, with the document unlocked while callbacks run.
+///
+/// Each `inserted` wrapper gets `disconnectedCallback` if it was connected
+/// before the mutation and `connectedCallback` if it is connected after it,
+/// so a node moved within the document sees both, as with `appendChild()`.
+/// Each `removed` wrapper that is not also inserted gets
+/// `disconnectedCallback` only when it left the document.
+fn mutate_tree(
+    document: &Arc<Mutex<Document>>,
+    inserted: &[Object],
+    removed: &[Object],
+    mutation: impl FnOnce(&mut Document) -> Result<(), crate::DomException>,
+) -> JsResult<()> {
+    let mut tracked: Vec<(&Object, bool)> = Vec::new();
+    for (object, is_inserted) in inserted
+        .iter()
+        .map(|object| (object, true))
+        .chain(removed.iter().map(|object| (object, false)))
+    {
+        if !tracked.iter().any(|(seen, _)| *seen == object) {
+            tracked.push((object, is_inserted));
+        }
+    }
+    let node_of = |object: &Object| node_argument(&Value::Object(object.clone())).map(|(id, _)| id);
+    let connections = {
+        let mut document = document.lock().unwrap();
+        let connected = |document: &Document, object: &Object| {
+            node_of(object).is_some_and(|id| document.is_connected(id))
+        };
+        let before: Vec<bool> = tracked
+            .iter()
+            .map(|(object, _)| connected(&document, object))
+            .collect();
+        mutation(&mut document).map_err(|error| JsError::new(error.to_string()))?;
+        tracked
+            .iter()
+            .zip(before)
+            .map(|((object, _), was)| (was, connected(&document, object)))
+            .collect::<Vec<_>>()
+    };
+    for ((object, is_inserted), (was_connected, is_connected)) in
+        tracked.into_iter().zip(connections)
+    {
+        if is_inserted {
+            if was_connected {
+                invoke_lifecycle_callback(object, "disconnectedCallback");
+            }
+            if is_connected {
+                invoke_lifecycle_callback(object, "connectedCallback");
+            }
+        } else if was_connected && !is_connected {
+            invoke_lifecycle_callback(object, "disconnectedCallback");
+        }
+    }
+    Ok(())
+}
+
+/// Returns the script wrapper for the element `node`, reusing the wrapper
+/// already handed to scripts so identity comparisons hold.
+pub(crate) fn wrap_element(document: &Arc<Mutex<Document>>, node: NodeID) -> JsResult<Value> {
+    let (element, bindings) = {
+        let document = document.lock().unwrap();
+        (document.element_snapshot(node), document.script_bindings())
+    };
+    let Some(element) = element else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Object(match bindings {
+        Some(bindings) => script_element_object(document, &bindings.registry, element)?,
+        None => element_object(element, document.clone()),
+    }))
+}
+
+/// Builds a thrown exception object whose `name` and `message` a `catch`
+/// clause can read.
+pub(super) fn thrown_exception(name: &str, message: &str) -> JsError {
+    let exception = Object::new();
+    exception.set("name", Value::String(name.to_owned()));
+    exception.set("message", Value::String(message.to_owned()));
+    JsError::thrown(Value::Object(exception))
 }
 
 pub(crate) fn invoke_lifecycle_callback(element: &Object, name: &str) {
@@ -437,6 +828,246 @@ mod tests {
             "InvalidCharacterError"
         );
         assert!(element.attributes.is_empty());
+    }
+
+    fn realm_with(markup: &str) -> Realm {
+        let mut realm = Realm::new();
+        register_document(
+            &mut realm,
+            Document::from_html_document(&parse_raw_html(markup.to_owned())),
+        )
+        .unwrap();
+        realm
+    }
+
+    fn eval(realm: &mut Realm, script: &str) -> Value {
+        realm
+            .evaluate_script(script)
+            .unwrap_or_else(|error| panic!("{script}: {error:?}"))
+    }
+
+    fn string(value: &str) -> Value {
+        Value::String(value.to_owned())
+    }
+
+    #[test]
+    fn element_query_selector_all_returns_shared_wrappers_for_descendants() {
+        let mut realm = realm_with(
+            "<div id='root' class='x'><p class='x' id='a'></p><span><b class='x' id='b'></b></span></div>\
+             <p class='x' id='outside'></p>",
+        );
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var found = document.getElementById('root').querySelectorAll('.x, i'); \
+                 found.length + ':' + found[0].getAttribute('id') + ':' + found[1].getAttribute('id')"
+            ),
+            string("2:a:b")
+        );
+        assert_eq!(
+            eval(&mut realm, "found[0] === document.getElementById('a')"),
+            Value::Boolean(true)
+        );
+        assert!(
+            realm
+                .evaluate_script("document.getElementById('root').querySelectorAll('div > p')")
+                .unwrap_err()
+                .to_string()
+                .contains("SyntaxError")
+        );
+    }
+
+    #[test]
+    fn element_tag_name_uppercases_html_names() {
+        let mut realm = realm_with("<main id='app'></main>");
+        assert_eq!(
+            eval(&mut realm, "document.getElementById('app').tagName"),
+            string("MAIN")
+        );
+        assert_eq!(
+            eval(&mut realm, "document.createElement('x-panel').tagName"),
+            string("X-PANEL")
+        );
+    }
+
+    #[test]
+    fn element_attributes_lists_name_value_pairs_in_order() {
+        let mut realm = realm_with("<a id='link' href='/x' data-kind='nav'></a>");
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var attrs = document.getElementById('link').attributes; \
+                 attrs.length + ':' + attrs[1].name + '=' + attrs[1].value + ':' + \
+                 attrs.getNamedItem('DATA-KIND').value + ':' + attrs.item(0).name + ':' + \
+                 (attrs.getNamedItem('missing') === null)"
+            ),
+            string("3:href=/x:nav:id:true")
+        );
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var link = document.getElementById('link'); link.setAttribute('title', 't'); \
+                 link.attributes.length + ':' + (link.attributes[0].ownerElement === link)"
+            ),
+            string("4:true")
+        );
+    }
+
+    #[test]
+    fn element_outer_html_serializes_the_current_subtree() {
+        let mut realm = realm_with("<ul id='list'><li>a &amp; b</li></ul>");
+        assert_eq!(
+            eval(&mut realm, "document.getElementById('list').outerHTML"),
+            string("<ul id=\"list\"><li>a &amp; b</li></ul>")
+        );
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var list = document.getElementById('list'); \
+                 list.appendChild(document.createElement('li')); list.outerHTML"
+            ),
+            string("<ul id=\"list\"><li>a &amp; b</li><li></li></ul>")
+        );
+        assert!(
+            realm
+                .evaluate_script("document.getElementById('list').outerHTML = '<p></p>'")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn element_client_size_reports_px_padding_box_or_zero() {
+        let mut realm = realm_with(
+            "<div id='box' style='width: 100px; height: 40px; padding: 5px'></div><div id='auto'></div>",
+        );
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var box = document.getElementById('box'); box.clientWidth + 'x' + box.clientHeight"
+            ),
+            string("110x50")
+        );
+        assert_eq!(
+            eval(&mut realm, "document.getElementById('auto').clientWidth"),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var created = document.createElement('div'); \
+                 created.setAttribute('style', 'width: 10px'); created.clientWidth"
+            ),
+            Value::Number(0.0)
+        );
+    }
+
+    #[test]
+    fn element_owner_document_is_the_document_object() {
+        let mut realm = realm_with("<main id='app'></main>");
+        assert_eq!(
+            eval(
+                &mut realm,
+                "(document.getElementById('app').ownerDocument === document) + ':' + \
+                 (document.createElement('p').ownerDocument === document)"
+            ),
+            string("true:true")
+        );
+    }
+
+    #[test]
+    fn element_remove_child_detaches_only_direct_children() {
+        let mut realm = realm_with("<div id='p'><span id='c'><i id='g'></i></span></div>");
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var parent = document.getElementById('p'); var child = document.getElementById('c'); \
+                 (parent.removeChild(child) === child) + ':' + (document.getElementById('c') === null) + \
+                 ':' + parent.outerHTML"
+            ),
+            string("true:true:<div id=\"p\"></div>")
+        );
+        assert!(
+            realm
+                .evaluate_script("parent.removeChild(child)")
+                .unwrap_err()
+                .to_string()
+                .contains("NotFoundError")
+        );
+    }
+
+    #[test]
+    fn element_replace_child_swaps_nodes_and_returns_the_old_child() {
+        let mut realm = realm_with("<div id='p'><a id='one'></a><a id='two'></a></div>");
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var parent = document.getElementById('p'); var one = document.getElementById('one'); \
+                 var fresh = document.createElement('b'); \
+                 (parent.replaceChild(fresh, one) === one) + ':' + parent.outerHTML"
+            ),
+            string("true:<div id=\"p\"><b></b><a id=\"two\"></a></div>")
+        );
+        assert!(
+            realm
+                .evaluate_script("fresh.replaceChild(parent, fresh)")
+                .unwrap_err()
+                .to_string()
+                .contains("HierarchyRequestError")
+        );
+    }
+
+    #[test]
+    fn element_replace_children_accepts_nodes_and_strings() {
+        let mut realm = realm_with("<div id='p'><a id='one'></a><a id='two'></a></div>");
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var parent = document.getElementById('p'); \
+                 parent.replaceChildren('x<', document.getElementById('two'), 7); parent.outerHTML"
+            ),
+            string("<div id=\"p\">x&lt;<a id=\"two\"></a>7</div>")
+        );
+        assert_eq!(
+            eval(&mut realm, "parent.replaceChildren(); parent.outerHTML"),
+            string("<div id=\"p\"></div>")
+        );
+    }
+
+    #[test]
+    fn element_before_inserts_preceding_siblings() {
+        let mut realm = realm_with("<div id='p'><a id='one'></a><a id='two'></a></div>");
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var two = document.getElementById('two'); \
+                 two.before(document.createElement('hr'), 'text'); \
+                 document.getElementById('p').outerHTML"
+            ),
+            string("<div id=\"p\"><a id=\"one\"></a><hr>text<a id=\"two\"></a></div>")
+        );
+        assert_eq!(
+            eval(
+                &mut realm,
+                "document.createElement('p').before('ignored'); 'ok'"
+            ),
+            string("ok")
+        );
+    }
+
+    #[test]
+    fn tree_mutations_run_custom_element_connection_callbacks() {
+        let mut realm = realm_with("<div id='p'><a id='one'></a></div>");
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var log = ''; var one = document.getElementById('one'); \
+                 one.disconnectedCallback = () => { log = log + 'one-out;'; }; \
+                 var fresh = document.createElement('b'); \
+                 fresh.connectedCallback = () => { log = log + 'fresh-in,'; }; \
+                 one.before(fresh); document.getElementById('p').removeChild(one); log"
+            ),
+            string("fresh-in,one-out;")
+        );
     }
 
     #[test]

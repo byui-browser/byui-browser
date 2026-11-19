@@ -18,7 +18,8 @@
 //! The engine coordinates process-local scheduling and a small in-memory cache.
 //! Durable storage, security policy, service workers, client context, and
 //! diagnostics may be collected through [`NetworkObserver`], while browser
-//! policy and durable state enter through [`FetchServices`]. Renderer
+//! policy and durable state enter through focused request, response, cookie,
+//! service-worker, and cache-partition capabilities. Renderer
 //! processes do not open sockets directly.
 //!
 //! The current transport executes HTTP(S) requests. Relative URLs require a
@@ -71,7 +72,10 @@ pub use api::{
         RequestDestination, RequestDuplex, RequestMode, RequestPriority, ServiceWorkersMode,
     },
     response::{Response, ResponseType},
-    services::{FetchServices, ResponseInfo, ServiceWorkerDecision},
+    services::{
+        CachePartitionService, CookieService, RequestPolicyService, ResponseInfo,
+        ResponsePolicyService, ServiceWorkerDecision, ServiceWorkerService,
+    },
 };
 pub use engine::{RequestController, RequestControllerBuilder};
 pub use http::{HeaderName, HeaderValue, Method};

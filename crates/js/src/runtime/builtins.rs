@@ -1,6 +1,6 @@
 //! ECMAScript built-ins that do not depend on browser host APIs.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{Function, JsError, JsResult, Object, Value};
 
@@ -9,6 +9,9 @@ type Values = Arc<Mutex<Vec<Value>>>;
 
 /// Installs the standard-library objects supported by the engine.
 pub(super) fn install(state: &super::GlobalState) {
+    super::primitives::install(state);
+    super::errors::install(state);
+
     state.install_host("Map", Value::Function(map_constructor()));
     state.install_host("Set", Value::Function(set_constructor()));
     state.install_host("WeakMap", Value::Function(map_constructor()));
@@ -65,6 +68,12 @@ fn reflect_namespace() -> Object {
 /// for its intentionally short-lived, non-persistent global environment.
 pub(crate) fn value(name: &str) -> Option<Value> {
     match name {
+        "String" => Some(Value::Function(
+            super::primitives::string_constructor_value(),
+        )),
+        "Number" => Some(Value::Function(
+            super::primitives::number_constructor_value(),
+        )),
         "Map" => Some(Value::Function(map_constructor())),
         "Set" => Some(Value::Function(set_constructor())),
         "WeakMap" => Some(Value::Function(map_constructor())),
@@ -73,7 +82,7 @@ pub(crate) fn value(name: &str) -> Option<Value> {
         "ArrayBuffer" => Some(Value::Function(array_buffer_constructor())),
         "Uint8Array" => Some(Value::Function(uint8_array_constructor())),
         "Reflect" => Some(Value::Object(reflect_namespace())),
-        _ => None,
+        _ => super::global_functions::value(name).or_else(|| super::errors::value(name)),
     }
 }
 
@@ -384,8 +393,12 @@ fn set_constructor() -> Function {
     )
 }
 
+// Well-known symbols share identity across constructors and realms.
+// Limitation: like Symbol(), dispose is an object handle; symbol primitives,
+// symbol-keyed properties, and automatic resource disposal are not modeled.
 fn symbol_constructor() -> Function {
-    Function::from_host(
+    static DISPOSE: OnceLock<Object> = OnceLock::new();
+    let function = Function::from_host(
         "Symbol",
         Arc::new(|args| {
             let symbol = Object::new();
@@ -394,7 +407,19 @@ fn symbol_constructor() -> Function {
             }
             Ok(Value::Object(symbol))
         }),
-    )
+    );
+    let dispose = DISPOSE.get_or_init(|| {
+        let symbol = Object::new();
+        symbol.set_read_only("description", Value::String("Symbol.dispose".into()));
+        symbol
+    });
+    match &*function.0 {
+        super::FunctionKind::Host { properties, .. } => {
+            properties.set_read_only("dispose", Value::Object(dispose.clone()));
+        }
+        _ => unreachable!(),
+    }
+    function
 }
 
 fn object_argument(args: &[Value], index: usize) -> JsResult<Object> {

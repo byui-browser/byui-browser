@@ -108,7 +108,7 @@ pub const WORKSPACE_CRATES: &[&str] = &[
     "browser",
     "browser_js",
     "browser_linux",
-    "browser_macos",
+    "byui_browser",
     "browser_shell",
     "byui_browser_windows",
     "chrome",
