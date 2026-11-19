@@ -19,14 +19,11 @@ build:
 # forwards a log level to the program being run.
 RUN_ARGS := $(if $(LOG),-- --log-level $(LOG))
 
-## Run a platform shell: `make run shell` for the browser, or `make run js`
-## for the interactive JavaScript engine shell. Add `LOG=<spec>` to set the
-## log level.
+## Run the native shell for this operating system, or `make run js` for the
+## interactive JavaScript engine shell. Add `LOG=<spec>` to set the log level.
 run:
 ifeq ($(ARGS),js)
 	cargo run -p browser-js $(RUN_ARGS)
-else ifeq ($(ARGS),shell)
-	cargo run -p browser $(RUN_ARGS)
 else ifeq ($(OS),Windows_NT)
 	cargo run -p byui-browser-windows $(RUN_ARGS)
 else ifneq (,$(filter Darwin darwin,$(shell uname -s)))

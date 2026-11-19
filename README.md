@@ -45,7 +45,7 @@ downloaded binary; clear that with
 │   ├── security/        # Security & Storage Team
 │   ├── chrome/          # Browser UX Team
 │   ├── devtools/        # Devtools Team
-│   └── browser/         # Top-level binary (wires crates/processes)
+│   └── browser/         # Page loading and script hosting (library)
 ├── platforms/           # Thin native shells (macOS, Windows, Linux)
 ├── tests/               # Integration + conformance tests
 └── docs/
@@ -76,13 +76,8 @@ make lint                  # rustfmt check + clippy (-D warnings)
 make release linux         # release build of the native shell (macos, linux, or windows)
 ```
 
-The binary entry point:
-
-```bash
-cargo run -p browser
-```
-
-`make run` selects the platform shell automatically. The macOS, Linux, and
+`make run` selects the platform shell automatically (`browser-macos`,
+`browser-linux`, or `byui-browser-windows`). The macOS, Linux, and
 Windows shells currently render the startup HTML page, parse its CSS, and
 execute its JavaScript startup script; see [`platforms/`](platforms/README.md)
 for what each shell needs.
