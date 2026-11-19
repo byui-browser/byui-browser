@@ -62,7 +62,7 @@ fn install_get_elements_by_tag_name(object: &Object, document: &Arc<Mutex<Docume
                 let locked = document.lock().unwrap();
                 locked
                     .html_document()
-                    .map(|source| matching_descendants(source, source.root, &name))
+                    .map(|source| matching_descendants(source, *source.get_root(), &name))
                     .unwrap_or_default()
             };
             let mut entries = Vec::with_capacity(matches.len());
@@ -225,7 +225,7 @@ fn register_shared_document(
         .lock()
         .unwrap()
         .html_document()
-        .map(|document| document.root)
+        .map(|document| *document.get_root())
     {
         // The document node is the parent of the root element. Tagging the
         // script object lets tree APIs such as `parentNode` and
@@ -665,7 +665,7 @@ impl Document {
             return ComputedStyles::default();
         };
         let sheets = source
-            .nodes
+            .get_nodes()
             .iter()
             .enumerate()
             .filter_map(|(index, node)| {
@@ -713,7 +713,7 @@ impl Document {
     pub fn text_content(&self) -> Option<String> {
         self.source_document
             .as_ref()
-            .and_then(|document| document.text_content(document.root))
+            .and_then(|document| document.text_content(*document.get_root()))
     }
 
     /// Implements `document.createElement(localName)` for an HTML document.
@@ -732,7 +732,7 @@ impl Document {
         })?;
         log::debug!("document.createElement({local_name:?})");
 
-        let element = match document.node(node).map(|node| node.get_kind()) {
+        let element = match document.get_node(node).map(|node| node.get_kind()) {
             Some(NodeKind::Element(element)) => element,
             _ => {
                 log::error!("createElement({local_name:?}) produced a non-element node");
@@ -776,7 +776,7 @@ impl Document {
         if wanted.is_empty() {
             return Vec::new();
         }
-        self.inclusive_descendant_elements(source.root)
+        self.inclusive_descendant_elements(*source.get_root())
             .into_iter()
             .filter(|element| {
                 let Some(class) = element
@@ -793,7 +793,7 @@ impl Document {
     }
 
     pub(crate) fn element_snapshot(&self, node: NodeID) -> Option<Element> {
-        let node_data = self.source_document.as_ref()?.node(node)?;
+        let node_data = self.source_document.as_ref()?.get_node(node)?;
         let NodeKind::Element(element) = node_data.get_kind() else {
             return None;
         };
@@ -853,7 +853,7 @@ impl Document {
             let Some(source) = &document.source_document else {
                 return;
             };
-            let Some(node_data) = source.node(node) else {
+            let Some(node_data) = source.get_node(node) else {
                 return;
             };
             if let NodeKind::Element(element) = node_data.get_kind() {
@@ -885,8 +885,11 @@ impl Document {
             return false;
         };
         let mut current = node;
-        while let Some(parent) = document.node(current).and_then(|node| node.get_parent()) {
-            if parent == document.root {
+        while let Some(parent) = document
+            .get_node(current)
+            .and_then(|node| node.get_parent())
+        {
+            if parent == *document.get_root() {
                 return true;
             }
             current = parent;
@@ -999,11 +1002,11 @@ impl Document {
             selectors: &[SimpleSelector],
             matches: &mut Vec<NodeID>,
         ) {
-            let Some(parent_node) = document.node(parent) else {
+            let Some(parent_node) = document.get_node(parent) else {
                 return;
             };
             for child in parent_node.get_children() {
-                let Some(node) = document.node(*child) else {
+                let Some(node) = document.get_node(*child) else {
                     continue;
                 };
                 if let NodeKind::Element(element) = node.get_kind() {
@@ -1015,7 +1018,7 @@ impl Document {
             }
         }
 
-        collect(document, document.root, &selectors, &mut matches);
+        collect(document, *document.get_root(), &selectors, &mut matches);
         log::debug!(
             "querySelectorAll({selector:?}) matched {} nodes",
             matches.len()
@@ -1036,10 +1039,10 @@ impl Document {
             self.source_document = Some(HTMLDocument::new());
         }
         let source = self.source_document.as_ref().unwrap();
-        let root = source.root;
+        let root = *source.get_root();
         let child_id = child;
         log::debug!("document.appendChild bridged to the DOM");
-        let child_node = source.node(child_id).ok_or_else(|| {
+        let child_node = source.get_node(child_id).ok_or_else(|| {
             log::debug!("appendChild failed: child node not found");
             DomException::NotFoundError
         })?;
@@ -1050,7 +1053,7 @@ impl Document {
         }
 
         match child_node.get_kind() {
-            NodeKind::Comment(_) | NodeKind::Element(_) | NodeKind::Doctype { .. } => {}
+            NodeKind::Comment(_) | NodeKind::Element(_) | NodeKind::Doctype(_) => {}
             NodeKind::Text(_) | NodeKind::Document | NodeKind::None => {
                 log::debug!("appendChild failed: node kind cannot be a document child");
                 return Err(DomException::HierarchyRequestError);
@@ -1058,7 +1061,7 @@ impl Document {
         }
 
         let root_node = source
-            .node(root)
+            .get_node(root)
             .ok_or(DomException::HierarchyRequestError)?;
         if !matches!(root_node.get_kind(), NodeKind::Document) {
             return Err(DomException::HierarchyRequestError);
@@ -1070,13 +1073,13 @@ impl Document {
             .copied()
             .filter(|sibling| *sibling != child_id)
         {
-            let Some(sibling) = source.node(sibling) else {
+            let Some(sibling) = source.get_node(sibling) else {
                 return Err(DomException::HierarchyRequestError);
             };
             match (child_node.get_kind(), sibling.get_kind()) {
                 (NodeKind::Element(_), NodeKind::Element(_))
-                | (NodeKind::Doctype { .. }, NodeKind::Doctype { .. })
-                | (NodeKind::Doctype { .. }, NodeKind::Element(_)) => {
+                | (NodeKind::Doctype(_), NodeKind::Doctype(_))
+                | (NodeKind::Doctype(_), NodeKind::Element(_)) => {
                     log::debug!("appendChild failed: document would have duplicate children");
                     return Err(DomException::HierarchyRequestError);
                 }
@@ -1085,7 +1088,7 @@ impl Document {
         }
 
         if let Some(parent) = child_node.get_parent() {
-            let Some(parent_node) = source.node(parent) else {
+            let Some(parent_node) = source.get_node(parent) else {
                 return Err(DomException::NotFoundError);
             };
             if !parent_node.get_children().contains(&child_id) {
@@ -1094,19 +1097,7 @@ impl Document {
         }
 
         let document = self.source_document.as_mut().unwrap();
-        if let Some(parent) = document.nodes[child_id.get()].get_parent() {
-            let siblings = document.nodes[parent.get()].get_children().to_vec();
-            let Some(position) = siblings.iter().position(|sibling| *sibling == child_id) else {
-                return Err(DomException::NotFoundError);
-            };
-            let mut updated_siblings = siblings;
-            updated_siblings.remove(position);
-            document.nodes[parent.get()].set_children(updated_siblings);
-        }
-        document.nodes[child_id.get()].set_parent(Some(root));
-        let mut root_children = document.nodes[root.get()].get_children().clone();
-        root_children.push(child_id);
-        document.nodes[root.get()].set_children(root_children);
+        document.append_child(root, child_id);
         self.elements = collect_elements(document);
         log::debug!(
             "appendChild done; document has {} elements",
@@ -1126,10 +1117,10 @@ impl Document {
             return Err(JsError::new("HierarchyRequestError"));
         }
         if !matches!(
-            document.node(parent).map(|node| node.get_kind()),
+            document.get_node(parent).map(|node| node.get_kind()),
             Some(NodeKind::Element(_))
         ) || !matches!(
-            document.node(child).map(|node| node.get_kind()),
+            document.get_node(child).map(|node| node.get_kind()),
             Some(NodeKind::Element(_))
         ) {
             return Err(JsError::new("HierarchyRequestError"));
@@ -1139,21 +1130,9 @@ impl Document {
             if node == child {
                 return Err(JsError::new("HierarchyRequestError"));
             }
-            ancestor = document.node(node).and_then(|node| node.get_parent());
+            ancestor = document.get_node(node).and_then(|node| node.get_parent());
         }
-        if let Some(old_parent) = document.node(child).and_then(|node| node.get_parent()) {
-            let mut siblings = document
-                .node(old_parent)
-                .ok_or_else(|| JsError::new("NotFoundError"))?
-                .get_children()
-                .clone();
-            siblings.retain(|sibling| *sibling != child);
-            document.nodes[old_parent.get()].set_children(siblings);
-        }
-        document.nodes[child.get()].set_parent(Some(parent));
-        let mut children = document.nodes[parent.get()].get_children().clone();
-        children.push(child);
-        document.nodes[parent.get()].set_children(children);
+        document.append_child(parent, child);
         self.elements = collect_elements(document);
         Ok(child)
     }
@@ -1233,12 +1212,12 @@ pub(crate) fn script_element_object(
 
 pub(crate) fn collect_elements(document: &HTMLDocument) -> Vec<Element> {
     fn collect(document: &HTMLDocument, parent: NodeID, elements: &mut Vec<Element>) {
-        let Some(node) = document.node(parent) else {
+        let Some(node) = document.get_node(parent) else {
             return;
         };
 
         for child in node.get_children() {
-            if let Some(node) = document.node(*child) {
+            if let Some(node) = document.get_node(*child) {
                 if let NodeKind::Element(element) = node.get_kind() {
                     let id_attr = element
                         .get_attributes()
@@ -1259,7 +1238,7 @@ pub(crate) fn collect_elements(document: &HTMLDocument) -> Vec<Element> {
     }
 
     let mut elements = Vec::new();
-    collect(document, document.root, &mut elements);
+    collect(document, *document.get_root(), &mut elements);
     elements
 }
 
@@ -1459,8 +1438,8 @@ mod tests {
             NodeID::new(1)
         );
         let source = document.source_document.as_ref().unwrap();
-        assert_eq!(source.node(NodeID::new(2)).unwrap().get_parent(), None);
-        assert_eq!(source.node(NodeID::new(3)).unwrap().get_parent(), None);
+        assert_eq!(source.get_node(NodeID::new(2)).unwrap().get_parent(), None);
+        assert_eq!(source.get_node(NodeID::new(3)).unwrap().get_parent(), None);
     }
 
     #[test]
@@ -1538,7 +1517,7 @@ mod tests {
         assert_eq!(document.append_child(child), Ok(child));
         let source = document.source_document.as_ref().unwrap();
         assert_eq!(
-            source.node(source.root).unwrap().get_children(),
+            source.get_node(*source.get_root()).unwrap().get_children(),
             &vec![html_child]
         );
         assert_eq!(document.get_element_by_id("appended").unwrap().node, child);
@@ -1553,21 +1532,24 @@ mod tests {
             Vec::new(),
         )));
         let comment = html_document.push_node(NodeKind::Comment("move me".into()));
-        html_document.append_child(html_document.root, element);
+        html_document.append_child(*html_document.get_root(), element);
         html_document.append_child(element, comment);
         let mut document = Document::from_html_document(&html_document);
         let comment_id = comment;
 
         assert_eq!(document.append_child(comment_id), Ok(comment_id));
         let source = document.source_document.as_ref().unwrap();
-        assert_eq!(source.node(element).unwrap().get_children(), &Vec::new());
         assert_eq!(
-            source.node(source.root).unwrap().get_children(),
+            source.get_node(element).unwrap().get_children(),
+            &Vec::new()
+        );
+        assert_eq!(
+            source.get_node(*source.get_root()).unwrap().get_children(),
             &vec![element, comment]
         );
         assert_eq!(
-            source.node(comment).unwrap().get_parent(),
-            Some(source.root)
+            source.get_node(comment).unwrap().get_parent(),
+            Some(*source.get_root())
         );
     }
 
@@ -1584,7 +1566,7 @@ mod tests {
             Namespace::Html,
             Vec::new(),
         )));
-        html_document.append_child(html_document.root, existing_element);
+        html_document.append_child(*html_document.get_root(), existing_element);
         let mut document = Document::from_html_document(&html_document);
         let before = document.source_document.clone();
 

@@ -54,7 +54,7 @@ fn node_contains(document: &Document, this: NodeID, other: NodeID) -> bool {
         return false;
     };
     let mut current = other;
-    while let Some(parent) = source.node(current).and_then(|node| node.get_parent()) {
+    while let Some(parent) = source.get_node(current).and_then(|node| node.get_parent()) {
         if parent == this {
             return true;
         }
