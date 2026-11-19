@@ -52,8 +52,11 @@ impl HTMLDocument {
 
     /// Gets a mutable node from its ID.
     ///
-    /// Returns None if not found.
-    pub(crate) fn get_mut_node(&mut self, id: NodeID) -> Option<&mut Node> {
+    /// The returned node remains owned by this document. Mutating its parent
+    /// or child links directly can violate DOM invariants; callers should
+    /// prefer [`Self::append_child`] and [`Self::remove`] for tree changes.
+    /// Returns `None` if the ID is not present.
+    pub fn get_mut_node(&mut self, id: NodeID) -> Option<&mut Node> {
         self.nodes.get_mut(id.get())
     }
 
@@ -163,7 +166,7 @@ impl HTMLDocument {
     /// ASCII uppercase characters are lowercased because this arena represents
     /// an HTML document. The returned node has no parent, no attributes, and
     /// the HTML namespace. Invalid names return [`DomError::InvalidCharacter`].
-    /// The node is owned by this arena; use the returned index with [`Self::node`].
+    /// The node is owned by this arena; use the returned ID with [`Self::get_node`].
     /// XML documents and custom-element creation options are not supported.
     pub fn create_element(&mut self, local_name: &str) -> Result<NodeID, DomError> {
         if !is_valid_element_local_name(local_name) {
@@ -243,7 +246,7 @@ impl HTMLDocument {
             return Err(DomError::InvalidCharacter);
         }
 
-        let node = self.node(element).ok_or(DomError::NotFound)?;
+        let node = self.get_node(element).ok_or(DomError::NotFound)?;
         let mut element_data = match node.get_kind() {
             NodeKind::Element(element_data) => element_data.clone(),
             _ => return Err(DomError::NotFound),
@@ -257,7 +260,7 @@ impl HTMLDocument {
         }
         log::trace!("remove attribute {name:?} on node {}", element.get());
         element_data.remove_attribute(name);
-        self.node_mut(element)
+        self.get_mut_node(element)
             .expect("element was validated above")
             .set_kind(NodeKind::Element(element_data));
         Ok(true)

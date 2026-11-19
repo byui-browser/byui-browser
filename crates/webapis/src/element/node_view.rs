@@ -27,7 +27,7 @@ enum WrappedKind {
 pub(super) fn parent_id(document: &Document, node: NodeID) -> Option<NodeID> {
     document
         .html_document()
-        .and_then(|source| source.node(node))
+        .and_then(|source| source.get_node(node))
         .and_then(|node| node.get_parent())
 }
 
@@ -35,7 +35,7 @@ pub(super) fn parent_id(document: &Document, node: NodeID) -> Option<NodeID> {
 pub(super) fn first_child_id(document: &Document, node: NodeID) -> Option<NodeID> {
     document
         .html_document()
-        .and_then(|source| source.node(node))
+        .and_then(|source| source.get_node(node))
         .and_then(|node| node.get_children().first().copied())
 }
 
@@ -44,7 +44,7 @@ pub(super) fn is_element(document: &Document, node: NodeID) -> bool {
     matches!(
         document
             .html_document()
-            .and_then(|source| source.node(node))
+            .and_then(|source| source.get_node(node))
             .map(|node| node.get_kind()),
         Some(NodeKind::Element(_))
     )
@@ -61,7 +61,7 @@ pub(super) fn wrap_any_node(document: &Arc<Mutex<Document>>, node: NodeID) -> Js
         let Some(source) = locked.html_document() else {
             return Ok(Value::Null);
         };
-        let Some(data) = source.node(node) else {
+        let Some(data) = source.get_node(node) else {
             return Ok(Value::Null);
         };
         match data.get_kind() {
@@ -69,7 +69,7 @@ pub(super) fn wrap_any_node(document: &Arc<Mutex<Document>>, node: NodeID) -> Js
             NodeKind::Text(_) => WrappedKind::Text,
             NodeKind::Comment(_) => WrappedKind::Comment,
             NodeKind::Document => WrappedKind::Document,
-            NodeKind::Doctype { .. } | NodeKind::None => WrappedKind::Unsupported,
+            NodeKind::Doctype(_) | NodeKind::None => WrappedKind::Unsupported,
         }
     };
     match kind {

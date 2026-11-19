@@ -1177,7 +1177,7 @@ mod tests {
     fn rect_for_class(page: &PageLayout, class: &str) -> Option<layout::Rect> {
         let node = page
             .document
-            .nodes
+            .get_nodes()
             .iter()
             .enumerate()
             .find_map(|(index, node)| {

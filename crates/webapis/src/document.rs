@@ -61,7 +61,7 @@ fn install_get_elements_by_tag_name(object: &Object, document: &Arc<Mutex<Docume
                 let locked = document.lock().unwrap();
                 locked
                     .html_document()
-                    .map(|source| matching_descendants(source, source.root, &name))
+                    .map(|source| matching_descendants(source, *source.get_root(), &name))
                     .unwrap_or_default()
             };
             let mut entries = Vec::with_capacity(matches.len());
@@ -224,7 +224,7 @@ fn register_shared_document(
         .lock()
         .unwrap()
         .html_document()
-        .map(|document| document.root)
+        .map(|document| *document.get_root())
     {
         // The document node is the parent of the root element. Tagging the
         // script object lets tree APIs such as `parentNode` and
@@ -715,7 +715,7 @@ impl Document {
         if wanted.is_empty() {
             return Vec::new();
         }
-        self.inclusive_descendant_elements(source.root)
+        self.inclusive_descendant_elements(*source.get_root())
             .into_iter()
             .filter(|element| {
                 let Some(class) = element
