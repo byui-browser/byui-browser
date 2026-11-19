@@ -82,8 +82,8 @@ pub(crate) fn instance_of(value: &Value, constructor: &Value) -> JsResult<bool> 
 /// not support property removal.
 pub(crate) fn delete_property(target: &Value, key: &str) -> JsResult<bool> {
     match target {
-        Value::Object(object) => Ok(object.delete_own(key)),
-        Value::Array(array) => Ok(key != "length" && array.delete_own(key)),
+        Value::Object(object) => object.delete_own(key),
+        Value::Array(array) => Ok(key != "length" && array.delete_own(key)?),
         Value::String(text) => {
             let is_index = key
                 .parse::<usize>()

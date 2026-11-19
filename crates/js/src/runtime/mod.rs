@@ -61,8 +61,8 @@ pub(crate) use array::{array_len, array_to_string, get_array_property, set_array
 pub(crate) use conversions::{is_truthy, number_to_string, to_property_key};
 pub(crate) use expressions::{copy_data_properties, delete_property, is_nullish, spread_values};
 pub use object::{
-    HostGetter, HostPropertyGetter, HostPropertyKeys, HostPropertySetter, HostSetter, Object,
-    WeakObject,
+    HostGetter, HostPropertyDeleter, HostPropertyGetter, HostPropertyKeys, HostPropertySetter,
+    HostSetter, Object, WeakObject,
 };
 pub(crate) use operators::{binary, unary};
 pub(crate) use primitives::{

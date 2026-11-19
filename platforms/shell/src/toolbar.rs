@@ -9,7 +9,10 @@
 //! address editing are handled by the shared shell.
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
-use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform};
+use tiny_skia::{
+    Color, FillRule, GradientStop, LinearGradient, Paint, Path, PathBuilder, Pixmap, Point, Rect,
+    SpreadMode, Stroke, Transform,
+};
 
 /// Address toolbar height in logical pixels, below the shared tab strip.
 pub(crate) const TOOLBAR_HEIGHT: f64 = 52.0;
@@ -49,6 +52,14 @@ const ADDRESS_LEADING: f32 = NAV_LEADING + NAV_WIDTH + NAV_ADDRESS_GAP;
 /// field usable.
 const TRAILING_MIN_WIDTH: f32 = 360.0;
 const TEXT_SIZE: f32 = 13.0;
+/// Logical height of the address-field load bar.
+const LOADING_BAR_HEIGHT: f32 = 1.5;
+/// Logical gap between the load bar and the address field's left and right edges.
+const LOADING_BAR_INSET_X: f32 = 10.0;
+/// Logical gap between the load bar and the address field's bottom edge.
+const LOADING_BAR_INSET_BOTTOM: f32 = 2.0;
+/// Where the solid accent gives way to the fade, as a fraction of the filled width.
+const LOADING_BAR_FADE_START: f32 = 0.62;
 
 /// A clickable region of the chrome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,7 +108,13 @@ pub(crate) struct ChromeState {
     /// Whether to use the dark palette.
     pub dark: bool,
     /// Whether the newest navigation or Refresh fetch is still pending.
+    /// While set, a blue progress bar is drawn along the bottom of the
+    /// address field.
     pub loading: bool,
+    /// Fraction of the address-field load bar that is filled, from 0 to 1.
+    /// The shell advances this from the moment a load starts. It is drawn
+    /// only while [`ChromeState::loading`] is set.
+    pub load_progress: f32,
     /// Whether a previous history entry is available.
     pub can_go_back: bool,
     /// Whether a forward history entry is available.
@@ -626,6 +643,7 @@ fn draw_address_field(
             address,
         );
     }
+    draw_loading_bar(pixmap, rect, transform, state, palette);
     if state.address_focused && selection.is_none() {
         let x = caret_x.min(clip_x - 2.0) + 1.0;
         if let Some(caret) = Rect::from_xywh(x, cy - 8.0, 1.5, 16.0) {
@@ -637,6 +655,65 @@ fn draw_address_field(
             );
         }
     }
+}
+
+/// How much of the address-field load bar is filled after `elapsed`.
+///
+/// The curve starts with a visible segment and eases toward about 92% of
+/// the field. It stays short of full so the bar is still moving when the
+/// load completes and the bar is removed.
+pub(crate) fn loading_bar_fraction(elapsed: std::time::Duration) -> f32 {
+    let eased = 1.0 - (-elapsed.as_secs_f32() * 1.35).exp();
+    (0.08 + eased * 0.84).min(0.92)
+}
+
+/// Draws the load indicator along the bottom inner edge of the address field.
+///
+/// The bar is a hairline. Its leading edge, the side the load is moving
+/// toward, fades from the accent color to transparent.
+fn draw_loading_bar(
+    pixmap: &mut Pixmap,
+    rect: Rect,
+    transform: Transform,
+    state: &ChromeState,
+    palette: &Palette,
+) {
+    if !state.loading {
+        return;
+    }
+    let height = LOADING_BAR_HEIGHT;
+    let y = rect.bottom() - height - LOADING_BAR_INSET_BOTTOM;
+    let x = rect.x() + LOADING_BAR_INSET_X;
+    let track_w = (rect.width() - LOADING_BAR_INSET_X * 2.0).max(0.0);
+    let progress = state.load_progress.clamp(0.0, 1.0);
+    if track_w < 1.0 || progress <= 0.0 {
+        return;
+    }
+    let fill_w = (track_w * progress).clamp(4.0_f32.min(track_w), track_w);
+    let Some(path) = rounded_rect(x, y, fill_w, height, height / 2.0) else {
+        return;
+    };
+    let mut faded = palette.accent;
+    faded.set_alpha(0.0);
+    let Some(shader) = LinearGradient::new(
+        Point::from_xy(x, y),
+        Point::from_xy(x + fill_w, y),
+        vec![
+            GradientStop::new(0.0, palette.accent),
+            GradientStop::new(LOADING_BAR_FADE_START, palette.accent),
+            GradientStop::new(1.0, faded),
+        ],
+        SpreadMode::Pad,
+        Transform::identity(),
+    ) else {
+        fill(pixmap, &path, palette.accent, transform);
+        return;
+    };
+    let paint = Paint {
+        shader,
+        ..Default::default()
+    };
+    pixmap.fill_path(&path, &paint, FillRule::Winding, transform, None);
 }
 
 /// Returns the byte offset in `address` of the character boundary nearest to
@@ -1027,6 +1104,116 @@ mod tests {
     }
 
     #[test]
+    fn loading_bar_eases_along_the_bottom_of_the_address_field() {
+        let start = loading_bar_fraction(std::time::Duration::ZERO);
+        let mid = loading_bar_fraction(std::time::Duration::from_millis(400));
+        let late = loading_bar_fraction(std::time::Duration::from_secs(4));
+        assert!((0.08..0.2).contains(&start), "{start}");
+        assert!(mid > start + 0.2, "{start} {mid}");
+        assert!(late > mid);
+        assert!(late < 0.94, "{late}");
+
+        let width = 640.0;
+        let field = control_rect(Control::Address, width).unwrap();
+        let y =
+            (field.bottom() - LOADING_BAR_INSET_BOTTOM - LOADING_BAR_HEIGHT / 2.0).round() as u32;
+        for dark in [false, true] {
+            let idle_state = ChromeState {
+                dark,
+                ..ChromeState::default()
+            };
+            let idle = compose(
+                width as u32,
+                200,
+                1.0,
+                &idle_state,
+                "https://example.com/",
+                None,
+                None,
+            )
+            .unwrap();
+            let early_state = ChromeState {
+                loading: true,
+                load_progress: start,
+                ..idle_state
+            };
+            let later_state = ChromeState {
+                load_progress: mid,
+                ..early_state
+            };
+            let early = compose(
+                width as u32,
+                200,
+                1.0,
+                &early_state,
+                "https://example.com/",
+                None,
+                None,
+            )
+            .unwrap();
+            let later = compose(
+                width as u32,
+                200,
+                1.0,
+                &later_state,
+                "https://example.com/",
+                None,
+                None,
+            )
+            .unwrap();
+            let track = field.width() - LOADING_BAR_INSET_X * 2.0;
+            let fill_start = field.left() + LOADING_BAR_INSET_X;
+            let early_fill = (track * start).max(4.0);
+            let body = (fill_start + early_fill * 0.2).round() as u32;
+            let tip = (fill_start + early_fill * 0.92).round() as u32;
+            assert!(
+                bar_pixel_differs(pixel(&idle, body, y), pixel(&early, body, y)),
+                "early bar {:?} vs {:?}",
+                pixel(&early, body, y),
+                pixel(&idle, body, y)
+            );
+            // The leading edge fades toward the empty field.
+            let body_gap = color_distance(pixel(&early, body, y), pixel(&idle, body, y));
+            let tip_gap = color_distance(pixel(&early, tip, y), pixel(&idle, tip, y));
+            assert!(
+                tip_gap + 12 < body_gap,
+                "fade tip {tip_gap} should be closer to the field than the body {body_gap}"
+            );
+            let between = fill_start + track * (start + mid) / 2.0;
+            let between = between.round() as u32;
+            assert!(
+                bar_pixel_differs(pixel(&early, between, y), pixel(&later, between, y)),
+                "later bar {:?} vs early {:?}",
+                pixel(&later, between, y),
+                pixel(&early, between, y)
+            );
+            // The indicator stays inside the address field.
+            assert_eq!(
+                pixel(&idle, 20, CENTER_Y as u32),
+                pixel(&early, 20, CENTER_Y as u32)
+            );
+            let below = (field.bottom() + 6.0) as u32;
+            assert_eq!(
+                pixel(&idle, body, below),
+                pixel(&early, body, below),
+                "bar spilled below the address field"
+            );
+        }
+    }
+
+    fn bar_pixel_differs(idle: [u8; 4], bar: [u8; 4]) -> bool {
+        let sum = |pixel: [u8; 4]| u32::from(pixel[0]) + u32::from(pixel[1]) + u32::from(pixel[2]);
+        bar[2] > idle[2].saturating_add(40) || sum(bar) + 120 < sum(idle)
+    }
+
+    fn color_distance(left: [u8; 4], right: [u8; 4]) -> u32 {
+        left.into_iter()
+            .zip(right)
+            .map(|(a, b)| u32::from(a.abs_diff(b)))
+            .sum()
+    }
+
+    #[test]
     fn page_card_is_inset_below_toolbar() {
         assert_eq!(
             page_rect(640, 480, 1.0),
@@ -1240,6 +1427,7 @@ mod tests {
                         pressed: hovered,
                         dark,
                         loading: false,
+                        load_progress: 0.0,
                         can_go_back: false,
                         can_go_forward: false,
                         find_open: false,
