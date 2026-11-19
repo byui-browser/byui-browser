@@ -1061,6 +1061,45 @@ fn inner_height_is_replaceable_like_the_cssom_view_attribute() {
 }
 
 #[test]
+fn window_onresize_dispatches_after_viewport_changes() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+
+    realm
+        .evaluate_script(
+            "var order = []; var seen = null; \
+             window.addEventListener('resize', () => order.push('listener')); \
+             function resizeHandler(event) { order.push('handler'); seen = { \
+               thisValue: this, type: event.type, target: event.target, \
+               currentTarget: event.currentTarget, bubbles: event.bubbles, \
+               cancelable: event.cancelable }; } \
+             window.onresize = resizeHandler; \
+             window.onresize === window.onresize",
+        )
+        .unwrap();
+
+    webapis::dispatch_window_resize(&window).unwrap();
+    assert_eq!(
+        realm.evaluate_script(
+            "order.length === 2 && order[0] === 'listener' && order[1] === 'handler' && \
+             seen.thisValue === window && seen.type === 'resize' && seen.target === window && \
+             seen.currentTarget === window && !seen.bubbles && !seen.cancelable",
+        ),
+        Ok(Value::Boolean(true))
+    );
+
+    realm.evaluate_script("window.onresize = null").unwrap();
+    webapis::dispatch_window_resize(&window).unwrap();
+    assert_eq!(
+        realm.evaluate_script("order.length === 3"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
 fn match_media_exposes_window_management_and_viewport_features() {
     let mut realm = Realm::new();
     webapis::register_window_with_url_device_pixel_ratio_and_viewport(
