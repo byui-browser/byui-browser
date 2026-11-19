@@ -12,8 +12,9 @@ use crate::{BorderRadius, BoxShadow, Edges, ImageKey, Rect, ToggleControl};
 
 /// Paint-relevant computed values for a box or inline box fragment.
 ///
-/// Colors, borders, corner radii, and outer box shadows are painted today;
-/// Inset shadows, and other decorations are not supported yet.
+/// Colors, borders, corner radii, outlines, text decorations, and outer box
+/// shadows are painted today. Inset shadows and full background layers are
+/// not supported yet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoxStyle {
     /// The background color, or `None` when it is transparent or unsupported.
@@ -30,6 +31,14 @@ pub struct BoxStyle {
     /// Per-side CSS styles. Dashed, dotted, and double are painted;
     /// relief styles currently use a solid fill. Border corners are square.
     pub border_style: crate::Sides<String>,
+    /// The outline color. Outlines are outside the border and do not affect layout.
+    pub outline_color: CssColor,
+    /// Outline width in CSS pixels; zero when the outline is not visible.
+    pub outline_width: f32,
+    /// Distance between the border edge and outline in CSS pixels.
+    pub outline_offset: f32,
+    /// Outline pattern, such as `solid`, `dashed`, or `dotted`.
+    pub outline_style: String,
     /// The computed `box-shadow` list, first (topmost) shadow first; empty
     /// for `none`. Shadows follow the rounded border box.
     pub box_shadow: Arc<[BoxShadow]>,
@@ -45,6 +54,10 @@ impl Default for BoxStyle {
             border_width: Edges::default(),
             border_color: crate::Sides::from_array([css::parse_color("black").unwrap(); 4]),
             border_style: crate::Sides::from_array(std::array::from_fn(|_| "none".to_owned())),
+            outline_color: css::parse_color("black").unwrap(),
+            outline_width: 0.0,
+            outline_offset: 0.0,
+            outline_style: "none".to_owned(),
             box_shadow: Arc::from(Vec::new()),
         }
     }
@@ -250,6 +263,8 @@ pub struct TextFragment {
     pub font: crate::FontId,
     /// The text color.
     pub color: CssColor,
+    /// Text decoration lines such as `underline`; empty for undecorated text.
+    pub text_decoration: Vec<String>,
     /// A rectangle the glyphs must not paint outside, in the same absolute
     /// coordinates as `rect`; `None` means unclipped. Set for text inside
     /// form controls, which is clipped to the control's padding box. The
@@ -497,6 +512,7 @@ mod tests {
                 font_size: 10.0,
                 font: crate::FontId::DEFAULT,
                 color: BoxStyle::default().text_color,
+                text_decoration: Vec::new(),
                 clip: None,
             })],
         });

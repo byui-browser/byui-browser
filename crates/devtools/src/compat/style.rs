@@ -23,6 +23,8 @@ const CONTEXTS: &[&str] = &[
     "#t{position:relative}",
     "#t{width:60px;height:30px;padding:7px;overflow:hidden;white-space:nowrap}",
     "#t{display:list-item}",
+    "#t{display:inline}",
+    "#t{border:4px solid transparent}",
 ];
 
 /// Values tried in the plain context when the page's own values show no

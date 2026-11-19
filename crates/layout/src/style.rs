@@ -2,12 +2,13 @@
 //!
 //! [`css::style_document`] produces cascaded, inherited declarations as text.
 //! This module parses `display`, box dimensions and edges, `box-sizing`, text
-//! colors, `text-align`, `line-height`, `border-*-radius`, `box-shadow`, `position`, `float`,
-//! the inset properties (`top`, `right`, `bottom`, `left`), and the flex subset
-//! (`flex-direction`, `flex-grow`, `flex-shrink`, `flex-basis`, and `gap`). Other
-//! properties use their initial values. A missing or unparsable value falls back to the initial
-//! value. Lengths are resolved to CSS pixels here; percentages are kept
-//! because they resolve against the containing block during layout.
+//! colors, `text-align`, `line-height`, `border-*-radius`, `box-shadow`,
+//! `position`, `float`, the inset properties (`top`, `right`, `bottom`,
+//! `left`), and the flex subset (`flex-direction`, `flex-grow`, `flex-shrink`,
+//! `flex-basis`, and `gap`). Other properties use their initial values. A
+//! missing or unparsable value falls back to the initial value. Lengths are
+//! resolved to CSS pixels here; percentages are kept because they resolve
+//! against the containing block during layout.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -467,7 +468,7 @@ pub(crate) struct ComputedStyle {
     pub height: Dimension,
     /// Which box `width`, `height`, and their limits measure.
     pub box_sizing: BoxSizing,
-    /// `min-width`; replaced elements and flex items honor it so far.
+    /// `min-width`; ordinary blocks, replaced elements, and flex items honor it.
     pub min_width: Dimension,
     /// `min-height`; replaced elements and flex items honor it so far.
     pub min_height: Dimension,
@@ -494,9 +495,21 @@ pub(crate) struct ComputedStyle {
     pub font: crate::FontId,
     pub color: CssColor,
     pub text_transform: TextTransform,
+    /// Lines painted over this element's text by `text-decoration`.
+    pub text_decoration: Vec<String>,
+    /// Approximate baseline shift for inline boxes using `vertical-align`.
+    pub vertical_align_offset: f32,
     pub text_align: TextAlign,
     pub background_color: Option<CssColor>,
     pub borders: crate::BoxStyle,
+    /// Outline color; `currentcolor` resolves to the computed text color.
+    pub outline_color: CssColor,
+    /// Outline width in CSS pixels; CSS's `medium` is represented as 3px.
+    pub outline_width: f32,
+    /// Outline offset in CSS pixels; negative values draw inside the border edge.
+    pub outline_offset: f32,
+    /// Outline line pattern; `none` suppresses painting.
+    pub outline_style: String,
     pub border_radius: BorderRadius,
     /// The computed `box-shadow` list, first (topmost) shadow first.
     pub box_shadow: Arc<[BoxShadow]>,
@@ -659,10 +672,17 @@ impl ComputedStyle {
                 |parent| parent.color,
             ),
             text_transform: parent.map_or(TextTransform::None, |parent| parent.text_transform),
+            text_decoration: parent.map_or_else(Vec::new, |parent| parent.text_decoration.clone()),
+            vertical_align_offset: 0.0,
             text_align: parent.map_or(TextAlign::Start, |parent| parent.text_align),
             background_color: None,
             content: None,
             borders: crate::BoxStyle::default(),
+            outline_color: css::user_agent_default_color("color")
+                .expect("user-agent stylesheet must define html color"),
+            outline_width: 3.0,
+            outline_offset: 0.0,
+            outline_style: "none".to_owned(),
             border_radius: BorderRadius::default(),
             box_shadow: Arc::from(Vec::new()),
             flex_column: false,
@@ -759,6 +779,13 @@ impl ComputedStyle {
                 None => log::debug!("ignoring unsupported text-transform value {value:?}"),
             }
         }
+        if let Some(value) = get("text-decoration-line") {
+            style.text_decoration = value
+                .split_ascii_whitespace()
+                .filter(|line| matches!(*line, "underline" | "overline" | "line-through"))
+                .map(str::to_owned)
+                .collect();
+        }
         style.text_align = TextAlign::compute(get("text-align"), parent_text_align);
         if let Some(value) = get("position") {
             match Position::parse(value) {
@@ -841,6 +868,22 @@ impl ComputedStyle {
             viewport_width: viewport.width,
             viewport_height: viewport.height,
         };
+        style.vertical_align_offset =
+            get("vertical-align").map_or(0.0, |value| match value.to_ascii_lowercase().as_str() {
+                "baseline" | "initial" | "inherit" | "unset" => 0.0,
+                "middle" => -style.font_size * 0.25,
+                "sub" => style.font_size * 0.2,
+                "super" => -style.font_size * 0.4,
+                "text-top" | "top" => -style.font_size * 0.8,
+                "text-bottom" | "bottom" => style.font_size * 0.2,
+                _ => parse_length(value)
+                    .map(|length| length.to_px(&context))
+                    .or_else(|| {
+                        parse_percentage(value).map(|percent| style.font_size * percent / 100.0)
+                    })
+                    .filter(|offset| offset.is_finite())
+                    .unwrap_or(0.0),
+            });
         let dimension = |property: &str, allow_auto: bool, allow_negative: bool| {
             let value = get(property)?;
             if property == "width" {
@@ -958,6 +1001,29 @@ impl ComputedStyle {
                 .and_then(css::parse_color)
                 .unwrap_or(style.color)
         }));
+        style.outline_style = get("outline-style").unwrap_or("none").to_ascii_lowercase();
+        style.outline_width = match get("outline-width").unwrap_or("medium") {
+            "thin" => 1.0,
+            "thick" => 5.0,
+            "medium" => 3.0,
+            value => parse_length(value)
+                .map(|length| length.to_px(&context))
+                .filter(|width| width.is_finite() && *width >= 0.0)
+                .unwrap_or(3.0),
+        };
+        style.outline_color = get("outline-color")
+            .and_then(|value| {
+                value
+                    .eq_ignore_ascii_case("currentcolor")
+                    .then_some(style.color)
+                    .or_else(|| css::parse_color(value))
+            })
+            .unwrap_or(style.color);
+        style.outline_offset = get("outline-offset")
+            .and_then(parse_length)
+            .map(|length| length.to_px(&context))
+            .filter(|offset| offset.is_finite())
+            .unwrap_or(0.0);
         style.gap = get("gap")
             .and_then(|value| parse_length(value).map(|length| length.to_px(&context)))
             .filter(|value| value.is_finite() && *value >= 0.0)
