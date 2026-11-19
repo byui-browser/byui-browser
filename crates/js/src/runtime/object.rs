@@ -261,6 +261,26 @@ impl Object {
                 None => Ok(()),
             };
         }
+        // An inherited non-writable data property prevents creation of an
+        // own shadowing property through ordinary assignment.
+        if self.get_own(&key).is_none() {
+            let mut prototype = self.prototype();
+            while let Some(object) = prototype {
+                if object
+                    .0
+                    .read_only_properties
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .contains(&key)
+                {
+                    return Ok(());
+                }
+                if object.get_own(&key).is_some() {
+                    break;
+                }
+                prototype = object.prototype();
+            }
+        }
         if !self.contains_key(&key)
             && let Some(setter) = self
                 .0

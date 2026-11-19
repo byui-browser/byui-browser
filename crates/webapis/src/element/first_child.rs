@@ -1,38 +1,4 @@
-//! `Node.firstChild` on script element wrappers.
-//!
-//! The getter is live: each read returns the element's current first child.
-//! An element child is the shared element wrapper. A text or comment child is
-//! a character-data object (see [`super::node_view`]). A missing child is
-//! `null`. Assignment is ignored.
-//!
-//! Limitation: a doctype child is not wrapped and reads as `null`.
-
-use std::sync::{Arc, Mutex};
-
-use js::{Object, Value};
-
-use crate::document::Document;
-use crate::element::Element;
-
-use super::node_view::{first_child_id, wrap_any_node};
-
-/// Installs `Node.firstChild` on the wrapper `object` for `element`.
-pub(super) fn install(object: &Object, element: &Element, document: &Arc<Mutex<Document>>) {
-    let node = element.node;
-    let document = Arc::clone(document);
-    object.define_accessor(
-        "firstChild",
-        Arc::new(move || {
-            let child = first_child_id(&document.lock().unwrap(), node);
-            match child {
-                Some(child) => wrap_any_node(&document, child),
-                None => Ok(Value::Null),
-            }
-        }),
-        None,
-    );
-}
-
+//! Regression coverage for shared Node behavior on Element wrappers.
 #[cfg(test)]
 mod tests {
     use html::parse_raw_html;

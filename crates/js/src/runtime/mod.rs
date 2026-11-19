@@ -212,8 +212,11 @@ pub(crate) fn with_host_this<T>(this: Value, body: impl FnOnce() -> T) -> T {
     })
 }
 
-/// The `this` value for the host function currently running on this thread.
-pub(crate) fn host_this() -> Value {
+/// Returns an owned handle to the JavaScript receiver of the native callback
+/// currently running on this thread. Native prototype methods can use this to
+/// validate their receiver and operate on different instances. Outside a native
+/// call this is undefined; nested calls restore the previous receiver.
+pub fn host_this() -> Value {
     HOST_THIS.with(|slot| slot.borrow().clone())
 }
 
@@ -403,7 +406,7 @@ impl Function {
     /// Wraps a Rust callback as a callable and constructible JavaScript
     /// function. The constructor callback receives the arguments passed to
     /// `new` and must return the constructed value.
-    pub(crate) fn from_host_constructor(
+    pub fn from_host_constructor(
         name: impl Into<String>,
         function: HostFunction,
         constructor: HostFunction,
@@ -540,6 +543,21 @@ impl Function {
     /// own properties.
     pub fn set_own_property(&self, key: &str, value: Value) -> bool {
         self.set_own(key, value)
+    }
+
+    /// Defines a read-only own property on a host or bytecode function.
+    ///
+    /// The function retains the supplied value; cloning a value handle preserves
+    /// its identity. Returns false for tree-walk functions, which have no own
+    /// property table. Script assignment cannot replace the property.
+    pub fn set_read_only_property(&self, key: &str, value: Value) -> bool {
+        match &*self.0 {
+            FunctionKind::Bytecode { properties, .. } | FunctionKind::Host { properties, .. } => {
+                properties.set_read_only(key, value);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Returns whether this function was compiled for the bytecode VM.
