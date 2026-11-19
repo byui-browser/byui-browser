@@ -675,10 +675,27 @@ fn invoke_message(window: &Object, event_target: &EventTargetRef, data: Value, o
     {
         event.set("currentTarget", Value::Object(window.clone()));
         event.set("eventPhase", Value::Number(2.0));
-        if let Err(error) = callback.call_with_this(
-            Value::Object(window.clone()),
-            &[Value::Object(event.clone())],
-        ) {
+        let evaluator = event_target
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .evaluator
+            .clone();
+        let result = evaluator.map_or_else(
+            || {
+                callback.call_with_this(
+                    Value::Object(window.clone()),
+                    &[Value::Object(event.clone())],
+                )
+            },
+            |evaluator| {
+                evaluator.call_with_this_reentrant(
+                    &callback,
+                    Value::Object(window.clone()),
+                    &[Value::Object(event.clone())],
+                )
+            },
+        );
+        if let Err(error) = result {
             log::warn!("message event handler threw: {error}");
         }
     }
@@ -828,7 +845,7 @@ fn media_query_list(query: &str, state: MediaState) -> Object {
     list
 }
 
-fn dispatch_media_query_change(list: &Object, matches: bool) {
+fn dispatch_media_query_change(list: &Object, matches: bool, evaluator: &js::ScriptEvaluator) {
     let media = list.get("media").unwrap_or(Value::String(String::new()));
     let event = Object::new();
     event.set("type", Value::String("change".into()));
@@ -851,11 +868,17 @@ fn dispatch_media_query_change(list: &Object, matches: bool) {
     }
     for callback in callbacks {
         let result = match callback {
-            Value::Function(callback) => callback.call(&[Value::Object(event.clone())]),
+            Value::Function(callback) => evaluator.call_with_this_reentrant(
+                &callback,
+                Value::Object(list.clone()),
+                &[Value::Object(event.clone())],
+            ),
             Value::Object(callback) => match callback.get("handleEvent") {
-                Some(Value::Function(handle_event)) => {
-                    handle_event.call(&[Value::Object(event.clone())])
-                }
+                Some(Value::Function(handle_event)) => evaluator.call_with_this_reentrant(
+                    &handle_event,
+                    Value::Object(callback.clone()),
+                    &[Value::Object(event.clone())],
+                ),
                 _ => Ok(Value::Undefined),
             },
             _ => Ok(Value::Undefined),
@@ -866,7 +889,7 @@ fn dispatch_media_query_change(list: &Object, matches: bool) {
     }
 }
 
-fn update_media_query_lists(window: &Object, state: MediaState) {
+fn update_media_query_lists(window: &Object, state: MediaState, evaluator: &js::ScriptEvaluator) {
     let Some(Value::Object(lists)) = window.get("__mediaQueryLists") else {
         return;
     };
@@ -881,7 +904,7 @@ fn update_media_query_lists(window: &Object, state: MediaState) {
         let old_matches = matches!(list.get("matches"), Some(Value::Boolean(true)));
         if matches != old_matches {
             list.update_read_only("matches", Value::Boolean(matches));
-            dispatch_media_query_change(&list, matches);
+            dispatch_media_query_change(&list, matches, evaluator);
         }
     }
 }
@@ -903,9 +926,10 @@ fn register_window_object(
     let history = Object::new();
     let location = Object::new();
     let session = Arc::new(Mutex::new(SessionHistory::new(initial_url)?));
+    let evaluator = realm.script_evaluator();
     let custom_elements = match realm.registered_global_value("customElements") {
         Some(Value::Object(registry)) => registry,
-        _ => CustomElementRegistry::new().object(),
+        _ => CustomElementRegistry::new_with_evaluator(Some(evaluator.clone())).object(),
     };
     let timers = Arc::new(Mutex::new(WindowTimers::new()));
     let microtasks = Arc::new(Mutex::new(MicrotaskQueue::new()));
@@ -919,7 +943,10 @@ fn register_window_object(
     let click_state = Arc::new(Mutex::new(WindowClickState::default()));
     let performance = Object::new();
     let performance_clock = Arc::new(PerformanceClock::new());
-    let evaluator = realm.script_evaluator();
+    event_target
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .evaluator = Some(evaluator.clone());
     let timer_this = Value::Object(window.clone());
     let nesting_context = Arc::new(AtomicU32::new(0));
 
@@ -1149,6 +1176,7 @@ fn register_window_object(
     let onload_listener = {
         let window = window.clone();
         let load_state = Arc::clone(&load_state);
+        let evaluator = evaluator.clone();
         Function::from_host(
             "onload",
             Arc::new(move |arguments| {
@@ -1158,9 +1186,11 @@ fn register_window_object(
                     .onload
                     .clone();
                 match handler {
-                    Some(handler) => {
-                        handler.call_with_this(Value::Object(window.clone()), arguments)
-                    }
+                    Some(handler) => evaluator.call_with_this_reentrant(
+                        &handler,
+                        Value::Object(window.clone()),
+                        arguments,
+                    ),
                     None => Ok(Value::Undefined),
                 }
             }),
@@ -1218,6 +1248,7 @@ fn register_window_object(
     let onpopstate_listener = {
         let window = window.clone();
         let popstate_state = Arc::clone(&popstate_state);
+        let evaluator = evaluator.clone();
         Function::from_host(
             "onpopstate",
             Arc::new(move |arguments| {
@@ -1227,9 +1258,11 @@ fn register_window_object(
                     .handler
                     .clone();
                 match handler {
-                    Some(handler) => {
-                        handler.call_with_this(Value::Object(window.clone()), arguments)
-                    }
+                    Some(handler) => evaluator.call_with_this_reentrant(
+                        &handler,
+                        Value::Object(window.clone()),
+                        arguments,
+                    ),
                     None => Ok(Value::Undefined),
                 }
             }),
@@ -1290,6 +1323,7 @@ fn register_window_object(
     let onhashchange_listener = {
         let window = window.clone();
         let hashchange_state = Arc::clone(&hashchange_state);
+        let evaluator = evaluator.clone();
         Function::from_host(
             "onhashchange",
             Arc::new(move |arguments| {
@@ -1299,9 +1333,11 @@ fn register_window_object(
                     .handler
                     .clone();
                 match handler {
-                    Some(handler) => {
-                        handler.call_with_this(Value::Object(window.clone()), arguments)
-                    }
+                    Some(handler) => evaluator.call_with_this_reentrant(
+                        &handler,
+                        Value::Object(window.clone()),
+                        arguments,
+                    ),
                     None => Ok(Value::Undefined),
                 }
             }),
@@ -1361,6 +1397,7 @@ fn register_window_object(
     let onkeydown_listener = {
         let window = window.clone();
         let keydown_state = Arc::clone(&keydown_state);
+        let evaluator = evaluator.clone();
         Function::from_host(
             "onkeydown",
             Arc::new(move |arguments| {
@@ -1370,8 +1407,11 @@ fn register_window_object(
                     .handler
                     .clone();
                 if let Some(handler) = handler {
-                    let result =
-                        handler.call_with_this(Value::Object(window.clone()), arguments)?;
+                    let result = evaluator.call_with_this_reentrant(
+                        &handler,
+                        Value::Object(window.clone()),
+                        arguments,
+                    )?;
                     if matches!(result, Value::Boolean(false))
                         && let Some(Value::Object(event)) = arguments.first()
                         && let Some(Value::Function(prevent_default)) = event.get("preventDefault")
@@ -1438,6 +1478,7 @@ fn register_window_object(
     let onscroll_listener = {
         let window = window.clone();
         let scroll_state = Arc::clone(&scroll_state);
+        let evaluator = evaluator.clone();
         Function::from_host(
             "onscroll",
             Arc::new(move |arguments| {
@@ -1447,9 +1488,11 @@ fn register_window_object(
                     .handler
                     .clone();
                 match handler {
-                    Some(handler) => {
-                        handler.call_with_this(Value::Object(window.clone()), arguments)
-                    }
+                    Some(handler) => evaluator.call_with_this_reentrant(
+                        &handler,
+                        Value::Object(window.clone()),
+                        arguments,
+                    ),
                     None => Ok(Value::Undefined),
                 }
             }),
@@ -1507,6 +1550,7 @@ fn register_window_object(
     let resize_state_for_get = Arc::clone(&resize_state);
     let resize_state_for_set = Arc::clone(&resize_state);
     let resize_window = window.clone();
+    let resize_evaluator = evaluator.clone();
     let onresize_listener = Function::from_host(
         "onresize",
         Arc::new(move |arguments| {
@@ -1516,9 +1560,11 @@ fn register_window_object(
                 .handler
                 .clone();
             match handler {
-                Some(handler) => {
-                    handler.call_with_this(Value::Object(resize_window.clone()), arguments)
-                }
+                Some(handler) => resize_evaluator.call_with_this_reentrant(
+                    &handler,
+                    Value::Object(resize_window.clone()),
+                    arguments,
+                ),
                 None => Ok(Value::Undefined),
             }
         }),
@@ -1572,6 +1618,7 @@ fn register_window_object(
     let onclick_listener = {
         let window = window.clone();
         let click_state = Arc::clone(&click_state);
+        let evaluator = evaluator.clone();
         Function::from_host(
             "onclick",
             Arc::new(move |arguments| {
@@ -1581,9 +1628,11 @@ fn register_window_object(
                     .handler
                     .clone();
                 match handler {
-                    Some(handler) => {
-                        handler.call_with_this(Value::Object(window.clone()), arguments)
-                    }
+                    Some(handler) => evaluator.call_with_this_reentrant(
+                        &handler,
+                        Value::Object(window.clone()),
+                        arguments,
+                    ),
                     None => Ok(Value::Undefined),
                 }
             }),
@@ -1804,6 +1853,7 @@ fn register_window_object(
         }),
     );
     let update_media_window = window.clone();
+    let evaluator_for_media = evaluator.clone();
     window.set_method(
         "__updateMediaQueries",
         Arc::new(move |arguments| {
@@ -1830,6 +1880,7 @@ fn register_window_object(
                         .map(|(width, height)| ViewportSize { width, height }),
                     ratio,
                 ),
+                &evaluator_for_media,
             );
             Ok(Value::Undefined)
         }),
@@ -1969,7 +2020,11 @@ fn register_window_object(
                 let Some(callback) = callback else {
                     continue;
                 };
-                if let Err(error) = callback.call(&[Value::Number(timestamp)]) {
+                if let Err(error) = evaluator_for_animation.call_with_this_reentrant(
+                    &callback,
+                    Value::Undefined,
+                    &[Value::Number(timestamp)],
+                ) {
                     log::warn!("requestAnimationFrame callback threw: {error}");
                 }
                 fired += 1;

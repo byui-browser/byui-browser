@@ -63,7 +63,14 @@ fn set_class_name(
     if old_value != new_value
         && let Some(owner) = owner.upgrade()
     {
-        invoke_attribute_changed_callback(&owner, "class", old_value, new_value);
+        let evaluator = document.lock().unwrap().event_evaluator.clone();
+        invoke_attribute_changed_callback(
+            &owner,
+            "class",
+            old_value,
+            new_value,
+            evaluator.as_ref(),
+        );
     }
     log::debug!("Element.className set ({} bytes)", value.len());
     Ok(())

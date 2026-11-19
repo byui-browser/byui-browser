@@ -737,6 +737,7 @@ impl GlobalState {
         let lexical = child_scope(&object);
         let state = Self { object, lexical };
         builtins::install(&state);
+        global_functions::install(&state);
         state
     }
 
@@ -798,6 +799,102 @@ impl GlobalState {
         }
         binding.setter = Some(setter);
         Ok(())
+    }
+
+    /// Declares a global binding emitted by the bytecode compiler.
+    pub(crate) fn bytecode_declare(&self, name: &str, kind: VarKind) -> JsResult<()> {
+        match kind {
+            VarKind::Var => {
+                if self.lexical.lock_scope().bindings.contains_key(name) {
+                    return Err(already_declared(name));
+                }
+                declare_var(&self.object, name)
+            }
+            VarKind::Let | VarKind::Const => {
+                let lexical = self.lexical.lock_scope();
+                let object = self.object.lock_scope();
+                if lexical.bindings.contains_key(name)
+                    || object
+                        .bindings
+                        .get(name)
+                        .is_some_and(|binding| !binding.host)
+                {
+                    return Err(already_declared(name));
+                }
+                drop(object);
+                drop(lexical);
+                declare_lexical(&self.lexical, name, kind == VarKind::Let, None)
+            }
+        }
+    }
+
+    /// Reads a global binding for bytecode, including host-provided globals.
+    pub(crate) fn bytecode_load(&self, name: &str) -> JsResult<Value> {
+        if self.lexical.lock_scope().bindings.contains_key(name) {
+            read(&self.lexical, name)
+        } else {
+            read(&self.object, name)
+        }
+    }
+
+    /// Returns whether a global binding exists, including an uninitialized
+    /// lexical binding in its temporal dead zone.
+    pub(crate) fn bytecode_has(&self, name: &str) -> bool {
+        self.lexical.lock_scope().bindings.contains_key(name)
+            || self.object.lock_scope().bindings.contains_key(name)
+    }
+
+    /// Initializes a global binding for bytecode.
+    pub(crate) fn bytecode_initialize(&self, name: &str, value: Value) -> JsResult<()> {
+        if self.lexical.lock_scope().bindings.contains_key(name) {
+            initialize(&self.lexical, name, value);
+            Ok(())
+        } else if self.object.lock_scope().bindings.contains_key(name) {
+            initialize(&self.object, name, value);
+            Ok(())
+        } else {
+            Err(JsError::runtime(format!(
+                "global binding `{name}` is unavailable"
+            )))
+        }
+    }
+
+    /// Assigns a global binding for bytecode, honoring host setters.
+    pub(crate) fn bytecode_store(&self, name: &str, value: Value) -> JsResult<Value> {
+        if is_declared(&self.lexical, name) {
+            assign(&self.lexical, name, value.clone())?;
+        } else {
+            assign(&self.object, name, value.clone())?;
+        }
+        Ok(value)
+    }
+
+    /// Returns the registered host-global name referring to `value`.
+    pub(crate) fn host_global_name(&self, value: &Value) -> Option<String> {
+        self.object
+            .lock_scope()
+            .bindings
+            .iter()
+            .find(|(_, binding)| binding.host && binding.value.as_ref() == Some(value))
+            .map(|(name, _)| name.clone())
+    }
+
+    /// Finds a global name currently referring to `value`, for call errors.
+    pub(crate) fn bytecode_name_for_value(&self, value: &Value) -> Option<String> {
+        let lexical = self.lexical.lock_scope();
+        if let Some((name, _)) = lexical
+            .bindings
+            .iter()
+            .find(|(_, binding)| binding.value.as_ref() == Some(value))
+        {
+            return Some(name.clone());
+        }
+        let object = self.object.lock_scope();
+        object
+            .bindings
+            .iter()
+            .find(|(_, binding)| binding.value.as_ref() == Some(value))
+            .map(|(name, _)| name.clone())
     }
 
     /// Evaluates `program` against the persistent globals.

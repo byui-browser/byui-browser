@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use js::{Function, JsError, Object, Value};
+use js::{Function, JsError, Object, ScriptEvaluator, Value};
 
 type PromiseResult = Arc<Mutex<Option<Value>>>;
 
@@ -32,12 +32,17 @@ pub struct CustomElementRegistry {
 impl CustomElementRegistry {
     /// Creates an empty registry and its JavaScript object wrapper.
     pub fn new() -> Self {
+        Self::new_with_evaluator(None)
+    }
+
+    pub(crate) fn new_with_evaluator(evaluator: Option<ScriptEvaluator>) -> Self {
         let object = Object::new();
         let definitions: Arc<Mutex<Vec<(String, Function)>>> = Arc::default();
         let waiting: Arc<Mutex<Vec<PendingDefinition>>> = Arc::default();
 
         let define_definitions = definitions.clone();
         let define_waiting = waiting.clone();
+        let define_evaluator = evaluator.clone();
         object.set_method(
             "define",
             Arc::new(move |arguments| {
@@ -82,7 +87,16 @@ impl CustomElementRegistry {
                 if let Some(pending) = pending {
                     *pending.result.lock().unwrap() = Some(Value::Function(constructor.clone()));
                     for reaction in pending.reactions {
-                        let _ = reaction.call(&[Value::Function(constructor.clone())]);
+                        let _ = define_evaluator.as_ref().map_or_else(
+                            || reaction.call(&[Value::Function(constructor.clone())]),
+                            |evaluator| {
+                                evaluator.call_with_this_reentrant(
+                                    &reaction,
+                                    Value::Undefined,
+                                    &[Value::Function(constructor.clone())],
+                                )
+                            },
+                        );
                     }
                 }
                 Ok(Value::Undefined)
@@ -108,6 +122,7 @@ impl CustomElementRegistry {
         );
 
         let when_defined_definitions = definitions.clone();
+        let when_defined_evaluator = evaluator.clone();
         object.set_method(
             "whenDefined",
             Arc::new(move |arguments| {
@@ -138,6 +153,7 @@ impl CustomElementRegistry {
                 let then_settled = settled.clone();
                 let then_waiting = waiting.clone();
                 let then_name = name.clone();
+                let then_evaluator = when_defined_evaluator.clone();
                 if settled.lock().unwrap().is_none() {
                     waiting.lock().unwrap().push(PendingDefinition {
                         name: name.clone(),
@@ -155,13 +171,22 @@ impl CustomElementRegistry {
                         let callback = callback.clone();
                         let settled_value = then_settled.lock().unwrap().clone();
                         if let Some(value) = settled_value {
-                            let _ = callback.call(&[value]);
+                            let _ = if let Some(evaluator) = then_evaluator.as_ref() {
+                                evaluator.call_with_this_reentrant(
+                                    &callback,
+                                    Value::Undefined,
+                                    &[value],
+                                )
+                            } else {
+                                callback.call(&[value])
+                            };
                         } else {
                             let mut waiting = then_waiting.lock().unwrap();
                             if let Some(pending) =
                                 waiting.iter_mut().find(|pending| pending.name == then_name)
                             {
                                 let reaction_state = then_settled.clone();
+                                let reaction_evaluator = then_evaluator.clone();
                                 pending.reactions.push(Function::from_host(
                                     "whenDefined reaction",
                                     Arc::new(move |values| {
@@ -169,12 +194,22 @@ impl CustomElementRegistry {
                                             return Ok(Value::Undefined);
                                         };
                                         *reaction_state.lock().unwrap() = Some(constructor.clone());
-                                        let _ = callback.call(values);
+                                        let _ = reaction_evaluator.as_ref().map_or_else(
+                                            || callback.call(values),
+                                            |evaluator| {
+                                                evaluator.call_with_this_reentrant(
+                                                    &callback,
+                                                    Value::Undefined,
+                                                    values,
+                                                )
+                                            },
+                                        );
                                         Ok(Value::Undefined)
                                     }),
                                 ));
                             } else {
                                 let reaction_state = then_settled.clone();
+                                let reaction_evaluator = then_evaluator.clone();
                                 let reaction = Function::from_host(
                                     "whenDefined reaction",
                                     Arc::new(move |values| {
@@ -182,7 +217,16 @@ impl CustomElementRegistry {
                                             return Ok(Value::Undefined);
                                         };
                                         *reaction_state.lock().unwrap() = Some(constructor.clone());
-                                        let _ = callback.call(values);
+                                        let _ = reaction_evaluator.as_ref().map_or_else(
+                                            || callback.call(values),
+                                            |evaluator| {
+                                                evaluator.call_with_this_reentrant(
+                                                    &callback,
+                                                    Value::Undefined,
+                                                    values,
+                                                )
+                                            },
+                                        );
                                         Ok(Value::Undefined)
                                     }),
                                 );

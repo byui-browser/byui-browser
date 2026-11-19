@@ -136,6 +136,7 @@ pub(crate) fn register(realm: &mut Realm, document: &SharedDocument) -> JsResult
     if let [Some(node), Some(element), Some(doc)] = existing {
         return finish_registration(document, node, element, doc);
     }
+    let evaluator = realm.script_evaluator();
     let event_target = Object::new();
     for name in ["addEventListener", "removeEventListener", "dispatchEvent"] {
         event_target.set_method(
@@ -229,6 +230,7 @@ pub(crate) fn register(realm: &mut Realm, document: &SharedDocument) -> JsResult
     ] {
         let constructor_document = document.clone();
         let constructor_prototype = object.clone();
+        let constructor_evaluator = evaluator.clone();
         let constructor = Function::from_host_constructor(
             name,
             Arc::new(|_| Err(exception("TypeError", "Illegal constructor"))),
@@ -247,9 +249,11 @@ pub(crate) fn register(realm: &mut Realm, document: &SharedDocument) -> JsResult
                 }
                 "EventTarget" => {
                     let object = Object::with_prototype(Some(constructor_prototype.clone()));
+                    let mut target = crate::event::EventTarget::default();
+                    target.evaluator = Some(constructor_evaluator.clone());
                     let mut targets = EVENT_TARGETS.lock().unwrap();
                     targets.retain(|(weak, _)| weak.upgrade().is_some());
-                    targets.push((object.downgrade(), Arc::default()));
+                    targets.push((object.downgrade(), Arc::new(Mutex::new(target))));
                     Ok(Value::Object(object))
                 }
                 _ => Err(exception("TypeError", "Illegal constructor")),
@@ -663,8 +667,9 @@ fn set_text(document: &SharedDocument, id: NodeID, property: &str, value: Value)
             _ => Vec::new(),
         }
     };
+    let evaluator = document.lock().unwrap().event_evaluator.clone();
     for object in removed {
-        invoke_lifecycle_callback(&object, "disconnectedCallback");
+        invoke_lifecycle_callback(&object, "disconnectedCallback", evaluator.as_ref());
     }
     Ok(())
 }
@@ -983,13 +988,14 @@ fn mutate(parent: &Handle, method: &str, arguments: &[Value]) -> JsResult<Value>
         }
         (removed, moved, !unchanged, result)
     };
+    let evaluator = parent.document.lock().unwrap().event_evaluator.clone();
     for object in removed.into_iter().chain(moved) {
-        invoke_lifecycle_callback(&object, "disconnectedCallback");
+        invoke_lifecycle_callback(&object, "disconnectedCallback", evaluator.as_ref());
     }
     if changed && method != "removeChild" {
         let connected = connected_wrappers(&parent.document.lock().unwrap(), &[inserted.id]);
         for object in connected {
-            invoke_lifecycle_callback(&object, "connectedCallback");
+            invoke_lifecycle_callback(&object, "connectedCallback", evaluator.as_ref());
         }
     }
     Ok(Value::Object(result))

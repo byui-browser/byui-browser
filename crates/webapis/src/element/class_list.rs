@@ -97,7 +97,14 @@ impl ClassList {
         if old_value != new_value
             && let Some(owner) = self.owner.upgrade()
         {
-            invoke_attribute_changed_callback(&owner, "class", old_value, new_value);
+            let evaluator = self.document.lock().unwrap().event_evaluator.clone();
+            invoke_attribute_changed_callback(
+                &owner,
+                "class",
+                old_value,
+                new_value,
+                evaluator.as_ref(),
+            );
         }
         Ok(result)
     }

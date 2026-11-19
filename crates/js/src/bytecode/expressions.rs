@@ -443,7 +443,18 @@ impl Compiler {
         arguments: &[Expr],
     ) -> Result<(), CompileError> {
         let method = self.compile_callee(callee)?;
-        self.emit_call(method, arguments)
+        let name = match callee {
+            Expr::Member {
+                property: MemberProperty::Named(name),
+                ..
+            }
+            | Expr::OptionalMember {
+                property: MemberProperty::Named(name),
+                ..
+            } => Some(self.name_constant(name)?),
+            _ => None,
+        };
+        self.emit_call(method, name, arguments)
     }
 
     /// Lowers `callee?.(arguments)`: a `null` or `undefined` function ends the
@@ -454,13 +465,29 @@ impl Compiler {
         arguments: &[Expr],
     ) -> Result<(), CompileError> {
         let method = self.compile_callee(callee)?;
+        let name = match callee {
+            Expr::Member {
+                property: MemberProperty::Named(name),
+                ..
+            }
+            | Expr::OptionalMember {
+                property: MemberProperty::Named(name),
+                ..
+            } => Some(self.name_constant(name)?),
+            _ => None,
+        };
         self.emit_optional_exit(usize::from(method))?;
-        self.emit_call(method, arguments)
+        self.emit_call(method, name, arguments)
     }
 
     /// Emits the arguments and the call instruction for a callee already on
     /// the stack. Spread arguments are gathered into one array first.
-    fn emit_call(&mut self, method: bool, arguments: &[Expr]) -> Result<(), CompileError> {
+    fn emit_call(
+        &mut self,
+        method: bool,
+        name: Option<u16>,
+        arguments: &[Expr],
+    ) -> Result<(), CompileError> {
         if has_spread(arguments) {
             self.compile_argument_array(arguments)?;
             self.chunk.emit(if method {
@@ -471,7 +498,9 @@ impl Compiler {
         } else {
             let count = self.compile_arguments(arguments)?;
             self.chunk.emit(if method {
-                Instruction::CallMethod(count)
+                name.map_or(Instruction::CallMethod(count), |name| {
+                    Instruction::CallMethodNamed { count, name }
+                })
             } else {
                 Instruction::Call(count)
             });

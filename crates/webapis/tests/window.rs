@@ -17,10 +17,11 @@ fn window_onkeydown_receives_keyboard_event_metadata_and_can_cancel() {
     };
     realm
         .evaluate_script(
-            "var seen = null; window.onkeydown = (event) => { seen = [
+            "var seen = null; function handler(event) { seen = [
              this === window, event.type, event.key, event.code, event.location,
              event.ctrlKey, event.shiftKey, event.altKey, event.metaKey,
-             event.repeat, event.bubbles, event.cancelable]; return false; }",
+             event.repeat, event.bubbles, event.cancelable]; return false; }
+             window.onkeydown = handler;",
         )
         .unwrap();
 
