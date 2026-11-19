@@ -19,18 +19,15 @@ build:
 # forwards a log level to the program being run.
 RUN_ARGS := $(if $(LOG),-- --log-level $(LOG))
 
-## Run a platform shell: `make run shell` for the browser, or `make run js`
-## for the interactive JavaScript engine shell. Add `LOG=<spec>` to set the
-## log level.
+## Run the native shell for this operating system, or `make run js` for the
+## interactive JavaScript engine shell. Add `LOG=<spec>` to set the log level.
 run:
 ifeq ($(ARGS),js)
 	cargo run -p browser-js $(RUN_ARGS)
-else ifeq ($(ARGS),shell)
-	cargo run -p browser $(RUN_ARGS)
 else ifeq ($(OS),Windows_NT)
 	cargo run -p byui-browser-windows $(RUN_ARGS)
 else ifneq (,$(filter Darwin darwin,$(shell uname -s)))
-	cargo run -p browser-macos $(RUN_ARGS)
+	cargo run -p byui-browser $(RUN_ARGS)
 else ifneq (,$(filter Linux linux,$(shell uname -s)))
 	cargo run -p browser-linux $(RUN_ARGS)
 else ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(shell uname -s)))
@@ -54,7 +51,7 @@ ifeq ($(strip $(ARGS)),)
 	$(error Usage: make release <platform> (macos|linux|windows))
 endif
 ifeq ($(ARGS),macos)
-	cargo build --locked --release --target aarch64-apple-darwin -p browser-macos
+	cargo build --locked --release --target aarch64-apple-darwin -p byui-browser
 else ifeq ($(ARGS),linux)
 	cargo build --locked --release --target x86_64-unknown-linux-gnu -p browser-linux
 else ifeq ($(ARGS),windows)

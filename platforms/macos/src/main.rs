@@ -1,4 +1,4 @@
-//! Minimal macOS shell. Run with `cargo run -p browser-macos`.
+//! Minimal macOS shell. Run with `cargo run -p byui-browser`.
 //!
 //! The window, toolbar, and page rendering come from the shared
 //! `browser-shell` crate; this crate only describes the macOS window, which
@@ -14,9 +14,9 @@ fn main() -> Result<(), winit::error::EventLoopError> {
 
     browser_shell::run(browser_shell::Platform {
         // Make the native titlebar transparent and let content extend under
-        // it so the toolbar spans the full window width, Safari-style. The
-        // system's traffic lights stay at the top left, and the toolbar
-        // leaves room for them.
+        // it so the tab strip and toolbar span the full window width. The
+        // system's traffic lights stay at the top left, centered on the tab
+        // row, and the tab strip leaves room for them.
         configure_window: |attributes| {
             attributes
                 .with_titlebar_transparent(true)
@@ -24,7 +24,7 @@ fn main() -> Result<(), winit::error::EventLoopError> {
                 .with_fullsize_content_view(true)
         },
         window_created: center_traffic_lights,
-        window_changed: sync_native_toolbar,
+        window_changed: sync_native_chrome,
         ui_font_files: || {
             [
                 "/System/Library/Fonts/SFNS.ttf",
@@ -48,32 +48,40 @@ fn main() -> Result<(), winit::error::EventLoopError> {
             .map(PathBuf::from)
             .collect()
         },
-        window_controls_inset: 72.0,
+        // The traffic lights end near x = 72; the rest leaves a Brave-like gap
+        // before the first tab.
+        window_controls_inset: 88.0,
     })
 }
 
-/// Normal windows keep the existing unified titlebar/traffic-light layout.
+/// Logical distance from the window's left edge to the close button, chosen
+/// so the traffic lights' side margin roughly matches their top margin.
+#[cfg(target_os = "macos")]
+const TRAFFIC_LIGHT_LEADING: f64 = 14.0;
+
+/// Places the traffic lights on the tab strip's center line once the window
+/// exists.
 #[cfg(target_os = "macos")]
 fn center_traffic_lights(window: &winit::window::Window) {
-    sync_native_toolbar(window);
+    sync_native_chrome(window);
 }
 
-/// AppKit manages native toolbars specially in full screen. Detach the empty
-/// titlebar-sizing helper there so it cannot obscure the software-painted tabs
-/// and address row in the full-size content view. Restore it on exit. Native
+/// Keeps the traffic lights vertically centered on the tab strip's row, the
+/// way Brave and Chrome do, rather than at AppKit's default titlebar height.
+///
+/// AppKit lays the buttons out inside a titlebar container view and can reset
+/// that layout on resize or full-screen changes, so this runs after every
+/// window change and re-applies the geometry only when it drifted. In full
+/// screen AppKit owns the revealed titlebar and it is left alone. Native
 /// decorations remain AppKit-owned; winit keeps its own window delegate.
 /// Returns true only when a native layout change requires a fresh frame.
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
-fn sync_native_toolbar(window: &winit::window::Window) -> bool {
-    use objc2::MainThreadMarker;
+fn sync_native_chrome(window: &winit::window::Window) -> bool {
     use objc2::rc::Retained;
-    use objc2_app_kit::{NSToolbar, NSView, NSWindowStyleMask, NSWindowToolbarStyle};
+    use objc2_app_kit::{NSView, NSWindowButton, NSWindowStyleMask};
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-    let Some(mtm) = MainThreadMarker::new() else {
-        return false;
-    };
     let Ok(handle) = window.window_handle() else {
         return false;
     };
@@ -89,33 +97,62 @@ fn sync_native_toolbar(window: &winit::window::Window) -> bool {
     let Some(ns_window) = view.window() else {
         return false;
     };
-    // Inspect AppKit's actual style rather than winit's requested mode, which
-    // can change before the native full-screen transition has finished.
-    let fullscreen = ns_window
-        .styleMask()
-        .contains(NSWindowStyleMask::FullScreen);
-    let attached = ns_window.toolbar().is_some();
-    if fullscreen {
-        if !attached {
-            return false;
-        }
-        ns_window.setToolbar(None);
-    } else {
-        if attached {
-            return false;
-        }
-        let toolbar = NSToolbar::new(mtm);
-        ns_window.setToolbar(Some(&toolbar));
-        ns_window.setToolbarStyle(NSWindowToolbarStyle::Unified);
-    }
     ns_window.setTitlebarAppearsTransparent(true);
     // Native titlebar dragging must not steal address-field text-selection
     // drags. Empty chrome still uses Window::drag_window, as before.
     ns_window.setMovable(false);
-    true
+    if ns_window
+        .styleMask()
+        .contains(NSWindowStyleMask::FullScreen)
+    {
+        return false;
+    }
+    let buttons: Vec<_> = [
+        NSWindowButton::CloseButton,
+        NSWindowButton::MiniaturizeButton,
+        NSWindowButton::ZoomButton,
+    ]
+    .into_iter()
+    .filter_map(|kind| ns_window.standardWindowButton(kind))
+    .collect();
+    // The buttons live in a titlebar view inside AppKit's titlebar container.
+    // SAFETY: `superview` is a plain main-thread view-hierarchy getter; the
+    // returned views are retained and only used within this call.
+    let Some(container) = buttons
+        .first()
+        .and_then(|button| unsafe { button.superview() })
+        .and_then(|titlebar| unsafe { titlebar.superview() })
+    else {
+        return false;
+    };
+    // A container twice the row center keeps the buttons centered on it.
+    let height = 2.0 * f64::from(browser_shell::TAB_ROW_CENTER);
+    let mut changed = false;
+    let mut frame = container.frame();
+    let top = ns_window.frame().size.height - height;
+    if frame.size.height != height || frame.origin.y != top {
+        frame.size.height = height;
+        frame.origin.y = top;
+        container.setFrame(frame);
+        changed = true;
+    }
+    // Shift the group so the close button's left margin matches the space
+    // above it, keeping AppKit's spacing between the buttons.
+    let shift = TRAFFIC_LIGHT_LEADING - buttons[0].frame().origin.x;
+    for button in &buttons {
+        let mut frame = button.frame();
+        let y = ((height - frame.size.height) / 2.0).round();
+        if frame.origin.y != y || shift != 0.0 {
+            frame.origin.y = y;
+            frame.origin.x += shift;
+            button.setFrame(frame);
+            changed = true;
+        }
+    }
+    changed
 }
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    eprintln!("browser-macos requires macOS.");
+    eprintln!("byui-browser requires macOS.");
 }

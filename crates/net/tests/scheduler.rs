@@ -13,8 +13,9 @@ use std::{
 
 use common::{TestServer, runtime};
 use net::{
-    AbortController, Config, FetchServices, Request, RequestController, RequestError, ResponseInfo,
-    ServiceWorkerDecision,
+    AbortController, CachePartitionService, Config, CookieService, Request, RequestController,
+    RequestError, RequestPolicyService, ResponseInfo, ResponsePolicyService, ServiceWorkerDecision,
+    ServiceWorkerService,
 };
 
 struct AdmissionObserver {
@@ -31,17 +32,21 @@ impl AdmissionObserver {
     }
 }
 
-impl FetchServices for AdmissionObserver {
+impl RequestPolicyService for AdmissionObserver {
     fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
         self.checks.fetch_add(1, Ordering::SeqCst);
         self.notified.notify_one();
         Ok(())
     }
+}
 
+impl ResponsePolicyService for AdmissionObserver {
     fn check_response(&self, _request: &Request, _info: &ResponseInfo) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl CookieService for AdmissionObserver {
     fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
         Ok(None)
     }
@@ -53,11 +58,15 @@ impl FetchServices for AdmissionObserver {
     ) -> Result<(), RequestError> {
         Ok(())
     }
+}
 
+impl ServiceWorkerService for AdmissionObserver {
     fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
         Ok(ServiceWorkerDecision::Network)
     }
+}
 
+impl CachePartitionService for AdmissionObserver {
     fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
         Ok("test".into())
     }
@@ -142,7 +151,7 @@ fn aborting_a_queued_request_releases_admission_for_the_next_request() {
         max_in_flight: 1,
         ..Config::default()
     })
-    .with_fetch_services(observer.clone())
+    .with_browser_capabilities(observer.clone())
     .build()
     .unwrap();
 

@@ -62,7 +62,19 @@ pub(super) fn parse_jump(parser: &mut Parser<'_>) -> ParseResult<Statement> {
     } else {
         "continue statement"
     };
-    if parser.loops.last() != Some(&parser.function_depth) {
+    let label = if matches!(parser.peek(), Some(Token::Identifier(_))) {
+        Some(parser.identifier(context)?)
+    } else {
+        None
+    };
+    let valid = match &label {
+        Some(label) => parser.labeled_target(label, !is_break),
+        None => {
+            parser.loops.last() == Some(&parser.function_depth)
+                || parser.breakables.last() == Some(&parser.function_depth)
+        }
+    };
+    if !valid {
         return Err(parser.error(
             if is_break {
                 "Break requires an enclosing loop"
@@ -74,8 +86,8 @@ pub(super) fn parse_jump(parser: &mut Parser<'_>) -> ParseResult<Statement> {
     }
     parser.terminator(context)?;
     Ok(if is_break {
-        Statement::Break
+        Statement::Break(label)
     } else {
-        Statement::Continue
+        Statement::Continue(label)
     })
 }

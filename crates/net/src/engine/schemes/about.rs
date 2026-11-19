@@ -7,7 +7,7 @@ use crate::{
     api::{
         error::RequestError,
         providers::{SchemeBody, SchemeResource},
-        request::{Origin, Request},
+        request::{Origin, PreparedRequest},
         response::Response,
     },
     engine::RequestController,
@@ -22,9 +22,9 @@ impl RequestController {
     /// readable body; `HEAD` exposes an explicit null body.
     pub(crate) async fn fetch_about(
         &self,
-        request: Request,
-        url: Url,
+        prepared: PreparedRequest,
     ) -> Result<Response, RequestError> {
+        let (request, url) = prepared.into_parts();
         let Some(allowed_url) = allowed_about_url(&url) else {
             log::debug!(
                 "about URL is not allowlisted: {}",

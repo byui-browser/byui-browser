@@ -1,5 +1,5 @@
 [package]
-name = "browser-macos"
+name = "byui-browser"
 description = "Minimal native macOS window for BYUI Browser"
 version.workspace = true
 edition.workspace = true
@@ -13,7 +13,7 @@ browser-shell = { path = "../shell" }
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSToolbar", "NSView", "NSWindow"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSButton", "NSControl", "NSResponder", "NSView", "NSWindow"] }
 
 [lints]
 workspace = true

@@ -16,7 +16,7 @@ make run
 ```
 
 On macOS, `make run` selects this shell automatically. The direct command
-`cargo run -p browser-macos` remains available for platform-only development.
+`cargo run -p byui-browser` remains available for platform-only development.
 
 A 1120 × 720 window titled **BYUI Browser** opens with a unified, Safari-style
 toolbar (52 logical pixels high) and the page shown as a rounded card inset

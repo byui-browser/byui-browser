@@ -2,6 +2,15 @@
 
 use crate::ast::{BinaryOperator, UnaryOperator, VarKind};
 
+/// The iteration source used by a `for...of` or `for...in` loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IterationKind {
+    /// Iterate values from arrays and strings.
+    Of,
+    /// Iterate enumerable own keys from objects and arrays.
+    In,
+}
+
 /// A single stack-machine instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Instruction {
@@ -83,6 +92,12 @@ pub enum Instruction {
     /// array or string and leaves the array on the stack. Any other value is
     /// a runtime error.
     ArrayExtend,
+    /// Starts an internal array/string or object-key iteration.
+    IteratorStart(IterationKind),
+    /// Pushes the next iteration value, or jumps when iteration is complete.
+    IteratorNext(usize),
+    /// Releases the active iterator during an abrupt loop exit.
+    IteratorEnd,
     /// Copies the own enumerable properties of the popped value onto the
     /// object beneath it, which stays on the stack. Object literal spread.
     SpreadProperties,

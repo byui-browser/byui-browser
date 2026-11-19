@@ -6,8 +6,9 @@ use std::sync::{
 };
 
 use net::{
-    BlobProvider, Config, FetchServices, FileProvider, Origin, PageProvider, ProviderFuture,
-    Request, RequestController, RequestError, ResponseInfo, SchemeProviders, ServiceWorkerDecision,
+    BlobProvider, CachePartitionService, Config, CookieService, FileProvider, Origin, PageProvider,
+    ProviderFuture, Request, RequestController, RequestError, RequestPolicyService, ResponseInfo,
+    ResponsePolicyService, SchemeProviders, ServiceWorkerDecision, ServiceWorkerService,
 };
 
 pub(crate) use crate::common::runtime;
@@ -32,7 +33,7 @@ pub(crate) enum FailurePoint {
 
 pub(crate) struct FailingServices(pub(crate) FailurePoint);
 
-impl FetchServices for FailingServices {
+impl RequestPolicyService for FailingServices {
     fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
         if matches!(self.0, FailurePoint::Request) {
             Err(RequestError::InvalidResponse("request denied".into()))
@@ -40,7 +41,9 @@ impl FetchServices for FailingServices {
             Ok(())
         }
     }
+}
 
+impl ResponsePolicyService for FailingServices {
     fn check_response(&self, _request: &Request, _info: &ResponseInfo) -> Result<(), RequestError> {
         if matches!(self.0, FailurePoint::Response) {
             Err(RequestError::InvalidResponse("response denied".into()))
@@ -48,7 +51,9 @@ impl FetchServices for FailingServices {
             Ok(())
         }
     }
+}
 
+impl CookieService for FailingServices {
     fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
         panic!("local fetches must not request cookies")
     }
@@ -60,7 +65,9 @@ impl FetchServices for FailingServices {
     ) -> Result<(), RequestError> {
         panic!("local fetches must not store cookies")
     }
+}
 
+impl ServiceWorkerService for FailingServices {
     fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
         if matches!(self.0, FailurePoint::Worker) {
             Ok(ServiceWorkerDecision::Intercept)
@@ -68,18 +75,22 @@ impl FetchServices for FailingServices {
             Ok(ServiceWorkerDecision::Network)
         }
     }
+}
 
+impl CachePartitionService for FailingServices {
     fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
         panic!("local fetches must not request a cache partition")
     }
 }
 
-impl FetchServices for RecordingServices {
+impl RequestPolicyService for RecordingServices {
     fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
         self.request_checks.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+}
 
+impl ResponsePolicyService for RecordingServices {
     fn check_response(&self, _request: &Request, info: &ResponseInfo) -> Result<(), RequestError> {
         self.response_checks.fetch_add(1, Ordering::SeqCst);
         self.response_origins
@@ -88,7 +99,9 @@ impl FetchServices for RecordingServices {
             .push(info.response_origin.clone());
         Ok(())
     }
+}
 
+impl CookieService for RecordingServices {
     fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
         self.cookie_lookups.fetch_add(1, Ordering::SeqCst);
         Ok(Some("session=unexpected".into()))
@@ -102,12 +115,16 @@ impl FetchServices for RecordingServices {
         self.cookie_stores.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+}
 
+impl ServiceWorkerService for RecordingServices {
     fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
         self.worker_checks.fetch_add(1, Ordering::SeqCst);
         Ok(ServiceWorkerDecision::Network)
     }
+}
 
+impl CachePartitionService for RecordingServices {
     fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
         self.cache_partitions.fetch_add(1, Ordering::SeqCst);
         Ok("local-scheme-test".into())
@@ -143,7 +160,7 @@ pub(crate) fn controller_with_services_and_providers() -> (RequestController, Ar
         .with_file(Arc::new(UnreachableProvider))
         .with_page(Arc::new(UnreachableProvider));
     let controller = RequestController::builder(Config::default())
-        .with_fetch_services(services.clone())
+        .with_browser_capabilities(services.clone())
         .with_scheme_providers(providers)
         .build()
         .expect("controller should initialize");

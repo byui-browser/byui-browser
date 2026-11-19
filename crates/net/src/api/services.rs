@@ -1,4 +1,4 @@
-//! Browser-owned inputs to the process-local Fetch engine.
+//! Browser-owned capability boundaries for the process-local Fetch engine.
 
 use crate::{Headers, Origin, Request, RequestError, RequestMode, ResponseType, Url};
 
@@ -39,12 +39,8 @@ pub struct ResponseInfo {
     pub from_cache: bool,
 }
 
-/// Browser-owned services required when a request carries client context.
-///
-/// Implementations are expected to delegate to the storage, security,
-/// service-worker, browser-context, and diagnostics owners. Methods return
-/// decisions or typed errors; the engine does not own their durable state.
-pub trait FetchServices: Send + Sync {
+/// Browser-owned authorization and header generation for request phases.
+pub trait RequestPolicyService: Send + Sync {
     /// Authorizes a request before cache lookup, cookies, or network I/O.
     ///
     /// The controller invokes this once for the initial request and again for
@@ -52,18 +48,13 @@ pub trait FetchServices: Send + Sync {
     /// per-hop decision; [`Request::url`] remains the original caller input.
     fn check_request(&self, request: &Request) -> Result<(), RequestError>;
 
-    /// Authorizes complete internal response metadata before public exposure.
-    fn check_response(&self, request: &Request, info: &ResponseInfo) -> Result<(), RequestError>;
-
     /// Returns browser-owned request headers for one validated transport hop.
     ///
     /// These values are merged into an internal transport-only channel before
     /// CORS-preflight calculation and after Fetch-owned headers are derived.
-    /// The default is empty for standalone consumers; browser implementations
-    /// can provide destination, language, identity, and Fetch Metadata headers
-    /// here. Use [`Headers::generated_request_headers`] for forbidden
-    /// browser-owned names such as `Sec-Fetch-*`; Fetch-owned `Origin`,
-    /// referrer, body, cookie, and preflight fields are rejected.
+    /// The default is empty. Use [`Headers::generated_request_headers`] for
+    /// forbidden browser-owned names such as `Sec-Fetch-*`; Fetch-owned
+    /// `Origin`, referrer, body, cookie, and preflight fields are rejected.
     fn generated_request_headers(
         &self,
         _request: &Request,
@@ -71,7 +62,21 @@ pub trait FetchServices: Send + Sync {
     ) -> Result<Headers, RequestError> {
         Ok(Headers::generated_request_headers())
     }
+}
 
+/// Browser-owned authorization and diagnostics for response phases.
+pub trait ResponsePolicyService: Send + Sync {
+    /// Authorizes complete internal response metadata before public exposure.
+    fn check_response(&self, request: &Request, info: &ResponseInfo) -> Result<(), RequestError>;
+
+    /// Observes approved response headers for diagnostics and timing clients.
+    ///
+    /// Body lifecycle and timing events are outside this first contract slice.
+    fn response_headers(&self, _request: &Request, _info: &ResponseInfo) {}
+}
+
+/// Browser-owned HTTP cookie selection and storage.
+pub trait CookieService: Send + Sync {
     /// Returns the cookie header selected by storage and security policy.
     ///
     /// The engine calls this only when the credentials mode permits credentials.
@@ -83,21 +88,22 @@ pub trait FetchServices: Send + Sync {
         request: &Request,
         values: &[http::HeaderValue],
     ) -> Result<(), RequestError>;
+}
 
-    /// Decides whether a service worker intercepts the request.
+/// Browser-owned service-worker interception decisions.
+pub trait ServiceWorkerService: Send + Sync {
+    /// Decides whether a service worker intercepts the initial request.
     ///
-    /// An `Intercept` decision fails closed until worker response integration
-    /// is implemented in a later plan step.
+    /// An [`ServiceWorkerDecision::Intercept`] decision fails closed until
+    /// worker response execution is implemented.
     fn service_worker(&self, request: &Request) -> Result<ServiceWorkerDecision, RequestError>;
+}
 
-    /// Returns an owned HTTP and CORS-preflight cache partition key for this request.
+/// Browser-owned HTTP and CORS-preflight cache isolation.
+pub trait CachePartitionService: Send + Sync {
+    /// Returns an owned process-local cache partition key for this request.
     ///
-    /// The process-local caches use the key only within this controller. It is
-    /// not a durable cache or a substitute for the storage owner.
+    /// The key is not durable storage identity and is not shared outside this
+    /// controller.
     fn cache_partition(&self, request: &Request) -> Result<String, RequestError>;
-
-    /// Observes approved response headers for diagnostics and timing clients.
-    ///
-    /// Body lifecycle and timing events are outside this first contract slice.
-    fn response_headers(&self, _request: &Request, _info: &ResponseInfo) {}
 }

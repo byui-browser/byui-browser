@@ -3,6 +3,7 @@
 mod collection;
 mod cors;
 mod guard;
+mod storage;
 mod validation;
 
 pub use collection::Headers;

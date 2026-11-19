@@ -1,15 +1,11 @@
 [package]
 name = "browser"
-description = "Top-level browser binary that wires processes and crates together"
+description = "Page loading, navigation, and script hosting shared by the native shells"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-
-[[bin]]
-name = "browser"
-path = "src/main.rs"
 
 [lib]
 path = "src/lib.rs"
@@ -25,15 +21,12 @@ render = { workspace = true }
 js = { workspace = true }
 webapis = { workspace = true }
 net = { workspace = true }
-tao.workspace = true
-wry.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 storage = { workspace = true }
 security = { workspace = true }
 chrome = { workspace = true }
 devtools = { workspace = true }
 futures-util = "0.3"
-rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
 
 [dev-dependencies]
 cap-std = "4"

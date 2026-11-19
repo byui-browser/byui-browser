@@ -211,6 +211,7 @@ impl Chunk {
                 | Instruction::JumpIfFalse(_)
                 | Instruction::JumpIfTrue(_)
                 | Instruction::JumpIfNullish(_)
+                | Instruction::IteratorNext(_)
                 | Instruction::EnterTry(_)
         ) {
             return Err("instruction is not patchable");
@@ -229,6 +230,7 @@ impl Chunk {
             | Instruction::JumpIfFalse(target_slot)
             | Instruction::JumpIfTrue(target_slot)
             | Instruction::JumpIfNullish(target_slot)
+            | Instruction::IteratorNext(target_slot)
             | Instruction::EnterTry(target_slot) => *target_slot = target,
             _ => return Err("instruction is not patchable"),
         }

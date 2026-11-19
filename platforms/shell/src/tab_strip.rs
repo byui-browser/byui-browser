@@ -6,7 +6,15 @@ use chrome::TabId;
 use tiny_skia::{Paint, PathBuilder, Pixmap, Rect, Transform};
 use unicode_segmentation::UnicodeSegmentation;
 
-pub(crate) const HEIGHT: f64 = 32.0;
+/// Logical height of the tab strip row above the address toolbar: the
+/// 28-pixel tabs centered on [`ROW_CENTER`] plus a 2-pixel gap below.
+pub(crate) const HEIGHT: f64 = ROW_CENTER as f64 + 16.0;
+/// Logical distance from the window's top edge to the tabs' vertical center.
+///
+/// Platforms whose window buttons overlap the tab strip (macOS's traffic
+/// lights) center those buttons on this line too, so tabs and window
+/// controls sit level with a little room above, like Brave and Chrome.
+pub const ROW_CENTER: f32 = 20.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -34,7 +42,8 @@ impl Strip {
         let start = offset.min(ids.len().saturating_sub(capacity));
         let visible = capacity.min(ids.len().saturating_sub(start));
         let tab_width = ((width - left - 44.0) / (visible.max(1) as f32)).clamp(1.0, 200.0);
-        let y = 0.0;
+        // Top of each 32-pixel tab slot; tabs are 28 tall, 2 below the slot top.
+        let y = ROW_CENTER - 16.0;
         let mut regions = Vec::new();
         if overflow {
             regions.push((
@@ -82,6 +91,15 @@ impl Strip {
             })
             .map(|(a, _)| *a)
     }
+    /// The tab under `cursor`, counting its close control as part of the tab.
+    ///
+    /// Used for middle-click closing, where the whole tab is the target.
+    pub fn tab_at(&self, cursor: Option<(f64, f64)>) -> Option<TabId> {
+        match self.action_at(cursor)? {
+            Action::Select(id) | Action::Close(id) => Some(id),
+            Action::New | Action::Previous | Action::Next => None,
+        }
+    }
     pub fn draw(
         &self,
         pixmap: &mut Pixmap,
@@ -107,21 +125,15 @@ impl Strip {
         for (action, rect) in &self.regions {
             if let Action::Select(id) = action {
                 paint.set_color(if *id == active {
-                    palette.field_hover
+                    palette.active_tab
                 } else {
                     palette.hover
                 });
+                // Inset only the painted leading edge: a four-pixel visual gap
+                // without moving titles, close targets, or tab hit regions.
                 pixmap.fill_path(
-                    // Inset only the painted leading edge: a four-pixel visual gap
-                    // without moving titles, close targets, or tab hit regions.
-                    &toolbar::rounded_rect(
-                        rect.x() + 2.0,
-                        rect.y(),
-                        rect.width() - 2.0,
-                        rect.height(),
-                        8.0,
-                    )
-                    .unwrap(),
+                    &tab_shape(rect.x() + 2.0, rect.y(), rect.width() - 2.0, rect.height())
+                        .unwrap(),
                     &paint,
                     tiny_skia::FillRule::Winding,
                     transform,
@@ -129,6 +141,8 @@ impl Strip {
                 );
                 if *id == active {
                     paint.set_color(palette.accent);
+                    // The bottom corners are square, so the underline runs
+                    // flush across the tab's full painted width.
                     if let Some(line) = Rect::from_xywh(
                         rect.x() + 2.0,
                         rect.bottom() - 2.0,
@@ -243,6 +257,30 @@ impl Strip {
 }
 
 /// Font-independent close mark centered in the existing click target.
+/// Corner radius in logical pixels of a tab's top corners.
+const TAB_RADIUS: f32 = 8.0;
+
+/// Outline of a painted tab at `x`, `y`, `w` wide and `h` tall in logical
+/// pixels: rounded top corners and square bottom corners, so the active tab's
+/// underline meets the tab's sides cleanly. `None` for an empty size.
+fn tab_shape(x: f32, y: f32, w: f32, h: f32) -> Option<tiny_skia::Path> {
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let r = TAB_RADIUS.min(w / 2.0).min(h);
+    // Cubic Bézier quarter-circle approximation, as in `toolbar::rounded_rect`.
+    let k = r * 0.4477;
+    let mut builder = PathBuilder::new();
+    builder.move_to(x, y + h);
+    builder.line_to(x, y + r);
+    builder.cubic_to(x, y + k, x + k, y, x + r, y);
+    builder.line_to(x + w - r, y);
+    builder.cubic_to(x + w - k, y, x + w, y + k, x + w, y + r);
+    builder.line_to(x + w, y + h);
+    builder.close();
+    builder.finish()
+}
+
 fn close_icon_rect(target: Rect) -> Rect {
     Rect::from_xywh(
         target.x() + target.width() / 2.0 - 4.0,
@@ -344,6 +382,66 @@ mod tests {
     }
 
     #[test]
+    fn middle_click_target_covers_the_whole_tab_but_not_strip_buttons() {
+        let ids: Vec<_> = (0..40).map(TabId).collect();
+        let strip = Strip::new(640.0, &ids, 0, 72.0);
+        for (action, rect) in &strip.regions {
+            let center = Some((
+                (rect.x() + rect.width() / 2.0) as f64,
+                (rect.y() + rect.height() / 2.0) as f64,
+            ));
+            let left_edge = Some((rect.x() as f64 + 1.0, rect.y() as f64 + 1.0));
+            match action {
+                Action::Select(id) | Action::Close(id) => {
+                    assert_eq!(strip.tab_at(center), Some(*id));
+                    assert_eq!(strip.tab_at(left_edge), Some(*id));
+                }
+                Action::New | Action::Previous | Action::Next => {
+                    assert_eq!(strip.tab_at(center), None);
+                }
+            }
+        }
+        assert_eq!(strip.tab_at(Some((10.0, f64::from(ROW_CENTER)))), None);
+        assert_eq!(strip.tab_at(None), None);
+    }
+
+    #[test]
+    fn active_tab_has_square_bottom_corners_under_a_full_underline() {
+        for dark in [false, true] {
+            let id = TabId(0);
+            let strip = Strip::new(640.0, &[id], 0, 72.0);
+            let tab = strip
+                .regions
+                .iter()
+                .find(|(a, _)| *a == Action::Select(id))
+                .unwrap()
+                .1;
+            let mut frame = Pixmap::new(1280, 200).unwrap();
+            strip.draw(&mut frame, 2.0, dark, id, &[], None);
+            let palette = toolbar::palette(dark);
+            let rgb = |color: tiny_skia::Color| {
+                let color = color.to_color_u8();
+                [color.red(), color.green(), color.blue()]
+            };
+            let at = |x: f32, y: f32| {
+                let pixel = frame.pixel((x * 2.0) as u32, (y * 2.0) as u32).unwrap();
+                [pixel.red(), pixel.green(), pixel.blue()]
+            };
+            let bottom = tab.bottom() - 0.5;
+            // The painted tab starts 2 pixels in; the underline reaches its
+            // outermost bottom corner pixels on both sides.
+            assert_eq!(at(tab.x() + 2.25, bottom), rgb(palette.accent));
+            assert_eq!(at(tab.right() - 0.25, bottom), rgb(palette.accent));
+            // The top corners stay rounded.
+            assert_eq!(at(tab.x() + 2.25, tab.y() + 0.25), rgb(palette.frame_top));
+            assert_eq!(
+                at(tab.right() - 0.25, tab.y() + 0.25),
+                rgb(palette.frame_top)
+            );
+        }
+    }
+
+    #[test]
     fn plus_hover_is_circular_and_local_in_both_themes() {
         for dark in [false, true] {
             for scale in [1.0, 1.5, 2.0] {
@@ -366,7 +464,10 @@ mod tests {
                         if idle.pixel(x, y) != hover.pixel(x, y) {
                             let cx = (x as f64 + 0.5) / scale;
                             let cy = (y as f64 + 0.5) / scale;
-                            assert!((cx - (target.x() + 14.0) as f64).hypot(cy - 16.0) <= 13.0);
+                            assert!(
+                                (cx - (target.x() + 14.0) as f64).hypot(cy - f64::from(ROW_CENTER))
+                                    <= 13.0
+                            );
                         }
                     }
                 }
@@ -397,7 +498,7 @@ mod tests {
                 .1;
             assert_eq!(plus.left(), last.right() + 7.0);
             assert_eq!(plus.width(), 28.0);
-            assert_eq!(plus.y() + plus.height() / 2.0, 16.0);
+            assert_eq!(plus.y() + plus.height() / 2.0, ROW_CENTER);
             assert!(plus.right() <= 1120.0);
             assert!(plus.left() > previous);
             previous = plus.left();
@@ -431,7 +532,10 @@ mod tests {
             };
             assert!(tab_width(&many) < tab_width(&one));
             for x in 0..inset as u32 {
-                assert_eq!(many.action_at(Some((x as f64, 16.0))), None);
+                assert_eq!(
+                    many.action_at(Some((x as f64, f64::from(ROW_CENTER)))),
+                    None
+                );
             }
             assert!(many.regions.iter().all(|(_, rect)| rect.left() >= inset));
             let plus = many
@@ -441,7 +545,7 @@ mod tests {
                 .unwrap()
                 .1;
             assert_eq!(
-                many.action_at(Some(((plus.x() + 15.0) as f64, 16.0))),
+                many.action_at(Some(((plus.x() + 15.0) as f64, f64::from(ROW_CENTER)))),
                 Some(Action::New)
             );
         }
@@ -507,7 +611,6 @@ mod tests {
             for (width, height, scale) in [(1120, 720, 1.0), (1728, 1117, 2.0), (1120, 720, 1.0)] {
                 let state = toolbar::ChromeState {
                     dark,
-                    window_controls_inset: 72.0,
                     ..Default::default()
                 };
                 let w = (width as f64 * scale) as u32;
@@ -527,7 +630,7 @@ mod tests {
                 let page = toolbar::page_rect(w, h, scale).unwrap();
                 assert_eq!(page.y, (toolbar::PAGE_TOP * scale) as u32);
                 assert_eq!(
-                    toolbar::hit_test(width as f64 / 2.0, HEIGHT + 26.0, width as f64, 72.0),
+                    toolbar::hit_test(width as f64 / 2.0, HEIGHT + 26.0, width as f64),
                     Some(toolbar::Control::Address)
                 );
                 assert_eq!(

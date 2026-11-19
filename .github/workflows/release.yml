@@ -35,8 +35,8 @@ jobs:
           - os: macos
             runner: macos-latest
             target: aarch64-apple-darwin
-            package: browser-macos
-            src_bin: browser-macos
+            package: byui-browser
+            src_bin: byui-browser
             dest_bin: byui-browser
             asset: byui-browser-macos-aarch64.tar.gz
           - os: linux

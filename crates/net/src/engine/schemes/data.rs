@@ -9,7 +9,7 @@ use crate::{
         error::RequestError,
         media_type::is_valid_media_type,
         providers::{SchemeBody, SchemeResource},
-        request::{Origin, Request},
+        request::{Origin, PreparedRequest},
         response::Response,
     },
     engine::RequestController,
@@ -19,9 +19,9 @@ impl RequestController {
     /// Fetches an inline `data:` URL without invoking transport or providers.
     pub(crate) async fn fetch_data(
         &self,
-        request: Request,
-        url: Url,
+        prepared: PreparedRequest,
     ) -> Result<Response, RequestError> {
+        let (request, url) = prepared.into_parts();
         let (media_type, bytes) = parse_data_url(&url).inspect_err(|error| {
             log::warn!("data URL rejected: {error}");
         })?;
