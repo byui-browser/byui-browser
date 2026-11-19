@@ -1438,6 +1438,34 @@ mod form_controls {
         assert!(find(&tree.root, id(&document, "o")).is_some());
     }
 
+    /// Guards the merge with generated content (#393) and floats and
+    /// positioning (#413): a drop-down shows only its selected option, never
+    /// `::before` / `::after` content, in or out of flow.
+    #[test]
+    fn drop_downs_ignore_pseudo_elements_and_keep_working_out_of_flow() {
+        let css = format!(
+            "{CSS} select::before {{ content: 'BEFORE' }} select::after {{ content: 'AFTER' }}"
+        );
+        let (document, tree) = lay_out(
+            "<body><div style='position: relative'>\
+             <select id=f style='float: right'><option>One</option></select>\
+             <select id=a style='position: absolute; top: 0; left: 0'>\
+             <option>A</option><option selected>B</option></select>\
+             <select id=x><option>In flow</option></select></div></body>",
+            &css,
+            800.0,
+        );
+        let floated = box_for(&tree, &document, "f");
+        assert_eq!(floated.placement, Placement::Float);
+        assert_eq!(texts(floated), ["One"]);
+        assert!(floated.select_arrow);
+        let placed = box_for(&tree, &document, "a");
+        assert_eq!(placed.placement, Placement::Absolute);
+        assert_eq!(texts(placed), ["B"]);
+        assert!(placed.select_arrow);
+        assert_eq!(texts(box_for(&tree, &document, "x")), ["In flow"]);
+    }
+
     #[test]
     fn drop_down_width_follows_the_widest_option_not_the_selection() {
         let options = "<option>Short</option><option>A much longer option label</option>";
