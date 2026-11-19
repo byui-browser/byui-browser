@@ -5,7 +5,7 @@ use crate::{
         body::Body,
         diagnostics::NetworkPhase,
         error::RequestError,
-        request::{CacheMode, PreparedRequest, Request, ValidatedHop},
+        request::{CacheMode, PreparedRequest, Request, ValidatedHop, urls_are_same_origin},
         response::{InternalResponse, Response, has_null_body},
     },
     cache::{CacheLookup, CacheValidator, StoredResponse},
@@ -148,6 +148,9 @@ impl RequestController {
                 request.method(),
                 crate::log_url::loggable(url.as_str())
             );
+            if !request.method().is_safe() {
+                self.invalidate_after_unsafe_response(&request, &url, &candidate);
+            }
             if status == http::StatusCode::NOT_MODIFIED.as_u16()
                 && revalidation.is_some()
                 && let Some(cached) =
@@ -373,6 +376,36 @@ impl RequestController {
             transport_headers,
             url.clone(),
         ))
+    }
+
+    /// Invalidates cache entries affected by one completed unsafe HTTP request.
+    ///
+    /// The request URL is always invalidated. A successful response can also
+    /// identify a same-origin target through `Location`; Fetch requires that
+    /// target to be invalidated without permitting one origin to evict another
+    /// origin's cached data.
+    fn invalidate_after_unsafe_response(
+        &self,
+        request: &Request,
+        url: &reqwest::Url,
+        response: &InternalResponse,
+    ) {
+        self.inner.cache.invalidate(request, url);
+        if !(200..400).contains(&response.status.as_u16()) {
+            return;
+        }
+        let Some(location) = response.headers.get(http::header::LOCATION) else {
+            return;
+        };
+        let Ok(location) = location.to_str() else {
+            return;
+        };
+        let Ok(target) = url.join(location) else {
+            return;
+        };
+        if urls_are_same_origin(url, &target) {
+            self.inner.cache.invalidate(request, &target);
+        }
     }
 
     /// Adds the browser-selected cookie to a cache-miss transport attempt.

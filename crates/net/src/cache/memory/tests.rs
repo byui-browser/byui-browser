@@ -765,6 +765,39 @@ fn authorized_requests_are_never_stored() {
     assert!(fresh_response(&cache, &request, &url).is_none());
 }
 
+#[test]
+fn invalidation_removes_every_variant_in_its_partition_only() {
+    let cache = ResponseCache::default();
+    let url = Url::parse("https://example.test/articles/42#summary").unwrap();
+    let other_url = Url::parse("https://example.test/articles/43").unwrap();
+
+    let mut first = Request::get(url.as_str());
+    first.set_cache_partition("first".into());
+    let mut second = first.try_clone().unwrap();
+    second.set_cache_partition("second".into());
+    let mut mutate = first.try_clone().unwrap();
+    mutate.set_method("PATCH").unwrap();
+
+    cache.insert(&first, &url, cached_response(&url, b"first"));
+    cache.insert(&second, &url, cached_response(&url, b"second"));
+    cache.insert(&first, &other_url, cached_response(&other_url, b"other"));
+
+    cache.invalidate(&mutate, &url);
+
+    assert!(fresh_response(&cache, &first, &url).is_none());
+    assert_eq!(
+        fresh_response(&cache, &second, &url).unwrap().body.as_ref(),
+        b"second"
+    );
+    assert_eq!(
+        fresh_response(&cache, &first, &other_url)
+            .unwrap()
+            .body
+            .as_ref(),
+        b"other"
+    );
+}
+
 fn cached_response(url: &Url, body: &'static [u8]) -> StoredResponse {
     let mut headers = HeaderMap::new();
     headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());

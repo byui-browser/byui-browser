@@ -60,13 +60,13 @@ Implement validator-aware revalidation using response validators such as
 `CacheMode::NoCache` should stop returning an unsupported-feature error once
 this path is available.
 
-### 4. Implement cache invalidation
+### 4. Implement cache invalidation (complete)
 
-Unsafe methods such as `POST`, `PUT`, `PATCH`, and `DELETE` must invalidate
-affected cached representations using the correct partition, origin, and URL
-scope. Invalidation must also work across matching redirect targets where the
-Fetch algorithm requires it, without clearing unrelated partitions or
-variants.
+Unsafe methods invalidate every cached representation for the request URL in
+the active cache partition, including method and `Vary` variants. A successful
+2xx or 3xx response also invalidates a same-origin `Location` target. URL
+fragments are ignored, while unrelated URLs, origins, and partitions remain
+untouched.
 
 ### 5. Finish all Fetch cache modes
 

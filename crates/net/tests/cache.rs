@@ -209,6 +209,46 @@ fn reload_bypasses_cache_and_caches_the_refresh_when_consumed() {
 }
 
 #[test]
+fn unsafe_redirect_invalidates_its_same_origin_location_target() {
+    let target_hits = Arc::new(AtomicUsize::new(0));
+    let observed_target_hits = Arc::clone(&target_hits);
+    let server = TestServer::start(3, move |request| {
+        if request.starts_with("POST /mutate ") {
+            b"HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        } else if request.starts_with("GET /target ") {
+            let body = if observed_target_hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                "old"
+            } else {
+                "new"
+            };
+            format!("HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
+        } else {
+            panic!("unexpected request: {request}");
+        }
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+    let target = format!("{}/target", server.url());
+    let mutation = format!("{}/mutate", server.url());
+
+    let final_response = runtime().block_on(async {
+        let initial = controller.fetch(Request::get(&target)).await.unwrap();
+        assert_eq!(collect_body(initial).await.unwrap(), b"old");
+
+        let mutation = controller
+            .fetch(Request::new(&mutation, "POST").unwrap())
+            .await
+            .unwrap();
+        (mutation.from_cache, collect_body(mutation).await.unwrap())
+    });
+
+    server.join();
+    assert!(!final_response.0);
+    assert_eq!(final_response.1, b"new");
+}
+
+#[test]
 fn only_if_cached_returns_a_cache_hit() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nX-Cache-Test: yes\r\nConnection: close\r\n\r\ncached".to_vec()

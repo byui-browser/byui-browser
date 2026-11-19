@@ -25,6 +25,14 @@ pub(crate) struct CacheKey {
     has_authorization: bool,
 }
 
+/// The partition and normalized URL shared by every representation invalidated
+/// by one unsafe request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct InvalidationKey {
+    partition: CachePartition,
+    url: String,
+}
+
 /// Browser-provided or standalone storage scope for a cache key.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum CachePartition {
@@ -34,21 +42,50 @@ enum CachePartition {
 
 /// Creates the cache key used to distinguish method and URL combinations.
 pub(crate) fn cache_key(request: &Request, url: &Url) -> CacheKey {
-    let mut url = url.clone();
-    url.set_fragment(None);
+    let credentials_allowed = request.credentials_allowed(url);
+    let url = normalized_url(url);
     CacheKey {
         partition: match request.cache_partition() {
             Some(partition) => CachePartition::Browser(partition.to_owned()),
             None => CachePartition::Standalone,
         },
         method: request.method().clone(),
-        url: url.to_string(),
+        url,
         credentials_mode: request.credentials_mode(),
-        credentials_allowed: request.credentials_allowed(&url),
+        credentials_allowed,
         request_mode: request.mode(),
         redirect_taint: request.redirect_taint(),
         has_authorization: has_authorization(request),
     }
+}
+
+/// Creates the partition-and-URL scope used to invalidate cached responses.
+///
+/// Deliberately omits request-specific matching attributes such as method and
+/// credentials: an unsafe mutation invalidates every cached representation of
+/// its target within the selected partition.
+pub(super) fn invalidation_key(request: &Request, url: &Url) -> InvalidationKey {
+    InvalidationKey {
+        partition: match request.cache_partition() {
+            Some(partition) => CachePartition::Browser(partition.to_owned()),
+            None => CachePartition::Standalone,
+        },
+        url: normalized_url(url),
+    }
+}
+
+impl CacheKey {
+    /// Reports whether this representation belongs to an invalidation scope.
+    pub(super) fn matches_invalidation(&self, invalidation: &InvalidationKey) -> bool {
+        self.partition == invalidation.partition && self.url == invalidation.url
+    }
+}
+
+/// Serializes a URL for cache identity after removing its non-network fragment.
+fn normalized_url(url: &Url) -> String {
+    let mut url = url.clone();
+    url.set_fragment(None);
+    url.to_string()
 }
 
 /// Reports whether a request carries an authorization-bearing header.

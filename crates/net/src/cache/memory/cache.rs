@@ -13,7 +13,7 @@ use crate::api::request::Request;
 use super::{
     entry::{CacheValidator, CachedResponse, StoredResponse, vary_header_names},
     freshness::{CacheClock, FreshnessMetadata, SystemCacheClock},
-    key::{cache_key, has_authorization},
+    key::{cache_key, has_authorization, invalidation_key},
     storage::{CacheEntries, CacheLimits},
 };
 
@@ -254,6 +254,34 @@ impl ResponseCache {
         variants.push(cached_response);
         entries.entries.insert(key, variants);
         entries.evict_to_limits(self.limits);
+    }
+
+    /// Removes every cached representation for `url` in the request's cache partition.
+    ///
+    /// This intentionally spans methods and `Vary` variants because an unsafe
+    /// request can change any representation of its target. Other cache-key
+    /// attributes remain isolated through the browser-selected partition.
+    pub(crate) fn invalidate(&self, request: &Request, url: &Url) {
+        let invalidation = invalidation_key(request, url);
+        let mut entries = self.entries.write().expect("cache lock poisoned");
+        let removed: usize = entries
+            .entries
+            .extract_if(|key, _| key.matches_invalidation(&invalidation))
+            .map(|(_, variants)| {
+                variants
+                    .iter()
+                    .map(CachedResponse::body_size)
+                    .sum::<usize>()
+            })
+            .sum();
+        entries.total_body_size = entries.total_body_size.saturating_sub(removed);
+        if removed > 0 {
+            log::debug!(
+                "cache invalidated {} bytes for {}",
+                removed,
+                crate::log_url::loggable(url.as_str())
+            );
+        }
     }
 
     /// Removes every response currently held by the cache.
