@@ -743,16 +743,47 @@ impl GlobalState {
     /// Binds a host-provided global, replacing any binding in the object
     /// layer. A script `let`/`const` of the same name still shadows it.
     pub(crate) fn install_host(&self, name: &str, value: Value) {
-        self.object.lock_scope().bindings.insert(
-            name.to_owned(),
-            Binding {
-                value: Some(value),
-                mutable: true,
-                lexical: false,
-                host: true,
-                setter: None,
-            },
-        );
+        let global_this = {
+            let mut scope = self.object.lock_scope();
+            scope.bindings.insert(
+                name.to_owned(),
+                Binding {
+                    value: Some(value.clone()),
+                    mutable: true,
+                    lexical: false,
+                    host: true,
+                    setter: None,
+                },
+            );
+            (name != "globalThis")
+                .then(|| {
+                    scope
+                        .bindings
+                        .get("globalThis")
+                        .and_then(|binding| binding.value.clone())
+                })
+                .flatten()
+        };
+        if let Some(Value::Object(global)) = global_this {
+            let _ = global.set_property(name.to_owned(), value);
+        }
+    }
+
+    pub(crate) fn install_global_this(&self) {
+        let global = Object::new();
+        let values = self
+            .object
+            .lock_scope()
+            .bindings
+            .iter()
+            .filter_map(|(name, binding)| binding.value.clone().map(|value| (name.clone(), value)))
+            .collect::<Vec<_>>();
+        for (name, value) in values {
+            let _ = global.set_property(name, value);
+        }
+        let value = Value::Object(global.clone());
+        let _ = global.set_property("globalThis", value.clone());
+        self.install_host("globalThis", value);
     }
 
     /// Sets the host hook that handles assignment to a registered global.

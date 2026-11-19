@@ -45,6 +45,8 @@ pub(crate) struct TabState {
     pub animation_clock: Option<Instant>,
     /// Next visible animation sample. Hidden tabs keep their clock without frame wakeups.
     pub next_animation_frame: Option<Instant>,
+    /// Selection endpoints in document CSS pixels, reset on navigation.
+    pub selection: Option<crate::content::Selection>,
     pub scroll_y: f32,
     pub page_zoom: f64,
     pub page_events: PageEvents,
@@ -87,6 +89,7 @@ impl TabState {
             selector_state: css::SelectorState::default(),
             animation_clock: None,
             next_animation_frame: None,
+            selection: None,
             scroll_y: 0.0,
             page_zoom: 1.0,
             page_events: PageEvents::new(),

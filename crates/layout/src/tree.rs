@@ -17,6 +17,12 @@ use crate::{BorderRadius, BoxShadow, Edges, ImageKey, Rect, ToggleControl};
 /// not supported yet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoxStyle {
+    /// Used selection mode for expanding user-select:all across descendant runs.
+    pub user_select: String,
+    /// CSS cursor keyword used when the pointer hits this box. Image cursors use their fallback.
+    pub cursor: String,
+    /// Whether visibility suppresses this fragment. Collapse currently behaves as hidden.
+    pub hidden: bool,
     /// The background color, or `None` when it is transparent or unsupported.
     pub background_color: Option<CssColor>,
     /// The computed `color`, used for text.
@@ -47,6 +53,9 @@ pub struct BoxStyle {
 impl Default for BoxStyle {
     fn default() -> Self {
         Self {
+            user_select: "auto".into(),
+            cursor: "auto".into(),
+            hidden: false,
             background_color: None,
             text_color: css::user_agent_default_color("color")
                 .expect("user-agent stylesheet must define html color"),
@@ -245,6 +254,15 @@ pub struct InlineBoxFragment {
 /// A run of text placed on a line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextFragment {
+    /// CSS cursor keyword inherited by this text.
+    pub cursor: String,
+    /// Selection behavior: auto/text allow ranges, none excludes text, all selects the element.
+    /// Containment selection is not implemented.
+    pub user_select: String,
+    /// CSS rendering hint. Kerning and shaping are not implemented.
+    pub text_rendering: String,
+    /// Whether inherited visibility suppresses painting and hit testing.
+    pub hidden: bool,
     /// The DOM text node the run comes from.
     pub node: NodeID,
     /// The text node's parent element, which is the hit-test target for the
@@ -268,7 +286,7 @@ pub struct TextFragment {
     /// A rectangle the glyphs must not paint outside, in the same absolute
     /// coordinates as `rect`; `None` means unclipped. Set for text inside
     /// form controls, which is clipped to the control's padding box. The
-    /// `overflow` property does not clip other content yet.
+    /// `overflow` property also clips text; other content is not clipped yet.
     pub clip: Option<Rect>,
 }
 
@@ -298,6 +316,34 @@ pub enum PaintItem<'a> {
 }
 
 impl LayoutTree {
+    /// Returns the CSS cursor keyword at a document point in CSS pixels.
+    /// Visible text with an auto cursor uses the text cursor; empty space uses auto.
+    pub fn cursor_at(&self, x: f32, y: f32) -> &str {
+        for item in self.paint_order().into_iter().rev() {
+            let (rect, hidden, cursor) = match item {
+                PaintItem::Text(t) if t.clip.is_none_or(|clip| clip.contains(x, y)) => {
+                    if !t.hidden && t.rect.contains(x, y) {
+                        return if t.cursor == "auto" {
+                            "text"
+                        } else {
+                            &t.cursor
+                        };
+                    }
+                    continue;
+                }
+                PaintItem::Text(_) => continue,
+                PaintItem::InlineBox(b) => (b.rect, b.style.hidden, &b.style.cursor),
+                PaintItem::BoxDecorations(b) | PaintItem::Image(b) => {
+                    (b.rect, b.style.hidden, &b.style.cursor)
+                }
+            };
+            if !hidden && rect.contains(x, y) {
+                return cursor;
+            }
+        }
+        "auto"
+    }
+
     /// Lists everything to paint, back to front.
     ///
     /// Within the root stacking context this follows CSS 2.2 Appendix E: the
@@ -347,14 +393,20 @@ impl LayoutTree {
             .into_iter()
             .rev()
             .find_map(|item| match item {
-                PaintItem::BoxDecorations(layout_box) => {
-                    layout_box.node.filter(|_| layout_box.rect.contains(x, y))
+                PaintItem::BoxDecorations(layout_box) => layout_box
+                    .node
+                    .filter(|_| !layout_box.style.hidden && layout_box.rect.contains(x, y)),
+                PaintItem::InlineBox(inline) => {
+                    (!inline.style.hidden && inline.rect.contains(x, y)).then_some(inline.node)
                 }
-                PaintItem::InlineBox(inline) => inline.rect.contains(x, y).then_some(inline.node),
-                PaintItem::Text(text) => text.element.filter(|_| text.rect.contains(x, y)),
-                PaintItem::Image(layout_box) => {
-                    layout_box.node.filter(|_| layout_box.rect.contains(x, y))
-                }
+                PaintItem::Text(text) => text.element.filter(|_| {
+                    !text.hidden
+                        && text.rect.contains(x, y)
+                        && text.clip.is_none_or(|clip| clip.contains(x, y))
+                }),
+                PaintItem::Image(layout_box) => layout_box
+                    .node
+                    .filter(|_| !layout_box.style.hidden && layout_box.rect.contains(x, y)),
             });
         match hit {
             Some(node) => log::trace!("hit test at ({x}, {y}): node {node:?}"),
@@ -504,6 +556,10 @@ mod tests {
             rect: rect(0.0, 0.0, 10.0),
             baseline: 8.0,
             fragments: vec![LineFragment::Text(TextFragment {
+                cursor: "auto".into(),
+                user_select: "auto".into(),
+                text_rendering: "auto".into(),
+                hidden: false,
                 node: NodeID::new(3),
                 element: Some(NodeID::new(1)),
                 rect: rect(0.0, 0.0, 10.0),

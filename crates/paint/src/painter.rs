@@ -37,7 +37,7 @@ pub const CANVAS_COLOR: Color = Color {
 /// opaque border of one color around an opaque background is painted as a
 /// rounded ring (a rounded fill in the border color under the rounded
 /// padding-box background); any other rounded border keeps square strips.
-/// Outlines and border images are not supported.
+/// Outlines use square strips with outline-offset; border images are not supported.
 ///
 /// Replaced boxes (`<img>`, inline `<svg>`) produce a [`DisplayItem::Image`]
 /// covering their content box, after their background. Their pictures are
@@ -94,6 +94,15 @@ fn paint(
     let scrolled = |rect: layout::Rect| rect.translate(0.0, -scroll_y);
     let mut items = Vec::new();
     for item in tree.paint_order() {
+        if match item {
+            PaintItem::BoxDecorations(b) | PaintItem::Image(b) => {
+                b.style.hidden && b.kind != BoxKind::Viewport
+            }
+            PaintItem::InlineBox(b) => b.style.hidden,
+            PaintItem::Text(t) => t.hidden,
+        } {
+            continue;
+        }
         match item {
             PaintItem::BoxDecorations(layout_box) => match layout_box.kind {
                 // The canvas is infinite, so it is never rounded.
@@ -153,7 +162,12 @@ fn paint(
                 }
                 if !text.text.trim().is_empty() && visible(&text.rect) {
                     items.push(DisplayItem::Text {
-                        x: text.rect.x,
+                        snap_glyphs: text.text_rendering == "optimizespeed",
+                        x: if text.text_rendering == "optimizespeed" {
+                            text.rect.x.round()
+                        } else {
+                            text.rect.x
+                        },
                         baseline: text.baseline - scroll_y,
                         font_size: text.font_size,
                         font: text.font,
@@ -256,8 +270,8 @@ fn shadows(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<Shadow> {
             let shape = layout::Rect {
                 x: rect.x + shadow.offset_x - spread,
                 y: rect.y + shadow.offset_y - spread,
-                width: rect.width + 2.0 * spread,
-                height: rect.height + 2.0 * spread,
+                width: (rect.width + 2.0 * spread).max(0.0),
+                height: (rect.height + 2.0 * spread).max(0.0),
             };
             if shape.width <= 0.0 || shape.height <= 0.0 {
                 return None;
@@ -291,14 +305,16 @@ fn shadows(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<Shadow> {
 /// order: a rounded ring when [`rounded_ring`] applies, otherwise the
 /// background followed by square border strips.
 fn decorations(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<DisplayItem> {
-    if let Some(ring) = rounded_ring(rect, style) {
-        return ring;
-    }
-    let mut items = Vec::new();
-    if let Some(color) = style.background_color {
-        items.push(background(rect, style, color.into()));
-    }
-    items.extend(borders(rect, style));
+    let mut items = if let Some(ring) = rounded_ring(rect, style) {
+        ring
+    } else {
+        let mut items = Vec::new();
+        if let Some(color) = style.background_color {
+            items.push(background(rect, style, color.into()));
+        }
+        items.extend(borders(rect, style));
+        items
+    };
     if style.outline_width > 0.0 && style.outline_style != "none" {
         let spread = style.outline_width + style.outline_offset;
         let outline_rect = layout::Rect {

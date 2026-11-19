@@ -245,6 +245,31 @@ pub(crate) fn register_shared_document(
         // `compareDocumentPosition` treat it as that node.
         document_object.set("__nodeId", Value::Number(root.get() as f64));
     }
+    let body_document = shared_document.clone();
+    document_object.define_accessor(
+        "body",
+        Arc::new(move || {
+            let body = {
+                let document = body_document.lock().unwrap();
+                document.html_document().and_then(|html| {
+                    html.get_nodes()
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, node)| match node.get_kind() {
+                            NodeKind::Element(element) if element.get_name() == "body" => {
+                                Some(NodeID::new(index))
+                            }
+                            _ => None,
+                        })
+                })
+            };
+            match body {
+                Some(node) => wrap_element(&body_document, node),
+                None => Ok(Value::Null),
+            }
+        }),
+        None,
+    );
     shared_document.lock().unwrap().script_bindings = Some(ScriptBindings {
         document: document_object.clone(),
         registry: custom_elements_registry.clone(),

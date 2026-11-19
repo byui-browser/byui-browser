@@ -22,6 +22,7 @@ pub(super) fn install(state: &super::GlobalState) {
     state.install_host("Uint8Array", Value::Function(uint8_array_constructor()));
 
     state.install_host("Reflect", Value::Object(reflect_namespace()));
+    state.install_global_this();
 }
 
 fn reflect_namespace() -> Object {
@@ -60,6 +61,90 @@ fn reflect_namespace() -> Object {
             let existed = object.get_property(&key)?.is_some();
             object.remove(&key);
             Ok(Value::Boolean(existed))
+        }),
+    );
+    reflect.set_method(
+        "construct",
+        Arc::new(|args| {
+            let Some(Value::Function(constructor)) = args.first() else {
+                return Err(JsError::new(
+                    "Reflect.construct target is not a constructor",
+                ));
+            };
+            let arguments = match args.get(1) {
+                None | Some(Value::Undefined) => Vec::new(),
+                Some(Value::Array(array)) => (0..array
+                    .get("length")
+                    .and_then(|v| match v {
+                        Value::Number(n) => Some(n as usize),
+                        _ => None,
+                    })
+                    .unwrap_or(0))
+                    .map(|i| array.get(&i.to_string()).unwrap_or(Value::Undefined))
+                    .collect(),
+                _ => {
+                    return Err(JsError::new(
+                        "Reflect.construct argumentsList must be an array",
+                    ));
+                }
+            };
+            constructor.construct(&arguments)
+        }),
+    );
+    reflect.set_method(
+        "decorate",
+        Arc::new(|args| {
+            let Some(Value::Array(decorators)) = args.first() else {
+                return Err(JsError::new(
+                    "Reflect.decorate requires an array of decorators",
+                ));
+            };
+            let target = object_argument(args, 1)?;
+            let key = args.get(2).map(property_key);
+            let descriptor = args.get(3).cloned().unwrap_or(Value::Undefined);
+            let len = decorators
+                .get("length")
+                .and_then(|v| match v {
+                    Value::Number(n) => Some(n as usize),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let mut result = Value::Object(target.clone());
+            for index in (0..len).rev() {
+                let Some(Value::Function(decorator)) = decorators.get(&index.to_string()) else {
+                    return Err(JsError::new("Decorator is not callable"));
+                };
+                let call_args = match &key {
+                    Some(key) => vec![
+                        result.clone(),
+                        Value::String(key.clone()),
+                        descriptor.clone(),
+                    ],
+                    None => vec![result.clone()],
+                };
+                let decorated = decorator.call(&call_args)?;
+                if !matches!(decorated, Value::Undefined | Value::Null) {
+                    result = decorated;
+                }
+            }
+            Ok(result)
+        }),
+    );
+    reflect.set_method(
+        "metadata",
+        Arc::new(|args| {
+            let metadata_key = property_key(args.first().unwrap_or(&Value::Undefined));
+            let metadata_value = args.get(1).cloned().unwrap_or(Value::Undefined);
+            Ok(Value::Function(Function::from_host(
+                "metadata",
+                Arc::new(move |decorator_args| {
+                    let target = object_argument(decorator_args, 0)?;
+                    let property = decorator_args.get(1).map(property_key).unwrap_or_default();
+                    let bag_key = format!("__metadata:{property}:{metadata_key}");
+                    target.set_property(bag_key, metadata_value.clone())?;
+                    Ok(Value::Undefined)
+                }),
+            )))
         }),
     );
     reflect
@@ -402,6 +487,8 @@ fn set_constructor() -> Function {
 // symbol-keyed properties, and automatic resource disposal are not modeled.
 fn symbol_constructor() -> Function {
     static DISPOSE: OnceLock<Object> = OnceLock::new();
+    static TO_PRIMITIVE: OnceLock<Object> = OnceLock::new();
+    static ASYNC_DISPOSE: OnceLock<Object> = OnceLock::new();
     let function = Function::from_host(
         "Symbol",
         Arc::new(|args| {
@@ -417,9 +504,23 @@ fn symbol_constructor() -> Function {
         symbol.set_read_only("description", Value::String("Symbol.dispose".into()));
         symbol
     });
+    let to_primitive = TO_PRIMITIVE.get_or_init(|| {
+        let symbol = Object::new();
+        symbol.set_read_only("description", Value::String("Symbol.toPrimitive".into()));
+        symbol
+    });
+    let async_dispose = ASYNC_DISPOSE.get_or_init(|| {
+        let symbol = Object::new();
+        symbol.set_read_only("description", Value::String("Symbol.asyncDispose".into()));
+        symbol
+    });
     match &*function.0 {
         super::FunctionKind::Host { properties, .. } => {
             properties.set_read_only("dispose", Value::Object(dispose.clone()));
+            properties.set_read_only("toPrimitive", Value::Object(to_primitive.clone()));
+            properties.set_read_only("asyncDispose", Value::Object(async_dispose.clone()));
+            let prototype = Object::new();
+            properties.set_read_only("prototype", Value::Object(prototype));
         }
         _ => unreachable!(),
     }

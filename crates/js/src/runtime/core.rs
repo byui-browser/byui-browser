@@ -78,6 +78,7 @@ fn math_namespace() -> Object {
         ("PI", std::f64::consts::PI),
         ("E", std::f64::consts::E),
         ("LN2", std::f64::consts::LN_2),
+        ("LN10", std::f64::consts::LN_10),
         ("SQRT2", std::f64::consts::SQRT_2),
     ] {
         math.set_read_only(name, Value::Number(value));
@@ -104,6 +105,19 @@ fn math_namespace() -> Object {
             }),
         );
     }
+    math.set_method(
+        "sign",
+        Arc::new(|args| {
+            let value = args.first().map(to_number).unwrap_or(f64::NAN);
+            Ok(Value::Number(if value.is_nan() || value == 0.0 {
+                value
+            } else if value.is_sign_positive() {
+                1.0
+            } else {
+                -1.0
+            }))
+        }),
+    );
     for (name, operation) in [("max", f64::max as fn(f64, f64) -> f64), ("min", f64::min)] {
         math.set_method(
             name,
