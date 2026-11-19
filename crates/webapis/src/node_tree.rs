@@ -227,6 +227,36 @@ impl Document {
         Ok(())
     }
 
+    /// Implements `ParentNode.append(...nodes)` for `parent`.
+    ///
+    /// Appends `nodes` after `parent`'s existing children, in argument order.
+    /// [`NodeInput::Text`] values become new text nodes. A node that already
+    /// has a parent is moved. A node listed more than once ends up at its last
+    /// position, as when the DOM gathers the arguments into a
+    /// `DocumentFragment`. An empty list changes nothing. On error the tree
+    /// is unchanged; errors are the same as for [`Document::replace_child`].
+    pub fn append(&mut self, parent: NodeID, nodes: &[NodeInput]) -> Result<(), DomException> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let (ids, has_text) = split_inputs(nodes);
+        self.ensure_pre_insert_validity(parent, &ids, has_text, &[])?;
+        let inserted = self.materialize(nodes);
+        let source = self.source_document.as_mut().unwrap();
+        for id in &inserted {
+            source.remove(*id);
+        }
+        let mut children = source.nodes[parent.get()].get_children().clone();
+        for id in &inserted {
+            children.push(*id);
+            source.nodes[id.get()].set_parent(Some(parent));
+        }
+        source.nodes[parent.get()].set_children(children);
+        self.elements = collect_elements(source);
+        log::debug!("Element.append inserted {} nodes", inserted.len());
+        Ok(())
+    }
+
     /// Implements the `Element.outerHTML` getter.
     ///
     /// Serializes `node` and its descendants with the HTML fragment
@@ -551,6 +581,29 @@ mod tests {
         assert_eq!(
             document.outer_html(id(&document, "list")).as_deref(),
             Some("<ul id=\"list\"><li class=\"a\">x &amp; y</li></ul>")
+        );
+    }
+
+    #[test]
+    fn append_adds_nodes_and_text_and_moves_existing_children() {
+        let mut document = document("<div id='p'><a id='one'></a></div><b id='two'></b>");
+        let parent = id(&document, "p");
+        let one = id(&document, "one");
+        let two = id(&document, "two");
+        document
+            .append(
+                parent,
+                &[NodeInput::Text("hi".into()), NodeInput::Node(two)],
+            )
+            .unwrap();
+        assert_eq!(child_ids(&document, parent), ["one", "#hi", "two"]);
+        document.append(parent, &[NodeInput::Node(one)]).unwrap();
+        assert_eq!(child_ids(&document, parent), ["#hi", "two", "one"]);
+        document.append(parent, &[]).unwrap();
+        assert_eq!(child_ids(&document, parent), ["#hi", "two", "one"]);
+        assert_eq!(
+            document.append(two, &[NodeInput::Node(parent)]),
+            Err(DomException::HierarchyRequestError)
         );
     }
 }

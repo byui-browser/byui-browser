@@ -10,12 +10,23 @@ use crate::event::{add_event_listener_at, dispatch_event_at, remove_event_listen
 use crate::node_tree::NodeInput;
 
 // One submodule per Element API; each installs its members on the wrapper.
+mod append;
 mod children;
 mod class_list;
+mod class_name;
 mod closest;
+mod compare_document_position;
+mod contains;
+mod dataset;
+mod first_child;
+mod focus;
+mod get_elements_by_class_name;
 mod get_elements_by_tag_name;
 mod has_attribute;
 mod node_type;
+mod node_view;
+mod parent_element;
+mod parent_node;
 mod query_selector;
 
 /// Script-visible view of a DOM element.
@@ -205,12 +216,22 @@ pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -
     );
     define_element_properties(&object, &element, &document);
     define_tree_methods(&object, node, &document);
+    append::install(&object, &element, &document);
     children::install(&object, &element, &document);
     class_list::install(&object, &element, &document);
+    class_name::install(&object, &element, &document);
     closest::install(&object, &element, &document);
+    compare_document_position::install(&object, &element, &document);
+    contains::install(&object, &element, &document);
+    dataset::install(&object, &element, &document);
+    first_child::install(&object, &element, &document);
+    focus::install(&object, &element, &document);
+    get_elements_by_class_name::install(&object, &element, &document);
     get_elements_by_tag_name::install(&object, &element, &document);
     has_attribute::install(&object, &element, &document);
     node_type::install(&object, &element, &document);
+    parent_element::install(&object, &element, &document);
+    parent_node::install(&object, &element, &document);
     query_selector::install(&object, &element, &document);
     object
 }
@@ -555,6 +576,15 @@ pub(crate) fn wrap_element(document: &Arc<Mutex<Document>>, node: NodeID) -> JsR
         Some(bindings) => script_element_object(document, &bindings.registry, element)?,
         None => element_object(element, document.clone()),
     }))
+}
+
+/// Builds a thrown exception object whose `name` and `message` a `catch`
+/// clause can read.
+pub(super) fn thrown_exception(name: &str, message: &str) -> JsError {
+    let exception = Object::new();
+    exception.set("name", Value::String(name.to_owned()));
+    exception.set("message", Value::String(message.to_owned()));
+    JsError::thrown(Value::Object(exception))
 }
 
 pub(crate) fn invoke_lifecycle_callback(element: &Object, name: &str) {

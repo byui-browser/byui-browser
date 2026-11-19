@@ -20,8 +20,8 @@ use std::fmt;
 use std::sync::Arc;
 
 pub use runtime::{
-    Function, HostGetter, HostPropertyGetter, HostPropertyKeys, HostPropertySetter, HostSetter,
-    MAX_ARRAY_LENGTH, Object, WeakObject,
+    Function, HostGetter, HostPropertyDeleter, HostPropertyGetter, HostPropertyKeys,
+    HostPropertySetter, HostSetter, MAX_ARRAY_LENGTH, Object, WeakObject,
 };
 pub use vm::Vm;
 

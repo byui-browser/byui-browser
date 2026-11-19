@@ -181,6 +181,17 @@ fn register_shared_document(
             Ok(Value::Undefined)
         }),
     );
+    if let Some(root) = shared_document
+        .lock()
+        .unwrap()
+        .html_document()
+        .map(|document| document.root)
+    {
+        // The document node is the parent of the root element. Tagging the
+        // script object lets tree APIs such as `parentNode` and
+        // `compareDocumentPosition` treat it as that node.
+        document_object.set("__nodeId", Value::Number(root.get() as f64));
+    }
     shared_document.lock().unwrap().script_bindings = Some(ScriptBindings {
         document: document_object.clone(),
         registry: custom_elements_registry.clone(),
@@ -493,6 +504,13 @@ pub struct Document {
     pub(crate) event_targets: Arc<Mutex<HashMap<usize, EventTargetRef>>>,
     custom_element_nodes: HashSet<NodeID>,
     script_elements: HashMap<NodeID, Object>,
+    /// The element last passed to `Element.focus()`, retained until another
+    /// focusable element is focused.
+    ///
+    /// Removing or detaching that element does not clear this field or fire
+    /// `blur`. The next successful `focus()` skips `blur` when the recorded
+    /// element is no longer connected.
+    focused: Option<NodeID>,
     /// The JavaScript `document` object and `customElements` registry this
     /// document is registered with, once a realm exposes it to scripts.
     script_bindings: Option<ScriptBindings>,
@@ -513,6 +531,7 @@ impl PartialEq for Document {
             && self.source_document == other.source_document
             && self.custom_element_nodes == other.custom_element_nodes
             && self.script_elements == other.script_elements
+            && self.focused == other.focused
     }
 }
 
@@ -534,6 +553,7 @@ impl Document {
             event_targets: Arc::default(),
             custom_element_nodes: HashSet::new(),
             script_elements: HashMap::new(),
+            focused: None,
             script_bindings: None,
         }
     }
@@ -567,6 +587,7 @@ impl Document {
             event_targets: Arc::default(),
             custom_element_nodes: HashSet::new(),
             script_elements: HashMap::new(),
+            focused: None,
             script_bindings: None,
         }
     }
@@ -699,6 +720,28 @@ impl Document {
         self.script_elements.get(&node).cloned()
     }
 
+    /// Remembers `object` as the script wrapper for `node`.
+    ///
+    /// A wrapper already recorded for `node` is kept and returned, so repeated
+    /// reads of the same node stay identical (`===`).
+    pub(crate) fn remember_script_node(&mut self, node: NodeID, object: Object) -> Object {
+        if let Some(existing) = self.script_elements.get(&node) {
+            return existing.clone();
+        }
+        self.script_elements.insert(node, object.clone());
+        object
+    }
+
+    /// The element recorded by the last successful `Element.focus()` call.
+    pub(crate) fn focused_element(&self) -> Option<NodeID> {
+        self.focused
+    }
+
+    /// Records `node` as the document's focused element.
+    pub(crate) fn set_focused_element(&mut self, node: Option<NodeID>) {
+        self.focused = node;
+    }
+
     fn mark_custom_element_upgraded(&mut self, node: NodeID) -> bool {
         self.custom_element_nodes.insert(node)
     }
@@ -768,6 +811,27 @@ impl Document {
             })?;
         self.elements = collect_elements(document);
         Ok(Value::Undefined)
+    }
+
+    /// Removes an attribute from an element and refreshes the element list.
+    ///
+    /// Returns `true` when the attribute was present. Name validation and
+    /// HTML lowercasing follow [`HTMLDocument::remove_attribute`].
+    pub(crate) fn remove_attribute(
+        &mut self,
+        node: NodeID,
+        qualified_name: &str,
+    ) -> JsResult<bool> {
+        log::debug!("removeAttribute {qualified_name:?} bridged to the DOM");
+        let document = self.source_document.get_or_insert_with(HTMLDocument::new);
+        let removed = document
+            .remove_attribute(node, qualified_name)
+            .map_err(|error| {
+                log::debug!("removeAttribute {qualified_name:?} failed: {error}");
+                JsError::new(error.to_string())
+            })?;
+        self.elements = collect_elements(document);
+        Ok(removed)
     }
 
     /// Returns this document's child nodes serialized as an HTML fragment.
