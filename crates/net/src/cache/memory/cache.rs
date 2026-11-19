@@ -159,20 +159,39 @@ impl ResponseCache {
         let now = self.clock.now();
         let mut entries = self.entries.write().expect("cache lock poisoned");
         let access = entries.next_access();
-        let cached = entries.entries.get_mut(&key)?.iter_mut().find(|entry| {
-            entry
-                .vary_headers
-                .iter()
-                .all(|(name, original_value)| request.headers().get(name) == *original_value)
-        })?;
-        let mut merged_headers = cached.response.headers.clone();
-        for (name, value) in headers {
-            if name != http::header::CONTENT_LENGTH {
-                merged_headers.insert(name.clone(), value.clone());
+        let (response, removed_body_size) = {
+            let variants = entries.entries.get_mut(&key)?;
+            let cached_index = variants.iter().position(|entry| {
+                entry
+                    .vary_headers
+                    .iter()
+                    .all(|(name, original_value)| request.headers().get(name) == *original_value)
+            })?;
+            let mut merged_headers = variants[cached_index].response.headers.clone();
+            for (name, value) in headers {
+                if name != http::header::CONTENT_LENGTH {
+                    merged_headers.insert(name.clone(), value.clone());
+                }
             }
-        }
-        let freshness = FreshnessMetadata::from_headers(&merged_headers, now)?;
-        Some(cached.merge_not_modified(headers, freshness, access))
+            let freshness = FreshnessMetadata::from_headers(&merged_headers, now)?;
+            let mut cached = variants.remove(cached_index);
+            let response = cached.merge_not_modified(request, headers, freshness, access);
+            let vary_names = cached.vary_names();
+            let cached_vary_headers = &cached.vary_headers;
+            let mut removed_body_size = 0_usize;
+            variants.retain(|entry| {
+                let retain =
+                    entry.vary_names() == vary_names && entry.vary_headers != *cached_vary_headers;
+                if !retain {
+                    removed_body_size = removed_body_size.saturating_add(entry.body_size());
+                }
+                retain
+            });
+            variants.push(cached);
+            (response, removed_body_size)
+        };
+        entries.total_body_size = entries.total_body_size.saturating_sub(removed_body_size);
+        Some(response)
     }
 
     /// Stores a successful response when its headers provide a positive TTL.

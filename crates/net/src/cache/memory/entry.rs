@@ -35,24 +35,27 @@ pub(crate) struct CachedResponse {
     pub(super) validator: Option<CacheValidator>,
 }
 
-/// A validator retained with a cached representation for conditional requests.
+/// Validators retained with a cached representation for conditional requests.
+///
+/// A response can provide both an entity tag and a modification time. Fetch
+/// sends both corresponding conditions on a cache-generated revalidation so a
+/// server can apply its normal precedence rules.
 #[derive(Clone, Debug)]
-pub(crate) enum CacheValidator {
-    /// Revalidate using the response entity tag.
-    EntityTag(HeaderValue),
-    /// Revalidate using the response modification time when no entity tag exists.
-    LastModified(HeaderValue),
+pub(crate) struct CacheValidator {
+    entity_tag: Option<HeaderValue>,
+    last_modified: Option<HeaderValue>,
 }
 
 impl CacheValidator {
     /// Adds this validator to internal transport headers.
     pub(crate) fn apply(&self, headers: &mut crate::Headers) -> Result<(), crate::RequestError> {
-        match self {
-            Self::EntityTag(value) => headers.insert_internal_header(IF_NONE_MATCH, value.clone()),
-            Self::LastModified(value) => {
-                headers.insert_internal_header(IF_MODIFIED_SINCE, value.clone())
-            }
+        if let Some(value) = &self.entity_tag {
+            headers.insert_internal_header(IF_NONE_MATCH, value.clone())?;
         }
+        if let Some(value) = &self.last_modified {
+            headers.insert_internal_header(IF_MODIFIED_SINCE, value.clone())?;
+        }
+        Ok(())
     }
 }
 
@@ -96,6 +99,7 @@ impl CachedResponse {
     /// Merges successful revalidation metadata while retaining the representation body.
     pub(super) fn merge_not_modified(
         &mut self,
+        request: &Request,
         headers: &HeaderMap,
         freshness: FreshnessMetadata,
         access: u64,
@@ -108,24 +112,19 @@ impl CachedResponse {
             }
         }
         self.validator = response_validator(&self.response.headers);
+        self.vary_headers = capture_vary_headers(request, &self.response.headers);
         self.freshness = freshness;
         self.last_access = access;
         self.as_response()
     }
 }
 
-/// Prefers an entity tag over a date validator, as required for conditional GET.
 fn response_validator(headers: &HeaderMap) -> Option<CacheValidator> {
-    headers
-        .get(ETAG)
-        .cloned()
-        .map(CacheValidator::EntityTag)
-        .or_else(|| {
-            headers
-                .get(LAST_MODIFIED)
-                .cloned()
-                .map(CacheValidator::LastModified)
-        })
+    let validator = CacheValidator {
+        entity_tag: headers.get(ETAG).cloned(),
+        last_modified: headers.get(LAST_MODIFIED).cloned(),
+    };
+    (validator.entity_tag.is_some() || validator.last_modified.is_some()).then_some(validator)
 }
 
 /// Returns the request header names listed in the response's `Vary` header.

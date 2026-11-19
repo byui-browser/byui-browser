@@ -281,7 +281,7 @@ fn no_cache_and_must_revalidate_entries_require_revalidation_when_stale() {
 }
 
 #[test]
-fn revalidation_prefers_etag_and_merges_304_metadata() {
+fn revalidation_sends_all_validators_and_merges_304_metadata() {
     let clock = Arc::new(TestClock::new(Duration::ZERO));
     let cache = ResponseCache::with_clock(4, 64, clock);
     let url = Url::parse("https://example.test/revalidate").unwrap();
@@ -315,11 +315,12 @@ fn revalidation_prefers_etag_and_merges_304_metadata() {
             .unwrap(),
         "\"first\""
     );
-    assert!(
+    assert_eq!(
         conditional_headers
             .to_reqwest()
             .get("if-modified-since")
-            .is_none()
+            .unwrap(),
+        "Sun, 06 Nov 1994 08:49:37 GMT"
     );
 
     let mut not_modified = HeaderMap::new();
@@ -336,6 +337,69 @@ fn revalidation_prefers_etag_and_merges_304_metadata() {
         cache.lookup(&request, &url),
         Some(CacheLookup::Fresh(_))
     ));
+}
+
+#[test]
+fn revalidation_updates_vary_snapshot_when_304_changes_vary_fields() {
+    let clock = Arc::new(TestClock::new(Duration::ZERO));
+    let cache = ResponseCache::with_clock(4, 64, clock);
+    let url = Url::parse("https://example.test/revalidate-vary").unwrap();
+    let mut original = Request::get(url.as_str());
+    original
+        .set_header("Accept-Language".parse().unwrap(), "en".parse().unwrap())
+        .unwrap();
+    original
+        .set_header(
+            "User-Agent".parse().unwrap(),
+            "first-agent".parse().unwrap(),
+        )
+        .unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, "max-age=0".parse().unwrap());
+    headers.insert(ETAG, "\"first\"".parse().unwrap());
+    headers.insert("vary", "Accept-Language".parse().unwrap());
+    cache.insert(
+        &original,
+        &url,
+        StoredResponse {
+            status: StatusCode::OK,
+            headers,
+            url: url.to_string(),
+            body: Bytes::from_static(b"cached"),
+            cookie_headers_processed: false,
+        },
+    );
+
+    let mut not_modified = HeaderMap::new();
+    not_modified.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+    not_modified.insert("vary", "User-Agent".parse().unwrap());
+    cache
+        .merge_not_modified(&original, &url, &not_modified)
+        .unwrap();
+
+    let mut same_agent = Request::get(url.as_str());
+    same_agent
+        .set_header("Accept-Language".parse().unwrap(), "fr".parse().unwrap())
+        .unwrap();
+    same_agent
+        .set_header(
+            "User-Agent".parse().unwrap(),
+            "first-agent".parse().unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        cache.lookup(&same_agent, &url),
+        Some(CacheLookup::Fresh(_))
+    ));
+
+    let mut different_agent = same_agent.clone_without_body();
+    different_agent
+        .set_header(
+            "User-Agent".parse().unwrap(),
+            "second-agent".parse().unwrap(),
+        )
+        .unwrap();
+    assert!(cache.lookup(&different_agent, &url).is_none());
 }
 
 #[test]

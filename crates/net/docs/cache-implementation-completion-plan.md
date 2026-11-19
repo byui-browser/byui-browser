@@ -62,17 +62,15 @@ date supplies a conservative one-tenth apparent-age heuristic.
 
 ### 3. Finish conditional revalidation
 
-Basic validator-aware revalidation now exists using `ETag` or
-`Last-Modified`. Remaining work is to:
+Basic validator-aware revalidation now retains and sends both `ETag` and
+`Last-Modified` when available. A `304` refreshes the stored `Vary` request
+snapshot and removes variants made obsolete by a changed `Vary` field set.
+Remaining work is to:
 
-1. send both `If-None-Match` and `If-Modified-Since` when both validators are
-   present, as required by Fetch;
-2. update the stored `Vary` snapshot when `304` metadata changes the `Vary`
-   field set;
-3. apply the complete HTTP freshening rules when merging `304` headers;
-4. process `Set-Cookie` and other response-side effects from the validation
+1. apply the complete HTTP freshening rules when merging `304` headers;
+2. process `Set-Cookie` and other response-side effects from the validation
    response; and
-5. cover validation failure, missing validators, changed validators, and
+3. cover validation failure, missing validators, changed validators, and
    concurrent revalidation.
 
 `CacheMode::NoCache` now uses this path, but its request-header interaction is
@@ -177,7 +175,8 @@ Add focused coverage for:
   `must-revalidate` entries;
 - stale-while-revalidate behavior;
 - `Pragma`, caller-supplied cache directives, and caller-supplied validators;
-- both validators, changed `Vary` metadata, and `Set-Cookie` during `304`;
+- validation failure, missing validators, changed validators, concurrent
+  revalidation, and `Set-Cookie` during `304`;
 - generated-header-aware `Vary` matching;
 - cacheable non-2xx responses and cached redirects; and
 - missing browser cache partitions and the resulting `no-store` behavior.

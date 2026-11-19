@@ -131,13 +131,15 @@ fn fully_consumed_stream_is_cached() {
 }
 
 #[test]
-fn no_cache_revalidates_with_etag_and_reuses_the_merged_representation() {
+fn no_cache_revalidates_with_all_validators_and_reuses_the_merged_representation() {
     let server = TestServer::start(2, |request| {
+        let request = request.to_ascii_lowercase();
         if request.contains("if-none-match: \"version-1\"") {
             assert!(request.contains("cache-control: max-age=0"));
+            assert!(request.contains("if-modified-since: sun, 06 nov 1994 08:49:37 gmt"));
             b"HTTP/1.1 304 Not Modified\r\nCache-Control: max-age=60\r\nETag: \"version-2\"\r\nX-Revalidated: yes\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
         } else {
-            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nETag: \"version-1\"\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
+            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nETag: \"version-1\"\r\nLast-Modified: Sun, 06 Nov 1994 08:49:37 GMT\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
         }
     });
     let controller = RequestController::builder(Config::default())
@@ -151,6 +153,9 @@ fn no_cache_revalidates_with_etag_and_reuses_the_merged_representation() {
             .await
             .unwrap();
         assert_eq!(collect_body(first).await.unwrap(), b"cached");
+        for _ in 0..4_096 {
+            tokio::task::yield_now().await;
+        }
         let mut no_cache = request;
         no_cache.set_cache_mode(CacheMode::NoCache);
         let revalidated = controller.fetch(no_cache).await.unwrap();
