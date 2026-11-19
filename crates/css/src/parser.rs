@@ -326,6 +326,11 @@ impl<'a> Parser<'a> {
                 &format!("unrecognized or invalid selector syntax: {}", error.message),
                 error.position,
             );
+            // CSS Syntax drops a qualified rule when its selector list is
+            // invalid. Still consume the block so malformed declarations can
+            // be reported without allowing this rule to reach the cascade.
+            self.consume_declaration_list(block);
+            return;
         }
         let parsed = self.consume_declaration_list(block);
         let selectors = split_top_level(prelude, |kind| *kind == TokenKind::Comma);
@@ -386,24 +391,30 @@ impl<'a> Parser<'a> {
                                 tokens[index].span.start,
                             );
                         } else {
-                            if let Err(error) = parse_selector_tokens(self.source, prelude) {
-                                let message = format!(
-                                    "unrecognized or invalid nested selector syntax: {}",
-                                    error.message
-                                );
-                                self.error(&message, error.position);
-                            }
+                            let valid_selector = match parse_selector_tokens(self.source, prelude) {
+                                Ok(_) => true,
+                                Err(error) => {
+                                    let message = format!(
+                                        "unrecognized or invalid nested selector syntax: {}",
+                                        error.message
+                                    );
+                                    self.error(&message, error.position);
+                                    false
+                                }
+                            };
                             let block = block_contents(tokens, end, rule_end);
                             let children = self.consume_declaration_list(block);
                             let selectors =
                                 split_top_level(prelude, |kind| *kind == TokenKind::Comma);
-                            for selector in selectors {
-                                parsed.nested_rules.push(Rule {
-                                    selector: Selector(source_text(self.source, selector)),
-                                    declarations: children.declarations.clone(),
-                                    nested_rules: children.nested_rules.clone(),
-                                    nested_at_rules: children.nested_at_rules.clone(),
-                                });
+                            if valid_selector {
+                                for selector in selectors {
+                                    parsed.nested_rules.push(Rule {
+                                        selector: Selector(source_text(self.source, selector)),
+                                        declarations: children.declarations.clone(),
+                                        nested_rules: children.nested_rules.clone(),
+                                        nested_at_rules: children.nested_at_rules.clone(),
+                                    });
+                                }
                             }
                         }
                         index = rule_end;

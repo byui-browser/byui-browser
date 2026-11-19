@@ -223,3 +223,50 @@ fn before_and_after_get_their_own_inheriting_styles() {
             .is_none()
     );
 }
+
+#[test]
+fn resolves_custom_properties_and_var_fallbacks() {
+    let document = parse_raw_html("<p id='target'>Hello</p>".into());
+    let sheet = parse_stylesheet(
+        ":root { --accent: rgb(255, 0, 0); --gap: 10px; } p { color: var(--accent); width: calc(20px + var(--gap)); margin-left: var(--missing, 5px); }",
+    );
+    let styles = style_document(&document, &[sheet]);
+
+    assert_eq!(
+        value(&styles, &document, "target", "color").as_deref(),
+        Some("rgb(255, 0, 0)")
+    );
+    assert_eq!(
+        value(&styles, &document, "target", "width").as_deref(),
+        Some("30px")
+    );
+    assert_eq!(
+        value(&styles, &document, "target", "margin-left").as_deref(),
+        Some("5px")
+    );
+}
+
+#[test]
+fn custom_properties_inherit_and_nested_fallbacks_resolve() {
+    let document = parse_raw_html("<div id='parent'><p id='child'>Hello</p></div>".into());
+    let sheet = parse_stylesheet(
+        "#parent { --space: 8px; } #child { width: calc(var(--space) + var(--missing, 2px)); }",
+    );
+    let styles = style_document(&document, &[sheet]);
+
+    assert_eq!(
+        value(&styles, &document, "child", "width").as_deref(),
+        Some("10px")
+    );
+}
+
+#[test]
+fn invalid_variable_cycles_remove_the_invalid_declaration() {
+    let document = parse_raw_html("<p id='target'>Hello</p>".into());
+    let sheet = parse_stylesheet(
+        "p { --first: var(--second); --second: var(--first); width: var(--first); }",
+    );
+    let styles = style_document(&document, &[sheet]);
+
+    assert_eq!(value(&styles, &document, "target", "width"), None);
+}

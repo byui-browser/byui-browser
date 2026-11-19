@@ -77,6 +77,28 @@ fn reports_errors_and_recovers_valid_neighboring_rules() {
 }
 
 #[test]
+fn drops_rules_with_invalid_selector_lists_and_keeps_valid_neighbors() {
+    let source = "p > { color: red; } h1 { color: blue; }";
+    let (sheet, errors) = parse_stylesheet_with_errors(source);
+
+    assert!(!errors.is_empty());
+    assert_eq!(sheet.rules.len(), 1);
+    assert_eq!(sheet.rules[0].selector.0, "h1");
+}
+
+#[test]
+fn drops_nested_rules_with_invalid_selector_lists() {
+    let source = "article { p > { color: red; } color: blue; }";
+    let (sheet, errors) = parse_stylesheet_with_errors(source);
+
+    assert!(!errors.is_empty());
+    assert_eq!(sheet.rules.len(), 1);
+    assert_eq!(sheet.rules[0].selector.0, "article");
+    assert_eq!(sheet.rules[0].declarations[0].property, "color");
+    assert!(sheet.rules[0].nested_rules.is_empty());
+}
+
+#[test]
 fn parses_the_common_stylesheet_rule_families_without_losing_structure() {
     let source = r#"
         @charset "UTF-8";
