@@ -2,8 +2,8 @@
 
 ## Current state
 
-The `net` crate has a working process-local cache foundation. It currently
-provides:
+The `net` crate has a working process-local cache foundation, but it is still
+a partial Fetch HTTP-cache implementation. It currently provides:
 
 - structured cache identity for partition, method, normalized URL, credential
   eligibility, request mode, redirect taint, and authorization presence;
@@ -14,6 +14,8 @@ provides:
 - explicit freshness based on `Date`, `Expires`, `Age`, and supported
   `Cache-Control` directives, plus conservative `Last-Modified` heuristic
   freshness when explicit metadata is absent;
+- validator retention, conditional requests, basic `304 Not Modified`
+  merging, and unsafe-request invalidation;
 - independent public body readers sharing immutable cached body bytes; and
 - response filtering and provider authorization on cache hits.
 
@@ -32,35 +34,51 @@ Regardless of the choice, the boundary must preserve `net`'s transport-
 independent cache matching and response-capture behavior while allowing the
 browser to supply partition identity and durable persistence.
 
-### 2. Complete cache identity and matching (complete)
+### 2. Finish cache identity and matching
 
-The cache matches the browser-provided partition, method, normalized URL,
-credential eligibility, request mode, redirect taint, authorization presence,
-and `Vary` request-header variants. Authorization values are never retained:
-authorized requests remain conservatively excluded until browser authorization
-policy can support them. Response filtering is re-run when a stored response is
-served, so the cache does not retain an already tainted exposed response.
+The current identity is conservative rather than Fetch-complete. It includes
+the browser-provided partition, method, normalized URL, credential eligibility,
+request mode, redirect taint, authorization presence, and `Vary` variants.
+Authorization values are never retained and authorized requests are excluded
+from storage.
+
+Remaining work:
+
+- Make the cache partition mandatory for browser-context requests. The current
+  standalone fallback can create an unpartitioned cache rather than selecting
+  `no-store` when no browser HTTP cache is available.
+- Match `Vary` against the complete outgoing request, including generated
+  headers such as `Origin`, `Referer`, user-agent/Fetch Metadata fields, body
+  metadata, and cookies, not only caller-visible headers.
+- Revisit the extra cache-key dimensions. They conservatively reduce reuse but
+  do not model HTTP cache matching directly.
+- Support cacheable response statuses and cached redirects according to HTTP
+  caching rules; storage is currently limited to successful `GET`/`HEAD`
+  responses.
 
 Freshness uses explicit `Cache-Control`, `Date`, `Expires`, and `Age` metadata
 where available. If no explicit lifetime is present, a valid `Last-Modified`
 date supplies a conservative one-tenth apparent-age heuristic.
 
-### 3. Add conditional revalidation
+### 3. Finish conditional revalidation
 
-Implement validator-aware revalidation using response validators such as
-`ETag` and `Last-Modified`. This requires:
+Basic validator-aware revalidation now exists using `ETag` or
+`Last-Modified`. Remaining work is to:
 
-1. retaining the applicable validator metadata with a stored response;
-2. creating conditional network requests when an entry is stale or the
-   request uses `no-cache`;
-3. handling a `304 Not Modified` response; and
-4. merging the `304` metadata with the stored representation before exposing
-   the result and updating freshness.
+1. send both `If-None-Match` and `If-Modified-Since` when both validators are
+   present, as required by Fetch;
+2. update the stored `Vary` snapshot when `304` metadata changes the `Vary`
+   field set;
+3. apply the complete HTTP freshening rules when merging `304` headers;
+4. process `Set-Cookie` and other response-side effects from the validation
+   response; and
+5. cover validation failure, missing validators, changed validators, and
+   concurrent revalidation.
 
-`CacheMode::NoCache` should stop returning an unsupported-feature error once
-this path is available.
+`CacheMode::NoCache` now uses this path, but its request-header interaction is
+not yet fully Fetch-compatible.
 
-### 4. Implement cache invalidation (complete)
+### 4. Finish cache invalidation
 
 Unsafe methods invalidate every cached representation for the request URL in
 the active cache partition, including method and `Vary` variants. A successful
@@ -68,7 +86,11 @@ the active cache partition, including method and `Vary` variants. A successful
 fragments are ignored, while unrelated URLs, origins, and partitions remain
 untouched.
 
-### 5. Finish all Fetch cache modes (complete)
+Remaining work is to validate this behavior against the complete HTTP
+invalidation rules, including status classes, redirect targets, and cache
+partition boundaries.
+
+### 5. Finish all Fetch cache modes
 
 Complete the behavior selected by each cache mode:
 
@@ -82,21 +104,44 @@ Complete the behavior selected by each cache mode:
 - `OnlyIfCached`: enforce the same-origin restriction and return a Fetch
   network error without network access on a miss.
 
-The current implementation treats these mostly as local lookup switches:
-`NoCache` is unsupported, `Reload` lacks the required request directives,
-`ForceCache` can serve stale entries without full stored-response matching,
-and `OnlyIfCached` lacks its same-origin restriction.
+The current implementation has all six modes represented, but several details
+remain incorrect:
 
-### 6. Decide body-capture semantics (complete)
+- `Default` does not implement stale-while-revalidate and always waits for a
+  stale response's network update.
+- `Reload` adds `Cache-Control: no-cache` but omits `Pragma: no-cache` and does
+  not fully honor the standard's caller-header conditions.
+- `NoStore`/`Reload` do not cover all standard request-directive interactions.
+- A request with caller-supplied validators does not force default mode to
+  `no-store`.
+- `ForceCache` and `OnlyIfCached` must use any matching response regardless of
+  staleness. The implementation currently rejects some stale entries marked
+  `no-cache` or `must-revalidate`.
+- Cached redirects are not stored or followed for `OnlyIfCached`.
+- The Rust error boundary should be aligned with the JavaScript-facing
+  `TypeError` required when `only-if-cached` is used outside same-origin mode.
+
+### 6. Revisit body-capture semantics
 
 The cache follows bounded streaming-capture semantics. A cacheable response
 body is teed: the caller receives one branch and a background capture branch
-collects the representation with one queued chunk per branch. Dropping the
-caller response allows capture to finish, while a slow live caller applies
-backpressure rather than allowing unbounded buffering. Disturbed bodies cannot
-be captured; failed or aborted streams, and bodies exceeding the configured
-per-entry limit, are discarded. Only clean, bounded end-of-stream capture
-inserts a response.
+collects the representation with one queued chunk per branch. Disturbed
+bodies cannot be captured; failed or aborted streams, and bodies exceeding the
+configured per-entry limit, are discarded. Only clean, bounded end-of-stream
+capture inserts a response.
+
+The dropped-caller-body regression now passes. Remaining work is to decide
+whether delaying insertion until end-of-stream is acceptable: the Fetch/HTTP
+cache algorithm can make a response available to later requests while the
+original body is still being delivered, whereas this implementation does not.
+
+### 7. Complete HTTP freshness policy
+
+The freshness parser remains intentionally small. Add support and focused
+behavior for `stale-while-revalidate`, `stale-if-error`, `s-maxage`,
+`private`/`public`, `immutable`, and more complete heuristic freshness rules.
+Document how these directives interact with `ForceCache`, stale responses,
+revalidation failures, and partitioned browser caches.
 
 ## Browser and storage integrations
 
@@ -125,6 +170,17 @@ Add focused unit and integration coverage for:
 - every Fetch cache mode, including same-origin `OnlyIfCached`; and
 - body capture after clean completion, failure, cancellation, dropping, and
   size-limit rejection.
+
+Add focused coverage for:
+
+- `force-cache` and `only-if-cached` with stale, `no-cache`, and
+  `must-revalidate` entries;
+- stale-while-revalidate behavior;
+- `Pragma`, caller-supplied cache directives, and caller-supplied validators;
+- both validators, changed `Vary` metadata, and `Set-Cookie` during `304`;
+- generated-header-aware `Vary` matching;
+- cacheable non-2xx responses and cached redirects; and
+- missing browser cache partitions and the resulting `no-store` behavior.
 
 Run the focused `net` tests together with formatting and clippy before the
 cache work is considered complete.
