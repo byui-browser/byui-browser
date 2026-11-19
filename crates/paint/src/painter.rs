@@ -485,8 +485,6 @@ fn borders(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<DisplayItem> {
     items
 }
 
-/// The background fill for a box's border box `rect`, rounded by its
-/// `border-radius` when that is non-zero.
 /// Width of a drop-down arrow chevron, in CSS pixels.
 const ARROW_WIDTH: f32 = 10.0;
 /// Rows (one CSS pixel each) in a drop-down arrow chevron.
@@ -777,16 +775,40 @@ mod tests {
             })
             .collect();
         assert_eq!(arrow.len(), 2 * ARROW_ROWS);
-        // "One" (24px) plus 20px of arrow room; one 19.2px line.
+        // "One" (24px) plus 20px of arrow room; one 19.2px line. The arrow
+        // sits inside the select's 2px user-agent border, so the padding box
+        // runs from 2px to 46px.
+        let border = 2.0;
         let right = arrow.iter().map(|rect| rect.right()).fold(0.0, f32::max);
         let left = arrow.iter().map(|rect| rect.x).fold(f32::MAX, f32::min);
-        assert_eq!(right, 44.0 - ARROW_INSET);
-        assert_eq!(left, 44.0 - ARROW_INSET - ARROW_WIDTH);
-        assert!((arrow[0].y - (19.2 - 5.0) / 2.0).abs() < 1e-4);
+        assert_eq!(right, border + 44.0 - ARROW_INSET);
+        assert_eq!(left, border + 44.0 - ARROW_INSET - ARROW_WIDTH);
+        assert!((arrow[0].y - (border + (19.2 - 5.0) / 2.0)).abs() < 1e-4);
         assert!(matches!(
             list.items.last(),
             Some(DisplayItem::Text { text, .. }) if text == "One"
         ));
+    }
+
+    /// Guards the merge with borders (#426): the arrow stays inside a thick
+    /// author border instead of painting over it.
+    #[test]
+    fn a_drop_down_arrow_stays_inside_thick_borders() {
+        let list = paint(
+            "<body><select><option>One</option></select></body>",
+            "body { margin: 0 } select { padding: 0; margin: 0; font-size: 16px; \
+             border: 8px solid black }",
+        );
+        let right = list
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::FillRect { rect, .. } if rect.height == 1.0 => Some(rect.right()),
+                _ => None,
+            })
+            .fold(0.0, f32::max);
+        // Border box: 8 + 44 + 8; the padding box ends at 52.
+        assert_eq!(right, 52.0 - ARROW_INSET);
     }
 
     #[test]
