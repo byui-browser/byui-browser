@@ -781,16 +781,53 @@ impl Context<'_> {
             .zip(&basis)
             .map(|(item, base)| item.style.flex_shrink * base.max(0.0))
             .sum();
-        let mut cursor = 0.0;
+        let targets = list
+            .iter()
+            .zip(basis)
+            .zip(minimums)
+            .map(|((item, base), minimum)| {
+                if free >= 0.0 && grow > 0.0 {
+                    base + free * item.style.flex_grow / grow
+                } else if free < 0.0 && shrink > 0.0 {
+                    (base + free * item.style.flex_shrink * base.max(0.0) / shrink).max(minimum)
+                } else {
+                    base
+                }
+            })
+            .collect::<Vec<_>>();
+        let remaining = available
+            - gaps
+            - list
+                .iter()
+                .zip(&targets)
+                .map(|(item, target)| target + main_padding(item))
+                .sum::<f32>();
+        let count = list.len() as f32;
+        let (leading_space, extra_gap) = if remaining <= 0.0 {
+            (0.0, 0.0)
+        } else {
+            match style.flex_justify_content.as_str() {
+                "center" => (remaining / 2.0, 0.0),
+                "flex-end" | "end" => (remaining, 0.0),
+                "space-between" if count > 1.0 => (0.0, remaining / (count - 1.0)),
+                "space-around" => (remaining / (2.0 * count), remaining / count),
+                "space-evenly" => (remaining / (count + 1.0), remaining / (count + 1.0)),
+                _ => (0.0, 0.0),
+            }
+        };
+        let cross_available = if column {
+            Some(width)
+        } else {
+            style.content_height(Some(width), height)
+        };
+        let mut cursor = leading_space;
         let mut cross = 0.0_f32;
-        for ((source, base), minimum) in list.iter().zip(basis).zip(minimums) {
+        for (index, (source, target)) in list.iter().zip(targets).enumerate() {
             let item = source;
-            let target = if free >= 0.0 && grow > 0.0 {
-                base + free * item.style.flex_grow / grow
-            } else if free < 0.0 && shrink > 0.0 {
-                (base + free * item.style.flex_shrink * base.max(0.0) / shrink).max(minimum)
+            let distributed_gap = if index + 1 < list.len() {
+                extra_gap
             } else {
-                base
+                0.0
             };
             let mut item = (*item).clone();
             let mut computed = (*item.style).clone();
@@ -828,14 +865,24 @@ impl Context<'_> {
                 None,
             );
             let (margin, size) = (result.fragment.margin, result.fragment.rect);
+            let cross_free = cross_available
+                .map(|available| {
+                    (available - if column { size.width } else { size.height }).max(0.0)
+                })
+                .unwrap_or(0.0);
+            let cross_offset = match style.flex_align_items.as_str() {
+                "center" => cross_free / 2.0,
+                "flex-end" | "end" => cross_free,
+                _ => 0.0,
+            };
             let (mut fragment, nested) = if column {
-                let placed = result.place(0.0, cursor + margin.top);
-                cursor += size.height + margin.vertical() + style.gap;
+                let placed = result.place(cross_offset, cursor + margin.top);
+                cursor += size.height + margin.vertical() + style.gap + distributed_gap;
                 cross = cross.max(size.width);
                 placed
             } else {
-                let placed = result.place(cursor + margin.left, 0.0);
-                cursor += size.width + margin.horizontal() + style.gap;
+                let placed = result.place(cursor + margin.left, cross_offset);
+                cursor += size.width + margin.horizontal() + style.gap + distributed_gap;
                 cross = cross.max(size.height);
                 placed
             };

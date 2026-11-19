@@ -26,7 +26,9 @@ const CSS_WIDE_KEYWORDS: [&str; 5] = ["inherit", "initial", "unset", "revert", "
 ///
 /// `animation` is expanded to the eight `animation-*` longhands, each a
 /// comma-separated list with one entry per animation (CSS Animations 1
-/// §3.10).
+/// §3.10). The supported WebKit animation and flexbox aliases normalize to
+/// their standard property names; legacy box alignment values are translated
+/// to their modern flex equivalents.
 /// `background` currently expands only its color component; image and other
 /// layer components are ignored. Numeric `flex` forms and the common
 /// `-webkit-flex`, `-webkit-box-flex`, `-webkit-box-sizing`, and
@@ -39,6 +41,24 @@ const CSS_WIDE_KEYWORDS: [&str; 5] = ["inherit", "initial", "unset", "revert", "
 /// expands to nothing, matching CSS's rule that invalid declarations are
 /// dropped. CSS-wide keywords such as `inherit` are copied to every longhand.
 pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
+    if let Some(property) = declaration.property.strip_prefix("-webkit-") {
+        let (property, value) = match property {
+            "box-align" => ("align-items", legacy_box_align(&declaration.value)),
+            "box-pack" => ("justify-content", legacy_box_pack(&declaration.value)),
+            "align-items" | "justify-content" | "animation" => {
+                (property, declaration.value.clone())
+            }
+            "box-shadow" => ("box-shadow", declaration.value.clone()),
+            "box-sizing" => ("box-sizing", declaration.value.clone()),
+            "box-flex" => ("flex-grow", declaration.value.clone()),
+            "flex" => return expand_flex(&declaration.value),
+            _ => return vec![declaration.clone()],
+        };
+        return expand(&Declaration {
+            property: property.to_owned(),
+            value,
+        });
+    }
     if declaration.property == "background" {
         return expand_background(&declaration.value);
     }
@@ -50,27 +70,6 @@ pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
             property: "text-decoration-line".to_owned(),
             value: declaration.value.clone(),
         }];
-    }
-    if declaration.property == "-webkit-box-shadow" {
-        return vec![Declaration {
-            property: "box-shadow".to_owned(),
-            value: declaration.value.clone(),
-        }];
-    }
-    if declaration.property == "-webkit-box-sizing" {
-        return vec![Declaration {
-            property: "box-sizing".to_owned(),
-            value: declaration.value.clone(),
-        }];
-    }
-    if declaration.property == "-webkit-box-flex" {
-        return vec![Declaration {
-            property: "flex-grow".to_owned(),
-            value: declaration.value.clone(),
-        }];
-    }
-    if declaration.property == "-webkit-flex" {
-        return expand_flex(&declaration.value);
     }
     if declaration.property == "flex" {
         return expand_flex(&declaration.value);
@@ -137,6 +136,25 @@ pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
             value: value.to_owned(),
         })
         .collect()
+}
+
+fn legacy_box_align(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "start" => "flex-start".to_owned(),
+        "end" => "flex-end".to_owned(),
+        "center" | "baseline" | "stretch" => value.trim().to_ascii_lowercase(),
+        _ => value.to_owned(),
+    }
+}
+
+fn legacy_box_pack(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "start" => "flex-start".to_owned(),
+        "end" => "flex-end".to_owned(),
+        "center" => "center".to_owned(),
+        "justify" => "space-between".to_owned(),
+        _ => value.to_owned(),
+    }
 }
 
 /// Expands the supported color-only portion of `background`. Image, repeat,
@@ -459,6 +477,29 @@ mod tests {
     }
 
     #[test]
+    fn webkit_flexbox_and_animation_aliases_normalize_to_standard_properties() {
+        assert_eq!(
+            expanded("-webkit-align-items", "center"),
+            [("align-items".into(), "center".into())]
+        );
+        assert_eq!(
+            expanded("-webkit-box-align", "start"),
+            [("align-items".into(), "flex-start".into())]
+        );
+        assert_eq!(
+            expanded("-webkit-box-pack", "justify"),
+            [("justify-content".into(), "space-between".into())]
+        );
+        assert_eq!(
+            expanded("-webkit-justify-content", "center"),
+            [("justify-content".into(), "center".into())]
+        );
+        let animation = expanded("-webkit-animation", "fade 1s linear");
+        assert_eq!(animation.len(), 8);
+        assert_eq!(animation[0], ("animation-name".into(), "fade".into()));
+    }
+
+    #[test]
     fn supported_css_property_shorthands_expand_to_longhands() {
         assert_eq!(
             expanded("background", "url(image.png) center red"),
@@ -487,6 +528,14 @@ mod tests {
         assert_eq!(
             expanded("-webkit-box-flex", "2"),
             [("flex-grow".into(), "2".into())]
+        );
+        assert_eq!(
+            expanded("-webkit-flex", "2"),
+            [
+                ("flex-grow".into(), "2".into()),
+                ("flex-shrink".into(), "1".into()),
+                ("flex-basis".into(), "0%".into()),
+            ]
         );
     }
 }

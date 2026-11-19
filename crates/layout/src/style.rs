@@ -514,6 +514,11 @@ pub(crate) struct ComputedStyle {
     /// The computed `box-shadow` list, first (topmost) shadow first.
     pub box_shadow: Arc<[BoxShadow]>,
     pub flex_column: bool,
+    /// Cross-axis placement for flex items; partial support includes start,
+    /// center, and end alignment when the container has a definite cross size.
+    pub flex_align_items: String,
+    /// Main-axis distribution for flex items when free space remains.
+    pub flex_justify_content: String,
     pub flex_grow: f32,
     /// Flex base size before free-space distribution; `auto` uses the
     /// corresponding main-size property or the item's intrinsic size.
@@ -681,6 +686,8 @@ impl ComputedStyle {
             border_radius: BorderRadius::default(),
             box_shadow: Arc::from(Vec::new()),
             flex_column: false,
+            flex_align_items: "stretch".to_owned(),
+            flex_justify_content: "flex-start".to_owned(),
             flex_grow: 0.0,
             flex_basis: Dimension::Auto,
             flex_shrink: 1.0,
@@ -821,6 +828,31 @@ impl ComputedStyle {
         }
         style.flex_column =
             get("flex-direction").is_some_and(|value| value.eq_ignore_ascii_case("column"));
+        style.flex_align_items = get("align-items")
+            .filter(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "stretch" | "flex-start" | "start" | "center" | "flex-end" | "end" | "baseline"
+                )
+            })
+            .unwrap_or("stretch")
+            .to_ascii_lowercase();
+        style.flex_justify_content = get("justify-content")
+            .filter(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "flex-start"
+                        | "start"
+                        | "center"
+                        | "flex-end"
+                        | "end"
+                        | "space-between"
+                        | "space-around"
+                        | "space-evenly"
+                )
+            })
+            .unwrap_or("flex-start")
+            .to_ascii_lowercase();
         style.flex_grow = get("flex-grow")
             .and_then(|value| value.parse::<f32>().ok())
             .filter(|value| value.is_finite() && *value >= 0.0)
