@@ -457,6 +457,38 @@ mod tests {
         assert_eq!(expanded("border-radius", "1px / "), []);
         assert_eq!(expanded("border-radius", "1px 2px 3px 4px 5px"), []);
     }
+
+    #[test]
+    fn supported_css_property_shorthands_expand_to_longhands() {
+        assert_eq!(
+            expanded("background", "url(image.png) center red"),
+            [("background-color".into(), "red".into())]
+        );
+        assert_eq!(
+            expanded("outline", "2px dashed blue"),
+            [
+                ("outline-width".into(), "2px".into()),
+                ("outline-style".into(), "dashed".into()),
+                ("outline-color".into(), "blue".into()),
+            ]
+        );
+        assert_eq!(
+            expanded("flex", "2"),
+            [
+                ("flex-grow".into(), "2".into()),
+                ("flex-shrink".into(), "1".into()),
+                ("flex-basis".into(), "0%".into()),
+            ]
+        );
+        assert_eq!(
+            expanded("text-decoration", "underline"),
+            [("text-decoration-line".into(), "underline".into())]
+        );
+        assert_eq!(
+            expanded("-webkit-box-flex", "2"),
+            [("flex-grow".into(), "2".into())]
+        );
+    }
 }
 
 #[cfg(test)]
