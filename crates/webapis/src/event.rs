@@ -72,7 +72,7 @@ fn event_listener_options(options: Option<&Value>) -> (bool, Option<bool>, bool,
     }
 }
 
-fn event_object(event_type: String, bubbles: bool, cancelable: bool) -> Object {
+pub(crate) fn event_object(event_type: String, bubbles: bool, cancelable: bool) -> Object {
     let event = Object::new();
     event.set("type", Value::String(event_type));
     event.set("bubbles", Value::Boolean(bubbles));

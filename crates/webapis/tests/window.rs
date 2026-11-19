@@ -87,6 +87,105 @@ fn post_message_respects_target_origin_and_options() {
 }
 
 #[test]
+fn onmessage_is_an_event_handler_with_window_this_and_event_metadata() {
+    let mut realm = Realm::new();
+    let window = register_window_with_url(&mut realm, "https://example.test/page").unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var seen = null; var handlerCalls = 0; \
+             function rememberMessage(event) { \
+                 handlerCalls = handlerCalls + 1; \
+                 seen = {thisValue: this, type: event.type, data: event.data, \
+                         origin: event.origin, source: event.source, target: event.target, \
+                         currentTarget: event.currentTarget, bubbles: event.bubbles, \
+                         cancelable: event.cancelable}; \
+             } \
+             window.onmessage = rememberMessage; \
+             window.postMessage({value: 1}, '/'); seen === null"
+        ),
+        Ok(Value::Boolean(true))
+    );
+
+    assert_eq!(run_window_messages(&window), Ok(1));
+    assert_eq!(
+        realm.evaluate_script(
+            "handlerCalls === 1 && seen.thisValue === window && seen.type === 'message' && \
+             seen.data.value === 1 && seen.origin === 'https://example.test' && \
+             seen.source === window && seen.target === window && \
+             seen.currentTarget === window && !seen.bubbles && !seen.cancelable"
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn onmessage_can_be_removed_and_runs_with_event_listeners() {
+    let mut realm = Realm::new();
+    let window = register_window_with_url(&mut realm, "https://example.test/page").unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var order = []; \
+             window.addEventListener('message', () => order.push('listener')); \
+             window.onmessage = () => order.push('handler'); \
+             window.postMessage('first', '/');"
+        ),
+        Ok(Value::Undefined)
+    );
+    assert_eq!(run_window_messages(&window), Ok(1));
+    assert_eq!(
+        realm.evaluate_script(
+            "order.length === 2 && order[0] === 'listener' && order[1] === 'handler'"
+        ),
+        Ok(Value::Boolean(true))
+    );
+
+    realm
+        .evaluate_script("window.onmessage = null; window.postMessage('second', '/');")
+        .unwrap();
+    assert_eq!(run_window_messages(&window), Ok(1));
+    assert_eq!(
+        realm.evaluate_script(
+            "order.length === 3 && order[0] === 'listener' && order[1] === 'handler' && order[2] === 'listener'",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn message_dispatch_honors_once_and_stop_immediate_propagation() {
+    let mut realm = Realm::new();
+    let window = register_window_with_url(&mut realm, "https://example.test/page").unwrap();
+
+    realm
+        .evaluate_script(
+            "var calls = 0; var handlerCalls = 0; \
+             window.addEventListener('message', () => calls++, {once: true}); \
+             window.onmessage = () => handlerCalls++; \
+             window.postMessage('first', '/'); window.postMessage('second', '/')",
+        )
+        .unwrap();
+    assert_eq!(run_window_messages(&window), Ok(2));
+    assert_eq!(
+        realm.evaluate_script("calls === 1 && handlerCalls === 2"),
+        Ok(Value::Boolean(true))
+    );
+
+    realm
+        .evaluate_script(
+            "window.addEventListener('message', (event) => event.stopImmediatePropagation()); \
+             window.postMessage('blocked', '/')",
+        )
+        .unwrap();
+    assert_eq!(run_window_messages(&window), Ok(1));
+    assert_eq!(
+        realm.evaluate_script("handlerCalls === 2"),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
 fn window_self_returns_the_current_window_object() {
     let mut realm = Realm::new();
     register_window(&mut realm).unwrap();

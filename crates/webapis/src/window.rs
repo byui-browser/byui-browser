@@ -11,7 +11,8 @@ use crate::crypto::register_crypto;
 use crate::custom_elements::CustomElementRegistry;
 use crate::event::{
     EventTarget, EventTargetRef, add_event_listener_to_target, dispatch_event_target,
-    dispatch_event_target_with_target, event_constructor, remove_event_listener_from_target,
+    dispatch_event_target_with_target, event_constructor, event_object,
+    remove_event_listener_from_target,
 };
 use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
@@ -512,14 +513,12 @@ fn message_origin(window: &Object) -> String {
 }
 
 fn invoke_message(window: &Object, event_target: &EventTargetRef, data: Value, origin: String) {
-    let event = Object::new();
-    event.set("type", Value::String("message".into()));
+    let event = event_object("message".into(), false, false);
     event.set("data", data);
     event.set("origin", Value::String(origin));
     event.set("source", Value::Object(window.clone()));
+    event.set("lastEventId", Value::String(String::new()));
     event.set("ports", Value::Array(Object::new()));
-    event.set("bubbles", Value::Boolean(false));
-    event.set("cancelable", Value::Boolean(false));
     event.set("target", Value::Object(window.clone()));
     event.set("currentTarget", Value::Object(window.clone()));
 
@@ -527,13 +526,22 @@ fn invoke_message(window: &Object, event_target: &EventTargetRef, data: Value, o
     {
         log::warn!("message event dispatch failed: {error}");
     }
-    if let Some(Value::Function(callback)) = window.get("onmessage") {
+    if !matches!(
+        event.get("__stopImmediatePropagation"),
+        Some(Value::Boolean(true))
+    ) && let Some(Value::Function(callback)) = window.get("onmessage")
+    {
         event.set("currentTarget", Value::Object(window.clone()));
         event.set("eventPhase", Value::Number(2.0));
-        if let Err(error) = callback.call(&[Value::Object(event)]) {
+        if let Err(error) = callback.call_with_this(
+            Value::Object(window.clone()),
+            &[Value::Object(event.clone())],
+        ) {
             log::warn!("message event handler threw: {error}");
         }
     }
+    event.set("eventPhase", Value::Number(0.0));
+    event.set("currentTarget", Value::Null);
 }
 
 /// The viewport dimensions exposed to a script-visible Window.
