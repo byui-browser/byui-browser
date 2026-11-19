@@ -62,6 +62,10 @@ pub(crate) struct TabState {
     pub navigation_id: u64,
     pub loading_id: u64,
     pub navigation_loading: Option<(u64, u64)>,
+    /// When the current load started. The address-bar progress eases from here.
+    pub loading_started: Option<Instant>,
+    /// Next time the address-bar load indicator should be repainted.
+    pub loading_bar_frame: Option<Instant>,
     pub reload_completion: Option<(u64, Box<dyn Fn() -> bool>)>,
 }
 
@@ -100,6 +104,8 @@ impl TabState {
             navigation_id: 0,
             loading_id: 0,
             navigation_loading: None,
+            loading_started: None,
+            loading_bar_frame: None,
             reload_completion: None,
         }
     }

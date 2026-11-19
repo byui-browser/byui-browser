@@ -550,6 +550,10 @@ impl App {
     fn begin_loading(&mut self) -> u64 {
         self.tab.loading_id += 1;
         self.tab.chrome.loading = true;
+        self.tab.loading_started = Some(Instant::now());
+        // The first paint is requested below. The next sample waits a frame
+        // so the bar keeps moving without redrawing in a tight loop.
+        self.tab.loading_bar_frame = Some(Instant::now() + ANIMATION_FRAME_INTERVAL);
         self.redraw();
         self.tab.loading_id
     }
@@ -557,8 +561,30 @@ impl App {
     fn finish_loading(&mut self, id: u64) {
         if id == self.tab.loading_id {
             self.tab.chrome.loading = false;
+            self.tab.chrome.load_progress = 0.0;
+            self.tab.loading_started = None;
+            self.tab.loading_bar_frame = None;
             self.redraw();
         }
+    }
+
+    /// Schedules the next address-bar load sample. Hidden tabs keep their
+    /// start time and are not woken until they are selected again.
+    fn pump_loading_bar_at(&mut self, now: Instant) -> Option<Instant> {
+        if !self.tab.chrome.loading {
+            self.tab.loading_bar_frame = None;
+            return None;
+        }
+        let due = self.tab.loading_bar_frame.unwrap_or(now);
+        if now < due {
+            return Some(due);
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        let next = now + ANIMATION_FRAME_INTERVAL;
+        self.tab.loading_bar_frame = Some(next);
+        Some(next)
     }
 
     fn poll_reload(&mut self) {
@@ -1931,7 +1957,12 @@ impl App {
                 .values()
                 .any(|tab| tab.reload_completion.is_some()))
         .then_some(now + Duration::from_millis(40));
-        [reload, animation, self.hover_update_after]
+        let loading_bar = self
+            .tab
+            .chrome
+            .loading
+            .then(|| self.tab.loading_bar_frame.unwrap_or(now));
+        [reload, animation, self.hover_update_after, loading_bar]
             .into_iter()
             .flatten()
             .min()
@@ -2398,6 +2429,16 @@ impl App {
         let scale = window.scale_factor();
         let page_scale = scale * self.tab.page_zoom;
         self.tab.chrome.dark = dark;
+        self.tab.chrome.load_progress = if self.tab.chrome.loading {
+            toolbar::loading_bar_fraction(
+                self.tab
+                    .loading_started
+                    .map(|started| started.elapsed())
+                    .unwrap_or_default(),
+            )
+        } else {
+            0.0
+        };
         let card =
             toolbar::page_rect_with_find(size.width, size.height, scale, self.tab.find.is_some());
         let card_size = card.map(|card| (card.width, card.height));
@@ -3143,8 +3184,14 @@ impl ApplicationHandler<UserEvent> for App {
         }
         self.settle_scroll_hover(Instant::now());
         let animation_frame = self.pump_animations();
+        let loading_frame = self.pump_loading_bar_at(Instant::now());
         event_loop.set_control_flow(
-            match self.wakeup_deadline(Instant::now(), animation_frame) {
+            match self
+                .wakeup_deadline(Instant::now(), animation_frame)
+                .into_iter()
+                .chain(loading_frame)
+                .min()
+            {
                 Some(deadline) => ControlFlow::WaitUntil(deadline),
                 None => ControlFlow::Wait,
             },
@@ -3669,6 +3716,38 @@ mod tests {
         app.activate(Control::Reload);
         assert_eq!(app.tab.browser_state, history);
         assert!(app.tab.find.is_some());
+    }
+
+    #[test]
+    fn address_load_bar_animates_only_while_the_active_tab_is_loading() {
+        let mut app = app();
+        let now = Instant::now();
+        let id = app.begin_loading();
+        let loading_tab = app.tab.id;
+        app.tab.loading_started = Some(now);
+        app.tab.loading_bar_frame = Some(now + ANIMATION_FRAME_INTERVAL);
+        assert_eq!(
+            app.pump_loading_bar_at(now),
+            Some(now + ANIMATION_FRAME_INTERVAL)
+        );
+        let next = app
+            .pump_loading_bar_at(now + ANIMATION_FRAME_INTERVAL)
+            .expect("another frame");
+        assert_eq!(next, now + 2 * ANIMATION_FRAME_INTERVAL);
+        app.new_tab();
+        assert_eq!(app.pump_loading_bar_at(now), None);
+        assert_eq!(app.wakeup_deadline(now, None), None);
+        app.switch_tab(loading_tab);
+        assert!(app.tab.chrome.loading);
+        assert_eq!(
+            app.wakeup_deadline(now, None),
+            Some(now + 2 * ANIMATION_FRAME_INTERVAL)
+        );
+        app.finish_loading(id);
+        assert!(!app.tab.chrome.loading);
+        assert!(app.tab.loading_started.is_none());
+        assert_eq!(app.pump_loading_bar_at(now), None);
+        assert_eq!(app.wakeup_deadline(now, None), None);
     }
 
     #[test]
@@ -5714,11 +5793,16 @@ mod tab_tests {
         let task = Arc::clone(&completed);
         let id = app.begin_loading();
         app.tab.reload_completion = Some((id, Box::new(move || task.load(Ordering::SeqCst))));
-        assert_eq!(app.wakeup_deadline(now, Some(animation)), Some(animation));
-        // A future animation deadline must not delay the next Reload poll.
+        let loading_frame = app.tab.loading_bar_frame.expect("load bar animates");
+        assert_eq!(
+            app.wakeup_deadline(now, Some(animation)),
+            Some(animation.min(loading_frame))
+        );
+        // A future animation deadline must not delay the next Reload poll
+        // or the address-bar load indicator.
         assert_eq!(
             app.wakeup_deadline(now, Some(now + Duration::from_millis(60))),
-            Some(now + Duration::from_millis(40))
+            Some((now + Duration::from_millis(40)).min(loading_frame))
         );
         let animated = app.tab.id;
         app.new_tab();
