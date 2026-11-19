@@ -89,7 +89,7 @@ fn compare(document: &Document, this: NodeID, other: NodeID) -> u16 {
     let Some(source) = document.html_document() else {
         return disconnected(this, other);
     };
-    if source.node(this).is_none() || source.node(other).is_none() {
+    if source.get_node(this).is_none() || source.get_node(other).is_none() {
         return disconnected(this, other);
     }
     if root_of(source, this) != root_of(source, other) {
@@ -128,7 +128,7 @@ fn disconnected(this: NodeID, other: NodeID) -> u16 {
 /// Walks parents until the node that has none.
 fn root_of(source: &HTMLDocument, node: NodeID) -> NodeID {
     let mut current = node;
-    while let Some(parent) = source.node(current).and_then(|data| data.get_parent()) {
+    while let Some(parent) = source.get_node(current).and_then(|data| data.get_parent()) {
         current = parent;
     }
     current
@@ -137,7 +137,7 @@ fn root_of(source: &HTMLDocument, node: NodeID) -> NodeID {
 /// Reports whether `ancestor` is a strict ancestor of `node`.
 fn is_ancestor(source: &HTMLDocument, ancestor: NodeID, node: NodeID) -> bool {
     let mut current = node;
-    while let Some(parent) = source.node(current).and_then(|data| data.get_parent()) {
+    while let Some(parent) = source.get_node(current).and_then(|data| data.get_parent()) {
         if parent == ancestor {
             return true;
         }
@@ -151,7 +151,7 @@ fn tree_order(source: &HTMLDocument, root: NodeID) -> Vec<NodeID> {
     let mut order = Vec::new();
     fn visit(source: &HTMLDocument, node: NodeID, order: &mut Vec<NodeID>) {
         order.push(node);
-        if let Some(data) = source.node(node) {
+        if let Some(data) = source.get_node(node) {
             for child in data.get_children() {
                 visit(source, *child, order);
             }

@@ -178,7 +178,7 @@ pub(crate) struct ElementTree<'d> {
 impl<'d> ElementTree<'d> {
     /// Builds the element links for `dom` in one pass over its nodes.
     pub(crate) fn new(dom: &'d HTMLDocument, state: SelectorState) -> Self {
-        let count = dom.nodes.len();
+        let count = dom.get_nodes().len();
         let mut tree = Self {
             dom,
             parent: vec![None; count],
@@ -187,7 +187,7 @@ impl<'d> ElementTree<'d> {
             is_root: vec![false; count],
             state,
         };
-        for (index, node) in dom.nodes.iter().enumerate() {
+        for (index, node) in dom.get_nodes().iter().enumerate() {
             let parent_is_element = matches!(node.get_kind(), NodeKind::Element(_));
             let parent_is_document = matches!(node.get_kind(), NodeKind::Document);
             let mut previous: Option<usize> = None;
@@ -212,14 +212,14 @@ impl<'d> ElementTree<'d> {
 
     /// The element data of node `index`, or `None` for non-elements.
     pub(crate) fn element(&self, index: usize) -> Option<&'d ElementData> {
-        match self.dom.nodes.get(index)?.get_kind() {
+        match self.dom.get_nodes().get(index)?.get_kind() {
             NodeKind::Element(element) => Some(element),
             _ => None,
         }
     }
 
     fn children(&self, index: usize) -> impl Iterator<Item = usize> + '_ {
-        self.dom.nodes[index]
+        self.dom.get_nodes()[index]
             .get_children()
             .iter()
             .map(|child| child.get())
@@ -413,13 +413,14 @@ impl<'d> ElementTree<'d> {
             "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type" => {
                 self.matches_nth(&name, pseudo, index, element)
             }
-            "empty" => self.dom.nodes[index].get_children().iter().all(|child| {
-                match self.dom.nodes[child.get()].get_kind() {
+            "empty" => self.dom.get_nodes()[index]
+                .get_children()
+                .iter()
+                .all(|child| match self.dom.get_nodes()[child.get()].get_kind() {
                     NodeKind::Element(_) => false,
                     NodeKind::Text(text) => text.is_empty(),
                     _ => true,
-                }
-            }),
+                }),
             "link" | "any-link" | "-webkit-any-link" => {
                 matches!(tag, "a" | "area") && attribute(element, "href").is_some()
             }

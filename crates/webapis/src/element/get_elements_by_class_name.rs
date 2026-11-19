@@ -73,11 +73,11 @@ fn matching_descendants(
     }
     let mut matches = Vec::new();
     let mut stack: Vec<NodeID> = source
-        .node(root)
+        .get_node(root)
         .map(|node| node.get_children().iter().rev().copied().collect())
         .unwrap_or_default();
     while let Some(id) = stack.pop() {
-        let Some(node) = source.node(id) else {
+        let Some(node) = source.get_node(id) else {
             continue;
         };
         if let NodeKind::Element(data) = node.get_kind()

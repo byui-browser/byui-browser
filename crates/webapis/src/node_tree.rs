@@ -67,11 +67,11 @@ impl Document {
             selectors: &[SimpleSelector],
             matches: &mut Vec<NodeID>,
         ) {
-            let Some(parent_node) = document.node(parent) else {
+            let Some(parent_node) = document.get_node(parent) else {
                 return;
             };
             for child in parent_node.get_children() {
-                let Some(node) = document.node(*child) else {
+                let Some(node) = document.get_node(*child) else {
                     continue;
                 };
                 if let NodeKind::Element(element) = node.get_kind() {
@@ -98,7 +98,7 @@ impl Document {
             .source_document
             .as_mut()
             .ok_or(DomException::NotFoundError)?;
-        if source.node(child).and_then(|node| node.get_parent()) != Some(parent) {
+        if source.get_node(child).and_then(|node| node.get_parent()) != Some(parent) {
             log::debug!("removeChild failed: node is not a child of this parent");
             return Err(DomException::NotFoundError);
         }
@@ -127,7 +127,7 @@ impl Document {
     ) -> Result<NodeID, DomException> {
         self.ensure_pre_insert_validity(parent, &[node], false, &[child])?;
         let source = self.source_document.as_mut().unwrap();
-        if source.node(child).and_then(|data| data.get_parent()) != Some(parent) {
+        if source.get_node(child).and_then(|data| data.get_parent()) != Some(parent) {
             log::debug!("replaceChild failed: child is not a child of this parent");
             return Err(DomException::NotFoundError);
         }
@@ -135,14 +135,14 @@ impl Document {
             return Ok(child);
         }
         source.remove(node);
-        let mut children = source.nodes[parent.get()].get_children().clone();
+        let mut children = source.get_node(parent).unwrap().get_children().clone();
         let Some(position) = children.iter().position(|sibling| *sibling == child) else {
             return Err(DomException::NotFoundError);
         };
         children[position] = node;
-        source.nodes[parent.get()].set_children(children);
-        source.nodes[node.get()].set_parent(Some(parent));
-        source.nodes[child.get()].set_parent(None);
+        source.get_mut_node(parent).unwrap().set_children(children);
+        source.get_mut_node(node).unwrap().set_parent(Some(parent));
+        source.get_mut_node(child).unwrap().set_parent(None);
         self.elements = collect_elements(source);
         Ok(child)
     }
@@ -163,21 +163,27 @@ impl Document {
         let current_children = self
             .source_document
             .as_ref()
-            .and_then(|source| source.node(parent))
+            .and_then(|source| source.get_node(parent))
             .map(|node| node.get_children().clone())
             .unwrap_or_default();
         self.ensure_pre_insert_validity(parent, &ids, has_text, &current_children)?;
         let new_children = self.materialize(nodes);
         let source = self.source_document.as_mut().unwrap();
         for old_child in current_children {
-            source.nodes[old_child.get()].set_parent(None);
+            source.get_mut_node(old_child).unwrap().set_parent(None);
         }
-        source.nodes[parent.get()].set_children(Vec::new());
+        source
+            .get_mut_node(parent)
+            .unwrap()
+            .set_children(Vec::new());
         for node in &new_children {
             source.remove(*node);
-            source.nodes[node.get()].set_parent(Some(parent));
+            source.get_mut_node(*node).unwrap().set_parent(Some(parent));
         }
-        source.nodes[parent.get()].set_children(new_children);
+        source
+            .get_mut_node(parent)
+            .unwrap()
+            .set_children(new_children);
         self.elements = collect_elements(source);
         Ok(())
     }
@@ -194,11 +200,11 @@ impl Document {
         let Some(source) = &self.source_document else {
             return Ok(());
         };
-        let Some(parent) = source.node(node).and_then(|data| data.get_parent()) else {
+        let Some(parent) = source.get_node(node).and_then(|data| data.get_parent()) else {
             return Ok(());
         };
         let (ids, has_text) = split_inputs(nodes);
-        let siblings = source.nodes[parent.get()].get_children().clone();
+        let siblings = source.get_node(parent).unwrap().get_children().clone();
         let position = siblings
             .iter()
             .position(|sibling| *sibling == node)
@@ -214,15 +220,15 @@ impl Document {
         for id in &inserted {
             source.remove(*id);
         }
-        let mut children = source.nodes[parent.get()].get_children().clone();
+        let mut children = source.get_node(parent).unwrap().get_children().clone();
         let index = viable_previous
             .and_then(|previous| children.iter().position(|sibling| *sibling == previous))
             .map_or(0, |index| index + 1);
         for (offset, id) in inserted.iter().enumerate() {
             children.insert(index + offset, *id);
-            source.nodes[id.get()].set_parent(Some(parent));
+            source.get_mut_node(*id).unwrap().set_parent(Some(parent));
         }
-        source.nodes[parent.get()].set_children(children);
+        source.get_mut_node(parent).unwrap().set_children(children);
         self.elements = collect_elements(source);
         Ok(())
     }
@@ -246,12 +252,12 @@ impl Document {
         for id in &inserted {
             source.remove(*id);
         }
-        let mut children = source.nodes[parent.get()].get_children().clone();
+        let mut children = source.get_node(parent).unwrap().get_children().clone();
         for id in &inserted {
             children.push(*id);
-            source.nodes[id.get()].set_parent(Some(parent));
+            source.get_mut_node(*id).unwrap().set_parent(Some(parent));
         }
-        source.nodes[parent.get()].set_children(children);
+        source.get_mut_node(parent).unwrap().set_children(children);
         self.elements = collect_elements(source);
         log::debug!("Element.append inserted {} nodes", inserted.len());
         Ok(())
@@ -320,26 +326,26 @@ impl Document {
             .source_document
             .as_ref()
             .ok_or(DomException::NotFoundError)?;
-        let parent_node = source.node(parent).ok_or(DomException::NotFoundError)?;
+        let parent_node = source.get_node(parent).ok_or(DomException::NotFoundError)?;
         let parent_is_document = match parent_node.get_kind() {
             NodeKind::Document => true,
             NodeKind::Element(_) => false,
             _ => return Err(DomException::HierarchyRequestError),
         };
         for node in nodes {
-            let data = source.node(*node).ok_or(DomException::NotFoundError)?;
+            let data = source.get_node(*node).ok_or(DomException::NotFoundError)?;
             let mut ancestor = Some(parent);
             while let Some(current) = ancestor {
                 if current == *node {
                     log::debug!("insertion failed: node is an inclusive ancestor of the parent");
                     return Err(DomException::HierarchyRequestError);
                 }
-                ancestor = source.node(current).and_then(|data| data.get_parent());
+                ancestor = source.get_node(current).and_then(|data| data.get_parent());
             }
             match data.get_kind() {
                 NodeKind::Element(_) | NodeKind::Comment(_) => {}
                 NodeKind::Text(_) if !parent_is_document => {}
-                NodeKind::Doctype { .. } if parent_is_document => {}
+                NodeKind::Doctype(_) if parent_is_document => {}
                 _ => return Err(DomException::HierarchyRequestError),
             }
         }
@@ -353,7 +359,7 @@ impl Document {
                 .filter(|child| !replaced.contains(child) && !nodes.contains(child))
                 .filter(|child| {
                     matches!(
-                        source.node(**child).map(|data| data.get_kind()),
+                        source.get_node(**child).map(|data| data.get_kind()),
                         Some(NodeKind::Element(_))
                     )
                 })
@@ -363,7 +369,7 @@ impl Document {
                 for node in nodes {
                     if !seen.contains(node)
                         && matches!(
-                            source.node(*node).map(|data| data.get_kind()),
+                            source.get_node(*node).map(|data| data.get_kind()),
                             Some(NodeKind::Element(_))
                         )
                     {
@@ -436,10 +442,12 @@ mod tests {
 
     fn child_ids(document: &Document, parent: NodeID) -> Vec<String> {
         let source = document.html_document().unwrap();
-        source.nodes[parent.get()]
+        source
+            .get_node(parent)
+            .unwrap()
             .get_children()
             .iter()
-            .map(|child| match source.nodes[child.get()].get_kind() {
+            .map(|child| match source.get_node(*child).unwrap().get_kind() {
                 NodeKind::Element(element) => element
                     .get_attributes()
                     .iter()

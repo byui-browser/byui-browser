@@ -56,7 +56,7 @@ fn foreign_names_remain_case_sensitive() {
         html::Namespace::Svg,
         vec![html::Attribute::new("id".into(), "foreign".into())],
     )));
-    source.append_child(source.root, foreign);
+    source.append_child(*source.get_root(), foreign);
     let mut realm = Realm::new();
     register_document(&mut realm, Document::from_html_document(&source)).unwrap();
     assert_eq!(realm.evaluate_script(

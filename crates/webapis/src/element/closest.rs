@@ -60,7 +60,7 @@ fn closest_node(
     };
     let mut current = Some(start);
     while let Some(id) = current {
-        let Some(node) = source.node(id) else {
+        let Some(node) = source.get_node(id) else {
             break;
         };
         let NodeKind::Element(data) = node.get_kind() else {
