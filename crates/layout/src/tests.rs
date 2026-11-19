@@ -1661,4 +1661,106 @@ mod control_text {
         assert_eq!(texts(box_for(&tree, &document, "a")), ["a b"]);
         assert_eq!(texts(box_for(&tree, &document, "b")), ["c d"]);
     }
+
+    #[test]
+    fn button_inputs_show_default_labels() {
+        let html = "<p><input id='a' type='submit'><input id='b' type='RESET'>\
+            <input id='c' type='button'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["Submit"]);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["Reset"]);
+        let c = box_for(&tree, &document, "c");
+        // Only the empty strut line.
+        assert_eq!(texts(c), [""]);
+        // No text, but the box keeps one line of height.
+        assert_close(c.content_rect().height, LINE);
+    }
+
+    #[test]
+    fn button_inputs_show_their_value_even_when_empty() {
+        let html = "<p><input id='a' type='submit' value='Google Search'>\
+            <input id='b' type='button' value='Lucky'>\
+            <input id='c' type='submit' value=''></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["Google Search"]);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["Lucky"]);
+        assert_eq!(texts(box_for(&tree, &document, "c")), [""]);
+    }
+
+    #[test]
+    fn button_input_label_is_centered_in_a_wide_box() {
+        let html = "<p><input id='a' type='submit' value='Wide' \
+            style='width: 200px; height: 39.2px'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let input = box_for(&tree, &document, "a");
+        let content = input.content_rect();
+        let LineFragment::Text(text) = &input.lines[0].fragments[0] else {
+            panic!("expected text");
+        };
+        assert_close(text.rect.width, 4.0 * 8.0);
+        assert_close(text.rect.x - content.x, (200.0 - 32.0) / 2.0);
+        assert_close(input.lines[0].rect.y - content.y, 10.0);
+    }
+
+    #[test]
+    fn empty_single_line_controls_align_with_filled_ones() {
+        let html = "<p><input id='a'><input id='b' value='x'>\
+            <input id='c' type='button'><input id='d' type='submit'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let a = box_for(&tree, &document, "a").rect;
+        for id in ["b", "c", "d"] {
+            let rect = box_for(&tree, &document, id).rect;
+            assert_close(rect.y, a.y);
+            assert_close(rect.height, a.height);
+        }
+    }
+
+    /// Guards the merge with borders (#426): with the user-agent borders
+    /// drawn, empty and filled controls still share a baseline, and the
+    /// strut line sits inside the border.
+    #[test]
+    fn bordered_empty_and_filled_controls_still_align() {
+        let html = "<p><input id='a'><input id='b' value='x'>\
+            <input id='c' type='submit'></p>";
+        let css = "body { margin: 0 } p { margin: 0 } input { font-size: 16px }";
+        let (document, tree) = lay_out(html, css, 800.0);
+        let a = box_for(&tree, &document, "a");
+        assert!(
+            a.style.border_width.top > 0.0,
+            "inputs have a user-agent border"
+        );
+        let line = a.lines.first().expect("an empty input keeps a strut line");
+        assert!(line.rect.y >= a.content_rect().y - 0.01);
+        for id in ["b", "c"] {
+            let other = box_for(&tree, &document, id);
+            assert_close(other.rect.y, a.rect.y);
+            assert_close(
+                other.lines[0].rect.y + other.lines[0].baseline,
+                line.rect.y + line.baseline,
+            );
+        }
+    }
+
+    /// Guards the merge with floats, positioning (#413) and generated
+    /// content (#393): button-like inputs keep their label out of flow and
+    /// never show `::before` / `::after` content.
+    #[test]
+    fn button_labels_survive_floats_positioning_and_pseudo_elements() {
+        let html = "<div style='position: relative'>\
+            <input id='f' type='submit' style='float: left'>\
+            <input id='a' type='reset' style='position: absolute; top: 3px; right: 0'>\
+            <input id='b' type='button' value='Go'></div>";
+        let css = format!(
+            "{CSS} input::before {{ content: 'BEFORE' }} input::after {{ content: 'AFTER' }}"
+        );
+        let (document, tree) = lay_out(html, &css, 800.0);
+        let floated = box_for(&tree, &document, "f");
+        assert_eq!(floated.placement, Placement::Float);
+        assert_eq!(texts(floated), ["Submit"]);
+        let placed = box_for(&tree, &document, "a");
+        assert_eq!(placed.placement, Placement::Absolute);
+        assert_eq!(texts(placed), ["Reset"]);
+        assert_close(placed.rect.right(), 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["Go"]);
+    }
 }

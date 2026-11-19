@@ -808,9 +808,15 @@ impl Builder<'_> {
     /// - `<textarea>` shows its child text, or its `placeholder` when it has
     ///   no text, as `white-space: pre-wrap` ([`WhiteSpace::PreWrap`]): line
     ///   breaks and spaces are kept and long lines wrap.
+    /// - `<input type=submit|reset|button>` shows its `value` (even when
+    ///   empty), or else "Submit", "Reset", or nothing, on one line. The
+    ///   defaults are not localized.
     ///
-    /// Other input types (buttons, checkboxes, dates, …) return `None` and
-    /// keep their empty inline-block box. Values changed at runtime, the
+    /// Single-line text drops CR and LF and shows tabs as one space. An
+    /// empty single-line control is still one line tall.
+    ///
+    /// Other input types (`image`, `file`, checkboxes, dates, …) return
+    /// `None` and keep their empty inline-block box. Values changed at runtime, the
     /// caret, and selection are not supported.
     fn form_control(
         &self,
@@ -844,17 +850,17 @@ impl Builder<'_> {
         let block = match element.get_name().as_str() {
             "input" => {
                 let kind = attribute("type").unwrap_or_default().to_ascii_lowercase();
-                if !is_text_like_input_type(&kind) {
+                let button_label = button_input_default_label(&kind);
+                if button_label.is_none() && !is_text_like_input_type(&kind) {
                     return None;
                 }
-                let value: String = attribute("value")
-                    .unwrap_or_default()
-                    .chars()
-                    .filter(|character| !matches!(character, '\n' | '\r'))
-                    // Tab stops are not supported: a tab shows as one space.
-                    .map(|character| if character == '\t' { ' ' } else { character })
-                    .collect();
-                let (text, text_style) = if value.is_empty() {
+                let value = single_line_text(attribute("value").unwrap_or_default());
+                let (text, text_style) = if let Some(default_label) = button_label {
+                    // The label is the value, even when empty.
+                    let label =
+                        attribute("value").map_or_else(|| default_label.to_owned(), |_| value);
+                    (label, Rc::clone(style))
+                } else if value.is_empty() {
                     placeholder(true)
                 } else if kind == "password" {
                     ("\u{2022}".repeat(value.chars().count()), Rc::clone(style))
@@ -925,7 +931,8 @@ impl Builder<'_> {
     /// line with its spaces preserved (as [`WhiteSpace::Pre`]),
     /// centered vertically in the content box, and clipped to the padding
     /// box. Horizontal placement follows the control's `text-align`. Empty
-    /// `text` gives a box with no lines. `text-transform` is applied here.
+    /// `text` gives a box whose only line is an empty strut, so it is still
+    /// one line tall. `text-transform` is applied here.
     ///
     /// Wrap the result with [`level_for`] (or `InlineItem::Atomic`) to place
     /// it.
@@ -963,6 +970,28 @@ pub(crate) const PLACEHOLDER_COLOR: css::CssColor = css::CssColor {
     b: 0x75,
     a: 255,
 };
+
+/// `text` for one line of a control: CR and LF are dropped, and each tab
+/// shows as one space because tab stops are not supported.
+fn single_line_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| !matches!(character, '\n' | '\r'))
+        .map(|character| if character == '\t' { ' ' } else { character })
+        .collect()
+}
+
+/// The label an `<input>` button with the lowercased `type` value `kind`
+/// shows when it has no `value` attribute: "Submit" for `submit`, "Reset"
+/// for `reset`, and no text for `button`. `None` for other types. The
+/// labels are not localized; `type=image` is not a labelled button here.
+fn button_input_default_label(kind: &str) -> Option<&'static str> {
+    match kind {
+        "submit" => Some("Submit"),
+        "reset" => Some("Reset"),
+        "button" => Some(""),
+        _ => None,
+    }
+}
 
 /// Whether an `<input>` with the lowercased `type` value `kind` is a text
 /// field. Missing, empty, and unknown types are `text` per HTML.
