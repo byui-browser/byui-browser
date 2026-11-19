@@ -675,13 +675,15 @@ impl Compiler {
             }
             Statement::Block(statements) => self.compile_block(statements, is_completion),
             Statement::VariableDeclaration { kind, name, init } => {
+                if *kind == VarKind::Var && init.is_none() {
+                    return Ok(false);
+                }
                 if let Some(init) = init {
                     self.compile_expression(init)?;
                 } else {
                     self.constant(Value::Undefined)?;
                 }
                 self.emit_initialize(name)?;
-                let _ = kind;
                 Ok(false)
             }
             Statement::If {
