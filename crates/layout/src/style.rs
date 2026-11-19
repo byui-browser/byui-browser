@@ -241,12 +241,15 @@ impl Float {
     }
 }
 
-/// A `<length-percentage>` or `auto`, with lengths resolved to CSS pixels.
+/// A sizing value with lengths resolved to CSS pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Dimension {
     Auto,
     Px(f32),
     Percent(f32),
+    MinContent,
+    MaxContent,
+    FitContent,
 }
 
 impl Dimension {
@@ -257,6 +260,7 @@ impl Dimension {
             Self::Auto => None,
             Self::Px(px) => Some(px),
             Self::Percent(percent) => basis.map(|basis| basis * percent / 100.0),
+            Self::MinContent | Self::MaxContent | Self::FitContent => None,
         }
     }
 
@@ -456,7 +460,8 @@ pub(crate) struct ComputedStyle {
     pub margin: Sides<Dimension>,
     pub padding: Sides<Dimension>,
     /// `width`, measuring the box chosen by `box_sizing`; read the content
-    /// width through [`ComputedStyle::content_width`].
+    /// width through [`ComputedStyle::content_width`]. Non-replaced boxes
+    /// support the `min-content`, `max-content`, and `fit-content` keywords.
     pub width: Dimension,
     /// `height`, as for `width`; see [`ComputedStyle::content_height`].
     pub height: Dimension,
@@ -778,7 +783,11 @@ impl ComputedStyle {
             };
         }
         if let Some(value) = get("background-color") {
-            style.background_color = css::parse_color(value);
+            style.background_color = if value.eq_ignore_ascii_case("currentcolor") {
+                Some(style.color)
+            } else {
+                css::parse_color(value)
+            };
             if style.background_color.is_none() && !is_no_color_keyword(value) {
                 log::debug!("ignoring invalid background-color value {value:?}; using transparent");
             }
@@ -802,6 +811,14 @@ impl ComputedStyle {
         };
         let dimension = |property: &str, allow_auto: bool, allow_negative: bool| {
             let value = get(property)?;
+            if property == "width" {
+                match value.to_ascii_lowercase().as_str() {
+                    "min-content" => return Some(Dimension::MinContent),
+                    "max-content" => return Some(Dimension::MaxContent),
+                    "fit-content" => return Some(Dimension::FitContent),
+                    _ => {}
+                }
+            }
             if value.eq_ignore_ascii_case("auto") {
                 if !allow_auto {
                     log::debug!("ignoring invalid {property} value {value:?}; using 0");
