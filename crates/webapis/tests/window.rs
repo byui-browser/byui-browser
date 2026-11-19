@@ -267,6 +267,50 @@ fn window_add_event_listener_dispatches_and_removes_callbacks() {
 }
 
 #[test]
+fn window_onclick_is_an_event_handler_attribute() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.onclick === null"),
+        Ok(Value::Boolean(true))
+    );
+    realm
+        .evaluate_script(
+            "var order = []; var seen = {}; \
+             function listener() { order.push('listener'); } \
+             function handler(event) { order.push('handler'); \
+               seen.thisValue = this; seen.type = event.type; \
+               seen.target = event.target; seen.currentTarget = event.currentTarget; \
+               seen.bubbles = event.bubbles; seen.cancelable = event.cancelable; } \
+             window.addEventListener('click', listener); window.onclick = handler; \
+             window.onclick === handler && window.dispatchEvent({type: 'click', bubbles: true, cancelable: true})",
+        )
+        .unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "order.length === 2 && order[0] === 'listener' && order[1] === 'handler' && \
+             seen.thisValue === window && seen.type === 'click' && \
+             seen.target === window && seen.currentTarget === window && \
+             seen.bubbles && seen.cancelable",
+        ),
+        Ok(Value::Boolean(true))
+    );
+
+    realm
+        .evaluate_script(
+            "window.onclick = null; window.dispatchEvent({type: 'click'}); window.onclick === null",
+        )
+        .unwrap();
+    assert_eq!(
+        realm.evaluate_script("order.length === 3 && order[2] === 'listener'"),
+        Ok(Value::Boolean(true))
+    );
+    assert!(realm.evaluate_script("window.onclick = 1").is_err());
+}
+
+#[test]
 fn clearing_window_onload_deactivates_the_handler() {
     let mut realm = Realm::new();
     register_window(&mut realm).unwrap();
