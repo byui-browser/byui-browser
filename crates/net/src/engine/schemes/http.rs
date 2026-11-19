@@ -5,7 +5,9 @@ use crate::{
         body::Body,
         diagnostics::NetworkPhase,
         error::RequestError,
-        request::{CacheMode, PreparedRequest, Request, ValidatedHop, urls_are_same_origin},
+        request::{
+            CacheMode, PreparedRequest, Request, RequestMode, ValidatedHop, urls_are_same_origin,
+        },
         response::{InternalResponse, Response, has_null_body},
     },
     cache::{CacheLookup, CacheValidator, StoredResponse},
@@ -22,6 +24,15 @@ impl RequestController {
         prepared: PreparedRequest,
     ) -> Result<Response, RequestError> {
         let (mut request, mut url) = prepared.into_parts();
+        if request.cache_mode() == CacheMode::OnlyIfCached
+            && request.mode() != RequestMode::SameOrigin
+        {
+            log::debug!(
+                "only-if-cached request requires same-origin mode: {}",
+                crate::log_url::loggable(url.as_str())
+            );
+            return Err(RequestError::NetworkError);
+        }
         let mut response;
         loop {
             let transport_headers = self.validate_http_hop(&mut request, &url).await?;
@@ -438,6 +449,17 @@ impl RequestController {
         url: &reqwest::Url,
     ) -> Result<(crate::Headers, crate::Headers), RequestError> {
         let mut headers = request.fetch_headers(url)?;
+        match request.cache_mode() {
+            CacheMode::Reload => headers.append_internal_header(
+                http::header::CACHE_CONTROL,
+                http::HeaderValue::from_static("no-cache"),
+            )?,
+            CacheMode::NoCache => headers.append_internal_header(
+                http::header::CACHE_CONTROL,
+                http::HeaderValue::from_static("max-age=0"),
+            )?,
+            _ => {}
+        }
         let generated = if let Some(policy) = &self.inner.request_policy {
             let generated = policy.generated_request_headers(request, url)?;
             headers.merge_generated_request_headers(&generated)?;

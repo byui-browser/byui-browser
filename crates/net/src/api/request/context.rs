@@ -78,8 +78,9 @@ pub enum RedirectMode {
 }
 /// Controls which process-local cache behavior a request selects.
 ///
-/// This is a documented HTTP cache subset. Matching validators are revalidated
-/// for `NoCache`; full Fetch cache matching belongs to a later step.
+/// This is a documented HTTP cache subset. It implements the Fetch cache-mode
+/// selection rules while leaving durable browser cache storage to the embedding
+/// layer.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CacheMode {
     #[default]
@@ -87,13 +88,17 @@ pub enum CacheMode {
     Default,
     /// Skip the cache and do not store the response.
     NoStore,
-    /// Skip an existing cached response, but permit the new response to be cached.
+    /// Skip an existing cached response, send `Cache-Control: no-cache`, and
+    /// permit the new response to be cached.
     Reload,
-    /// Revalidate a cached response before using it.
+    /// Revalidate a cached response before using it, sending
+    /// `Cache-Control: max-age=0` on the network request.
     NoCache,
     /// Use a cached response when available, even if stale.
     ForceCache,
     /// Return a cached response or fail without making a network request.
+    ///
+    /// This mode requires [`RequestMode::SameOrigin`].
     OnlyIfCached,
 }
 /// The destination type associated with a fetch.

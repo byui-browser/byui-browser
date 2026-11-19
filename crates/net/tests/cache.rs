@@ -8,7 +8,51 @@ use std::sync::{
 };
 
 use common::{TestServer, collect_body, runtime};
-use net::{CacheMode, Config, Request, RequestController};
+use net::{
+    CacheMode, CachePartitionService, Config, CookieService, FetchEnvironment, Request,
+    RequestController, RequestError, RequestMode, RequestPolicyService, ResponseInfo,
+    ResponsePolicyService, ServiceWorkerDecision, ServiceWorkerService,
+};
+
+struct SameOriginCacheServices;
+
+impl RequestPolicyService for SameOriginCacheServices {
+    fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
+        Ok(())
+    }
+}
+
+impl ResponsePolicyService for SameOriginCacheServices {
+    fn check_response(&self, _request: &Request, _info: &ResponseInfo) -> Result<(), RequestError> {
+        Ok(())
+    }
+}
+
+impl CookieService for SameOriginCacheServices {
+    fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
+        Ok(None)
+    }
+
+    fn store_set_cookie(
+        &self,
+        _request: &Request,
+        _values: &[net::HeaderValue],
+    ) -> Result<(), RequestError> {
+        Ok(())
+    }
+}
+
+impl ServiceWorkerService for SameOriginCacheServices {
+    fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
+        Ok(ServiceWorkerDecision::Network)
+    }
+}
+
+impl CachePartitionService for SameOriginCacheServices {
+    fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
+        Ok("same-origin-cache-test".into())
+    }
+}
 
 #[test]
 fn empty_stream_body_can_be_consumed_and_cached() {
@@ -64,6 +108,7 @@ fn fully_consumed_stream_is_cached() {
 fn no_cache_revalidates_with_etag_and_reuses_the_merged_representation() {
     let server = TestServer::start(2, |request| {
         if request.contains("if-none-match: \"version-1\"") {
+            assert!(request.contains("cache-control: max-age=0"));
             b"HTTP/1.1 304 Not Modified\r\nCache-Control: max-age=60\r\nETag: \"version-2\"\r\nX-Revalidated: yes\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
         } else {
             b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nETag: \"version-1\"\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
@@ -159,15 +204,42 @@ fn no_store_responses_are_not_cached() {
 }
 
 #[test]
+fn force_cache_serves_a_permitted_stale_representation_without_network_io() {
+    let server = TestServer::start(1, |_| {
+        b"HTTP/1.1 200 OK\r\nCache-Control: max-age=0\r\nContent-Length: 5\r\nConnection: close\r\n\r\nstale".to_vec()
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+
+    let cached = runtime().block_on(async {
+        let request = Request::get(server.url());
+        let first = controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(collect_body(first).await.unwrap(), b"stale");
+
+        let mut force_cache = request;
+        force_cache.set_cache_mode(CacheMode::ForceCache);
+        controller.fetch(force_cache).await.unwrap()
+    });
+
+    server.join();
+    assert!(cached.from_cache);
+    assert_eq!(runtime().block_on(cached.body.bytes()).unwrap(), b"stale");
+}
+
+#[test]
 fn reload_bypasses_cache_and_caches_the_refresh_when_consumed() {
     let hits = Arc::new(AtomicUsize::new(0));
     let observed_hits = Arc::clone(&hits);
-    let server = TestServer::start(2, move |_| {
-        let body = if observed_hits.fetch_add(1, Ordering::SeqCst) == 0 {
-            "first"
-        } else {
-            "second"
-        };
+    let server = TestServer::start(2, move |request| {
+        let hit = observed_hits.fetch_add(1, Ordering::SeqCst);
+        if hit == 1 {
+            assert!(request.contains("cache-control: no-cache"));
+        }
+        let body = if hit == 0 { "first" } else { "second" };
         format!("HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).into_bytes()
     });
     let controller = RequestController::builder(Config::default())
@@ -254,11 +326,16 @@ fn only_if_cached_returns_a_cache_hit() {
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nX-Cache-Test: yes\r\nConnection: close\r\n\r\ncached".to_vec()
     });
     let controller = RequestController::builder(Config::default())
+        .with_browser_capabilities(Arc::new(SameOriginCacheServices))
         .build()
         .unwrap();
 
     let (from_cache, body, header) = runtime().block_on(async {
-        let request = Request::get(server.url());
+        let mut request = Request::get(server.url());
+        request.set_mode(RequestMode::SameOrigin).unwrap();
+        request.set_environment(
+            FetchEnvironment::from_url(url::Url::parse(request.url()).unwrap()).unwrap(),
+        );
         collect_body(
             controller
                 .fetch(request.try_clone().unwrap())
@@ -347,12 +424,12 @@ fn clear_cache_forces_a_new_network_request() {
 fn reload_bypasses_cached_response_and_caches_the_refresh() {
     let hits = Arc::new(AtomicUsize::new(0));
     let observed_hits = Arc::clone(&hits);
-    let server = TestServer::start(2, move |_| {
-        let body = if observed_hits.fetch_add(1, Ordering::SeqCst) == 0 {
-            "first"
-        } else {
-            "second"
-        };
+    let server = TestServer::start(2, move |request| {
+        let hit = observed_hits.fetch_add(1, Ordering::SeqCst);
+        if hit == 1 {
+            assert!(request.contains("cache-control: no-cache"));
+        }
+        let body = if hit == 0 { "first" } else { "second" };
         format!("HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).into_bytes()
     });
     let controller = RequestController::builder(Config::default())
@@ -392,11 +469,16 @@ fn only_if_cached_returns_a_cached_response_without_network_io() {
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
     });
     let controller = RequestController::builder(Config::default())
+        .with_browser_capabilities(Arc::new(SameOriginCacheServices))
         .build()
         .unwrap();
 
     let cached = runtime().block_on(async {
-        let request = Request::get(server.url());
+        let mut request = Request::get(server.url());
+        request.set_mode(RequestMode::SameOrigin).unwrap();
+        request.set_environment(
+            FetchEnvironment::from_url(url::Url::parse(request.url()).unwrap()).unwrap(),
+        );
         let first = controller
             .fetch(request.try_clone().unwrap())
             .await
@@ -410,6 +492,34 @@ fn only_if_cached_returns_a_cached_response_without_network_io() {
     server.join();
     assert!(cached.from_cache);
     assert_eq!(runtime().block_on(cached.body.bytes()).unwrap(), b"cached");
+}
+
+#[test]
+fn only_if_cached_requires_same_origin_mode_without_network_access() {
+    let server = TestServer::start(1, |_| {
+        b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+
+    runtime().block_on(async {
+        let request = Request::get(server.url());
+        let response = controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(collect_body(response).await.unwrap(), b"cached");
+
+        let mut only_cached = request;
+        only_cached.set_cache_mode(CacheMode::OnlyIfCached);
+        assert!(matches!(
+            controller.fetch(only_cached).await,
+            Err(RequestError::NetworkError)
+        ));
+    });
+
+    server.join();
 }
 
 #[test]
