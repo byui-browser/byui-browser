@@ -65,7 +65,7 @@ impl HTMLDocument {
         id
     }
 
-    /// Parents node to another node.
+    /// Parents 'child' node to 'parent'.
     pub fn append_child(&mut self, parent: NodeID, child: NodeID) {
         // Removes child from previous parent.
         if let Some(prev_parent) = self.get_node(child).and_then(Node::get_parent)
@@ -93,36 +93,39 @@ impl HTMLDocument {
     /// their existing stable IDs. Removing a detached node, the document root,
     /// or an invalid node ID has no effect.
     pub fn remove(&mut self, node: NodeID) {
+        // Gets parent, returns otherwise.
         let Some(parent) = self.get_node(node).and_then(Node::get_parent) else {
             return;
         };
 
+        // Removes node from parent.
         if let Some(parent_node) = self.get_mut_node(parent) {
             parent_node.remove_child(node);
         }
 
-        // Sets node to be removed parent to None.
+        // Sets to be removed node's parent to None.
         if let Some(removed) = self.nodes.get_mut(node.get()) {
             removed.set_parent(None);
         }
     }
 
-    /// Gets the first element with the given HTML `#id`.
-    pub fn get_element_by_id(&self, value: &str) -> Option<NodeID> {
-        fn find_in_tree(document: &HTMLDocument, parent: NodeID, value: &str) -> Option<NodeID> {
+    /// Gets the first element with the given HTML id (#id).
+    pub fn get_element_by_id(&self, id_value: &str) -> Option<NodeID> {
+        // Recursively searches from element by id through DOM tree.
+        fn find_in_tree(document: &HTMLDocument, parent: NodeID, id_value: &str) -> Option<NodeID> {
             let children = document.get_node(parent)?.get_children().clone();
 
             for child in children {
                 let node = document.get_node(child)?;
                 if let NodeKind::Element(element) = node.get_kind()
                     && element.get_attributes().iter().any(|attribute| {
-                        attribute.get_name() == "id" && attribute.get_value() == value
+                        attribute.get_name() == "id" && attribute.get_value() == id_value
                     })
                 {
                     return Some(child);
                 }
 
-                if let Some(found) = find_in_tree(document, child, value) {
+                if let Some(found) = find_in_tree(document, child, id_value) {
                     return Some(found);
                 }
             }
@@ -132,7 +135,7 @@ impl HTMLDocument {
 
         // The DOM algorithm searches descendants in tree order. The document
         // node itself is not an element and therefore is never a candidate.
-        find_in_tree(self, self.root, value)
+        find_in_tree(self, self.root, id_value)
     }
 
     /// Returns a live `DOMTokenList` for an element's `class` attribute.
