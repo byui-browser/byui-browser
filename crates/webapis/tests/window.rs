@@ -485,8 +485,8 @@ fn window_history_is_stable_and_starts_at_one_entry() {
 
     assert_eq!(
         realm.evaluate_script(
-            "window.history() === window.history() && \
-             window.history().length === 1 && window.history().state === null",
+            "history === window.history && window.history === window.history && \
+             window.history.length === 1 && window.history.state === null",
         ),
         Ok(Value::Boolean(true))
     );
@@ -499,21 +499,21 @@ fn history_push_replace_and_navigation_update_state() {
 
     assert_eq!(
         realm.evaluate_script(
-            "window.history().pushState('first', ''); \
-             window.history().pushState('second', ''); \
-             window.history().back(); window.history().state === 'first'",
+            "window.history.pushState('first', ''); \
+             window.history.pushState('second', ''); \
+             window.history.back(); window.history.state === 'first'",
         ),
         Ok(Value::Boolean(true))
     );
     assert_eq!(
         realm.evaluate_script(
-            "window.history().replaceState('updated', ''); \
-             window.history().forward(); window.history().state === 'second'",
+            "window.history.replaceState('updated', ''); \
+             window.history.forward(); window.history.state === 'second'",
         ),
         Ok(Value::Boolean(true))
     );
     assert_eq!(
-        realm.evaluate_script("window.history().go(-2); window.history().state === null"),
+        realm.evaluate_script("window.history.go(-2); window.history.state === null"),
         Ok(Value::Boolean(true))
     );
 }
@@ -525,11 +525,11 @@ fn pushing_state_discards_forward_entries() {
 
     assert_eq!(
         realm.evaluate_script(
-            "window.history().pushState('first', ''); \
-             window.history().pushState('second', ''); window.history().back(); \
-             window.history().pushState('replacement', ''); \
-             window.history().length === 3 && window.history().forward(); \
-             window.history().state === 'replacement'",
+            "window.history.pushState('first', ''); \
+             window.history.pushState('second', ''); window.history.back(); \
+             window.history.pushState('replacement', ''); \
+             window.history.length === 3 && window.history.forward(); \
+             window.history.state === 'replacement'",
         ),
         Ok(Value::Boolean(true))
     );
@@ -545,23 +545,74 @@ fn history_resolves_same_origin_urls_and_dispatches_popstate() {
             "var seen = 'unset'; \
              function remember(event) { seen = event.state; } \
              window.addEventListener('popstate', remember); \
-             window.history().pushState('next', '', '/next'); \
+             window.history.pushState('next', '', '/next'); \
              window.location().href === 'https://example.test/next' && \
-             window.history().state === 'next'",
+             window.history.state === 'next'",
         ),
         Ok(Value::Boolean(true))
     );
     assert_eq!(
         realm.evaluate_script(
-            "window.history().back(); \
+            "window.history.back(); \
              window.location().href === 'https://example.test/start' && seen === null",
         ),
         Ok(Value::Boolean(true))
     );
     assert!(
         realm
-            .evaluate_script("window.history().pushState(null, '', 'https://other.test/blocked')")
+            .evaluate_script("window.history.pushState(null, '', 'https://other.test/blocked')")
             .is_err()
+    );
+    assert_eq!(
+        realm.evaluate_script(
+            "window.history.pushState('same', '', null); window.location().href === 'https://example.test/start'",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_onpopstate_is_an_event_handler_attribute() {
+    let mut realm = Realm::new();
+    register_window_with_url(&mut realm, "https://example.test/start").unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "window.onpopstate === null && \
+             window.history.pushState('next', '', '/next'); \
+             var calls = 0; var seen_state; var seen_this; \
+             function remember(event) { calls++; seen_state = event.state; seen_this = this; } \
+             window.onpopstate = remember; \
+             window.history.back(); \
+             calls === 1 && seen_state === null && seen_this === window && \
+             window.onpopstate !== null",
+        ),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(
+        realm.evaluate_script(
+            "window.onpopstate = null; window.history.forward(); calls === 1 && window.onpopstate === null",
+        ),
+        Ok(Value::Boolean(true))
+    );
+    assert!(realm.evaluate_script("window.onpopstate = 1").is_err());
+}
+
+#[test]
+fn window_onpopstate_runs_in_event_listener_order() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "window.history.pushState('next', ''); var order = ''; \
+             function listener() { order += 'listener'; } \
+             function handler() { order += 'handler'; } \
+             window.addEventListener('popstate', listener); \
+             window.onpopstate = handler; \
+             window.history.back(); order === 'listenerhandler'",
+        ),
+        Ok(Value::Boolean(true))
     );
 }
 
@@ -573,9 +624,20 @@ fn history_state_is_structured_cloned() {
     assert_eq!(
         realm.evaluate_script(
             "var original = {nested: {value: 1}}; \
-             window.history().pushState(original, ''); \
+             window.history.pushState(original, ''); \
              original.nested.value = 2; \
-             window.history().state.nested.value === 1",
+             var first_read = window.history.state; first_read.nested.value = 3; \
+             window.history.state.nested.value === 1",
+        ),
+        Ok(Value::Boolean(true))
+    );
+
+    assert_eq!(
+        realm.evaluate_script(
+            "window.history.pushState({nested: {value: 2}}, ''); \
+             function mutate(event) { event.state.nested.value = 9; } \
+             window.onpopstate = mutate; window.history.back(); \
+             window.history.state.nested.value === 1",
         ),
         Ok(Value::Boolean(true))
     );
