@@ -183,6 +183,31 @@ pub fn event_constructor(arguments: &[Value]) -> JsResult<Value> {
     )))
 }
 
+/// Implements the HTML Standard's `HashChangeEvent` constructor.
+pub fn hashchange_event_constructor(arguments: &[Value]) -> JsResult<Value> {
+    let Some(event_type) = arguments.first() else {
+        return Err(JsError::new("HashChangeEvent() expects an event type"));
+    };
+    let event = event_object(event_type.to_string(), false, false);
+    if let Some(Value::Object(init) | Value::Array(init)) = arguments.get(1) {
+        if let Some(value) = init.get_property("oldURL")? {
+            event.set("oldURL", Value::String(value.to_string()));
+        }
+        if let Some(value) = init.get_property("newURL")? {
+            event.set("newURL", Value::String(value.to_string()));
+        }
+    }
+    event.set(
+        "oldURL",
+        event.get("oldURL").unwrap_or(Value::String(String::new())),
+    );
+    event.set(
+        "newURL",
+        event.get("newURL").unwrap_or(Value::String(String::new())),
+    );
+    Ok(Value::Object(event))
+}
+
 /// Implements the DOM Standard's `EventTarget.addEventListener()` listener
 /// registration algorithm for a document or exposed element target.
 ///

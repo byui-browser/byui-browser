@@ -12,7 +12,7 @@ use crate::custom_elements::CustomElementRegistry;
 use crate::event::{
     EventTarget, EventTargetRef, add_event_listener_to_target, dispatch_event_target,
     dispatch_event_target_with_target, event_constructor, event_object,
-    remove_event_listener_from_target,
+    hashchange_event_constructor, remove_event_listener_from_target,
 };
 use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
@@ -47,6 +47,13 @@ struct WindowLoadState {
 #[derive(Default)]
 struct WindowPopstateState {
     /// The current `window.onpopstate` event handler, if any.
+    handler: Option<Function>,
+}
+
+/// Per-Window state for the `hashchange` event handler attribute.
+#[derive(Default)]
+struct WindowHashchangeState {
+    /// The current `window.onhashchange` event handler, if any.
     handler: Option<Function>,
 }
 
@@ -168,6 +175,10 @@ struct MessageQueue {
     messages: VecDeque<Value>,
 }
 
+struct HashchangeQueue {
+    events: VecDeque<(Url, Url)>,
+}
+
 impl MicrotaskQueue {
     fn new() -> Self {
         Self {
@@ -188,6 +199,14 @@ impl MessageQueue {
     fn new() -> Self {
         Self {
             messages: VecDeque::new(),
+        }
+    }
+}
+
+impl HashchangeQueue {
+    fn new() -> Self {
+        Self {
+            events: VecDeque::new(),
         }
     }
 }
@@ -431,12 +450,20 @@ fn resolve_history_url(base: &Url, requested: Option<&Value>) -> JsResult<Url> {
     Ok(resolved)
 }
 
-fn sync_history_properties(history: &Object, location: &Object, session: &SessionHistory) {
+fn sync_history_properties(
+    history: &Object,
+    location: &Object,
+    window: &Object,
+    session: &SessionHistory,
+) {
     history.set("length", Value::Number(session.entries.len() as f64));
-    location.set(
-        "href",
-        Value::String(session.current().url.as_str().to_owned()),
-    );
+    let href = session.current().url.as_str().to_owned();
+    location.set("href", Value::String(href.clone()));
+    if let Some(Value::Function(sync)) = window.get("__syncLocation")
+        && let Err(error) = sync.call(&[Value::String(href)])
+    {
+        log::warn!("failed to synchronize the live Location: {error}");
+    }
 }
 
 fn invoke_popstate(window: &Object, event_target: &EventTargetRef, state: &Value) {
@@ -455,6 +482,24 @@ fn invoke_popstate(window: &Object, event_target: &EventTargetRef, state: &Value
     {
         log::warn!("popstate event dispatch failed: {error}");
     }
+}
+
+fn invoke_hashchange(window: &Object, event_target: &EventTargetRef, old_url: &Url, new_url: &Url) {
+    let event = event_object("hashchange".into(), false, false);
+    event.set("oldURL", Value::String(old_url.as_str().to_owned()));
+    event.set("newURL", Value::String(new_url.as_str().to_owned()));
+
+    if let Err(error) = dispatch_event_target(event_target, window, &[Value::Object(event)]) {
+        log::warn!("hashchange event dispatch failed: {error}");
+    }
+}
+
+fn queue_hashchange(queue: &Mutex<HashchangeQueue>, old_url: Url, new_url: Url) {
+    queue
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .events
+        .push_back((old_url, new_url));
 }
 
 fn message_target_origin(arguments: &[Value]) -> JsResult<String> {
@@ -752,6 +797,7 @@ fn register_window_object(
     let timers = Arc::new(Mutex::new(WindowTimers::new()));
     let microtasks = Arc::new(Mutex::new(MicrotaskQueue::new()));
     let messages = Arc::new(Mutex::new(MessageQueue::new()));
+    let hashchange_events = Arc::new(Mutex::new(HashchangeQueue::new()));
     let event_target: EventTargetRef = Arc::new(Mutex::new(EventTarget::default()));
     let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
     let load_state = Arc::new(Mutex::new(WindowLoadState::default()));
@@ -952,6 +998,78 @@ fn register_window_object(
                 (true, false) => {
                     remove_event_listener_from_target(
                         &onpopstate_event_target,
+                        &listener_arguments,
+                    )?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })),
+    );
+    // `window.onhashchange` is an event handler IDL attribute. Keep its
+    // handler in private state and expose one stable event listener so it
+    // participates in Window listener ordering.
+    let hashchange_state = Arc::new(Mutex::new(WindowHashchangeState::default()));
+    let onhashchange_listener = {
+        let window = window.clone();
+        let hashchange_state = Arc::clone(&hashchange_state);
+        Function::from_host(
+            "onhashchange",
+            Arc::new(move |arguments| {
+                let handler = hashchange_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .handler
+                    .clone();
+                match handler {
+                    Some(handler) => {
+                        handler.call_with_this(Value::Object(window.clone()), arguments)
+                    }
+                    None => Ok(Value::Undefined),
+                }
+            }),
+        )
+    };
+    let hashchange_state_for_get = Arc::clone(&hashchange_state);
+    let hashchange_state_for_set = Arc::clone(&hashchange_state);
+    let onhashchange_event_target = event_target.clone();
+    window.define_accessor(
+        "onhashchange",
+        Arc::new(move || {
+            let state = hashchange_state_for_get
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(state.handler.clone().map_or(Value::Null, Value::Function))
+        }),
+        Some(Arc::new(move |value| {
+            let handler = match value {
+                Value::Null | Value::Undefined => None,
+                Value::Function(handler) => Some(handler),
+                _ => return Err(type_error("window.onhashchange must be a function or null")),
+            };
+            let had_handler = {
+                let mut state = hashchange_state_for_set
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let had_handler = state.handler.is_some();
+                state.handler = handler.clone();
+                had_handler
+            };
+            let listener_arguments = [
+                Value::String("hashchange".into()),
+                Value::Function(onhashchange_listener.clone()),
+            ];
+            match (had_handler, handler.is_some()) {
+                (false, true) => {
+                    add_event_listener_to_target(
+                        &onhashchange_event_target,
+                        &listener_arguments,
+                        "window",
+                    )?;
+                }
+                (true, false) => {
+                    remove_event_listener_from_target(
+                        &onhashchange_event_target,
                         &listener_arguments,
                     )?;
                 }
@@ -1366,6 +1484,7 @@ fn register_window_object(
             dispatch_event_target(&dispatch_window_event_target, &dispatch_window, arguments)
         }),
     );
+    window.set_method("HashChangeEvent", Arc::new(hashchange_event_constructor));
 
     let report_window_event_target = event_target.clone();
     let report_window = window.clone();
@@ -1404,11 +1523,48 @@ fn register_window_object(
             Ok(Value::Number(delivered as f64))
         }),
     );
+    let hashchange_events_for_pump = Arc::clone(&hashchange_events);
+    let hashchange_window = window.clone();
+    let hashchange_event_target = event_target.clone();
+    window.set_method(
+        "__runHashchangeEvents",
+        Arc::new(move |_| {
+            let mut delivered = 0;
+            loop {
+                let event = hashchange_events_for_pump
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .events
+                    .pop_front();
+                let Some((old_url, new_url)) = event else {
+                    break;
+                };
+                invoke_hashchange(
+                    &hashchange_window,
+                    &hashchange_event_target,
+                    &old_url,
+                    &new_url,
+                );
+                delivered += 1;
+            }
+            Ok(Value::Number(delivered as f64))
+        }),
+    );
     window.set("history", Value::Object(history.clone()));
     let location_for_window = location.clone();
     window.set_method(
         "location",
         Arc::new(move |_| Ok(Value::Object(location_for_window.clone()))),
+    );
+    let location_for_sync = location.clone();
+    window.set_method(
+        "__syncLocation",
+        Arc::new(move |arguments| {
+            if let Some(Value::String(href)) = arguments.first() {
+                location_for_sync.set("href", Value::String(href.clone()));
+            }
+            Ok(Value::Undefined)
+        }),
     );
 
     let history_for_state = Arc::clone(&session);
@@ -1421,8 +1577,68 @@ fn register_window_object(
         None,
     );
 
+    let history_for_same_document = history.clone();
+    let location_for_same_document = location.clone();
+    let window_for_same_document = window.clone();
+    let session_for_same_document = Arc::clone(&session);
+    let event_target_for_same_document = event_target.clone();
+    let hashchange_events_for_same_document = Arc::clone(&hashchange_events);
+    window.set_method(
+        "__navigateSameDocument",
+        Arc::new(move |arguments| {
+            let Some(Value::String(serialized_url)) = arguments.first() else {
+                return Err(JsError::runtime(
+                    "same-document navigation requires a URL string",
+                ));
+            };
+            let target = Url::parse(serialized_url)
+                .map_err(|error| JsError::runtime(format!("invalid same-document URL: {error}")))?;
+            let replace = matches!(arguments.get(1), Some(Value::Boolean(true)));
+            let mut session = lock_history(&session_for_same_document);
+            let current_url = session.current().url.clone();
+            if current_url.origin() != target.origin()
+                || current_url.path() != target.path()
+                || current_url.query() != target.query()
+            {
+                return Err(JsError::runtime(
+                    "same-document navigation must only change the fragment",
+                ));
+            }
+            if current_url.fragment() == target.fragment() {
+                return Ok(Value::Undefined);
+            }
+            let old_url = current_url;
+            let state = session.current().state.clone();
+            if replace {
+                let current = session.current;
+                session.entries[current] = HistoryEntry { url: target, state };
+            } else {
+                let current = session.current;
+                session.entries.truncate(current + 1);
+                session.entries.push(HistoryEntry { url: target, state });
+                session.current += 1;
+            }
+            let new_url = session.current().url.clone();
+            sync_history_properties(
+                &history_for_same_document,
+                &location_for_same_document,
+                &window_for_same_document,
+                &session,
+            );
+            invoke_popstate(
+                &window_for_same_document,
+                &event_target_for_same_document,
+                &session.current().state,
+            );
+            if old_url.fragment() != new_url.fragment() {
+                queue_hashchange(&hashchange_events_for_same_document, old_url, new_url);
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+
     let initial_session = lock_history(&session);
-    sync_history_properties(&history, &location, &initial_session);
+    sync_history_properties(&history, &location, &window, &initial_session);
     drop(initial_session);
 
     let history_for_back = history.clone();
@@ -1430,18 +1646,32 @@ fn register_window_object(
     let window_for_back = window.clone();
     let event_target_for_back = event_target.clone();
     let session_for_back = Arc::clone(&session);
+    let hashchange_events_for_back = Arc::clone(&hashchange_events);
     history.set_method(
         "back",
         Arc::new(move |_| {
             let mut session = lock_history(&session_for_back);
             if session.current > 0 {
+                let old_url = session.current().url.clone();
                 session.current -= 1;
-                sync_history_properties(&history_for_back, &location_for_back, &session);
+                sync_history_properties(
+                    &history_for_back,
+                    &location_for_back,
+                    &window_for_back,
+                    &session,
+                );
                 invoke_popstate(
                     &window_for_back,
                     &event_target_for_back,
                     &session.current().state,
                 );
+                if old_url.fragment() != session.current().url.fragment() {
+                    queue_hashchange(
+                        &hashchange_events_for_back,
+                        old_url,
+                        session.current().url.clone(),
+                    );
+                }
             }
             Ok(Value::Undefined)
         }),
@@ -1452,18 +1682,32 @@ fn register_window_object(
     let window_for_forward = window.clone();
     let event_target_for_forward = event_target.clone();
     let session_for_forward = Arc::clone(&session);
+    let hashchange_events_for_forward = Arc::clone(&hashchange_events);
     history.set_method(
         "forward",
         Arc::new(move |_| {
             let mut session = lock_history(&session_for_forward);
             if session.current + 1 < session.entries.len() {
+                let old_url = session.current().url.clone();
                 session.current += 1;
-                sync_history_properties(&history_for_forward, &location_for_forward, &session);
+                sync_history_properties(
+                    &history_for_forward,
+                    &location_for_forward,
+                    &window_for_forward,
+                    &session,
+                );
                 invoke_popstate(
                     &window_for_forward,
                     &event_target_for_forward,
                     &session.current().state,
                 );
+                if old_url.fragment() != session.current().url.fragment() {
+                    queue_hashchange(
+                        &hashchange_events_for_forward,
+                        old_url,
+                        session.current().url.clone(),
+                    );
+                }
             }
             Ok(Value::Undefined)
         }),
@@ -1474,6 +1718,7 @@ fn register_window_object(
     let window_for_go = window.clone();
     let event_target_for_go = event_target.clone();
     let session_for_go = Arc::clone(&session);
+    let hashchange_events_for_go = Arc::clone(&hashchange_events);
     history.set_method(
         "go",
         Arc::new(move |arguments| {
@@ -1487,13 +1732,26 @@ fn register_window_object(
                 .clamp(0, session.entries.len().saturating_sub(1) as i64)
                 as usize;
             if target != session.current {
+                let old_url = session.current().url.clone();
                 session.current = target;
-                sync_history_properties(&history_for_go, &location_for_go, &session);
+                sync_history_properties(
+                    &history_for_go,
+                    &location_for_go,
+                    &window_for_go,
+                    &session,
+                );
                 invoke_popstate(
                     &window_for_go,
                     &event_target_for_go,
                     &session.current().state,
                 );
+                if old_url.fragment() != session.current().url.fragment() {
+                    queue_hashchange(
+                        &hashchange_events_for_go,
+                        old_url,
+                        session.current().url.clone(),
+                    );
+                }
             }
             Ok(Value::Undefined)
         }),
@@ -1501,6 +1759,7 @@ fn register_window_object(
 
     let history_for_push = history.clone();
     let location_for_push = location.clone();
+    let window_for_push = window.clone();
     let session_for_push = Arc::clone(&session);
     history.set_method(
         "pushState",
@@ -1520,13 +1779,19 @@ fn register_window_object(
                 state,
             });
             session.current += 1;
-            sync_history_properties(&history_for_push, &location_for_push, &session);
+            sync_history_properties(
+                &history_for_push,
+                &location_for_push,
+                &window_for_push,
+                &session,
+            );
             Ok(Value::Undefined)
         }),
     );
 
     let history_for_replace = history.clone();
     let location_for_replace = location.clone();
+    let window_for_replace = window.clone();
     let session_for_replace = Arc::clone(&session);
     history.set_method(
         "replaceState",
@@ -1544,12 +1809,18 @@ fn register_window_object(
                 url: new_url,
                 state,
             };
-            sync_history_properties(&history_for_replace, &location_for_replace, &session);
+            sync_history_properties(
+                &history_for_replace,
+                &location_for_replace,
+                &window_for_replace,
+                &session,
+            );
             Ok(Value::Undefined)
         }),
     );
 
     realm.register_global_value("window", Value::Object(window.clone()))?;
+    realm.register_global_function("HashChangeEvent", Arc::new(hashchange_event_constructor))?;
     realm.register_global_value("self", Value::Object(window.clone()))?;
     realm.register_global_value("history", Value::Object(history.clone()))?;
     realm.register_global_value(
@@ -1680,6 +1951,25 @@ pub fn run_window_messages(window: &Object) -> JsResult<usize> {
         Ok(Value::Number(delivered)) => Ok(delivered as usize),
         Ok(_) => Err(JsError::runtime(
             "window message pump returned a non-number",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+/// Delivers queued `hashchange` events for a Window.
+///
+/// Browser integrations should call this at a task checkpoint after the
+/// synchronous history or fragment-navigation algorithm completes.
+pub fn run_window_hashchange_events(window: &Object) -> JsResult<usize> {
+    let Some(Value::Function(pump)) = window.get("__runHashchangeEvents") else {
+        return Err(JsError::runtime(
+            "window hashchange event pump is not installed",
+        ));
+    };
+    match pump.call(&[]) {
+        Ok(Value::Number(delivered)) => Ok(delivered as usize),
+        Ok(_) => Err(JsError::runtime(
+            "window hashchange event pump returned a non-number",
         )),
         Err(error) => Err(error),
     }

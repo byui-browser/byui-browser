@@ -4,7 +4,7 @@ use std::{thread, time::Duration};
 use webapis::{
     Document, register_document, register_window, register_window_with_security_context,
     register_window_with_url, register_window_with_url_and_device_pixel_ratio, report_window_error,
-    run_window_messages,
+    run_window_hashchange_events, run_window_messages,
 };
 
 #[test]
@@ -711,6 +711,62 @@ fn window_onpopstate_runs_in_event_listener_order() {
              window.onpopstate = handler; \
              window.history.back(); order === 'listenerhandler'",
         ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_onhashchange_reports_fragment_urls_during_history_traversal() {
+    let mut realm = Realm::new();
+    let window = register_window_with_url(&mut realm, "https://example.test/start").unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var calls = 0; var old_url; var new_url; var seen_this; var flags; \
+             function remember_hash(event) { calls++; old_url = event.oldURL; \
+               new_url = event.newURL; seen_this = this; flags = event.bubbles + ':' + event.cancelable; } \
+             window.onhashchange = remember_hash; \
+             window.history.pushState(null, '', '#part'); window.history.back(); \
+             calls === 0",
+        ),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(run_window_hashchange_events(&window), Ok(1));
+    assert_eq!(
+        realm.evaluate_script(
+            "calls === 1 && old_url === 'https://example.test/start#part' && \
+             new_url === 'https://example.test/start' && seen_this === window && flags === 'false:false'",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_onhashchange_is_an_event_handler_attribute_and_only_fires_for_fragment_changes() {
+    let mut realm = Realm::new();
+    let window = register_window_with_url(&mut realm, "https://example.test/start").unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "var calls = 0; function count_hash() { calls++; } \
+             window.addEventListener('hashchange', count_hash); \
+             window.history.pushState(null, '', '/next'); window.history.back(); calls === 0 && \
+             window.onhashchange === null",
+        ),
+        Ok(Value::Boolean(true))
+    );
+    assert!(realm.evaluate_script("window.onhashchange = 1").is_err());
+    assert_eq!(
+        realm.evaluate_script(
+            "function count_hash_attribute() { calls++; } window.onhashchange = count_hash_attribute; \
+             window.history.pushState(null, '', '#x'); \
+             window.history.back(); calls === 0; window.onhashchange = null; window.history.forward(); calls === 0",
+        ),
+        Ok(Value::Boolean(true))
+    );
+    assert_eq!(run_window_hashchange_events(&window), Ok(2));
+    assert_eq!(
+        realm.evaluate_script("calls === 2"),
         Ok(Value::Boolean(true))
     );
 }

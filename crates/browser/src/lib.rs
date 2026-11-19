@@ -760,7 +760,8 @@ impl BrowserRuntime {
             log::trace!("evaluating script {index}: {} bytes", source.len());
             let result = realm.evaluate_script(source);
             let checkpoint = webapis::run_window_microtasks(&window);
-            match (result, checkpoint) {
+            let hashchange_checkpoint = webapis::run_window_hashchange_events(&window);
+            match (result, checkpoint.and(hashchange_checkpoint)) {
                 (Ok(result), Ok(_)) => results.push(result),
                 (Err(error), _) => {
                     let _ = report_window_error(&window, &error, initial_url);
@@ -809,7 +810,8 @@ impl PageSession {
     pub fn evaluate_script(&self, source: &str) -> JsResult<Value> {
         let result = self.realm.evaluate_script(source);
         let checkpoint = webapis::run_window_microtasks(&self.window);
-        match (result, checkpoint) {
+        let hashchange_checkpoint = webapis::run_window_hashchange_events(&self.window);
+        match (result, checkpoint.and(hashchange_checkpoint)) {
             (Err(error), _) => {
                 let _ = report_window_error(&self.window, &error, &self.source_url);
                 Err(error)
@@ -914,6 +916,7 @@ impl PageSession {
         let document = self.document.lock().unwrap().clone();
         let result = webapis::dispatch_click(&document);
         webapis::run_window_microtasks(&self.window)?;
+        webapis::run_window_hashchange_events(&self.window)?;
         result
     }
 
@@ -925,6 +928,7 @@ impl PageSession {
     pub fn dispatch_click_at(&self, node: html::NodeID) -> JsResult<Value> {
         let result = webapis::dispatch_click_at_live(&self.document, node);
         webapis::run_window_microtasks(&self.window)?;
+        webapis::run_window_hashchange_events(&self.window)?;
         result
     }
 
