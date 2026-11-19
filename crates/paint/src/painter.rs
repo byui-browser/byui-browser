@@ -161,6 +161,21 @@ fn paint(
                         color: text.color.into(),
                         clip: text.clip.map(scrolled),
                     });
+                    if text.clip.is_none() {
+                        for decoration in &text.text_decoration {
+                            let y = match decoration.as_str() {
+                                "overline" => text.baseline - text.font_size * 0.8 - scroll_y,
+                                "line-through" => text.baseline - text.font_size * 0.3 - scroll_y,
+                                _ => text.baseline + text.font_size * 0.08 - scroll_y,
+                            };
+                            items.push(DisplayItem::StrokeLine {
+                                from: (text.rect.x, y),
+                                to: (text.rect.right(), y),
+                                width: 1.0,
+                                color: text.color.into(),
+                            });
+                        }
+                    }
                 }
             }
             PaintItem::Image(layout_box) => {
@@ -284,6 +299,29 @@ fn decorations(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<DisplayItem>
         items.push(background(rect, style, color.into()));
     }
     items.extend(borders(rect, style));
+    if style.outline_width > 0.0 && style.outline_style != "none" {
+        let spread = style.outline_width + style.outline_offset;
+        let outline_rect = layout::Rect {
+            x: rect.x - spread,
+            y: rect.y - spread,
+            width: (rect.width + 2.0 * spread).max(0.0),
+            height: (rect.height + 2.0 * spread).max(0.0),
+        };
+        let outline = layout::BoxStyle {
+            border_width: layout::Edges {
+                top: style.outline_width,
+                right: style.outline_width,
+                bottom: style.outline_width,
+                left: style.outline_width,
+            },
+            border_color: layout::Sides::from_array([style.outline_color; 4]),
+            border_style: layout::Sides::from_array(std::array::from_fn(|_| {
+                style.outline_style.clone()
+            })),
+            ..Default::default()
+        };
+        items.extend(borders(outline_rect, &outline));
+    }
     items
 }
 

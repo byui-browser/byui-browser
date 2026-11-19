@@ -772,6 +772,11 @@ impl Context<'_> {
         };
         for (box_index, start, end) in box_ranges {
             let style = prepared.boxes[box_index].style;
+            if style.vertical_align_offset != 0.0 {
+                for fragment in &mut fragments[start..end] {
+                    translate_fragment(fragment, 0.0, style.vertical_align_offset);
+                }
+            }
             if style.position != Position::Relative {
                 continue;
             }
@@ -840,6 +845,7 @@ impl Context<'_> {
             font_size: source.style.font_size,
             font: source.style.font,
             color: source.style.color,
+            text_decoration: source.style.text_decoration.clone(),
             clip: None,
         }));
     }
