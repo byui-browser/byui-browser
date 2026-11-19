@@ -17,6 +17,24 @@ use crate::{
     },
 };
 
+/// Result of looking up an HTTP request in the cache.
+enum CacheDecision {
+    /// A finalized response can return without a transport attempt.
+    Hit(Response),
+    /// A transport attempt is required, optionally with a cached validator.
+    Miss(Option<(StoredResponse, CacheValidator)>),
+}
+
+/// Result of processing one HTTP transport response.
+enum HopResult {
+    /// The response completes the fetch.
+    Complete(InternalResponse),
+    /// Redirect processing prepared another request URL.
+    Follow(reqwest::Url),
+    /// A manual redirect can be exposed immediately.
+    Expose(Response),
+}
+
 impl RequestController {
     /// Executes HTTP(S) exchanges and controller-owned redirects.
     pub(crate) async fn fetch_http(
@@ -33,281 +51,309 @@ impl RequestController {
             );
             return Err(RequestError::NetworkError);
         }
-        let mut response;
-        loop {
+        let response = loop {
             let transport_headers = self.validate_http_hop(&mut request, &url).await?;
-
-            let cacheable = request.is_cacheable_method();
-            let cache_lookup = matches!(
-                request.cache_mode(),
-                CacheMode::Default
-                    | CacheMode::OnlyIfCached
-                    | CacheMode::ForceCache
-                    | CacheMode::NoCache
-            );
-            let mut revalidation: Option<(StoredResponse, CacheValidator)> = None;
-            if cacheable {
-                self.observe(&request, NetworkPhase::CacheLookup, &url, None, false);
-                let cached = match request.cache_mode() {
-                    CacheMode::NoCache => {
-                        revalidation = self.inner.cache.lookup_for_revalidation(&request, &url);
-                        None
-                    }
-                    _ => match cache_lookup
-                        .then(|| self.inner.cache.lookup(&request, &url))
-                        .flatten()
-                    {
-                        Some(CacheLookup::Fresh(response)) => Some(response),
-                        Some(CacheLookup::Stale {
-                            response,
-                            may_serve_stale: true,
-                            ..
-                        }) if request.cache_mode() == CacheMode::ForceCache => Some(response),
-                        Some(CacheLookup::Stale {
-                            response,
-                            validator,
-                            ..
-                        }) => {
-                            revalidation = validator.map(|validator| (response, validator));
-                            None
-                        }
-                        None => None,
-                    },
-                };
-                if let Some(cached) = cached {
-                    self.observe(
-                        &request,
-                        NetworkPhase::CacheHit,
-                        &url,
-                        Some(cached.status.as_u16()),
-                        true,
-                    );
-                    log::debug!(
-                        "cache hit: {} {} -> {} ({} bytes)",
-                        request.method(),
-                        crate::log_url::loggable(url.as_str()),
-                        cached.status,
-                        cached.body.len()
-                    );
-                    let mut body = if has_null_body(request.method(), cached.status) {
-                        Body::null()
-                    } else {
-                        Body::once_bytes_with_signal(cached.body, request.signal().clone())
-                    };
-                    body.set_response_metadata(&cached.headers, None);
-                    let mut internal = InternalResponse::from_http_parts(
-                        cached.status,
-                        cached.headers,
-                        cached.url,
-                        request.context(),
-                        body,
-                        true,
-                        cached.cookie_headers_processed,
-                    );
-                    internal.apply_request_state(&request);
-                    self.finalize_response(&request, &mut internal, ResponseFinalization::Standard)
-                        .inspect_err(|_| {
-                            self.clear_preflight_cache_after_failure(&request, &url);
-                        })?;
-                    self.observe(
-                        &request,
-                        NetworkPhase::ResponseFinalized,
-                        &url,
-                        Some(internal.status.as_u16()),
-                        true,
-                    );
-                    return Ok(internal.expose());
-                }
-                if cache_lookup {
-                    self.observe(&request, NetworkPhase::CacheMiss, &url, None, false);
-                    log::debug!(
-                        "cache miss: {} {}",
-                        request.method(),
-                        crate::log_url::loggable(url.as_str())
-                    );
-                }
-                if request.cache_mode() == CacheMode::OnlyIfCached {
-                    log::debug!(
-                        "only-if-cached request has no cache entry: {}",
-                        crate::log_url::loggable(url.as_str())
-                    );
-                    return Err(RequestError::NetworkError);
-                }
-            }
+            let revalidation = match self.lookup_http_cache(&request, &url)? {
+                CacheDecision::Hit(response) => return Ok(response),
+                CacheDecision::Miss(revalidation) => revalidation,
+            };
 
             let had_nonreplayable_body = request
                 .body()
                 .as_ref()
                 .is_some_and(|body| !body.is_replayable());
-            let mut transport_headers = transport_headers;
-            if let Some((_, validator)) = &revalidation {
-                validator.apply(&mut transport_headers)?;
+            let candidate = self
+                .submit_http_hop(&mut request, &url, transport_headers, revalidation)
+                .await?;
+            match self.process_http_result(&mut request, &url, candidate, had_nonreplayable_body)? {
+                HopResult::Complete(response) => break response,
+                HopResult::Follow(next_url) => {
+                    url = next_url;
+                    continue;
+                }
+                HopResult::Expose(response) => return Ok(response),
             }
-            let validated = self.finish_http_hop(&mut request, &url, transport_headers)?;
-            let mut candidate = self
-                .inner
-                .scheduler
-                .submit(validated, request.transport_priority())
-                .await
-                .inspect_err(|_| {
-                    self.clear_preflight_cache_after_failure(&request, &url);
-                })?;
-            candidate.apply_request_state(&request);
-            let status = candidate.status.as_u16();
+        };
+
+        self.finalize_and_cache_http_response(&request, url, response)
+    }
+
+    /// Looks up the current hop and selects an optional validator for transport.
+    fn lookup_http_cache(
+        &self,
+        request: &Request,
+        url: &reqwest::Url,
+    ) -> Result<CacheDecision, RequestError> {
+        if !request.is_cacheable_method() {
+            return Ok(CacheDecision::Miss(None));
+        }
+        self.observe(request, NetworkPhase::CacheLookup, url, None, false);
+        let cache_lookup = matches!(
+            request.cache_mode(),
+            CacheMode::Default
+                | CacheMode::OnlyIfCached
+                | CacheMode::ForceCache
+                | CacheMode::NoCache
+        );
+        let mut revalidation = None;
+        let cached = match request.cache_mode() {
+            CacheMode::NoCache => {
+                revalidation = self.inner.cache.lookup_for_revalidation(request, url);
+                None
+            }
+            _ => match cache_lookup
+                .then(|| self.inner.cache.lookup(request, url))
+                .flatten()
+            {
+                Some(CacheLookup::Fresh(response)) => Some(response),
+                Some(CacheLookup::Stale {
+                    response,
+                    may_serve_stale: true,
+                    ..
+                }) if request.cache_mode() == CacheMode::ForceCache => Some(response),
+                Some(CacheLookup::Stale {
+                    response,
+                    validator,
+                    ..
+                }) => {
+                    revalidation = validator.map(|validator| (response, validator));
+                    None
+                }
+                None => None,
+            },
+        };
+        if let Some(cached) = cached {
+            return self
+                .serve_cached_response(request, url, cached)
+                .map(CacheDecision::Hit);
+        }
+        if cache_lookup {
+            self.observe(request, NetworkPhase::CacheMiss, url, None, false);
             log::debug!(
-                "transport response: {} {} -> {status}",
+                "cache miss: {} {}",
                 request.method(),
                 crate::log_url::loggable(url.as_str())
             );
-            if !request.method().is_safe() {
-                self.invalidate_after_unsafe_response(&request, &url, &candidate);
-            }
-            if status == http::StatusCode::NOT_MODIFIED.as_u16()
-                && revalidation.is_some()
-                && let Some(cached) =
-                    self.inner
-                        .cache
-                        .merge_not_modified(&request, &url, &candidate.headers)
-            {
-                let mut body = if has_null_body(request.method(), cached.status) {
-                    Body::null()
-                } else {
-                    Body::once_bytes_with_signal(cached.body, request.signal().clone())
-                };
-                body.set_response_metadata(&cached.headers, None);
-                response = InternalResponse::from_http_parts(
-                    cached.status,
-                    cached.headers,
-                    cached.url,
-                    request.context(),
-                    body,
-                    true,
-                    cached.cookie_headers_processed,
-                );
-                response.apply_request_state(&request);
-                break;
-            }
-            if !matches!(status, 301 | 302 | 303 | 307 | 308) {
-                response = candidate;
-                break;
-            }
-
-            let Some(location) = candidate.headers.get(http::header::LOCATION) else {
-                // A redirect status without Location is an ordinary response;
-                // there is no target for Fetch's redirect algorithm to follow.
-                response = candidate;
-                break;
-            };
-
-            if request.redirect_mode() == crate::RedirectMode::Manual {
-                candidate.redirect_count = request.redirect_count() + 1;
-                self.finalize_http_response(
-                    &request,
-                    &url,
-                    &mut candidate,
-                    ResponseFinalization::ManualRedirect,
-                )?;
-                log::debug!(
-                    "manual redirect {status} returned as opaque from {}",
-                    crate::log_url::loggable(url.as_str())
-                );
-                candidate.body = Body::null();
-                return Ok(candidate.expose());
-            }
-
-            if request.redirect_mode() == crate::RedirectMode::Error {
-                log::warn!(
-                    "redirect {status} from {} refused by redirect mode error",
-                    crate::log_url::loggable(url.as_str())
-                );
-                return Err(RequestError::RedirectFailure);
-            }
-            let location = location.to_str().map_err(|_| {
-                log::warn!(
-                    "redirect {status} from {} has a non-text location header",
-                    crate::log_url::loggable(url.as_str())
-                );
-                RequestError::RedirectFailure
-            })?;
-            let next_url = url.join(location).map_err(|_| {
-                log::warn!(
-                    "redirect {status} from {} has an invalid location",
-                    crate::log_url::loggable(url.as_str())
-                );
-                RequestError::RedirectFailure
-            })?;
-
-            self.finalize_http_response(
-                &request,
-                &url,
-                &mut candidate,
-                ResponseFinalization::Standard,
-            )
-            .inspect_err(|_| {
-                self.clear_preflight_cache_after_failure(&request, &url);
-            })?;
-            self.inner
-                .policy
-                .validate_redirect_location(&next_url)
-                .inspect_err(|error| {
-                    log::warn!(
-                        "redirect target blocked: {} -> {} ({})",
-                        crate::log_url::loggable(url.as_str()),
-                        crate::log_url::loggable(next_url.as_str()),
-                        crate::log_url::loggable_error(error)
-                    );
-                })?;
-            if request.redirect_count() >= 20 {
-                log::warn!(
-                    "redirect limit reached at {}",
-                    crate::log_url::loggable(url.as_str())
-                );
-                return Err(RequestError::RedirectFailure);
-            }
-
-            let rewrite_to_get = (matches!(status, 301 | 302)
-                && request.method() == http::Method::POST)
-                || (status == 303
-                    && !matches!(request.method(), &http::Method::GET | &http::Method::HEAD));
-            if had_nonreplayable_body && !rewrite_to_get {
-                log::warn!(
-                    "cannot replay request body for {status} redirect from {}",
-                    crate::log_url::loggable(url.as_str())
-                );
-                return Err(RequestError::RedirectFailure);
-            }
-            log::debug!(
-                "following redirect {status}: {} -> {} (hop {})",
-                crate::log_url::loggable(url.as_str()),
-                crate::log_url::loggable(next_url.as_str()),
-                request.redirect_count() + 1
-            );
-            self.observe(&request, NetworkPhase::Redirect, &url, Some(status), false);
-            request.transition_to_redirect(next_url.clone(), &candidate.headers, rewrite_to_get)?;
-            self.inner
-                .policy
-                .validate_redirect_target(&request, &next_url)
-                .inspect_err(|error| {
-                    log::warn!(
-                        "redirect hop policy blocked: {} ({})",
-                        crate::log_url::loggable(next_url.as_str()),
-                        crate::log_url::loggable_error(error)
-                    );
-                })?;
-            url = next_url;
         }
+        if request.cache_mode() == CacheMode::OnlyIfCached {
+            log::debug!(
+                "only-if-cached request has no cache entry: {}",
+                crate::log_url::loggable(url.as_str())
+            );
+            return Err(RequestError::NetworkError);
+        }
+        Ok(CacheDecision::Miss(revalidation))
+    }
 
-        self.finalize_http_response(
-            &request,
-            &url,
-            &mut response,
-            ResponseFinalization::Standard,
-        )
-        .inspect_err(|_| {
-            self.clear_preflight_cache_after_failure(&request, &url);
-        })?;
+    /// Finalizes and exposes a cached representation without selecting cookies.
+    fn serve_cached_response(
+        &self,
+        request: &Request,
+        url: &reqwest::Url,
+        cached: StoredResponse,
+    ) -> Result<Response, RequestError> {
         self.observe(
-            &request,
+            request,
+            NetworkPhase::CacheHit,
+            url,
+            Some(cached.status.as_u16()),
+            true,
+        );
+        log::debug!(
+            "cache hit: {} {} -> {} ({} bytes)",
+            request.method(),
+            crate::log_url::loggable(url.as_str()),
+            cached.status,
+            cached.body.len()
+        );
+        let mut response = self.response_from_stored(request, cached);
+        self.finalize_response(request, &mut response, ResponseFinalization::Standard)
+            .inspect_err(|_| self.clear_preflight_cache_after_failure(request, url))?;
+        self.observe(
+            request,
+            NetworkPhase::ResponseFinalized,
+            url,
+            Some(response.status.as_u16()),
+            true,
+        );
+        Ok(response.expose())
+    }
+
+    /// Creates an internal response from a stored HTTP representation.
+    fn response_from_stored(&self, request: &Request, cached: StoredResponse) -> InternalResponse {
+        let mut body = if has_null_body(request.method(), cached.status) {
+            Body::null()
+        } else {
+            Body::once_bytes_with_signal(cached.body, request.signal().clone())
+        };
+        body.set_response_metadata(&cached.headers, None);
+        let mut response = InternalResponse::from_http_parts(
+            cached.status,
+            cached.headers,
+            cached.url,
+            request.context(),
+            body,
+            true,
+            cached.cookie_headers_processed,
+        );
+        response.apply_request_state(request);
+        response
+    }
+
+    /// Submits one cache-miss hop and merges a successful conditional response.
+    async fn submit_http_hop(
+        &self,
+        request: &mut Request,
+        url: &reqwest::Url,
+        mut transport_headers: crate::Headers,
+        revalidation: Option<(StoredResponse, CacheValidator)>,
+    ) -> Result<InternalResponse, RequestError> {
+        if let Some((_, validator)) = &revalidation {
+            validator.apply(&mut transport_headers)?;
+        }
+        let validated = self.finish_http_hop(request, url, transport_headers)?;
+        let mut response = self
+            .inner
+            .scheduler
+            .submit(validated, request.transport_priority())
+            .await
+            .inspect_err(|_| self.clear_preflight_cache_after_failure(request, url))?;
+        response.apply_request_state(request);
+        log::debug!(
+            "transport response: {} {} -> {}",
+            request.method(),
+            crate::log_url::loggable(url.as_str()),
+            response.status
+        );
+        if !request.method().is_safe() {
+            self.invalidate_after_unsafe_response(request, url, &response);
+        }
+        if response.status == http::StatusCode::NOT_MODIFIED
+            && revalidation.is_some()
+            && let Some(cached) =
+                self.inner
+                    .cache
+                    .merge_not_modified(request, url, &response.headers)
+        {
+            return Ok(self.response_from_stored(request, cached));
+        }
+        Ok(response)
+    }
+
+    /// Processes a response as terminal, manual redirect, or followed redirect.
+    fn process_http_result(
+        &self,
+        request: &mut Request,
+        url: &reqwest::Url,
+        mut response: InternalResponse,
+        had_nonreplayable_body: bool,
+    ) -> Result<HopResult, RequestError> {
+        let status = response.status.as_u16();
+        if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+            return Ok(HopResult::Complete(response));
+        }
+        let Some(location) = response.headers.get(http::header::LOCATION) else {
+            return Ok(HopResult::Complete(response));
+        };
+        if request.redirect_mode() == crate::RedirectMode::Manual {
+            response.redirect_count = request.redirect_count() + 1;
+            self.finalize_http_response(
+                request,
+                url,
+                &mut response,
+                ResponseFinalization::ManualRedirect,
+            )?;
+            log::debug!(
+                "manual redirect {status} returned as opaque from {}",
+                crate::log_url::loggable(url.as_str())
+            );
+            response.body = Body::null();
+            return Ok(HopResult::Expose(response.expose()));
+        }
+        if request.redirect_mode() == crate::RedirectMode::Error {
+            log::warn!(
+                "redirect {status} from {} refused by redirect mode error",
+                crate::log_url::loggable(url.as_str())
+            );
+            return Err(RequestError::RedirectFailure);
+        }
+        let location = location.to_str().map_err(|_| {
+            log::warn!(
+                "redirect {status} from {} has a non-text location header",
+                crate::log_url::loggable(url.as_str())
+            );
+            RequestError::RedirectFailure
+        })?;
+        let next_url = url.join(location).map_err(|_| {
+            log::warn!(
+                "redirect {status} from {} has an invalid location",
+                crate::log_url::loggable(url.as_str())
+            );
+            RequestError::RedirectFailure
+        })?;
+        self.finalize_http_response(request, url, &mut response, ResponseFinalization::Standard)
+            .inspect_err(|_| self.clear_preflight_cache_after_failure(request, url))?;
+        self.inner
+            .policy
+            .validate_redirect_location(&next_url)
+            .inspect_err(|error| {
+                log::warn!(
+                    "redirect target blocked: {} -> {} ({})",
+                    crate::log_url::loggable(url.as_str()),
+                    crate::log_url::loggable(next_url.as_str()),
+                    crate::log_url::loggable_error(error)
+                );
+            })?;
+        if request.redirect_count() >= 20 {
+            log::warn!(
+                "redirect limit reached at {}",
+                crate::log_url::loggable(url.as_str())
+            );
+            return Err(RequestError::RedirectFailure);
+        }
+        let rewrite_to_get = (matches!(status, 301 | 302)
+            && request.method() == http::Method::POST)
+            || (status == 303
+                && !matches!(request.method(), &http::Method::GET | &http::Method::HEAD));
+        if had_nonreplayable_body && !rewrite_to_get {
+            log::warn!(
+                "cannot replay request body for {status} redirect from {}",
+                crate::log_url::loggable(url.as_str())
+            );
+            return Err(RequestError::RedirectFailure);
+        }
+        log::debug!(
+            "following redirect {status}: {} -> {} (hop {})",
+            crate::log_url::loggable(url.as_str()),
+            crate::log_url::loggable(next_url.as_str()),
+            request.redirect_count() + 1
+        );
+        self.observe(request, NetworkPhase::Redirect, url, Some(status), false);
+        request.transition_to_redirect(next_url.clone(), &response.headers, rewrite_to_get)?;
+        self.inner
+            .policy
+            .validate_redirect_target(request, &next_url)
+            .inspect_err(|error| {
+                log::warn!(
+                    "redirect hop policy blocked: {} ({})",
+                    crate::log_url::loggable(next_url.as_str()),
+                    crate::log_url::loggable_error(error)
+                );
+            })?;
+        Ok(HopResult::Follow(next_url))
+    }
+
+    /// Finalizes a terminal response and arranges cache storage when allowed.
+    fn finalize_and_cache_http_response(
+        &self,
+        request: &Request,
+        url: reqwest::Url,
+        mut response: InternalResponse,
+    ) -> Result<Response, RequestError> {
+        self.finalize_http_response(request, &url, &mut response, ResponseFinalization::Standard)
+            .inspect_err(|_| self.clear_preflight_cache_after_failure(request, &url))?;
+        self.observe(
+            request,
             NetworkPhase::ResponseFinalized,
             &url,
             Some(response.status.as_u16()),
@@ -320,7 +366,7 @@ impl RequestController {
                     crate::log_url::loggable(url.as_str())
                 );
                 self.inner.cache.insert(
-                    &request,
+                    request,
                     &url,
                     StoredResponse {
                         status: response.status,
@@ -330,15 +376,15 @@ impl RequestController {
                         cookie_headers_processed: response.cookie_headers_processed,
                     },
                 );
-                return Ok(response.expose());
+            } else {
+                response = with_cache_capture(
+                    response,
+                    self.inner.cache.clone(),
+                    request.for_cache(),
+                    url,
+                    self.inner.max_cache_body_size,
+                )?;
             }
-            response = with_cache_capture(
-                response,
-                self.inner.cache.clone(),
-                request.for_cache(),
-                url,
-                self.inner.max_cache_body_size,
-            )?;
         }
         Ok(response.expose())
     }
