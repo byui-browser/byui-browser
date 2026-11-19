@@ -366,6 +366,15 @@ fn style_document_with_stats_context(
                 parent_font_size
             });
         properties.insert("font-size".to_owned(), values::format_px(font_size));
+        if let Some(percent) = properties
+            .get("line-height")
+            .and_then(|value| values::parse_percentage(value))
+        {
+            properties.insert(
+                "line-height".to_owned(),
+                values::format_px(font_size * percent / 100.0),
+            );
+        }
         if root_font_size.is_none() {
             root_font_size = Some(font_size);
         }

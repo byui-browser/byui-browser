@@ -2,7 +2,7 @@
 //!
 //! [`css::style_document`] produces cascaded, inherited declarations as text.
 //! This module parses `display`, box dimensions and edges, text colors, and
-//! `text-align`, `border-*-radius`, and the initial flex subset (`flex-direction`, `flex-grow`, and `gap`). Other
+//! `text-align`, `line-height`, `border-*-radius`, and the initial flex subset (`flex-direction`, `flex-grow`, and `gap`). Other
 //! properties use their initial values. A missing or unparsable value falls back to the initial
 //! value. Lengths are resolved to CSS pixels here; percentages are kept
 //! because they resolve against the containing block during layout.
@@ -231,6 +231,41 @@ pub(crate) enum TextTransform {
     Capitalize,
 }
 
+/// Computed `line-height`; unitless values remain multipliers so descendants
+/// apply them to their own font size, while lengths and percentages inherit as lengths.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum LineHeight {
+    Normal,
+    Number(f32),
+    Length(f32),
+}
+
+impl LineHeight {
+    fn parse(value: &str, context: &LengthContext, font_size: f32) -> Option<Self> {
+        let value = value.trim().to_ascii_lowercase();
+        if value == "normal" {
+            return Some(Self::Normal);
+        }
+        if let Ok(number) = value.parse::<f32>() {
+            return (number.is_finite() && number >= 0.0).then_some(Self::Number(number));
+        }
+        if let Some(percent) = parse_percentage(&value) {
+            let px = font_size * percent / 100.0;
+            return (px.is_finite() && px >= 0.0).then_some(Self::Length(px));
+        }
+        let px = parse_length(&value)?.to_px(context);
+        (px.is_finite() && px >= 0.0).then_some(Self::Length(px))
+    }
+
+    pub(crate) fn used(self, font_size: f32, normal: f32) -> f32 {
+        match self {
+            Self::Normal => normal,
+            Self::Number(n) => font_size * n,
+            Self::Length(px) => px,
+        }
+    }
+}
+
 impl TextTransform {
     /// Parses a `text-transform` value, returning `None` for unsupported
     /// or invalid values.
@@ -353,6 +388,7 @@ pub(crate) struct ComputedStyle {
     /// `max-height`, as for `max_width`.
     pub max_height: Dimension,
     pub font_size: f32,
+    pub line_height: LineHeight,
     /// The computed `font-family` list, unquoted, in order of preference.
     /// Empty means the user agent's default font.
     pub font_families: Rc<[String]>,
@@ -397,6 +433,7 @@ impl ComputedStyle {
             max_width: Dimension::Auto,
             max_height: Dimension::Auto,
             font_size: parent.map_or(css::values::MEDIUM_FONT_SIZE, |parent| parent.font_size),
+            line_height: parent.map_or(LineHeight::Normal, |parent| parent.line_height),
             font_families: parent.map_or_else(
                 || Rc::from(Vec::new()),
                 |parent| Rc::clone(&parent.font_families),
@@ -454,6 +491,20 @@ impl ComputedStyle {
                     style.font_size
                 ),
             }
+        }
+        if let Some(value) = get("line-height")
+            && let Some(line_height) = LineHeight::parse(
+                value,
+                &LengthContext {
+                    font_size: style.font_size,
+                    root_font_size,
+                    viewport_width: viewport.width,
+                    viewport_height: viewport.height,
+                },
+                style.font_size,
+            )
+        {
+            style.line_height = line_height;
         }
         if let Some(value) = get("font-family") {
             style.font_families = css::parse_font_family_list(value).into();

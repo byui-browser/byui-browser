@@ -317,6 +317,29 @@ fn text_align_places_each_line_in_the_line_box() {
 }
 
 #[test]
+fn line_height_lengths_and_inherited_numbers_set_line_box_height() {
+    let (document, tree) = lay_out(
+        "<body><p id='length' style='line-height: 40px'>a<br>b</p><div style='font-size: 20px; line-height: 1.5'><p id='number' style='font-size: 10px'>a<br>b</p></div><div style='font-size: 20px; line-height: 150%'><p id='percent' style='font-size: 10px'>a<br>b</p></div></body>",
+        "body { margin: 0 } p { margin: 0 } div { margin: 0 }",
+        200.0,
+    );
+    let length = box_for(&tree, &document, "length");
+    assert_eq!(length.lines.len(), 2);
+    assert_close(length.lines[0].rect.height, 40.0);
+    assert_close(length.lines[1].rect.y - length.lines[0].rect.y, 40.0);
+
+    let number = box_for(&tree, &document, "number");
+    // Unitless line-height inherits as a multiplier and uses the child's 10px font.
+    assert_close(number.lines[0].rect.height, 15.0);
+    assert_close(number.lines[1].rect.y - number.lines[0].rect.y, 15.0);
+
+    let percent = box_for(&tree, &document, "percent");
+    // Percentage line-height computes to a length on the parent before inheritance.
+    assert_close(percent.lines[0].rect.height, 30.0);
+    assert_close(percent.lines[1].rect.y - percent.lines[0].rect.y, 30.0);
+}
+
+#[test]
 fn text_align_is_inherited_and_moves_inline_boxes_and_atomics() {
     let (document, tree) = lay_out(
         "<body><div><p id='p'><span id='s'>ab</span><b id='b'>x</b></p></div></body>",
