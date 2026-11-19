@@ -606,6 +606,15 @@ fn compute(
             parent_font_size
         });
     properties.insert("font-size".to_owned(), values::format_px(font_size));
+    if let Some(percent) = properties
+        .get("line-height")
+        .and_then(|value| values::parse_percentage(value))
+    {
+        properties.insert(
+            "line-height".to_owned(),
+            values::format_px(font_size * percent / 100.0),
+        );
+    }
     (
         properties
             .into_iter()
