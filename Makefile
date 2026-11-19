@@ -30,7 +30,7 @@ else ifeq ($(ARGS),shell)
 else ifeq ($(OS),Windows_NT)
 	cargo run -p byui-browser-windows $(RUN_ARGS)
 else ifneq (,$(filter Darwin darwin,$(shell uname -s)))
-	cargo run -p browser-macos $(RUN_ARGS)
+	cargo run -p byui-browser $(RUN_ARGS)
 else ifneq (,$(filter Linux linux,$(shell uname -s)))
 	cargo run -p browser-linux $(RUN_ARGS)
 else ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(shell uname -s)))
@@ -54,7 +54,7 @@ ifeq ($(strip $(ARGS)),)
 	$(error Usage: make release <platform> (macos|linux|windows))
 endif
 ifeq ($(ARGS),macos)
-	cargo build --locked --release --target aarch64-apple-darwin -p browser-macos
+	cargo build --locked --release --target aarch64-apple-darwin -p byui-browser
 else ifeq ($(ARGS),linux)
 	cargo build --locked --release --target x86_64-unknown-linux-gnu -p browser-linux
 else ifeq ($(ARGS),windows)

@@ -38,8 +38,46 @@ pub fn get_element_by_id(document: &Document, arguments: &[Value]) -> JsResult<V
     })
 }
 
+/// Installs document-wide tag lookup, including the document element.
+///
+/// Results preserve tree order, namespace matching, and wrapper identity.
+/// Limitation: this shares Element's snapshot HTMLCollection implementation;
+/// later DOM mutations are visible on a new query, not on an existing result.
+fn install_get_elements_by_tag_name(object: &Object, document: &Arc<Mutex<Document>>) {
+    use crate::element::get_elements_by_tag_name::{collection, matching_descendants};
+    let document = Arc::clone(document);
+    object.set_method(
+        "getElementsByTagName",
+        Arc::new(move |arguments| {
+            let argument = arguments.first().ok_or_else(|| {
+                crate::element::thrown_exception(
+                    "TypeError",
+                    "Document.getElementsByTagName() requires 1 argument, but 0 were present",
+                )
+            })?;
+            let name = argument.to_string();
+            let matches = {
+                let locked = document.lock().unwrap();
+                locked
+                    .html_document()
+                    .map(|source| matching_descendants(source, source.root, &name))
+                    .unwrap_or_default()
+            };
+            let mut entries = Vec::with_capacity(matches.len());
+            for (id, names) in matches {
+                entries.push((crate::element::wrap_element(&document, id)?, names));
+            }
+            Ok(Value::Array(collection(entries)))
+        }),
+    );
+}
+
 /// Registers the DOM methods and `Event` constructor supported by this crate
 /// on the global JavaScript environment.
+///
+/// `document.getElementsByTagName(name)` matches descendants in tree order,
+/// including the document element, and returns shared element wrappers.
+/// Its HTMLCollection is currently a snapshot: query again after DOM changes.
 ///
 /// The same `Document` object is exposed as both the global `document` and
 /// `window.document`, matching the HTML Standard's readonly
@@ -225,6 +263,7 @@ fn register_shared_document(
             })
         }),
     );
+    install_get_elements_by_tag_name(&document_object, &shared_document);
     let by_class_document = shared_document.clone();
     let by_class_registry = custom_elements_registry.clone();
     document_object.set_method(

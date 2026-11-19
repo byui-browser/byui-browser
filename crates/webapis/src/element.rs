@@ -21,7 +21,7 @@ mod dataset;
 mod first_child;
 mod focus;
 mod get_elements_by_class_name;
-mod get_elements_by_tag_name;
+pub(crate) mod get_elements_by_tag_name;
 mod has_attribute;
 mod node_type;
 mod node_view;

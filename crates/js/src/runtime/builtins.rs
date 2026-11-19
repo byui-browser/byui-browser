@@ -1,6 +1,6 @@
 //! ECMAScript built-ins that do not depend on browser host APIs.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{Function, JsError, JsResult, Object, Value};
 
@@ -393,8 +393,12 @@ fn set_constructor() -> Function {
     )
 }
 
+// Well-known symbols share identity across constructors and realms.
+// Limitation: like Symbol(), dispose is an object handle; symbol primitives,
+// symbol-keyed properties, and automatic resource disposal are not modeled.
 fn symbol_constructor() -> Function {
-    Function::from_host(
+    static DISPOSE: OnceLock<Object> = OnceLock::new();
+    let function = Function::from_host(
         "Symbol",
         Arc::new(|args| {
             let symbol = Object::new();
@@ -403,7 +407,19 @@ fn symbol_constructor() -> Function {
             }
             Ok(Value::Object(symbol))
         }),
-    )
+    );
+    let dispose = DISPOSE.get_or_init(|| {
+        let symbol = Object::new();
+        symbol.set_read_only("description", Value::String("Symbol.dispose".into()));
+        symbol
+    });
+    match &*function.0 {
+        super::FunctionKind::Host { properties, .. } => {
+            properties.set_read_only("dispose", Value::Object(dispose.clone()));
+        }
+        _ => unreachable!(),
+    }
+    function
 }
 
 fn object_argument(args: &[Value], index: usize) -> JsResult<Object> {

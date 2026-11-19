@@ -32,7 +32,9 @@ pub use vm::Vm;
 /// function or property table, and `==`/`===` compare them by identity.
 ///
 /// Symbols are currently represented by identity-bearing object handles rather
-/// than a distinct primitive variant. Bigints and other built-in object kinds
+/// than a distinct primitive variant. This includes the shared, read-only
+/// `Symbol.dispose` handle; symbol property keys and automatic resource
+/// disposal are not implemented. Bigints and other built-in object kinds
 /// remain unsupported.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {

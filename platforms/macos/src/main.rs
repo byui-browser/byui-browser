@@ -1,4 +1,4 @@
-//! Minimal macOS shell. Run with `cargo run -p browser-macos`.
+//! Minimal macOS shell. Run with `cargo run -p byui-browser`.
 //!
 //! The window, toolbar, and page rendering come from the shared
 //! `browser-shell` crate; this crate only describes the macOS window, which
@@ -154,5 +154,5 @@ fn sync_native_chrome(window: &winit::window::Window) -> bool {
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    eprintln!("browser-macos requires macOS.");
+    eprintln!("byui-browser requires macOS.");
 }

@@ -1,5 +1,5 @@
 [package]
-name = "browser-macos"
+name = "byui-browser"
 description = "Minimal native macOS window for BYUI Browser"
 version.workspace = true
 edition.workspace = true

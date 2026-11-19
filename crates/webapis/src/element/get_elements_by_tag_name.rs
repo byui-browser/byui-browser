@@ -61,12 +61,12 @@ pub(super) fn install(object: &Object, element: &Element, document: &Arc<Mutex<D
 
 /// Values of a matched element's `id` and `name` attributes, captured for
 /// `HTMLCollection.namedItem()` while the document lock is held.
-pub(super) type ItemNames = (Option<String>, Option<String>);
+pub(crate) type ItemNames = (Option<String>, Option<String>);
 
 /// Returns the descendants of `root` (excluding `root`) in tree order whose
 /// qualified name matches `qualified_name`, with their `id` and `name`
 /// attribute values.
-fn matching_descendants(
+pub(crate) fn matching_descendants(
     source: &HTMLDocument,
     root: NodeID,
     qualified_name: &str,
@@ -105,7 +105,7 @@ fn matching_descendants(
 }
 
 /// Builds the snapshot `HTMLCollection` array-like for `entries`.
-pub(super) fn collection(entries: Vec<(Value, ItemNames)>) -> Object {
+pub(crate) fn collection(entries: Vec<(Value, ItemNames)>) -> Object {
     let collection = Object::new();
     for (index, (wrapper, _)) in entries.iter().enumerate() {
         collection.set(index.to_string(), wrapper.clone());

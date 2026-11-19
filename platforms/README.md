@@ -5,7 +5,7 @@ Thin native shells that host the browser UI. The engine produces pixels and even
 | Directory  | Platform                 | Owning team | Status          |
 |------------|--------------------------|-------------|-----------------|
 | `shell/`   | Shared (`winit`)         | Browser UX  | Window, toolbar, and page rendering used by every shell |
-| `macos/`   | macOS (AppKit via winit) | Browser UX  | Runs: `cargo run -p browser-macos` |
+| `macos/`   | macOS (AppKit via winit) | Browser UX  | Runs: `cargo run -p byui-browser` |
 | `linux/`   | X11 and Wayland via winit| Browser UX  | Runs: `cargo run -p browser-linux` |
 | `windows/` | Win32 / WinUI            | Browser UX  | Runs: `cargo run -p byui-browser-windows` |
 | `js/`      | Interactive JavaScript  | JavaScript Engine | Runs: `cargo run -p browser-js` |

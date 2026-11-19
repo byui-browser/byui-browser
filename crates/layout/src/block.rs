@@ -82,10 +82,7 @@ impl Context<'_> {
     ) -> BlockResult {
         let style = &block.style;
         let basis = Some(cb.width);
-        let padding = style
-            .padding
-            .map(|value| value.resolve_or_zero(basis))
-            .horizontal();
+        let padding = style.outer_edges(basis).horizontal();
         let margin_left = style.margin.left.resolve(basis);
         let margin_right = style.margin.right.resolve(basis);
         let used_width = match &block.contents {
@@ -165,10 +162,7 @@ impl Context<'_> {
     ) -> BlockResult {
         let style = &block.style;
         let basis = Some(cb_width);
-        let padding = style
-            .padding
-            .map(|value| value.resolve_or_zero(basis))
-            .horizontal();
+        let padding = style.outer_edges(basis).horizontal();
         let margin_left = style.margin.left.resolve_or_zero(basis);
         let margin_right = style.margin.right.resolve_or_zero(basis);
         let replaced_width = match &block.contents {
@@ -290,7 +284,7 @@ impl Context<'_> {
         };
         let style = &block.style;
         let basis = Some(cb.width);
-        let padding = style.padding.map(|value| value.resolve_or_zero(basis));
+        let padding = style.outer_edges(basis);
         let margin_top = style.margin.top.resolve_or_zero(basis);
         let margin_bottom = style.margin.bottom.resolve_or_zero(basis);
         // Percentage heights resolve only against a definite containing block
@@ -397,10 +391,16 @@ impl Context<'_> {
             height: content_height + padding.vertical(),
         };
         // A positioned box is the containing block of its absolutely
-        // positioned descendants: its padding box, which is the border box
-        // since borders are not supported (CSS 2.2 §10.1).
+        // positioned descendants: its padding box (CSS 2.2 §10.1).
         if style.is_positioned() && !absolutes.is_empty() {
-            absolutes = self.place_absolutes(absolutes, border_box, false, &mut children);
+            let b = style.borders.border_width;
+            let padding_box = Rect {
+                x: b.left,
+                y: b.top,
+                width: (border_box.width - b.horizontal()).max(0.0),
+                height: (border_box.height - b.vertical()).max(0.0),
+            };
+            absolutes = self.place_absolutes(absolutes, padding_box, false, &mut children);
         }
         log::trace!(
             "laid out {kind:?} node {:?}: content {}x{}, margin top/bottom {margin_top}/{margin_bottom}, {} children, {} lines",
@@ -421,7 +421,7 @@ impl Context<'_> {
                     bottom: margin_bottom,
                     left: margin_left,
                 },
-                padding,
+                padding: style.padding.map(|v| v.resolve_or_zero(basis)),
                 style: box_style(style),
                 placement: placement(style),
                 children,
@@ -593,10 +593,7 @@ impl Context<'_> {
         // Each item's main-axis padding: free space is what is left after
         // the items' outer sizes, not just their content sizes.
         let main_padding = |item: &BlockBox| {
-            let padding = item
-                .style
-                .padding
-                .map(|value| value.resolve_or_zero(Some(width)));
+            let padding = item.style.outer_edges(Some(width));
             if column {
                 padding.vertical()
             } else {
@@ -715,12 +712,7 @@ impl Context<'_> {
             let item_width = if column {
                 width
             } else {
-                target
-                    + item
-                        .style
-                        .padding
-                        .map(|value| value.resolve_or_zero(Some(width)))
-                        .horizontal()
+                target + item.style.outer_edges(Some(width)).horizontal()
             };
             let result = self.layout_block_level(
                 &item,
@@ -787,7 +779,8 @@ impl Context<'_> {
             Dimension::Px(px) => px,
             _ => 0.0,
         };
-        let outer = fixed(style.padding.left)
+        let outer = style.borders.border_width.horizontal()
+            + fixed(style.padding.left)
             + fixed(style.padding.right)
             + fixed(style.margin.left)
             + fixed(style.margin.right);
@@ -856,6 +849,9 @@ pub(crate) fn box_style(style: &ComputedStyle) -> BoxStyle {
     BoxStyle {
         background_color: style.background_color,
         text_color: style.color,
+        border_width: style.borders.border_width,
+        border_color: style.borders.border_color,
+        border_style: style.borders.border_style.clone(),
         border_radius: style.border_radius,
         box_shadow: Arc::clone(&style.box_shadow),
     }

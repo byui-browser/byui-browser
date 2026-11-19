@@ -1,4 +1,4 @@
-//! The bottom DevTools dock: a small read-only Elements tree derived from
+//! The resizable DevTools dock: a small read-only Elements tree derived from
 //! loaded HTML (not the live JS DOM), the Compatibility audit from
 //! [`crate::compat_panel`], the Network and Console session logs, and the
 //! Performance timeline.
@@ -47,6 +47,16 @@ impl DockTab {
     }
 }
 
+/// Edge of the content area occupied by DevTools.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DockPosition {
+    Left,
+    Right,
+    Top,
+    #[default]
+    Bottom,
+}
+
 /// Parsed element hierarchy, the Compatibility view, and docked-panel
 /// scrolling state. Each tab keeps its own scroll position.
 pub(crate) struct ElementsPanel {
@@ -56,6 +66,12 @@ pub(crate) struct ElementsPanel {
     visible: usize,
     wheel_remainder: f64,
     bounds: Option<Rect>,
+    dock: DockPosition,
+    extent: Option<f64>,
+    dragging: bool,
+    dock_menu_open: bool,
+    tab_menu_open: bool,
+    viewport: (f64, f64),
     tab: DockTab,
     /// The Compatibility tab's content. The app fills it with audit results.
     pub(crate) compat: CompatView,
@@ -76,6 +92,12 @@ impl ElementsPanel {
             visible: 0,
             wheel_remainder: 0.0,
             bounds: None,
+            dock: DockPosition::Bottom,
+            extent: None,
+            dragging: false,
+            dock_menu_open: false,
+            tab_menu_open: false,
+            viewport: (0.0, 0.0),
             tab: DockTab::Elements,
             compat: CompatView::new(),
             network: NetworkLog::new(),
@@ -155,16 +177,25 @@ impl ElementsPanel {
         self.rows.iter().any(|(_, row)| *row == tag)
     }
 
-    /// Fits a bottom dock into the content area, leaving the upper page visible.
+    /// Fits the selected dock into the page, clamping its logical-pixel size.
     pub(crate) fn resize(&mut self, width: f64, height: f64) {
-        let available = (height - 60.0).max(0.0);
-        let dock_height = (available * 0.5).min(320.0).round();
-        self.bounds = Rect::from_xywh(
-            INSET,
-            (height - f64::from(INSET) - dock_height) as f32,
-            (width - 2.0 * f64::from(INSET)).max(0.0) as f32,
-            dock_height as f32,
-        );
+        self.viewport = (width, height);
+        let top = toolbar::PAGE_TOP as f32;
+        let available_w = (width as f32 - 2.0 * INSET).max(0.0);
+        let available_h = (height as f32 - INSET - top).max(0.0);
+        let vertical = matches!(self.dock, DockPosition::Left | DockPosition::Right);
+        let available = if vertical { available_w } else { available_h };
+        let maximum = (available - 80.0).max(0.0);
+        let extent = (self.extent.unwrap_or((available as f64 * 0.5).min(320.0)) as f32)
+            .clamp(160.0_f32.min(maximum), maximum);
+        let (x, y, w, h) = match self.dock {
+            DockPosition::Left => (INSET, top, extent, available_h),
+            DockPosition::Right => (INSET + available_w - extent, top, extent, available_h),
+            DockPosition::Top => (INSET, top, available_w, extent),
+            DockPosition::Bottom => (INSET, top + available_h - extent, available_w, extent),
+        };
+        self.bounds = Rect::from_xywh(x, y, w, h);
+        let dock_height = f64::from(h);
         let footer = if self.message.is_some() { FOOTER } else { 0.0 };
         let tree = dock_height - f64::from(HEADER + 2.0 * TREE_PAD + footer);
         self.visible = (tree / f64::from(ROW)).max(0.0) as usize;
@@ -172,6 +203,172 @@ impl ElementsPanel {
         let body = dock_height - f64::from(HEADER + 2.0 * TREE_PAD);
         self.compat
             .set_visible((body / f64::from(ROW)).max(0.0) as usize);
+    }
+
+    /// Whether the pointer is on the draggable edge facing the page.
+    pub(crate) fn resize_at(&self, cursor: Option<(f64, f64)>) -> bool {
+        let (Some(b), Some((x, y))) = (self.bounds, cursor) else {
+            return false;
+        };
+        let (x, y) = (x as f32, y as f32);
+        match self.dock {
+            DockPosition::Left => (x - b.right()).abs() <= 5.0 && y >= b.top() && y <= b.bottom(),
+            DockPosition::Right => (x - b.left()).abs() <= 5.0 && y >= b.top() && y <= b.bottom(),
+            DockPosition::Top => (y - b.bottom()).abs() <= 5.0 && x >= b.left() && x <= b.right(),
+            DockPosition::Bottom => (y - b.top()).abs() <= 5.0 && x >= b.left() && x <= b.right(),
+        }
+    }
+
+    /// Cursor feedback for the dock's resize edge, including an active drag.
+    pub(crate) fn resize_cursor(
+        &self,
+        cursor: Option<(f64, f64)>,
+    ) -> Option<winit::window::CursorIcon> {
+        (self.dragging || self.resize_at(cursor)).then_some(
+            if matches!(self.dock, DockPosition::Left | DockPosition::Right) {
+                winit::window::CursorIcon::EwResize
+            } else {
+                winit::window::CursorIcon::NsResize
+            },
+        )
+    }
+
+    /// Handles dock controls and captures divider drags until mouse release.
+    pub(crate) fn dock_mouse(&mut self, cursor: Option<(f64, f64)>, pressed: bool) -> bool {
+        if self.dragging {
+            if !pressed {
+                self.dragging = false;
+            }
+            return true;
+        }
+        if !pressed {
+            return false;
+        }
+        if self.tab_menu_open {
+            let selected = self
+                .tab_choices()
+                .into_iter()
+                .find(|(_, rect)| Self::in_rect(Some(*rect), cursor))
+                .map(|(tab, _)| tab);
+            self.tab_menu_open = false;
+            if let Some(tab) = selected {
+                self.set_tab(tab);
+            }
+            return true;
+        }
+        if self.compact_tabs() && self.tab_at(cursor).is_some() {
+            self.tab_menu_open = true;
+            self.dock_menu_open = false;
+            self.network_view.close_menu();
+            self.compat.close_preview();
+            return true;
+        }
+        if Self::in_rect(self.dock_button(), cursor) {
+            self.dock_menu_open = !self.dock_menu_open;
+            self.network_view.close_menu();
+            self.compat.close_preview();
+            return true;
+        }
+        if self.dock_menu_open {
+            if let Some((dock, _)) = self
+                .dock_controls()
+                .into_iter()
+                .find(|(_, r)| Self::in_rect(Some(*r), cursor))
+            {
+                self.dock = dock;
+                self.extent = None;
+                self.resize(self.viewport.0, self.viewport.1);
+            }
+            self.dock_menu_open = false;
+            return true;
+        }
+        if self.resize_at(cursor) {
+            self.dragging = true;
+            return true;
+        }
+        false
+    }
+
+    /// Updates the panel size during a captured drag, even outside its bounds.
+    pub(crate) fn drag_to(&mut self, x: f64, y: f64) -> bool {
+        if !self.dragging {
+            return false;
+        }
+        let (w, h) = self.viewport;
+        self.extent = Some(match self.dock {
+            DockPosition::Left => x - f64::from(INSET),
+            DockPosition::Right => w - f64::from(INSET) - x,
+            DockPosition::Top => y - toolbar::PAGE_TOP,
+            DockPosition::Bottom => h - f64::from(INSET) - y,
+        });
+        self.resize(w, h);
+        true
+    }
+
+    fn dock_button(&self) -> Option<Rect> {
+        let b = self.bounds?;
+        if b.height() < HEADER || b.width() < 80.0 {
+            return None;
+        }
+        Rect::from_xywh(b.right() - 60.0, b.top() + 6.0, 24.0, 24.0)
+    }
+
+    fn dock_menu_rect(&self) -> Option<Rect> {
+        let button = self.dock_button()?;
+        Rect::from_xywh(button.right() - 112.0, button.bottom() + 8.0, 112.0, 32.0)
+    }
+
+    fn dock_controls(&self) -> Vec<(DockPosition, Rect)> {
+        if !self.dock_menu_open {
+            return Vec::new();
+        }
+        let Some(menu) = self.dock_menu_rect() else {
+            return Vec::new();
+        };
+        [
+            DockPosition::Left,
+            DockPosition::Right,
+            DockPosition::Top,
+            DockPosition::Bottom,
+        ]
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, dock)| {
+            Rect::from_xywh(menu.x() + 4.0 + i as f32 * 26.0, menu.y() + 4.0, 24.0, 24.0)
+                .map(|r| (dock, r))
+        })
+        .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tab_choice_center(&self, tab: DockTab) -> (f64, f64) {
+        let (_, rect) = self
+            .tab_choices()
+            .into_iter()
+            .find(|(t, _)| *t == tab)
+            .unwrap();
+        (
+            (rect.x() + rect.width() / 2.0) as f64,
+            (rect.y() + rect.height() / 2.0) as f64,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tab_center(&self, tab: DockTab) -> (f64, f64) {
+        let (_, rect) = self.tab_rects().find(|(t, _)| *t == tab).unwrap();
+        (
+            (rect.left() + rect.width() / 2.0) as f64,
+            (rect.top() + rect.height() / 2.0) as f64,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_center(&self) -> (f64, f64) {
+        let rect = self.close_rect().unwrap();
+        (
+            (rect.left() + rect.width() / 2.0) as f64,
+            (rect.top() + rect.height() / 2.0) as f64,
+        )
     }
 
     /// The tab currently shown.
@@ -182,6 +379,7 @@ impl ElementsPanel {
     /// Shows `tab`.
     pub(crate) fn set_tab(&mut self, tab: DockTab) {
         self.tab = tab;
+        self.tab_menu_open = false;
         self.network_view.close_menu();
         self.compat.close_preview();
         self.offset = self.offset.min(self.max_offset());
@@ -235,7 +433,10 @@ impl ElementsPanel {
     /// Closes the column menu or the Compatibility code preview, if open, so
     /// Escape dismisses it before the panel. Returns whether one was open.
     pub(crate) fn dismiss_menu(&mut self) -> bool {
-        self.compat.close_preview() | self.network_view.close_menu()
+        std::mem::take(&mut self.tab_menu_open)
+            | std::mem::take(&mut self.dock_menu_open)
+            | self.compat.close_preview()
+            | self.network_view.close_menu()
     }
 
     /// The Network table's area: below the tab strip, inside the panel.
@@ -274,15 +475,47 @@ impl ElementsPanel {
         self.offset = 0;
     }
 
-    /// Header tab rectangles in logical pixels.
+    fn compact_tabs(&self) -> bool {
+        let total: f32 = DockTab::ALL.into_iter().map(DockTab::width).sum();
+        self.bounds.is_some_and(|b| b.width() - 80.0 < total)
+    }
+
+    fn tab_choices(&self) -> Vec<(DockTab, Rect)> {
+        let Some(b) = self.bounds else {
+            return Vec::new();
+        };
+        DockTab::ALL
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, tab)| {
+                Rect::from_xywh(
+                    b.left() + 6.0,
+                    b.top() + HEADER + 4.0 + i as f32 * 28.0,
+                    (b.width() - 12.0).min(220.0),
+                    28.0,
+                )
+                .map(|rect| (tab, rect))
+            })
+            .collect()
+    }
+
+    /// Header tabs retain their natural width; narrow docks show a selector.
     fn tab_rects(&self) -> impl Iterator<Item = (DockTab, Rect)> + '_ {
-        let mut left = self.bounds.map_or(0.0, |bounds| bounds.left() + 6.0);
+        let mut left = self.bounds.map_or(0.0, |b| b.left() + 6.0);
+        let compact = self.compact_tabs();
         DockTab::ALL.into_iter().filter_map(move |tab| {
             let bounds = self.bounds?;
-            let rect =
-                Rect::from_xywh(left, bounds.top(), tab.width(), HEADER.min(bounds.height()))?;
-            left += tab.width();
-            (rect.right() <= bounds.right()).then_some((tab, rect))
+            if compact && tab != self.tab {
+                return None;
+            }
+            let width = if compact {
+                (bounds.width() - 80.0).max(0.0)
+            } else {
+                tab.width()
+            };
+            let rect = Rect::from_xywh(left, bounds.top(), width, HEADER.min(bounds.height()))?;
+            left += width;
+            Some((tab, rect))
         })
     }
 
@@ -374,12 +607,7 @@ impl ElementsPanel {
             return None;
         }
         let size = 24.0;
-        Rect::from_xywh(
-            bounds.right() - 8.0 - size,
-            bounds.top() + (HEADER - size) / 2.0,
-            size,
-            size,
-        )
+        Rect::from_xywh(bounds.right() - 8.0 - size, bounds.top() + 6.0, size, size)
     }
 
     fn in_rect(rect: Option<Rect>, cursor: Option<(f64, f64)>) -> bool {
@@ -395,6 +623,12 @@ impl ElementsPanel {
     /// Whether the pointer belongs to the panel rather than the webpage below.
     pub(crate) fn contains(&self, cursor: Option<(f64, f64)>) -> bool {
         Self::in_rect(self.bounds, cursor)
+            || (self.tab_menu_open
+                && self
+                    .tab_choices()
+                    .iter()
+                    .any(|(_, rect)| Self::in_rect(Some(*rect), cursor)))
+            || (self.dock_menu_open && Self::in_rect(self.dock_menu_rect(), cursor))
     }
 
     /// Hit-tests the Close (×) control, in logical pixels.
@@ -419,11 +653,117 @@ impl ElementsPanel {
         .then_some(index as usize)
     }
 
-    /// Draws only the bottom panel; page pixels above its bounds are preserved.
+    /// Draws the dock with its positioning popup above the active tab content.
+    pub(crate) fn draw(
+        &mut self,
+        frame: &mut Pixmap,
+        scale: f64,
+        dark: bool,
+        cursor: Option<(f64, f64)>,
+        ui_font: Option<&FontVec>,
+        mono_font: Option<&FontVec>,
+    ) {
+        self.draw_content(frame, scale, dark, cursor, ui_font, mono_font);
+        let palette = toolbar::palette(dark);
+        let transform = Transform::from_scale(scale as f32, scale as f32);
+        if self.tab_menu_open {
+            let choices = self.tab_choices();
+            if let (Some((_, first)), Some((_, last))) = (choices.first(), choices.last())
+                && let Some(rect) =
+                    Rect::from_ltrb(first.left(), first.top(), last.right(), last.bottom())
+            {
+                crate::context_menu::draw_menu_shadow(frame, Some(rect), 6.0, scale as f32);
+                if let Some(path) =
+                    toolbar::rounded_rect(rect.x(), rect.y(), rect.width(), rect.height(), 6.0)
+                {
+                    toolbar::fill(frame, &path, palette.panel, transform);
+                    toolbar::stroke(frame, &path, palette.panel_border, 1.0, transform);
+                }
+                for (tab, row) in choices {
+                    if (tab == self.tab || Self::in_rect(Some(row), cursor))
+                        && let Some(path) = toolbar::rounded_rect(
+                            row.x() + 2.0,
+                            row.y() + 2.0,
+                            row.width() - 4.0,
+                            row.height() - 4.0,
+                            4.0,
+                        )
+                    {
+                        toolbar::fill(frame, &path, palette.hover, transform);
+                    }
+                    if let Some(font) = ui_font {
+                        let s = scale as f32;
+                        toolbar::draw_text(
+                            frame,
+                            font,
+                            TITLE_SIZE * s,
+                            (row.x() + 10.0) * s,
+                            (row.y() + 18.0) * s,
+                            (row.right() - 8.0) * s,
+                            if tab == self.tab {
+                                palette.accent
+                            } else {
+                                palette.text
+                            },
+                            &self.tab_label(tab),
+                        );
+                    }
+                }
+            }
+        }
+        if self.dock_menu_open
+            && let Some(rect) = self.dock_menu_rect()
+        {
+            crate::context_menu::draw_menu_shadow(frame, Some(rect), 6.0, scale as f32);
+            if let Some(path) =
+                toolbar::rounded_rect(rect.x(), rect.y(), rect.width(), rect.height(), 6.0)
+            {
+                toolbar::fill(frame, &path, palette.panel, transform);
+                toolbar::stroke(frame, &path, palette.panel_border, 1.0, transform);
+            }
+        }
+        for (dock, rect) in self
+            .dock_button()
+            .map(|r| (self.dock, r))
+            .into_iter()
+            .chain(self.dock_controls())
+        {
+            if (dock == self.dock || Self::in_rect(Some(rect), cursor))
+                && let Some(path) = toolbar::rounded_rect(rect.x(), rect.y(), 24.0, 24.0, 4.0)
+            {
+                toolbar::fill(frame, &path, palette.hover, transform);
+            }
+            if let Some(outline) =
+                toolbar::rounded_rect(rect.x() + 5.0, rect.y() + 5.0, 14.0, 14.0, 2.0)
+            {
+                toolbar::stroke(frame, &outline, palette.text_muted, 1.0, transform);
+            }
+            let (x, y, w, h) = match dock {
+                DockPosition::Left => (5.0, 5.0, 5.0, 14.0),
+                DockPosition::Right => (14.0, 5.0, 5.0, 14.0),
+                DockPosition::Top => (5.0, 5.0, 14.0, 5.0),
+                DockPosition::Bottom => (5.0, 14.0, 14.0, 5.0),
+            };
+            if let Some(r) = Rect::from_xywh(rect.x() + x, rect.y() + y, w, h) {
+                toolbar::fill(
+                    frame,
+                    &PathBuilder::from_rect(r),
+                    if dock == self.dock {
+                        palette.accent
+                    } else {
+                        palette.text_muted
+                    },
+                    transform,
+                );
+            }
+        }
+    }
+
+    /// Draws the dock and any open positioning menu.
     ///
     /// `cursor` is in logical pixels and drives hover feedback. The header uses
     /// `ui_font`; the element tree uses `mono_font`, falling back to `ui_font`.
-    pub(crate) fn draw(
+    fn draw_content(
         &mut self,
         frame: &mut Pixmap,
         scale: f64,
@@ -475,6 +815,34 @@ impl ElementsPanel {
                 bounds.right(),
                 bounds.top() + HEADER - 1.0,
                 colors.separator,
+                transform,
+            );
+        }
+
+        // Keep the draggable divider inside the panel's painted bounds.
+        let divider = match self.dock {
+            DockPosition::Left => {
+                Rect::from_xywh(bounds.right() - 1.0, bounds.top(), 1.0, bounds.height())
+            }
+            DockPosition::Right => {
+                Rect::from_xywh(bounds.left(), bounds.top(), 1.0, bounds.height())
+            }
+            DockPosition::Top => {
+                Rect::from_xywh(bounds.left(), bounds.bottom() - 1.0, bounds.width(), 1.0)
+            }
+            DockPosition::Bottom => {
+                Rect::from_xywh(bounds.left(), bounds.top(), bounds.width(), 1.0)
+            }
+        };
+        if let Some(rect) = divider {
+            toolbar::fill(
+                frame,
+                &PathBuilder::from_rect(rect),
+                if self.dragging || self.resize_at(cursor) {
+                    palette.accent
+                } else {
+                    colors.separator
+                },
                 transform,
             );
         }
@@ -1010,12 +1378,14 @@ impl ElementsPanel {
         let transform = Transform::from_scale(s, s);
         let device = |value: f32| value * s;
         let baseline = bounds.top() + HEADER / 2.0 + 4.5;
-        let content_right = self
-            .close_rect()
-            .map_or(bounds.right() - 8.0, |close| close.left() - 8.0);
+        let content_right = bounds.right() - 72.0;
         let mut subtitle_left = bounds.left() + 14.0;
         for (tab, rect) in self.tab_rects() {
-            let label = self.tab_label(tab);
+            let label = if self.compact_tabs() {
+                format!("{}  ▾", self.tab_label(tab))
+            } else {
+                self.tab_label(tab)
+            };
             let active = tab == self.tab;
             if !active
                 && Self::in_rect(Some(rect), cursor)
@@ -1046,8 +1416,12 @@ impl ElementsPanel {
                 &label,
             );
             if active
-                && let Some(underline) =
-                    Rect::from_xywh(left - 4.0, bounds.top() + HEADER - 2.0, width + 8.0, 2.0)
+                && let Some(underline) = Rect::from_xywh(
+                    rect.left() + 4.0,
+                    bounds.top() + HEADER - 2.0,
+                    rect.width() - 8.0,
+                    2.0,
+                )
             {
                 toolbar::fill(
                     frame,
@@ -1267,6 +1641,112 @@ fn hairline(frame: &mut Pixmap, left: f32, right: f32, y: f32, color: Color, tra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn narrow_docks_offer_readable_tab_selection_and_restore_full_row_when_widened() {
+        let mut panel = ElementsPanel::new(None);
+        panel.resize(320.0, 600.0);
+        assert!(panel.compact_tabs());
+        assert_eq!(panel.tab_rects().count(), 1);
+        let rect = panel.tab_rects().next().unwrap().1;
+        assert!(rect.width() >= 220.0);
+        let center = Some(panel.tab_center(DockTab::Elements));
+        assert!(panel.dock_mouse(center, true));
+        assert!(panel.tab_menu_open);
+        assert_eq!(panel.tab_choices().len(), 5);
+        assert!(panel.dismiss_menu());
+        panel.dock_mouse(center, true);
+        assert!(panel.dock_mouse(Some((0.0, 0.0)), true));
+        assert!(!panel.tab_menu_open);
+        assert_eq!(panel.tab(), DockTab::Elements);
+        panel.resize(1000.0, 600.0);
+        assert!(!panel.compact_tabs());
+        assert_eq!(panel.tab_rects().count(), 5);
+    }
+
+    #[test]
+    fn positioning_dropdown_shares_header_and_dismisses_without_changing_dock() {
+        let mut panel = ElementsPanel::new(None);
+        panel.resize(800.0, 600.0);
+        let button = panel.dock_button().unwrap();
+        let cursor = Some(((button.x() + 12.0) as f64, (button.y() + 12.0) as f64));
+        for (_, tab) in panel.tab_rects() {
+            assert!(tab.right() < button.left());
+            assert!(tab.top() <= button.top() && tab.bottom() >= button.bottom());
+        }
+        assert!(panel.dock_controls().is_empty());
+        assert!(panel.dock_mouse(cursor, true));
+        assert_eq!(panel.dock_controls().len(), 4);
+        assert!(panel.dismiss_menu());
+        assert!(panel.dock_controls().is_empty());
+        panel.dock_mouse(cursor, true);
+        assert!(panel.dock_mouse(Some((0.0, 0.0)), true));
+        assert!(panel.dock_controls().is_empty());
+        assert_eq!(panel.dock, DockPosition::Bottom);
+        panel.dock_mouse(cursor, true);
+        panel.dock_mouse(cursor, true);
+        assert!(panel.dock_controls().is_empty());
+    }
+
+    #[test]
+    fn dock_controls_and_dragging_work_on_every_edge() {
+        let mut panel = ElementsPanel::new(Some(&"<p>row</p>".repeat(100)));
+        panel.resize(1000.0, 800.0);
+        assert_eq!(panel.dock, DockPosition::Bottom);
+        for dock in [
+            DockPosition::Left,
+            DockPosition::Right,
+            DockPosition::Top,
+            DockPosition::Bottom,
+        ] {
+            let button = panel.dock_button().unwrap();
+            assert!(panel.dock_mouse(
+                Some(((button.x() + 12.0) as f64, (button.y() + 12.0) as f64)),
+                true
+            ));
+            let (_, control) = panel
+                .dock_controls()
+                .into_iter()
+                .find(|(d, _)| *d == dock)
+                .unwrap();
+            let cursor = Some(((control.x() + 12.0) as f64, (control.y() + 12.0) as f64));
+            assert!(panel.dock_mouse(cursor, true));
+            panel.dock_mouse(cursor, false);
+            let b = panel.bounds.unwrap();
+            let edge = match dock {
+                DockPosition::Left => (b.right(), b.top() + 100.0),
+                DockPosition::Right => (b.left(), b.top() + 100.0),
+                DockPosition::Top => (b.left() + 100.0, b.bottom()),
+                DockPosition::Bottom => (b.left() + 100.0, b.top()),
+            };
+            assert!(panel.dock_mouse(Some((edge.0 as f64, edge.1 as f64)), true));
+            assert!(panel.drag_to(500.0, 400.0));
+            assert_ne!(panel.bounds, Some(b));
+            assert!(panel.dock_mouse(None, false));
+            assert!(!panel.drag_to(0.0, 0.0));
+            assert_eq!(
+                panel.tab_rects().count(),
+                if panel.compact_tabs() {
+                    1
+                } else {
+                    DockTab::ALL.len()
+                }
+            );
+            for point in [(-1000.0, -1000.0), (2000.0, 2000.0)] {
+                panel.dragging = true;
+                panel.drag_to(point.0, point.1);
+                let b = panel.bounds.unwrap();
+                assert!(b.left() >= 8.0 && b.top() >= toolbar::PAGE_TOP as f32);
+                assert!(b.right() <= 992.0 && b.bottom() <= 792.0);
+                panel.dock_mouse(None, false);
+            }
+            panel.resize(240.0, 180.0);
+            if let Some(b) = panel.bounds {
+                assert!(b.right() <= 232.0 && b.bottom() <= 172.0);
+            }
+            panel.resize(1000.0, 800.0);
+        }
+    }
 
     #[test]
     fn parses_real_element_relationships_without_inventing_wrappers() {
