@@ -9,6 +9,7 @@ type Values = Arc<Mutex<Vec<Value>>>;
 
 /// Installs the standard-library objects supported by the engine.
 pub(super) fn install(state: &super::GlobalState) {
+    super::core::install(state);
     super::primitives::install(state);
     super::errors::install(state);
 
@@ -67,6 +68,9 @@ fn reflect_namespace() -> Object {
 /// Returns a fresh standalone value for a standard global. The VM uses this
 /// for its intentionally short-lived, non-persistent global environment.
 pub(crate) fn value(name: &str) -> Option<Value> {
+    if let Some(value) = super::core::value(name) {
+        return Some(value);
+    }
     match name {
         "String" => Some(Value::Function(
             super::primitives::string_constructor_value(),

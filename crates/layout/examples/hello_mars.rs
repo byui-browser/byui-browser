@@ -40,6 +40,7 @@ fn main() {
         font: paint::FontId::DEFAULT,
         text: "Hello Mars, We Are Earthlings".to_owned(),
         color: text_color,
+        clip: None,
     });
 
     let frame = Compositor::new(width, height).compose_paint(&DisplayList { items });

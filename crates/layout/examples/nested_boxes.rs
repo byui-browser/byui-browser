@@ -85,6 +85,7 @@ fn main() {
             font: paint::FontId::DEFAULT,
             text: label.to_owned(),
             color: text_color,
+            clip: None,
         });
     }
 

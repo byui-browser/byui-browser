@@ -13,6 +13,25 @@ enum FontChoice<'a> {
     Collection(&'a FontCollection),
 }
 
+/// A clip rectangle in device pixels: a pixel `(x, y)` may be drawn when
+/// `left <= x < right` and `top <= y < bottom`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PixelBounds {
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+}
+
+impl PixelBounds {
+    /// Whether text clipped to `bounds` (if any) may draw pixel `(x, y)`.
+    fn allows(bounds: Option<Self>, x: u32, y: u32) -> bool {
+        bounds.is_none_or(|bounds| {
+            (bounds.left..bounds.right).contains(&x) && (bounds.top..bounds.bottom).contains(&y)
+        })
+    }
+}
+
 /// A software compositor for a fixed device-pixel viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Compositor {
@@ -86,7 +105,7 @@ impl Compositor {
                     font_size,
                     text,
                     rgba,
-                } => self.draw_text(&mut frame, *x, *baseline, *font_size, text, *rgba),
+                } => self.draw_text(&mut frame, *x, *baseline, *font_size, text, *rgba, None),
                 DisplayItem::BoxShadow {
                     left,
                     top,
@@ -336,6 +355,7 @@ impl Compositor {
 
     /// Draws text by sampling each scaled glyph bitmap at device-pixel
     /// centers (nearest-neighbor scaling).
+    #[allow(clippy::too_many_arguments)]
     fn draw_text(
         &self,
         frame: &mut Frame,
@@ -344,6 +364,7 @@ impl Compositor {
         font_size: f32,
         text: &str,
         rgba: [u8; 4],
+        clip: Option<PixelBounds>,
     ) {
         let scale = BitmapFont::scale(font_size);
         if scale <= 0.0 {
@@ -372,7 +393,9 @@ impl Compositor {
                             continue;
                         }
                         let bit = BitmapFont::GLYPH_WIDTH - 1 - column as u32;
-                        if glyph[row as usize] & (1 << bit) != 0 {
+                        if glyph[row as usize] & (1 << bit) != 0
+                            && PixelBounds::allows(clip, px, py)
+                        {
                             self.put_pixel(frame, px, py, rgba);
                         }
                     }
@@ -415,7 +438,9 @@ impl Compositor {
     ///
     /// One CSS pixel maps to one device pixel. Rectangle edges are rounded to
     /// the nearest pixel boundary, so a rectangle covers the pixels whose
-    /// centers it contains, and parts outside the frame are clipped.
+    /// centers it contains, and parts outside the frame are clipped. Text
+    /// clip rectangles are ignored here; [`Compositor::compose_page`]
+    /// honors them.
     pub fn compose_paint(&self, list: &paint::DisplayList) -> Frame {
         log::debug!(
             "compositing paint display list with {} items",
@@ -600,7 +625,19 @@ impl Compositor {
                     font,
                     text,
                     color,
+                    clip,
                 } => {
+                    let clip = clip.map(|clip| {
+                        let edge = |value: f32, limit: u32| {
+                            (value * scale).round().clamp(0.0, limit as f32) as u32
+                        };
+                        PixelBounds {
+                            left: edge(clip.x, self.width),
+                            top: edge(clip.y, self.height),
+                            right: edge(clip.right(), self.width),
+                            bottom: edge(clip.bottom(), self.height),
+                        }
+                    });
                     let rgba = [color.r, color.g, color.b, color.a];
                     let outline = match fonts {
                         FontChoice::Single(font) => Some(font),
@@ -615,6 +652,7 @@ impl Compositor {
                             (*baseline * scale).round(),
                             text,
                             rgba,
+                            clip,
                         ),
                         None => self.draw_text(
                             &mut frame,
@@ -623,6 +661,7 @@ impl Compositor {
                             *font_size * scale,
                             text,
                             rgba,
+                            clip,
                         ),
                     }
                 }
@@ -704,6 +743,7 @@ impl Compositor {
         baseline: f32,
         text: &str,
         rgba: [u8; 4],
+        clip: Option<PixelBounds>,
     ) {
         use ab_glyph::{Font, ScaleFont};
         if font_size <= 0.0 {
@@ -729,7 +769,7 @@ impl Compositor {
             outline.draw(|gx, gy, coverage| {
                 let px = bounds.min.x as i64 + i64::from(gx);
                 let py = bounds.min.y as i64 + i64::from(gy);
-                if px < 0 || py < 0 {
+                if px < 0 || py < 0 || !PixelBounds::allows(clip, px as u32, py as u32) {
                     return;
                 }
                 let alpha = (coverage.clamp(0.0, 1.0) * f32::from(rgba[3])).round() as u8;
@@ -890,6 +930,7 @@ mod tests {
                 font: paint::FontId::DEFAULT,
                 text: "Hi".into(),
                 color: black,
+                clip: None,
             }],
         };
         let scale = 2.0;
@@ -1140,6 +1181,7 @@ mod image_tests {
                         b: 0,
                         a: 255,
                     },
+                    clip: None,
                 },
             ],
         };
@@ -1148,5 +1190,97 @@ mod image_tests {
             compositor.compose_page(&list, &FontCollection::default(), &ImageStore::new(), 1.0),
             compositor.compose_paint(&list)
         );
+    }
+
+    /// A grey background wider than the clip, then "HHHH" clipped to
+    /// `0..12` x `0..16` CSS pixels.
+    fn clipped_text_list(clip: Option<paint::Rect>) -> paint::DisplayList {
+        paint::DisplayList {
+            items: vec![
+                paint::DisplayItem::FillRect {
+                    rect: paint::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 40.0,
+                        height: 16.0,
+                    },
+                    color: paint::Color {
+                        r: 200,
+                        g: 200,
+                        b: 200,
+                        a: 255,
+                    },
+                },
+                paint::DisplayItem::Text {
+                    x: 0.0,
+                    baseline: 12.0,
+                    font_size: 12.0,
+                    font: paint::FontId::DEFAULT,
+                    text: "HHHH".into(),
+                    color: paint::Color {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    },
+                    clip,
+                },
+            ],
+        }
+    }
+
+    const TEXT_CLIP: paint::Rect = paint::Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 12.0,
+        height: 16.0,
+    };
+
+    /// Checks a clipped frame against an unclipped one at `scale`: outside
+    /// the clip only the background remains; inside, both frames match.
+    fn assert_clipped(unclipped: &Frame, clipped: &Frame, scale: u32) {
+        let edge = TEXT_CLIP.right() as u32 * scale;
+        let grey = [200, 200, 200, 255];
+        let ink_past_edge = (edge..40 * scale)
+            .flat_map(|x| (0..16 * scale).map(move |y| (x, y)))
+            .any(|(x, y)| pixel(unclipped, x, y) != grey);
+        assert!(ink_past_edge, "the unclipped text reaches past the clip");
+        for y in 0..16 * scale {
+            for x in 0..40 * scale {
+                if x < edge {
+                    assert_eq!(pixel(clipped, x, y), pixel(unclipped, x, y), "({x}, {y})");
+                } else {
+                    assert_eq!(pixel(clipped, x, y), grey, "({x}, {y})");
+                }
+            }
+        }
+        let ink_inside = (0..edge)
+            .flat_map(|x| (0..16 * scale).map(move |y| (x, y)))
+            .any(|(x, y)| pixel(clipped, x, y) != grey);
+        assert!(ink_inside, "text inside the clip is drawn");
+    }
+
+    #[test]
+    fn clipped_text_paints_nothing_outside_its_clip() {
+        let compose = |clip| {
+            Compositor::new(80, 32).compose_page(
+                &clipped_text_list(clip),
+                &FontCollection::default(),
+                &ImageStore::new(),
+                2.0,
+            )
+        };
+        assert_clipped(&compose(None), &compose(Some(TEXT_CLIP)), 2);
+    }
+
+    #[test]
+    fn clipped_outline_text_paints_nothing_outside_its_clip() {
+        let Some(font) = crate::fonts::tests::system_font() else {
+            return;
+        };
+        let compose = |clip| {
+            Compositor::new(80, 32).compose_paint_with_font(&clipped_text_list(clip), &font, 2.0)
+        };
+        assert_clipped(&compose(None), &compose(Some(TEXT_CLIP)), 2);
     }
 }

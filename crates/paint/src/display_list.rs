@@ -57,6 +57,10 @@ pub enum DisplayItem {
         text: String,
         /// Text color.
         color: Color,
+        /// A rectangle the glyphs must not paint outside; `None` means
+        /// unclipped. Set for text inside form controls
+        /// ([`layout::TextFragment::clip`]).
+        clip: Option<Rect>,
     },
     /// Draws a picture (a decoded bitmap or an SVG document) stretched to
     /// fill `rect`.
