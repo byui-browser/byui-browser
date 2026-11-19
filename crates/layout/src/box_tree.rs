@@ -376,7 +376,7 @@ impl Builder<'_> {
     /// The form control `node` is, which gives its `auto` sizes a default;
     /// `None` for other nodes.
     fn form_control_sizing(&self, node: NodeID) -> Option<FormControl> {
-        match self.document.node(node).map(|node| node.get_kind()) {
+        match self.document.get_node(node).map(|node| node.get_kind()) {
             Some(NodeKind::Element(element)) => {
                 FormControl::for_element(self.document, node, element)
             }
@@ -867,12 +867,12 @@ impl Builder<'_> {
                 let mut text = String::new();
                 for child in self
                     .document
-                    .node(node)
+                    .get_node(node)
                     .map(|dom_node| dom_node.get_children().as_slice())
                     .unwrap_or_default()
                 {
                     if let Some(NodeKind::Text(data)) =
-                        self.document.node(*child).map(|child| child.get_kind())
+                        self.document.get_node(*child).map(|child| child.get_kind())
                     {
                         text.push_str(data);
                     }
