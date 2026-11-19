@@ -47,16 +47,45 @@ pub fn register_location_with_navigation(
     navigate: LocationNavigate,
 ) -> JsResult<Object> {
     let current_url = Arc::new(Mutex::new(url));
-    let location = location_object(Arc::clone(&current_url), Arc::clone(&navigate));
     // Reuse a window installed by `register_window*` so its other properties
     // survive; the accessor takes precedence over its data `location` slot.
     let window = match realm.registered_global_value("window") {
         Some(Value::Object(window)) => window,
         _ => Object::new(),
     };
+    let fragment_url = Arc::clone(&current_url);
+    let fragment_window = window.clone();
+    let page_navigate = Arc::clone(&navigate);
+    let navigation = Arc::new(move |destination: Url, behavior: NavigationBehavior| {
+        let current = fragment_url
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let can_update_document = matches!(
+            behavior,
+            NavigationBehavior::Auto | NavigationBehavior::Replace
+        ) && current.origin() == destination.origin()
+            && current.path() == destination.path()
+            && current.query() == destination.query()
+            && current.fragment() != destination.fragment();
+        if can_update_document
+            && let Some(Value::Function(same_document)) =
+                fragment_window.get("__navigateSameDocument")
+        {
+            let replace = Value::Boolean(behavior == NavigationBehavior::Replace);
+            if let Err(error) =
+                same_document.call(&[Value::String(destination.as_str().to_owned()), replace])
+            {
+                log::warn!("same-document fragment navigation failed: {error}");
+            }
+            return;
+        }
+        page_navigate(destination, behavior);
+    }) as LocationNavigate;
+    let location = location_object(Arc::clone(&current_url), Arc::clone(&navigation));
     let location_for_window = location.clone();
     let window_url = Arc::clone(&current_url);
-    let window_navigate = Arc::clone(&navigate);
+    let window_navigate = Arc::clone(&navigation);
     window.define_accessor(
         "location",
         Arc::new(move || Ok(Value::Object(location_for_window.clone()))),
@@ -69,10 +98,24 @@ pub fn register_location_with_navigation(
             )
         })),
     );
+    let url_for_sync = Arc::clone(&current_url);
+    window.set_method(
+        "__syncLocation",
+        Arc::new(move |arguments| {
+            if let Some(Value::String(href)) = arguments.first()
+                && let Ok(url) = Url::parse(href)
+            {
+                *url_for_sync
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = url;
+            }
+            Ok(Value::Undefined)
+        }),
+    );
     realm.register_global_value("window", Value::Object(window))?;
     realm.register_global_value("location", Value::Object(location.clone()))?;
     let url = Arc::clone(&current_url);
-    let handler = Arc::clone(&navigate);
+    let handler = Arc::clone(&navigation);
     realm.register_global_setter(
         "location",
         Arc::new(move |value| navigate_to_value(&url, &handler, value, NavigationBehavior::Auto)),
@@ -301,6 +344,8 @@ fn set_component(
 mod tests {
     use std::sync::Mutex;
 
+    use crate::window::{register_window, register_window_with_url, run_window_hashchange_events};
+
     use super::*;
 
     #[test]
@@ -399,5 +444,50 @@ mod tests {
         assert_eq!(navigations[0].1, NavigationBehavior::Auto);
         assert_eq!(navigations[1].1, NavigationBehavior::Replace);
         assert_eq!(navigations[2].1, NavigationBehavior::Reload);
+    }
+
+    #[test]
+    fn fragment_navigation_updates_live_location_and_dispatches_hashchange() {
+        let mut realm = Realm::new();
+        let window = register_window_with_url(&mut realm, "https://example.test/start").unwrap();
+        register_location_with_navigation(
+            &mut realm,
+            Url::parse("https://example.test/start").unwrap(),
+            Arc::new(|_, _| panic!("fragment navigation must stay in the document")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            realm.evaluate_script(
+                "var calls = 0; var old_url; var new_url; \
+                 function remember(event) { calls++; old_url = event.oldURL; new_url = event.newURL; } \
+                 window.onhashchange = remember; location.hash = '#part'; \
+                 calls === 0 && location.hash === '#part' && history.length === 2",
+            ),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(run_window_hashchange_events(&window), Ok(1));
+        assert_eq!(
+            realm.evaluate_script(
+                "calls === 1 && old_url === 'https://example.test/start' && \
+                 new_url === 'https://example.test/start#part'",
+            ),
+            Ok(Value::Boolean(true))
+        );
+    }
+
+    #[test]
+    fn hashchange_event_constructor_has_standard_defaults_and_fields() {
+        let mut realm = Realm::new();
+        register_window(&mut realm).unwrap();
+
+        assert_eq!(
+            realm.evaluate_script(
+                "var event = HashChangeEvent('hashchange', {oldURL: 'old', newURL: 'new'}); \
+                 event.type === 'hashchange' && event.oldURL === 'old' && event.newURL === 'new' && \
+                 event.bubbles === false && event.cancelable === false && event.defaultPrevented === false",
+            ),
+            Ok(Value::Boolean(true))
+        );
     }
 }

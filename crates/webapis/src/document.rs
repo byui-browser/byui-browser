@@ -14,7 +14,8 @@ use crate::element::{
 };
 use crate::event::{
     EventTarget, EventTargetRef, abort_controller_constructor, add_event_listener,
-    dispatch_event_with_target, event_constructor, remove_event_listener,
+    dispatch_event_with_target, event_constructor, hashchange_event_constructor,
+    remove_event_listener,
 };
 use crate::selection::{document_get_selection, new_selection};
 use crate::selector::{SelectorError, SimpleSelector, parse_selector_list};
@@ -326,6 +327,7 @@ fn register_shared_document(
         }),
     );
     realm.register_global_function("Event", Arc::new(event_constructor))?;
+    realm.register_global_function("HashChangeEvent", Arc::new(hashchange_event_constructor))?;
     realm.register_global_function("AbortController", Arc::new(abort_controller_constructor))?;
     let document_value = Value::Object(document_object);
     let window_object = match realm.registered_global_value("window") {
