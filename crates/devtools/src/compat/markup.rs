@@ -287,14 +287,22 @@ const ELEMENT_PROBES: &[ElementProbe] = &[
     ElementProbe {
         uses: &["input"],
         feature: "<input> form controls",
-        expected: "A visible text field even when empty",
-        check: || visible_box("<input id=\"x\">"),
+        expected: "A visible text field about 20 characters wide even when empty",
+        check: || {
+            body("<input id=\"x\">")
+                .and_then(|page| page.rect("x"))
+                .is_some_and(|rect| rect.width >= 100.0 && rect.height > 0.0)
+        },
     },
     ElementProbe {
         uses: &["textarea"],
         feature: "<textarea>",
-        expected: "A visible multi-line text field",
-        check: || visible_box("<textarea id=\"x\"></textarea>"),
+        expected: "A visible multi-line text field, 20 columns by 2 rows by default",
+        check: || {
+            body("<textarea id=\"x\"></textarea>")
+                .and_then(|page| page.rect("x"))
+                .is_some_and(|rect| rect.width >= 100.0 && rect.height >= 20.0)
+        },
     },
     ElementProbe {
         uses: &["select"],
