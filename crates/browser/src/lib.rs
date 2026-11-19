@@ -22,9 +22,9 @@ use storage::{
 use webapis::local_storage::register_local_storage_with_url;
 use webapis::session_storage::register_session_storage;
 use webapis::{
-    AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, register_alert,
-    register_console, register_fetch_with_url, register_location_with_navigation, register_print,
-    register_shared_document_with_location, register_window_with_security_context,
+    AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, dispatch_window_keydown,
+    register_alert, register_console, register_fetch_with_url, register_location_with_navigation,
+    register_print, register_shared_document_with_location, register_window_with_security_context,
     register_window_with_url_device_pixel_ratio_and_viewport, report_window_error,
 };
 
@@ -930,6 +930,38 @@ impl PageSession {
         webapis::run_window_microtasks(&self.window)?;
         webapis::run_window_hashchange_events(&self.window)?;
         result
+    }
+
+    /// Fires a trusted native `keydown` event on this page's Window.
+    ///
+    /// The returned value is `false` when a handler called `preventDefault()`
+    /// or returned `false`; otherwise it is `true`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_keydown(
+        &self,
+        key: &str,
+        code: &str,
+        location: u32,
+        ctrl_key: bool,
+        shift_key: bool,
+        alt_key: bool,
+        meta_key: bool,
+        repeat: bool,
+    ) -> JsResult<bool> {
+        let allowed = dispatch_window_keydown(
+            &self.window,
+            key,
+            code,
+            location,
+            ctrl_key,
+            shift_key,
+            alt_key,
+            meta_key,
+            repeat,
+        )?;
+        webapis::run_window_microtasks(&self.window)?;
+        webapis::run_window_hashchange_events(&self.window)?;
+        Ok(allowed)
     }
 
     /// Runs this page's elapsed `window.setInterval()` callbacks.

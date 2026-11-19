@@ -1317,6 +1317,28 @@ impl App {
         }
     }
 
+    /// Converts winit's logical key into the UI Events `KeyboardEvent.key`
+    /// value used by page scripts.
+    fn page_key_name(key: &Key<&str>) -> String {
+        match key {
+            Key::Character(value) => (*value).to_owned(),
+            Key::Named(value) => format!("{value:?}"),
+            Key::Dead(value) => value.map_or_else(|| "Dead".into(), |value| value.to_string()),
+            Key::Unidentified(_) => "Unidentified".into(),
+        }
+    }
+
+    /// Converts winit's physical key debug name into the UI Events `code`
+    /// value. The enum's code variants intentionally use the same names.
+    fn page_key_code(event: &KeyEvent) -> String {
+        let value = format!("{:?}", event.physical_key);
+        value
+            .strip_prefix("Code(")
+            .and_then(|value| value.strip_suffix(')'))
+            .unwrap_or(&value)
+            .to_owned()
+    }
+
     /// Applies browser shortcuts and address-field editing for a pressed key.
     fn key_down(&mut self, key: Key<&str>) {
         let modifiers = self.modifiers;
@@ -3043,6 +3065,26 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 log::trace!("key event: {:?}", event.state);
+                if event.state == ElementState::Pressed {
+                    let modifiers = self.modifiers;
+                    let page_has_focus = !self.tab.chrome.address_focused
+                        && !self.tab.find.as_ref().is_some_and(|find| find.focused)
+                        && self.tab.page_source.is_none();
+                    if page_has_focus
+                        && !self.tab.page_events.keydown(
+                            Self::page_key_name(&event.logical_key.as_ref()),
+                            Self::page_key_code(&event),
+                            0,
+                            modifiers.control_key(),
+                            modifiers.shift_key(),
+                            modifiers.alt_key(),
+                            modifiers.super_key(),
+                            event.repeat,
+                        )
+                    {
+                        return;
+                    }
+                }
                 if event.state == ElementState::Pressed
                     && (self.site_info_escape(&event.logical_key)
                         || self.tab_shortcut(&event.logical_key))

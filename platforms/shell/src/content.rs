@@ -721,6 +721,17 @@ enum PageCommand {
     ScrollY(f64),
     DevicePixelRatio(f64),
     Click(Option<NodeID>),
+    Keydown {
+        key: String,
+        code: String,
+        location: u32,
+        ctrl_key: bool,
+        shift_key: bool,
+        alt_key: bool,
+        meta_key: bool,
+        repeat: bool,
+        response: mpsc::Sender<bool>,
+    },
     WatchDom(DomChanged),
     Snapshot(mpsc::Sender<String>),
     /// Answers once every earlier command has been handled.
@@ -858,6 +869,43 @@ impl PageEvents {
         if self.commands.send(PageCommand::Click(target)).is_err() {
             log::warn!("page session is not running; dropped click");
         }
+    }
+
+    /// Dispatches a trusted native `keydown` event to the current page.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn keydown(
+        &self,
+        key: String,
+        code: String,
+        location: u32,
+        ctrl_key: bool,
+        shift_key: bool,
+        alt_key: bool,
+        meta_key: bool,
+        repeat: bool,
+    ) -> bool {
+        let (response, receiver) = mpsc::channel();
+        if self
+            .commands
+            .send(PageCommand::Keydown {
+                key,
+                code,
+                location,
+                ctrl_key,
+                shift_key,
+                alt_key,
+                meta_key,
+                repeat,
+                response,
+            })
+            .is_err()
+        {
+            log::warn!("page session is not running; dropped keydown");
+            return true;
+        }
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap_or(true)
     }
 
     /// Reports DOM changes of the next loaded page to `changed`.
@@ -1018,6 +1066,38 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
                 if let Err(error) = result {
                     log::warn!("page click failed: {error}");
                 }
+                report_dom_change(session, &mut shown, watcher.as_ref());
+            }
+            PageCommand::Keydown {
+                key,
+                code,
+                location,
+                ctrl_key,
+                shift_key,
+                alt_key,
+                meta_key,
+                repeat,
+                response,
+            } => {
+                let Some(session) = &session else {
+                    let _ = response.send(true);
+                    continue;
+                };
+                let (result, event) =
+                    TimelineEvent::measure(EventCategory::Script, "Keydown listeners", || {
+                        session.dispatch_keydown(
+                            &key, &code, location, ctrl_key, shift_key, alt_key, meta_key, repeat,
+                        )
+                    });
+                record(&performance, event);
+                let allowed = match result {
+                    Ok(allowed) => allowed,
+                    Err(error) => {
+                        log::warn!("page keydown failed: {error}");
+                        true
+                    }
+                };
+                let _ = response.send(allowed);
                 report_dom_change(session, &mut shown, watcher.as_ref());
             }
             PageCommand::WatchDom(changed) => watcher = Some(changed),
