@@ -8,7 +8,7 @@ use std::sync::Arc;
 use css::CssColor;
 use html::NodeID;
 
-use crate::{BorderRadius, BoxShadow, Edges, ImageKey, Rect};
+use crate::{BorderRadius, BoxShadow, Edges, ImageKey, Rect, ToggleControl};
 
 /// Paint-relevant computed values for a box or inline box fragment.
 ///
@@ -136,6 +136,9 @@ pub struct LayoutBox {
     /// For [`BoxKind::Replaced`] boxes, the picture to draw in the content
     /// box; `None` for every other kind.
     pub image: Option<ImageKey>,
+    /// For [`BoxKind::Replaced`] boxes of checkbox and radio inputs, the
+    /// control to draw in the content box; `None` for every other box.
+    pub control: Option<ToggleControl>,
 }
 
 impl LayoutBox {
@@ -270,8 +273,8 @@ pub enum PaintItem<'a> {
     InlineBox(&'a InlineBoxFragment),
     /// A text run.
     Text(&'a TextFragment),
-    /// The picture of a [`BoxKind::Replaced`] box, drawn in its content box
-    /// after its background.
+    /// The picture or form control of a [`BoxKind::Replaced`] box, drawn in
+    /// its content box after its background.
     Image(&'a LayoutBox),
 }
 
@@ -402,7 +405,7 @@ fn push_block_decorations<'a>(
 }
 
 fn push_inline_content<'a>(layout_box: &'a LayoutBox, items: &mut Vec<PaintItem<'a>>) {
-    if layout_box.image.is_some() {
+    if layout_box.image.is_some() || layout_box.control.is_some() {
         items.push(PaintItem::Image(layout_box));
     }
     for line in &layout_box.lines {
@@ -441,6 +444,7 @@ mod tests {
             children,
             lines: Vec::new(),
             image: None,
+            control: None,
         }
     }
 

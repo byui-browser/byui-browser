@@ -1470,7 +1470,8 @@ mod form_controls {
 
     #[test]
     fn checkboxes_get_no_text_field_size() {
-        assert_close(size("<input id=x type=checkbox>", CSS).0, 0.0);
+        // A 13px toggle, not a 20-character field.
+        assert_eq!(size("<input id=x type=checkbox>", CSS), (13.0, 13.0));
     }
 }
 
@@ -1763,4 +1764,116 @@ mod control_text {
         assert_close(placed.rect.right(), 800.0);
         assert_eq!(texts(box_for(&tree, &document, "b")), ["Go"]);
     }
+}
+
+#[test]
+fn checkbox_and_radio_inputs_are_13px_replaced_boxes_with_ua_margins() {
+    let (document, tree) = lay_out(
+        "<body><p id=p>ab<input id=c type=checkbox checked>cd\
+         <input id=r type=RADIO disabled><input id=t type=text>\
+         <input id=s type=' checkbox'></p></body>",
+        "body { margin: 0 } p { margin: 0 }",
+        400.0,
+    );
+    let checkbox = box_for(&tree, &document, "c");
+    assert_eq!(checkbox.kind, BoxKind::Replaced);
+    assert_eq!(checkbox.image, None);
+    assert_eq!(
+        checkbox.control,
+        Some(crate::ToggleControl {
+            kind: crate::ControlKind::Checkbox,
+            checked: true,
+            disabled: false,
+        })
+    );
+    assert_eq!((checkbox.rect.width, checkbox.rect.height), (13.0, 13.0));
+    // `margin: 3px 3px 3px 4px` from the user-agent stylesheet.
+    assert_eq!(
+        (
+            checkbox.margin.top,
+            checkbox.margin.right,
+            checkbox.margin.bottom,
+            checkbox.margin.left
+        ),
+        (3.0, 3.0, 3.0, 4.0)
+    );
+    // After "ab" (two 8px characters) and the 4px left margin.
+    assert_eq!(checkbox.rect.x, 20.0);
+    let radio = box_for(&tree, &document, "r");
+    assert_eq!(
+        radio.control,
+        Some(crate::ToggleControl {
+            kind: crate::ControlKind::Radio,
+            checked: false,
+            disabled: true,
+        })
+    );
+    assert_eq!(box_for(&tree, &document, "t").control, None);
+    // Enumerated attributes are not trimmed.
+    assert_eq!(box_for(&tree, &document, "s").control, None);
+}
+
+#[test]
+fn checkbox_bottom_margin_edge_sits_on_the_baseline() {
+    let (document, tree) = lay_out(
+        "<body><p id=p>a<input id=c type=checkbox>b</p></body>",
+        "body { margin: 0 } p { margin: 0 }",
+        400.0,
+    );
+    let checkbox = box_for(&tree, &document, "c");
+    let line = &box_for(&tree, &document, "p").lines[0];
+    assert_close(
+        checkbox.rect.bottom() + checkbox.margin.bottom,
+        line.baseline,
+    );
+}
+
+#[test]
+fn author_width_and_height_override_the_control_size() {
+    let (document, tree) = lay_out(
+        "<body><input id=c type=checkbox width=50 style='width:30px;height:20px'>\
+         <input id=r type=radio width=50 height=50></body>",
+        "body { margin: 0 }",
+        400.0,
+    );
+    let checkbox = box_for(&tree, &document, "c");
+    assert_eq!((checkbox.rect.width, checkbox.rect.height), (30.0, 20.0));
+    // The `width` and `height` attributes do not apply to these inputs.
+    let radio = box_for(&tree, &document, "r");
+    assert_eq!((radio.rect.width, radio.rect.height), (13.0, 13.0));
+}
+
+/// Guards the merge with floats and positioning (#413), borders (#426) and
+/// generated content (#393): checkboxes and radios stay 13px toggles with no
+/// border or `::before` / `::after` content, in or out of flow.
+#[test]
+fn toggles_survive_floats_positioning_borders_and_pseudo_elements() {
+    let (document, tree) = lay_out(
+        "<body><div style='position: relative'>\
+         <input id=f type=checkbox style='float: right' checked>\
+         <input id=a type=radio style='position: absolute; top: 4px; left: 6px'>\
+         <p id=p>after <input id=c type=checkbox></p></div></body>",
+        "body { margin: 0 } p { margin: 0 } \
+         input::before { content: 'BEFORE' } input::after { content: 'AFTER' }",
+        400.0,
+    );
+    let floated = box_for(&tree, &document, "f");
+    assert_eq!(floated.placement, Placement::Float);
+    assert_eq!(floated.control.map(|control| control.checked), Some(true));
+    let placed = box_for(&tree, &document, "a");
+    assert_eq!(placed.placement, Placement::Absolute);
+    assert_eq!(
+        placed.control.map(|control| control.kind),
+        Some(crate::ControlKind::Radio)
+    );
+    // The insets place the margin box; the user-agent margins are 4px left
+    // and 3px top.
+    assert_eq!((placed.rect.x, placed.rect.y), (6.0 + 4.0, 4.0 + 3.0));
+    for id in ["f", "a", "c"] {
+        let toggle = box_for(&tree, &document, id);
+        assert_eq!((toggle.rect.width, toggle.rect.height), (13.0, 13.0));
+        assert_eq!(toggle.style.border_width, crate::Edges::default());
+        assert!(texts(toggle).is_empty());
+    }
+    assert_eq!(texts(box_for(&tree, &document, "p")), ["after "]);
 }

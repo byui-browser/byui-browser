@@ -9,7 +9,7 @@ use css::PseudoElement;
 
 use html::{HTMLDocument, NodeID, NodeKind};
 
-use crate::control::FormControl;
+use crate::control::{CHECKBOX_RADIO_SIZE, ControlKind, FormControl, ToggleControl};
 use crate::replaced::{
     ImageKey, ImageMetrics, NaturalSize, ReplacedBox, parse_dimension_attribute, view_box_ratio,
 };
@@ -685,8 +685,9 @@ impl Builder<'_> {
 }
 
 impl Builder<'_> {
-    /// The box for a replaced element (`<img>`, or an `<svg>` element that is
-    /// not inside another SVG element), or `None` for other elements.
+    /// The box for a replaced element (`<img>`, an `<svg>` element that is
+    /// not inside another SVG element, or a checkbox or radio `<input>`, which
+    /// is sized like a 13x13 image), or `None` for other elements.
     ///
     /// A broken `<img>` (no `src`, or one the embedder has no image for) with
     /// a non-empty `alt` and no `width`/`height` is shown as its `alt` text
@@ -706,7 +707,27 @@ impl Builder<'_> {
                 .map(|attribute| attribute.get_value().as_str())
         };
         let hint = |name: &str| attribute(name).map_or(Dimension::Auto, parse_dimension_attribute);
+        let mut control = None;
         let (key, natural) = match (element.get_name().as_str(), element.get_namespace()) {
+            ("input", html::Namespace::Html) => {
+                let kind = match attribute("type") {
+                    Some(kind) if kind.eq_ignore_ascii_case("checkbox") => ControlKind::Checkbox,
+                    Some(kind) if kind.eq_ignore_ascii_case("radio") => ControlKind::Radio,
+                    _ => return None,
+                };
+                control = Some(ToggleControl {
+                    kind,
+                    checked: attribute("checked").is_some(),
+                    disabled: attribute("disabled").is_some(),
+                });
+                (
+                    None,
+                    NaturalSize::from_size(crate::Size {
+                        width: CHECKBOX_RADIO_SIZE,
+                        height: CHECKBOX_RADIO_SIZE,
+                    }),
+                )
+            }
             ("img", html::Namespace::Html) => {
                 let src = attribute("src").map(str::trim).unwrap_or_default();
                 let key = ImageKey::Src(src.to_owned());
@@ -739,7 +760,7 @@ impl Builder<'_> {
                         }
                     }
                 };
-                (key, natural)
+                (Some(key), natural)
             }
             ("svg", html::Namespace::Svg) => {
                 let nested = self
@@ -771,7 +792,7 @@ impl Builder<'_> {
                         _ => None,
                     }),
                 };
-                (ImageKey::InlineSvg(node), natural)
+                (Some(ImageKey::InlineSvg(node)), natural)
             }
             _ => return None,
         };
@@ -788,9 +809,20 @@ impl Builder<'_> {
             centers_lines: false,
             contents: BlockContents::Replaced(ReplacedBox {
                 key,
+                control,
                 natural,
-                width_hint: hint("width"),
-                height_hint: hint("height"),
+                // The `width` and `height` attributes do not apply to
+                // checkbox and radio inputs.
+                width_hint: if control.is_some() {
+                    Dimension::Auto
+                } else {
+                    hint("width")
+                },
+                height_hint: if control.is_some() {
+                    Dimension::Auto
+                } else {
+                    hint("height")
+                },
             }),
             control: None,
         };
