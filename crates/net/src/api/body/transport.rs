@@ -5,7 +5,10 @@ use reqwest::Body as ReqwestBody;
 
 use crate::api::error::RequestError;
 
-use super::{Body, BodyPhase, BodySource, BoxedBodyStream};
+use super::{Body, BodyPhase, BodySource};
+
+#[cfg(test)]
+use super::BoxedBodyStream;
 
 impl Body {
     /// Transfers the source to Reqwest for a request send.
@@ -33,6 +36,7 @@ impl Body {
     }
 
     /// Separates a live stream from its scheduler permit for internal wrappers.
+    #[cfg(test)]
     pub(crate) fn try_into_parts(
         self,
     ) -> Result<(BoxedBodyStream, Option<tokio::sync::OwnedSemaphorePermit>), RequestError> {

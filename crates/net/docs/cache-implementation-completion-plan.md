@@ -68,7 +68,7 @@ the active cache partition, including method and `Vary` variants. A successful
 fragments are ignored, while unrelated URLs, origins, and partitions remain
 untouched.
 
-### 5. Finish all Fetch cache modes
+### 5. Finish all Fetch cache modes (complete)
 
 Complete the behavior selected by each cache mode:
 
@@ -87,13 +87,16 @@ The current implementation treats these mostly as local lookup switches:
 `ForceCache` can serve stale entries without full stored-response matching,
 and `OnlyIfCached` lacks its same-origin restriction.
 
-### 6. Decide body-capture semantics
+### 6. Decide body-capture semantics (complete)
 
-The current cache stores a response only after the caller fully consumes its
-body. Confirm whether this product decision is intentional. If the cache is to
-follow the standard capture behavior more closely, add bounded streaming
-capture with correct handling for disturbed, failed, aborted, dropped, and
-oversized bodies.
+The cache follows bounded streaming-capture semantics. A cacheable response
+body is teed: the caller receives one branch and a background capture branch
+collects the representation with one queued chunk per branch. Dropping the
+caller response allows capture to finish, while a slow live caller applies
+backpressure rather than allowing unbounded buffering. Disturbed bodies cannot
+be captured; failed or aborted streams, and bodies exceeding the configured
+per-entry limit, are discarded. Only clean, bounded end-of-stream capture
+inserts a response.
 
 ## Browser and storage integrations
 

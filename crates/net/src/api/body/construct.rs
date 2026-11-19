@@ -124,6 +124,7 @@ impl Body {
     }
 
     /// Wraps a live body stream without adding cancellation behavior.
+    #[cfg(test)]
     pub(crate) fn from_stream<S>(stream: S) -> Self
     where
         S: Stream<Item = Result<Bytes, RequestError>> + Send + 'static,

@@ -323,10 +323,10 @@ fn fetch_returns_headers_before_body_and_forwards_body_bytes() {
 }
 
 #[test]
-/// Verifies a response enters cache only after body completion.
-fn fetch_is_cached_only_after_body_completion() {
-    // The first response is streamed and fully consumed. The following
-    // streaming request should then use the completed response from cache.
+/// Verifies a completed background capture can satisfy the next request.
+fn completed_background_capture_is_cached() {
+    // The first response is streamed and fully consumed. Let its bounded
+    // background capture reach completion before the following request.
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
     let address = format!(
         "http://{}",
@@ -361,6 +361,9 @@ fn fetch_is_cached_only_after_body_completion() {
         let mut first_body = Vec::new();
         while let Some(chunk) = first.body.next().await {
             first_body.extend_from_slice(&chunk.expect("first body chunk should be valid"));
+        }
+        for _ in 0..4_096 {
+            tokio::task::yield_now().await;
         }
 
         let second = client

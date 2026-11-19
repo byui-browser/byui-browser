@@ -9,10 +9,11 @@ impl RequestController {
     /// Validates and executes one browser request.
     ///
     /// The returned headers are available before the body is consumed. Body
-    /// chunks are delivered as the transport receives them. A network response
-    /// with bytes is inserted into the cache only after the caller consumes the
-    /// stream to completion; dropped or failed streams are not cached. Null
-    /// bodies may be cached as soon as headers arrive.
+    /// chunks are delivered as the transport receives them. A cacheable network
+    /// response is captured concurrently in bounded storage and enters the
+    /// cache only after capture reaches a clean end of stream. Failed, aborted,
+    /// and oversized bodies are not cached. Null bodies may be cached as soon
+    /// as headers arrive.
     pub async fn fetch(&self, request: Request) -> Result<Response, RequestError> {
         let original_url = request.url().to_owned();
         let original_url = reqwest::Url::parse(&original_url).ok();
