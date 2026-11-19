@@ -43,6 +43,13 @@ struct WindowLoadState {
     fired: bool,
 }
 
+/// Per-Window state for the `popstate` event handler attribute.
+#[derive(Default)]
+struct WindowPopstateState {
+    /// The current `window.onpopstate` event handler, if any.
+    handler: Option<Function>,
+}
+
 fn dispatch_load_event(
     window: &Object,
     event_target: &EventTargetRef,
@@ -326,27 +333,7 @@ fn lock_history(history: &Mutex<SessionHistory>) -> std::sync::MutexGuard<'_, Se
 }
 
 fn clone_for_storage(value: &Value) -> JsResult<Value> {
-    match value {
-        Value::Undefined
-        | Value::Null
-        | Value::Boolean(_)
-        | Value::Number(_)
-        | Value::String(_) => Ok(value.clone()),
-        Value::Function(_) => Err(JsError::runtime("history state cannot contain a function")),
-        Value::Object(object) | Value::Array(object) => {
-            let cloned = Object::new();
-            for key in object.keys() {
-                if let Some(property) = object.get_own(&key) {
-                    cloned.set(key, clone_for_storage(&property)?);
-                }
-            }
-            Ok(if matches!(value, Value::Array(_)) {
-                Value::Array(cloned)
-            } else {
-                Value::Object(cloned)
-            })
-        }
-    }
+    structured_clone_value(value, &mut Vec::new())
 }
 
 fn data_clone_error(message: impl Into<String>) -> JsError {
@@ -424,6 +411,9 @@ fn resolve_history_url(base: &Url, requested: Option<&Value>) -> JsResult<Url> {
     let Some(requested) = requested else {
         return Ok(base.clone());
     };
+    if matches!(requested, Value::Null | Value::Undefined) {
+        return Ok(base.clone());
+    }
     let Value::String(requested) = requested else {
         return Err(JsError::runtime("history URL must be a string or null"));
     };
@@ -443,7 +433,6 @@ fn resolve_history_url(base: &Url, requested: Option<&Value>) -> JsResult<Url> {
 
 fn sync_history_properties(history: &Object, location: &Object, session: &SessionHistory) {
     history.set("length", Value::Number(session.entries.len() as f64));
-    history.set("state", session.current().state.clone());
     location.set(
         "href",
         Value::String(session.current().url.as_str().to_owned()),
@@ -453,7 +442,10 @@ fn sync_history_properties(history: &Object, location: &Object, session: &Sessio
 fn invoke_popstate(window: &Object, event_target: &EventTargetRef, state: &Value) {
     let event = Object::new();
     event.set("type", Value::String("popstate".into()));
-    event.set("state", state.clone());
+    // PopStateEvent.state is a copy of the entry's structured-cloned state;
+    // mutations made by the handler must not mutate session history.
+    event.set("state", clone_for_storage(state).unwrap_or(Value::Null));
+    event.set("hasUAVisualTransition", Value::Boolean(false));
     event.set("bubbles", Value::Boolean(false));
     event.set("cancelable", Value::Boolean(false));
     event.set("target", Value::Object(window.clone()));
@@ -462,13 +454,6 @@ fn invoke_popstate(window: &Object, event_target: &EventTargetRef, state: &Value
     if let Err(error) = dispatch_event_target(event_target, window, &[Value::Object(event.clone())])
     {
         log::warn!("popstate event dispatch failed: {error}");
-    }
-    if let Some(Value::Function(callback)) = window.get("onpopstate") {
-        event.set("currentTarget", Value::Object(window.clone()));
-        event.set("eventPhase", Value::Number(2.0));
-        if let Err(error) = callback.call(&[Value::Object(event.clone())]) {
-            log::warn!("popstate event handler threw: {error}");
-        }
     }
 }
 
@@ -833,7 +818,6 @@ fn register_window_object(
     // replaceable.
     let inner_height = Value::Number(viewport.map_or(0, |size| size.height) as f64);
     window.set("innerHeight", inner_height.clone());
-    window.set("onpopstate", Value::Null);
     window.set("onmessage", Value::Null);
     window.set("onerror", Value::Null);
     // The `onload` event handler is backed by one stable listener on the
@@ -898,6 +882,78 @@ fn register_window_object(
                 }
                 (true, false) => {
                     remove_event_listener_from_target(&onload_event_target, &listener_arguments)?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })),
+    );
+    // `window.onpopstate` is an event handler IDL attribute. Keep its handler
+    // in private state and expose one stable event listener so it participates
+    // in Window listener ordering.
+    let popstate_state = Arc::new(Mutex::new(WindowPopstateState::default()));
+    let onpopstate_listener = {
+        let window = window.clone();
+        let popstate_state = Arc::clone(&popstate_state);
+        Function::from_host(
+            "onpopstate",
+            Arc::new(move |arguments| {
+                let handler = popstate_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .handler
+                    .clone();
+                match handler {
+                    Some(handler) => {
+                        handler.call_with_this(Value::Object(window.clone()), arguments)
+                    }
+                    None => Ok(Value::Undefined),
+                }
+            }),
+        )
+    };
+    let popstate_state_for_get = Arc::clone(&popstate_state);
+    let popstate_state_for_set = Arc::clone(&popstate_state);
+    let onpopstate_event_target = event_target.clone();
+    window.define_accessor(
+        "onpopstate",
+        Arc::new(move || {
+            let state = popstate_state_for_get
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(state.handler.clone().map_or(Value::Null, Value::Function))
+        }),
+        Some(Arc::new(move |value| {
+            let handler = match value {
+                Value::Null | Value::Undefined => None,
+                Value::Function(handler) => Some(handler),
+                _ => return Err(type_error("window.onpopstate must be a function or null")),
+            };
+            let had_handler = {
+                let mut state = popstate_state_for_set
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let had_handler = state.handler.is_some();
+                state.handler = handler.clone();
+                had_handler
+            };
+            let listener_arguments = [
+                Value::String("popstate".into()),
+                Value::Function(onpopstate_listener.clone()),
+            ];
+            match (had_handler, handler.is_some()) {
+                (false, true) => {
+                    add_event_listener_to_target(
+                        &onpopstate_event_target,
+                        &listener_arguments,
+                        "window",
+                    )?;
+                }
+                (true, false) => {
+                    remove_event_listener_from_target(
+                        &onpopstate_event_target,
+                        &listener_arguments,
+                    )?;
                 }
                 _ => {}
             }
@@ -1348,15 +1404,21 @@ fn register_window_object(
             Ok(Value::Number(delivered as f64))
         }),
     );
-    let history_for_window = history.clone();
-    window.set_method(
-        "history",
-        Arc::new(move |_| Ok(Value::Object(history_for_window.clone()))),
-    );
+    window.set("history", Value::Object(history.clone()));
     let location_for_window = location.clone();
     window.set_method(
         "location",
         Arc::new(move |_| Ok(Value::Object(location_for_window.clone()))),
+    );
+
+    let history_for_state = Arc::clone(&session);
+    history.define_accessor(
+        "state",
+        Arc::new(move || {
+            let session = lock_history(&history_for_state);
+            clone_for_storage(&session.current().state)
+        }),
+        None,
     );
 
     let initial_session = lock_history(&session);
@@ -1489,6 +1551,7 @@ fn register_window_object(
 
     realm.register_global_value("window", Value::Object(window.clone()))?;
     realm.register_global_value("self", Value::Object(window.clone()))?;
+    realm.register_global_value("history", Value::Object(history.clone()))?;
     realm.register_global_value(
         "structuredClone",
         window

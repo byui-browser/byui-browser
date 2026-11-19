@@ -225,7 +225,7 @@ fn html_script_history_survives_document_registration() {
     );
     let result = BrowserRuntime::in_memory()
         .evaluate_page_scripts(
-            "<script>window.history().pushState('ready', ''); window.history().state</script>",
+            "<script>window.history.pushState('ready', ''); window.history.state</script>",
             Arc::new(TestConsole::default()),
             Arc::new(TestAlert::default()),
             controller,
