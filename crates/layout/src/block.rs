@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::positioned::{FloatContext, FloatScope, PendingAbsolute, relative_offset};
 use crate::style::{BoxSizing, ComputedStyle, Dimension, Position};
-use crate::tree::{BoxKind, BoxStyle, LayoutBox, Placement};
+use crate::tree::{BoxKind, BoxStyle, LayoutBox, LineBox, LineFragment, Placement};
 use crate::{Edges, Rect};
 
 /// Adjoining vertical margins, collapsed as CSS 2.2 §8.3.1 describes: the
@@ -383,8 +383,27 @@ impl Context<'_> {
         for child in &mut children {
             child.translate(padding.left, padding.top);
         }
+        // Single-line controls center their text vertically (CSS Basic UI
+        // leaves this to the user agent; Chrome centers it). In a box shorter
+        // than its line the text overflows both edges equally and is clipped.
+        let line_offset = if block.centers_lines {
+            (content_height - flow.height) / 2.0
+        } else {
+            0.0
+        };
         for line in &mut lines {
-            line.translate(padding.left, padding.top);
+            line.translate(padding.left, padding.top + line_offset);
+        }
+        if block.clips_contents {
+            // Control text is clipped to the padding box, inside the borders.
+            let border = style.borders.border_width;
+            let clip = Rect {
+                x: border.left,
+                y: border.top,
+                width: content_width + padding.horizontal() - border.horizontal(),
+                height: content_height + padding.vertical() - border.vertical(),
+            };
+            clip_text(&mut lines, clip);
         }
         let mut absolutes = flow.absolutes;
         for absolute in &mut absolutes {
@@ -851,6 +870,33 @@ fn placement(style: &ComputedStyle) -> Placement {
         Position::Fixed => Placement::Fixed,
         Position::Static if style.is_floated() => Placement::Float,
         Position::Static => Placement::InFlow,
+    }
+}
+
+/// Clips every text run in `lines`, including those of nested inline
+/// boxes, to `clip`, intersecting with any clip a run already has.
+fn clip_text(lines: &mut [LineBox], clip: Rect) {
+    for line in lines {
+        for fragment in &mut line.fragments {
+            if let LineFragment::Text(text) = fragment {
+                text.clip = Some(match text.clip {
+                    Some(inner) => intersect(inner, clip),
+                    None => clip,
+                });
+            }
+        }
+    }
+}
+
+/// The overlap of two rectangles; empty (zero-sized) when they are apart.
+fn intersect(a: Rect, b: Rect) -> Rect {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    Rect {
+        x,
+        y,
+        width: (a.right().min(b.right()) - x).max(0.0),
+        height: (a.bottom().min(b.bottom()) - y).max(0.0),
     }
 }
 
