@@ -862,6 +862,16 @@ impl PageSession {
     /// `window.innerHeight`, and their global aliases synchronized with the
     /// current viewport.
     pub fn set_viewport(&mut self, viewport: ViewportSize) {
+        let old_width = match self.window.get("innerWidth") {
+            Some(Value::Number(width)) => width,
+            _ => 0.0,
+        };
+        let old_height = match self.window.get("innerHeight") {
+            Some(Value::Number(height)) => height,
+            _ => 0.0,
+        };
+        let dimensions_changed =
+            old_width != viewport.width as f64 || old_height != viewport.height as f64;
         let width = Value::Number(viewport.width as f64);
         let height = Value::Number(viewport.height as f64);
         self.window.set("innerWidth", width.clone());
@@ -878,6 +888,13 @@ impl PageSession {
                 Value::Number(viewport.height as f64),
                 Value::Number(ratio),
             ]);
+        }
+        if dimensions_changed && let Err(error) = webapis::dispatch_window_resize(&self.window) {
+            log::warn!("could not dispatch window resize event: {error}");
+        } else if dimensions_changed
+            && let Err(error) = webapis::run_window_microtasks(&self.window)
+        {
+            log::warn!("could not run resize microtasks: {error}");
         }
     }
 
