@@ -57,6 +57,13 @@ struct WindowHashchangeState {
     handler: Option<Function>,
 }
 
+/// Per-Window state for the `resize` event handler attribute.
+#[derive(Default)]
+struct WindowResizeState {
+    /// The current `window.onresize` event handler, if any.
+    handler: Option<Function>,
+}
+
 fn dispatch_load_event(
     window: &Object,
     event_target: &EventTargetRef,
@@ -801,6 +808,7 @@ fn register_window_object(
     let event_target: EventTargetRef = Arc::new(Mutex::new(EventTarget::default()));
     let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
     let load_state = Arc::new(Mutex::new(WindowLoadState::default()));
+    let resize_state = Arc::new(Mutex::new(WindowResizeState::default()));
     let performance = Object::new();
     let performance_clock = Arc::new(PerformanceClock::new());
     let evaluator = realm.script_evaluator();
@@ -1078,6 +1086,71 @@ fn register_window_object(
             Ok(())
         })),
     );
+    // `window.onresize` is an event handler IDL attribute. Keep its handler
+    // in private state and expose one stable event listener so it participates
+    // in Window listener ordering.
+    let resize_state_for_get = Arc::clone(&resize_state);
+    let resize_state_for_set = Arc::clone(&resize_state);
+    let resize_window = window.clone();
+    let onresize_listener = Function::from_host(
+        "onresize",
+        Arc::new(move |arguments| {
+            let handler = resize_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .handler
+                .clone();
+            match handler {
+                Some(handler) => {
+                    handler.call_with_this(Value::Object(resize_window.clone()), arguments)
+                }
+                None => Ok(Value::Undefined),
+            }
+        }),
+    );
+    let onresize_event_target = event_target.clone();
+    window.define_accessor(
+        "onresize",
+        Arc::new(move || {
+            let state = resize_state_for_get
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(state.handler.clone().map_or(Value::Null, Value::Function))
+        }),
+        Some(Arc::new(move |value| {
+            let handler = match value {
+                Value::Null | Value::Undefined => None,
+                Value::Function(handler) => Some(handler),
+                _ => return Err(type_error("window.onresize must be a function or null")),
+            };
+            let had_handler = {
+                let mut state = resize_state_for_set
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let had_handler = state.handler.is_some();
+                state.handler = handler.clone();
+                had_handler
+            };
+            let listener_arguments = [
+                Value::String("resize".into()),
+                Value::Function(onresize_listener.clone()),
+            ];
+            match (had_handler, handler.is_some()) {
+                (false, true) => {
+                    add_event_listener_to_target(
+                        &onresize_event_target,
+                        &listener_arguments,
+                        "window",
+                    )?;
+                }
+                (true, false) => {
+                    remove_event_listener_from_target(&onresize_event_target, &listener_arguments)?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })),
+    );
     history.set("scrollRestoration", Value::String("auto".into()));
     window.set("__mediaQueryLists", Value::Object(Object::new()));
     let load_window = window.clone();
@@ -1090,6 +1163,21 @@ fn register_window_object(
                 &load_window,
                 &load_dispatch_event_target,
                 &load_state_for_dispatch,
+            )?;
+            Ok(Value::Undefined)
+        }),
+    );
+
+    let resize_window = window.clone();
+    let resize_event_target = event_target.clone();
+    window.set_method(
+        "__dispatchResize",
+        Arc::new(move |_| {
+            let event = event_object("resize".into(), false, false);
+            dispatch_event_target(
+                &resize_event_target,
+                &resize_window,
+                &[Value::Object(event)],
             )?;
             Ok(Value::Undefined)
         }),
@@ -1916,6 +2004,17 @@ pub fn dispatch_window_load(window: &Object) -> JsResult<()> {
     };
     dispatch.call(&[])?;
     run_window_microtasks(window).map(|_| ())
+}
+
+/// Dispatches a `resize` event on a Window after its viewport dimensions have
+/// changed. The event is non-bubbling and non-cancelable, matching CSSOM View.
+pub fn dispatch_window_resize(window: &Object) -> JsResult<()> {
+    let Some(Value::Function(dispatch)) = window.get("__dispatchResize") else {
+        return Err(JsError::runtime(
+            "window resize dispatcher is not installed",
+        ));
+    };
+    dispatch.call(&[]).map(|_| ())
 }
 
 /// Runs the Window's microtask checkpoint.
