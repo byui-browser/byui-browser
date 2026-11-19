@@ -64,6 +64,13 @@ struct WindowScrollState {
     handler: Option<Function>,
 }
 
+/// Per-Window state for the `click` event handler attribute.
+#[derive(Default)]
+struct WindowClickState {
+    /// The current `window.onclick` event handler, if any.
+    handler: Option<Function>,
+}
+
 fn dispatch_load_event(
     window: &Object,
     event_target: &EventTargetRef,
@@ -809,6 +816,7 @@ fn register_window_object(
     let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
     let load_state = Arc::new(Mutex::new(WindowLoadState::default()));
     let scroll_state = Arc::new(Mutex::new(WindowScrollState::default()));
+    let click_state = Arc::new(Mutex::new(WindowClickState::default()));
     let performance = Object::new();
     let performance_clock = Arc::new(PerformanceClock::new());
     let evaluator = realm.script_evaluator();
@@ -1148,6 +1156,74 @@ fn register_window_object(
                 }
                 (true, false) => {
                     remove_event_listener_from_target(&onscroll_event_target, &listener_arguments)?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })),
+    );
+    // `window.onclick` is an event handler IDL attribute. Keep its handler
+    // in private state and expose one stable bubble-phase listener so it
+    // participates in Window listener ordering.
+    let onclick_listener = {
+        let window = window.clone();
+        let click_state = Arc::clone(&click_state);
+        Function::from_host(
+            "onclick",
+            Arc::new(move |arguments| {
+                let handler = click_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .handler
+                    .clone();
+                match handler {
+                    Some(handler) => {
+                        handler.call_with_this(Value::Object(window.clone()), arguments)
+                    }
+                    None => Ok(Value::Undefined),
+                }
+            }),
+        )
+    };
+    let click_state_for_get = Arc::clone(&click_state);
+    let click_state_for_set = Arc::clone(&click_state);
+    let onclick_event_target = event_target.clone();
+    window.define_accessor(
+        "onclick",
+        Arc::new(move || {
+            let state = click_state_for_get
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(state.handler.clone().map_or(Value::Null, Value::Function))
+        }),
+        Some(Arc::new(move |value| {
+            let handler = match value {
+                Value::Null | Value::Undefined => None,
+                Value::Function(handler) => Some(handler),
+                _ => return Err(type_error("window.onclick must be a function or null")),
+            };
+            let had_handler = {
+                let mut state = click_state_for_set
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let had_handler = state.handler.is_some();
+                state.handler = handler.clone();
+                had_handler
+            };
+            let listener_arguments = [
+                Value::String("click".into()),
+                Value::Function(onclick_listener.clone()),
+            ];
+            match (had_handler, handler.is_some()) {
+                (false, true) => {
+                    add_event_listener_to_target(
+                        &onclick_event_target,
+                        &listener_arguments,
+                        "window",
+                    )?;
+                }
+                (true, false) => {
+                    remove_event_listener_from_target(&onclick_event_target, &listener_arguments)?;
                 }
                 _ => {}
             }
