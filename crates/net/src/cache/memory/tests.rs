@@ -173,6 +173,64 @@ fn expires_is_used_when_max_age_is_absent() {
 }
 
 #[test]
+fn last_modified_supplies_conservative_heuristic_freshness() {
+    let date = httpdate::parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT")
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap();
+    let clock = Arc::new(TestClock::new(date));
+    let cache = ResponseCache::with_clock(4, 64, clock.clone());
+    let url = Url::parse("https://example.test/heuristic").unwrap();
+    let request = Request::get(url.as_str());
+    let mut headers = HeaderMap::new();
+    headers.insert(DATE, "Sun, 06 Nov 1994 08:49:37 GMT".parse().unwrap());
+    headers.insert(
+        LAST_MODIFIED,
+        "Sun, 06 Nov 1994 08:39:37 GMT".parse().unwrap(),
+    );
+
+    cache.insert(
+        &request,
+        &url,
+        StoredResponse {
+            status: StatusCode::OK,
+            headers,
+            url: url.to_string(),
+            body: Bytes::from_static(b"heuristic"),
+            cookie_headers_processed: false,
+        },
+    );
+
+    clock.advance(Duration::from_secs(59));
+    assert!(matches!(
+        cache.lookup(&request, &url),
+        Some(CacheLookup::Fresh(_))
+    ));
+    clock.advance(Duration::from_secs(1));
+    assert!(matches!(
+        cache.lookup(&request, &url),
+        Some(CacheLookup::Stale { .. })
+    ));
+}
+
+#[test]
+fn explicit_freshness_overrides_last_modified_heuristics() {
+    let now = CacheTime {
+        wall: Duration::from_secs(1_000),
+        elapsed: Duration::ZERO,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+    headers.insert(
+        LAST_MODIFIED,
+        "Sun, 06 Nov 1994 08:39:37 GMT".parse().unwrap(),
+    );
+
+    let freshness = FreshnessMetadata::from_headers(&headers, now).unwrap();
+    assert_eq!(freshness.lifetime, Duration::from_secs(60));
+}
+
+#[test]
 fn no_cache_and_must_revalidate_entries_require_revalidation_when_stale() {
     let clock = Arc::new(TestClock::new(Duration::ZERO));
     let cache = ResponseCache::with_clock(4, 64, clock);

@@ -12,7 +12,8 @@ provides:
 - multiple `Vary` request-header variants, including `Vary: *` rejection and
   variant replacement when the `Vary` field set changes;
 - explicit freshness based on `Date`, `Expires`, `Age`, and supported
-  `Cache-Control` directives;
+  `Cache-Control` directives, plus conservative `Last-Modified` heuristic
+  freshness when explicit metadata is absent;
 - independent public body readers sharing immutable cached body bytes; and
 - response filtering and provider authorization on cache hits.
 
@@ -31,19 +32,18 @@ Regardless of the choice, the boundary must preserve `net`'s transport-
 independent cache matching and response-capture behavior while allowing the
 browser to supply partition identity and durable persistence.
 
-### 2. Complete cache identity and matching
+### 2. Complete cache identity and matching (complete)
 
-Finish standards-compliant matching for:
+The cache matches the browser-provided partition, method, normalized URL,
+credential eligibility, request mode, redirect taint, authorization presence,
+and `Vary` request-header variants. Authorization values are never retained:
+authorized requests remain conservatively excluded until browser authorization
+policy can support them. Response filtering is re-run when a stored response is
+served, so the cache does not retain an already tainted exposed response.
 
-- credentials and authorization eligibility;
-- response tainting and the complete network/cache partition key;
-- stored-response matching beyond the current structured key and `Vary`
-  variants; and
-- heuristic freshness where explicit freshness metadata is absent.
-
-Authorization values must not be retained in cache keys or stored responses.
-Until the browser provides complete authorization policy, conservative
-exclusion of authorized requests is acceptable but remains incomplete behavior.
+Freshness uses explicit `Cache-Control`, `Date`, `Expires`, and `Age` metadata
+where available. If no explicit lifetime is present, a valid `Last-Modified`
+date supplies a conservative one-tenth apparent-age heuristic.
 
 ### 3. Add conditional revalidation
 

@@ -5,7 +5,15 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use reqwest::header::{AGE, CACHE_CONTROL, DATE, EXPIRES, HeaderMap};
+use reqwest::header::{AGE, CACHE_CONTROL, DATE, EXPIRES, HeaderMap, LAST_MODIFIED};
+
+/// The conventional fraction of a resource's age used for heuristic freshness.
+///
+/// RFC 9111 leaves the precise fraction to the cache implementation. Ten
+/// percent is the interoperable convention and keeps a response without
+/// explicit cache directives from remaining fresh for its entire apparent
+/// lifetime.
+const HEURISTIC_FRESHNESS_FRACTION: u32 = 10;
 
 /// Clock reading used for cache freshness and deterministic tests.
 #[derive(Clone, Copy, Debug)]
@@ -57,10 +65,13 @@ pub(super) struct FreshnessMetadata {
 }
 
 impl FreshnessMetadata {
-    /// Builds cache metadata for the supported explicit-freshness subset.
+    /// Builds cache metadata from explicit or heuristic HTTP freshness data.
     ///
-    /// Responses without `max-age` or a valid `Expires` value are not stored;
-    /// heuristic freshness is intentionally deferred.
+    /// Explicit `max-age` and `Expires` values take precedence. When neither
+    /// is present, a valid `Last-Modified` value supplies a conservative
+    /// heuristic lifetime: one tenth of the apparent time since modification.
+    /// Responses without either explicit metadata or `Last-Modified` remain
+    /// ineligible for storage.
     pub(super) fn from_headers(headers: &HeaderMap, response_time: CacheTime) -> Option<Self> {
         let directives = cache_control(headers);
         if directives.no_store {
@@ -68,12 +79,19 @@ impl FreshnessMetadata {
         }
         let date = parse_http_date(headers.get(DATE));
         let expires = parse_http_date(headers.get(EXPIRES));
+        let last_modified = parse_http_date(headers.get(LAST_MODIFIED));
         let lifetime = if directives.no_cache {
             Duration::ZERO
         } else if let Some(max_age) = directives.max_age {
             max_age
+        } else if let Some(expires) = expires {
+            expires.saturating_sub(date.unwrap_or(response_time.wall))
         } else {
-            expires?.saturating_sub(date.unwrap_or(response_time.wall))
+            let last_modified = last_modified?;
+            let apparent_age = date
+                .unwrap_or(response_time.wall)
+                .saturating_sub(last_modified);
+            apparent_age / HEURISTIC_FRESHNESS_FRACTION
         };
         Some(Self {
             response_time,

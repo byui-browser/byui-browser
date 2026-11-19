@@ -20,7 +20,7 @@ use bytes::Bytes;
 #[cfg(test)]
 use reqwest::{
     StatusCode, Url,
-    header::{AGE, AUTHORIZATION, CACHE_CONTROL, DATE, EXPIRES, HeaderMap},
+    header::{AGE, AUTHORIZATION, CACHE_CONTROL, DATE, EXPIRES, HeaderMap, LAST_MODIFIED},
 };
 
 #[cfg(test)]
