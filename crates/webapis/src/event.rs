@@ -516,6 +516,20 @@ pub(crate) fn dispatch_event_target_with_target(
     ))
 }
 
+/// Dispatches an event on a standalone target while retaining the event's
+/// existing target, for the final Window phase of a bubbling event.
+pub(crate) fn dispatch_event_target_preserving_target(
+    target: &EventTargetRef,
+    target_object: &Object,
+    arguments: &[Value],
+) -> JsResult<Value> {
+    let [Value::Object(event)] = arguments else {
+        return Err(JsError::new("dispatchEvent() expects one Event object"));
+    };
+    let event_target = event.get("target").unwrap_or(Value::Null);
+    dispatch_event_target_with_target(target, target_object, event_target, arguments)
+}
+
 fn invoke_window_error_handler(target: &Object, event: &Object) -> bool {
     let Some(Value::Function(handler)) = target.get("onerror") else {
         return false;

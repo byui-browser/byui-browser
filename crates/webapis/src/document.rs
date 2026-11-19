@@ -11,10 +11,11 @@ use crate::custom_elements::CustomElementRegistry;
 use crate::dom_exception::DomException;
 use crate::element::{
     Element, element_object, invoke_attribute_changed_callback, invoke_lifecycle_callback,
+    wrap_element,
 };
 use crate::event::{
     EventTarget, EventTargetRef, abort_controller_constructor, add_event_listener,
-    dispatch_event_with_target, event_constructor, hashchange_event_constructor,
+    dispatch_event_at, dispatch_event_with_target, event_constructor, hashchange_event_constructor,
     remove_event_listener,
 };
 use crate::selection::{document_get_selection, new_selection};
@@ -373,6 +374,66 @@ fn register_shared_document(
         Some(Value::Object(window)) => window,
         _ => Object::new(),
     };
+    // A trusted keydown targets the focused element first, then bubbles to
+    // the document and Window. Window registration happens before Document
+    // registration, so install the document-aware dispatcher here.
+    let keydown_document = Arc::clone(&shared_document);
+    let keydown_window = window_object.clone();
+    window_object.set_method(
+        "__dispatchKeydown",
+        Arc::new(move |arguments| {
+            let Some(Value::Function(create)) = keydown_window.get("__createKeydownEvent") else {
+                return Err(JsError::runtime(
+                    "window keydown event constructor is not installed",
+                ));
+            };
+            let event = create.call(arguments)?;
+            let focused = {
+                let document = keydown_document.lock().unwrap();
+                document
+                    .focused_element()
+                    .filter(|node| document.is_connected(*node))
+            };
+            let Some(node) = focused else {
+                let Some(Value::Function(dispatch)) =
+                    keydown_window.get("__dispatchKeydownAtWindow")
+                else {
+                    return Err(JsError::runtime(
+                        "window keydown dispatcher is not installed",
+                    ));
+                };
+                return dispatch.call(&[event]);
+            };
+            let Value::Object(target) = wrap_element(&keydown_document, node)? else {
+                return Err(JsError::runtime("focused keydown target is not an element"));
+            };
+            let snapshot = keydown_document.lock().unwrap().clone();
+            let result =
+                dispatch_event_at(&snapshot, Some(node), &target, std::slice::from_ref(&event))?;
+            let Value::Object(event_object) = &event else {
+                return Err(JsError::runtime("keydown event is not an object"));
+            };
+            if matches!(
+                event_object.get("__stopPropagation"),
+                Some(Value::Boolean(true))
+            ) {
+                return Ok(result);
+            }
+            let Some(Value::Function(dispatch)) = keydown_window.get("__dispatchKeydownAtWindow")
+            else {
+                return Err(JsError::runtime(
+                    "window keydown dispatcher is not installed",
+                ));
+            };
+            let window_result = dispatch.call(&[event])?;
+            match (result, window_result) {
+                (Value::Boolean(false), _) | (_, Value::Boolean(false)) => {
+                    Ok(Value::Boolean(false))
+                }
+                _ => Ok(Value::Boolean(true)),
+            }
+        }),
+    );
     let computed_style_document = shared_document.clone();
     window_object.set_method(
         "getComputedStyle",

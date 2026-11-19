@@ -11,8 +11,8 @@ use crate::crypto::register_crypto;
 use crate::custom_elements::CustomElementRegistry;
 use crate::event::{
     EventTarget, EventTargetRef, add_event_listener_to_target, dispatch_event_target,
-    dispatch_event_target_with_target, event_constructor, event_object,
-    hashchange_event_constructor, remove_event_listener_from_target,
+    dispatch_event_target_preserving_target, dispatch_event_target_with_target, event_constructor,
+    event_object, hashchange_event_constructor, remove_event_listener_from_target,
 };
 use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
@@ -55,6 +55,97 @@ struct WindowPopstateState {
 struct WindowHashchangeState {
     /// The current `window.onhashchange` event handler, if any.
     handler: Option<Function>,
+}
+
+/// Per-Window state for the `keydown` event handler attribute.
+#[derive(Default)]
+struct WindowKeydownState {
+    /// The current `window.onkeydown` event handler, if any.
+    handler: Option<Function>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn keyboard_event(
+    key: &str,
+    code: &str,
+    location: u32,
+    ctrl_key: bool,
+    shift_key: bool,
+    alt_key: bool,
+    meta_key: bool,
+    repeat: bool,
+) -> Object {
+    let event = event_object("keydown".into(), true, true);
+    event.set("key", Value::String(key.into()));
+    event.set("code", Value::String(code.into()));
+    event.set("location", Value::Number(location as f64));
+    event.set("ctrlKey", Value::Boolean(ctrl_key));
+    event.set("shiftKey", Value::Boolean(shift_key));
+    event.set("altKey", Value::Boolean(alt_key));
+    event.set("metaKey", Value::Boolean(meta_key));
+    event.set("repeat", Value::Boolean(repeat));
+    event.set("isComposing", Value::Boolean(false));
+    event.set("view", Value::Null);
+    event.set("detail", Value::Number(0.0));
+    event.set("which", Value::Number(0.0));
+    event.set("keyCode", Value::Number(0.0));
+    event.set("charCode", Value::Number(0.0));
+    event.set_method(
+        "getModifierState",
+        Arc::new(move |arguments| {
+            let modifier = arguments.first().map_or_else(String::new, Value::to_string);
+            let active = match modifier.as_str() {
+                "Control" => ctrl_key,
+                "Shift" => shift_key,
+                "Alt" => alt_key,
+                "Meta" => meta_key,
+                _ => false,
+            };
+            Ok(Value::Boolean(active))
+        }),
+    );
+    event
+}
+
+/// Implements the callable subset of the UI Events `KeyboardEvent` constructor.
+fn keyboard_event_constructor(arguments: &[Value]) -> JsResult<Value> {
+    let event_type = arguments.first().map_or_else(String::new, Value::to_string);
+    let options = match arguments.get(1) {
+        Some(Value::Object(options) | Value::Array(options)) => Some(options),
+        _ => None,
+    };
+    let string = |name: &str| {
+        options
+            .and_then(|options| options.get(name))
+            .map_or_else(String::new, |value| value.to_string())
+    };
+    let number = |name: &str| {
+        options
+            .and_then(|options| options.get(name))
+            .and_then(|value| match value {
+                Value::Number(value) => Some(value as u32),
+                _ => None,
+            })
+            .unwrap_or(0)
+    };
+    let boolean = |name: &str| {
+        options
+            .and_then(|options| options.get(name))
+            .is_some_and(|value| matches!(value, Value::Boolean(true)))
+    };
+    let event = keyboard_event(
+        &string("key"),
+        &string("code"),
+        number("location"),
+        boolean("ctrlKey"),
+        boolean("shiftKey"),
+        boolean("altKey"),
+        boolean("metaKey"),
+        boolean("repeat"),
+    );
+    event.set("type", Value::String(event_type));
+    event.set("isComposing", Value::Boolean(boolean("isComposing")));
+    Ok(Value::Object(event))
 }
 
 /// Per-Window state for the `scroll` event handler attribute.
@@ -1102,6 +1193,83 @@ fn register_window_object(
             Ok(())
         })),
     );
+    // `window.onkeydown` is an event handler IDL attribute. Keep its handler
+    // in private state and expose one stable listener on Window.
+    let keydown_state = Arc::new(Mutex::new(WindowKeydownState::default()));
+    let onkeydown_listener = {
+        let window = window.clone();
+        let keydown_state = Arc::clone(&keydown_state);
+        Function::from_host(
+            "onkeydown",
+            Arc::new(move |arguments| {
+                let handler = keydown_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .handler
+                    .clone();
+                if let Some(handler) = handler {
+                    let result =
+                        handler.call_with_this(Value::Object(window.clone()), arguments)?;
+                    if matches!(result, Value::Boolean(false))
+                        && let Some(Value::Object(event)) = arguments.first()
+                        && let Some(Value::Function(prevent_default)) = event.get("preventDefault")
+                    {
+                        prevent_default.call(&[])?;
+                    }
+                }
+                Ok(Value::Undefined)
+            }),
+        )
+    };
+    let keydown_state_for_get = Arc::clone(&keydown_state);
+    let keydown_state_for_set = Arc::clone(&keydown_state);
+    let onkeydown_event_target = event_target.clone();
+    window.define_accessor(
+        "onkeydown",
+        Arc::new(move || {
+            let state = keydown_state_for_get
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(state.handler.clone().map_or(Value::Null, Value::Function))
+        }),
+        Some(Arc::new(move |value| {
+            let handler = match value {
+                Value::Null | Value::Undefined => None,
+                Value::Function(handler) => Some(handler),
+                _ => return Err(type_error("window.onkeydown must be a function or null")),
+            };
+            let had_handler = {
+                let mut state = keydown_state_for_set
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let had_handler = state.handler.is_some();
+                state.handler = handler.clone();
+                had_handler
+            };
+            let listener_arguments = [
+                Value::String("keydown".into()),
+                Value::Function(onkeydown_listener.clone()),
+            ];
+            match (had_handler, handler.is_some()) {
+                (false, true) => {
+                    add_event_listener_to_target(
+                        &onkeydown_event_target,
+                        &listener_arguments,
+                        "window",
+                    )?;
+                }
+                (true, false) => {
+                    remove_event_listener_from_target(
+                        &onkeydown_event_target,
+                        &listener_arguments,
+                    )?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })),
+    );
+
     // CSSOM View's `window.onscroll` is an event handler IDL attribute. Keep
     // one stable listener so it participates in registration order with
     // `addEventListener("scroll", ...)` listeners.
@@ -1170,6 +1338,7 @@ fn register_window_object(
             Ok(())
         })),
     );
+
     // `window.onresize` is an event handler IDL attribute. Keep its handler
     // in private state and expose one stable event listener so it participates
     // in Window listener ordering.
@@ -1724,7 +1893,76 @@ fn register_window_object(
             dispatch_event_target(&dispatch_window_event_target, &dispatch_window, arguments)
         }),
     );
+    let create_keydown_event = window.clone();
+    window.set_method(
+        "__createKeydownEvent",
+        Arc::new(move |arguments| {
+            let string = |index: usize| {
+                arguments.get(index).and_then(|value| match value {
+                    Value::String(value) => Some(value.as_str()),
+                    _ => None,
+                })
+            };
+            let number = |index: usize| {
+                arguments.get(index).and_then(|value| match value {
+                    Value::Number(value) => Some(*value as u32),
+                    _ => None,
+                })
+            };
+            let boolean = |index: usize| {
+                arguments
+                    .get(index)
+                    .is_some_and(|value| matches!(value, Value::Boolean(true)))
+            };
+            let event = keyboard_event(
+                string(0).unwrap_or_default(),
+                string(1).unwrap_or_default(),
+                number(2).unwrap_or(0),
+                boolean(3),
+                boolean(4),
+                boolean(5),
+                boolean(6),
+                boolean(7),
+            );
+            Ok(Value::Object(event))
+        }),
+    );
+    let dispatch_keydown_event_target = event_target.clone();
+    let dispatch_keydown_window = window.clone();
+    window.set_method(
+        "__dispatchKeydownAtWindow",
+        Arc::new(move |arguments| {
+            dispatch_event_target_preserving_target(
+                &dispatch_keydown_event_target,
+                &dispatch_keydown_window,
+                arguments,
+            )
+        }),
+    );
+    let dispatch_keydown_creator = create_keydown_event.clone();
+    let dispatch_keydown_event_target = event_target.clone();
+    let dispatch_keydown_window = window.clone();
+    window.set_method(
+        "__dispatchKeydown",
+        Arc::new(move |arguments| {
+            let Some(Value::Function(create)) =
+                dispatch_keydown_creator.get("__createKeydownEvent")
+            else {
+                return Err(JsError::runtime(
+                    "window keydown event constructor is not installed",
+                ));
+            };
+            let event = create.call(arguments)?;
+            dispatch_event_target(
+                &dispatch_keydown_event_target,
+                &dispatch_keydown_window,
+                &[event],
+            )
+        }),
+    );
     window.set_method("HashChangeEvent", Arc::new(hashchange_event_constructor));
+    window.set_method("KeyboardEvent", Arc::new(keyboard_event_constructor));
+    realm.register_global_function("KeyboardEvent", Arc::new(keyboard_event_constructor))?;
 
     let report_window_event_target = event_target.clone();
     let report_window = window.clone();
@@ -2171,6 +2409,45 @@ pub fn dispatch_window_load(window: &Object) -> JsResult<()> {
     };
     dispatch.call(&[])?;
     run_window_microtasks(window).map(|_| ())
+}
+
+/// Dispatches a trusted native `keydown` event on a Window.
+///
+/// `key` and `code` use the UI Events names. `location` is the standard
+/// keyboard location value: 0 for standard keys, 1 for the left side, 2 for
+/// the right side, and 3 for the numeric keypad.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_window_keydown(
+    window: &Object,
+    key: &str,
+    code: &str,
+    location: u32,
+    ctrl_key: bool,
+    shift_key: bool,
+    alt_key: bool,
+    meta_key: bool,
+    repeat: bool,
+) -> JsResult<bool> {
+    let Some(Value::Function(dispatch)) = window.get("__dispatchKeydown") else {
+        return Err(JsError::runtime(
+            "window keydown dispatcher is not installed",
+        ));
+    };
+    match dispatch.call(&[
+        Value::String(key.into()),
+        Value::String(code.into()),
+        Value::Number(location as f64),
+        Value::Boolean(ctrl_key),
+        Value::Boolean(shift_key),
+        Value::Boolean(alt_key),
+        Value::Boolean(meta_key),
+        Value::Boolean(repeat),
+    ])? {
+        Value::Boolean(allowed) => Ok(allowed),
+        _ => Err(JsError::runtime(
+            "window keydown dispatcher returned a non-boolean",
+        )),
+    }
 }
 
 /// Dispatches a `resize` event on a Window after its viewport dimensions have
