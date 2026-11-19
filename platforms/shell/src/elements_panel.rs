@@ -3,7 +3,10 @@
 //! [`crate::compat_panel`], the Network and Console session logs, and the
 //! Performance timeline.
 
+use std::collections::HashSet;
+
 use ab_glyph::FontVec;
+use html::{HTMLDocument, NodeID, NodeKind};
 use tiny_skia::{Color, Path, PathBuilder, Pixmap, Rect, Transform};
 
 use crate::compat_panel::CompatView;
@@ -14,6 +17,16 @@ use crate::toolbar;
 use devtools::network::NetworkLog;
 use devtools::performance::{EventCategory, PerformanceLog};
 use devtools::{Console, Level};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ElementRow {
+    depth: usize,
+    node: NodeID,
+    label: String,
+    selector: String,
+    has_children: bool,
+    inline_style: Option<String>,
+}
 
 /// The dock's tabs, in header order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,7 +63,16 @@ impl DockTab {
 /// Parsed element hierarchy, the Compatibility view, and docked-panel
 /// scrolling state. Each tab keeps its own scroll position.
 pub(crate) struct ElementsPanel {
-    rows: Vec<(usize, String)>,
+    rows: Vec<ElementRow>,
+    document: Option<HTMLDocument>,
+    collapsed: HashSet<NodeID>,
+    selected_node: Option<NodeID>,
+    hovered_node: Option<NodeID>,
+    inspect_hover: bool,
+    styles_view: bool,
+    style_input: String,
+    style_overrides: Vec<(NodeID, String)>,
+    computed_styles: Vec<(NodeID, Vec<(String, String)>)>,
     message: Option<&'static str>,
     offset: usize,
     visible: usize,
@@ -74,6 +96,15 @@ impl ElementsPanel {
     pub(crate) fn new(html: Option<&str>) -> Self {
         let mut panel = Self {
             rows: Vec::new(),
+            document: None,
+            collapsed: HashSet::new(),
+            selected_node: None,
+            hovered_node: None,
+            inspect_hover: false,
+            styles_view: false,
+            style_input: String::new(),
+            style_overrides: Vec::new(),
+            computed_styles: Vec::new(),
             message: None,
             offset: 0,
             visible: 0,
@@ -102,6 +133,13 @@ impl ElementsPanel {
     /// supplies the new page's Network, Console, and Performance data.
     pub(crate) fn load_document(&mut self, html: Option<&str>) {
         self.rows.clear();
+        self.document = None;
+        self.collapsed.clear();
+        self.selected_node = None;
+        self.hovered_node = None;
+        self.style_overrides.clear();
+        self.style_input.clear();
+        self.styles_view = false;
         self.message = None;
         self.offset = 0;
         self.wheel_remainder = 0.0;
@@ -111,9 +149,22 @@ impl ElementsPanel {
         self.parse_rows(html);
     }
 
+    /// Refreshes the live DOM snapshot while retaining the selected tab and
+    /// any tree rows that remain present in the newly serialized document.
+    pub(crate) fn update_live_document(&mut self, html: &str) {
+        let selected = self.selected_node;
+        let _ = self.parse_rows(Some(html));
+        if selected.is_some_and(|node| self.rows.iter().any(|row| row.node == node)) {
+            self.selected_node = selected;
+        } else {
+            self.selected_node = None;
+        }
+    }
+
     /// Fills the Elements rows from `html`, or sets the status message
     /// explaining why there are none.
     fn parse_rows(&mut self, html: Option<&str>) {
+        self.message = None;
         let Some(html) = html else {
             self.message = Some("No loaded HTML available");
             return;
@@ -127,38 +178,128 @@ impl ElementsPanel {
             self.message = Some("Could not parse loaded HTML");
             return;
         };
-        let mut stack = vec![(document.root, 0)];
-        while let Some((id, depth)) = stack.pop() {
-            let Some(node) = document.node(id) else {
-                continue;
-            };
-            let child_depth = if let html::NodeKind::Element(element) = node.get_kind() {
-                self.rows.push((depth, format!("<{}>", element.get_name())));
-                depth + 1
-            } else {
-                depth
-            };
-            if self.rows.len() >= 20_000 {
-                self.message = Some("Element list limited to 20,000 entries");
-                break;
-            }
-            stack.extend(
-                node.get_children()
-                    .iter()
-                    .rev()
-                    .map(|child| (*child, child_depth)),
-            );
-        }
+        self.document = Some(document);
+        self.rebuild_rows();
         if self.rows.is_empty() {
             self.message = Some("No HTML elements found in the loaded snapshot");
         }
+    }
+
+    fn rebuild_rows(&mut self) {
+        fn visit(
+            document: &HTMLDocument,
+            id: NodeID,
+            depth: usize,
+            collapsed: &HashSet<NodeID>,
+            rows: &mut Vec<ElementRow>,
+        ) {
+            let Some(node) = document.node(id) else {
+                return;
+            };
+            let NodeKind::Element(element) = node.get_kind() else {
+                for child in node.get_children() {
+                    visit(document, *child, depth, collapsed, rows);
+                }
+                return;
+            };
+            let name = element.get_name();
+            let attributes = element.get_attributes();
+            let attr_text = attributes
+                .iter()
+                .map(|attr| format!(" {}=\"{}\"", attr.get_name(), attr.get_value()))
+                .collect::<String>();
+            let label = format!("<{name}{attr_text}>");
+            let child_count = node
+                .get_children()
+                .iter()
+                .filter(|child| {
+                    matches!(
+                        document.node(**child).map(|node| node.get_kind()),
+                        Some(NodeKind::Element(_))
+                    )
+                })
+                .count();
+            let inline_style = attributes
+                .iter()
+                .find(|attribute| attribute.get_name() == "style")
+                .map(|attribute| attribute.get_value().clone());
+            rows.push(ElementRow {
+                depth,
+                node: id,
+                label,
+                selector: ElementsPanel::selector_for_node(document, id),
+                has_children: child_count > 0,
+                inline_style,
+            });
+            if rows.len() >= 20_000 || collapsed.contains(&id) {
+                return;
+            }
+            for child in node.get_children() {
+                visit(document, *child, depth + 1, collapsed, rows);
+                if rows.len() >= 20_000 {
+                    return;
+                }
+            }
+        }
+
+        self.rows.clear();
+        if let Some(document) = &self.document {
+            let children = document
+                .node(document.root)
+                .map(|node| node.get_children().clone())
+                .unwrap_or_default();
+            for child in children {
+                visit(document, child, 0, &self.collapsed, &mut self.rows);
+                if self.rows.len() >= 20_000 {
+                    self.message = Some("Element list limited to 20,000 entries");
+                    break;
+                }
+            }
+        }
+    }
+
+    fn selector_for_node(document: &HTMLDocument, id: NodeID) -> String {
+        let mut parts = Vec::new();
+        let mut current = Some(id);
+        while let Some(node_id) = current {
+            let Some(node) = document.node(node_id) else {
+                break;
+            };
+            if let NodeKind::Element(element) = node.get_kind() {
+                let tag = element.get_name();
+                let part = node
+                    .get_parent()
+                    .and_then(|parent_id| {
+                        let parent = document.node(parent_id)?;
+                        let index = parent
+                            .get_children()
+                            .iter()
+                            .filter(|child| {
+                                matches!(
+                                    document.node(**child).map(|node| node.get_kind()),
+                                    Some(NodeKind::Element(_))
+                                )
+                            })
+                            .position(|child| *child == node_id)?
+                            + 1;
+                        Some(format!("{tag}:nth-child({index})"))
+                    })
+                    .unwrap_or_else(|| tag.to_owned());
+                parts.push(part);
+            }
+            current = node.get_parent();
+        }
+        parts.reverse();
+        parts.join(" > ")
     }
 
     /// Whether the Elements tree lists a `<name>` element.
     #[cfg(test)]
     pub(crate) fn shows_element(&self, name: &str) -> bool {
         let tag = format!("<{name}>");
-        self.rows.iter().any(|(_, row)| *row == tag)
+        self.rows
+            .iter()
+            .any(|row| row.label.starts_with(&tag[..tag.len() - 1]))
     }
 
     /// Fits a bottom dock into the content area, leaving the upper page visible.
@@ -175,6 +316,8 @@ impl ElementsPanel {
         let tree = dock_height - f64::from(HEADER + 2.0 * TREE_PAD + footer);
         let tree = if self.tab == DockTab::Console {
             (tree - 34.0).max(0.0)
+        } else if self.tab == DockTab::Elements {
+            (tree - f64::from(SUBHEADER) - if self.styles_view { 28.0 } else { 0.0 }).max(0.0)
         } else {
             tree
         };
@@ -195,6 +338,109 @@ impl ElementsPanel {
         self.tab = tab;
         self.network_view.close_menu();
         self.offset = self.offset.min(self.max_offset());
+    }
+
+    pub(crate) fn styles_view(&self) -> bool {
+        self.styles_view
+    }
+
+    pub(crate) fn inspecting_hover(&self) -> bool {
+        self.inspect_hover
+    }
+
+    pub(crate) fn set_hovered_node(&mut self, node: Option<NodeID>) -> bool {
+        if self.hovered_node == node {
+            return false;
+        }
+        self.hovered_node = node;
+        true
+    }
+
+    pub(crate) fn set_computed_styles(&mut self, styles: Vec<(NodeID, Vec<(String, String)>)>) {
+        self.computed_styles = styles;
+    }
+
+    pub(crate) fn highlighted_node(&self) -> Option<NodeID> {
+        self.hovered_node.or(self.selected_node)
+    }
+
+    pub(crate) fn node_at(&self, cursor: Option<(f64, f64)>) -> Option<NodeID> {
+        let bounds = self.bounds?;
+        let row = self.row_at(cursor)?;
+        self.rows
+            .get(self.offset + row)
+            .filter(|_| {
+                cursor.is_some_and(|(_, y)| y >= f64::from(bounds.top() + HEADER + SUBHEADER))
+            })
+            .map(|row| row.node)
+    }
+
+    pub(crate) fn insert_style_text(&mut self, text: &str) {
+        self.style_input.push_str(text);
+    }
+
+    pub(crate) fn backspace_style_text(&mut self) {
+        self.style_input.pop();
+    }
+
+    pub(crate) fn submit_style_override(&mut self) -> Option<(String, String)> {
+        let node = self.selected_node?;
+        let selector = self
+            .rows
+            .iter()
+            .find(|row| row.node == node)?
+            .selector
+            .clone();
+        let declaration = self.style_input.trim().trim_end_matches(';').to_owned();
+        let (property, value) = declaration.split_once(':')?;
+        if property.trim().is_empty() || value.trim().is_empty() {
+            return None;
+        }
+        self.style_input.clear();
+        self.style_overrides.push((node, declaration.clone()));
+        Some((
+            selector,
+            format!("{}: {} !important", property.trim(), value.trim()),
+        ))
+    }
+
+    pub(crate) fn current_element_label(&self) -> String {
+        let node = self.hovered_node.or(self.selected_node);
+        node.and_then(|node| self.rows.iter().find(|row| row.node == node))
+            .map_or_else(
+                || "Current Element: none".to_owned(),
+                |row| format!("Current Element: {}", row.label),
+            )
+    }
+
+    pub(crate) fn click_style_subtab(&mut self, cursor: Option<(f64, f64)>) -> bool {
+        let Some(bounds) = self.bounds else {
+            return false;
+        };
+        let (Some(x), Some(y)) = (cursor.map(|point| point.0), cursor.map(|point| point.1)) else {
+            return false;
+        };
+        let top = f64::from(bounds.top() + HEADER + 2.0);
+        if y < top || y > top + 22.0 {
+            return false;
+        }
+        if x >= f64::from(bounds.left() + 7.0) && x < f64::from(bounds.left() + 66.0) {
+            self.styles_view = false;
+            return true;
+        }
+        if x >= f64::from(bounds.left() + 70.0) && x < f64::from(bounds.left() + 130.0) {
+            self.styles_view = true;
+            return true;
+        }
+        let inspect_left = bounds.right() - 118.0;
+        if x >= f64::from(inspect_left) && x < f64::from(bounds.right() - 8.0) {
+            self.inspect_hover = !self.inspect_hover;
+            if !self.inspect_hover {
+                self.hovered_node = None;
+            }
+            return true;
+        }
+        false
     }
 
     /// Inserts text into the Console command line.
@@ -255,6 +501,35 @@ impl ElementsPanel {
             && let Some(column) = self.network_view.heading_at(table, cursor)
         {
             self.network_view.click_heading(column);
+            return true;
+        }
+        if self.tab == DockTab::Elements {
+            if self.click_style_subtab(cursor) {
+                return true;
+            }
+            if self.styles_view {
+                return false;
+            }
+            let (Some(bounds), Some((x, y))) = (self.bounds, cursor) else {
+                return false;
+            };
+            let top = f64::from(bounds.top() + HEADER + SUBHEADER + TREE_PAD);
+            if y < top {
+                return false;
+            }
+            let row_index = ((y - top) / f64::from(ROW)).floor() as usize + self.offset;
+            let Some(row) = self.rows.get(row_index).cloned() else {
+                return false;
+            };
+            let indent_left = f64::from(bounds.left() + 14.0 + row.depth as f32 * INDENT);
+            if row.has_children && x >= indent_left && x < indent_left + 12.0 {
+                if !self.collapsed.insert(row.node) {
+                    self.collapsed.remove(&row.node);
+                }
+                self.rebuild_rows();
+                return true;
+            }
+            self.selected_node = Some(row.node);
             return true;
         }
         false
@@ -456,9 +731,11 @@ impl ElementsPanel {
         if !self.contains(cursor) || x >= f64::from(bounds.right() - SCROLLBAR_GUTTER) {
             return None;
         }
-        let top = f64::from(bounds.top() + HEADER + TREE_PAD);
+        let top = f64::from(bounds.top() + HEADER + SUBHEADER + TREE_PAD);
         let index = ((y - top) / f64::from(ROW)).floor();
-        (index >= 0.0
+        (self.tab == DockTab::Elements
+            && !self.styles_view
+            && index >= 0.0
             && (index as usize)
                 < self
                     .visible
@@ -581,6 +858,25 @@ impl ElementsPanel {
             return;
         }
 
+        if self.tab == DockTab::Elements {
+            if let Some(font) = mono_font.or(ui_font) {
+                self.draw_elements_view(
+                    frame,
+                    s,
+                    palette,
+                    colors,
+                    bounds,
+                    cursor,
+                    font,
+                    header_font,
+                );
+            }
+            if let Some(font) = header_font {
+                self.draw_header(frame, s, dark, cursor, font);
+            }
+            return;
+        }
+
         if self.tab == DockTab::Network {
             if let Some(table) = self.network_table() {
                 self.network_view.draw(
@@ -611,38 +907,12 @@ impl ElementsPanel {
             return;
         }
 
-        let tree_top = bounds.top() + HEADER + TREE_PAD;
-        let footer = if self.message.is_some() && self.tab == DockTab::Elements {
-            FOOTER
-        } else {
-            0.0
-        };
-        let tree_bottom = bounds.bottom() - footer;
-        let hovered_row = self.row_at(cursor);
-        let rows_shown = self
-            .visible
-            .min(self.active_row_count().saturating_sub(self.offset));
-        let indent_x = |depth: usize| {
-            bounds.left() + 14.0 + (depth as f32 * INDENT).min((bounds.width() - 120.0).max(0.0))
-        };
-
-        if let Some(row) = hovered_row
-            && let Some(rect) = Rect::from_xywh(
-                bounds.left(),
-                tree_top + row as f32 * ROW,
-                bounds.width(),
-                ROW,
-            )
-        {
-            toolbar::fill(
-                frame,
-                &PathBuilder::from_rect(rect),
-                colors.row_hover,
-                transform,
-            );
-        }
-
         if self.tab == DockTab::Console {
+            let tree_top = bounds.top() + HEADER + TREE_PAD;
+            let tree_bottom = bounds.bottom();
+            let rows_shown = self
+                .visible
+                .min(self.active_row_count().saturating_sub(self.offset));
             if let Some(font) = mono_font.or(ui_font) {
                 self.draw_console(
                     frame,
@@ -661,110 +931,230 @@ impl ElementsPanel {
             }
             return;
         }
+    }
 
-        // Indent guides connect each element to its ancestors' columns.
-        for (index, (depth, _)) in self
-            .rows
-            .iter()
-            .skip(self.offset)
-            .take(rows_shown)
-            .enumerate()
-        {
-            let top = tree_top + index as f32 * ROW;
-            for level in 0..*depth {
-                let x = indent_x(level) + 4.0;
-                if let Some(rect) = Rect::from_xywh(x, top, 1.0, ROW) {
-                    toolbar::fill(
-                        frame,
-                        &PathBuilder::from_rect(rect),
-                        colors.guide,
-                        transform,
+    #[allow(clippy::too_many_arguments)]
+    fn draw_elements_view(
+        &self,
+        frame: &mut Pixmap,
+        s: f32,
+        palette: toolbar::Palette,
+        colors: Colors,
+        bounds: Rect,
+        cursor: Option<(f64, f64)>,
+        font: &FontVec,
+        _header_font: Option<&FontVec>,
+    ) {
+        let device = |value: f32| value * s;
+        let transform = Transform::from_scale(s, s);
+        let subtop = bounds.top() + HEADER + 2.0;
+        let selected_label = self.current_element_label();
+        for (left, label, selected) in [
+            (bounds.left() + 10.0, "HTML", !self.styles_view),
+            (bounds.left() + 72.0, "Styles", self.styles_view),
+        ] {
+            toolbar::draw_text(
+                frame,
+                font,
+                device(SMALL_SIZE),
+                device(left),
+                device(subtop + 17.0),
+                device(left + 56.0),
+                if selected {
+                    palette.text
+                } else {
+                    palette.text_muted
+                },
+                label,
+            );
+            if selected && let Some(rect) = Rect::from_xywh(left - 2.0, subtop + 22.0, 48.0, 2.0) {
+                toolbar::fill(
+                    frame,
+                    &PathBuilder::from_rect(rect),
+                    palette.accent,
+                    transform,
+                );
+            }
+        }
+        let inspect = if self.inspect_hover {
+            "Inspect: On"
+        } else {
+            "Inspect: Off"
+        };
+        toolbar::draw_text(
+            frame,
+            font,
+            device(SMALL_SIZE),
+            device(bounds.right() - 110.0),
+            device(subtop + 17.0),
+            device(bounds.right() - 12.0),
+            if self.inspect_hover {
+                palette.accent
+            } else {
+                palette.text_muted
+            },
+            inspect,
+        );
+        let body_top = bounds.top() + HEADER + SUBHEADER;
+        toolbar::draw_text(
+            frame,
+            font,
+            device(SMALL_SIZE),
+            device(bounds.left() + 14.0),
+            device(body_top - 3.0),
+            device(bounds.right() - 14.0),
+            palette.text_muted,
+            &selected_label,
+        );
+
+        let clip = device(bounds.right() - SCROLLBAR_GUTTER);
+        if self.styles_view {
+            let selected = self
+                .selected_node
+                .and_then(|node| self.rows.iter().find(|row| row.node == node));
+            let top = body_top + TREE_PAD + 4.0;
+            let mut lines = vec![selected.map_or_else(
+                || "Select an element in the HTML view to inspect its styles".to_owned(),
+                |row| format!("Selector: {}", row.selector),
+            )];
+            if let Some(row) = selected {
+                if let Some((_, properties)) = self
+                    .computed_styles
+                    .iter()
+                    .find(|(node, _)| *node == row.node)
+                {
+                    lines.extend(
+                        properties
+                            .iter()
+                            .map(|(name, value)| format!("{name}: {value}")),
                     );
                 }
+                lines.push(format!(
+                    "Inline style: {}",
+                    row.inline_style.as_deref().unwrap_or("(none)")
+                ));
+                lines.extend(
+                    self.style_overrides
+                        .iter()
+                        .filter(|(node, _)| *node == row.node)
+                        .map(|(_, rule)| format!("Temporary: {rule}")),
+                );
             }
-        }
-
-        // Scrollbar thumb, only when the tree overflows.
-        if self.rows.len() > self.visible && self.visible > 0 {
-            let track_top = tree_top;
-            let track_height = (tree_bottom - TREE_PAD - track_top).max(0.0);
-            let thumb_height =
-                (track_height * self.visible as f32 / self.rows.len() as f32).max(24.0);
-            let progress = self.offset as f32 / self.max_offset().max(1) as f32;
-            let thumb_top = track_top + (track_height - thumb_height).max(0.0) * progress;
-            if let Some(path) = toolbar::rounded_rect(
-                bounds.right() - 9.0,
-                thumb_top,
-                5.0,
-                thumb_height.min(track_height),
-                2.5,
-            ) {
-                toolbar::fill(frame, &path, colors.scrollbar, transform);
+            for (index, line) in lines.iter().take(self.visible.max(1)).enumerate() {
+                toolbar::draw_text(
+                    frame,
+                    font,
+                    device(TREE_SIZE),
+                    device(bounds.left() + 14.0),
+                    device(top + index as f32 * ROW + 12.0),
+                    clip,
+                    palette.text,
+                    line,
+                );
             }
-        }
-
-        if self.message.is_some() && bounds.height() >= HEADER + footer {
+            let input_top = bounds.bottom() - 25.0;
             hairline(
                 frame,
-                bounds.left(),
-                bounds.right(),
-                tree_bottom,
+                bounds.left() + 10.0,
+                bounds.right() - 10.0,
+                input_top - 8.0,
                 colors.separator,
                 transform,
             );
-        }
-
-        let Some(ui_font) = ui_font.or(mono_font) else {
-            return;
-        };
-        let mono_font = mono_font.unwrap_or(ui_font);
-        let device = |value: f32| value * s;
-
-        self.draw_header(frame, s, dark, cursor, ui_font);
-
-        if let Some(message) = self.message
-            && bounds.height() >= HEADER + footer
-        {
             toolbar::draw_text(
                 frame,
-                ui_font,
-                device(SMALL_SIZE),
+                font,
+                device(TREE_SIZE),
                 device(bounds.left() + 14.0),
-                device(bounds.bottom() - FOOTER / 2.0 + 4.0),
-                device(bounds.right() - 14.0),
-                palette.text_muted,
-                message,
+                device(bounds.bottom() - 8.0),
+                clip,
+                palette.text,
+                &format!("Temporary CSS > {}", self.style_input),
             );
+            return;
         }
 
-        // Element rows: `<` and `>` in a muted tone, tag names highlighted.
-        let clip = device(bounds.right() - SCROLLBAR_GUTTER);
-        for (index, (depth, tag)) in self
+        let top = body_top + TREE_PAD;
+        let rows_shown = self
+            .visible
+            .min(self.rows.len().saturating_sub(self.offset));
+        if let Some(row) = self.row_at(cursor)
+            && let Some(rect) =
+                Rect::from_xywh(bounds.left(), top + row as f32 * ROW, bounds.width(), ROW)
+        {
+            toolbar::fill(
+                frame,
+                &PathBuilder::from_rect(rect),
+                colors.row_hover,
+                transform,
+            );
+        }
+        for (index, row) in self
             .rows
             .iter()
             .skip(self.offset)
             .take(rows_shown)
             .enumerate()
         {
-            let baseline = tree_top + index as f32 * ROW + ROW / 2.0 + 4.0;
-            let name = tag.trim_start_matches('<').trim_end_matches('>');
-            let mut pen = device(indent_x(*depth) + 12.0);
-            for (part, color) in [
-                ("<", colors.punctuation),
-                (name, colors.tag),
-                (">", colors.punctuation),
-            ] {
-                pen = toolbar::draw_text(
+            let row_top = top + index as f32 * ROW;
+            let baseline = row_top + ROW / 2.0 + 4.0;
+            if self.selected_node == Some(row.node)
+                && let Some(rect) = Rect::from_xywh(bounds.left(), row_top, bounds.width(), ROW)
+            {
+                toolbar::fill(
                     frame,
-                    mono_font,
-                    device(TREE_SIZE),
-                    pen,
-                    device(baseline),
-                    clip,
-                    color,
-                    part,
+                    &PathBuilder::from_rect(rect),
+                    palette.hover,
+                    transform,
                 );
             }
+            let indent = bounds.left()
+                + 14.0
+                + (row.depth as f32 * INDENT).min((bounds.width() - 120.0).max(0.0));
+            let marker = if row.has_children {
+                if self.collapsed.contains(&row.node) {
+                    "+ "
+                } else {
+                    "- "
+                }
+            } else {
+                "  "
+            };
+            let pen = toolbar::draw_text(
+                frame,
+                font,
+                device(TREE_SIZE),
+                device(indent),
+                device(baseline),
+                clip,
+                colors.punctuation,
+                marker,
+            );
+            toolbar::draw_text(
+                frame,
+                font,
+                device(TREE_SIZE),
+                pen,
+                device(baseline),
+                clip,
+                colors.tag,
+                &row.label,
+            );
+        }
+        if self.rows.len() > self.visible && self.visible > 0 {
+            self.draw_scrollbar(frame, s, &colors, bounds, top);
+        }
+        if let Some(message) = self.message {
+            toolbar::draw_text(
+                frame,
+                font,
+                device(SMALL_SIZE),
+                device(bounds.left() + 14.0),
+                device(bounds.bottom() - 8.0),
+                clip,
+                palette.text_muted,
+                message,
+            );
         }
     }
 
@@ -1247,6 +1637,7 @@ fn category_color(category: EventCategory) -> Color {
 const INSET: f32 = 8.0;
 /// Header strip height in logical pixels.
 const HEADER: f32 = 36.0;
+const SUBHEADER: f32 = 28.0;
 /// Element row height in logical pixels.
 const ROW: f32 = 20.0;
 /// Horizontal step per tree depth in logical pixels.
@@ -1342,7 +1733,11 @@ mod tests {
             "<html><head><title>T</title></head><body><main><p>Hello</p></main></body></html>",
         ));
         assert_eq!(
-            panel.rows,
+            panel
+                .rows
+                .iter()
+                .map(|row| (row.depth, row.label.as_str()))
+                .collect::<Vec<_>>(),
             [
                 (0, "<html>"),
                 (1, "<head>"),
@@ -1351,10 +1746,16 @@ mod tests {
                 (2, "<main>"),
                 (3, "<p>")
             ]
-            .map(|(d, s)| (d, s.to_owned()))
         );
         let fragment = ElementsPanel::new(Some("<p>Only this element</p>"));
-        assert_eq!(fragment.rows, [(0, "<p>".to_owned())]);
+        assert_eq!(
+            fragment
+                .rows
+                .iter()
+                .map(|row| (row.depth, row.label.as_str()))
+                .collect::<Vec<_>>(),
+            [(0, "<p>")]
+        );
         assert!(ElementsPanel::new(None).message.is_some());
         assert!(ElementsPanel::new(Some("")).rows.is_empty());
     }

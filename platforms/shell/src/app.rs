@@ -215,6 +215,8 @@ enum UserEvent {
     },
     /// A console command completed and its output is ready to paint.
     ConsoleUpdated,
+    /// A console command changed the live document tree.
+    LiveDomUpdated(String),
 }
 
 /// Delivers `alert` on the UI thread, attached to the browser window.
@@ -488,6 +490,16 @@ impl App {
         if let Some(window) = &self.devtools_window {
             window.request_redraw();
         }
+    }
+
+    fn refresh_live_dom_async(&self) {
+        let page_events = self.page_events.clone();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            if let (Some(html), Some(proxy)) = (page_events.snapshot_html(), proxy) {
+                let _ = proxy.send_event(UserEvent::LiveDomUpdated(html));
+            }
+        });
     }
 
     fn request_devtools(&self) {
@@ -1249,6 +1261,9 @@ impl App {
         self.elements = Some(ElementsPanel::new(html));
         if let Some(panel) = &mut self.elements {
             sync_devtools_panel(panel, &self.network_log, &self.console, &self.performance);
+            if let Some(layout) = &self.page_layout {
+                panel.set_computed_styles(layout.computed_styles());
+            }
         }
         self.resize_elements();
         self.chrome.address_focused = false;
@@ -1667,6 +1682,7 @@ impl App {
                 {
                     let target = self.page_node_at(x, y);
                     self.page_events.click(target);
+                    self.refresh_live_dom_async();
                 }
             }
         }
@@ -1842,6 +1858,25 @@ impl App {
         }
         if let Some(panel) = &mut self.elements {
             sync_devtools_panel(panel, &self.network_log, &self.console, &self.performance);
+            if let (Some(node), Some(layout), Some(card)) =
+                (panel.highlighted_node(), self.page_layout.as_ref(), card)
+                && let Some(rect) = layout.node_rect(node)
+                && let Some(path) = tiny_skia::Rect::from_xywh(
+                    card.x as f32 + rect.x * page_scale as f32,
+                    card.y as f32 + (rect.y - self.scroll_y) * page_scale as f32,
+                    (rect.width * page_scale as f32).max(1.0),
+                    (rect.height * page_scale as f32).max(1.0),
+                )
+                .map(|rect| tiny_skia::PathBuilder::from_rect(rect))
+            {
+                toolbar::stroke(
+                    &mut composed,
+                    &path,
+                    toolbar::rgba(0x16, 0x9b, 0xf0, 220),
+                    (2.0 * scale) as f32,
+                    tiny_skia::Transform::identity(),
+                );
+            }
             panel.draw(
                 &mut composed,
                 scale,
@@ -1905,6 +1940,33 @@ impl App {
             .as_ref()
             .is_some_and(|panel| panel.contains(self.cursor) && !panel.contains(Some((x, y))));
         self.cursor = Some((x, y));
+        let hovered_node = self.elements.as_ref().and_then(|panel| {
+            if panel.contains(self.cursor) {
+                return panel.node_at(self.cursor);
+            }
+            if !panel.inspecting_hover() {
+                return None;
+            }
+            let size = window.inner_size();
+            let rect =
+                toolbar::page_rect_with_find(size.width, size.height, scale, self.find.is_some())?;
+            let px = x * scale - f64::from(rect.x);
+            let py = y * scale - f64::from(rect.y);
+            if px < 0.0 || py < 0.0 || px >= f64::from(rect.width) || py >= f64::from(rect.height) {
+                return None;
+            }
+            let page_scale = (scale * self.page_zoom) as f32;
+            self.page_layout.as_ref()?.hit_test(
+                px as f32 / page_scale,
+                py as f32 / page_scale,
+                self.scroll_y,
+            )
+        });
+        if let Some(panel) = &mut self.elements {
+            if panel.set_hovered_node(hovered_node) {
+                self.redraw();
+            }
+        }
         log::trace!("cursor moved: ({x:.0}, {y:.0})");
         if self.address_press.is_some()
             && let Some(offset) = self.address_offset_under_pointer()
@@ -2027,6 +2089,73 @@ impl App {
         } else {
             self.elements.as_ref()
         };
+        if panel.is_some_and(|panel| panel.tab() == DockTab::Elements && panel.styles_view()) {
+            let mut submit = false;
+            let handled = match event.logical_key.as_ref() {
+                Key::Named(NamedKey::Enter) => {
+                    submit = true;
+                    true
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(panel) = if standalone {
+                        self.devtools_panel.as_mut()
+                    } else {
+                        self.elements.as_mut()
+                    } {
+                        panel.backspace_style_text();
+                    }
+                    true
+                }
+                Key::Named(NamedKey::Space)
+                    if !self.modifiers.control_key()
+                        && !self.modifiers.alt_key()
+                        && !self.modifiers.super_key() =>
+                {
+                    if let Some(panel) = if standalone {
+                        self.devtools_panel.as_mut()
+                    } else {
+                        self.elements.as_mut()
+                    } {
+                        panel.insert_style_text(" ");
+                    }
+                    true
+                }
+                Key::Character(character)
+                    if !self.modifiers.control_key()
+                        && !self.modifiers.alt_key()
+                        && !self.modifiers.super_key() =>
+                {
+                    let text = event.text.as_deref().unwrap_or(character);
+                    if let Some(panel) = if standalone {
+                        self.devtools_panel.as_mut()
+                    } else {
+                        self.elements.as_mut()
+                    } {
+                        panel.insert_style_text(text);
+                    }
+                    true
+                }
+                _ => false,
+            };
+            if submit {
+                let rule = if standalone {
+                    self.devtools_panel.as_mut()
+                } else {
+                    self.elements.as_mut()
+                }
+                .and_then(ElementsPanel::submit_style_override);
+                if let (Some(page), Some((selector, declaration))) = (&mut self.loaded_page, rule) {
+                    page.stylesheets
+                        .push(format!("{selector} {{ {declaration} }}"));
+                    self.page = None;
+                    self.page_layout = None;
+                }
+            }
+            if handled {
+                self.redraw();
+            }
+            return handled;
+        }
         if panel.is_none_or(|panel| panel.tab() != DockTab::Console) {
             return false;
         }
@@ -2099,10 +2228,18 @@ impl App {
                 console.log(devtools::Level::Log, &format!("> {source}"));
             }
             let proxy = self.proxy.clone();
+            let page_events = self.page_events.clone();
             self.page_events
                 .evaluate_console(source, Arc::clone(&self.console), move || {
                     if let Some(proxy) = &proxy {
                         let _ = proxy.send_event(UserEvent::ConsoleUpdated);
+                        let proxy = proxy.clone();
+                        let page_events = page_events.clone();
+                        std::thread::spawn(move || {
+                            if let Some(html) = page_events.snapshot_html() {
+                                let _ = proxy.send_event(UserEvent::LiveDomUpdated(html));
+                            }
+                        });
                     }
                 });
         }
@@ -2219,6 +2356,18 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(window) = &self.devtools_window {
                         let position = position.to_logical::<f64>(window.scale_factor());
                         self.devtools_cursor = Some((position.x, position.y));
+                        let hovered = self
+                            .devtools_panel
+                            .as_ref()
+                            .and_then(|panel| panel.node_at(self.devtools_cursor));
+                        if let Some(panel) = &mut self.devtools_panel {
+                            panel.set_hovered_node(hovered);
+                        }
+                        if let Some(panel) = &mut self.elements
+                            && panel.set_hovered_node(hovered)
+                        {
+                            self.redraw();
+                        }
                         window.request_redraw();
                     }
                 }
@@ -2246,6 +2395,15 @@ impl ApplicationHandler<UserEvent> for App {
                         if changed && let Some(window) = &self.devtools_window {
                             window.request_redraw();
                         }
+                    }
+                    let highlighted = self
+                        .devtools_panel
+                        .as_ref()
+                        .and_then(ElementsPanel::highlighted_node);
+                    if let Some(panel) = &mut self.elements
+                        && panel.set_hovered_node(highlighted)
+                    {
+                        self.redraw();
                     }
                 }
                 WindowEvent::MouseInput {
@@ -2437,6 +2595,18 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::AuditFinished { id, report } => self.audit_finished(id, *report),
             UserEvent::ConsoleUpdated => {
+                if let Some(window) = &self.devtools_window {
+                    window.request_redraw();
+                }
+            }
+            UserEvent::LiveDomUpdated(html) => {
+                if let Some(panel) = &mut self.elements {
+                    panel.update_live_document(&html);
+                }
+                if let Some(panel) = &mut self.devtools_panel {
+                    panel.update_live_document(&html);
+                }
+                self.redraw();
                 if let Some(window) = &self.devtools_window {
                     window.request_redraw();
                 }
