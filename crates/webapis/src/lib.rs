@@ -19,6 +19,7 @@ mod event;
 mod fetch;
 pub mod local_storage;
 mod location;
+mod node;
 mod node_tree;
 mod selection;
 mod selector;

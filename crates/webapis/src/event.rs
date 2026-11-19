@@ -626,59 +626,58 @@ pub(crate) fn dispatch_event_at(
             .and_then(|source| source.get_node(current_node).and_then(|n| n.get_parent()));
     }
     let document_target = document.event_target.clone();
-    if node.is_some() {
-        invoke_listeners(
-            &document_target,
-            event,
-            &event_type,
-            &Object::new(),
-            true,
-            1.0,
-        );
-        for ancestor in path.iter().rev().skip(1).take(path.len().saturating_sub(2)) {
+    if node.is_none() {
+        return dispatch_event_target(&document_target, target_object, arguments);
+    }
+    // Build the dispatch path once. Detached trees have no document ancestor.
+    // Reuse registered wrappers so event.currentTarget has normal DOM identity.
+    let ancestors: Vec<_> = path
+        .iter()
+        .skip(1)
+        .filter_map(|id| {
+            let is_document = document
+                .html_document()?
+                .get_node(*id)
+                .is_some_and(|data| matches!(data.get_kind(), html::NodeKind::Document));
+            if is_document {
+                let object = document
+                    .script_bindings()
+                    .map(|bindings| bindings.document)
+                    .unwrap_or_default();
+                Some((document_target.clone(), object))
+            } else {
+                let object = document.cached_script_element(*id).or_else(|| {
+                    element_for_node(document, *id).map(|element| {
+                        element_object(element, Arc::new(Mutex::new(document.clone())))
+                    })
+                })?;
+                Some((event_target_for(document, Some(*id)), object))
+            }
+        })
+        .collect();
+    for (target, object) in ancestors.iter().rev() {
+        if matches!(event.get("__stopPropagation"), Some(Value::Boolean(true))) {
+            break;
+        }
+        invoke_listeners(target, event, &event_type, object, true, 1.0);
+    }
+    if !matches!(event.get("__stopPropagation"), Some(Value::Boolean(true))) {
+        let target = event_target_for(document, node);
+        invoke_listeners(&target, event, &event_type, target_object, true, 2.0);
+        if !matches!(
+            event.get("__stopImmediatePropagation"),
+            Some(Value::Boolean(true))
+        ) {
+            invoke_listeners(&target, event, &event_type, target_object, false, 2.0);
+        }
+    }
+    if matches!(event.get("bubbles"), Some(Value::Boolean(true))) {
+        for (target, object) in &ancestors {
             if matches!(event.get("__stopPropagation"), Some(Value::Boolean(true))) {
                 break;
             }
-            if let Some(element) = element_for_node(document, *ancestor) {
-                let target = event_target_for(document, Some(*ancestor));
-                let object = element_object(element, Arc::new(Mutex::new(document.clone())));
-                invoke_listeners(&target, event, &event_type, &object, true, 1.0);
-            }
+            invoke_listeners(target, event, &event_type, object, false, 3.0);
         }
-        if let Some(target_node) = node {
-            let target = event_target_for(document, Some(target_node));
-            invoke_listeners(&target, event, &event_type, target_object, true, 2.0);
-            if !matches!(
-                event.get("__stopImmediatePropagation"),
-                Some(Value::Boolean(true))
-            ) {
-                invoke_listeners(&target, event, &event_type, target_object, false, 2.0);
-            }
-        }
-        if matches!(event.get("bubbles"), Some(Value::Boolean(true)))
-            && !matches!(event.get("__stopPropagation"), Some(Value::Boolean(true)))
-        {
-            for ancestor in &path[1..] {
-                if matches!(event.get("__stopPropagation"), Some(Value::Boolean(true))) {
-                    break;
-                }
-                if let Some(element) = element_for_node(document, *ancestor) {
-                    let target = event_target_for(document, Some(*ancestor));
-                    let object = element_object(element, Arc::new(Mutex::new(document.clone())));
-                    invoke_listeners(&target, event, &event_type, &object, false, 3.0);
-                }
-            }
-            invoke_listeners(
-                &document_target,
-                event,
-                &event_type,
-                &Object::new(),
-                false,
-                3.0,
-            );
-        }
-    } else {
-        return dispatch_event_target(&document_target, target_object, arguments);
     }
 
     event.set("eventPhase", Value::Number(0.0));
