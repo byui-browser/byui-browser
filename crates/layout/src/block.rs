@@ -97,7 +97,7 @@ impl Context<'_> {
                 .or_else(|| self.intrinsic_content_width(block, (cb.width - padding).max(0.0)))
                 .or(self.control_size(block, basis, cb.height).width),
         };
-        let (left, width, right) = match used_width {
+        let (mut left, mut width, mut right) = match used_width {
             None => {
                 // `auto` margins become 0 and the width fills the rest.
                 let left = margin_left.unwrap_or(0.0);
@@ -139,6 +139,30 @@ impl Context<'_> {
                 }
             }
         };
+        if let Some(min_width) = style.content_width_for(style.min_width, basis)
+            && width < min_width
+        {
+            width = min_width;
+            let remaining = cb.width - padding - width;
+            match (margin_left, margin_right) {
+                (None, None) if remaining >= 0.0 => {
+                    left = remaining / 2.0;
+                    right = remaining / 2.0;
+                }
+                (None, Some(right_margin)) => {
+                    left = remaining - right_margin;
+                    right = right_margin;
+                }
+                (Some(left_margin), _) => {
+                    left = left_margin;
+                    right = remaining - left_margin;
+                }
+                (None, None) => {
+                    left = 0.0;
+                    right = remaining;
+                }
+            }
+        }
         let kind = if block.node.is_some() {
             BoxKind::Block
         } else {
@@ -173,7 +197,7 @@ impl Context<'_> {
             BlockContents::Replaced(replaced) => Some(replaced.used_size(style, basis, None).0),
             _ => None,
         };
-        let width = replaced_width
+        let mut width = replaced_width
             .or(style.content_width(basis))
             .or_else(|| {
                 self.intrinsic_content_width(
@@ -192,6 +216,9 @@ impl Context<'_> {
             );
             width
         });
+        if let Some(min_width) = style.content_width_for(style.min_width, basis) {
+            width = width.max(min_width);
+        }
         self.layout_block_container(
             block,
             ContainingBlock {
@@ -971,6 +998,10 @@ pub(crate) fn box_style(style: &ComputedStyle) -> BoxStyle {
         border_width: style.borders.border_width,
         border_color: style.borders.border_color,
         border_style: style.borders.border_style.clone(),
+        outline_color: style.outline_color,
+        outline_width: style.outline_width,
+        outline_offset: style.outline_offset,
+        outline_style: style.outline_style.clone(),
         border_radius: style.border_radius,
         box_shadow: Arc::clone(&style.box_shadow),
     }

@@ -45,6 +45,27 @@ impl FontMetrics for ProbeMetrics {
             line_gap: 0.0,
         }
     }
+
+    fn select_font(&self, families: &[String], _weight: u16, _italic: bool) -> layout::FontId {
+        if families.is_empty() {
+            layout::FontId::DEFAULT
+        } else if families
+            .iter()
+            .any(|family| family.eq_ignore_ascii_case("monospace"))
+        {
+            layout::FontId(1)
+        } else {
+            layout::FontId(2)
+        }
+    }
+
+    fn font_advance(&self, font: layout::FontId, _character: char, font_size: f32) -> f32 {
+        match font {
+            layout::FontId(1) => font_size * 0.7,
+            layout::FontId(2) => font_size * 0.4,
+            _ => font_size * 0.5,
+        }
+    }
 }
 
 /// The result of rendering one probe document.

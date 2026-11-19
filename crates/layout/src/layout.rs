@@ -40,8 +40,11 @@ pub(crate) struct Context<'a> {
 /// Non-replaced boxes support `width: min-content`, `max-content`, and
 /// `fit-content`; intrinsic sizing keywords on `height` and replaced boxes
 /// are not implemented. Other supported properties are margins, padding,
-/// `width`, `height`, `font-size`, `font-family`,
-/// `font-weight`, `font-style`, `color`, and `background-color`;
+/// `min-width`, `width`, `height`, `font-size`, `font-family`, `font-weight`,
+/// `font-style`, `color`, `background-color`, and the color component of the
+/// `background` shorthand. `text-decoration` paints simple text lines,
+/// `outline` paints a square outline without changing layout, and
+/// `vertical-align` applies an approximate baseline shift to inline boxes;
 /// unsupported properties (including the `font` shorthand) use their initial
 /// values. The font properties choose a face through
 /// [`FontMetrics::select_font`], which measures each text run.
@@ -58,8 +61,11 @@ pub(crate) struct Context<'a> {
 ///   viewport. `sticky` stays at its in-flow position. `z-index` is not
 ///   supported; see [`LayoutTree::paint_order`] for stacking.
 ///
-/// Borders are not implemented. Min/max sizes apply to replaced elements;
-/// flex items also honor their main-axis minimum size.
+/// Border widths, colors, and styles paint on boxes. Min/max sizes apply to
+/// replaced elements; ordinary blocks and flex items also honor `min-width`.
+/// Other `min-*`/`max-*` constraints are incomplete.
+/// Background images and full background layers, opacity groups, and
+/// standards-complete `vertical-align` are not implemented.
 /// Content may overflow the viewport; the root box's rect stays viewport-sized.
 ///
 /// This lays out without images: every `<img>` is treated as broken. Use

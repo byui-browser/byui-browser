@@ -27,11 +27,54 @@ const CSS_WIDE_KEYWORDS: [&str; 5] = ["inherit", "initial", "unset", "revert", "
 /// `animation` is expanded to the eight `animation-*` longhands, each a
 /// comma-separated list with one entry per animation (CSS Animations 1
 /// §3.10).
+/// `background` currently expands only its color component; image and other
+/// layer components are ignored. Numeric `flex` forms and the common
+/// `-webkit-flex`, `-webkit-box-flex`, `-webkit-box-sizing`, and
+/// `-webkit-box-shadow` aliases map to the corresponding supported longhands.
+/// `outline` expands width, style, and color. `text-decoration` currently
+/// expands its line component; style, thickness, and explicit color are not
+/// interpreted.
 ///
 /// Other declarations are returned unchanged. An invalid shorthand value
 /// expands to nothing, matching CSS's rule that invalid declarations are
 /// dropped. CSS-wide keywords such as `inherit` are copied to every longhand.
 pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
+    if declaration.property == "background" {
+        return expand_background(&declaration.value);
+    }
+    if declaration.property == "outline" {
+        return expand_outline(&declaration.value);
+    }
+    if declaration.property == "text-decoration" {
+        return vec![Declaration {
+            property: "text-decoration-line".to_owned(),
+            value: declaration.value.clone(),
+        }];
+    }
+    if declaration.property == "-webkit-box-shadow" {
+        return vec![Declaration {
+            property: "box-shadow".to_owned(),
+            value: declaration.value.clone(),
+        }];
+    }
+    if declaration.property == "-webkit-box-sizing" {
+        return vec![Declaration {
+            property: "box-sizing".to_owned(),
+            value: declaration.value.clone(),
+        }];
+    }
+    if declaration.property == "-webkit-box-flex" {
+        return vec![Declaration {
+            property: "flex-grow".to_owned(),
+            value: declaration.value.clone(),
+        }];
+    }
+    if declaration.property == "-webkit-flex" {
+        return expand_flex(&declaration.value);
+    }
+    if declaration.property == "flex" {
+        return expand_flex(&declaration.value);
+    }
     if matches!(
         declaration.property.as_str(),
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left"
@@ -91,6 +134,108 @@ pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
             } else {
                 format!("{prefix}-{side}")
             },
+            value: value.to_owned(),
+        })
+        .collect()
+}
+
+/// Expands the supported color-only portion of `background`. Image, repeat,
+/// position, and sizing components are ignored; the shorthand still resets
+/// the background color when it contains no supported color.
+fn expand_background(value: &str) -> Vec<Declaration> {
+    let color = if CSS_WIDE_KEYWORDS
+        .iter()
+        .any(|keyword| value.trim().eq_ignore_ascii_case(keyword))
+    {
+        value.trim()
+    } else {
+        split_components(value)
+            .into_iter()
+            .find(|part| crate::parse_color(part).is_some())
+            .unwrap_or("transparent")
+    };
+    vec![Declaration {
+        property: "background-color".to_owned(),
+        value: color.to_owned(),
+    }]
+}
+
+/// Expands the width, style, and color components of the outline shorthand.
+fn expand_outline(value: &str) -> Vec<Declaration> {
+    let trimmed = value.trim();
+    let mut components = ["medium", "none", "currentcolor"];
+    if CSS_WIDE_KEYWORDS
+        .iter()
+        .any(|keyword| trimmed.eq_ignore_ascii_case(keyword))
+    {
+        components = [trimmed; 3];
+    } else {
+        let mut seen = [false; 3];
+        for token in split_components(trimmed) {
+            let lower = token.to_ascii_lowercase();
+            let index = if matches!(
+                lower.as_str(),
+                "none" | "auto" | "solid" | "dashed" | "dotted" | "double"
+            ) {
+                1
+            } else if matches!(lower.as_str(), "thin" | "medium" | "thick")
+                || crate::values::parse_length(&lower).is_some_and(|length| length.value >= 0.0)
+            {
+                0
+            } else if lower == "currentcolor" || crate::parse_color(token).is_some() {
+                2
+            } else {
+                return Vec::new();
+            };
+            if seen[index] {
+                return Vec::new();
+            }
+            seen[index] = true;
+            components[index] = token;
+        }
+    }
+    ["outline-width", "outline-style", "outline-color"]
+        .into_iter()
+        .zip(components)
+        .map(|(property, value)| Declaration {
+            property: property.to_owned(),
+            value: value.to_owned(),
+        })
+        .collect()
+}
+
+/// Expands the numeric and keyword forms of the `flex` shorthand.
+fn expand_flex(value: &str) -> Vec<Declaration> {
+    if CSS_WIDE_KEYWORDS
+        .iter()
+        .any(|keyword| value.trim().eq_ignore_ascii_case(keyword))
+    {
+        return ["flex-grow", "flex-shrink", "flex-basis"]
+            .into_iter()
+            .map(|property| Declaration {
+                property: property.to_owned(),
+                value: value.trim().to_owned(),
+            })
+            .collect();
+    }
+    let parts = split_components(value);
+    let values = match parts.as_slice() {
+        ["none"] => ["0", "0", "auto"],
+        ["auto"] => ["1", "1", "auto"],
+        [grow] if grow.parse::<f32>().is_ok() => [*grow, "1", "0%"],
+        [grow, shrink] if grow.parse::<f32>().is_ok() && shrink.parse::<f32>().is_ok() => {
+            [*grow, *shrink, "0%"]
+        }
+        [grow, shrink, basis] if grow.parse::<f32>().is_ok() && shrink.parse::<f32>().is_ok() => {
+            [*grow, *shrink, *basis]
+        }
+        _ => return Vec::new(),
+    };
+    ["flex-grow", "flex-shrink", "flex-basis"]
+        .into_iter()
+        .zip(values)
+        .map(|(property, value)| Declaration {
+            property: property.to_owned(),
             value: value.to_owned(),
         })
         .collect()
