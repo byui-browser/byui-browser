@@ -60,6 +60,18 @@ pub enum DisplayItem {
         /// RGBA8 color.
         rgba: [u8; 4],
     },
+    /// Strokes a straight segment with round caps, in device pixels. Edge
+    /// pixels are blended by their center's distance to the outline.
+    StrokeLine {
+        /// Start point `(x, y)`.
+        from: (f32, f32),
+        /// End point `(x, y)`.
+        to: (f32, f32),
+        /// Stroke width; points within `width / 2` of the segment are covered.
+        width: f32,
+        /// RGBA8 color.
+        rgba: [u8; 4],
+    },
     /// Draws text with the built-in [`crate::BitmapFont`].
     Text {
         /// Left edge of the first glyph cell, in device pixels.

@@ -9,7 +9,7 @@ use css::PseudoElement;
 
 use html::{HTMLDocument, NodeID, NodeKind};
 
-use crate::control::FormControl;
+use crate::control::{CHECKBOX_RADIO_SIZE, ControlKind, FormControl, ToggleControl};
 use crate::replaced::{
     ImageKey, ImageMetrics, NaturalSize, ReplacedBox, parse_dimension_attribute, view_box_ratio,
 };
@@ -360,14 +360,40 @@ impl Builder<'_> {
             style.display,
             is_root || flow_root
         );
+        let control = self.form_control_sizing(node);
+        let contents = match &control {
+            // A drop-down shows only its selected option's text, as one
+            // synthetic run; its options and groups generate no boxes, and
+            // it never shows `::before` / `::after` content.
+            Some(FormControl::Select {
+                drop_down: Some(text),
+                ..
+            }) => BlockContents::Inlines(
+                (!text.is_empty())
+                    .then(|| {
+                        BuildStats::bump(&self.stats.text_runs);
+                        let style = self.styles.for_text_parent(Some(node));
+                        InlineItem::Text {
+                            node,
+                            element: Some(node),
+                            text: style.text_transform.apply(text),
+                            style,
+                            white_space: WhiteSpace::Collapse,
+                        }
+                    })
+                    .into_iter()
+                    .collect(),
+            ),
+            _ => self.container_contents(Some(node), children, style),
+        };
         BlockBox {
             node: Some(node),
-            contents: self.container_contents(Some(node), children, style),
+            contents,
             style: Rc::clone(style),
             // Floats and absolutely positioned boxes establish a new block
             // formatting context (CSS 2.2 §9.4.1).
             establishes_bfc: is_root || flow_root || style.is_out_of_flow(),
-            control: self.form_control_sizing(node),
+            control,
             clips_contents: false,
             centers_lines: false,
         }
@@ -685,8 +711,9 @@ impl Builder<'_> {
 }
 
 impl Builder<'_> {
-    /// The box for a replaced element (`<img>`, or an `<svg>` element that is
-    /// not inside another SVG element), or `None` for other elements.
+    /// The box for a replaced element (`<img>`, an `<svg>` element that is
+    /// not inside another SVG element, or a checkbox or radio `<input>`, which
+    /// is sized like a 13x13 image), or `None` for other elements.
     ///
     /// A broken `<img>` (no `src`, or one the embedder has no image for) with
     /// a non-empty `alt` and no `width`/`height` is shown as its `alt` text
@@ -706,7 +733,27 @@ impl Builder<'_> {
                 .map(|attribute| attribute.get_value().as_str())
         };
         let hint = |name: &str| attribute(name).map_or(Dimension::Auto, parse_dimension_attribute);
+        let mut control = None;
         let (key, natural) = match (element.get_name().as_str(), element.get_namespace()) {
+            ("input", html::Namespace::Html) => {
+                let kind = match attribute("type") {
+                    Some(kind) if kind.eq_ignore_ascii_case("checkbox") => ControlKind::Checkbox,
+                    Some(kind) if kind.eq_ignore_ascii_case("radio") => ControlKind::Radio,
+                    _ => return None,
+                };
+                control = Some(ToggleControl {
+                    kind,
+                    checked: attribute("checked").is_some(),
+                    disabled: attribute("disabled").is_some(),
+                });
+                (
+                    None,
+                    NaturalSize::from_size(crate::Size {
+                        width: CHECKBOX_RADIO_SIZE,
+                        height: CHECKBOX_RADIO_SIZE,
+                    }),
+                )
+            }
             ("img", html::Namespace::Html) => {
                 let src = attribute("src").map(str::trim).unwrap_or_default();
                 let key = ImageKey::Src(src.to_owned());
@@ -739,7 +786,7 @@ impl Builder<'_> {
                         }
                     }
                 };
-                (key, natural)
+                (Some(key), natural)
             }
             ("svg", html::Namespace::Svg) => {
                 let nested = self
@@ -771,7 +818,7 @@ impl Builder<'_> {
                         _ => None,
                     }),
                 };
-                (ImageKey::InlineSvg(node), natural)
+                (Some(ImageKey::InlineSvg(node)), natural)
             }
             _ => return None,
         };
@@ -788,9 +835,20 @@ impl Builder<'_> {
             centers_lines: false,
             contents: BlockContents::Replaced(ReplacedBox {
                 key,
+                control,
                 natural,
-                width_hint: hint("width"),
-                height_hint: hint("height"),
+                // The `width` and `height` attributes do not apply to
+                // checkbox and radio inputs.
+                width_hint: if control.is_some() {
+                    Dimension::Auto
+                } else {
+                    hint("width")
+                },
+                height_hint: if control.is_some() {
+                    Dimension::Auto
+                } else {
+                    hint("height")
+                },
             }),
             control: None,
         };
@@ -808,9 +866,15 @@ impl Builder<'_> {
     /// - `<textarea>` shows its child text, or its `placeholder` when it has
     ///   no text, as `white-space: pre-wrap` ([`WhiteSpace::PreWrap`]): line
     ///   breaks and spaces are kept and long lines wrap.
+    /// - `<input type=submit|reset|button>` shows its `value` (even when
+    ///   empty), or else "Submit", "Reset", or nothing, on one line. The
+    ///   defaults are not localized.
     ///
-    /// Other input types (buttons, checkboxes, dates, …) return `None` and
-    /// keep their empty inline-block box. Values changed at runtime, the
+    /// Single-line text drops CR and LF and shows tabs as one space. An
+    /// empty single-line control is still one line tall.
+    ///
+    /// Other input types (`image`, `file`, checkboxes, dates, …) return
+    /// `None` and keep their empty inline-block box. Values changed at runtime, the
     /// caret, and selection are not supported.
     fn form_control(
         &self,
@@ -844,17 +908,17 @@ impl Builder<'_> {
         let block = match element.get_name().as_str() {
             "input" => {
                 let kind = attribute("type").unwrap_or_default().to_ascii_lowercase();
-                if !is_text_like_input_type(&kind) {
+                let button_label = button_input_default_label(&kind);
+                if button_label.is_none() && !is_text_like_input_type(&kind) {
                     return None;
                 }
-                let value: String = attribute("value")
-                    .unwrap_or_default()
-                    .chars()
-                    .filter(|character| !matches!(character, '\n' | '\r'))
-                    // Tab stops are not supported: a tab shows as one space.
-                    .map(|character| if character == '\t' { ' ' } else { character })
-                    .collect();
-                let (text, text_style) = if value.is_empty() {
+                let value = single_line_text(attribute("value").unwrap_or_default());
+                let (text, text_style) = if let Some(default_label) = button_label {
+                    // The label is the value, even when empty.
+                    let label =
+                        attribute("value").map_or_else(|| default_label.to_owned(), |_| value);
+                    (label, Rc::clone(style))
+                } else if value.is_empty() {
                     placeholder(true)
                 } else if kind == "password" {
                     ("\u{2022}".repeat(value.chars().count()), Rc::clone(style))
@@ -925,7 +989,8 @@ impl Builder<'_> {
     /// line with its spaces preserved (as [`WhiteSpace::Pre`]),
     /// centered vertically in the content box, and clipped to the padding
     /// box. Horizontal placement follows the control's `text-align`. Empty
-    /// `text` gives a box with no lines. `text-transform` is applied here.
+    /// `text` gives a box whose only line is an empty strut, so it is still
+    /// one line tall. `text-transform` is applied here.
     ///
     /// Wrap the result with [`level_for`] (or `InlineItem::Atomic`) to place
     /// it.
@@ -963,6 +1028,28 @@ pub(crate) const PLACEHOLDER_COLOR: css::CssColor = css::CssColor {
     b: 0x75,
     a: 255,
 };
+
+/// `text` for one line of a control: CR and LF are dropped, and each tab
+/// shows as one space because tab stops are not supported.
+fn single_line_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| !matches!(character, '\n' | '\r'))
+        .map(|character| if character == '\t' { ' ' } else { character })
+        .collect()
+}
+
+/// The label an `<input>` button with the lowercased `type` value `kind`
+/// shows when it has no `value` attribute: "Submit" for `submit`, "Reset"
+/// for `reset`, and no text for `button`. `None` for other types. The
+/// labels are not localized; `type=image` is not a labelled button here.
+fn button_input_default_label(kind: &str) -> Option<&'static str> {
+    match kind {
+        "submit" => Some("Submit"),
+        "reset" => Some("Reset"),
+        "button" => Some(""),
+        _ => None,
+    }
+}
 
 /// Whether an `<input>` with the lowercased `type` value `kind` is a text
 /// field. Missing, empty, and unknown types are `text` per HTML.

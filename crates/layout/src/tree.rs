@@ -8,12 +8,13 @@ use std::sync::Arc;
 use css::CssColor;
 use html::NodeID;
 
-use crate::{BorderRadius, BoxShadow, Edges, ImageKey, Rect};
+use crate::{BorderRadius, BoxShadow, Edges, ImageKey, Rect, ToggleControl};
 
 /// Paint-relevant computed values for a box or inline box fragment.
 ///
-/// Colors, borders, corner radii, and outer box shadows are painted today;
-/// Inset shadows, and other decorations are not supported yet.
+/// Colors, borders, corner radii, outlines, text decorations, and outer box
+/// shadows are painted today. Inset shadows and full background layers are
+/// not supported yet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoxStyle {
     /// The background color, or `None` when it is transparent or unsupported.
@@ -30,6 +31,14 @@ pub struct BoxStyle {
     /// Per-side CSS styles. Dashed, dotted, and double are painted;
     /// relief styles currently use a solid fill. Border corners are square.
     pub border_style: crate::Sides<String>,
+    /// The outline color. Outlines are outside the border and do not affect layout.
+    pub outline_color: CssColor,
+    /// Outline width in CSS pixels; zero when the outline is not visible.
+    pub outline_width: f32,
+    /// Distance between the border edge and outline in CSS pixels.
+    pub outline_offset: f32,
+    /// Outline pattern, such as `solid`, `dashed`, or `dotted`.
+    pub outline_style: String,
     /// The computed `box-shadow` list, first (topmost) shadow first; empty
     /// for `none`. Shadows follow the rounded border box.
     pub box_shadow: Arc<[BoxShadow]>,
@@ -45,6 +54,10 @@ impl Default for BoxStyle {
             border_width: Edges::default(),
             border_color: crate::Sides::from_array([css::parse_color("black").unwrap(); 4]),
             border_style: crate::Sides::from_array(std::array::from_fn(|_| "none".to_owned())),
+            outline_color: css::parse_color("black").unwrap(),
+            outline_width: 0.0,
+            outline_offset: 0.0,
+            outline_style: "none".to_owned(),
             box_shadow: Arc::from(Vec::new()),
         }
     }
@@ -133,9 +146,16 @@ pub struct LayoutBox {
     /// Line boxes when the box establishes an inline formatting context, in
     /// order from top to bottom.
     pub lines: Vec<LineBox>,
+    /// Whether to draw a drop-down arrow: a small down chevron, vertically
+    /// centered near the right of the padding box. Set for single-choice
+    /// `<select>` elements, whose layout keeps the arrow area free of text.
+    pub select_arrow: bool,
     /// For [`BoxKind::Replaced`] boxes, the picture to draw in the content
     /// box; `None` for every other kind.
     pub image: Option<ImageKey>,
+    /// For [`BoxKind::Replaced`] boxes of checkbox and radio inputs, the
+    /// control to draw in the content box; `None` for every other box.
+    pub control: Option<ToggleControl>,
 }
 
 impl LayoutBox {
@@ -243,6 +263,8 @@ pub struct TextFragment {
     pub font: crate::FontId,
     /// The text color.
     pub color: CssColor,
+    /// Text decoration lines such as `underline`; empty for undecorated text.
+    pub text_decoration: Vec<String>,
     /// A rectangle the glyphs must not paint outside, in the same absolute
     /// coordinates as `rect`; `None` means unclipped. Set for text inside
     /// form controls, which is clipped to the control's padding box. The
@@ -270,8 +292,8 @@ pub enum PaintItem<'a> {
     InlineBox(&'a InlineBoxFragment),
     /// A text run.
     Text(&'a TextFragment),
-    /// The picture of a [`BoxKind::Replaced`] box, drawn in its content box
-    /// after its background.
+    /// The picture or form control of a [`BoxKind::Replaced`] box, drawn in
+    /// its content box after its background.
     Image(&'a LayoutBox),
 }
 
@@ -402,7 +424,7 @@ fn push_block_decorations<'a>(
 }
 
 fn push_inline_content<'a>(layout_box: &'a LayoutBox, items: &mut Vec<PaintItem<'a>>) {
-    if layout_box.image.is_some() {
+    if layout_box.image.is_some() || layout_box.control.is_some() {
         items.push(PaintItem::Image(layout_box));
     }
     for line in &layout_box.lines {
@@ -440,7 +462,9 @@ mod tests {
             placement: Placement::InFlow,
             children,
             lines: Vec::new(),
+            select_arrow: false,
             image: None,
+            control: None,
         }
     }
 
@@ -488,6 +512,7 @@ mod tests {
                 font_size: 10.0,
                 font: crate::FontId::DEFAULT,
                 color: BoxStyle::default().text_color,
+                text_decoration: Vec::new(),
                 clip: None,
             })],
         });

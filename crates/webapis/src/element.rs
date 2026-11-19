@@ -6,7 +6,6 @@ use html::{Attribute, Namespace, NodeID};
 use js::{JsError, JsResult, Object, ScriptEvaluator, Value};
 
 use crate::document::{Document, script_element_object};
-use crate::event::{add_event_listener_at, dispatch_event_at, remove_event_listener_at};
 use crate::node_tree::NodeInput;
 
 // One submodule per Element API; each installs its members on the wrapper.
@@ -15,17 +14,22 @@ mod children;
 mod class_list;
 mod class_name;
 mod closest;
+#[cfg(test)]
 mod compare_document_position;
+#[cfg(test)]
 mod contains;
 mod dataset;
+#[cfg(test)]
 mod first_child;
 mod focus;
 mod get_elements_by_class_name;
 pub(crate) mod get_elements_by_tag_name;
 mod has_attribute;
+#[cfg(test)]
 mod node_type;
-mod node_view;
+#[cfg(test)]
 mod parent_element;
+#[cfg(test)]
 mod parent_node;
 mod query_selector;
 
@@ -156,30 +160,6 @@ pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -
             Ok(Value::Undefined)
         }),
     );
-    let append_document = document.clone();
-    object.set_method(
-        "appendChild",
-        Arc::new(move |arguments| {
-            let ([Value::Object(child)] | [Value::Array(child)]) = arguments else {
-                return Err(JsError::new("Element.appendChild() expects an element"));
-            };
-            let Some(Value::Number(child_id)) = child.get("__nodeId") else {
-                return Err(JsError::new("Element.appendChild() expects an element"));
-            };
-            let child_id = html::NodeID::new(child_id as usize);
-            let was_connected = append_document.lock().unwrap().is_connected(child_id);
-            let evaluator = append_document.lock().unwrap().event_evaluator.clone();
-            if was_connected {
-                invoke_lifecycle_callback(child, "disconnectedCallback", evaluator.as_ref());
-            }
-            append_document
-                .lock()
-                .unwrap()
-                .append_child_to(node, child_id)?;
-            invoke_lifecycle_callback(child, "connectedCallback", evaluator.as_ref());
-            Ok(Value::Object(child.clone()))
-        }),
-    );
     let remove_document = document.clone();
     let remove_target = object.clone();
     object.set_method(
@@ -198,34 +178,6 @@ pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -
             Ok(Value::Undefined)
         }),
     );
-    let add_document = document.clone();
-    let add_node = element.node;
-    object.set_method(
-        "addEventListener",
-        Arc::new(move |arguments| {
-            let document = add_document.lock().unwrap();
-            add_event_listener_at(&document, Some(add_node), arguments)
-        }),
-    );
-    let remove_document = document.clone();
-    let remove_node = element.node;
-    object.set_method(
-        "removeEventListener",
-        Arc::new(move |arguments| {
-            let document = remove_document.lock().unwrap();
-            remove_event_listener_at(&document, Some(remove_node), arguments)
-        }),
-    );
-    let dispatch_document = document.clone();
-    let dispatch_node = element.node;
-    let dispatch_target = object.clone();
-    object.set_method(
-        "dispatchEvent",
-        Arc::new(move |arguments| {
-            let document = dispatch_document.lock().unwrap();
-            dispatch_event_at(&document, Some(dispatch_node), &dispatch_target, arguments)
-        }),
-    );
     define_element_properties(&object, &element, &document);
     define_tree_methods(&object, node, &document);
     append::install(&object, &element, &document);
@@ -233,18 +185,13 @@ pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -
     class_list::install(&object, &element, &document);
     class_name::install(&object, &element, &document);
     closest::install(&object, &element, &document);
-    compare_document_position::install(&object, &element, &document);
-    contains::install(&object, &element, &document);
     dataset::install(&object, &element, &document);
-    first_child::install(&object, &element, &document);
     focus::install(&object, &element, &document);
     get_elements_by_class_name::install(&object, &element, &document);
     get_elements_by_tag_name::install(&object, &element, &document);
     has_attribute::install(&object, &element, &document);
-    node_type::install(&object, &element, &document);
-    parent_element::install(&object, &element, &document);
-    parent_node::install(&object, &element, &document);
     query_selector::install(&object, &element, &document);
+    crate::node::install(&object, node, &document);
     object
 }
 
@@ -302,16 +249,6 @@ fn define_element_properties(object: &Object, element: &Element, document: &Arc<
         );
     }
 
-    let owner_document = document.clone();
-    object.define_accessor(
-        "ownerDocument",
-        Arc::new(move || {
-            let bindings = owner_document.lock().unwrap().script_bindings();
-            Ok(bindings.map_or(Value::Null, |bindings| Value::Object(bindings.document)))
-        }),
-        None,
-    );
-
     let query_document = document.clone();
     object.set_method(
         "querySelectorAll",
@@ -340,57 +277,6 @@ fn define_element_properties(object: &Object, element: &Element, document: &Arc<
 
 /// Defines `removeChild`, `replaceChild`, `replaceChildren`, and `before`.
 fn define_tree_methods(object: &Object, node: NodeID, document: &Arc<Mutex<Document>>) {
-    let remove_child_document = document.clone();
-    object.set_method(
-        "removeChild",
-        Arc::new(move |arguments| {
-            let Some((child, child_object)) = arguments.first().and_then(node_argument) else {
-                return Err(JsError::new(
-                    "TypeError: Element.removeChild() expects a Node",
-                ));
-            };
-            mutate_tree(
-                &remove_child_document,
-                &[],
-                std::slice::from_ref(&child_object),
-                |document| document.remove_child(node, child).map(|_| ()),
-            )?;
-            Ok(Value::Object(child_object))
-        }),
-    );
-
-    let replace_child_document = document.clone();
-    object.set_method(
-        "replaceChild",
-        Arc::new(move |arguments| {
-            let (Some((new_node, new_object)), Some((child, child_object))) = (
-                arguments.first().and_then(node_argument),
-                arguments.get(1).and_then(node_argument),
-            ) else {
-                return Err(JsError::new(
-                    "TypeError: Element.replaceChild() expects two Nodes",
-                ));
-            };
-            if new_node == child {
-                // Replacing a child with itself changes nothing, so no
-                // lifecycle callbacks run.
-                replace_child_document
-                    .lock()
-                    .unwrap()
-                    .replace_child(node, new_node, child)
-                    .map_err(|error| JsError::new(error.to_string()))?;
-                return Ok(Value::Object(child_object));
-            }
-            mutate_tree(
-                &replace_child_document,
-                &[new_object],
-                std::slice::from_ref(&child_object),
-                |document| document.replace_child(node, new_node, child).map(|_| ()),
-            )?;
-            Ok(Value::Object(child_object))
-        }),
-    );
-
     let replace_children_document = document.clone();
     object.set_method(
         "replaceChildren",

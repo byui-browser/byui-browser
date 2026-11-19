@@ -19,6 +19,7 @@ mod event;
 mod fetch;
 pub mod local_storage;
 mod location;
+mod node;
 mod node_tree;
 mod selection;
 mod selector;
@@ -49,8 +50,8 @@ pub use node_tree::{ClientSize, NodeInput};
 pub use selector::SelectorError;
 pub use timer::{TimerId, TimerQueue};
 pub use window::{
-    ViewportSize, dispatch_window_load, dispatch_window_resize, dispatch_window_scroll,
-    register_window, register_window_with_security_context,
+    ViewportSize, dispatch_window_keydown, dispatch_window_load, dispatch_window_resize,
+    dispatch_window_scroll, register_window, register_window_with_security_context,
     register_window_with_security_context_and_viewport, register_window_with_url,
     register_window_with_url_and_device_pixel_ratio,
     register_window_with_url_device_pixel_ratio_and_viewport, run_window_animation_frames,

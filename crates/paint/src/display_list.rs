@@ -62,6 +62,20 @@ pub enum DisplayItem {
         /// ([`layout::TextFragment::clip`]).
         clip: Option<Rect>,
     },
+    /// Strokes a straight line segment with round caps.
+    ///
+    /// Painted for the check mark of checked checkboxes.
+    StrokeLine {
+        /// Start point `(x, y)`.
+        from: (f32, f32),
+        /// End point `(x, y)`.
+        to: (f32, f32),
+        /// Stroke width; the line covers points within `width / 2` of the
+        /// segment.
+        width: f32,
+        /// Stroke color.
+        color: Color,
+    },
     /// Draws a picture (a decoded bitmap or an SVG document) stretched to
     /// fill `rect`.
     ///

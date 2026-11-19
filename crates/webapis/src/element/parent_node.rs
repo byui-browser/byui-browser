@@ -1,39 +1,4 @@
-//! `Node.parentNode` on script element wrappers.
-//!
-//! The getter is live. An element parent is that element's shared wrapper.
-//! A document parent is the registered `document` object, which is how a
-//! node created by the HTML parser reports its parent. A disconnected node
-//! returns `null`. Assignment is ignored.
-//!
-//! Limitation: when the document has not been registered with a realm, a
-//! document parent reads as `null` because there is no script object for it.
-
-use std::sync::{Arc, Mutex};
-
-use js::{Object, Value};
-
-use crate::document::Document;
-use crate::element::Element;
-
-use super::node_view::{parent_id, wrap_any_node};
-
-/// Installs `Node.parentNode` on the wrapper `object` for `element`.
-pub(super) fn install(object: &Object, element: &Element, document: &Arc<Mutex<Document>>) {
-    let node = element.node;
-    let document = Arc::clone(document);
-    object.define_accessor(
-        "parentNode",
-        Arc::new(move || {
-            let parent = parent_id(&document.lock().unwrap(), node);
-            match parent {
-                Some(parent) => wrap_any_node(&document, parent),
-                None => Ok(Value::Null),
-            }
-        }),
-        None,
-    );
-}
-
+//! Regression coverage for shared Node behavior on Element wrappers.
 #[cfg(test)]
 mod tests {
     use html::parse_raw_html;

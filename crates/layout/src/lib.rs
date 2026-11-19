@@ -27,6 +27,7 @@ mod shadow;
 mod style;
 mod tree;
 
+pub use control::{CHECKBOX_RADIO_SIZE, ControlKind, ToggleControl};
 pub use fonts::{FontId, FontMetrics, VerticalMetrics};
 pub use geometry::{Edges, Rect, Sides, Size};
 pub use layout::{layout_document, layout_document_with_images};

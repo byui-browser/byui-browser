@@ -1,39 +1,4 @@
-//! `Node.parentElement` on script element wrappers.
-//!
-//! The getter is live. It returns the shared wrapper of the parent when that
-//! parent is an element, and `null` when the node is disconnected or its
-//! parent is the document. Assignment is ignored.
-
-use std::sync::{Arc, Mutex};
-
-use js::{Object, Value};
-
-use crate::document::Document;
-use crate::element::Element;
-
-use super::node_view::{is_element, parent_id};
-use super::wrap_element;
-
-/// Installs `Node.parentElement` on the wrapper `object` for `element`.
-pub(super) fn install(object: &Object, element: &Element, document: &Arc<Mutex<Document>>) {
-    let node = element.node;
-    let document = Arc::clone(document);
-    object.define_accessor(
-        "parentElement",
-        Arc::new(move || {
-            let parent = {
-                let locked = document.lock().unwrap();
-                parent_id(&locked, node).filter(|parent| is_element(&locked, *parent))
-            };
-            match parent {
-                Some(parent) => wrap_element(&document, parent),
-                None => Ok(Value::Null),
-            }
-        }),
-        None,
-    );
-}
-
+//! Regression coverage for shared Node behavior on Element wrappers.
 #[cfg(test)]
 mod tests {
     use html::parse_raw_html;

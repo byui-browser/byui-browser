@@ -3,11 +3,11 @@
 //!
 //! Supported today: `white-space: normal` collapsing, soft wrap
 //! opportunities at spaces and around atomic inlines, forced breaks from
-//! `<br>`, inline boxes split across lines, `line-height: normal`,
+//! `<br>`, inline boxes split across lines, `line-height`,
 //! `vertical-align: baseline`, preserved unbreakable runs for text the user
 //! agent draws in form controls, and left-to-right text aligned by every
 //! `text-align` keyword (`justify` widens the spaces between words). Other
-//! `white-space`, `line-height`, and `vertical-align` values, as well as
+//! non-`normal` `white-space` and `vertical-align` values, as well as
 //! bidirectional text, `text-align-last`, and hyphenation, are not
 //! implemented.
 //!
@@ -687,7 +687,8 @@ impl Context<'_> {
             let metrics = self
                 .fonts
                 .font_vertical_metrics(style.font, style.font_size);
-            let line_height = metrics.ascent + metrics.descent + metrics.line_gap;
+            let normal = metrics.ascent + metrics.descent + metrics.line_gap;
+            let line_height = style.line_height.used(style.font_size, normal);
             let half_leading = (line_height - metrics.ascent - metrics.descent) / 2.0;
             (
                 metrics.ascent + half_leading,
@@ -703,13 +704,13 @@ impl Context<'_> {
             include(leaded(prepared.boxes[*box_index].style));
         }
         for fragment in &fragments {
-            if let LineFragment::Text(text) = fragment {
-                let metrics = self.fonts.font_vertical_metrics(text.font, text.font_size);
-                let half_leading = metrics.line_gap / 2.0;
-                include((
-                    metrics.ascent + half_leading,
-                    metrics.descent + half_leading,
-                ));
+            if let LineFragment::Text(text) = fragment
+                && let Some(source) = prepared
+                    .sources
+                    .iter()
+                    .find(|source| source.node == text.node)
+            {
+                include(leaded(source.style));
             }
         }
         let atomic_ascents = atomics_on_line
@@ -771,6 +772,11 @@ impl Context<'_> {
         };
         for (box_index, start, end) in box_ranges {
             let style = prepared.boxes[box_index].style;
+            if style.vertical_align_offset != 0.0 {
+                for fragment in &mut fragments[start..end] {
+                    translate_fragment(fragment, 0.0, style.vertical_align_offset);
+                }
+            }
             if style.position != Position::Relative {
                 continue;
             }
@@ -839,6 +845,7 @@ impl Context<'_> {
             font_size: source.style.font_size,
             font: source.style.font,
             color: source.style.color,
+            text_decoration: source.style.text_decoration.clone(),
             clip: None,
         }));
     }

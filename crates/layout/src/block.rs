@@ -5,6 +5,7 @@
 //! origin of the box being laid out; the parent translates them into place.
 
 use crate::box_tree::{BlockBox, BlockContents};
+use crate::control::SELECT_ARROW_ROOM;
 use crate::layout::Context;
 use std::sync::Arc;
 
@@ -93,9 +94,10 @@ impl Context<'_> {
             }
             _ => style
                 .content_width(basis)
+                .or_else(|| self.intrinsic_content_width(block, (cb.width - padding).max(0.0)))
                 .or(self.control_size(block, basis, cb.height).width),
         };
-        let (left, width, right) = match used_width {
+        let (mut left, mut width, mut right) = match used_width {
             None => {
                 // `auto` margins become 0 and the width fills the rest.
                 let left = margin_left.unwrap_or(0.0);
@@ -137,6 +139,30 @@ impl Context<'_> {
                 }
             }
         };
+        if let Some(min_width) = style.content_width_for(style.min_width, basis)
+            && width < min_width
+        {
+            width = min_width;
+            let remaining = cb.width - padding - width;
+            match (margin_left, margin_right) {
+                (None, None) if remaining >= 0.0 => {
+                    left = remaining / 2.0;
+                    right = remaining / 2.0;
+                }
+                (None, Some(right_margin)) => {
+                    left = remaining - right_margin;
+                    right = right_margin;
+                }
+                (Some(left_margin), _) => {
+                    left = left_margin;
+                    right = remaining - left_margin;
+                }
+                (None, None) => {
+                    left = 0.0;
+                    right = remaining;
+                }
+            }
+        }
         let kind = if block.node.is_some() {
             BoxKind::Block
         } else {
@@ -171,8 +197,14 @@ impl Context<'_> {
             BlockContents::Replaced(replaced) => Some(replaced.used_size(style, basis, None).0),
             _ => None,
         };
-        let width = replaced_width
+        let mut width = replaced_width
             .or(style.content_width(basis))
+            .or_else(|| {
+                self.intrinsic_content_width(
+                    block,
+                    (cb_width - margin_left - margin_right - padding).max(0.0),
+                )
+            })
             .or(self.control_size(block, basis, None).width)
             .unwrap_or_else(|| {
             let (min_content, max_content) = self.intrinsic_content_sizes(block);
@@ -184,6 +216,9 @@ impl Context<'_> {
             );
             width
         });
+        if let Some(min_width) = style.content_width_for(style.min_width, basis) {
+            width = width.max(min_width);
+        }
         self.layout_block_container(
             block,
             ContainingBlock {
@@ -268,7 +303,9 @@ impl Context<'_> {
             placement: Placement::InFlow,
             children,
             lines,
+            select_arrow: false,
             image: None,
+            control: None,
         }
     }
 
@@ -325,7 +362,8 @@ impl Context<'_> {
                 if matches!(
                     style.display,
                     crate::style::Display::Box {
-                        inside: crate::style::DisplayInside::Flex,
+                        inside: crate::style::DisplayInside::Flex
+                            | crate::style::DisplayInside::Table,
                         ..
                     }
                 ) {
@@ -341,12 +379,49 @@ impl Context<'_> {
                     )
                 }
             }
+            BlockContents::Inlines(items) if block.is_drop_down() => {
+                // One unbroken line beside the arrow; text that doesn't fit
+                // is clipped where the arrow area starts.
+                let text_width = (content_width - SELECT_ARROW_ROOM).max(0.0);
+                let (_, max_content) = self.inline_intrinsic_sizes(items, style);
+                let inline =
+                    self.layout_inline(items, style, text_width.max(max_content), &mut floats);
+                lines = inline.lines;
+                children.extend(inline.floats);
+                self.clip_lines(&mut lines, text_width, content_width);
+                FlowResult {
+                    height: lines.last().map_or(0.0, |line| line.rect.bottom()),
+                    margin_top: edges.own_top,
+                    margin_bottom: edges.own_bottom,
+                    has_content: !lines.is_empty(),
+                    absolutes: inline.absolutes,
+                }
+            }
             BlockContents::Inlines(items) => {
                 let inline = self.layout_inline(items, style, content_width, &mut floats);
                 lines = inline.lines;
                 children.extend(inline.floats);
+                if lines.is_empty() && block.centers_lines {
+                    // A single-line control with no text (an empty field or
+                    // `<input type=button>`) keeps one empty strut line, so
+                    // it is one line tall and has a baseline to align by.
+                    let metrics = self
+                        .fonts
+                        .font_vertical_metrics(style.font, style.font_size);
+                    lines.push(LineBox {
+                        rect: Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: content_width,
+                            height: metrics.ascent + metrics.descent + metrics.line_gap,
+                        },
+                        baseline: metrics.ascent + metrics.line_gap / 2.0,
+                        fragments: Vec::new(),
+                    });
+                }
+                let height = lines.last().map_or(0.0, |line| line.rect.bottom());
                 FlowResult {
-                    height: lines.last().map_or(0.0, |line| line.rect.bottom()),
+                    height,
                     margin_top: edges.own_top,
                     margin_bottom: edges.own_bottom,
                     has_content: !lines.is_empty(),
@@ -451,8 +526,13 @@ impl Context<'_> {
                 placement: placement(style),
                 children,
                 lines,
+                select_arrow: block.is_drop_down(),
                 image: match &block.contents {
-                    BlockContents::Replaced(replaced) => Some(replaced.key.clone()),
+                    BlockContents::Replaced(replaced) => replaced.key.clone(),
+                    _ => None,
+                },
+                control: match &block.contents {
+                    BlockContents::Replaced(replaced) => replaced.control,
                     _ => None,
                 },
             },
@@ -701,16 +781,53 @@ impl Context<'_> {
             .zip(&basis)
             .map(|(item, base)| item.style.flex_shrink * base.max(0.0))
             .sum();
-        let mut cursor = 0.0;
+        let targets = list
+            .iter()
+            .zip(basis)
+            .zip(minimums)
+            .map(|((item, base), minimum)| {
+                if free >= 0.0 && grow > 0.0 {
+                    base + free * item.style.flex_grow / grow
+                } else if free < 0.0 && shrink > 0.0 {
+                    (base + free * item.style.flex_shrink * base.max(0.0) / shrink).max(minimum)
+                } else {
+                    base
+                }
+            })
+            .collect::<Vec<_>>();
+        let remaining = available
+            - gaps
+            - list
+                .iter()
+                .zip(&targets)
+                .map(|(item, target)| target + main_padding(item))
+                .sum::<f32>();
+        let count = list.len() as f32;
+        let (leading_space, extra_gap) = if remaining <= 0.0 {
+            (0.0, 0.0)
+        } else {
+            match style.flex_justify_content.as_str() {
+                "center" => (remaining / 2.0, 0.0),
+                "flex-end" | "end" => (remaining, 0.0),
+                "space-between" if count > 1.0 => (0.0, remaining / (count - 1.0)),
+                "space-around" => (remaining / (2.0 * count), remaining / count),
+                "space-evenly" => (remaining / (count + 1.0), remaining / (count + 1.0)),
+                _ => (0.0, 0.0),
+            }
+        };
+        let cross_available = if column {
+            Some(width)
+        } else {
+            style.content_height(Some(width), height)
+        };
+        let mut cursor = leading_space;
         let mut cross = 0.0_f32;
-        for ((source, base), minimum) in list.iter().zip(basis).zip(minimums) {
+        for (index, (source, target)) in list.iter().zip(targets).enumerate() {
             let item = source;
-            let target = if free >= 0.0 && grow > 0.0 {
-                base + free * item.style.flex_grow / grow
-            } else if free < 0.0 && shrink > 0.0 {
-                (base + free * item.style.flex_shrink * base.max(0.0) / shrink).max(minimum)
+            let distributed_gap = if index + 1 < list.len() {
+                extra_gap
             } else {
-                base
+                0.0
             };
             let mut item = (*item).clone();
             let mut computed = (*item.style).clone();
@@ -748,14 +865,24 @@ impl Context<'_> {
                 None,
             );
             let (margin, size) = (result.fragment.margin, result.fragment.rect);
+            let cross_free = cross_available
+                .map(|available| {
+                    (available - if column { size.width } else { size.height }).max(0.0)
+                })
+                .unwrap_or(0.0);
+            let cross_offset = match style.flex_align_items.as_str() {
+                "center" => cross_free / 2.0,
+                "flex-end" | "end" => cross_free,
+                _ => 0.0,
+            };
             let (mut fragment, nested) = if column {
-                let placed = result.place(0.0, cursor + margin.top);
-                cursor += size.height + margin.vertical() + style.gap;
+                let placed = result.place(cross_offset, cursor + margin.top);
+                cursor += size.height + margin.vertical() + style.gap + distributed_gap;
                 cross = cross.max(size.width);
                 placed
             } else {
-                let placed = result.place(cursor + margin.left, 0.0);
-                cursor += size.width + margin.horizontal() + style.gap;
+                let placed = result.place(cursor + margin.left, cross_offset);
+                cursor += size.width + margin.horizontal() + style.gap + distributed_gap;
                 cross = cross.max(size.height);
                 placed
             };
@@ -795,6 +922,17 @@ impl Context<'_> {
                 let width = replaced.used_size(&block.style, None, None).0;
                 (width, width)
             }
+        }
+    }
+
+    /// Resolves intrinsic width keywords for a non-replaced box.
+    fn intrinsic_content_width(&self, block: &BlockBox, available: f32) -> Option<f32> {
+        let (min_content, max_content) = self.intrinsic_content_sizes(block);
+        match block.style.width {
+            Dimension::MinContent => Some(min_content),
+            Dimension::MaxContent => Some(max_content),
+            Dimension::FitContent => Some(max_content.min(available.max(min_content))),
+            _ => None,
         }
     }
 
@@ -907,6 +1045,10 @@ pub(crate) fn box_style(style: &ComputedStyle) -> BoxStyle {
         border_width: style.borders.border_width,
         border_color: style.borders.border_color,
         border_style: style.borders.border_style.clone(),
+        outline_color: style.outline_color,
+        outline_width: style.outline_width,
+        outline_offset: style.outline_offset,
+        outline_style: style.outline_style.clone(),
         border_radius: style.border_radius,
         box_shadow: Arc::clone(&style.box_shadow),
     }

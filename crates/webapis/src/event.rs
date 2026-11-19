@@ -561,6 +561,20 @@ pub(crate) fn dispatch_event_target_with_target(
     ))
 }
 
+/// Dispatches an event on a standalone target while retaining the event's
+/// existing target, for the final Window phase of a bubbling event.
+pub(crate) fn dispatch_event_target_preserving_target(
+    target: &EventTargetRef,
+    target_object: &Object,
+    arguments: &[Value],
+) -> JsResult<Value> {
+    let [Value::Object(event)] = arguments else {
+        return Err(JsError::new("dispatchEvent() expects one Event object"));
+    };
+    let event_target = event.get("target").unwrap_or(Value::Null);
+    dispatch_event_target_with_target(target, target_object, event_target, arguments)
+}
+
 fn invoke_window_error_handler(
     evaluator: Option<&ScriptEvaluator>,
     target: &Object,
@@ -666,95 +680,57 @@ pub(crate) fn dispatch_event_at(
             .and_then(|source| source.get_node(current_node).and_then(|n| n.get_parent()));
     }
     let document_target = document.event_target.clone();
-    if node.is_some() {
+    // Clones share the event target, so this is the evaluator installed at
+    // registration even when `document` itself was copied before that.
+    let evaluator = event_evaluator(&document_target);
+    if node.is_none() {
+        return dispatch_event_target(&document_target, target_object, arguments);
+    }
+    // Build the dispatch path once. Detached trees have no document ancestor.
+    // Reuse registered wrappers so event.currentTarget has normal DOM identity.
+    let ancestors: Vec<_> = path
+        .iter()
+        .skip(1)
+        .filter_map(|id| {
+            let is_document = document
+                .html_document()?
+                .get_node(*id)
+                .is_some_and(|data| matches!(data.get_kind(), html::NodeKind::Document));
+            if is_document {
+                let object = document
+                    .script_bindings()
+                    .map(|bindings| bindings.document)
+                    .unwrap_or_default();
+                Some((document_target.clone(), object))
+            } else {
+                let object = document.cached_script_element(*id).or_else(|| {
+                    element_for_node(document, *id).map(|element| {
+                        element_object(element, Arc::new(Mutex::new(document.clone())))
+                    })
+                })?;
+                Some((event_target_for(document, Some(*id)), object))
+            }
+        })
+        .collect();
+    for (target, object) in ancestors.iter().rev() {
+        if matches!(event.get("__stopPropagation"), Some(Value::Boolean(true))) {
+            break;
+        }
         invoke_listeners(
-            event_evaluator(&document_target).as_ref(),
-            &document_target,
+            evaluator.as_ref(),
+            target,
             event,
             &event_type,
-            &Object::new(),
+            object,
             true,
             1.0,
         );
-        for ancestor in path.iter().rev().skip(1).take(path.len().saturating_sub(2)) {
-            if matches!(event.get("__stopPropagation"), Some(Value::Boolean(true))) {
-                break;
-            }
-            if let Some(element) = element_for_node(document, *ancestor) {
-                let target = event_target_for(document, Some(*ancestor));
-                let object = element_object(element, Arc::new(Mutex::new(document.clone())));
-                invoke_listeners(
-                    event_evaluator(&document_target).as_ref(),
-                    &target,
-                    event,
-                    &event_type,
-                    &object,
-                    true,
-                    1.0,
-                );
-            }
-        }
-        if let Some(target_node) = node {
-            let target = event_target_for(document, Some(target_node));
-            invoke_listeners(
-                event_evaluator(&document_target).as_ref(),
-                &target,
-                event,
-                &event_type,
-                target_object,
-                true,
-                2.0,
-            );
-            if !matches!(
-                event.get("__stopImmediatePropagation"),
-                Some(Value::Boolean(true))
-            ) {
-                invoke_listeners(
-                    event_evaluator(&document_target).as_ref(),
-                    &target,
-                    event,
-                    &event_type,
-                    target_object,
-                    false,
-                    2.0,
-                );
-            }
-        }
-        if matches!(event.get("bubbles"), Some(Value::Boolean(true)))
-            && !matches!(event.get("__stopPropagation"), Some(Value::Boolean(true)))
-        {
-            for ancestor in &path[1..] {
-                if matches!(event.get("__stopPropagation"), Some(Value::Boolean(true))) {
-                    break;
-                }
-                if let Some(element) = element_for_node(document, *ancestor) {
-                    let target = event_target_for(document, Some(*ancestor));
-                    let object = element_object(element, Arc::new(Mutex::new(document.clone())));
-                    invoke_listeners(
-                        event_evaluator(&document_target).as_ref(),
-                        &target,
-                        event,
-                        &event_type,
-                        &object,
-                        false,
-                        3.0,
-                    );
-                }
-            }
-            invoke_listeners(
-                event_evaluator(&document_target).as_ref(),
-                &document_target,
-                event,
-                &event_type,
-                &Object::new(),
-                false,
-                3.0,
-            );
-        }
-    } else {
+    }
+    if !matches!(event.get("__stopPropagation"), Some(Value::Boolean(true))) {
+        let target = event_target_for(document, node);
         invoke_listeners(
-            event_evaluator(&document_target).as_ref(),
-            &document_target,
+            evaluator.as_ref(),
+            &target,
             event,
             &event_type,
             target_object,
@@ -766,13 +742,29 @@ pub(crate) fn dispatch_event_at(
             Some(Value::Boolean(true))
         ) {
             invoke_listeners(
-                event_evaluator(&document_target).as_ref(),
-                &document_target,
+                evaluator.as_ref(),
+                &target,
                 event,
                 &event_type,
                 target_object,
                 false,
                 2.0,
+            );
+        }
+    }
+    if matches!(event.get("bubbles"), Some(Value::Boolean(true))) {
+        for (target, object) in &ancestors {
+            if matches!(event.get("__stopPropagation"), Some(Value::Boolean(true))) {
+                break;
+            }
+            invoke_listeners(
+                evaluator.as_ref(),
+                target,
+                event,
+                &event_type,
+                object,
+                false,
+                3.0,
             );
         }
     }

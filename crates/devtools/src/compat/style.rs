@@ -23,6 +23,8 @@ const CONTEXTS: &[&str] = &[
     "#t{position:relative}",
     "#t{width:60px;height:30px;padding:7px;overflow:hidden;white-space:nowrap}",
     "#t{display:list-item}",
+    "#t{display:inline}",
+    "#t{border:4px solid transparent}",
 ];
 
 /// Values tried in the plain context when the page's own values show no
@@ -1438,6 +1440,21 @@ mod tests {
             .find(|probe| probe.names.contains(&"keyframes"))
             .expect("@keyframes probe");
         assert!(matches!((probe.check)(), Outcome::Works));
+    }
+
+    #[test]
+    fn reported_css_value_gaps_match_the_rendered_behavior() {
+        for name in [
+            "currentcolor",
+            "display: table / table-cell",
+            "Intrinsic sizes (min-content, max-content, fit-content)",
+        ] {
+            let feature = VALUE_FEATURES
+                .iter()
+                .find(|feature| feature.name == name)
+                .unwrap_or_else(|| panic!("missing value probe {name}"));
+            assert_eq!((feature.check)(), Outcome::Works, "{name}");
+        }
     }
 
     #[test]
