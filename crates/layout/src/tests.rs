@@ -1470,7 +1470,8 @@ mod form_controls {
 
     #[test]
     fn checkboxes_get_no_text_field_size() {
-        assert_close(size("<input id=x type=checkbox>", CSS).0, 0.0);
+        // A 13px toggle, not a 20-character field.
+        assert_eq!(size("<input id=x type=checkbox>", CSS), (13.0, 13.0));
     }
 }
 
@@ -1840,4 +1841,39 @@ fn author_width_and_height_override_the_control_size() {
     // The `width` and `height` attributes do not apply to these inputs.
     let radio = box_for(&tree, &document, "r");
     assert_eq!((radio.rect.width, radio.rect.height), (13.0, 13.0));
+}
+
+/// Guards the merge with floats and positioning (#413), borders (#426) and
+/// generated content (#393): checkboxes and radios stay 13px toggles with no
+/// border or `::before` / `::after` content, in or out of flow.
+#[test]
+fn toggles_survive_floats_positioning_borders_and_pseudo_elements() {
+    let (document, tree) = lay_out(
+        "<body><div style='position: relative'>\
+         <input id=f type=checkbox style='float: right' checked>\
+         <input id=a type=radio style='position: absolute; top: 4px; left: 6px'>\
+         <p id=p>after <input id=c type=checkbox></p></div></body>",
+        "body { margin: 0 } p { margin: 0 } \
+         input::before { content: 'BEFORE' } input::after { content: 'AFTER' }",
+        400.0,
+    );
+    let floated = box_for(&tree, &document, "f");
+    assert_eq!(floated.placement, Placement::Float);
+    assert_eq!(floated.control.map(|control| control.checked), Some(true));
+    let placed = box_for(&tree, &document, "a");
+    assert_eq!(placed.placement, Placement::Absolute);
+    assert_eq!(
+        placed.control.map(|control| control.kind),
+        Some(crate::ControlKind::Radio)
+    );
+    // The insets place the margin box; the user-agent margins are 4px left
+    // and 3px top.
+    assert_eq!((placed.rect.x, placed.rect.y), (6.0 + 4.0, 4.0 + 3.0));
+    for id in ["f", "a", "c"] {
+        let toggle = box_for(&tree, &document, id);
+        assert_eq!((toggle.rect.width, toggle.rect.height), (13.0, 13.0));
+        assert_eq!(toggle.style.border_width, crate::Edges::default());
+        assert!(texts(toggle).is_empty());
+    }
+    assert_eq!(texts(box_for(&tree, &document, "p")), ["after "]);
 }
