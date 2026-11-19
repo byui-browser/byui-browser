@@ -1404,6 +1404,70 @@ mod form_controls {
         assert_close(width, 3.0 * 8.0 + 20.0);
     }
 
+    /// Guards the merge with flex sizing (#405): a control's default width is
+    /// also its automatic minimum, so shrinking stops there.
+    ///
+    /// The inputs are `display: block` because inline-level children of a
+    /// flex container are not blockified into flex items yet.
+    #[test]
+    fn shrinking_flex_items_stop_at_the_control_default_width() {
+        let (width, _) = size(
+            "<div style=\"display:flex;width:100px\"><input id=x style=\"display:block\"></div>",
+            CSS,
+        );
+        assert_close(width, 160.0);
+        // An explicit `min-width: 0` lets it shrink to fit, as in Chrome.
+        let (width, _) = size(
+            "<div style=\"display:flex;width:100px\">\
+             <input id=x style=\"display:block;min-width:0\"></div>",
+            CSS,
+        );
+        assert_close(width, 100.0);
+    }
+
+    /// Guards the merge with floats and positioning (#413): out-of-flow
+    /// controls still get their default sizes.
+    #[test]
+    fn floated_and_positioned_controls_keep_their_default_sizes() {
+        let (document, tree) = lay_out(
+            "<body><div style=\"position:relative\">\
+             <input id=f style=\"float:left\">\
+             <input id=a style=\"position:absolute;top:0;left:0\">\
+             <textarea id=t style=\"position:absolute;top:0;right:0\"></textarea>\
+             </div></body>",
+            CSS,
+            800.0,
+        );
+        for id in ["f", "a"] {
+            let input = box_for(&tree, &document, id);
+            assert_close(input.rect.width, 160.0);
+            assert_close(input.rect.height, LINE);
+        }
+        assert_eq!(box_for(&tree, &document, "f").placement, Placement::Float);
+        assert_eq!(
+            box_for(&tree, &document, "a").placement,
+            Placement::Absolute
+        );
+        let textarea = box_for(&tree, &document, "t");
+        assert_close(textarea.rect.width, 160.0);
+        assert_close(textarea.rect.height, 2.0 * LINE);
+        assert_close(textarea.rect.x, 800.0 - 160.0);
+    }
+
+    /// Guards the merge with borders (#426): the user-agent border sits
+    /// outside the default content size.
+    #[test]
+    fn user_agent_borders_add_to_the_default_size() {
+        let css = "body { margin: 0 } input { font-size: 16px; padding: 0; margin: 0 }";
+        let (document, tree) = lay_out("<body><input id=x></body>", css, 800.0);
+        let input = box_for(&tree, &document, "x");
+        let border = input.style.border_width;
+        assert!(border.left > 0.0, "inputs have a user-agent border");
+        assert_close(input.rect.width, 160.0 + border.horizontal());
+        assert_close(input.rect.height, LINE + border.vertical());
+        assert_close(input.content_rect().width, 160.0);
+    }
+
     #[test]
     fn checkboxes_get_no_text_field_size() {
         assert_close(size("<input id=x type=checkbox>", CSS).0, 0.0);
