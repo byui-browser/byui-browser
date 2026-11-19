@@ -94,6 +94,7 @@ impl Context<'_> {
             }
             _ => style
                 .content_width(basis)
+                .or_else(|| self.intrinsic_content_width(block, (cb.width - padding).max(0.0)))
                 .or(self.control_size(block, basis, cb.height).width),
         };
         let (left, width, right) = match used_width {
@@ -174,6 +175,12 @@ impl Context<'_> {
         };
         let width = replaced_width
             .or(style.content_width(basis))
+            .or_else(|| {
+                self.intrinsic_content_width(
+                    block,
+                    (cb_width - margin_left - margin_right - padding).max(0.0),
+                )
+            })
             .or(self.control_size(block, basis, None).width)
             .unwrap_or_else(|| {
             let (min_content, max_content) = self.intrinsic_content_sizes(block);
@@ -328,7 +335,8 @@ impl Context<'_> {
                 if matches!(
                     style.display,
                     crate::style::Display::Box {
-                        inside: crate::style::DisplayInside::Flex,
+                        inside: crate::style::DisplayInside::Flex
+                            | crate::style::DisplayInside::Table,
                         ..
                     }
                 ) {
@@ -840,6 +848,17 @@ impl Context<'_> {
                 let width = replaced.used_size(&block.style, None, None).0;
                 (width, width)
             }
+        }
+    }
+
+    /// Resolves intrinsic width keywords for a non-replaced box.
+    fn intrinsic_content_width(&self, block: &BlockBox, available: f32) -> Option<f32> {
+        let (min_content, max_content) = self.intrinsic_content_sizes(block);
+        match block.style.width {
+            Dimension::MinContent => Some(min_content),
+            Dimension::MaxContent => Some(max_content),
+            Dimension::FitContent => Some(max_content.min(available.max(min_content))),
+            _ => None,
         }
     }
 

@@ -1441,6 +1441,21 @@ mod tests {
     }
 
     #[test]
+    fn reported_css_value_gaps_match_the_rendered_behavior() {
+        for name in [
+            "currentcolor",
+            "display: table / table-cell",
+            "Intrinsic sizes (min-content, max-content, fit-content)",
+        ] {
+            let feature = VALUE_FEATURES
+                .iter()
+                .find(|feature| feature.name == name)
+                .unwrap_or_else(|| panic!("missing value probe {name}"));
+            assert_eq!((feature.check)(), Outcome::Works, "{name}");
+        }
+    }
+
+    #[test]
     fn value_detectors_respect_function_and_unit_boundaries() {
         assert!(calls("calc(1px + 2px)", "calc"));
         assert!(!calls("minmax(1fr, 2fr)", "min"));

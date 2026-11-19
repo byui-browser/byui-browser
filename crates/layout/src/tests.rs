@@ -175,6 +175,34 @@ fn flex_shrink_respects_the_automatic_min_content_width() {
 }
 
 #[test]
+fn intrinsic_width_keywords_resolve_min_max_and_fit_content_sizes() {
+    let (document, tree) = lay_out(
+        "<body><div id='min'>one two</div><div id='max'>one two</div>\
+         <div id='parent'><div id='fit'>one two</div></div></body>",
+        "body { margin: 0 } #min { width: min-content } #max { width: max-content }\
+         #parent { width: 40px } #fit { width: fit-content }",
+        800.0,
+    );
+    assert_eq!(box_for(&tree, &document, "min").rect.width, 24.0);
+    assert_eq!(box_for(&tree, &document, "max").rect.width, 56.0);
+    assert_eq!(box_for(&tree, &document, "fit").rect.width, 40.0);
+}
+
+#[test]
+fn table_cells_are_placed_in_a_row() {
+    let (document, tree) = lay_out(
+        "<body><div id='table'><div id='first'>A</div><div id='second'>B</div></div></body>",
+        "body { margin: 0 } #table { display: table }\
+         #first, #second { display: table-cell }",
+        800.0,
+    );
+    let first = box_for(&tree, &document, "first");
+    let second = box_for(&tree, &document, "second");
+    assert_eq!(first.rect.y, second.rect.y);
+    assert!(second.rect.x > first.rect.x);
+}
+
+#[test]
 fn parent_and_first_child_margins_collapse() {
     let (document, tree) = lay_out(
         "<html id='root'><body id='body'><h1 id='h'>T</h1></body></html>",
@@ -579,6 +607,19 @@ fn the_canvas_takes_the_body_background_when_the_root_has_none() {
     );
     assert_eq!(
         box_for(&tree, &document, "body").style.background_color,
+        css::parse_color("red")
+    );
+}
+
+#[test]
+fn currentcolor_background_uses_the_elements_computed_text_color() {
+    let (document, tree) = lay_out(
+        "<body><div id='target'>text</div></body>",
+        "body { margin: 0 } #target { color: red; background-color: currentColor }",
+        800.0,
+    );
+    assert_eq!(
+        box_for(&tree, &document, "target").style.background_color,
         css::parse_color("red")
     );
 }

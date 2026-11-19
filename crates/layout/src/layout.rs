@@ -34,9 +34,13 @@ pub(crate) struct Context<'a> {
 /// `flex-direction:row|column`, `flex-basis`, `flex-grow`, `flex-shrink`, and
 /// `gap`. Wrapping, alignment, and anonymous flex items for mixed text are not
 /// implemented.
-/// Grid and table modes are preserved distinctly in computed display values,
-/// but still use ordinary flow layout. Other supported properties are
-/// margins, padding, `width`, `height`, `font-size`, `font-family`,
+/// Grid modes are preserved distinctly in computed display values, but still
+/// use ordinary flow layout. Tables lay out direct children in one row; full
+/// row groups, column sizing, and collapsed borders are not implemented.
+/// Non-replaced boxes support `width: min-content`, `max-content`, and
+/// `fit-content`; intrinsic sizing keywords on `height` and replaced boxes
+/// are not implemented. Other supported properties are margins, padding,
+/// `width`, `height`, `font-size`, `font-family`,
 /// `font-weight`, `font-style`, `color`, and `background-color`;
 /// unsupported properties (including the `font` shorthand) use their initial
 /// values. The font properties choose a face through
