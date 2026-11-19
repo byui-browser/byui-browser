@@ -401,7 +401,8 @@ fn computed_index_expressions_work() {
 
 #[test]
 fn indexing_non_arrays_keeps_existing_errors() {
-    fails("let n = 1; n[0]", "a number");
+    // Numbers expose Number.prototype, so an unknown index reads as undefined.
+    assert_eq!(value("let n = 1; n[0]"), Value::Undefined);
     fails("let u; u[0]", "undefined");
     fails("let o = null; o[0] = 1", "null");
 }

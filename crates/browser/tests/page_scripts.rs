@@ -1,7 +1,10 @@
 use std::sync::{Arc, Mutex};
 
-use browser::BrowserRuntime;
-use security::{Origin, RendererSecurityContext, StoragePermission};
+use browser::{BrowserRuntime, security_context_for_url_with_policy};
+use security::{
+    Origin, RendererSecurityContext, StoragePermission,
+    permissions::{PermissionKind, PermissionPolicy},
+};
 use webapis::{AlertSink, ConsoleSink};
 
 #[derive(Default)]
@@ -63,6 +66,67 @@ fn html_script_reaches_registered_web_api() {
 }
 
 #[test]
+fn window_onload_runs_after_page_scripts_finish() {
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+    let session = BrowserRuntime::in_memory()
+        .open_page_session(
+            "<script>\
+                var scriptState = 'running';\
+                function onLoaded(event) {\
+                    window.onloadRan = this === window && event.type === 'load' &&\
+                        event.target === document && scriptState === 'finished';\
+                }\
+                window.onload = onLoaded;\
+                scriptState = 'finished';\
+             </script>",
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            security_context(),
+        )
+        .expect("page session should dispatch its load event");
+
+    assert_eq!(
+        session.evaluate_script("window.onloadRan === true"),
+        Ok(js::Value::Boolean(true))
+    );
+}
+
+#[test]
+fn policy_context_controls_runtime_local_storage() {
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+    let mut policy = PermissionPolicy::new();
+    policy.deny(
+        Origin::new("https", "example.com", None),
+        PermissionKind::Storage,
+    );
+    let context = security_context_for_url_with_policy("https://example.com/", &policy);
+
+    let error = BrowserRuntime::in_memory()
+        .evaluate_page_scripts(
+            "<script>localStorage.setItem('key', 'value')</script>",
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            context,
+        )
+        .expect_err("explicit storage denial should reach localStorage");
+
+    assert_eq!(
+        error.to_string(),
+        "Uncaught SecurityError: localStorage write access denied"
+    );
+}
+
+#[test]
 fn page_script_runs_queued_microtasks_before_the_next_script() {
     let controller = Arc::new(
         net::RequestController::builder(net::Config::default())
@@ -112,6 +176,43 @@ fn page_session_script_evaluates_through_a_microtask_checkpoint() {
     assert_eq!(
         session.evaluate_script("order"),
         Ok(js::Value::String("a".into()))
+    );
+}
+
+#[test]
+fn page_session_reports_uncaught_errors_to_window_onerror() {
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+    let session = BrowserRuntime::in_memory()
+        .open_page(
+            &browser::Page {
+                html: "<main></main>".into(),
+                url: "https://example.com/".into(),
+                scripts: Vec::new(),
+                stylesheets: Vec::new(),
+                resources: Default::default(),
+            },
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            security_context(),
+        )
+        .expect("page session should open");
+
+    session
+        .evaluate_script(
+            "var report = ''; window.onerror = (message, source, line, column, error) => { \
+             report = message + '|' + source + '|' + error; }; throw 'boom';",
+        )
+        .expect_err("the original uncaught script error remains observable");
+    assert_eq!(
+        session.evaluate_script("report"),
+        Ok(js::Value::String(
+            "Uncaught boom|https://example.com/|boom".into()
+        ))
     );
 }
 

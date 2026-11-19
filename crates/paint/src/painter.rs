@@ -23,7 +23,11 @@ pub const CANVAS_COLOR: Color = Color {
 /// [`CANVAS_COLOR`]. Text is drawn at its layout baseline and font size.
 ///
 /// Backgrounds are clipped to the rounded border box when `border-radius` is
-/// set, producing [`DisplayItem::FillRoundedRect`]. An inline box split across
+/// set, producing [`DisplayItem::FillRoundedRect`]. Each outer `box-shadow`
+/// produces a [`DisplayItem::BoxShadow`] just before its box's background,
+/// last shadow first so the first one ends up on top. Shadows are not
+/// clipped out beneath the box, so they show through a translucent
+/// background, and inset shadows are not painted yet. An inline box split across
 /// lines rounds every fragment's corners, as if each fragment were a whole
 /// box. Borders, outlines, and other decorations are not supported yet.
 ///
@@ -91,6 +95,11 @@ fn paint(
                         .map_or(CANVAS_COLOR, Color::from),
                 }),
                 _ => {
+                    for shadow in shadows(layout_box.rect, &layout_box.style) {
+                        if visible(&shadow.bounds()) {
+                            items.push(shadow.item(scroll_y));
+                        }
+                    }
                     if let Some(color) = layout_box.style.background_color
                         && visible(&layout_box.rect)
                     {
@@ -103,6 +112,11 @@ fn paint(
                 }
             },
             PaintItem::InlineBox(inline) => {
+                for shadow in shadows(inline.rect, &inline.style) {
+                    if visible(&shadow.bounds()) {
+                        items.push(shadow.item(scroll_y));
+                    }
+                }
                 if let Some(color) = inline.style.background_color
                     && visible(&inline.rect)
                 {
@@ -159,6 +173,84 @@ fn paint(
     DisplayList { items }
 }
 
+/// One outer shadow's shape, before scrolling.
+struct Shadow {
+    rect: layout::Rect,
+    radii: crate::CornerRadii,
+    blur: f32,
+    color: Color,
+}
+
+impl Shadow {
+    /// The area the shadow can paint, blur included: the renderer fades the
+    /// edge over three standard deviations (`1.5 * blur`) plus a pixel.
+    fn bounds(&self) -> layout::Rect {
+        let reach = 1.5 * self.blur + 1.0;
+        layout::Rect {
+            x: self.rect.x - reach,
+            y: self.rect.y - reach,
+            width: self.rect.width + 2.0 * reach,
+            height: self.rect.height + 2.0 * reach,
+        }
+    }
+
+    /// The display item, moved up by `scroll_y`.
+    fn item(self, scroll_y: f32) -> DisplayItem {
+        DisplayItem::BoxShadow {
+            rect: self.rect.translate(0.0, -scroll_y),
+            radii: self.radii,
+            blur: self.blur,
+            color: self.color,
+        }
+    }
+}
+
+/// The outer shadows of a box with border box `rect`, in paint order: the
+/// last shadow in the list first. Inset shadows, fully transparent ones,
+/// and ones a negative spread shrinks to nothing are skipped.
+fn shadows(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<Shadow> {
+    let radii = style.border_radius.resolve(rect);
+    style
+        .box_shadow
+        .iter()
+        .rev()
+        .filter(|shadow| !shadow.inset && shadow.color.a > 0)
+        .filter_map(|shadow| {
+            let spread = shadow.spread;
+            let shape = layout::Rect {
+                x: rect.x + shadow.offset_x - spread,
+                y: rect.y + shadow.offset_y - spread,
+                width: rect.width + 2.0 * spread,
+                height: rect.height + 2.0 * spread,
+            };
+            if shape.width <= 0.0 || shape.height <= 0.0 {
+                return None;
+            }
+            // Rounded corners grow or shrink with the spread; square ones
+            // stay square (CSS Backgrounds 3 §7.1.1).
+            let grow = |radius: f32| {
+                if radius > 0.0 {
+                    (radius + spread).max(0.0)
+                } else {
+                    0.0
+                }
+            };
+            let radii = layout::Corners::from_array(radii.into_array().map(|corner| {
+                layout::CornerRadius {
+                    horizontal: grow(corner.horizontal),
+                    vertical: grow(corner.vertical),
+                }
+            }));
+            Some(Shadow {
+                rect: shape,
+                radii,
+                blur: shadow.blur,
+                color: shadow.color.into(),
+            })
+        })
+        .collect()
+}
+
 /// The background fill for a box's border box `rect`, rounded by its
 /// `border-radius` when that is non-zero.
 fn background(rect: layout::Rect, style: &layout::BoxStyle, color: Color) -> DisplayItem {
@@ -207,6 +299,75 @@ mod tests {
     }
 
     #[test]
+    fn box_shadows_paint_under_the_background_last_shadow_first() {
+        let list = paint(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { width: 40px; height: 20px; margin: 10px; \
+             background-color: white; border-radius: 4px; \
+             box-shadow: 2px 3px 6px 1px #ff0000, inset 0 0 2px #00ff00, 0 0 0 0 rgba(0, 0, 255, 0), \
+             -1px 0 #0000ff }",
+        );
+        let shadows: Vec<_> = list
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::BoxShadow {
+                    rect,
+                    radii,
+                    blur,
+                    color,
+                } => Some((*rect, *radii, *blur, *color)),
+                _ => None,
+            })
+            .collect();
+        // The inset and the fully transparent shadows are skipped.
+        assert_eq!(shadows.len(), 2);
+        let (rect, radii, blur, color) = shadows[0];
+        assert_eq!(color.b, 255);
+        assert_eq!(
+            (rect.x, rect.y, rect.width, rect.height),
+            (9.0, 10.0, 40.0, 20.0)
+        );
+        assert_eq!((radii.top_left.horizontal, blur), (4.0, 0.0));
+        let (rect, radii, blur, color) = shadows[1];
+        assert_eq!(color.r, 255);
+        // Offset by (2, 3) and grown by the 1px spread on every side.
+        assert_eq!(
+            (rect.x, rect.y, rect.width, rect.height),
+            (11.0, 12.0, 42.0, 22.0)
+        );
+        assert_eq!((radii.top_left.horizontal, blur), (5.0, 6.0));
+        // Both shadows come right before the background they belong to.
+        let background = list
+            .items
+            .iter()
+            .position(|item| matches!(item, DisplayItem::FillRoundedRect { .. }))
+            .unwrap();
+        assert!(matches!(
+            list.items[background - 1],
+            DisplayItem::BoxShadow { .. }
+        ));
+        assert!(matches!(
+            list.items[background - 2],
+            DisplayItem::BoxShadow { .. }
+        ));
+    }
+
+    #[test]
+    fn a_shrinking_spread_can_remove_a_shadow() {
+        let list = paint(
+            "<body><div>x</div></body>",
+            "body { margin: 0 } div { width: 10px; height: 10px; box-shadow: 0 0 0 -6px red }",
+        );
+        assert!(
+            !list
+                .items
+                .iter()
+                .any(|item| matches!(item, DisplayItem::BoxShadow { .. }))
+        );
+    }
+
+    #[test]
     fn the_canvas_is_painted_first_with_the_default_canvas_color() {
         let list = paint("<body>Hello</body>", "");
         assert_eq!(
@@ -237,6 +398,7 @@ mod tests {
                 DisplayItem::FillRoundedRect { color, .. } => format!("round {}", color.b),
                 DisplayItem::Text { text, baseline, .. } => format!("text {text} {baseline:.1}"),
                 DisplayItem::Image { .. } => "image".to_owned(),
+                DisplayItem::BoxShadow { .. } => "shadow".to_owned(),
             })
             .collect::<Vec<_>>();
         // Canvas, then both block backgrounds, then the text of both blocks

@@ -760,7 +760,7 @@ fn malformed_handler_bytecode_is_an_error_not_a_panic() {
 #[test]
 fn break_and_continue_outside_loops_do_not_compile() {
     use js::ast::{Program, Statement};
-    for statement in [Statement::Break, Statement::Continue] {
+    for statement in [Statement::Break(None), Statement::Continue(None)] {
         let program = Program {
             body: vec![statement],
         };

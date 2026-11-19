@@ -150,7 +150,10 @@ fn unsupported_integrity_is_rejected_before_transport() {
 /// Verifies cross-origin requests requiring preflight reach HTTP execution.
 fn preflight_required_cross_origin_request_passes_request_validation() {
     let mut request = Request::new("https://remote.test/data", "PUT").unwrap();
-    request.context.environment.origin = Some(crate::Origin::parse("https://client.test").unwrap());
+    request.set_environment(crate::FetchEnvironment {
+        origin: Some(crate::Origin::parse("https://client.test").unwrap()),
+        ..crate::FetchEnvironment::default()
+    });
     assert!(RequestPolicy.validate_request(&request, 65_536).is_ok());
 }
 

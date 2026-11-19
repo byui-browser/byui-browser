@@ -11,29 +11,38 @@ use super::{
 /// A browser request before conversion to a transport request.
 #[derive(Debug)]
 pub struct Request {
-    pub(crate) id: u64,
-    pub(crate) url: String,
-    pub(crate) method: Method,
-    pub(crate) headers: Headers,
-    pub(crate) body: Option<Body>,
-    pub(crate) cache_mode: CacheMode,
-    pub(crate) redirect_mode: RedirectMode,
-    pub(crate) referrer: Referrer,
-    pub(crate) referrer_policy: ReferrerPolicy,
-    pub(crate) destination: RequestDestination,
-    pub(crate) service_workers: ServiceWorkersMode,
-    pub(crate) initiator: InitiatorType,
-    pub(crate) integrity: Option<String>,
-    pub(crate) keepalive: bool,
-    pub(crate) priority: RequestPriority,
-    pub(crate) duplex: Option<RequestDuplex>,
-    pub(crate) context: FetchContext,
-    pub(crate) request_origin: Option<Origin>,
-    pub(crate) signal: AbortSignal,
-    pub(crate) url_list: Vec<Url>,
-    pub(crate) current_url: Option<Url>,
-    pub(crate) redirect_count: usize,
-    pub(crate) cache_partition: Option<String>,
+    pub(super) id: u64,
+    pub(super) url: String,
+    pub(super) method: Method,
+    pub(super) headers: Headers,
+    pub(super) body: Option<Body>,
+    pub(super) cache_mode: CacheMode,
+    pub(super) redirect_mode: RedirectMode,
+    pub(super) referrer: Referrer,
+    pub(super) referrer_policy: ReferrerPolicy,
+    pub(super) destination: RequestDestination,
+    pub(super) service_workers: ServiceWorkersMode,
+    pub(super) initiator: InitiatorType,
+    pub(super) integrity: Option<String>,
+    pub(super) keepalive: bool,
+    pub(super) priority: RequestPriority,
+    pub(super) duplex: Option<RequestDuplex>,
+    pub(super) context: FetchContext,
+    pub(super) signal: AbortSignal,
+    pub(super) execution: RequestExecution,
+}
+
+/// Controller-owned state created and mutated only while Fetch executes.
+///
+/// Keeping this state separate from caller configuration prevents cache and
+/// redirect bookkeeping from being mistaken for request initialization data.
+#[derive(Debug, Default)]
+pub(super) struct RequestExecution {
+    pub(super) request_origin: Option<Origin>,
+    pub(super) url_list: Vec<Url>,
+    pub(super) current_url: Option<Url>,
+    pub(super) redirect_count: usize,
+    pub(super) cache_partition: Option<String>,
 }
 
 /// Relative importance assigned to a request by the network scheduler.

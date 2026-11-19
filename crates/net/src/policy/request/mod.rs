@@ -5,7 +5,7 @@ mod scheme;
 mod validation;
 
 pub(crate) use scheme::FetchScheme;
-pub(crate) use validation::{RequestPolicy, ValidatedUrl};
+pub(crate) use validation::RequestPolicy;
 
 #[cfg(test)]
 mod tests;

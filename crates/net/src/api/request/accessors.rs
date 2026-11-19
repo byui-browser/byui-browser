@@ -3,7 +3,10 @@ use url::Url;
 
 use crate::api::{Headers, body::Body, cancellation::AbortSignal};
 
-use super::{CredentialsMode, FetchEnvironment, Request, RequestMode};
+use super::{
+    CacheMode, CredentialsMode, FetchContext, FetchEnvironment, InitiatorType, RedirectMode,
+    Request, RequestDestination, RequestMode, RequestPriority, ServiceWorkersMode,
+};
 
 impl Request {
     /// Returns the original URL string supplied for this request.
@@ -17,7 +20,8 @@ impl Request {
     /// services that make per-hop decisions should use this rather than
     /// [`Request::url`], which intentionally preserves the original input.
     pub fn active_url(&self) -> &str {
-        self.current_url
+        self.execution
+            .current_url
             .as_ref()
             .map(Url::as_str)
             .unwrap_or(&self.url)
@@ -42,9 +46,49 @@ impl Request {
     pub fn body(&self) -> Option<&Body> {
         self.body.as_ref()
     }
+    /// Returns the configured cache mode.
+    pub(crate) fn cache_mode(&self) -> CacheMode {
+        self.cache_mode
+    }
+    /// Returns the configured redirect mode.
+    pub(crate) fn redirect_mode(&self) -> RedirectMode {
+        self.redirect_mode
+    }
+    /// Returns the request destination used by browser policy.
+    pub(crate) fn destination(&self) -> RequestDestination {
+        self.destination
+    }
+    /// Returns whether service-worker interception remains enabled.
+    pub(crate) fn service_workers_mode(&self) -> ServiceWorkersMode {
+        self.service_workers
+    }
+    /// Returns the request initiator category.
+    pub(crate) fn initiator(&self) -> InitiatorType {
+        self.initiator
+    }
+    /// Returns optional subresource-integrity metadata.
+    pub(crate) fn integrity(&self) -> Option<&str> {
+        self.integrity.as_deref()
+    }
+    /// Returns whether Fetch keepalive lifetime was requested.
+    pub(crate) fn keepalive(&self) -> bool {
+        self.keepalive
+    }
+    /// Returns the configured scheduling priority.
+    pub(crate) fn priority(&self) -> RequestPriority {
+        self.priority
+    }
+    /// Returns the complete client and policy context.
+    pub(crate) fn context(&self) -> &FetchContext {
+        &self.context
+    }
+    /// Removes and returns the body for a single ownership transfer.
+    pub(crate) fn take_body(&mut self) -> Option<Body> {
+        self.body.take()
+    }
     /// Returns the resolved current URL once request preparation has run.
     pub fn current_url(&self) -> Option<&Url> {
-        self.current_url.as_ref()
+        self.execution.current_url.as_ref()
     }
     /// Returns the configured request mode.
     pub fn mode(&self) -> RequestMode {
@@ -60,11 +104,15 @@ impl Request {
     }
     /// Returns all URLs visited by this request, in order.
     pub fn url_list(&self) -> &[Url] {
-        &self.url_list
+        &self.execution.url_list
     }
     /// Returns the number of redirects followed so far.
     pub fn redirect_count(&self) -> usize {
-        self.redirect_count
+        self.execution.redirect_count
+    }
+    /// Returns the browser-selected cache partition for this execution.
+    pub(crate) fn cache_partition(&self) -> Option<&str> {
+        self.execution.cache_partition.as_deref()
     }
     /// Returns the cancellation signal associated with this request.
     ///

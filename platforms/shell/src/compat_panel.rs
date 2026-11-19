@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use ab_glyph::FontVec;
-use devtools::compat::{Area, AuditReport, Auditor, Evidence, PageScriptEngine, PageSources};
+use devtools::compat::{
+    Area, AuditReport, Auditor, Evidence, PageScriptEngine, PageSources, SourcePreview,
+};
 use tiny_skia::{Color, PathBuilder, Pixmap, Rect, Transform};
 use webapis::{AlertSink, ConsoleSink};
 
@@ -108,6 +110,8 @@ struct Entry {
     meta: String,
     /// The explanation shown under an item.
     detail: String,
+    /// Index into the report's findings, for finding rows.
+    finding: Option<usize>,
 }
 
 /// One display row after wrapping.
@@ -116,6 +120,20 @@ struct Line {
     kind: LineKind,
     text: String,
     meta: String,
+    /// Index into the report's findings, on a finding's first row.
+    finding: Option<usize>,
+}
+
+/// The code preview popover opened by right-clicking a finding.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OpenPreview {
+    /// Index into the report's findings.
+    finding: usize,
+    /// Pointer x where the menu was requested, in logical pixels.
+    x: f32,
+    /// The clicked row's top and bottom edges, in logical pixels.
+    row_top: f32,
+    row_bottom: f32,
 }
 
 /// The Compatibility tab's content and its scrolling state.
@@ -127,6 +145,10 @@ pub(crate) struct CompatView {
     offset: usize,
     visible: usize,
     wheel_remainder: f64,
+    /// The body rectangle of the last draw, in logical pixels, for hit tests.
+    body: Option<Rect>,
+    /// The open code preview, if any.
+    preview: Option<OpenPreview>,
 }
 
 /// Row height in logical pixels, matching the Elements tree.
@@ -147,6 +169,8 @@ impl CompatView {
             offset: 0,
             visible: 0,
             wheel_remainder: 0.0,
+            body: None,
+            preview: None,
         }
     }
 
@@ -161,6 +185,7 @@ impl CompatView {
         self.lines.clear();
         self.offset = 0;
         self.wheel_remainder = 0.0;
+        self.preview = None;
     }
 
     /// Short text for the dock header, such as "12 issues · 80 checked".
@@ -190,6 +215,7 @@ impl CompatView {
             text: text.to_owned(),
             meta: String::new(),
             detail: String::new(),
+            finding: None,
         };
         let report = match &self.state {
             CompatState::Idle | CompatState::Auditing => {
@@ -208,7 +234,7 @@ impl CompatView {
             )));
         }
         let mut area: Option<Area> = None;
-        for finding in &report.findings {
+        for (index, finding) in report.findings.iter().enumerate() {
             if area != Some(finding.area) {
                 area = Some(finding.area);
                 let count = report.in_area(finding.area).count();
@@ -217,6 +243,7 @@ impl CompatView {
                     text: finding.area.label().to_owned(),
                     meta: count.to_string(),
                     detail: String::new(),
+                    finding: None,
                 });
             }
             let mut meta = Vec::new();
@@ -230,6 +257,7 @@ impl CompatView {
                 text: finding.feature.clone(),
                 meta: meta.join(" · "),
                 detail: finding.detail.clone(),
+                finding: Some(index),
             });
         }
         if !report.unverified.is_empty() {
@@ -238,6 +266,7 @@ impl CompatView {
                 text: "Not verified (no static probe)".to_owned(),
                 meta: report.unverified.len().to_string(),
                 detail: String::new(),
+                finding: None,
             });
             for item in &report.unverified {
                 entries.push(Entry {
@@ -245,6 +274,7 @@ impl CompatView {
                     text: item.feature.clone(),
                     meta: item.location.clone().unwrap_or_default(),
                     detail: item.reason.clone(),
+                    finding: None,
                 });
             }
         }
@@ -264,6 +294,7 @@ impl CompatView {
                             kind: LineKind::Note,
                             text: row,
                             meta: String::new(),
+                            finding: None,
                         });
                     }
                 }
@@ -272,12 +303,14 @@ impl CompatView {
                         kind: entry.kind,
                         text: entry.text,
                         meta: entry.meta,
+                        finding: entry.finding,
                     });
                     for row in wrap_words(&entry.detail, text_width, META_SIZE, measure) {
                         lines.push(Line {
                             kind: LineKind::Detail,
                             text: row,
                             meta: String::new(),
+                            finding: None,
                         });
                     }
                 }
@@ -300,6 +333,7 @@ impl CompatView {
 
     /// Scrolls by rows; fractional wheel deltas accumulate.
     pub(crate) fn scroll(&mut self, rows: f64) {
+        self.preview = None;
         self.wheel_remainder += rows;
         let whole = self.wheel_remainder.trunc() as isize;
         self.wheel_remainder -= whole as f64;
@@ -313,6 +347,7 @@ impl CompatView {
     pub(crate) fn key(&mut self, key: &winit::keyboard::NamedKey) {
         use winit::keyboard::NamedKey;
         self.wheel_remainder = 0.0;
+        self.preview = None;
         let page = self.visible.max(1) as f64;
         match key {
             NamedKey::ArrowDown => self.scroll(1.0),
@@ -323,6 +358,65 @@ impl CompatView {
             NamedKey::End => self.offset = self.max_offset(),
             _ => {}
         }
+    }
+
+    /// The index into `lines` of the row under `cursor`, if the pointer is
+    /// over a row of the last drawn body (not its scrollbar gutter).
+    fn line_at(&self, cursor: Option<(f64, f64)>) -> Option<usize> {
+        let body = self.body?;
+        let (x, y) = cursor?;
+        let (x, y) = (x as f32, y as f32);
+        if x < body.left() || x >= body.right() - SCROLLBAR_GUTTER || y < body.top() {
+            return None;
+        }
+        let row = ((y - body.top()) / ROW) as usize;
+        let shown = self
+            .visible
+            .min(self.lines.len().saturating_sub(self.offset));
+        (row < shown).then_some(self.offset + row)
+    }
+
+    /// The source preview of the finding at `index` of the report.
+    fn source_preview(&self, index: usize) -> Option<&SourcePreview> {
+        match &self.state {
+            CompatState::Ready(report) => report.findings.get(index)?.preview.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Handles a secondary (right) click: on a finding whose failing code is
+    /// known it opens a preview of that code; anywhere else it closes an
+    /// open preview. Returns whether anything changed.
+    pub(crate) fn context_click(&mut self, cursor: Option<(f64, f64)>) -> bool {
+        let target = self.line_at(cursor).and_then(|line| {
+            let finding = self.lines[line].finding?;
+            self.source_preview(finding)?;
+            Some((line, finding))
+        });
+        match (target, self.body, cursor) {
+            (Some((line, finding)), Some(body), Some((x, _))) => {
+                let row_top = body.top() + (line - self.offset) as f32 * ROW;
+                self.preview = Some(OpenPreview {
+                    finding,
+                    x: x as f32,
+                    row_top,
+                    row_bottom: row_top + ROW,
+                });
+                true
+            }
+            _ => self.close_preview(),
+        }
+    }
+
+    /// Closes the code preview. Returns whether it was open.
+    pub(crate) fn close_preview(&mut self) -> bool {
+        self.preview.take().is_some()
+    }
+
+    /// Whether the code preview is open.
+    #[cfg(test)]
+    pub(crate) fn preview_open(&self) -> bool {
+        self.preview.is_some()
     }
 
     /// Draws the rows into `body` (logical pixels) of `frame`.
@@ -340,6 +434,7 @@ impl CompatView {
         let s = scale as f32;
         let transform = Transform::from_scale(s, s);
         let width = body.width();
+        self.body = Some(body);
         if self.wrapped_width != Some(width) || self.lines.is_empty() {
             match ui_font {
                 Some(font) => self.wrap(width, &|text, size| {
@@ -355,15 +450,21 @@ impl CompatView {
             .visible
             .min(self.lines.len().saturating_sub(self.offset));
 
-        // Hover highlight for the finding under the pointer.
-        if let Some((x, y)) = cursor
-            && x >= f64::from(body.left())
-            && x < f64::from(body.right() - SCROLLBAR_GUTTER)
-            && y >= f64::from(body.top())
+        // Hover highlight for the finding under the pointer (or the one
+        // whose code is being previewed).
+        let highlighted = match self.preview {
+            Some(open) => self
+                .lines
+                .iter()
+                .position(|line| line.finding == Some(open.finding)),
+            None => self.line_at(cursor),
+        };
+        if let Some(line) = highlighted
+            && line >= self.offset
         {
-            let row = ((y - f64::from(body.top())) / f64::from(ROW)) as usize;
+            let row = line - self.offset;
             if row < shown
-                && matches!(self.lines[self.offset + row].kind, LineKind::Item(_))
+                && matches!(self.lines[line].kind, LineKind::Item(_))
                 && let Some(rect) =
                     Rect::from_xywh(body.left(), body.top() + row as f32 * ROW, width, ROW)
             {
@@ -492,7 +593,198 @@ impl CompatView {
                 }
             }
         }
+        if let Some(open) = self.preview
+            && let Some(preview) = self.source_preview(open.finding)
+        {
+            draw_preview(frame, body, s, dark, open, preview, ui_font, mono_font);
+        }
     }
+}
+
+/// Code row height inside the preview, in logical pixels.
+const CODE_ROW: f32 = 17.0;
+const CODE_SIZE: f32 = 12.0;
+const PREVIEW_HEADER: f32 = 26.0;
+const PREVIEW_PAD: f32 = 8.0;
+
+/// Draws the code preview popover for `open` inside `body`.
+#[allow(clippy::too_many_arguments)]
+fn draw_preview(
+    frame: &mut Pixmap,
+    body: Rect,
+    s: f32,
+    dark: bool,
+    open: OpenPreview,
+    preview: &SourcePreview,
+    ui_font: &FontVec,
+    mono_font: &FontVec,
+) {
+    let transform = Transform::from_scale(s, s);
+    let device = |value: f32| value * s;
+    let colors = Colors::new(dark);
+    let palette = toolbar::palette(dark);
+
+    let width = (body.width() - 16.0).clamp(160.0, 820.0);
+    let height = PREVIEW_HEADER + preview.lines.len() as f32 * CODE_ROW + PREVIEW_PAD;
+    let left = (open.x - 24.0)
+        .min(body.right() - width - 8.0)
+        .max(body.left() + 8.0);
+    let below = open.row_bottom + 2.0;
+    let top = if below + height <= body.bottom() - 4.0 {
+        below
+    } else {
+        (open.row_top - height - 2.0).max(body.top() + 4.0)
+    };
+    if let Some(path) = toolbar::rounded_rect(left, top + 2.0, width, height, 8.0) {
+        toolbar::fill(frame, &path, colors.preview_shadow, transform);
+    }
+    if let Some(path) = toolbar::rounded_rect(left, top, width, height, 8.0) {
+        toolbar::fill(frame, &path, colors.preview_background, transform);
+        toolbar::stroke(frame, &path, colors.preview_border, 1.0, transform);
+    }
+    let right = left + width - 12.0;
+
+    // Header: where the code is, and how to dismiss it.
+    let mut place = format!("{} · line {}", preview.source, preview.line);
+    if let Some(column) = preview.column {
+        place.push_str(&format!(", column {column}"));
+    }
+    let hint = "Esc to close";
+    let hint_width = toolbar::text_advance(ui_font, device(META_SIZE), hint) / s;
+    let header_baseline = top + PREVIEW_HEADER / 2.0 + 4.0;
+    toolbar::draw_text(
+        frame,
+        ui_font,
+        device(META_SIZE),
+        device(left + 12.0),
+        device(header_baseline),
+        device(right - hint_width - 12.0),
+        palette.text,
+        &place,
+    );
+    toolbar::draw_text(
+        frame,
+        ui_font,
+        device(META_SIZE),
+        device(right - hint_width),
+        device(header_baseline),
+        device(right),
+        palette.text_muted,
+        hint,
+    );
+    if let Some(rule) = Rect::from_xywh(left, top + PREVIEW_HEADER - 1.0, width, 1.0) {
+        toolbar::fill(
+            frame,
+            &PathBuilder::from_rect(rule),
+            colors.separator,
+            transform,
+        );
+    }
+
+    // Gutter of line numbers, then the code.
+    let last_number = preview.first_line + preview.lines.len().saturating_sub(1);
+    let gutter = toolbar::text_advance(mono_font, device(CODE_SIZE), &last_number.to_string()) / s;
+    let number_right = left + 12.0 + gutter;
+    let code_left = number_right + 14.0;
+    let char_width = (toolbar::text_advance(mono_font, device(CODE_SIZE), "0") / s).max(1.0);
+    let fits = (((right - code_left) / char_width) as usize).max(8);
+    let skip = horizontal_skip(preview, fits);
+    let cut = preview.first_column > 1 || skip > 0;
+    for (index, text) in preview.lines.iter().enumerate() {
+        let number = preview.first_line + index;
+        let row_top = top + PREVIEW_HEADER + 4.0 + index as f32 * CODE_ROW;
+        let baseline = row_top + CODE_ROW / 2.0 + 4.0;
+        let focus = number == preview.line;
+        if focus && let Some(rect) = Rect::from_xywh(left + 1.0, row_top, width - 2.0, CODE_ROW) {
+            toolbar::fill(
+                frame,
+                &PathBuilder::from_rect(rect),
+                colors.preview_focus,
+                transform,
+            );
+        }
+        let label = number.to_string();
+        let label_width = toolbar::text_advance(mono_font, device(CODE_SIZE), &label) / s;
+        toolbar::draw_text(
+            frame,
+            mono_font,
+            device(CODE_SIZE),
+            device(number_right - label_width),
+            device(baseline),
+            device(number_right),
+            if focus {
+                palette.text
+            } else {
+                palette.text_muted
+            },
+            &label,
+        );
+        let mut x = code_left;
+        if cut {
+            x = toolbar::draw_text(
+                frame,
+                mono_font,
+                device(CODE_SIZE),
+                device(x),
+                device(baseline),
+                device(right),
+                palette.text_muted,
+                "…",
+            ) / s;
+        }
+        let shown: String = text.chars().skip(skip).collect();
+        toolbar::draw_text(
+            frame,
+            mono_font,
+            device(CODE_SIZE),
+            device(x),
+            device(baseline),
+            device(right),
+            if focus {
+                palette.text
+            } else {
+                palette.text_muted
+            },
+            &shown,
+        );
+        // Underline the character the parser stopped at.
+        if focus
+            && let Some(column) = preview.column
+            && let Some(at) = column
+                .saturating_sub(preview.first_column)
+                .checked_sub(skip)
+        {
+            let before: String = text.chars().skip(skip).take(at).collect();
+            let glyph = text.chars().nth(skip + at).unwrap_or(' ').to_string();
+            let start = x + toolbar::text_advance(mono_font, device(CODE_SIZE), &before) / s;
+            let span = (toolbar::text_advance(mono_font, device(CODE_SIZE), &glyph) / s).max(6.0);
+            if start < right
+                && let Some(rect) = Rect::from_xywh(
+                    start,
+                    row_top + CODE_ROW - 3.0,
+                    span.min(right - start),
+                    2.0,
+                )
+            {
+                toolbar::fill(
+                    frame,
+                    &PathBuilder::from_rect(rect),
+                    colors.probed,
+                    transform,
+                );
+            }
+        }
+    }
+}
+
+/// How many leading characters of each excerpt line to hide so the failing
+/// column is visible when `fits` characters fit across the preview.
+fn horizontal_skip(preview: &SourcePreview, fits: usize) -> usize {
+    let Some(column) = preview.column else {
+        return 0;
+    };
+    let at = column.saturating_sub(preview.first_column);
+    if at < fits * 2 / 3 { 0 } else { at - fits / 3 }
 }
 
 /// Approximate text width when no font is loaded (tests).
@@ -538,6 +830,10 @@ struct Colors {
     name_match: Color,
     documented: Color,
     unverified: Color,
+    preview_background: Color,
+    preview_border: Color,
+    preview_shadow: Color,
+    preview_focus: Color,
 }
 
 impl Colors {
@@ -554,6 +850,10 @@ impl Colors {
                 name_match: rgba(0xe6, 0xc4, 0x5c, 255),
                 documented: rgba(0x9a, 0xa3, 0xb0, 255),
                 unverified: rgba(0x6b, 0x72, 0x7d, 255),
+                preview_background: rgba(0x1c, 0x1f, 0x26, 255),
+                preview_border: rgba(255, 255, 255, 30),
+                preview_shadow: rgba(0, 0, 0, 90),
+                preview_focus: rgba(0xf2, 0x6d, 0x6d, 40),
             }
         } else {
             Self {
@@ -566,6 +866,10 @@ impl Colors {
                 name_match: rgba(0xc9, 0x9a, 0x06, 255),
                 documented: rgba(0x6b, 0x72, 0x80, 255),
                 unverified: rgba(0xb0, 0xb6, 0xc0, 255),
+                preview_background: rgba(255, 255, 255, 255),
+                preview_border: rgba(15, 23, 42, 40),
+                preview_shadow: rgba(15, 23, 42, 30),
+                preview_focus: rgba(0xd9, 0x30, 0x25, 26),
             }
         }
     }
@@ -589,7 +893,7 @@ mod tests {
         let page = browser::Page {
             url: "https://example.test/".into(),
             html: "<html><body><ul><li>x</li></ul><script>a</script></body></html>".into(),
-            stylesheets: vec![".x { box-shadow: 1px 1px #000; cursor: pointer }".into()],
+            stylesheets: vec![".x { text-shadow: 1px 1px #000; cursor: pointer }".into()],
             scripts: vec!["var t = /a+/.test('a'); var o = new IntersectionObserver(f);".into()],
             resources: Default::default(),
         };
@@ -603,7 +907,7 @@ mod tests {
         for expected in [
             "Regular expression literals",
             "IntersectionObserver",
-            "box-shadow",
+            "text-shadow",
             "List markers",
         ] {
             assert!(
@@ -674,6 +978,68 @@ mod tests {
             view.scroll(0.25);
         }
         assert_eq!(view.offset, 1);
+    }
+
+    #[test]
+    fn right_clicking_a_finding_previews_its_code() {
+        let page = browser::Page {
+            url: "https://example.test/".into(),
+            html: "<html><body><script>a</script></body></html>".into(),
+            stylesheets: Vec::new(),
+            scripts: vec!["var a = 1;\nvar b = ;\nvar c = 3;".into()],
+            resources: Default::default(),
+        };
+        let report = audit_page(&Auditor::new(ShellScriptEngine::new()), &page, None);
+        let mut view = CompatView::new();
+        view.set_state(CompatState::Ready(report));
+        view.wrap(600.0, &estimate);
+        view.set_visible(20);
+        view.body = Rect::from_xywh(0.0, 100.0, 600.0, 400.0);
+        let row_of = |view: &CompatView, feature: &str| {
+            view.lines
+                .iter()
+                .position(|line| line.text == feature)
+                .unwrap_or_else(|| panic!("{feature} is listed"))
+        };
+        let at_row = |row: usize| Some((60.0, 100.0 + row as f64 * f64::from(ROW) + 5.0));
+
+        let parse = row_of(&view, "inline script #1 cannot be parsed");
+        assert!(view.context_click(at_row(parse)));
+        assert!(view.preview_open());
+        let open = view.preview.unwrap();
+        let preview = view.source_preview(open.finding).unwrap();
+        assert_eq!(preview.line, 2);
+        assert_eq!(preview.focus(), "var b = ;");
+
+        // Detail rows and empty space close the preview instead.
+        assert!(view.context_click(at_row(parse + 1)));
+        assert!(!view.preview_open());
+        assert!(!view.context_click(Some((60.0, 99.0))));
+
+        // Scrolling and new audits close it too, and drawing without fonts
+        // with it open is harmless.
+        view.context_click(at_row(parse));
+        let mut frame = Pixmap::new(600, 500).unwrap();
+        view.draw(&mut frame, view.body.unwrap(), 1.0, true, None, None, None);
+        view.scroll(1.0);
+        assert!(!view.preview_open());
+        view.scroll(-1.0);
+        view.context_click(at_row(parse));
+        view.set_state(CompatState::Auditing);
+        assert!(!view.preview_open());
+    }
+
+    #[test]
+    fn previews_scroll_sideways_to_keep_the_column_visible() {
+        let line = "x".repeat(200);
+        let near = SourcePreview::new("a.js", &line, 1, Some(10)).unwrap();
+        assert_eq!(horizontal_skip(&near, 80), 0);
+        let far = SourcePreview::new("a.js", &line, 1, Some(150)).unwrap();
+        let skip = horizontal_skip(&far, 80);
+        let at = far.column.unwrap() - far.first_column;
+        assert!(skip <= at && at - skip < 80, "column stays on screen");
+        let unknown = SourcePreview::new("a.js", &line, 1, None).unwrap();
+        assert_eq!(horizontal_skip(&unknown, 80), 0);
     }
 
     #[test]

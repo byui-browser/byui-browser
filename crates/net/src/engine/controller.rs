@@ -8,7 +8,10 @@ use crate::{
         diagnostics::{NetworkEvent, NetworkPhase, SharedNetworkObserver},
         error::RequestError,
         providers::SchemeProviders,
-        services::FetchServices,
+        services::{
+            CachePartitionService, CookieService, RequestPolicyService, ResponsePolicyService,
+            ServiceWorkerService,
+        },
     },
     cache::{PreflightCache, ResponseCache},
     policy::{CorsChecker, RequestPolicy},
@@ -30,15 +33,19 @@ pub struct RequestController {
 
 /// Configures the optional capabilities used by a [`RequestController`].
 ///
-/// A builder may omit both capabilities for standalone HTTP and engine-owned
-/// local requests. Browser client context still requires
-/// [`FetchServices`], and provider-backed local schemes still require their
+/// A builder may omit browser capabilities for standalone HTTP and
+/// engine-owned local requests. Browser client context requires the applicable
+/// focused capabilities, and provider-backed local schemes require their
 /// matching [`SchemeProviders`] entry when a request is fetched. Building a
 /// controller only initializes the shared HTTP transport; it does not invoke
-/// browser services or scheme providers.
+/// browser capabilities or scheme providers.
 pub struct RequestControllerBuilder {
     config: Config,
-    services: Option<Arc<dyn FetchServices>>,
+    request_policy: Option<Arc<dyn RequestPolicyService>>,
+    response_policy: Option<Arc<dyn ResponsePolicyService>>,
+    cookies: Option<Arc<dyn CookieService>>,
+    service_workers: Option<Arc<dyn ServiceWorkerService>>,
+    cache_partitions: Option<Arc<dyn CachePartitionService>>,
     providers: SchemeProviders,
     observer: SharedNetworkObserver,
 }
@@ -55,8 +62,16 @@ pub(crate) struct ControllerInner {
     pub(crate) preflight_cache: PreflightCache,
     /// Maximum lifetime accepted for one preflight permission.
     pub(crate) max_preflight_cache_age: std::time::Duration,
-    /// Browser-owned policy, credential, cache-partition, and worker decisions.
-    pub(crate) services: Option<Arc<dyn FetchServices>>,
+    /// Browser-owned request authorization and generated headers.
+    pub(crate) request_policy: Option<Arc<dyn RequestPolicyService>>,
+    /// Browser-owned response authorization and diagnostics.
+    pub(crate) response_policy: Option<Arc<dyn ResponsePolicyService>>,
+    /// Browser-owned HTTP cookie selection and storage.
+    pub(crate) cookies: Option<Arc<dyn CookieService>>,
+    /// Browser-owned initial service-worker interception decision.
+    pub(crate) service_workers: Option<Arc<dyn ServiceWorkerService>>,
+    /// Browser-owned HTTP cache partition selection.
+    pub(crate) cache_partitions: Option<Arc<dyn CachePartitionService>>,
     /// Browser-owned scheme providers selected by the dispatcher.
     pub(crate) providers: SchemeProviders,
     /// Cross-origin response validation boundary.
@@ -81,7 +96,11 @@ impl RequestController {
     pub fn builder(config: Config) -> RequestControllerBuilder {
         RequestControllerBuilder {
             config,
-            services: None,
+            request_policy: None,
+            response_policy: None,
+            cookies: None,
+            service_workers: None,
+            cache_partitions: None,
             providers: SchemeProviders::default(),
             observer: None,
         }
@@ -89,12 +108,60 @@ impl RequestController {
 }
 
 impl RequestControllerBuilder {
-    /// Installs browser-owned service decisions for requests carrying client
-    /// context, credentials, storage, or service-worker state.
+    /// Installs one value that implements every browser-owned Fetch capability.
     ///
-    /// The service is retained by the controller and shared by its clones.
-    pub fn with_fetch_services(mut self, services: Arc<dyn FetchServices>) -> Self {
-        self.services = Some(services);
+    /// Call the focused setters instead when capabilities have different
+    /// owners or lifetimes.
+    pub fn with_browser_capabilities<T>(mut self, capabilities: Arc<T>) -> Self
+    where
+        T: RequestPolicyService
+            + ResponsePolicyService
+            + CookieService
+            + ServiceWorkerService
+            + CachePartitionService
+            + 'static,
+    {
+        self.request_policy = Some(capabilities.clone());
+        self.response_policy = Some(capabilities.clone());
+        self.cookies = Some(capabilities.clone());
+        self.service_workers = Some(capabilities.clone());
+        self.cache_partitions = Some(capabilities);
+        self
+    }
+
+    /// Installs browser-owned request authorization and generated headers.
+    pub fn with_request_policy(mut self, policy: Arc<dyn RequestPolicyService>) -> Self {
+        self.request_policy = Some(policy);
+        self
+    }
+
+    /// Installs browser-owned response authorization and diagnostics.
+    pub fn with_response_policy(mut self, policy: Arc<dyn ResponsePolicyService>) -> Self {
+        self.response_policy = Some(policy);
+        self
+    }
+
+    /// Installs browser-owned HTTP cookie selection and storage.
+    pub fn with_cookie_service(mut self, cookies: Arc<dyn CookieService>) -> Self {
+        self.cookies = Some(cookies);
+        self
+    }
+
+    /// Installs the browser-owned initial service-worker decision capability.
+    pub fn with_service_worker_service(
+        mut self,
+        service_workers: Arc<dyn ServiceWorkerService>,
+    ) -> Self {
+        self.service_workers = Some(service_workers);
+        self
+    }
+
+    /// Installs browser-owned HTTP cache partition selection.
+    pub fn with_cache_partition_service(
+        mut self,
+        cache_partitions: Arc<dyn CachePartitionService>,
+    ) -> Self {
+        self.cache_partitions = Some(cache_partitions);
         self
     }
 
@@ -121,7 +188,11 @@ impl RequestControllerBuilder {
     pub fn build(self) -> Result<RequestController, RequestError> {
         let Self {
             config,
-            services,
+            request_policy,
+            response_policy,
+            cookies,
+            service_workers,
+            cache_partitions,
             providers,
             observer,
         } = self;
@@ -135,8 +206,17 @@ impl RequestControllerBuilder {
         })?;
         log::debug!(
             "request controller built: max_in_flight={max_in_flight}, \
-             fetch_services={}, max_keepalive_body_size={max_keepalive_body_size}, max_cache_body_size={max_cache_body_size}",
-            services.is_some()
+             browser_capabilities={}, max_keepalive_body_size={max_keepalive_body_size}, max_cache_body_size={max_cache_body_size}",
+            [
+                request_policy.is_some(),
+                response_policy.is_some(),
+                cookies.is_some(),
+                service_workers.is_some(),
+                cache_partitions.is_some(),
+            ]
+            .into_iter()
+            .filter(|installed| *installed)
+            .count()
         );
         Ok(RequestController {
             inner: Arc::new(ControllerInner {
@@ -145,7 +225,11 @@ impl RequestControllerBuilder {
                 cache: ResponseCache::default(),
                 preflight_cache: PreflightCache::default(),
                 max_preflight_cache_age,
-                services,
+                request_policy,
+                response_policy,
+                cookies,
+                service_workers,
+                cache_partitions,
                 providers,
                 cors: CorsChecker,
                 policy: RequestPolicy,
@@ -172,7 +256,7 @@ impl RequestController {
             url.as_str(),
             status,
             from_cache,
-            request.redirect_count,
+            request.redirect_count(),
         );
     }
 

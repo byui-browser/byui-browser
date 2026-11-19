@@ -175,7 +175,7 @@ fn controller(provider: Arc<dyn PageProvider>) -> (RequestController, Arc<Record
         .with_page(provider);
     (
         RequestController::builder(Config::default())
-            .with_fetch_services(services.clone())
+            .with_browser_capabilities(services.clone())
             .with_scheme_providers(providers)
             .build()
             .unwrap(),

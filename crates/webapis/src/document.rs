@@ -181,6 +181,10 @@ fn register_shared_document(
             Ok(Value::Undefined)
         }),
     );
+    shared_document.lock().unwrap().script_bindings = Some(ScriptBindings {
+        document: document_object.clone(),
+        registry: custom_elements_registry.clone(),
+    });
     let get_element_document = shared_document.clone();
     let get_element_registry = custom_elements_registry.clone();
     document_object.set_method(
@@ -208,6 +212,38 @@ fn register_shared_document(
                 )?),
                 None => Value::Null,
             })
+        }),
+    );
+    let by_class_document = shared_document.clone();
+    let by_class_registry = custom_elements_registry.clone();
+    document_object.set_method(
+        "getElementsByClassName",
+        Arc::new(move |arguments| {
+            let class_names = match arguments.first() {
+                Some(value) => value.to_string(),
+                None => {
+                    return Err(JsError::new(
+                        "document.getElementsByClassName() expects a class names string",
+                    ));
+                }
+            };
+            let elements = by_class_document
+                .lock()
+                .unwrap()
+                .get_elements_by_class_name(&class_names);
+            log::debug!(
+                "document.getElementsByClassName({class_names:?}) matched {} elements",
+                elements.len()
+            );
+            // A static array stands in for the live HTMLCollection.
+            let collection = Object::new();
+            for (index, element) in elements.into_iter().enumerate() {
+                let object =
+                    script_element_object(&by_class_document, &by_class_registry, element)?;
+                collection.set(index.to_string(), Value::Object(object));
+            }
+            collection.set("length", Value::Number(collection.len() as f64));
+            Ok(Value::Array(collection))
         }),
     );
     let create_element_document = shared_document.clone();
@@ -457,6 +493,18 @@ pub struct Document {
     pub(crate) event_targets: Arc<Mutex<HashMap<usize, EventTargetRef>>>,
     custom_element_nodes: HashSet<NodeID>,
     script_elements: HashMap<NodeID, Object>,
+    /// The JavaScript `document` object and `customElements` registry this
+    /// document is registered with, once a realm exposes it to scripts.
+    script_bindings: Option<ScriptBindings>,
+}
+
+/// JavaScript objects that element bindings need to reach from a document:
+/// the `document` object (for `ownerDocument`) and the custom element
+/// registry (for wrapping elements the same way `document` methods do).
+#[derive(Debug, Clone)]
+pub(crate) struct ScriptBindings {
+    pub(crate) document: Object,
+    pub(crate) registry: Object,
 }
 
 impl PartialEq for Document {
@@ -486,10 +534,11 @@ impl Document {
             event_targets: Arc::default(),
             custom_element_nodes: HashSet::new(),
             script_elements: HashMap::new(),
+            script_bindings: None,
         }
     }
 
-    fn computed_styles(&self) -> ComputedStyles {
+    pub(crate) fn computed_styles(&self) -> ComputedStyles {
         let Some(source) = &self.source_document else {
             return ComputedStyles::default();
         };
@@ -518,6 +567,7 @@ impl Document {
             event_targets: Arc::default(),
             custom_element_nodes: HashSet::new(),
             script_elements: HashMap::new(),
+            script_bindings: None,
         }
     }
 
@@ -584,6 +634,41 @@ impl Document {
             .find(|element| element.id_attr.as_deref() == Some(id))
     }
 
+    /// `document.getElementsByClassName(classNames)`.
+    ///
+    /// Splits `class_names` on ASCII whitespace and returns, in tree order,
+    /// every element connected to the document whose `class` attribute
+    /// contains all of those tokens. Matching is case-sensitive, as in a
+    /// no-quirks document. An empty or all-whitespace argument matches
+    /// nothing.
+    ///
+    /// Limitation: the DOM returns a live `HTMLCollection`; this returns a
+    /// snapshot of the current tree, so later class or tree changes are not
+    /// reflected in it.
+    pub fn get_elements_by_class_name(&self, class_names: &str) -> Vec<Element> {
+        let wanted: Vec<&str> = class_names.split_ascii_whitespace().collect();
+        let Some(source) = &self.source_document else {
+            return Vec::new();
+        };
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        self.inclusive_descendant_elements(source.root)
+            .into_iter()
+            .filter(|element| {
+                let Some(class) = element
+                    .attributes
+                    .iter()
+                    .find(|attribute| attribute.get_name() == "class")
+                else {
+                    return false;
+                };
+                let classes: Vec<&str> = class.get_value().split_ascii_whitespace().collect();
+                wanted.iter().all(|token| classes.contains(token))
+            })
+            .collect()
+    }
+
     pub(crate) fn element_snapshot(&self, node: NodeID) -> Option<Element> {
         let node_data = self.source_document.as_ref()?.node(node)?;
         let NodeKind::Element(element) = node_data.get_kind() else {
@@ -601,6 +686,17 @@ impl Document {
             id_attr,
             attributes: element.get_attributes().clone(),
         })
+    }
+
+    /// The `document` and `customElements` objects this document is
+    /// registered with, or `None` before registration.
+    pub(crate) fn script_bindings(&self) -> Option<ScriptBindings> {
+        self.script_bindings.clone()
+    }
+
+    /// The JavaScript object already handed to scripts for `node`, if any.
+    pub(crate) fn cached_script_element(&self, node: NodeID) -> Option<Object> {
+        self.script_elements.get(&node).cloned()
     }
 
     fn mark_custom_element_upgraded(&mut self, node: NodeID) -> bool {
@@ -938,7 +1034,7 @@ fn upgrade_element(
     ))
 }
 
-fn script_element_object(
+pub(crate) fn script_element_object(
     document: &Arc<Mutex<Document>>,
     registry: &Object,
     element: Element,
@@ -969,7 +1065,7 @@ fn script_element_object(
     Ok(object)
 }
 
-fn collect_elements(document: &HTMLDocument) -> Vec<Element> {
+pub(crate) fn collect_elements(document: &HTMLDocument) -> Vec<Element> {
     fn collect(document: &HTMLDocument, parent: NodeID, elements: &mut Vec<Element>) {
         let Some(node) = document.node(parent) else {
             return;
@@ -1095,6 +1191,65 @@ mod tests {
             .expect("nested element");
         assert_eq!(element.node.get(), 2);
         assert_eq!(document.get_element_by_id("NESTED"), None);
+    }
+
+    #[test]
+    fn document_get_elements_by_class_name_requires_every_token_in_tree_order() {
+        let html_document = parse_raw_html(
+            "<div class='card wide' id='a'><p class='wide  card x' id='b'></p></div>\
+             <span class='card' id='c'></span><i class='Card wide' id='d'></i>"
+                .to_owned(),
+        );
+        let document = Document::from_html_document(&html_document);
+        let ids = |names: &str| {
+            document
+                .get_elements_by_class_name(names)
+                .into_iter()
+                .map(|element| element.id_attr.unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids("card"), ["a", "b", "c"]);
+        assert_eq!(ids(" wide\tcard "), ["a", "b"]);
+        assert_eq!(ids("Card"), ["d"]);
+        assert!(ids("").is_empty());
+        assert!(ids("   ").is_empty());
+        assert!(ids("missing").is_empty());
+    }
+
+    #[test]
+    fn get_elements_by_class_name_is_exposed_to_scripts() {
+        let document = Document::from_html_document(&parse_raw_html(
+            "<ul><li class='item' id='one'></li><li class='item done' id='two'></li></ul>"
+                .to_owned(),
+        ));
+        let mut realm = Realm::new();
+        register_document(&mut realm, document).unwrap();
+
+        assert_eq!(
+            realm.evaluate_script("document.getElementsByClassName('item').length"),
+            Ok(Value::Number(2.0))
+        );
+        assert_eq!(
+            realm.evaluate_script(
+                "const done = document.getElementsByClassName('done item'); \
+                 done.length + ':' + done[0].getAttribute('id')"
+            ),
+            Ok(Value::String("1:two".into()))
+        );
+        assert_eq!(
+            realm.evaluate_script(
+                "document.getElementsByClassName('item')[0] === document.getElementById('one')"
+            ),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            realm.evaluate_script(
+                "document.getElementById('one').setAttribute('class', 'other'); \
+                 document.getElementsByClassName('item').length"
+            ),
+            Ok(Value::Number(1.0))
+        );
     }
 
     #[test]

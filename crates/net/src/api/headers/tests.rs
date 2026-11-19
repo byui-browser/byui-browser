@@ -123,6 +123,16 @@ fn map_and_headers_construction_preserve_duplicates_and_guard() {
     let cloned = Headers::from_headers(&headers);
     assert_eq!(cloned, headers);
     assert_eq!(cloned.guard(), HeaderGuard::Request);
+
+    let transport = headers.to_reqwest();
+    assert_eq!(
+        transport
+            .get_all("x-test")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["one", "two"]
+    );
 }
 
 #[test]
@@ -146,6 +156,29 @@ fn public_iteration_combines_ordinary_values_but_not_set_cookie() {
     );
     assert_eq!(headers.get_set_cookie(), ["a=1", "b=2"]);
     assert_eq!(headers.iter_raw().count(), 5);
+}
+
+#[test]
+/// Verifies large duplicate sets combine without changing first-insertion order.
+fn public_iteration_combines_large_duplicate_sets_in_first_insertion_order() {
+    let mut headers = Headers::with_guard(HeaderGuard::None);
+    headers.append_str("x-first", "start").unwrap();
+    headers.append_str("set-cookie", "a=1").unwrap();
+    for index in 0..256 {
+        headers
+            .append_str("x-repeated", &index.to_string())
+            .unwrap();
+    }
+    headers.append_str("x-first", "end").unwrap();
+    headers.append_str("set-cookie", "b=2").unwrap();
+
+    let combined = headers.iter().collect::<Vec<_>>();
+    assert_eq!(combined.len(), 4);
+    assert_eq!(combined[0].1, "start, end");
+    assert_eq!(combined[1].1, "a=1");
+    assert_eq!(combined[2].0, HeaderName::from_static("x-repeated"));
+    assert_eq!(combined[2].1.split(", ").count(), 256);
+    assert_eq!(combined[3].1, "b=2");
 }
 
 #[test]

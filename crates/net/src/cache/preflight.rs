@@ -30,7 +30,7 @@ impl PreflightCache {
     pub(crate) fn allows(&self, request: &Request, url: &Url, unsafe_names: &[HeaderName]) -> bool {
         let now = Instant::now();
         let key = PreflightKey::new(request, url);
-        let include_credentials = request.context.credentials == CredentialsMode::Include;
+        let include_credentials = request.credentials_mode() == CredentialsMode::Include;
         let mut entries = self.entries.write().expect("preflight cache lock poisoned");
         entries.retain(|entry| entry.expires_at > now);
 
@@ -65,7 +65,7 @@ impl PreflightCache {
         let now = Instant::now();
         let expires_at = now.checked_add(ttl).unwrap_or(now);
         let key = PreflightKey::new(request, url);
-        let credentials = request.context.credentials == CredentialsMode::Include;
+        let credentials = request.credentials_mode() == CredentialsMode::Include;
         let mut entries = self.entries.write().expect("preflight cache lock poisoned");
         entries.retain(|entry| entry.expires_at > now);
 
@@ -131,7 +131,7 @@ impl PreflightKey {
         let mut normalized_url = url.clone();
         normalized_url.set_fragment(None);
         Self {
-            partition: request.cache_partition.clone(),
+            partition: request.cache_partition().map(str::to_owned),
             origin: request.serialized_origin().unwrap_or_default(),
             url: normalized_url.to_string(),
         }
@@ -167,11 +167,11 @@ mod tests {
     /// Creates a cross-origin request with an explicit cache partition.
     fn request(method: &str) -> Request {
         let mut request = Request::new("https://remote.test/data", method).unwrap();
-        request.context.environment = FetchEnvironment {
+        request.set_environment(FetchEnvironment {
             origin: Some(Origin::parse("https://client.test").unwrap()),
             ..FetchEnvironment::default()
-        };
-        request.cache_partition = Some("top-level-site".into());
+        });
+        request.set_cache_partition("top-level-site".into());
         request
     }
 
@@ -188,7 +188,7 @@ mod tests {
         cache.insert(&request, &url, &permissions, Duration::from_secs(60));
         assert!(cache.allows(&request, &url, &names));
 
-        request.context.credentials = CredentialsMode::Include;
+        request.set_credentials_mode(CredentialsMode::Include);
         assert!(!cache.allows(&request, &url, &names));
         cache.insert(&request, &url, &permissions, Duration::from_secs(60));
         assert!(cache.allows(&request, &url, &names));
@@ -243,11 +243,13 @@ mod tests {
             &[]
         ));
         let mut other_partition = request.try_clone().unwrap();
-        other_partition.cache_partition = Some("other-site".into());
+        other_partition.set_cache_partition("other-site".into());
         assert!(!cache.allows(&other_partition, &url, &[]));
         let mut other_origin = request.try_clone().unwrap();
-        other_origin.context.environment.origin =
-            Some(Origin::parse("https://other-client.test").unwrap());
+        other_origin.set_environment(FetchEnvironment {
+            origin: Some(Origin::parse("https://other-client.test").unwrap()),
+            ..other_origin.environment().clone()
+        });
         assert!(!cache.allows(&other_origin, &url, &[]));
     }
 
