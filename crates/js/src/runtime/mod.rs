@@ -37,6 +37,7 @@
 mod array;
 pub(crate) mod builtins;
 mod conversions;
+mod core;
 mod errors;
 mod expressions;
 mod global_functions;

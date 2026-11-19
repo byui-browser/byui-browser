@@ -14,6 +14,7 @@
 
 mod block;
 mod box_tree;
+mod control;
 mod fonts;
 mod geometry;
 mod inline;

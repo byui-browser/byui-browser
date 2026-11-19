@@ -188,6 +188,7 @@ impl LineBox {
                 LineFragment::Text(text) => {
                     text.rect = text.rect.translate(dx, dy);
                     text.baseline += dy;
+                    text.clip = text.clip.map(|clip| clip.translate(dx, dy));
                 }
                 LineFragment::Atomic(atomic) => atomic.translate(dx, dy),
             }
@@ -242,6 +243,11 @@ pub struct TextFragment {
     pub font: crate::FontId,
     /// The text color.
     pub color: CssColor,
+    /// A rectangle the glyphs must not paint outside, in the same absolute
+    /// coordinates as `rect`; `None` means unclipped. Set for text inside
+    /// form controls, which is clipped to the control's padding box. The
+    /// `overflow` property does not clip other content yet.
+    pub clip: Option<Rect>,
 }
 
 /// The complete layout output for one document and viewport.
@@ -482,6 +488,7 @@ mod tests {
                 font_size: 10.0,
                 font: crate::FontId::DEFAULT,
                 color: BoxStyle::default().text_color,
+                clip: None,
             })],
         });
         let sibling = block(Some(2), rect(0.0, 10.0, 10.0), Vec::new());

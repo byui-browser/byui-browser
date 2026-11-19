@@ -210,3 +210,27 @@ fn rejects_unsupported_or_invalid_colors() {
     assert_eq!(parse_color("rgb(1, 2)"), None);
     assert_eq!(parse_color("not-a-color"), None);
 }
+
+#[test]
+fn resolves_css_length_functions() {
+    assert_eq!(
+        css::values::resolve_length_function("calc(20px + 30px)").as_deref(),
+        Some("50px")
+    );
+    assert_eq!(
+        css::values::resolve_length_function("calc(50px - 20px)").as_deref(),
+        Some("30px")
+    );
+    assert_eq!(
+        css::values::resolve_length_function("min(50px, 80px)").as_deref(),
+        Some("50px")
+    );
+    assert_eq!(
+        css::values::resolve_length_function("max(50px, 80px)").as_deref(),
+        Some("80px")
+    );
+    assert_eq!(
+        css::values::resolve_length_function("clamp(10px, 50px, 90px)").as_deref(),
+        Some("50px")
+    );
+}

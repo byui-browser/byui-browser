@@ -848,8 +848,12 @@ impl PageSession {
     /// non-replaceable read-only host attributes.
     pub fn set_scroll_y(&mut self, scroll_y: f64) {
         let value = Value::Number(scroll_y.max(0.0));
+        let changed = self.window.get("scrollY") != Some(value.clone());
         self.window.update_read_only("scrollY", value.clone());
         self.window.update_read_only("pageYOffset", value);
+        if changed && let Err(error) = webapis::dispatch_window_scroll(&self.window) {
+            log::warn!("could not dispatch window scroll event: {error}");
+        }
     }
 
     /// Updates the viewport dimensions exposed to this live page session.
@@ -858,6 +862,16 @@ impl PageSession {
     /// `window.innerHeight`, and their global aliases synchronized with the
     /// current viewport.
     pub fn set_viewport(&mut self, viewport: ViewportSize) {
+        let old_width = match self.window.get("innerWidth") {
+            Some(Value::Number(width)) => width,
+            _ => 0.0,
+        };
+        let old_height = match self.window.get("innerHeight") {
+            Some(Value::Number(height)) => height,
+            _ => 0.0,
+        };
+        let dimensions_changed =
+            old_width != viewport.width as f64 || old_height != viewport.height as f64;
         let width = Value::Number(viewport.width as f64);
         let height = Value::Number(viewport.height as f64);
         self.window.set("innerWidth", width.clone());
@@ -874,6 +888,13 @@ impl PageSession {
                 Value::Number(viewport.height as f64),
                 Value::Number(ratio),
             ]);
+        }
+        if dimensions_changed && let Err(error) = webapis::dispatch_window_resize(&self.window) {
+            log::warn!("could not dispatch window resize event: {error}");
+        } else if dimensions_changed
+            && let Err(error) = webapis::run_window_microtasks(&self.window)
+        {
+            log::warn!("could not run resize microtasks: {error}");
         }
     }
 
@@ -1112,11 +1133,27 @@ mod tests {
                 .evaluate_script("window.scrollY === 0 && window.pageYOffset === 0"),
             Ok(Value::Boolean(true))
         );
+        session
+            .realm
+            .evaluate_script(
+                "var scrollEvents = 0; var scrollMetadata = null; \
+                 window.onscroll = (event) => { scrollEvents++; scrollMetadata = [event.type, \
+                 event.target, event.currentTarget, event.bubbles, event.cancelable]; }",
+            )
+            .unwrap();
         session.set_scroll_y(123.5);
         assert_eq!(
-            session
-                .realm
-                .evaluate_script("window.scrollY === 123.5 && window.pageYOffset === 123.5"),
+            session.realm.evaluate_script(
+                "window.scrollY === 123.5 && window.pageYOffset === 123.5 && \
+                     scrollEvents === 1 && scrollMetadata[0] === 'scroll' && \
+                     scrollMetadata[1] === window && scrollMetadata[2] === window && \
+                     !scrollMetadata[3] && !scrollMetadata[4]",
+            ),
+            Ok(Value::Boolean(true))
+        );
+        session.set_scroll_y(123.5);
+        assert_eq!(
+            session.realm.evaluate_script("scrollEvents === 1"),
             Ok(Value::Boolean(true))
         );
         assert_eq!(

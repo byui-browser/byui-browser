@@ -369,6 +369,66 @@ fn window_location_shares_the_window_with_viewport_and_device_scale() {
 }
 
 #[test]
+fn viewport_resize_updates_inner_dimensions_and_dispatches_onresize() {
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+    let mut session = BrowserRuntime::in_memory()
+        .open_page_with_viewport(
+            &browser::Page {
+                url: "https://example.com/resize".into(),
+                html: String::new(),
+                stylesheets: Vec::new(),
+                scripts: vec![
+                    "var resizeCalls = 0; var resizeSeen = null; \
+                     function resizeHandler(event) { resizeCalls++; resizeSeen = \
+                     [this === window, event.type, event.target === window, \
+                      event.currentTarget === window, event.bubbles, event.cancelable, \
+                      window.innerWidth, window.innerHeight]; } \
+                     window.onresize = resizeHandler"
+                        .into(),
+                ],
+                resources: Default::default(),
+            },
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            security_context(),
+            1.0,
+            webapis::ViewportSize {
+                width: 800,
+                height: 600,
+            },
+        )
+        .expect("page script should evaluate");
+
+    session.set_viewport(webapis::ViewportSize {
+        width: 1024,
+        height: 768,
+    });
+    assert_eq!(
+        session.evaluate_script(
+            "resizeCalls === 1 && resizeSeen[0] && resizeSeen[1] === 'resize' && \
+             resizeSeen[2] && resizeSeen[3] && !resizeSeen[4] && !resizeSeen[5] && \
+             resizeSeen[6] === 1024 && resizeSeen[7] === 768 && \
+             window.innerWidth === 1024 && window.innerHeight === 768",
+        ),
+        Ok(js::Value::Boolean(true))
+    );
+
+    session.set_viewport(webapis::ViewportSize {
+        width: 1024,
+        height: 768,
+    });
+    assert_eq!(
+        session.evaluate_script("resizeCalls === 1"),
+        Ok(js::Value::Boolean(true))
+    );
+}
+
+#[test]
 fn document_click_listener_runs_after_the_page_loads() {
     let console = Arc::new(TestConsole::default());
     let alert = Arc::new(TestAlert::default());
