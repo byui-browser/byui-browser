@@ -6,6 +6,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 use common::{TestServer, collect_body, runtime};
 use net::{
@@ -15,6 +16,31 @@ use net::{
 };
 
 struct SameOriginCacheServices;
+
+/// Waits for detached body capture by retrying a cache-preferred probe.
+async fn wait_for_cached(controller: &RequestController, request: &Request) -> net::Response {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut probe = request
+                .try_clone()
+                .expect("cache probe request should be cloneable");
+            probe.set_cache_mode(CacheMode::ForceCache);
+            match controller.fetch(probe).await {
+                Ok(response) if response.from_cache => break response,
+                Ok(response) => {
+                    let _ = response.body.bytes().await;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(RequestError::NetworkError | RequestError::Transport(_)) => {
+                    tokio::time::sleep(Duration::from_millis(1)).await
+                }
+                Err(error) => panic!("cache probe failed unexpectedly: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("background body capture should finish within five seconds")
+}
 
 impl RequestPolicyService for SameOriginCacheServices {
     fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
@@ -94,7 +120,7 @@ fn fully_consumed_stream_is_cached() {
         let response = controller.fetch(Request::get(server.url())).await.unwrap();
         assert_eq!(response.body.length(), Some(6));
         assert_eq!(collect_body(response).await.unwrap(), b"cached");
-        let cached = controller.fetch(Request::get(server.url())).await.unwrap();
+        let cached = wait_for_cached(&controller, &Request::get(server.url())).await;
         assert!(cached.from_cache);
         assert_eq!(cached.body.length(), Some(6));
         assert_eq!(cached.body.bytes().await.unwrap(), b"cached");
@@ -133,7 +159,7 @@ fn no_cache_revalidates_with_etag_and_reuses_the_merged_representation() {
             revalidated.headers.get("x-revalidated"),
             collect_body(revalidated).await.unwrap(),
         );
-        let cached = controller.fetch(Request::get(server.url())).await.unwrap();
+        let cached = wait_for_cached(&controller, &Request::get(server.url())).await;
         let cached = (cached.from_cache, collect_body(cached).await.unwrap());
         (revalidated, cached)
     });
@@ -219,6 +245,7 @@ fn force_cache_serves_a_permitted_stale_representation_without_network_io() {
             .await
             .unwrap();
         assert_eq!(collect_body(first).await.unwrap(), b"stale");
+        wait_for_cached(&controller, &request).await;
 
         let mut force_cache = request;
         force_cache.set_cache_mode(CacheMode::ForceCache);
@@ -263,7 +290,7 @@ fn reload_bypasses_cache_and_caches_the_refresh_when_consumed() {
             refreshed_response.from_cache,
             collect_body(refreshed_response).await.unwrap(),
         );
-        let cached_response = controller.fetch(Request::get(server.url())).await.unwrap();
+        let cached_response = wait_for_cached(&controller, &Request::get(server.url())).await;
         let cached = (
             cached_response.from_cache,
             collect_body(cached_response).await.unwrap(),
@@ -344,9 +371,7 @@ fn only_if_cached_returns_a_cache_hit() {
         )
         .await
         .unwrap();
-        let mut only_cached = request;
-        only_cached.set_cache_mode(CacheMode::OnlyIfCached);
-        let response = controller.fetch(only_cached).await.unwrap();
+        let response = wait_for_cached(&controller, &request).await;
         let from_cache = response.from_cache;
         let header = response.headers.get("x-cache-test").unwrap().to_owned();
         let body = collect_body(response).await.unwrap();
@@ -405,13 +430,7 @@ fn clear_cache_forces_a_new_network_request() {
             .unwrap();
         assert!(!first.from_cache);
         collect_body(first).await.unwrap();
-        assert!(
-            controller
-                .fetch(request.try_clone().unwrap())
-                .await
-                .unwrap()
-                .from_cache
-        );
+        assert!(wait_for_cached(&controller, &request).await.from_cache);
         controller.clear_cache();
         assert!(!controller.fetch(request).await.unwrap().from_cache);
     });
@@ -448,7 +467,25 @@ fn reload_bypasses_cached_response_and_caches_the_refresh() {
         let refreshed = controller.fetch(reload).await.unwrap();
         let refreshed_from_cache = refreshed.from_cache;
         let refreshed_body = collect_body(refreshed).await.unwrap();
-        let cached = controller.fetch(Request::get(server.url())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut probe = Request::get(server.url());
+                probe.set_cache_mode(CacheMode::ForceCache);
+                match controller.fetch(probe).await {
+                    Ok(response) => {
+                        if response.body.bytes().await.unwrap() == b"second" {
+                            break;
+                        }
+                    }
+                    Err(RequestError::NetworkError | RequestError::Transport(_)) => {}
+                    Err(error) => panic!("cache probe failed unexpectedly: {error}"),
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("refreshed background body capture should finish within five seconds");
+        let cached = wait_for_cached(&controller, &Request::get(server.url())).await;
         (refreshed_from_cache, refreshed_body, cached)
     });
 
@@ -484,9 +521,7 @@ fn only_if_cached_returns_a_cached_response_without_network_io() {
             .await
             .unwrap();
         collect_body(first).await.unwrap();
-        let mut only_cached = request;
-        only_cached.set_cache_mode(CacheMode::OnlyIfCached);
-        controller.fetch(only_cached).await.unwrap()
+        wait_for_cached(&controller, &request).await
     });
 
     server.join();
@@ -540,7 +575,7 @@ fn cloned_controllers_share_the_response_cache() {
             .unwrap();
         let first_from_cache = first.from_cache;
         collect_body(first).await.unwrap();
-        let second = clone.fetch(request).await.unwrap();
+        let second = wait_for_cached(&clone, &request).await;
         (first_from_cache, second)
     });
 

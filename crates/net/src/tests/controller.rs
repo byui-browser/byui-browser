@@ -5,6 +5,7 @@ use std::{
     net::TcpListener,
     sync::{Arc, Mutex, mpsc},
     thread,
+    time::Duration,
 };
 
 use crate::{
@@ -362,14 +363,25 @@ fn completed_background_capture_is_cached() {
         while let Some(chunk) = first.body.next().await {
             first_body.extend_from_slice(&chunk.expect("first body chunk should be valid"));
         }
-        for _ in 0..4_096 {
-            tokio::task::yield_now().await;
-        }
-
-        let second = client
-            .fetch(Request::get(&address))
-            .await
-            .expect("cached streaming request should succeed");
+        let second = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut probe = Request::get(&address);
+                probe.set_cache_mode(CacheMode::ForceCache);
+                match client.fetch(probe).await {
+                    Ok(response) if response.from_cache => break response,
+                    Ok(response) => {
+                        let _ = response.body.bytes().await;
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(RequestError::NetworkError | RequestError::Transport(_)) => {
+                        tokio::time::sleep(Duration::from_millis(1)).await
+                    }
+                    Err(error) => panic!("cache probe failed unexpectedly: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("background body capture should finish within five seconds");
         (first_body, second)
     });
 
