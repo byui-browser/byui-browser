@@ -7,10 +7,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod control;
 mod display_list;
 mod painter;
 mod types;
 
+pub use control::{ACCENT, CONTROL_BORDER, DISABLED};
 pub use display_list::{DisplayItem, DisplayList, build_display_list};
 pub use painter::{
     CANVAS_COLOR, paint_document, paint_document_scrolled,

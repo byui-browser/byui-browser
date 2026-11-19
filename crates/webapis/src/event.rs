@@ -516,6 +516,20 @@ pub(crate) fn dispatch_event_target_with_target(
     ))
 }
 
+/// Dispatches an event on a standalone target while retaining the event's
+/// existing target, for the final Window phase of a bubbling event.
+pub(crate) fn dispatch_event_target_preserving_target(
+    target: &EventTargetRef,
+    target_object: &Object,
+    arguments: &[Value],
+) -> JsResult<Value> {
+    let [Value::Object(event)] = arguments else {
+        return Err(JsError::new("dispatchEvent() expects one Event object"));
+    };
+    let event_target = event.get("target").unwrap_or(Value::Null);
+    dispatch_event_target_with_target(target, target_object, event_target, arguments)
+}
+
 fn invoke_window_error_handler(target: &Object, event: &Object) -> bool {
     let Some(Value::Function(handler)) = target.get("onerror") else {
         return false;
@@ -609,7 +623,7 @@ pub(crate) fn dispatch_event_at(
         current = document
             .source_document
             .as_ref()
-            .and_then(|source| source.node(current_node).and_then(|n| n.get_parent()));
+            .and_then(|source| source.get_node(current_node).and_then(|n| n.get_parent()));
     }
     let document_target = document.event_target.clone();
     if node.is_none() {
@@ -623,7 +637,7 @@ pub(crate) fn dispatch_event_at(
         .filter_map(|id| {
             let is_document = document
                 .html_document()?
-                .node(*id)
+                .get_node(*id)
                 .is_some_and(|data| matches!(data.get_kind(), html::NodeKind::Document));
             if is_document {
                 let object = document
@@ -751,7 +765,7 @@ fn nearest_element(document: &Document, node: NodeID) -> Option<Element> {
         current = document
             .source_document
             .as_ref()
-            .and_then(|source| source.node(node))
+            .and_then(|source| source.get_node(node))
             .and_then(|node| node.get_parent());
     }
     None
@@ -865,7 +879,7 @@ mod tests {
     fn user_click_on_element_text_targets_the_element_and_bubbles() {
         let html_document = parse_raw_html("<main><button id='btn'>Go</button></main>".to_owned());
         let button = html_document.get_element_by_id("btn").unwrap();
-        let text = html_document.node(button).unwrap().get_children()[0];
+        let text = html_document.get_node(button).unwrap().get_children()[0];
         let document = Document::from_html_document(&html_document);
         let mut realm = Realm::new();
         register_document(&mut realm, document.clone()).unwrap();

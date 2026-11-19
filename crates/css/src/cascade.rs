@@ -155,7 +155,7 @@ fn style_document_with_stats_context(
 ) -> (ComputedStyles, CascadeStats) {
     log::debug!(
         "styling document: {} nodes, {} author stylesheets",
-        dom.nodes.len(),
+        dom.get_nodes().len(),
         stylesheets.len()
     );
     if log::log_enabled!(log::Level::Debug) {
@@ -203,7 +203,7 @@ fn style_document_with_stats_context(
     let mut root_font_size = None;
     let mut candidates = Vec::new();
     let initial_color = initial_color_value();
-    for (node_index, node) in dom.nodes.iter().enumerate() {
+    for (node_index, node) in dom.get_nodes().iter().enumerate() {
         let NodeKind::Element(element) = node.get_kind() else {
             continue;
         };
@@ -538,7 +538,9 @@ fn compute(
     let mut properties = BTreeMap::<String, String>::new();
     if let Some(parent) = parent {
         for declaration in parent {
-            if is_inherited_property(&declaration.property) {
+            if is_inherited_property(&declaration.property)
+                || declaration.property.starts_with("--")
+            {
                 properties.insert(declaration.property.clone(), declaration.value.clone());
             }
         }
@@ -574,6 +576,8 @@ fn compute(
         }
     }
 
+    resolve_computed_values(&mut properties);
+
     let parent_font_size = parent_value("font-size")
         .and_then(|value| {
             values::compute_font_size_with_context(
@@ -602,6 +606,15 @@ fn compute(
             parent_font_size
         });
     properties.insert("font-size".to_owned(), values::format_px(font_size));
+    if let Some(percent) = properties
+        .get("line-height")
+        .and_then(|value| values::parse_percentage(value))
+    {
+        properties.insert(
+            "line-height".to_owned(),
+            values::format_px(font_size * percent / 100.0),
+        );
+    }
     (
         properties
             .into_iter()
@@ -609,6 +622,113 @@ fn compute(
             .collect(),
         font_size,
     )
+}
+
+fn resolve_computed_values(properties: &mut BTreeMap<String, String>) {
+    let variables: BTreeMap<String, String> = properties
+        .iter()
+        .filter(|(property, _)| property.starts_with("--"))
+        .map(|(property, value)| (property.clone(), value.clone()))
+        .collect();
+    let property_names: Vec<String> = properties.keys().cloned().collect();
+
+    for property in property_names {
+        let Some(value) = properties.get(&property).cloned() else {
+            continue;
+        };
+        let Some(mut value) = substitute_variables(&value, &variables, &mut Vec::new()) else {
+            properties.remove(&property);
+            continue;
+        };
+        if !property.starts_with("--")
+            && let Some(resolved) = values::resolve_length_function(&value)
+        {
+            value = resolved;
+        }
+        properties.insert(property, value);
+    }
+}
+
+fn substitute_variables(
+    value: &str,
+    variables: &BTreeMap<String, String>,
+    stack: &mut Vec<String>,
+) -> Option<String> {
+    let mut result = String::new();
+    let mut index = 0;
+
+    while index < value.len() {
+        if !value[index..].to_ascii_lowercase().starts_with("var(") {
+            let character = value[index..].chars().next()?;
+            result.push(character);
+            index += character.len_utf8();
+            continue;
+        }
+
+        let end = matching_function_end(value, index)?;
+        let arguments = split_function_arguments(&value[index + 4..end - 1]);
+        let name = arguments.first()?.trim();
+        if !name.starts_with("--") {
+            return None;
+        }
+
+        let replacement = variables
+            .get(name)
+            .cloned()
+            .or_else(|| arguments.get(1).map(|fallback| fallback.to_string()))?;
+        if stack.iter().any(|item| item == name) {
+            return None;
+        }
+
+        stack.push(name.to_owned());
+        let resolved = substitute_variables(&replacement, variables, stack)?;
+        stack.pop();
+        result.push_str(&resolved);
+        index = end;
+    }
+
+    Some(result)
+}
+
+fn matching_function_end(value: &str, start: usize) -> Option<usize> {
+    let open = value[start..].find('(')? + start;
+    let mut depth: usize = 0;
+
+    for (offset, character) in value[open..].char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn split_function_arguments(input: &str) -> Vec<&str> {
+    let mut arguments = Vec::new();
+    let mut depth: usize = 0;
+    let mut start = 0;
+
+    for (index, character) in input.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                arguments.push(input[start..index].trim());
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    arguments.push(input[start..].trim());
+    arguments
 }
 
 /// Records `declaration` for its property if it beats the current winner.

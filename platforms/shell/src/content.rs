@@ -120,14 +120,14 @@ fn decoded_images(page: &Page) -> Arc<ImageStore> {
 fn add_inline_svgs(document: &html::HTMLDocument, images: &mut ImageStore) {
     let is_svg_element = |id: NodeID| {
         matches!(
-            document.node(id).map(|node| node.get_kind()),
+            document.get_node(id).map(|node| node.get_kind()),
             Some(html::NodeKind::Element(element))
                 if *element.get_namespace() == html::Namespace::Svg
         )
     };
-    for index in 0..document.nodes.len() {
+    for index in 0..document.get_nodes().len() {
         let id = NodeID::new(index);
-        let Some(node) = document.node(id) else {
+        let Some(node) = document.get_node(id) else {
             continue;
         };
         let html::NodeKind::Element(element) = node.get_kind() else {
@@ -413,7 +413,7 @@ impl PageLayout {
             }
         };
         let focusable = document
-            .nodes
+            .get_nodes()
             .iter()
             .enumerate()
             .filter_map(|(index, node)| {
@@ -721,6 +721,17 @@ enum PageCommand {
     ScrollY(f64),
     DevicePixelRatio(f64),
     Click(Option<NodeID>),
+    Keydown {
+        key: String,
+        code: String,
+        location: u32,
+        ctrl_key: bool,
+        shift_key: bool,
+        alt_key: bool,
+        meta_key: bool,
+        repeat: bool,
+        response: mpsc::Sender<bool>,
+    },
     WatchDom(DomChanged),
     Snapshot(mpsc::Sender<String>),
     /// Answers once every earlier command has been handled.
@@ -858,6 +869,43 @@ impl PageEvents {
         if self.commands.send(PageCommand::Click(target)).is_err() {
             log::warn!("page session is not running; dropped click");
         }
+    }
+
+    /// Dispatches a trusted native `keydown` event to the current page.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn keydown(
+        &self,
+        key: String,
+        code: String,
+        location: u32,
+        ctrl_key: bool,
+        shift_key: bool,
+        alt_key: bool,
+        meta_key: bool,
+        repeat: bool,
+    ) -> bool {
+        let (response, receiver) = mpsc::channel();
+        if self
+            .commands
+            .send(PageCommand::Keydown {
+                key,
+                code,
+                location,
+                ctrl_key,
+                shift_key,
+                alt_key,
+                meta_key,
+                repeat,
+                response,
+            })
+            .is_err()
+        {
+            log::warn!("page session is not running; dropped keydown");
+            return true;
+        }
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap_or(true)
     }
 
     /// Reports DOM changes of the next loaded page to `changed`.
@@ -1020,6 +1068,38 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
                 }
                 report_dom_change(session, &mut shown, watcher.as_ref());
             }
+            PageCommand::Keydown {
+                key,
+                code,
+                location,
+                ctrl_key,
+                shift_key,
+                alt_key,
+                meta_key,
+                repeat,
+                response,
+            } => {
+                let Some(session) = &session else {
+                    let _ = response.send(true);
+                    continue;
+                };
+                let (result, event) =
+                    TimelineEvent::measure(EventCategory::Script, "Keydown listeners", || {
+                        session.dispatch_keydown(
+                            &key, &code, location, ctrl_key, shift_key, alt_key, meta_key, repeat,
+                        )
+                    });
+                record(&performance, event);
+                let allowed = match result {
+                    Ok(allowed) => allowed,
+                    Err(error) => {
+                        log::warn!("page keydown failed: {error}");
+                        true
+                    }
+                };
+                let _ = response.send(allowed);
+                report_dom_change(session, &mut shown, watcher.as_ref());
+            }
             PageCommand::WatchDom(changed) => watcher = Some(changed),
             PageCommand::Flush(sender) => {
                 let _ = sender.send(());
@@ -1177,7 +1257,7 @@ mod tests {
     fn rect_for_class(page: &PageLayout, class: &str) -> Option<layout::Rect> {
         let node = page
             .document
-            .nodes
+            .get_nodes()
             .iter()
             .enumerate()
             .find_map(|(index, node)| {
@@ -1779,7 +1859,7 @@ mod tests {
         }
         // Find a point in the top bar that hits the toggle or its text.
         let on_blue = |node: NodeID| {
-            node == blue || parsed.node(node).and_then(|node| node.get_parent()) == Some(blue)
+            node == blue || parsed.get_node(node).and_then(|node| node.get_parent()) == Some(blue)
         };
         let target = (0..60)
             .flat_map(|y| (0..width).step_by(4).map(move |x| (x as f32, y as f32)))
@@ -1801,7 +1881,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the toggle click should change the DOM");
         let root = dom.get_element_by_id("page").expect("#page");
-        let class = match dom.node(root).map(|node| node.get_kind()) {
+        let class = match dom.get_node(root).map(|node| node.get_kind()) {
             Some(NodeKind::Element(element)) => element
                 .get_attributes()
                 .iter()
@@ -1815,7 +1895,7 @@ mod tests {
         let blue_oak = layout_with_live(&page, &dom, width, height);
         let oak = |document: &html::HTMLDocument, class: &str| {
             document
-                .nodes
+                .get_nodes()
                 .iter()
                 .position(|node| {
                     matches!(node.get_kind(), NodeKind::Element(element)
@@ -2332,7 +2412,7 @@ mod tests {
 
     fn box_class(document: &html::HTMLDocument) -> Option<String> {
         let node = document.get_element_by_id("box")?;
-        match document.node(node)?.get_kind() {
+        match document.get_node(node)?.get_kind() {
             NodeKind::Element(element) => element
                 .get_attributes()
                 .iter()

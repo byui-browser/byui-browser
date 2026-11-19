@@ -275,7 +275,7 @@ fn define_tree_methods(object: &Object, node: NodeID, document: &Arc<Mutex<Docum
                 let document = replace_children_document.lock().unwrap();
                 let children = document
                     .html_document()
-                    .and_then(|source| source.node(node))
+                    .and_then(|source| source.get_node(node))
                     .map(|data| data.get_children().clone())
                     .unwrap_or_default();
                 children

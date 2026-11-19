@@ -357,6 +357,29 @@ fn text_align_places_each_line_in_the_line_box() {
 }
 
 #[test]
+fn line_height_lengths_and_inherited_numbers_set_line_box_height() {
+    let (document, tree) = lay_out(
+        "<body><p id='length' style='line-height: 40px'>a<br>b</p><div style='font-size: 20px; line-height: 1.5'><p id='number' style='font-size: 10px'>a<br>b</p></div><div style='font-size: 20px; line-height: 150%'><p id='percent' style='font-size: 10px'>a<br>b</p></div></body>",
+        "body { margin: 0 } p { margin: 0 } div { margin: 0 }",
+        200.0,
+    );
+    let length = box_for(&tree, &document, "length");
+    assert_eq!(length.lines.len(), 2);
+    assert_close(length.lines[0].rect.height, 40.0);
+    assert_close(length.lines[1].rect.y - length.lines[0].rect.y, 40.0);
+
+    let number = box_for(&tree, &document, "number");
+    // Unitless line-height inherits as a multiplier and uses the child's 10px font.
+    assert_close(number.lines[0].rect.height, 15.0);
+    assert_close(number.lines[1].rect.y - number.lines[0].rect.y, 15.0);
+
+    let percent = box_for(&tree, &document, "percent");
+    // Percentage line-height computes to a length on the parent before inheritance.
+    assert_close(percent.lines[0].rect.height, 30.0);
+    assert_close(percent.lines[1].rect.y - percent.lines[0].rect.y, 30.0);
+}
+
+#[test]
 fn text_align_is_inherited_and_moves_inline_boxes_and_atomics() {
     let (document, tree) = lay_out(
         "<body><div><p id='p'><span id='s'>ab</span><b id='b'>x</b></p></div></body>",
@@ -1311,4 +1334,679 @@ fn floats_paint_after_blocks_and_positioned_boxes_paint_last() {
     assert!(position("a") < position("f"));
     assert!(position("f") < text);
     assert!(text < position("r"));
+}
+
+mod form_controls {
+    use super::*;
+
+    /// Zeroes the UA padding and fixes the font so sizes are easy to check:
+    /// each character is 8px wide and a line is 19.2px tall.
+    const CSS: &str = "body { margin: 0 } input, textarea, select, button \
+                       { font-size: 16px; padding: 0; margin: 0; border: none }";
+
+    fn size(html: &str, css: &str) -> (f32, f32) {
+        let (document, tree) = lay_out(&format!("<body>{html}</body>"), css, 800.0);
+        let rect = box_for(&tree, &document, "x").rect;
+        (rect.width, rect.height)
+    }
+
+    #[test]
+    fn empty_text_input_is_twenty_characters_by_one_line() {
+        let (width, height) = size("<input id=x>", CSS);
+        assert_close(width, 160.0);
+        assert_close(height, LINE);
+    }
+
+    #[test]
+    fn input_size_attribute_sets_the_character_count() {
+        assert_close(size("<input id=x size=5>", CSS).0, 40.0);
+        // Invalid and zero sizes fall back to 20.
+        assert_close(size("<input id=x size=0>", CSS).0, 160.0);
+        assert_close(size("<input id=x type=search size=abc>", CSS).0, 160.0);
+        assert_close(size("<input id=x size=5px>", CSS).0, 40.0);
+        assert_close(size("<input id=x size=' 5'>", CSS).0, 40.0);
+        assert_close(size("<textarea id=x cols=40abc></textarea>", CSS).0, 320.0);
+    }
+
+    #[test]
+    fn author_sizes_and_limits_win_over_the_default() {
+        let css = format!("{CSS} #x {{ width: 300px; height: 40px }}");
+        assert_eq!(size("<input id=x>", &css), (300.0, 40.0));
+        let css = format!("{CSS} #x {{ max-width: 100px; min-height: 30px }}");
+        assert_eq!(size("<input id=x>", &css), (100.0, 30.0));
+        let css = format!("{CSS} #x {{ padding: 5px }}");
+        assert_eq!(size("<input id=x>", &css), (170.0, LINE + 10.0));
+        let css = format!("{CSS} #x {{ box-sizing: border-box; width: 100px; padding: 5px }}");
+        assert_close(size("<input id=x>", &css).0, 100.0);
+    }
+
+    #[test]
+    fn textarea_uses_cols_and_rows() {
+        let (width, height) = size("<textarea id=x></textarea>", CSS);
+        assert_close(width, 160.0);
+        assert_close(height, 2.0 * LINE);
+        let (width, height) = size("<textarea id=x cols=40 rows=4></textarea>", CSS);
+        assert_close(width, 320.0);
+        assert_close(height, 4.0 * LINE);
+    }
+
+    #[test]
+    fn select_fits_its_widest_option_plus_arrow_room() {
+        let (width, height) = size(
+            "<select id=x><option>One</option><option>Much longer option</option></select>",
+            CSS,
+        );
+        assert_close(width, 18.0 * 8.0 + 20.0);
+        assert_close(height, LINE);
+    }
+
+    fn shown(html: &str, css: &str) -> Vec<String> {
+        let (document, tree) = lay_out(&format!("<body>{html}</body>"), css, 800.0);
+        texts(box_for(&tree, &document, "x"))
+    }
+
+    #[test]
+    fn drop_down_shows_the_selected_option() {
+        let one_two = "<option>One</option><option>Two</option>";
+        assert_eq!(
+            shown(&format!("<select id=x>{one_two}</select>"), CSS),
+            ["One"]
+        );
+        assert_eq!(
+            shown(
+                "<select id=x><option selected>One</option><option selected>Two</option></select>",
+                CSS
+            ),
+            ["Two"]
+        );
+        assert_eq!(
+            shown(
+                "<select id=x><option disabled>One</option><option>Two</option></select>",
+                CSS
+            ),
+            ["Two"]
+        );
+        assert_eq!(
+            shown(
+                "<select id=x><optgroup label=G disabled><option>A</option></optgroup>\
+                 <optgroup label=H><option>  In   group </option></optgroup></select>",
+                CSS
+            ),
+            ["In group"]
+        );
+        assert!(shown("<select id=x></select>", CSS).is_empty());
+    }
+
+    #[test]
+    fn drop_down_options_generate_no_boxes() {
+        let (document, tree) = lay_out(
+            "<body><select id=x><optgroup id=g label=G><option id=o>A</option></optgroup>\
+             <option>B</option></select></body>",
+            CSS,
+            800.0,
+        );
+        let select = box_for(&tree, &document, "x");
+        assert!(select.children.is_empty());
+        assert_eq!(select.lines.len(), 1);
+        assert!(select.select_arrow);
+        assert!(find(&tree.root, id(&document, "o")).is_none());
+        assert!(find(&tree.root, id(&document, "g")).is_none());
+        // A list box keeps its option boxes and draws no arrow.
+        let (document, tree) = lay_out(
+            "<body><select id=x multiple><option id=o>A</option></select></body>",
+            CSS,
+            800.0,
+        );
+        assert!(!box_for(&tree, &document, "x").select_arrow);
+        assert!(find(&tree.root, id(&document, "o")).is_some());
+    }
+
+    /// Guards the merge with generated content (#393) and floats and
+    /// positioning (#413): a drop-down shows only its selected option, never
+    /// `::before` / `::after` content, in or out of flow.
+    #[test]
+    fn drop_downs_ignore_pseudo_elements_and_keep_working_out_of_flow() {
+        let css = format!(
+            "{CSS} select::before {{ content: 'BEFORE' }} select::after {{ content: 'AFTER' }}"
+        );
+        let (document, tree) = lay_out(
+            "<body><div style='position: relative'>\
+             <select id=f style='float: right'><option>One</option></select>\
+             <select id=a style='position: absolute; top: 0; left: 0'>\
+             <option>A</option><option selected>B</option></select>\
+             <select id=x><option>In flow</option></select></div></body>",
+            &css,
+            800.0,
+        );
+        let floated = box_for(&tree, &document, "f");
+        assert_eq!(floated.placement, Placement::Float);
+        assert_eq!(texts(floated), ["One"]);
+        assert!(floated.select_arrow);
+        let placed = box_for(&tree, &document, "a");
+        assert_eq!(placed.placement, Placement::Absolute);
+        assert_eq!(texts(placed), ["B"]);
+        assert!(placed.select_arrow);
+        assert_eq!(texts(box_for(&tree, &document, "x")), ["In flow"]);
+    }
+
+    #[test]
+    fn drop_down_width_follows_the_widest_option_not_the_selection() {
+        let options = "<option>Short</option><option>A much longer option label</option>";
+        let (width, height) = size(&format!("<select id=x>{options}</select>"), CSS);
+        assert_close(width, 26.0 * 8.0 + 20.0);
+        assert_close(height, LINE);
+        assert_eq!(
+            shown(&format!("<select id=x>{options}</select>"), CSS),
+            ["Short"]
+        );
+    }
+
+    #[test]
+    fn long_drop_down_text_is_clipped_before_the_arrow() {
+        let css = format!("{CSS} #x {{ width: 80px }}");
+        let html = "<select id=x><option>Clipped long label here</option></select>";
+        assert_eq!(size(html, &css), (80.0, LINE));
+        // 80px less 20px of arrow room fits 7 characters, on one line.
+        assert_eq!(shown(html, &css), ["Clipped"]);
+    }
+
+    #[test]
+    fn empty_button_is_one_line_tall() {
+        let (width, height) = size("<button id=x></button>", CSS);
+        assert_close(width, 0.0);
+        assert_close(height, LINE);
+        assert_close(size("<input id=x type=submit>", CSS).1, LINE);
+        // A button with text sizes from the text.
+        assert_close(size("<button id=x>Go</button>", CSS).0, 16.0);
+    }
+
+    #[test]
+    fn controls_keep_their_default_size_in_flex_and_shrink_to_fit() {
+        let (width, height) = size("<div style=\"display:flex\"><input id=x></div>", CSS);
+        assert_close(width, 160.0);
+        assert_close(height, LINE);
+        let (width, _) = size(
+            "<span id=x style=\"display:inline-block\"><input></span>",
+            CSS,
+        );
+        assert_close(width, 160.0);
+        let (width, _) = size(
+            "<div style=\"display:flex\"><select id=x><option>One</option></select></div>",
+            CSS,
+        );
+        assert_close(width, 3.0 * 8.0 + 20.0);
+    }
+
+    /// Guards the merge with flex sizing (#405): a control's default width is
+    /// also its automatic minimum, so shrinking stops there.
+    ///
+    /// The inputs are `display: block` because inline-level children of a
+    /// flex container are not blockified into flex items yet.
+    #[test]
+    fn shrinking_flex_items_stop_at_the_control_default_width() {
+        let (width, _) = size(
+            "<div style=\"display:flex;width:100px\"><input id=x style=\"display:block\"></div>",
+            CSS,
+        );
+        assert_close(width, 160.0);
+        // An explicit `min-width: 0` lets it shrink to fit, as in Chrome.
+        let (width, _) = size(
+            "<div style=\"display:flex;width:100px\">\
+             <input id=x style=\"display:block;min-width:0\"></div>",
+            CSS,
+        );
+        assert_close(width, 100.0);
+    }
+
+    /// Guards the merge with floats and positioning (#413): out-of-flow
+    /// controls still get their default sizes.
+    #[test]
+    fn floated_and_positioned_controls_keep_their_default_sizes() {
+        let (document, tree) = lay_out(
+            "<body><div style=\"position:relative\">\
+             <input id=f style=\"float:left\">\
+             <input id=a style=\"position:absolute;top:0;left:0\">\
+             <textarea id=t style=\"position:absolute;top:0;right:0\"></textarea>\
+             </div></body>",
+            CSS,
+            800.0,
+        );
+        for id in ["f", "a"] {
+            let input = box_for(&tree, &document, id);
+            assert_close(input.rect.width, 160.0);
+            assert_close(input.rect.height, LINE);
+        }
+        assert_eq!(box_for(&tree, &document, "f").placement, Placement::Float);
+        assert_eq!(
+            box_for(&tree, &document, "a").placement,
+            Placement::Absolute
+        );
+        let textarea = box_for(&tree, &document, "t");
+        assert_close(textarea.rect.width, 160.0);
+        assert_close(textarea.rect.height, 2.0 * LINE);
+        assert_close(textarea.rect.x, 800.0 - 160.0);
+    }
+
+    /// Guards the merge with borders (#426): the user-agent border sits
+    /// outside the default content size.
+    #[test]
+    fn user_agent_borders_add_to_the_default_size() {
+        let css = "body { margin: 0 } input { font-size: 16px; padding: 0; margin: 0 }";
+        let (document, tree) = lay_out("<body><input id=x></body>", css, 800.0);
+        let input = box_for(&tree, &document, "x");
+        let border = input.style.border_width;
+        assert!(border.left > 0.0, "inputs have a user-agent border");
+        assert_close(input.rect.width, 160.0 + border.horizontal());
+        assert_close(input.rect.height, LINE + border.vertical());
+        assert_close(input.content_rect().width, 160.0);
+    }
+
+    #[test]
+    fn checkboxes_get_no_text_field_size() {
+        // A 13px toggle, not a 20-character field.
+        assert_eq!(size("<input id=x type=checkbox>", CSS), (13.0, 13.0));
+    }
+}
+
+mod control_text {
+    use super::*;
+
+    const CSS: &str = "body { margin: 0 } p { margin: 0 } \
+        input, textarea { font-size: 16px; padding: 0; text-transform: none }";
+
+    fn text_color(layout_box: &LayoutBox) -> css::CssColor {
+        layout_box
+            .lines
+            .iter()
+            .flat_map(|line| &line.fragments)
+            .find_map(|fragment| match fragment {
+                LineFragment::Text(text) => Some(text.color),
+                _ => None,
+            })
+            .expect("control has text")
+    }
+
+    #[test]
+    fn text_inputs_show_their_value_with_spaces_kept_on_one_line() {
+        let html = "<p><input id='a' value='hello  world'>\
+            <input id='b' type='search' value='x'>\
+            <input id='c' type='bogus' value='y'>\
+            <input id='d' type='checkbox' value='z'></p>";
+        let (document, tree) = lay_out(html, CSS, 40.0);
+        let input = box_for(&tree, &document, "a");
+        assert_eq!(input.kind, BoxKind::InlineBlock);
+        // One unbreakable run even though 40px is narrower than the text.
+        assert_eq!(texts(input), ["hello  world"]);
+        // The default 20-character width, not the text's width.
+        assert_close(input.content_rect().width, 20.0 * 8.0);
+        assert_close(input.content_rect().height, LINE);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["x"]);
+        assert_eq!(texts(box_for(&tree, &document, "c")), ["y"]);
+        assert!(texts(box_for(&tree, &document, "d")).is_empty());
+    }
+
+    #[test]
+    fn value_line_breaks_are_stripped() {
+        let html = "<p><input id='a' value='one&#10;two'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["onetwo"]);
+    }
+
+    #[test]
+    fn placeholder_shows_in_grey_only_without_a_value() {
+        let html = "<p><input id='a' placeholder='Search'>\
+            <input id='b' value='' placeholder='Empty'>\
+            <input id='c' value='real' placeholder='ignored'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let grey = css::CssColor {
+            r: 0x75,
+            g: 0x75,
+            b: 0x75,
+            a: 255,
+        };
+        let a = box_for(&tree, &document, "a");
+        assert_eq!(texts(a), ["Search"]);
+        assert_eq!(text_color(a), grey);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["Empty"]);
+        let c = box_for(&tree, &document, "c");
+        assert_eq!(texts(c), ["real"]);
+        assert_ne!(text_color(c), grey);
+    }
+
+    #[test]
+    fn password_inputs_show_one_bullet_per_character() {
+        let html = "<p><input id='a' type='PassWord' value='secret'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["••••••"]);
+    }
+
+    #[test]
+    fn control_text_is_clipped_to_the_padding_box_and_centered() {
+        let html = "<p><input id='a' style='width: 40px; height: 39.2px; padding: 0 2px' \
+            value='much too long'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let input = box_for(&tree, &document, "a");
+        let LineFragment::Text(text) = &input.lines[0].fragments[0] else {
+            panic!("expected text");
+        };
+        assert!(text.rect.width > 40.0);
+        // The clip is the padding box: inside the user-agent border, so the
+        // text never paints over it.
+        let border = input.style.border_width;
+        assert!(border.left > 0.0, "inputs have a user-agent border");
+        let clip = text.clip.expect("control text is clipped");
+        assert_close(clip.x, input.rect.x + border.left);
+        assert_close(clip.y, input.rect.y + border.top);
+        assert_close(clip.width, input.rect.width - border.horizontal());
+        assert_close(clip.height, input.rect.height - border.vertical());
+        // 39.2px tall, one 19.2px line: 10px above and below.
+        assert_close(input.lines[0].rect.y - input.content_rect().y, 10.0);
+    }
+
+    #[test]
+    fn textarea_keeps_line_breaks_and_shows_its_placeholder_when_empty() {
+        let html = "<p><textarea id='a'>line one\nline two</textarea>\
+            <textarea id='b' placeholder='Write here'></textarea></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let a = box_for(&tree, &document, "a");
+        assert_eq!(texts(a), ["line one", "line two"]);
+        let b = box_for(&tree, &document, "b");
+        assert_eq!(texts(b), ["Write here"]);
+        assert_eq!(text_color(b).r, 0x75);
+    }
+
+    #[test]
+    fn textarea_text_wraps_like_pre_wrap() {
+        // 100px fits 12 characters. Leading spaces are kept, the space a
+        // line wraps after hangs, and runs of spaces are not collapsed.
+        let html = "<p><textarea id='a' style='width: 100px'>  aaaa bbbb cccc  dd</textarea></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let a = box_for(&tree, &document, "a");
+        assert_eq!(texts(a), ["  aaaa bbbb", "cccc  dd"]);
+        let first = &a.lines[0].fragments;
+        let LineFragment::Text(text) = &first[0] else {
+            panic!("expected text");
+        };
+        assert_close(text.rect.x - a.content_rect().x, 0.0);
+        assert_close(text.rect.width, 11.0 * 8.0);
+    }
+
+    #[test]
+    fn textarea_placeholder_keeps_line_breaks() {
+        let html = "<p><textarea id='a' placeholder='one&#10;two'></textarea></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["one", "two"]);
+    }
+
+    #[test]
+    fn text_in_a_control_shorter_than_its_line_stays_centered() {
+        let html = "<p><input id='a' style='height: 9.2px' value='x'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let input = box_for(&tree, &document, "a");
+        // The 19.2px line overflows the 9.2px box by 5px on each side.
+        assert_close(input.lines[0].rect.y - input.content_rect().y, -5.0);
+    }
+
+    /// Guards the merge with floats and positioning (#413): controls with
+    /// drawn text go out of flow like other boxes and keep their text.
+    #[test]
+    fn floated_and_positioned_inputs_go_out_of_flow_with_their_text() {
+        let html = "<div style='position: relative'>\
+            <input id='f' style='float: right' value='floated'>\
+            <input id='a' style='position: absolute; top: 5px; left: 7px' value='placed'>\
+            <textarea id='t' style='position: absolute; top: 0; right: 0'>area</textarea>\
+            <p id='p'>after</p></div>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let floated = box_for(&tree, &document, "f");
+        assert_eq!(floated.placement, Placement::Float);
+        assert_eq!(texts(floated), ["floated"]);
+        assert_close(floated.rect.right(), 800.0);
+        let placed = box_for(&tree, &document, "a");
+        assert_eq!(placed.placement, Placement::Absolute);
+        assert_eq!(texts(placed), ["placed"]);
+        assert_eq!((placed.rect.x, placed.rect.y), (7.0, 5.0));
+        let area = box_for(&tree, &document, "t");
+        assert_eq!(area.placement, Placement::Absolute);
+        assert_eq!(texts(area), ["area"]);
+        // None of them takes space in the flow.
+        assert_close(box_for(&tree, &document, "p").rect.y, 0.0);
+    }
+
+    /// Guards the merge with generated content (#393): inputs and textareas
+    /// show only their own text, never `::before` / `::after` content.
+    #[test]
+    fn controls_never_show_before_or_after_content() {
+        let html = "<p><input id='a' value='v'><input id='b' placeholder='p'>\
+            <textarea id='c'>t</textarea></p>";
+        let css = format!(
+            "{CSS} input::before, textarea::before {{ content: 'BEFORE' }} \
+             input::after, textarea::after {{ content: 'AFTER' }}"
+        );
+        let (document, tree) = lay_out(html, &css, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["v"]);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["p"]);
+        assert_eq!(texts(box_for(&tree, &document, "c")), ["t"]);
+    }
+
+    #[test]
+    fn tabs_in_control_text_render_as_one_space() {
+        let html = "<p><textarea id='a'>a\tb</textarea><input id='b' value='c&#9;d'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["a b"]);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["c d"]);
+    }
+
+    #[test]
+    fn button_inputs_show_default_labels() {
+        let html = "<p><input id='a' type='submit'><input id='b' type='RESET'>\
+            <input id='c' type='button'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["Submit"]);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["Reset"]);
+        let c = box_for(&tree, &document, "c");
+        // Only the empty strut line.
+        assert_eq!(texts(c), [""]);
+        // No text, but the box keeps one line of height.
+        assert_close(c.content_rect().height, LINE);
+    }
+
+    #[test]
+    fn button_inputs_show_their_value_even_when_empty() {
+        let html = "<p><input id='a' type='submit' value='Google Search'>\
+            <input id='b' type='button' value='Lucky'>\
+            <input id='c' type='submit' value=''></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["Google Search"]);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["Lucky"]);
+        assert_eq!(texts(box_for(&tree, &document, "c")), [""]);
+    }
+
+    #[test]
+    fn button_input_label_is_centered_in_a_wide_box() {
+        let html = "<p><input id='a' type='submit' value='Wide' \
+            style='width: 200px; height: 39.2px'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let input = box_for(&tree, &document, "a");
+        let content = input.content_rect();
+        let LineFragment::Text(text) = &input.lines[0].fragments[0] else {
+            panic!("expected text");
+        };
+        assert_close(text.rect.width, 4.0 * 8.0);
+        assert_close(text.rect.x - content.x, (200.0 - 32.0) / 2.0);
+        assert_close(input.lines[0].rect.y - content.y, 10.0);
+    }
+
+    #[test]
+    fn empty_single_line_controls_align_with_filled_ones() {
+        let html = "<p><input id='a'><input id='b' value='x'>\
+            <input id='c' type='button'><input id='d' type='submit'></p>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let a = box_for(&tree, &document, "a").rect;
+        for id in ["b", "c", "d"] {
+            let rect = box_for(&tree, &document, id).rect;
+            assert_close(rect.y, a.y);
+            assert_close(rect.height, a.height);
+        }
+    }
+
+    /// Guards the merge with borders (#426): with the user-agent borders
+    /// drawn, empty and filled controls still share a baseline, and the
+    /// strut line sits inside the border.
+    #[test]
+    fn bordered_empty_and_filled_controls_still_align() {
+        let html = "<p><input id='a'><input id='b' value='x'>\
+            <input id='c' type='submit'></p>";
+        let css = "body { margin: 0 } p { margin: 0 } input { font-size: 16px }";
+        let (document, tree) = lay_out(html, css, 800.0);
+        let a = box_for(&tree, &document, "a");
+        assert!(
+            a.style.border_width.top > 0.0,
+            "inputs have a user-agent border"
+        );
+        let line = a.lines.first().expect("an empty input keeps a strut line");
+        assert!(line.rect.y >= a.content_rect().y - 0.01);
+        for id in ["b", "c"] {
+            let other = box_for(&tree, &document, id);
+            assert_close(other.rect.y, a.rect.y);
+            assert_close(
+                other.lines[0].rect.y + other.lines[0].baseline,
+                line.rect.y + line.baseline,
+            );
+        }
+    }
+
+    /// Guards the merge with floats, positioning (#413) and generated
+    /// content (#393): button-like inputs keep their label out of flow and
+    /// never show `::before` / `::after` content.
+    #[test]
+    fn button_labels_survive_floats_positioning_and_pseudo_elements() {
+        let html = "<div style='position: relative'>\
+            <input id='f' type='submit' style='float: left'>\
+            <input id='a' type='reset' style='position: absolute; top: 3px; right: 0'>\
+            <input id='b' type='button' value='Go'></div>";
+        let css = format!(
+            "{CSS} input::before {{ content: 'BEFORE' }} input::after {{ content: 'AFTER' }}"
+        );
+        let (document, tree) = lay_out(html, &css, 800.0);
+        let floated = box_for(&tree, &document, "f");
+        assert_eq!(floated.placement, Placement::Float);
+        assert_eq!(texts(floated), ["Submit"]);
+        let placed = box_for(&tree, &document, "a");
+        assert_eq!(placed.placement, Placement::Absolute);
+        assert_eq!(texts(placed), ["Reset"]);
+        assert_close(placed.rect.right(), 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["Go"]);
+    }
+}
+
+#[test]
+fn checkbox_and_radio_inputs_are_13px_replaced_boxes_with_ua_margins() {
+    let (document, tree) = lay_out(
+        "<body><p id=p>ab<input id=c type=checkbox checked>cd\
+         <input id=r type=RADIO disabled><input id=t type=text>\
+         <input id=s type=' checkbox'></p></body>",
+        "body { margin: 0 } p { margin: 0 }",
+        400.0,
+    );
+    let checkbox = box_for(&tree, &document, "c");
+    assert_eq!(checkbox.kind, BoxKind::Replaced);
+    assert_eq!(checkbox.image, None);
+    assert_eq!(
+        checkbox.control,
+        Some(crate::ToggleControl {
+            kind: crate::ControlKind::Checkbox,
+            checked: true,
+            disabled: false,
+        })
+    );
+    assert_eq!((checkbox.rect.width, checkbox.rect.height), (13.0, 13.0));
+    // `margin: 3px 3px 3px 4px` from the user-agent stylesheet.
+    assert_eq!(
+        (
+            checkbox.margin.top,
+            checkbox.margin.right,
+            checkbox.margin.bottom,
+            checkbox.margin.left
+        ),
+        (3.0, 3.0, 3.0, 4.0)
+    );
+    // After "ab" (two 8px characters) and the 4px left margin.
+    assert_eq!(checkbox.rect.x, 20.0);
+    let radio = box_for(&tree, &document, "r");
+    assert_eq!(
+        radio.control,
+        Some(crate::ToggleControl {
+            kind: crate::ControlKind::Radio,
+            checked: false,
+            disabled: true,
+        })
+    );
+    assert_eq!(box_for(&tree, &document, "t").control, None);
+    // Enumerated attributes are not trimmed.
+    assert_eq!(box_for(&tree, &document, "s").control, None);
+}
+
+#[test]
+fn checkbox_bottom_margin_edge_sits_on_the_baseline() {
+    let (document, tree) = lay_out(
+        "<body><p id=p>a<input id=c type=checkbox>b</p></body>",
+        "body { margin: 0 } p { margin: 0 }",
+        400.0,
+    );
+    let checkbox = box_for(&tree, &document, "c");
+    let line = &box_for(&tree, &document, "p").lines[0];
+    assert_close(
+        checkbox.rect.bottom() + checkbox.margin.bottom,
+        line.baseline,
+    );
+}
+
+#[test]
+fn author_width_and_height_override_the_control_size() {
+    let (document, tree) = lay_out(
+        "<body><input id=c type=checkbox width=50 style='width:30px;height:20px'>\
+         <input id=r type=radio width=50 height=50></body>",
+        "body { margin: 0 }",
+        400.0,
+    );
+    let checkbox = box_for(&tree, &document, "c");
+    assert_eq!((checkbox.rect.width, checkbox.rect.height), (30.0, 20.0));
+    // The `width` and `height` attributes do not apply to these inputs.
+    let radio = box_for(&tree, &document, "r");
+    assert_eq!((radio.rect.width, radio.rect.height), (13.0, 13.0));
+}
+
+/// Guards the merge with floats and positioning (#413), borders (#426) and
+/// generated content (#393): checkboxes and radios stay 13px toggles with no
+/// border or `::before` / `::after` content, in or out of flow.
+#[test]
+fn toggles_survive_floats_positioning_borders_and_pseudo_elements() {
+    let (document, tree) = lay_out(
+        "<body><div style='position: relative'>\
+         <input id=f type=checkbox style='float: right' checked>\
+         <input id=a type=radio style='position: absolute; top: 4px; left: 6px'>\
+         <p id=p>after <input id=c type=checkbox></p></div></body>",
+        "body { margin: 0 } p { margin: 0 } \
+         input::before { content: 'BEFORE' } input::after { content: 'AFTER' }",
+        400.0,
+    );
+    let floated = box_for(&tree, &document, "f");
+    assert_eq!(floated.placement, Placement::Float);
+    assert_eq!(floated.control.map(|control| control.checked), Some(true));
+    let placed = box_for(&tree, &document, "a");
+    assert_eq!(placed.placement, Placement::Absolute);
+    assert_eq!(
+        placed.control.map(|control| control.kind),
+        Some(crate::ControlKind::Radio)
+    );
+    // The insets place the margin box; the user-agent margins are 4px left
+    // and 3px top.
+    assert_eq!((placed.rect.x, placed.rect.y), (6.0 + 4.0, 4.0 + 3.0));
+    for id in ["f", "a", "c"] {
+        let toggle = box_for(&tree, &document, id);
+        assert_eq!((toggle.rect.width, toggle.rect.height), (13.0, 13.0));
+        assert_eq!(toggle.style.border_width, crate::Edges::default());
+        assert!(texts(toggle).is_empty());
+    }
+    assert_eq!(texts(box_for(&tree, &document, "p")), ["after "]);
 }

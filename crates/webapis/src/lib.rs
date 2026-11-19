@@ -50,9 +50,10 @@ pub use node_tree::{ClientSize, NodeInput};
 pub use selector::SelectorError;
 pub use timer::{TimerId, TimerQueue};
 pub use window::{
-    ViewportSize, dispatch_window_load, dispatch_window_resize, register_window,
-    register_window_with_security_context, register_window_with_security_context_and_viewport,
-    register_window_with_url, register_window_with_url_and_device_pixel_ratio,
+    ViewportSize, dispatch_window_keydown, dispatch_window_load, dispatch_window_resize,
+    dispatch_window_scroll, register_window, register_window_with_security_context,
+    register_window_with_security_context_and_viewport, register_window_with_url,
+    register_window_with_url_and_device_pixel_ratio,
     register_window_with_url_device_pixel_ratio_and_viewport, run_window_animation_frames,
     run_window_hashchange_events, run_window_messages, run_window_microtasks, run_window_timers,
 };

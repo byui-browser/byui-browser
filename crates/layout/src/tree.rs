@@ -8,7 +8,7 @@ use std::sync::Arc;
 use css::CssColor;
 use html::NodeID;
 
-use crate::{BorderRadius, BoxShadow, Edges, ImageKey, Rect};
+use crate::{BorderRadius, BoxShadow, Edges, ImageKey, Rect, ToggleControl};
 
 /// Paint-relevant computed values for a box or inline box fragment.
 ///
@@ -133,9 +133,16 @@ pub struct LayoutBox {
     /// Line boxes when the box establishes an inline formatting context, in
     /// order from top to bottom.
     pub lines: Vec<LineBox>,
+    /// Whether to draw a drop-down arrow: a small down chevron, vertically
+    /// centered near the right of the padding box. Set for single-choice
+    /// `<select>` elements, whose layout keeps the arrow area free of text.
+    pub select_arrow: bool,
     /// For [`BoxKind::Replaced`] boxes, the picture to draw in the content
     /// box; `None` for every other kind.
     pub image: Option<ImageKey>,
+    /// For [`BoxKind::Replaced`] boxes of checkbox and radio inputs, the
+    /// control to draw in the content box; `None` for every other box.
+    pub control: Option<ToggleControl>,
 }
 
 impl LayoutBox {
@@ -188,6 +195,7 @@ impl LineBox {
                 LineFragment::Text(text) => {
                     text.rect = text.rect.translate(dx, dy);
                     text.baseline += dy;
+                    text.clip = text.clip.map(|clip| clip.translate(dx, dy));
                 }
                 LineFragment::Atomic(atomic) => atomic.translate(dx, dy),
             }
@@ -242,6 +250,11 @@ pub struct TextFragment {
     pub font: crate::FontId,
     /// The text color.
     pub color: CssColor,
+    /// A rectangle the glyphs must not paint outside, in the same absolute
+    /// coordinates as `rect`; `None` means unclipped. Set for text inside
+    /// form controls, which is clipped to the control's padding box. The
+    /// `overflow` property does not clip other content yet.
+    pub clip: Option<Rect>,
 }
 
 /// The complete layout output for one document and viewport.
@@ -264,8 +277,8 @@ pub enum PaintItem<'a> {
     InlineBox(&'a InlineBoxFragment),
     /// A text run.
     Text(&'a TextFragment),
-    /// The picture of a [`BoxKind::Replaced`] box, drawn in its content box
-    /// after its background.
+    /// The picture or form control of a [`BoxKind::Replaced`] box, drawn in
+    /// its content box after its background.
     Image(&'a LayoutBox),
 }
 
@@ -396,7 +409,7 @@ fn push_block_decorations<'a>(
 }
 
 fn push_inline_content<'a>(layout_box: &'a LayoutBox, items: &mut Vec<PaintItem<'a>>) {
-    if layout_box.image.is_some() {
+    if layout_box.image.is_some() || layout_box.control.is_some() {
         items.push(PaintItem::Image(layout_box));
     }
     for line in &layout_box.lines {
@@ -434,7 +447,9 @@ mod tests {
             placement: Placement::InFlow,
             children,
             lines: Vec::new(),
+            select_arrow: false,
             image: None,
+            control: None,
         }
     }
 
@@ -482,6 +497,7 @@ mod tests {
                 font_size: 10.0,
                 font: crate::FontId::DEFAULT,
                 color: BoxStyle::default().text_color,
+                clip: None,
             })],
         });
         let sibling = block(Some(2), rect(0.0, 10.0, 10.0), Vec::new());

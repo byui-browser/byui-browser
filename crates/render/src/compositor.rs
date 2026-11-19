@@ -13,6 +13,25 @@ enum FontChoice<'a> {
     Collection(&'a FontCollection),
 }
 
+/// A clip rectangle in device pixels: a pixel `(x, y)` may be drawn when
+/// `left <= x < right` and `top <= y < bottom`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PixelBounds {
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+}
+
+impl PixelBounds {
+    /// Whether text clipped to `bounds` (if any) may draw pixel `(x, y)`.
+    fn allows(bounds: Option<Self>, x: u32, y: u32) -> bool {
+        bounds.is_none_or(|bounds| {
+            (bounds.left..bounds.right).contains(&x) && (bounds.top..bounds.bottom).contains(&y)
+        })
+    }
+}
+
 /// A software compositor for a fixed device-pixel viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Compositor {
@@ -86,7 +105,13 @@ impl Compositor {
                     font_size,
                     text,
                     rgba,
-                } => self.draw_text(&mut frame, *x, *baseline, *font_size, text, *rgba),
+                } => self.draw_text(&mut frame, *x, *baseline, *font_size, text, *rgba, None),
+                DisplayItem::StrokeLine {
+                    from,
+                    to,
+                    width,
+                    rgba,
+                } => self.stroke_line(&mut frame, *from, *to, *width, *rgba),
                 DisplayItem::BoxShadow {
                     left,
                     top,
@@ -336,6 +361,7 @@ impl Compositor {
 
     /// Draws text by sampling each scaled glyph bitmap at device-pixel
     /// centers (nearest-neighbor scaling).
+    #[allow(clippy::too_many_arguments)]
     fn draw_text(
         &self,
         frame: &mut Frame,
@@ -344,6 +370,7 @@ impl Compositor {
         font_size: f32,
         text: &str,
         rgba: [u8; 4],
+        clip: Option<PixelBounds>,
     ) {
         let scale = BitmapFont::scale(font_size);
         if scale <= 0.0 {
@@ -372,7 +399,9 @@ impl Compositor {
                             continue;
                         }
                         let bit = BitmapFont::GLYPH_WIDTH - 1 - column as u32;
-                        if glyph[row as usize] & (1 << bit) != 0 {
+                        if glyph[row as usize] & (1 << bit) != 0
+                            && PixelBounds::allows(clip, px, py)
+                        {
                             self.put_pixel(frame, px, py, rgba);
                         }
                     }
@@ -415,7 +444,9 @@ impl Compositor {
     ///
     /// One CSS pixel maps to one device pixel. Rectangle edges are rounded to
     /// the nearest pixel boundary, so a rectangle covers the pixels whose
-    /// centers it contains, and parts outside the frame are clipped.
+    /// centers it contains, and parts outside the frame are clipped. Text
+    /// clip rectangles are ignored here; [`Compositor::compose_page`]
+    /// honors them.
     pub fn compose_paint(&self, list: &paint::DisplayList) -> Frame {
         log::debug!(
             "compositing paint display list with {} items",
@@ -466,6 +497,17 @@ impl Compositor {
                     log::trace!("no image store to draw {image:?}; use compose_page");
                     None
                 }
+                paint::DisplayItem::StrokeLine {
+                    from,
+                    to,
+                    width,
+                    color,
+                } => Some(DisplayItem::StrokeLine {
+                    from: *from,
+                    to: *to,
+                    width: *width,
+                    rgba: [color.r, color.g, color.b, color.a],
+                }),
             })
             .collect::<Vec<_>>();
         self.compose(&items)
@@ -600,7 +642,19 @@ impl Compositor {
                     font,
                     text,
                     color,
+                    clip,
                 } => {
+                    let clip = clip.map(|clip| {
+                        let edge = |value: f32, limit: u32| {
+                            (value * scale).round().clamp(0.0, limit as f32) as u32
+                        };
+                        PixelBounds {
+                            left: edge(clip.x, self.width),
+                            top: edge(clip.y, self.height),
+                            right: edge(clip.right(), self.width),
+                            bottom: edge(clip.bottom(), self.height),
+                        }
+                    });
                     let rgba = [color.r, color.g, color.b, color.a];
                     let outline = match fonts {
                         FontChoice::Single(font) => Some(font),
@@ -615,6 +669,7 @@ impl Compositor {
                             (*baseline * scale).round(),
                             text,
                             rgba,
+                            clip,
                         ),
                         None => self.draw_text(
                             &mut frame,
@@ -623,9 +678,22 @@ impl Compositor {
                             *font_size * scale,
                             text,
                             rgba,
+                            clip,
                         ),
                     }
                 }
+                paint::DisplayItem::StrokeLine {
+                    from,
+                    to,
+                    width,
+                    color,
+                } => self.stroke_line(
+                    &mut frame,
+                    (from.0 * scale, from.1 * scale),
+                    (to.0 * scale, to.1 * scale),
+                    *width * scale,
+                    [color.r, color.g, color.b, color.a],
+                ),
                 paint::DisplayItem::Image { rect, image } => match images {
                     Some(images) => self.draw_image(&mut frame, images, image, rect, scale),
                     None => log::trace!("no image store to draw {image:?}"),
@@ -633,6 +701,46 @@ impl Compositor {
             }
         }
         frame
+    }
+
+    /// Strokes the segment `from`-`to` (device pixels) with round caps,
+    /// `width` device pixels wide. Edge pixels are blended by their center's
+    /// distance to the stroke's outline.
+    fn stroke_line(
+        &self,
+        frame: &mut Frame,
+        (ax, ay): (f32, f32),
+        (bx, by): (f32, f32),
+        width: f32,
+        rgba: [u8; 4],
+    ) {
+        let half = width.max(0.0) / 2.0;
+        if half <= 0.0 {
+            return;
+        }
+        log::trace!("stroke line ({ax}, {ay})-({bx}, {by}) half width {half}");
+        let (dx, dy) = (bx - ax, by - ay);
+        let length_squared = dx * dx + dy * dy;
+        let range = |a: f32, b: f32, limit: u32| {
+            (a.min(b) - half - 1.0).floor().clamp(0.0, limit as f32) as u32
+                ..(a.max(b) + half + 1.0).ceil().clamp(0.0, limit as f32) as u32
+        };
+        for py in range(ay, by, self.height) {
+            for px in range(ax, bx, self.width) {
+                let (x, y) = (px as f32 + 0.5, py as f32 + 0.5);
+                let t = if length_squared > 0.0 {
+                    (((x - ax) * dx + (y - ay) * dy) / length_squared).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let distance = (x - (ax + t * dx)).hypot(y - (ay + t * dy));
+                let coverage = (half - distance + 0.5).clamp(0.0, 1.0);
+                let alpha = (coverage * f32::from(rgba[3])).round() as u8;
+                if alpha > 0 {
+                    self.put_pixel(frame, px, py, [rgba[0], rgba[1], rgba[2], alpha]);
+                }
+            }
+        }
     }
 
     /// Draws `key`'s picture stretched over `rect` (CSS pixels) at `scale`
@@ -704,6 +812,7 @@ impl Compositor {
         baseline: f32,
         text: &str,
         rgba: [u8; 4],
+        clip: Option<PixelBounds>,
     ) {
         use ab_glyph::{Font, ScaleFont};
         if font_size <= 0.0 {
@@ -729,7 +838,7 @@ impl Compositor {
             outline.draw(|gx, gy, coverage| {
                 let px = bounds.min.x as i64 + i64::from(gx);
                 let py = bounds.min.y as i64 + i64::from(gy);
-                if px < 0 || py < 0 {
+                if px < 0 || py < 0 || !PixelBounds::allows(clip, px as u32, py as u32) {
                     return;
                 }
                 let alpha = (coverage.clamp(0.0, 1.0) * f32::from(rgba[3])).round() as u8;
@@ -890,6 +999,7 @@ mod tests {
                 font: paint::FontId::DEFAULT,
                 text: "Hi".into(),
                 color: black,
+                clip: None,
             }],
         };
         let scale = 2.0;
@@ -1006,6 +1116,95 @@ mod tests {
         // The corner is cut away, but the straight edge next to it is not.
         assert_eq!(pixel(2, 2), [255, 255]);
         assert_eq!(pixel(2, 10), [255, 0]);
+    }
+
+    #[test]
+    fn stroked_lines_cover_the_segment_and_leave_the_rest_clear() {
+        let red = paint::Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let list = paint::DisplayList {
+            items: vec![paint::DisplayItem::StrokeLine {
+                from: (2.0, 5.0),
+                to: (8.0, 5.0),
+                width: 2.0,
+                color: red,
+            }],
+        };
+        let frame = Compositor::new(10, 10).compose_paint(&list);
+        let pixel = |x: u32, y: u32| -> [u8; 4] {
+            let offset = ((y * frame.width + x) * 4) as usize;
+            frame.pixels[offset..offset + 4].try_into().unwrap()
+        };
+        assert_eq!(pixel(5, 4), [255, 0, 0, 255]);
+        assert_eq!(pixel(5, 5), [255, 0, 0, 255]);
+        assert_eq!(pixel(5, 8), Compositor::CLEAR_COLOR);
+        assert_eq!(pixel(0, 5), Compositor::CLEAR_COLOR);
+    }
+
+    #[test]
+    fn compose_paint_keeps_stroke_lines_in_paint_order() {
+        let color = |r, b| paint::Color { r, g: 0, b, a: 255 };
+        let list = paint::DisplayList {
+            items: vec![
+                paint::DisplayItem::StrokeLine {
+                    from: (2.0, 5.0),
+                    to: (8.0, 5.0),
+                    width: 2.0,
+                    color: color(255, 0),
+                },
+                paint::DisplayItem::FillRect {
+                    rect: paint::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 10.0,
+                        height: 10.0,
+                    },
+                    color: color(0, 255),
+                },
+            ],
+        };
+        let frame = Compositor::new(10, 10).compose_paint(&list);
+        let offset = ((5 * frame.width + 5) * 4) as usize;
+        assert_eq!(frame.pixels[offset..offset + 4], [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn stroke_lines_scale_to_device_pixels_and_clip_at_frame_edges() {
+        let list = paint::DisplayList {
+            items: vec![paint::DisplayItem::StrokeLine {
+                from: (1.0, 3.0),
+                to: (20.0, 3.0),
+                width: 1.0,
+                color: paint::Color {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+            }],
+        };
+        // The line runs off the right edge of the 10x10 device frame. This
+        // is the shell's path, with no fonts or images loaded.
+        let frame = Compositor::new(10, 10).compose_page(
+            &list,
+            &FontCollection::new(None),
+            &ImageStore::new(),
+            2.0,
+        );
+        let pixel = |x: u32, y: u32| -> [u8; 4] {
+            let offset = ((y * frame.width + x) * 4) as usize;
+            frame.pixels[offset..offset + 4].try_into().unwrap()
+        };
+        // CSS y 3 is device y 6; the 2-device-pixel line covers rows 5 and 6.
+        assert_eq!(pixel(5, 5), [255, 0, 0, 255]);
+        assert_eq!(pixel(5, 6), [255, 0, 0, 255]);
+        assert_eq!(pixel(9, 6), [255, 0, 0, 255]);
+        assert_eq!(pixel(5, 9), Compositor::CLEAR_COLOR);
+        assert_eq!(pixel(5, 2), Compositor::CLEAR_COLOR);
     }
 
     #[test]
@@ -1140,6 +1339,7 @@ mod image_tests {
                         b: 0,
                         a: 255,
                     },
+                    clip: None,
                 },
             ],
         };
@@ -1148,5 +1348,97 @@ mod image_tests {
             compositor.compose_page(&list, &FontCollection::default(), &ImageStore::new(), 1.0),
             compositor.compose_paint(&list)
         );
+    }
+
+    /// A grey background wider than the clip, then "HHHH" clipped to
+    /// `0..12` x `0..16` CSS pixels.
+    fn clipped_text_list(clip: Option<paint::Rect>) -> paint::DisplayList {
+        paint::DisplayList {
+            items: vec![
+                paint::DisplayItem::FillRect {
+                    rect: paint::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 40.0,
+                        height: 16.0,
+                    },
+                    color: paint::Color {
+                        r: 200,
+                        g: 200,
+                        b: 200,
+                        a: 255,
+                    },
+                },
+                paint::DisplayItem::Text {
+                    x: 0.0,
+                    baseline: 12.0,
+                    font_size: 12.0,
+                    font: paint::FontId::DEFAULT,
+                    text: "HHHH".into(),
+                    color: paint::Color {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    },
+                    clip,
+                },
+            ],
+        }
+    }
+
+    const TEXT_CLIP: paint::Rect = paint::Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 12.0,
+        height: 16.0,
+    };
+
+    /// Checks a clipped frame against an unclipped one at `scale`: outside
+    /// the clip only the background remains; inside, both frames match.
+    fn assert_clipped(unclipped: &Frame, clipped: &Frame, scale: u32) {
+        let edge = TEXT_CLIP.right() as u32 * scale;
+        let grey = [200, 200, 200, 255];
+        let ink_past_edge = (edge..40 * scale)
+            .flat_map(|x| (0..16 * scale).map(move |y| (x, y)))
+            .any(|(x, y)| pixel(unclipped, x, y) != grey);
+        assert!(ink_past_edge, "the unclipped text reaches past the clip");
+        for y in 0..16 * scale {
+            for x in 0..40 * scale {
+                if x < edge {
+                    assert_eq!(pixel(clipped, x, y), pixel(unclipped, x, y), "({x}, {y})");
+                } else {
+                    assert_eq!(pixel(clipped, x, y), grey, "({x}, {y})");
+                }
+            }
+        }
+        let ink_inside = (0..edge)
+            .flat_map(|x| (0..16 * scale).map(move |y| (x, y)))
+            .any(|(x, y)| pixel(clipped, x, y) != grey);
+        assert!(ink_inside, "text inside the clip is drawn");
+    }
+
+    #[test]
+    fn clipped_text_paints_nothing_outside_its_clip() {
+        let compose = |clip| {
+            Compositor::new(80, 32).compose_page(
+                &clipped_text_list(clip),
+                &FontCollection::default(),
+                &ImageStore::new(),
+                2.0,
+            )
+        };
+        assert_clipped(&compose(None), &compose(Some(TEXT_CLIP)), 2);
+    }
+
+    #[test]
+    fn clipped_outline_text_paints_nothing_outside_its_clip() {
+        let Some(font) = crate::fonts::tests::system_font() else {
+            return;
+        };
+        let compose = |clip| {
+            Compositor::new(80, 32).compose_paint_with_font(&clipped_text_list(clip), &font, 2.0)
+        };
+        assert_clipped(&compose(None), &compose(Some(TEXT_CLIP)), 2);
     }
 }

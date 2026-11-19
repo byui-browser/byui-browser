@@ -22,9 +22,9 @@ use storage::{
 use webapis::local_storage::register_local_storage_with_url;
 use webapis::session_storage::register_session_storage;
 use webapis::{
-    AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, register_alert,
-    register_console, register_fetch_with_url, register_location_with_navigation, register_print,
-    register_shared_document_with_location, register_window_with_security_context,
+    AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, dispatch_window_keydown,
+    register_alert, register_console, register_fetch_with_url, register_location_with_navigation,
+    register_print, register_shared_document_with_location, register_window_with_security_context,
     register_window_with_url_device_pixel_ratio_and_viewport, report_window_error,
 };
 
@@ -848,8 +848,12 @@ impl PageSession {
     /// non-replaceable read-only host attributes.
     pub fn set_scroll_y(&mut self, scroll_y: f64) {
         let value = Value::Number(scroll_y.max(0.0));
+        let changed = self.window.get("scrollY") != Some(value.clone());
         self.window.update_read_only("scrollY", value.clone());
         self.window.update_read_only("pageYOffset", value);
+        if changed && let Err(error) = webapis::dispatch_window_scroll(&self.window) {
+            log::warn!("could not dispatch window scroll event: {error}");
+        }
     }
 
     /// Updates the viewport dimensions exposed to this live page session.
@@ -947,6 +951,38 @@ impl PageSession {
         webapis::run_window_microtasks(&self.window)?;
         webapis::run_window_hashchange_events(&self.window)?;
         result
+    }
+
+    /// Fires a trusted native `keydown` event on this page's Window.
+    ///
+    /// The returned value is `false` when a handler called `preventDefault()`
+    /// or returned `false`; otherwise it is `true`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_keydown(
+        &self,
+        key: &str,
+        code: &str,
+        location: u32,
+        ctrl_key: bool,
+        shift_key: bool,
+        alt_key: bool,
+        meta_key: bool,
+        repeat: bool,
+    ) -> JsResult<bool> {
+        let allowed = dispatch_window_keydown(
+            &self.window,
+            key,
+            code,
+            location,
+            ctrl_key,
+            shift_key,
+            alt_key,
+            meta_key,
+            repeat,
+        )?;
+        webapis::run_window_microtasks(&self.window)?;
+        webapis::run_window_hashchange_events(&self.window)?;
+        Ok(allowed)
     }
 
     /// Runs this page's elapsed `window.setInterval()` callbacks.
@@ -1129,11 +1165,27 @@ mod tests {
                 .evaluate_script("window.scrollY === 0 && window.pageYOffset === 0"),
             Ok(Value::Boolean(true))
         );
+        session
+            .realm
+            .evaluate_script(
+                "var scrollEvents = 0; var scrollMetadata = null; \
+                 window.onscroll = (event) => { scrollEvents++; scrollMetadata = [event.type, \
+                 event.target, event.currentTarget, event.bubbles, event.cancelable]; }",
+            )
+            .unwrap();
         session.set_scroll_y(123.5);
         assert_eq!(
-            session
-                .realm
-                .evaluate_script("window.scrollY === 123.5 && window.pageYOffset === 123.5"),
+            session.realm.evaluate_script(
+                "window.scrollY === 123.5 && window.pageYOffset === 123.5 && \
+                     scrollEvents === 1 && scrollMetadata[0] === 'scroll' && \
+                     scrollMetadata[1] === window && scrollMetadata[2] === window && \
+                     !scrollMetadata[3] && !scrollMetadata[4]",
+            ),
+            Ok(Value::Boolean(true))
+        );
+        session.set_scroll_y(123.5);
+        assert_eq!(
+            session.realm.evaluate_script("scrollEvents === 1"),
             Ok(Value::Boolean(true))
         );
         assert_eq!(

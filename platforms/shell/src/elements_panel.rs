@@ -143,9 +143,9 @@ impl ElementsPanel {
             self.message = Some("Could not parse loaded HTML");
             return;
         };
-        let mut stack = vec![(document.root, 0)];
+        let mut stack = vec![(*document.get_root(), 0)];
         while let Some((id, depth)) = stack.pop() {
-            let Some(node) = document.node(id) else {
+            let Some(node) = document.get_node(id) else {
                 continue;
             };
             let child_depth = if let html::NodeKind::Element(element) = node.get_kind() {

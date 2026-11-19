@@ -98,13 +98,13 @@ fn same_document(a: &Handle, b: &Handle) -> bool {
 fn children(document: &Document, id: NodeID) -> Vec<NodeID> {
     document
         .html_document()
-        .and_then(|source| source.node(id))
+        .and_then(|source| source.get_node(id))
         .map(|node| node.get_children().clone())
         .unwrap_or_default()
 }
 
 fn root(source: &HTMLDocument, mut node: NodeID) -> NodeID {
-    while let Some(parent) = source.node(node).and_then(|node| node.get_parent()) {
+    while let Some(parent) = source.get_node(node).and_then(|node| node.get_parent()) {
         node = parent;
     }
     node
@@ -115,7 +115,7 @@ fn contains(source: &HTMLDocument, ancestor: NodeID, mut node: NodeID) -> bool {
         if node == ancestor {
             return true;
         }
-        match source.node(node).and_then(|node| node.get_parent()) {
+        match source.get_node(node).and_then(|node| node.get_parent()) {
             Some(parent) => node = parent,
             None => return false,
         }
@@ -169,10 +169,10 @@ pub(crate) fn register(realm: &mut Realm, document: &SharedDocument) -> JsResult
                         let locked = node.document.lock().unwrap();
                         let source = locked.html_document().unwrap();
                         let mut ancestors = Vec::new();
-                        let mut parent = source.nodes[node.id.get()].get_parent();
+                        let mut parent = source.get_nodes()[node.id.get()].get_parent();
                         while let Some(id) = parent {
                             ancestors.push(id);
-                            parent = source.nodes[id.get()].get_parent();
+                            parent = source.get_nodes()[id.get()].get_parent();
                         }
                         ancestors
                     };
@@ -185,7 +185,7 @@ pub(crate) fn register(realm: &mut Realm, document: &SharedDocument) -> JsResult
                 let snapshot = node.document.lock().unwrap().clone();
                 let target = snapshot
                     .html_document()
-                    .and_then(|source| source.node(node.id))
+                    .and_then(|source| source.get_node(node.id))
                     .filter(|data| matches!(data.get_kind(), NodeKind::Document))
                     .map_or(Some(node.id), |_| None);
                 match name {
@@ -277,7 +277,7 @@ fn finish_registration(
     element: Object,
     doc_prototype: Object,
 ) -> JsResult<()> {
-    let root = document.lock().unwrap().html_document().unwrap().root;
+    let root = *document.lock().unwrap().html_document().unwrap().get_root();
     let object = {
         let mut locked = document.lock().unwrap();
         let bindings = locked.script_bindings.as_mut().unwrap();
@@ -323,7 +323,7 @@ pub(crate) fn install(object: &Object, id: NodeID, document: &SharedDocument) {
         (
             locked
                 .html_document()
-                .and_then(|source| source.node(id))
+                .and_then(|source| source.get_node(id))
                 .map(|node| node.get_kind().clone()),
             locked.script_bindings(),
         )
@@ -399,7 +399,7 @@ pub(crate) fn wrap(document: &SharedDocument, id: NodeID) -> JsResult<Value> {
         (
             locked
                 .html_document()
-                .and_then(|source| source.node(id))
+                .and_then(|source| source.get_node(id))
                 .map(|node| node.get_kind().clone()),
             locked.cached_script_element(id),
             locked.script_bindings(),
@@ -410,7 +410,7 @@ pub(crate) fn wrap(document: &SharedDocument, id: NodeID) -> JsResult<Value> {
     }
     if matches!(kind, Some(NodeKind::Document))
         && let Some(bindings) = &bindings
-        && document.lock().unwrap().html_document().unwrap().root == id
+        && *document.lock().unwrap().html_document().unwrap().get_root() == id
     {
         return Ok(Value::Object(bindings.document.clone()));
     }
@@ -432,15 +432,18 @@ fn property(document: &SharedDocument, id: NodeID, name: &str) -> JsResult<Value
         let locked = document.lock().unwrap();
         let source = locked.html_document().unwrap();
         let node = source
-            .node(id)
+            .get_node(id)
             .ok_or_else(|| exception("NotFoundError", "Unknown node"))?;
         let parent = node.get_parent();
-        let siblings = parent.map(|parent| source.nodes[parent.get()].get_children());
+        let siblings = parent.map(|parent| source.get_nodes()[parent.get()].get_children());
         let position = siblings.and_then(|siblings| siblings.iter().position(|child| *child == id));
         let relation = match name {
             "parentNode" => parent,
             "parentElement" => parent.filter(|parent| {
-                matches!(source.nodes[parent.get()].get_kind(), NodeKind::Element(_))
+                matches!(
+                    source.get_nodes()[parent.get()].get_kind(),
+                    NodeKind::Element(_)
+                )
             }),
             "firstChild" => node.get_children().first().copied(),
             "lastChild" => node.get_children().last().copied(),
@@ -455,7 +458,7 @@ fn property(document: &SharedDocument, id: NodeID, name: &str) -> JsResult<Value
             locked.script_bindings(),
             relation,
             matches!(
-                source.nodes[root(source, id).get()].get_kind(),
+                source.get_nodes()[root(source, id).get()].get_kind(),
                 NodeKind::Document
             ),
             if name == "textContent" {
@@ -471,7 +474,7 @@ fn property(document: &SharedDocument, id: NodeID, name: &str) -> JsResult<Value
             NodeKind::Text(_) => 3.,
             NodeKind::Comment(_) => 8.,
             NodeKind::Document => 9.,
-            NodeKind::Doctype { .. } => 10.,
+            NodeKind::Doctype(_) => 10.,
             NodeKind::None => 0.,
         }),
         "nodeName" => Value::String(match kind {
@@ -485,7 +488,7 @@ fn property(document: &SharedDocument, id: NodeID, name: &str) -> JsResult<Value
             NodeKind::Text(_) => "#text".into(),
             NodeKind::Comment(_) => "#comment".into(),
             NodeKind::Document => "#document".into(),
-            NodeKind::Doctype { name, .. } => name.unwrap_or_default(),
+            NodeKind::Doctype(doctype) => doctype.get_name().clone().unwrap_or_default(),
             NodeKind::None => String::new(),
         }),
         "isConnected" => Value::Boolean(connected),
@@ -515,8 +518,8 @@ fn property(document: &SharedDocument, id: NodeID, name: &str) -> JsResult<Value
 
 fn descendant_text(source: &HTMLDocument, id: NodeID) -> String {
     let mut result = String::new();
-    for child in source.nodes[id.get()].get_children() {
-        match source.nodes[child.get()].get_kind() {
+    for child in source.get_nodes()[id.get()].get_children() {
+        match source.get_nodes()[child.get()].get_kind() {
             NodeKind::Text(text) => result.push_str(text),
             NodeKind::Element(_) => result.push_str(&descendant_text(source, *child)),
             _ => {}
@@ -530,7 +533,7 @@ fn base_uri(document: &SharedDocument) -> String {
         let locked = document.lock().unwrap();
         let base = locked.html_document().and_then(|source| {
             fn find(source: &HTMLDocument, id: NodeID) -> Option<String> {
-                if let NodeKind::Element(element) = source.nodes[id.get()].get_kind()
+                if let NodeKind::Element(element) = source.get_nodes()[id.get()].get_kind()
                     && *element.get_namespace() == Namespace::Html
                     && element.get_name() == "base"
                     && let Some(attr) = element
@@ -540,12 +543,12 @@ fn base_uri(document: &SharedDocument) -> String {
                 {
                     return Some(attr.get_value().clone());
                 }
-                source.nodes[id.get()]
+                source.get_nodes()[id.get()]
                     .get_children()
                     .iter()
                     .find_map(|child| find(source, *child))
             }
-            find(source, source.root)
+            find(source, *source.get_root())
         });
         (locked.script_bindings(), base)
     };
@@ -625,18 +628,22 @@ fn set_text(document: &SharedDocument, id: NodeID, property: &str, value: Value)
     };
     let removed = {
         let mut locked = document.lock().unwrap();
-        let kind = locked.source_document.as_ref().unwrap().nodes[id.get()]
+        let kind = locked.source_document.as_ref().unwrap().get_nodes()[id.get()]
             .get_kind()
             .clone();
         match kind {
             NodeKind::Text(_) | NodeKind::Comment(_) => {
-                locked.source_document.as_mut().unwrap().nodes[id.get()].set_kind(
-                    if matches!(kind, NodeKind::Text(_)) {
+                locked
+                    .source_document
+                    .as_mut()
+                    .unwrap()
+                    .get_mut_node(id)
+                    .unwrap()
+                    .set_kind(if matches!(kind, NodeKind::Text(_)) {
                         NodeKind::Text(value)
                     } else {
                         NodeKind::Comment(value)
-                    },
-                );
+                    });
                 Vec::new()
             }
             NodeKind::Element(_) if property == "textContent" => {
@@ -751,7 +758,7 @@ fn call(name: &str, arguments: &[Value]) -> JsResult<Value> {
                 } else {
                     fn order(source: &HTMLDocument, id: NodeID, output: &mut Vec<NodeID>) {
                         output.push(id);
-                        for child in source.nodes[id.get()].get_children() {
+                        for child in source.get_nodes()[id.get()].get_children() {
                             order(source, *child, output);
                         }
                     }
@@ -860,7 +867,7 @@ fn mutate(parent: &Handle, method: &str, arguments: &[Value]) -> JsResult<Value>
     let (removed, moved, changed, result) = {
         let mut locked = parent.document.lock().unwrap();
         let source = locked.source_document.as_mut().unwrap();
-        let mut ids = source.nodes[parent.id.get()].get_children().clone();
+        let mut ids = source.get_nodes()[parent.id.get()].get_children().clone();
         let child = if method == "removeChild" {
             Some(inserted.id)
         } else {
@@ -868,20 +875,20 @@ fn mutate(parent: &Handle, method: &str, arguments: &[Value]) -> JsResult<Value>
         };
         if method != "removeChild"
             && (!matches!(
-                source.nodes[parent.id.get()].get_kind(),
+                source.get_nodes()[parent.id.get()].get_kind(),
                 NodeKind::Element(_) | NodeKind::Document
             ) || contains(source, inserted.id, parent.id))
         {
             return Err(exception("HierarchyRequestError", "Invalid node hierarchy"));
         }
         if let Some(child) = child
-            && source.nodes[child.get()].get_parent() != Some(parent.id)
+            && source.get_nodes()[child.get()].get_parent() != Some(parent.id)
         {
             return Err(exception("NotFoundError", "Not a child of this node"));
         }
         if method != "removeChild" {
             if matches!(
-                source.nodes[inserted.id.get()].get_kind(),
+                source.get_nodes()[inserted.id.get()].get_kind(),
                 NodeKind::Document | NodeKind::None
             ) {
                 return Err(exception("HierarchyRequestError", "Invalid node hierarchy"));
@@ -897,13 +904,16 @@ fn mutate(parent: &Handle, method: &str, arguments: &[Value]) -> JsResult<Value>
                 ids.remove(position);
             }
             ids.insert(position, inserted.id);
-            if matches!(source.nodes[parent.id.get()].get_kind(), NodeKind::Document) {
+            if matches!(
+                source.get_nodes()[parent.id.get()].get_kind(),
+                NodeKind::Document
+            ) {
                 let mut element = None;
                 let mut doctype = None;
                 for (index, id) in ids.iter().enumerate() {
-                    match source.nodes[id.get()].get_kind() {
+                    match source.get_nodes()[id.get()].get_kind() {
                         NodeKind::Element(_) if element.is_none() => element = Some(index),
-                        NodeKind::Doctype { .. } if doctype.is_none() => doctype = Some(index),
+                        NodeKind::Doctype(_) if doctype.is_none() => doctype = Some(index),
                         NodeKind::Comment(_) => {}
                         _ => {
                             return Err(exception(
@@ -923,8 +933,8 @@ fn mutate(parent: &Handle, method: &str, arguments: &[Value]) -> JsResult<Value>
                     ));
                 }
             } else if matches!(
-                source.nodes[inserted.id.get()].get_kind(),
-                NodeKind::Doctype { .. }
+                source.get_nodes()[inserted.id.get()].get_kind(),
+                NodeKind::Doctype(_)
             ) {
                 return Err(exception(
                     "HierarchyRequestError",
@@ -960,9 +970,15 @@ fn mutate(parent: &Handle, method: &str, arguments: &[Value]) -> JsResult<Value>
                 if method == "replaceChild" {
                     source.remove(reference.as_ref().unwrap().id);
                 }
-                source.nodes[inserted.id.get()].set_parent(Some(parent.id));
+                source
+                    .get_mut_node(NodeID::new(inserted.id.get()))
+                    .unwrap()
+                    .set_parent(Some(parent.id));
             }
-            source.nodes[parent.id.get()].set_children(ids);
+            source
+                .get_mut_node(NodeID::new(parent.id.get()))
+                .unwrap()
+                .set_children(ids);
             locked.elements = collect_elements(source);
         }
         (removed, moved, !unchanged, result)
@@ -983,8 +999,8 @@ fn equal(a: &Handle, b: &Handle) -> bool {
     let a_source = a.document.lock().unwrap().html_document().unwrap().clone();
     let b_source = b.document.lock().unwrap().html_document().unwrap().clone();
     fn compare(a: &HTMLDocument, ai: NodeID, b: &HTMLDocument, bi: NodeID) -> bool {
-        let an = &a.nodes[ai.get()];
-        let bn = &b.nodes[bi.get()];
+        let an = &a.get_nodes()[ai.get()];
+        let bn = &b.get_nodes()[bi.get()];
         let kinds_equal = match (an.get_kind(), bn.get_kind()) {
             (NodeKind::Element(a), NodeKind::Element(b)) => {
                 a.get_name() == b.get_name()
@@ -1008,19 +1024,23 @@ fn equal(a: &Handle, b: &Handle) -> bool {
 }
 
 fn normalize(source: &mut HTMLDocument, id: NodeID) {
-    let ids = source.nodes[id.get()].get_children().clone();
+    let ids = source.get_nodes()[id.get()].get_children().clone();
     let mut previous: Option<NodeID> = None;
     for child in ids {
-        if let NodeKind::Text(text) = source.nodes[child.get()].get_kind().clone() {
+        if let NodeKind::Text(text) = source.get_nodes()[child.get()].get_kind().clone() {
             if text.is_empty() {
                 source.remove(child);
             } else if let Some(previous) = previous {
-                let NodeKind::Text(mut data) = source.nodes[previous.get()].get_kind().clone()
+                let NodeKind::Text(mut data) =
+                    source.get_nodes()[previous.get()].get_kind().clone()
                 else {
                     unreachable!()
                 };
                 data.push_str(&text);
-                source.nodes[previous.get()].set_kind(NodeKind::Text(data));
+                source
+                    .get_mut_node(NodeID::new(previous.get()))
+                    .unwrap()
+                    .set_kind(NodeKind::Text(data));
                 source.remove(child);
             } else {
                 previous = Some(child);
@@ -1034,7 +1054,7 @@ fn normalize(source: &mut HTMLDocument, id: NodeID) {
 
 fn clone_node(node: &Handle, deep: bool) -> JsResult<Value> {
     fn copy(source: &mut HTMLDocument, id: NodeID, deep: bool) -> NodeID {
-        let data = source.nodes[id.get()].clone();
+        let data = source.get_nodes()[id.get()].clone();
         let cloned = source.push_node(data.get_kind().clone());
         if deep {
             for child in data.get_children() {
@@ -1051,7 +1071,7 @@ fn clone_node(node: &Handle, deep: bool) -> JsResult<Value> {
             .source_document
             .as_ref()
             .unwrap()
-            .nodes[node.id.get()]
+            .get_nodes()[node.id.get()]
         .get_kind(),
         NodeKind::Document
     );
@@ -1064,16 +1084,16 @@ fn clone_node(node: &Handle, deep: bool) -> JsResult<Value> {
             )
         };
         fn copy_into(old: &HTMLDocument, new: &mut HTMLDocument, id: NodeID, parent: NodeID) {
-            let new_id = new.push_node(old.nodes[id.get()].get_kind().clone());
+            let new_id = new.push_node(old.get_nodes()[id.get()].get_kind().clone());
             new.append_child(parent, new_id);
-            for child in old.nodes[id.get()].get_children() {
+            for child in old.get_nodes()[id.get()].get_children() {
                 copy_into(old, new, *child, new_id);
             }
         }
         let mut target = HTMLDocument::new();
         if deep {
-            let root = target.root;
-            for child in source.nodes[node.id.get()].get_children() {
+            let root = *target.get_root();
+            for child in source.get_nodes()[node.id.get()].get_children() {
                 copy_into(&source, &mut target, *child, root);
             }
         }
@@ -1098,17 +1118,25 @@ fn clone_node(node: &Handle, deep: bool) -> JsResult<Value> {
 }
 
 fn namespace_element(source: &HTMLDocument, id: NodeID) -> Option<NodeID> {
-    match source.nodes[id.get()].get_kind() {
+    match source.get_nodes()[id.get()].get_kind() {
         NodeKind::Element(_) => Some(id),
-        NodeKind::Document => source.nodes[id.get()]
+        NodeKind::Document => source.get_nodes()[id.get()]
             .get_children()
             .iter()
-            .find(|child| matches!(source.nodes[child.get()].get_kind(), NodeKind::Element(_)))
+            .find(|child| {
+                matches!(
+                    source.get_nodes()[child.get()].get_kind(),
+                    NodeKind::Element(_)
+                )
+            })
             .copied(),
-        NodeKind::Doctype { .. } => None,
-        _ => source.nodes[id.get()]
-            .get_parent()
-            .filter(|parent| matches!(source.nodes[parent.get()].get_kind(), NodeKind::Element(_))),
+        NodeKind::Doctype(_) => None,
+        _ => source.get_nodes()[id.get()].get_parent().filter(|parent| {
+            matches!(
+                source.get_nodes()[parent.get()].get_kind(),
+                NodeKind::Element(_)
+            )
+        }),
     }
 }
 
@@ -1130,7 +1158,7 @@ fn lookup_namespace(source: &HTMLDocument, id: NodeID, prefix: Option<&str>) -> 
         return Some("http://www.w3.org/2000/xmlns/".into());
     }
     while let Some(id) = current {
-        let NodeKind::Element(element) = source.nodes[id.get()].get_kind() else {
+        let NodeKind::Element(element) = source.get_nodes()[id.get()].get_kind() else {
             return None;
         };
         if prefix.is_none() {
@@ -1144,9 +1172,12 @@ fn lookup_namespace(source: &HTMLDocument, id: NodeID, prefix: Option<&str>) -> 
         {
             return (!attr.get_value().is_empty()).then(|| attr.get_value().clone());
         }
-        current = source.nodes[id.get()]
-            .get_parent()
-            .filter(|parent| matches!(source.nodes[parent.get()].get_kind(), NodeKind::Element(_)));
+        current = source.get_nodes()[id.get()].get_parent().filter(|parent| {
+            matches!(
+                source.get_nodes()[parent.get()].get_kind(),
+                NodeKind::Element(_)
+            )
+        });
     }
     None
 }
@@ -1156,7 +1187,7 @@ fn lookup_prefix(source: &HTMLDocument, id: NodeID, namespace: Option<&str>) -> 
     let original = id;
     let mut current = namespace_element(source, id);
     while let Some(id) = current {
-        let NodeKind::Element(element) = source.nodes[id.get()].get_kind() else {
+        let NodeKind::Element(element) = source.get_nodes()[id.get()].get_kind() else {
             return None;
         };
         for attr in element.get_attributes() {
@@ -1167,9 +1198,12 @@ fn lookup_prefix(source: &HTMLDocument, id: NodeID, namespace: Option<&str>) -> 
                 return Some(prefix.into());
             }
         }
-        current = source.nodes[id.get()]
-            .get_parent()
-            .filter(|parent| matches!(source.nodes[parent.get()].get_kind(), NodeKind::Element(_)));
+        current = source.get_nodes()[id.get()].get_parent().filter(|parent| {
+            matches!(
+                source.get_nodes()[parent.get()].get_kind(),
+                NodeKind::Element(_)
+            )
+        });
     }
     None
 }

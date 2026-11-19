@@ -5,12 +5,13 @@
 //! origin of the box being laid out; the parent translates them into place.
 
 use crate::box_tree::{BlockBox, BlockContents};
+use crate::control::SELECT_ARROW_ROOM;
 use crate::layout::Context;
 use std::sync::Arc;
 
 use crate::positioned::{FloatContext, FloatScope, PendingAbsolute, relative_offset};
 use crate::style::{BoxSizing, ComputedStyle, Dimension, Position};
-use crate::tree::{BoxKind, BoxStyle, LayoutBox, Placement};
+use crate::tree::{BoxKind, BoxStyle, LayoutBox, LineBox, LineFragment, Placement};
 use crate::{Edges, Rect};
 
 /// Adjoining vertical margins, collapsed as CSS 2.2 §8.3.1 describes: the
@@ -91,7 +92,9 @@ impl Context<'_> {
             BlockContents::Replaced(replaced) => {
                 Some(replaced.used_size(style, basis, cb.height).0)
             }
-            _ => style.content_width(basis),
+            _ => style
+                .content_width(basis)
+                .or(self.control_size(block, basis, cb.height).width),
         };
         let (left, width, right) = match used_width {
             None => {
@@ -169,7 +172,10 @@ impl Context<'_> {
             BlockContents::Replaced(replaced) => Some(replaced.used_size(style, basis, None).0),
             _ => None,
         };
-        let width = replaced_width.or(style.content_width(basis)).unwrap_or_else(|| {
+        let width = replaced_width
+            .or(style.content_width(basis))
+            .or(self.control_size(block, basis, None).width)
+            .unwrap_or_else(|| {
             let (min_content, max_content) = self.intrinsic_content_sizes(block);
             let available = cb_width - margin_left - margin_right - padding;
             let width = max_content.min(available.max(min_content));
@@ -263,7 +269,9 @@ impl Context<'_> {
             placement: Placement::InFlow,
             children,
             lines,
+            select_arrow: false,
             image: None,
+            control: None,
         }
     }
 
@@ -289,11 +297,12 @@ impl Context<'_> {
         let margin_bottom = style.margin.bottom.resolve_or_zero(basis);
         // Percentage heights resolve only against a definite containing block
         // height; otherwise they behave as `auto` (CSS 2.2 §10.5).
+        let control = self.control_size(block, basis, cb.height);
         let specified_height = match &block.contents {
             BlockContents::Replaced(replaced) => {
                 Some(replaced.used_size(style, basis, cb.height).1)
             }
-            _ => style.content_height(basis, cb.height),
+            _ => style.content_height(basis, cb.height).or(control.height),
         };
 
         let edges = FlowEdges {
@@ -335,12 +344,49 @@ impl Context<'_> {
                     )
                 }
             }
+            BlockContents::Inlines(items) if block.is_drop_down() => {
+                // One unbroken line beside the arrow; text that doesn't fit
+                // is clipped where the arrow area starts.
+                let text_width = (content_width - SELECT_ARROW_ROOM).max(0.0);
+                let (_, max_content) = self.inline_intrinsic_sizes(items, style);
+                let inline =
+                    self.layout_inline(items, style, text_width.max(max_content), &mut floats);
+                lines = inline.lines;
+                children.extend(inline.floats);
+                self.clip_lines(&mut lines, text_width, content_width);
+                FlowResult {
+                    height: lines.last().map_or(0.0, |line| line.rect.bottom()),
+                    margin_top: edges.own_top,
+                    margin_bottom: edges.own_bottom,
+                    has_content: !lines.is_empty(),
+                    absolutes: inline.absolutes,
+                }
+            }
             BlockContents::Inlines(items) => {
                 let inline = self.layout_inline(items, style, content_width, &mut floats);
                 lines = inline.lines;
                 children.extend(inline.floats);
+                if lines.is_empty() && block.centers_lines {
+                    // A single-line control with no text (an empty field or
+                    // `<input type=button>`) keeps one empty strut line, so
+                    // it is one line tall and has a baseline to align by.
+                    let metrics = self
+                        .fonts
+                        .font_vertical_metrics(style.font, style.font_size);
+                    lines.push(LineBox {
+                        rect: Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: content_width,
+                            height: metrics.ascent + metrics.descent + metrics.line_gap,
+                        },
+                        baseline: metrics.ascent + metrics.line_gap / 2.0,
+                        fragments: Vec::new(),
+                    });
+                }
+                let height = lines.last().map_or(0.0, |line| line.rect.bottom());
                 FlowResult {
-                    height: lines.last().map_or(0.0, |line| line.rect.bottom()),
+                    height,
                     margin_top: edges.own_top,
                     margin_bottom: edges.own_bottom,
                     has_content: !lines.is_empty(),
@@ -362,7 +408,7 @@ impl Context<'_> {
         {
             flow.height = flow.height.max(bottom);
         }
-        let content_height = specified_height.unwrap_or(flow.height);
+        let content_height = specified_height.unwrap_or(flow.height.max(control.min_height));
         if specified_height.is_none() {
             log::trace!(
                 "node {:?}: auto height resolved to {content_height}",
@@ -377,8 +423,27 @@ impl Context<'_> {
         for child in &mut children {
             child.translate(padding.left, padding.top);
         }
+        // Single-line controls center their text vertically (CSS Basic UI
+        // leaves this to the user agent; Chrome centers it). In a box shorter
+        // than its line the text overflows both edges equally and is clipped.
+        let line_offset = if block.centers_lines {
+            (content_height - flow.height) / 2.0
+        } else {
+            0.0
+        };
         for line in &mut lines {
-            line.translate(padding.left, padding.top);
+            line.translate(padding.left, padding.top + line_offset);
+        }
+        if block.clips_contents {
+            // Control text is clipped to the padding box, inside the borders.
+            let border = style.borders.border_width;
+            let clip = Rect {
+                x: border.left,
+                y: border.top,
+                width: content_width + padding.horizontal() - border.horizontal(),
+                height: content_height + padding.vertical() - border.vertical(),
+            };
+            clip_text(&mut lines, clip);
         }
         let mut absolutes = flow.absolutes;
         for absolute in &mut absolutes {
@@ -426,8 +491,13 @@ impl Context<'_> {
                 placement: placement(style),
                 children,
                 lines,
+                select_arrow: block.is_drop_down(),
                 image: match &block.contents {
-                    BlockContents::Replaced(replaced) => Some(replaced.key.clone()),
+                    BlockContents::Replaced(replaced) => replaced.key.clone(),
+                    _ => None,
+                },
+                control: match &block.contents {
+                    BlockContents::Replaced(replaced) => replaced.control,
                     _ => None,
                 },
             },
@@ -752,6 +822,9 @@ impl Context<'_> {
     /// The min-content and max-content widths of a block container's content
     /// box (CSS Sizing 3 §5).
     pub(crate) fn intrinsic_content_sizes(&self, block: &BlockBox) -> (f32, f32) {
+        if let Some(width) = self.control_size(block, None, None).width {
+            return (width, width);
+        }
         match &block.contents {
             BlockContents::Blocks(list) => list
                 .iter()
@@ -842,6 +915,33 @@ fn placement(style: &ComputedStyle) -> Placement {
         Position::Fixed => Placement::Fixed,
         Position::Static if style.is_floated() => Placement::Float,
         Position::Static => Placement::InFlow,
+    }
+}
+
+/// Clips every text run in `lines`, including those of nested inline
+/// boxes, to `clip`, intersecting with any clip a run already has.
+fn clip_text(lines: &mut [LineBox], clip: Rect) {
+    for line in lines {
+        for fragment in &mut line.fragments {
+            if let LineFragment::Text(text) = fragment {
+                text.clip = Some(match text.clip {
+                    Some(inner) => intersect(inner, clip),
+                    None => clip,
+                });
+            }
+        }
+    }
+}
+
+/// The overlap of two rectangles; empty (zero-sized) when they are apart.
+fn intersect(a: Rect, b: Rect) -> Rect {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    Rect {
+        x,
+        y,
+        width: (a.right().min(b.right()) - x).max(0.0),
+        height: (a.bottom().min(b.bottom()) - y).max(0.0),
     }
 }
 
