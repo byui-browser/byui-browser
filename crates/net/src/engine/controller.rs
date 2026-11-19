@@ -199,6 +199,8 @@ impl RequestControllerBuilder {
         let max_in_flight = config.max_in_flight;
         let max_keepalive_body_size = config.max_keepalive_body_size;
         let max_cache_body_size = config.max_cache_body_size;
+        let max_cache_entries = config.max_cache_entries;
+        let max_cache_total_body_size = config.max_cache_total_body_size;
         let max_preflight_cache_age = config.max_preflight_cache_age;
         let transport = reqwest_transport(config.clone()).map_err(|error| {
             log::error!("http transport initialization failed: {error}");
@@ -206,7 +208,7 @@ impl RequestControllerBuilder {
         })?;
         log::debug!(
             "request controller built: max_in_flight={max_in_flight}, \
-             browser_capabilities={}, max_keepalive_body_size={max_keepalive_body_size}, max_cache_body_size={max_cache_body_size}",
+             browser_capabilities={}, max_keepalive_body_size={max_keepalive_body_size}, max_cache_body_size={max_cache_body_size}, max_cache_entries={max_cache_entries}, max_cache_total_body_size={max_cache_total_body_size}",
             [
                 request_policy.is_some(),
                 response_policy.is_some(),
@@ -222,7 +224,7 @@ impl RequestControllerBuilder {
             inner: Arc::new(ControllerInner {
                 max_keepalive_body_size,
                 max_cache_body_size,
-                cache: ResponseCache::default(),
+                cache: ResponseCache::new(max_cache_entries, max_cache_total_body_size),
                 preflight_cache: PreflightCache::default(),
                 max_preflight_cache_age,
                 request_policy,

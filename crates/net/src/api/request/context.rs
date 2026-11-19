@@ -42,7 +42,7 @@ pub struct FetchContext {
 }
 
 /// Controls how a request may cross origins.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum RequestMode {
     /// Used for document navigation requests.
     Navigate,
@@ -55,7 +55,7 @@ pub enum RequestMode {
     NoCors,
 }
 /// Controls whether credentials may be sent with a request.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum CredentialsMode {
     /// Never send credentials.
     Omit,

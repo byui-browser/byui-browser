@@ -21,12 +21,11 @@ and provider interfaces rather than importing JavaScript types into `net`.
 Treat the following as internal refactors: preserve Fetch behavior and add
 focused regression coverage before changing each area.
 
-| Priority | Issue                                                                                                                                                                                                 | Potential solution                                                                                                                                                                                                                                   |
-| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Medium   | The process-local response cache has an unbounded entry map and supports only a narrow `Cache-Control` subset. It does not yet model complete credential/authorization and response-tainting inputs, validators, revalidation, 304 merging, or unsafe-method invalidation. | Define the cache boundary as an intentionally bounded adapter, add eviction and complete partition/key inputs, and implement standards-aware freshness and revalidation or delegate those decisions to the browser cache owner. |
-| Low      | `CachedResponse` duplicates `StoredResponse` and clones headers and complete bodies both when inserting and when serving a hit, creating avoidable memory bandwidth and peak allocations for large entries. | Store response data with expiration metadata without duplicating the representation, and use shared or move-based body ownership where the cache contract permits without exposing mutable state. |
-| Low      | Production cache and body-state locks still use `expect` on poisoning, so a poisoned lock becomes a panic rather than an explicit engine failure policy. | Map poisoned locks to typed errors where callers can recover, or document and test the deliberate process-failure policy for each remaining lock. |
-| Medium   | Lifecycle diagnostics stop at response headers. Body consumption, completion timing, cancellation timing, and transport/body failure details are not yet exposed through the browser-owned diagnostics boundary. | Extend the diagnostics contract with non-sensitive body and timing events, route transport failures through the redaction helpers, and add focused coverage for successful, failed, dropped, and cancelled streams. |
+| Priority | Issue                                                                                                                                                                                                                                                                      | Potential solution                                                                                                                                                                                                              |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Medium   | The process-local response cache has bounded storage and structured request identity, but supports only a narrow `Cache-Control` subset. Authorized requests are conservatively excluded while complete authorization policy, validators, revalidation, 304 merging, and unsafe-method invalidation remain absent. | Expand the bounded adapter with standards-aware freshness and revalidation, or delegate those decisions to the browser cache owner. |
+| Low      | Production cache and body-state locks still use `expect` on poisoning, so a poisoned lock becomes a panic rather than an explicit engine failure policy.                                                                                                                   | Map poisoned locks to typed errors where callers can recover, or document and test the deliberate process-failure policy for each remaining lock.                                                                               |
+| Medium   | Lifecycle diagnostics stop at response headers. Body consumption, completion timing, cancellation timing, and transport/body failure details are not yet exposed through the browser-owned diagnostics boundary.                                                           | Extend the diagnostics contract with non-sensitive body and timing events, route transport failures through the redaction helpers, and add focused coverage for successful, failed, dropped, and cancelled streams.             |
 
 Provider-backed `blob:`, `file:`, and `byui:` requests now use one declarative
 dispatch path for method policy, provider selection, cancellation, and response
@@ -124,9 +123,14 @@ responses.
 
 `net` owns the transport-independent HTTP-cache algorithm and response
 capture; browser and storage layers own durable persistence and provide
-partition identity through a replaceable boundary. Keep the initial backend
-process-local while later slices add complete cache identity, bounded eviction,
-freshness, revalidation, and invalidation. Cache entries own one
+partition identity through a replaceable boundary. The process-local backend
+uses a structured key for partition, method, normalized URL, credential mode
+and eligibility, request mode, redirect taint, and authorization presence.
+Authorization values are never retained: authorized requests are
+conservatively not stored until complete authorization caching exists. Config
+limits bound primary entries and aggregate body bytes, with least-recently-used
+primary-entry eviction and expired-entry pruning before insertion. Later slices
+add standards-aware freshness, revalidation, and invalidation. Cache entries own one
 `StoredResponse` representation rather than mirroring its fields in
 `CachedResponse`; immutable buffered body bytes may be shared with each
 independent public body view, while headers remain independently owned for

@@ -148,9 +148,12 @@ work.
   documented process-local cache subset; `NoCache` fails until revalidation
   exists. Browser service providers choose the partition key. This cache is
   neither durable nor a full Fetch HTTP cache. Successful responses with a
-  positive `Cache-Control: max-age` are stored by method, normalized URL,
-  and partition; response `Vary` fields select among request-header variants,
-  and `Vary: *` responses are not stored. Cache hits still pass through the
+   positive `Cache-Control: max-age` are stored by structured partition,
+   method, normalized URL, credential mode/eligibility, request mode, redirect
+   taint, and authorization-presence identity; authorized requests are not
+   stored. Response `Vary` fields select among request-header variants, and
+   `Vary: *` responses are not stored. Configured entry and aggregate-body-byte
+   limits evict least-recently-used primary entries. Cache hits still pass through the
    normal response finalization and filtering path. `net` owns the
    transport-independent cache algorithm and capture boundary; browser/storage
    integrations provide partition identity and may replace process-local

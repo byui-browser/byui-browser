@@ -9,10 +9,10 @@ use std::{
 use bytes::Bytes;
 use reqwest::{
     StatusCode, Url,
-    header::{CACHE_CONTROL, HeaderMap},
+    header::{AUTHORIZATION, CACHE_CONTROL, HeaderMap, PROXY_AUTHORIZATION},
 };
 
-use crate::api::request::Request;
+use crate::api::request::{CredentialsMode, RedirectTaint, Request, RequestMode};
 
 /// Complete buffered response retained for cache policy and later filtering.
 #[derive(Clone, Debug)]
@@ -26,10 +26,70 @@ pub(crate) struct StoredResponse {
     pub(crate) cookie_headers_processed: bool,
 }
 
-/// Thread-safe process-local cache shared by cloned request clients.
-#[derive(Clone, Debug, Default)]
+/// Thread-safe, bounded process-local cache shared by cloned request clients.
+#[derive(Clone, Debug)]
 pub(crate) struct ResponseCache {
-    entries: Arc<RwLock<HashMap<String, Vec<CachedResponse>>>>,
+    entries: Arc<RwLock<CacheEntries>>,
+    limits: CacheLimits,
+}
+
+impl Default for ResponseCache {
+    fn default() -> Self {
+        Self::new(256, 64 * 1024 * 1024)
+    }
+}
+
+impl ResponseCache {
+    /// Creates a bounded process-local response cache.
+    pub(crate) fn new(max_entries: usize, max_body_size: usize) -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(CacheEntries::default())),
+            limits: CacheLimits {
+                max_entries,
+                max_body_size,
+            },
+        }
+    }
+}
+
+/// Limits enforced across all partitions held by one response cache.
+#[derive(Clone, Copy, Debug)]
+struct CacheLimits {
+    max_entries: usize,
+    max_body_size: usize,
+}
+
+/// Mutable cache state protected by the response-cache lock.
+#[derive(Debug, Default)]
+struct CacheEntries {
+    entries: HashMap<CacheKey, Vec<CachedResponse>>,
+    total_body_size: usize,
+    next_access: u64,
+}
+
+/// Structured identity for one cacheable request representation.
+///
+/// Authorization values are deliberately not retained. Authorized requests
+/// are currently excluded from storage until complete authorization caching is
+/// implemented, while this marker prevents any future lookup from sharing an
+/// unauthenticated representation.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CacheKey {
+    partition: CachePartition,
+    method: http::Method,
+    url: String,
+    credentials_mode: CredentialsMode,
+    credentials_allowed: bool,
+    request_mode: RequestMode,
+    redirect_taint: RedirectTaint,
+    has_authorization: bool,
+}
+
+/// Browser-provided or standalone storage scope for a cache key.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum CachePartition {
+    Browser(String),
+    Standalone,
 }
 
 impl ResponseCache {
@@ -49,8 +109,9 @@ impl ResponseCache {
         let key = cache_key(request, url);
         // Clone the response while the read lock is held, then release the lock
         // before returning so callers never hold cache state during network work.
-        let entries = self.entries.read().expect("cache lock poisoned");
-        let Some(cached) = entries.get(&key) else {
+        let mut entries = self.entries.write().expect("cache lock poisoned");
+        let access = entries.next_access();
+        let Some(cached) = entries.entries.get_mut(&key) else {
             log::trace!(
                 "cache lookup found no entry for {} {}",
                 request.method(),
@@ -60,7 +121,7 @@ impl ResponseCache {
         };
 
         // Find the cached response that matches this request's Vary headers.
-        let Some(cached) = cached.iter().find(|entry| {
+        let Some(cached) = cached.iter_mut().find(|entry| {
             entry
                 .vary_headers
                 .iter()
@@ -77,11 +138,23 @@ impl ResponseCache {
                 crate::log_url::loggable(url.as_str())
             );
         }
-        usable.then(|| cached.as_response())
+        if usable {
+            cached.last_access = access;
+            Some(cached.as_response())
+        } else {
+            None
+        }
     }
 
     /// Stores a successful response when its headers provide a positive TTL.
     pub(crate) fn insert(&self, request: &Request, url: &Url, response: StoredResponse) {
+        if !request.is_cacheable_method() || has_authorization(request) {
+            log::trace!(
+                "cache store skipped for {}: method or authorization is not cacheable",
+                crate::log_url::loggable(url.as_str())
+            );
+            return;
+        }
         if !response.status.is_success() {
             log::trace!(
                 "cache store skipped for {}: status {} is not successful",
@@ -116,33 +189,48 @@ impl ResponseCache {
             ttl.as_secs()
         );
         let key = cache_key(request, url);
-        let cached_response = CachedResponse::from_response(request, response, ttl);
+        let body_size = response.body.len();
+        if self.limits.max_entries == 0
+            || self.limits.max_body_size == 0
+            || body_size > self.limits.max_body_size
+        {
+            log::trace!("cache store skipped: cache limits do not admit response");
+            return;
+        }
 
         let mut entries = self.entries.write().expect("cache lock poisoned");
-        let variants = entries.entry(key).or_default();
-
-        // Remove cached responses that use a different set of Vary headers.
-        variants.retain(|existing| {
-            let existing_names: Vec<_> =
-                existing.vary_headers.iter().map(|(name, _)| name).collect();
-
-            let new_names: Vec<_> = cached_response
-                .vary_headers
-                .iter()
-                .map(|(name, _)| name)
-                .collect();
-
-            existing_names == new_names
-        });
-
-        variants.retain(|existing| existing.vary_headers != cached_response.vary_headers);
-
+        entries.prune_expired();
+        let access = entries.next_access();
+        let cached_response = CachedResponse::from_response(request, response, ttl, access);
+        let new_vary_names = cached_response.vary_names();
+        let replaced_body_size = entries.body_size_for(&key);
+        let existing = entries.entries.remove(&key).unwrap_or_default();
+        let retained: Vec<_> = existing
+            .into_iter()
+            .filter(|entry| {
+                entry.vary_names() == new_vary_names
+                    && entry.vary_headers != cached_response.vary_headers
+            })
+            .collect();
+        entries.total_body_size = entries.total_body_size.saturating_sub(replaced_body_size);
+        entries.total_body_size = entries
+            .total_body_size
+            .saturating_add(
+                retained
+                    .iter()
+                    .map(CachedResponse::body_size)
+                    .sum::<usize>(),
+            )
+            .saturating_add(body_size);
+        let mut variants = retained;
         variants.push(cached_response);
+        entries.entries.insert(key, variants);
+        entries.evict_to_limits(self.limits);
     }
 
     /// Removes every response currently held by the cache.
     pub(crate) fn clear(&self) {
-        self.entries.write().expect("cache lock poisoned").clear();
+        *self.entries.write().expect("cache lock poisoned") = CacheEntries::default();
     }
 }
 
@@ -155,6 +243,7 @@ pub(crate) struct CachedResponse {
     response: StoredResponse,
     pub(crate) expires_at: Instant,
     vary_headers: Vec<(String, Option<String>)>,
+    last_access: u64,
 }
 
 impl CachedResponse {
@@ -163,12 +252,14 @@ impl CachedResponse {
         request: &Request,
         response: StoredResponse,
         ttl: Duration,
+        last_access: u64,
     ) -> Self {
         let vary_headers = capture_vary_headers(request, &response.headers);
         Self {
             response,
             expires_at: Instant::now() + ttl,
             vary_headers,
+            last_access,
         }
     }
 
@@ -179,19 +270,99 @@ impl CachedResponse {
     pub(crate) fn as_response(&self) -> StoredResponse {
         self.response.clone()
     }
+
+    fn body_size(&self) -> usize {
+        self.response.body.len()
+    }
+
+    fn vary_names(&self) -> Vec<&str> {
+        self.vary_headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
 }
 
 /// Creates the cache key used to distinguish method and URL combinations.
-pub(crate) fn cache_key(request: &Request, url: &Url) -> String {
+pub(crate) fn cache_key(request: &Request, url: &Url) -> CacheKey {
     let mut url = url.clone();
     url.set_fragment(None);
-    match request.cache_partition() {
-        Some(partition) => format!(
-            "browser:{}:{partition} {} {url}",
-            partition.len(),
-            request.method()
-        ),
-        None => format!("standalone {} {url}", request.method()),
+    CacheKey {
+        partition: match request.cache_partition() {
+            Some(partition) => CachePartition::Browser(partition.to_owned()),
+            None => CachePartition::Standalone,
+        },
+        method: request.method().clone(),
+        url: url.to_string(),
+        credentials_mode: request.credentials_mode(),
+        credentials_allowed: request.credentials_allowed(&url),
+        request_mode: request.mode(),
+        redirect_taint: request.redirect_taint(),
+        has_authorization: has_authorization(request),
+    }
+}
+
+/// Reports whether a request carries an authorization-bearing header.
+fn has_authorization(request: &Request) -> bool {
+    request.headers().has(AUTHORIZATION.as_str())
+        || request.headers().has(PROXY_AUTHORIZATION.as_str())
+}
+
+impl CacheEntries {
+    fn next_access(&mut self) -> u64 {
+        let access = self.next_access;
+        self.next_access = self.next_access.wrapping_add(1);
+        access
+    }
+
+    fn body_size_for(&self, key: &CacheKey) -> usize {
+        self.entries
+            .get(key)
+            .into_iter()
+            .flatten()
+            .map(CachedResponse::body_size)
+            .sum()
+    }
+
+    /// Drops expired data before an insertion; stale data may still be served
+    /// by `ForceCache` until a later insertion makes it eligible for eviction.
+    fn prune_expired(&mut self) {
+        let now = Instant::now();
+        self.entries.retain(|_, variants| {
+            variants.retain(|entry| entry.expires_at > now);
+            !variants.is_empty()
+        });
+        self.total_body_size = self
+            .entries
+            .values()
+            .flatten()
+            .map(CachedResponse::body_size)
+            .sum();
+    }
+
+    fn evict_to_limits(&mut self, limits: CacheLimits) {
+        while self.entries.len() > limits.max_entries || self.total_body_size > limits.max_body_size
+        {
+            let Some(key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, variants)| {
+                    variants
+                        .iter()
+                        .map(|entry| entry.last_access)
+                        .max()
+                        .unwrap_or_default()
+                })
+                .map(|(key, _)| key.clone())
+            else {
+                return;
+            };
+            if let Some(variants) = self.entries.remove(&key) {
+                self.total_body_size = self
+                    .total_body_size
+                    .saturating_sub(variants.iter().map(CachedResponse::body_size).sum());
+            }
+        }
     }
 }
 
@@ -437,9 +608,9 @@ mod tests {
             body: Bytes::from_static(b"stale"),
             cookie_headers_processed: false,
         };
-        let cached = CachedResponse::from_response(&request, response, Duration::ZERO);
+        let cached = CachedResponse::from_response(&request, response, Duration::ZERO, 0);
 
-        cache.entries.write().unwrap().insert(
+        cache.entries.write().unwrap().entries.insert(
             cache_key(&request, &Url::parse(request.url()).unwrap()),
             vec![cached],
         );
@@ -462,9 +633,9 @@ mod tests {
             body: Bytes::from_static(b"stale"),
             cookie_headers_processed: false,
         };
-        let cached = CachedResponse::from_response(&request, response, Duration::ZERO);
+        let cached = CachedResponse::from_response(&request, response, Duration::ZERO, 0);
 
-        cache.entries.write().unwrap().insert(
+        cache.entries.write().unwrap().entries.insert(
             cache_key(&request, &Url::parse(request.url()).unwrap()),
             vec![cached],
         );
@@ -592,7 +763,7 @@ mod tests {
         // The cache should contain only the new Vary rule.
         let key = cache_key(&request, &url);
         let entries = cache.entries.read().unwrap();
-        let variants = entries.get(&key).unwrap();
+        let variants = entries.entries.get(&key).unwrap();
 
         assert_eq!(variants.len(), 1);
         assert_eq!(variants[0].response.body.as_ref(), b"Gzip response");
@@ -621,9 +792,131 @@ mod tests {
 
         let hit = cache.get(&request, &url).unwrap();
         let entries = cache.entries.read().unwrap();
-        let cached = &entries[&cache_key(&request, &url)][0];
+        let cached = &entries.entries[&cache_key(&request, &url)][0];
 
         assert_eq!(hit.body.as_ref(), cached.response.body.as_ref());
         assert_eq!(hit.body.as_ptr(), cached.response.body.as_ptr());
+    }
+
+    #[test]
+    fn cache_keys_isolate_credentials_modes_request_modes_and_authorization() {
+        let url = Url::parse("https://example.test/identity").unwrap();
+        let omit = Request::get(url.as_str());
+
+        let mut include = omit.try_clone().unwrap();
+        include.set_credentials_mode(CredentialsMode::Include);
+        assert_ne!(cache_key(&omit, &url), cache_key(&include, &url));
+
+        let mut no_cors = omit.try_clone().unwrap();
+        no_cors.set_mode(RequestMode::NoCors).unwrap();
+        assert_ne!(cache_key(&omit, &url), cache_key(&no_cors, &url));
+
+        let mut authorized = omit.try_clone().unwrap();
+        authorized
+            .set_header(AUTHORIZATION, "Bearer cache-key-test".parse().unwrap())
+            .unwrap();
+        assert_ne!(cache_key(&omit, &url), cache_key(&authorized, &url));
+    }
+
+    #[test]
+    fn cache_evicts_the_least_recently_used_primary_entry() {
+        let cache = ResponseCache::new(2, 64);
+        let first = Url::parse("https://example.test/first").unwrap();
+        let second = Url::parse("https://example.test/second").unwrap();
+        let third = Url::parse("https://example.test/third").unwrap();
+        let first_request = Request::get(first.as_str());
+        let second_request = Request::get(second.as_str());
+        let third_request = Request::get(third.as_str());
+
+        cache.insert(&first_request, &first, cached_response(&first, b"first"));
+        cache.insert(
+            &second_request,
+            &second,
+            cached_response(&second, b"second"),
+        );
+        assert!(cache.get(&first_request, &first).is_some());
+        cache.insert(&third_request, &third, cached_response(&third, b"third"));
+
+        assert!(cache.get(&first_request, &first).is_some());
+        assert!(cache.get(&second_request, &second).is_none());
+        assert!(cache.get(&third_request, &third).is_some());
+    }
+
+    #[test]
+    fn cache_evicts_across_partitions_to_stay_within_the_body_budget() {
+        let cache = ResponseCache::new(4, 8);
+        let url = Url::parse("https://example.test/budget").unwrap();
+        let mut first = Request::get(url.as_str());
+        first.set_cache_partition("one".into());
+        let mut second = first.try_clone().unwrap();
+        second.set_cache_partition("two".into());
+
+        cache.insert(&first, &url, cached_response(&url, b"first"));
+        cache.insert(&second, &url, cached_response(&url, b"second"));
+
+        assert!(cache.get(&first, &url).is_none());
+        assert!(cache.get(&second, &url).is_some());
+        assert_eq!(cache.entries.read().unwrap().total_body_size, 6);
+    }
+
+    #[test]
+    fn insertion_removes_expired_entries_before_admitting_new_data() {
+        let cache = ResponseCache::new(4, 64);
+        let expired_url = Url::parse("https://example.test/expired-prune").unwrap();
+        let fresh_url = Url::parse("https://example.test/fresh-prune").unwrap();
+        let expired_request = Request::get(expired_url.as_str());
+        let fresh_request = Request::get(fresh_url.as_str());
+        let expired_key = cache_key(&expired_request, &expired_url);
+
+        cache.insert(
+            &expired_request,
+            &expired_url,
+            cached_response(&expired_url, b"expired"),
+        );
+        cache
+            .entries
+            .write()
+            .unwrap()
+            .entries
+            .get_mut(&expired_key)
+            .unwrap()[0]
+            .expires_at = Instant::now();
+
+        cache.insert(
+            &fresh_request,
+            &fresh_url,
+            cached_response(&fresh_url, b"fresh"),
+        );
+
+        let entries = cache.entries.read().unwrap();
+        assert!(!entries.entries.contains_key(&expired_key));
+        assert_eq!(entries.entries.len(), 1);
+        assert_eq!(entries.total_body_size, 5);
+    }
+
+    #[test]
+    fn authorized_requests_are_never_stored() {
+        let cache = ResponseCache::default();
+        let url = Url::parse("https://example.test/authorized").unwrap();
+        let mut request = Request::get(url.as_str());
+        request
+            .set_header(AUTHORIZATION, "Bearer do-not-store".parse().unwrap())
+            .unwrap();
+
+        cache.insert(&request, &url, cached_response(&url, b"private"));
+
+        assert!(cache.get(&request, &url).is_none());
+    }
+
+    fn cached_response(url: &Url, body: &'static [u8]) -> StoredResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+        StoredResponse {
+            status: StatusCode::OK,
+            headers,
+            url: url.to_string(),
+            body: Bytes::from_static(body),
+            cookie_headers_processed: false,
+        }
     }
 }
