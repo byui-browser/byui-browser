@@ -157,6 +157,14 @@ fn inline_styles_and_html_elements_are_audited() {
 }
 
 #[test]
+fn a_drop_down_select_showing_its_selected_option_is_supported() {
+    let html = "<!DOCTYPE html><html><body>\
+                <select><option>One</option><option selected>Two</option></select></body></html>";
+    let report = audit(html, &[], &[], None);
+    assert!(!has(&report, Area::Html, "<select>"));
+}
+
+#[test]
 fn unobservable_properties_are_listed_as_unverified() {
     let report = audit("<p></p>", &[".x { cursor: pointer; }"], &[], None);
     assert!(!has(&report, Area::CssProperty, "cursor"));

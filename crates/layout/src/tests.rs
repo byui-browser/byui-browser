@@ -1377,6 +1377,116 @@ mod form_controls {
         assert_close(height, LINE);
     }
 
+    fn shown(html: &str, css: &str) -> Vec<String> {
+        let (document, tree) = lay_out(&format!("<body>{html}</body>"), css, 800.0);
+        texts(box_for(&tree, &document, "x"))
+    }
+
+    #[test]
+    fn drop_down_shows_the_selected_option() {
+        let one_two = "<option>One</option><option>Two</option>";
+        assert_eq!(
+            shown(&format!("<select id=x>{one_two}</select>"), CSS),
+            ["One"]
+        );
+        assert_eq!(
+            shown(
+                "<select id=x><option selected>One</option><option selected>Two</option></select>",
+                CSS
+            ),
+            ["Two"]
+        );
+        assert_eq!(
+            shown(
+                "<select id=x><option disabled>One</option><option>Two</option></select>",
+                CSS
+            ),
+            ["Two"]
+        );
+        assert_eq!(
+            shown(
+                "<select id=x><optgroup label=G disabled><option>A</option></optgroup>\
+                 <optgroup label=H><option>  In   group </option></optgroup></select>",
+                CSS
+            ),
+            ["In group"]
+        );
+        assert!(shown("<select id=x></select>", CSS).is_empty());
+    }
+
+    #[test]
+    fn drop_down_options_generate_no_boxes() {
+        let (document, tree) = lay_out(
+            "<body><select id=x><optgroup id=g label=G><option id=o>A</option></optgroup>\
+             <option>B</option></select></body>",
+            CSS,
+            800.0,
+        );
+        let select = box_for(&tree, &document, "x");
+        assert!(select.children.is_empty());
+        assert_eq!(select.lines.len(), 1);
+        assert!(select.select_arrow);
+        assert!(find(&tree.root, id(&document, "o")).is_none());
+        assert!(find(&tree.root, id(&document, "g")).is_none());
+        // A list box keeps its option boxes and draws no arrow.
+        let (document, tree) = lay_out(
+            "<body><select id=x multiple><option id=o>A</option></select></body>",
+            CSS,
+            800.0,
+        );
+        assert!(!box_for(&tree, &document, "x").select_arrow);
+        assert!(find(&tree.root, id(&document, "o")).is_some());
+    }
+
+    /// Guards the merge with generated content (#393) and floats and
+    /// positioning (#413): a drop-down shows only its selected option, never
+    /// `::before` / `::after` content, in or out of flow.
+    #[test]
+    fn drop_downs_ignore_pseudo_elements_and_keep_working_out_of_flow() {
+        let css = format!(
+            "{CSS} select::before {{ content: 'BEFORE' }} select::after {{ content: 'AFTER' }}"
+        );
+        let (document, tree) = lay_out(
+            "<body><div style='position: relative'>\
+             <select id=f style='float: right'><option>One</option></select>\
+             <select id=a style='position: absolute; top: 0; left: 0'>\
+             <option>A</option><option selected>B</option></select>\
+             <select id=x><option>In flow</option></select></div></body>",
+            &css,
+            800.0,
+        );
+        let floated = box_for(&tree, &document, "f");
+        assert_eq!(floated.placement, Placement::Float);
+        assert_eq!(texts(floated), ["One"]);
+        assert!(floated.select_arrow);
+        let placed = box_for(&tree, &document, "a");
+        assert_eq!(placed.placement, Placement::Absolute);
+        assert_eq!(texts(placed), ["B"]);
+        assert!(placed.select_arrow);
+        assert_eq!(texts(box_for(&tree, &document, "x")), ["In flow"]);
+    }
+
+    #[test]
+    fn drop_down_width_follows_the_widest_option_not_the_selection() {
+        let options = "<option>Short</option><option>A much longer option label</option>";
+        let (width, height) = size(&format!("<select id=x>{options}</select>"), CSS);
+        assert_close(width, 26.0 * 8.0 + 20.0);
+        assert_close(height, LINE);
+        assert_eq!(
+            shown(&format!("<select id=x>{options}</select>"), CSS),
+            ["Short"]
+        );
+    }
+
+    #[test]
+    fn long_drop_down_text_is_clipped_before_the_arrow() {
+        let css = format!("{CSS} #x {{ width: 80px }}");
+        let html = "<select id=x><option>Clipped long label here</option></select>";
+        assert_eq!(size(html, &css), (80.0, LINE));
+        // 80px less 20px of arrow room fits 7 characters, on one line.
+        assert_eq!(shown(html, &css), ["Clipped"]);
+    }
+
     #[test]
     fn empty_button_is_one_line_tall() {
         let (width, height) = size("<button id=x></button>", CSS);

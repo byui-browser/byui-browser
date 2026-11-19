@@ -5,6 +5,7 @@
 //! origin of the box being laid out; the parent translates them into place.
 
 use crate::box_tree::{BlockBox, BlockContents};
+use crate::control::SELECT_ARROW_ROOM;
 use crate::layout::Context;
 use std::sync::Arc;
 
@@ -268,6 +269,7 @@ impl Context<'_> {
             placement: Placement::InFlow,
             children,
             lines,
+            select_arrow: false,
             image: None,
             control: None,
         }
@@ -340,6 +342,24 @@ impl Context<'_> {
                         &mut children,
                         &mut floats,
                     )
+                }
+            }
+            BlockContents::Inlines(items) if block.is_drop_down() => {
+                // One unbroken line beside the arrow; text that doesn't fit
+                // is clipped where the arrow area starts.
+                let text_width = (content_width - SELECT_ARROW_ROOM).max(0.0);
+                let (_, max_content) = self.inline_intrinsic_sizes(items, style);
+                let inline =
+                    self.layout_inline(items, style, text_width.max(max_content), &mut floats);
+                lines = inline.lines;
+                children.extend(inline.floats);
+                self.clip_lines(&mut lines, text_width, content_width);
+                FlowResult {
+                    height: lines.last().map_or(0.0, |line| line.rect.bottom()),
+                    margin_top: edges.own_top,
+                    margin_bottom: edges.own_bottom,
+                    has_content: !lines.is_empty(),
+                    absolutes: inline.absolutes,
                 }
             }
             BlockContents::Inlines(items) => {
@@ -471,6 +491,7 @@ impl Context<'_> {
                 placement: placement(style),
                 children,
                 lines,
+                select_arrow: block.is_drop_down(),
                 image: match &block.contents {
                     BlockContents::Replaced(replaced) => replaced.key.clone(),
                     _ => None,
