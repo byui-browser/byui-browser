@@ -2,13 +2,17 @@
 //! address field, actions) above a rounded page card.
 //!
 //! Window controls come from the operating system: each shell keeps its native
-//! decorations, and where those overlap the toolbar (macOS's traffic lights on
-//! a transparent titlebar) the controls shift right by
-//! [`ChromeState::window_controls_inset`]. The tab strip sits above this toolbar;
-//! navigation and address editing are handled by the shared shell.
+//! decorations. Where those overlap the window contents (macOS's traffic
+//! lights on a transparent titlebar) they share the tab strip's row, which
+//! reserves room for them; this toolbar sits below that row, so its Back
+//! button lines up with the traffic lights' leading edge. Navigation and
+//! address editing are handled by the shared shell.
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
-use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform};
+use tiny_skia::{
+    Color, FillRule, GradientStop, LinearGradient, Paint, Path, PathBuilder, Pixmap, Point, Rect,
+    SpreadMode, Stroke, Transform,
+};
 
 /// Address toolbar height in logical pixels, below the shared tab strip.
 pub(crate) const TOOLBAR_HEIGHT: f64 = 52.0;
@@ -30,25 +34,32 @@ const ADDRESS_MAX_WIDTH: f32 = 640.0;
 /// Logical distance from the address field's left edge to its text, leaving
 /// room for the Site Information button.
 const ADDRESS_TEXT_LEADING: f32 = 30.0;
-/// Logical distance from the toolbar's left edge (after the window-controls
-/// inset) to the Back button when it is furthest left: when the address field
-/// sits at [`ADDRESS_LEADING`] or the window is too narrow to show the field.
-const NAV_LEADING: f32 = 12.0;
+/// Logical distance from the window's left edge to the Back button. The
+/// chevron is then centered under macOS's close traffic light (x ≈ 20.5) in
+/// the tab strip row above, so the two groups line up.
+const NAV_LEADING: f32 = 7.0;
 /// Logical horizontal distance between neighboring navigation buttons' left
 /// edges.
 const NAV_STRIDE: f32 = 32.0;
 /// Logical width of the Back, Forward, and Reload group.
 const NAV_WIDTH: f32 = 2.0 * NAV_STRIDE + BUTTON_SIZE;
-/// Logical gap between the Reload button and the address field; the
-/// navigation group stays this far left of the field wherever it sits.
-const NAV_ADDRESS_GAP: f32 = ADDRESS_LEADING - NAV_LEADING - NAV_WIDTH;
-/// Logical distance from the toolbar's left edge (after the window-controls
-/// inset) to the earliest position of the address field.
-const ADDRESS_LEADING: f32 = 116.0;
+/// Minimum logical gap between the Reload button and the address field.
+const NAV_ADDRESS_GAP: f32 = 12.0;
+/// Logical distance from the window's left edge to the earliest position of
+/// the address field, just past the navigation group.
+const ADDRESS_LEADING: f32 = NAV_LEADING + NAV_WIDTH + NAV_ADDRESS_GAP;
 /// Narrower windows drop the menu button to keep the address
 /// field usable.
 const TRAILING_MIN_WIDTH: f32 = 360.0;
 const TEXT_SIZE: f32 = 13.0;
+/// Logical height of the address-field load bar.
+const LOADING_BAR_HEIGHT: f32 = 1.5;
+/// Logical gap between the load bar and the address field's left and right edges.
+const LOADING_BAR_INSET_X: f32 = 10.0;
+/// Logical gap between the load bar and the address field's bottom edge.
+const LOADING_BAR_INSET_BOTTOM: f32 = 2.0;
+/// Where the solid accent gives way to the fade, as a fraction of the filled width.
+const LOADING_BAR_FADE_START: f32 = 0.62;
 
 /// A clickable region of the chrome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,18 +108,19 @@ pub(crate) struct ChromeState {
     /// Whether to use the dark palette.
     pub dark: bool,
     /// Whether the newest navigation or Refresh fetch is still pending.
+    /// While set, a blue progress bar is drawn along the bottom of the
+    /// address field.
     pub loading: bool,
+    /// Fraction of the address-field load bar that is filled, from 0 to 1.
+    /// The shell advances this from the moment a load starts. It is drawn
+    /// only while [`ChromeState::loading`] is set.
+    pub load_progress: f32,
     /// Whether a previous history entry is available.
     pub can_go_back: bool,
     /// Whether a forward history entry is available.
     pub can_go_forward: bool,
     /// Reserve space below the toolbar for Find in Page.
     pub find_open: bool,
-    /// Logical width at the toolbar's left reserved for the operating
-    /// system's own window buttons when they overlap the toolbar, as macOS's
-    /// traffic lights do on a transparent titlebar. Zero when the system draws
-    /// its buttons in a separate titlebar above the toolbar.
-    pub window_controls_inset: f32,
     /// Whether the address field owns keyboard input.
     pub address_focused: bool,
     /// Fixed end of the address selection as a byte offset into the address
@@ -182,12 +194,11 @@ pub(crate) fn page_rect_with_find(
 }
 
 /// Returns the enabled or disabled control at a point given in logical
-/// pixels, for a window `width` logical pixels wide whose toolbar starts
-/// `inset` logical pixels in (see [`ChromeState::window_controls_inset`]).
-pub(crate) fn hit_test(x: f64, y: f64, width: f64, inset: f32) -> Option<Control> {
+/// pixels, for a window `width` logical pixels wide.
+pub(crate) fn hit_test(x: f64, y: f64, width: f64) -> Option<Control> {
     let (x, y) = (x as f32, y as f32);
     CONTROLS.into_iter().find(|control| {
-        control_rect(*control, width as f32, inset).is_some_and(|rect| {
+        control_rect(*control, width as f32).is_some_and(|rect| {
             x >= rect.left() && x < rect.right() && y >= rect.top() && y < rect.bottom()
         })
     })
@@ -388,12 +399,11 @@ fn draw_toolbar(
     address: &str,
 ) {
     let transform = Transform::from_scale(scale, scale);
-    let inset = state.window_controls_inset;
     for control in CONTROLS {
         if matches!(control, Control::Address | Control::SiteInfo) {
             continue;
         }
-        let Some(rect) = control_rect(control, width, inset) else {
+        let Some(rect) = control_rect(control, width) else {
             continue;
         };
         let active = control.is_enabled(state);
@@ -415,7 +425,7 @@ fn draw_toolbar(
         let (cx, cy) = (rect.x() + rect.width() / 2.0, CENTER_Y);
         draw_icon(pixmap, control, cx, cy, color, transform);
     }
-    if let Some(rect) = control_rect(Control::Address, width, inset) {
+    if let Some(rect) = control_rect(Control::Address, width) {
         draw_address_field(pixmap, rect, scale, state, palette, font, address);
     }
 }
@@ -526,6 +536,8 @@ fn draw_address_field(
         palette.pressed
     } else if state.hovered == Some(Control::SiteInfo) {
         palette.hover
+    } else if state.dark {
+        palette.frame_top
     } else {
         palette.field_border
     };
@@ -623,7 +635,7 @@ fn draw_address_field(
             text_x * scale,
             baseline,
             clip_x * scale,
-            if state.address_focused {
+            if state.address_focused || state.dark {
                 palette.text
             } else {
                 palette.text_muted
@@ -631,6 +643,7 @@ fn draw_address_field(
             address,
         );
     }
+    draw_loading_bar(pixmap, rect, transform, state, palette);
     if state.address_focused && selection.is_none() {
         let x = caret_x.min(clip_x - 2.0) + 1.0;
         if let Some(caret) = Rect::from_xywh(x, cy - 8.0, 1.5, 16.0) {
@@ -644,22 +657,79 @@ fn draw_address_field(
     }
 }
 
+/// How much of the address-field load bar is filled after `elapsed`.
+///
+/// The curve starts with a visible segment and eases toward about 92% of
+/// the field. It stays short of full so the bar is still moving when the
+/// load completes and the bar is removed.
+pub(crate) fn loading_bar_fraction(elapsed: std::time::Duration) -> f32 {
+    let eased = 1.0 - (-elapsed.as_secs_f32() * 1.35).exp();
+    (0.08 + eased * 0.84).min(0.92)
+}
+
+/// Draws the load indicator along the bottom inner edge of the address field.
+///
+/// The bar is a hairline. Its leading edge, the side the load is moving
+/// toward, fades from the accent color to transparent.
+fn draw_loading_bar(
+    pixmap: &mut Pixmap,
+    rect: Rect,
+    transform: Transform,
+    state: &ChromeState,
+    palette: &Palette,
+) {
+    if !state.loading {
+        return;
+    }
+    let height = LOADING_BAR_HEIGHT;
+    let y = rect.bottom() - height - LOADING_BAR_INSET_BOTTOM;
+    let x = rect.x() + LOADING_BAR_INSET_X;
+    let track_w = (rect.width() - LOADING_BAR_INSET_X * 2.0).max(0.0);
+    let progress = state.load_progress.clamp(0.0, 1.0);
+    if track_w < 1.0 || progress <= 0.0 {
+        return;
+    }
+    let fill_w = (track_w * progress).clamp(4.0_f32.min(track_w), track_w);
+    let Some(path) = rounded_rect(x, y, fill_w, height, height / 2.0) else {
+        return;
+    };
+    let mut faded = palette.accent;
+    faded.set_alpha(0.0);
+    let Some(shader) = LinearGradient::new(
+        Point::from_xy(x, y),
+        Point::from_xy(x + fill_w, y),
+        vec![
+            GradientStop::new(0.0, palette.accent),
+            GradientStop::new(LOADING_BAR_FADE_START, palette.accent),
+            GradientStop::new(1.0, faded),
+        ],
+        SpreadMode::Pad,
+        Transform::identity(),
+    ) else {
+        fill(pixmap, &path, palette.accent, transform);
+        return;
+    };
+    let paint = Paint {
+        shader,
+        ..Default::default()
+    };
+    pixmap.fill_path(&path, &paint, FillRule::Winding, transform, None);
+}
+
 /// Returns the byte offset in `address` of the character boundary nearest to
 /// logical x coordinate `x`, for placing the caret where the pointer presses
 /// or drags in the address field of a toolbar `width` logical pixels wide
-/// with leading inset `inset`. `scale` is the device scale factor the field
+/// `scale` is the device scale factor the field
 /// is painted at. Points left of the text give 0 and points right of it give
 /// the address length; without a font every point maps to 0.
 pub(crate) fn address_offset_at(
     x: f64,
     width: f64,
-    inset: f32,
     scale: f32,
     font: Option<&FontVec>,
     address: &str,
 ) -> usize {
-    let (Some(font), Some(rect)) = (font, control_rect(Control::Address, width as f32, inset))
-    else {
+    let (Some(font), Some(rect)) = (font, control_rect(Control::Address, width as f32)) else {
         return 0;
     };
     let size = TEXT_SIZE * scale;
@@ -754,27 +824,21 @@ pub(crate) fn draw_text(
     caret
 }
 
-/// Returns where `control` sits in a toolbar `width` logical pixels wide
-/// whose leading controls start `inset` pixels in, or `None` when the window
-/// is too narrow to show it.
+/// Returns where `control` sits in a toolbar `width` logical pixels wide, or
+/// `None` when the window is too narrow to show it.
 ///
-/// Back, Forward, and Reload sit just left of the address field and move
-/// with it; when the field is hidden they sit at [`NAV_LEADING`].
-fn control_rect(control: Control, width: f32, inset: f32) -> Option<Rect> {
+/// Back, Forward, and Reload stay pinned at [`NAV_LEADING`], under the
+/// window's traffic lights, while the address field centers independently.
+fn control_rect(control: Control, width: f32) -> Option<Rect> {
     let button = |x: f32| Rect::from_xywh(x, BUTTON_TOP, BUTTON_SIZE, BUTTON_SIZE);
     let trailing = width >= TRAILING_MIN_WIDTH;
-    let nav_x = || {
-        address_rect(width, inset, trailing).map_or(inset + NAV_LEADING, |field| {
-            field.x() - NAV_ADDRESS_GAP - NAV_WIDTH
-        })
-    };
     match control {
-        Control::Back => button(nav_x()),
-        Control::Forward => button(nav_x() + NAV_STRIDE),
-        Control::Reload => button(nav_x() + 2.0 * NAV_STRIDE),
+        Control::Back => button(NAV_LEADING),
+        Control::Forward => button(NAV_LEADING + NAV_STRIDE),
+        Control::Reload => button(NAV_LEADING + 2.0 * NAV_STRIDE),
         Control::Menu => button(width - 44.0).filter(|_| trailing),
-        Control::Address => address_rect(width, inset, trailing),
-        Control::SiteInfo => address_rect(width, inset, trailing).map(site_info_button),
+        Control::Address => address_rect(width, trailing),
+        Control::SiteInfo => address_rect(width, trailing).map(site_info_button),
     }
 }
 
@@ -784,14 +848,14 @@ fn site_info_button(field: Rect) -> Rect {
 }
 
 /// Left edge of the Site Information button in logical window pixels.
-pub(crate) fn site_info_anchor(width: f64, inset: f32) -> Option<f32> {
-    control_rect(Control::SiteInfo, width as f32, inset).map(|rect| rect.left())
+pub(crate) fn site_info_anchor(width: f64) -> Option<f32> {
+    control_rect(Control::SiteInfo, width as f32).map(|rect| rect.left())
 }
 
 /// Returns where the address field sits, or `None` when the window is too
 /// narrow for it. `trailing` says whether the menu is shown.
-fn address_rect(width: f32, inset: f32, trailing: bool) -> Option<Rect> {
-    let leading = inset + ADDRESS_LEADING;
+fn address_rect(width: f32, trailing: bool) -> Option<Rect> {
+    let leading = ADDRESS_LEADING;
     let right = if trailing { width - 92.0 } else { width - 12.0 };
     let available = right - leading;
     if available < 80.0 {
@@ -876,6 +940,10 @@ pub(crate) struct Palette {
     pub(crate) text: Color,
     pub(crate) text_muted: Color,
     pub(crate) accent: Color,
+    pub(crate) on_accent: Color,
+    pub(crate) active_tab: Color,
+    pub(crate) panel: Color,
+    pub(crate) panel_border: Color,
     pub(crate) selection: Color,
 }
 
@@ -901,6 +969,10 @@ fn light() -> Palette {
         text_muted: rgba(0x6b, 0x72, 0x80, 255),
         // BYU–Idaho blue.
         accent: rgba(0x00, 0x6e, 0xb6, 255),
+        on_accent: Color::WHITE,
+        active_tab: Color::WHITE,
+        panel: rgba(0xf4, 0xf5, 0xf8, 255),
+        panel_border: rgba(15, 23, 42, 34),
         selection: rgba(0x00, 0x6e, 0xb6, 64),
     }
 }
@@ -911,16 +983,20 @@ fn dark() -> Palette {
         frame_bottom: rgba(0x1b, 0x1c, 0x20, 255),
         shadow: rgba(0, 0, 0, 40),
         card_border: rgba(255, 255, 255, 20),
-        icon: rgba(0xe2, 0xe5, 0xeb, 255),
-        icon_disabled: rgba(0xe2, 0xe5, 0xeb, 70),
+        icon: rgba(0xec, 0xef, 0xf5, 255),
+        icon_disabled: rgba(0x7b, 0x82, 0x90, 255),
         hover: rgba(255, 255, 255, 18),
         pressed: rgba(255, 255, 255, 32),
-        field: rgba(255, 255, 255, 16),
-        field_hover: rgba(255, 255, 255, 26),
-        field_border: rgba(255, 255, 255, 16),
+        field: rgba(0x30, 0x33, 0x3c, 255),
+        field_hover: rgba(0x39, 0x3d, 0x48, 255),
+        field_border: rgba(0x67, 0x70, 0x83, 255),
         text: rgba(0xec, 0xee, 0xf2, 255),
-        text_muted: rgba(0x96, 0x9c, 0xa8, 255),
+        text_muted: rgba(0xb0, 0xb8, 0xc7, 255),
         accent: rgba(0x4d, 0xa3, 0xff, 255),
+        on_accent: rgba(0x12, 0x1b, 0x29, 255),
+        active_tab: rgba(0x41, 0x49, 0x59, 255),
+        panel: rgba(0x29, 0x2c, 0x35, 255),
+        panel_border: rgba(0x6e, 0x77, 0x89, 255),
         selection: rgba(0x4d, 0xa3, 0xff, 96),
     }
 }
@@ -932,6 +1008,46 @@ mod tests {
     fn pixel(pixmap: &Pixmap, x: u32, y: u32) -> [u8; 4] {
         let p = pixmap.pixel(x, y).expect("pixel in bounds");
         [p.red(), p.green(), p.blue(), p.alpha()]
+    }
+
+    #[test]
+    fn dark_palette_keeps_text_controls_and_focus_legible() {
+        fn luminance(color: Color) -> f32 {
+            let linear = |value: f32| {
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(color.red())
+                + 0.7152 * linear(color.green())
+                + 0.0722 * linear(color.blue())
+        }
+        let contrast = |a, b| {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        };
+        let dark = palette(true);
+        for (foreground, background) in [
+            (dark.text, dark.field_hover),
+            (dark.text, dark.active_tab),
+            (dark.text_muted, dark.panel),
+            (dark.on_accent, dark.accent),
+        ] {
+            assert!(contrast(foreground, background) >= 4.5);
+        }
+        for (foreground, background) in [
+            (dark.icon, dark.field_hover),
+            (dark.icon_disabled, dark.frame_top),
+            (dark.accent, dark.active_tab),
+            (dark.accent, dark.field_hover),
+            (dark.panel_border, dark.panel),
+        ] {
+            assert!(contrast(foreground, background) >= 3.0);
+        }
+        let light = palette(false);
+        assert!(contrast(light.on_accent, light.accent) >= 4.5);
     }
 
     #[cfg(target_os = "macos")]
@@ -949,7 +1065,6 @@ mod tests {
                     let height = (300.0 * scale) as u32;
                     let idle = ChromeState {
                         dark,
-                        window_controls_inset: 72.0,
                         address_focused: true,
                         address_caret: usize::MAX,
                         ..ChromeState::default()
@@ -970,7 +1085,7 @@ mod tests {
                         compose_controls(width_px, height, scale, &busy, address, Some(&font))
                             .unwrap();
                     assert_eq!(strip.data(), &after.data()[..strip.data().len()]);
-                    let rect = control_rect(Control::Address, width as f32, 72.0).unwrap();
+                    let rect = control_rect(Control::Address, width as f32).unwrap();
                     for y in 0..height {
                         for x in 0..width_px {
                             if (x as f64 / scale) < rect.left() as f64 - 1.0
@@ -989,19 +1104,129 @@ mod tests {
     }
 
     #[test]
+    fn loading_bar_eases_along_the_bottom_of_the_address_field() {
+        let start = loading_bar_fraction(std::time::Duration::ZERO);
+        let mid = loading_bar_fraction(std::time::Duration::from_millis(400));
+        let late = loading_bar_fraction(std::time::Duration::from_secs(4));
+        assert!((0.08..0.2).contains(&start), "{start}");
+        assert!(mid > start + 0.2, "{start} {mid}");
+        assert!(late > mid);
+        assert!(late < 0.94, "{late}");
+
+        let width = 640.0;
+        let field = control_rect(Control::Address, width).unwrap();
+        let y =
+            (field.bottom() - LOADING_BAR_INSET_BOTTOM - LOADING_BAR_HEIGHT / 2.0).round() as u32;
+        for dark in [false, true] {
+            let idle_state = ChromeState {
+                dark,
+                ..ChromeState::default()
+            };
+            let idle = compose(
+                width as u32,
+                200,
+                1.0,
+                &idle_state,
+                "https://example.com/",
+                None,
+                None,
+            )
+            .unwrap();
+            let early_state = ChromeState {
+                loading: true,
+                load_progress: start,
+                ..idle_state
+            };
+            let later_state = ChromeState {
+                load_progress: mid,
+                ..early_state
+            };
+            let early = compose(
+                width as u32,
+                200,
+                1.0,
+                &early_state,
+                "https://example.com/",
+                None,
+                None,
+            )
+            .unwrap();
+            let later = compose(
+                width as u32,
+                200,
+                1.0,
+                &later_state,
+                "https://example.com/",
+                None,
+                None,
+            )
+            .unwrap();
+            let track = field.width() - LOADING_BAR_INSET_X * 2.0;
+            let fill_start = field.left() + LOADING_BAR_INSET_X;
+            let early_fill = (track * start).max(4.0);
+            let body = (fill_start + early_fill * 0.2).round() as u32;
+            let tip = (fill_start + early_fill * 0.92).round() as u32;
+            assert!(
+                bar_pixel_differs(pixel(&idle, body, y), pixel(&early, body, y)),
+                "early bar {:?} vs {:?}",
+                pixel(&early, body, y),
+                pixel(&idle, body, y)
+            );
+            // The leading edge fades toward the empty field.
+            let body_gap = color_distance(pixel(&early, body, y), pixel(&idle, body, y));
+            let tip_gap = color_distance(pixel(&early, tip, y), pixel(&idle, tip, y));
+            assert!(
+                tip_gap + 12 < body_gap,
+                "fade tip {tip_gap} should be closer to the field than the body {body_gap}"
+            );
+            let between = fill_start + track * (start + mid) / 2.0;
+            let between = between.round() as u32;
+            assert!(
+                bar_pixel_differs(pixel(&early, between, y), pixel(&later, between, y)),
+                "later bar {:?} vs early {:?}",
+                pixel(&later, between, y),
+                pixel(&early, between, y)
+            );
+            // The indicator stays inside the address field.
+            assert_eq!(
+                pixel(&idle, 20, CENTER_Y as u32),
+                pixel(&early, 20, CENTER_Y as u32)
+            );
+            let below = (field.bottom() + 6.0) as u32;
+            assert_eq!(
+                pixel(&idle, body, below),
+                pixel(&early, body, below),
+                "bar spilled below the address field"
+            );
+        }
+    }
+
+    fn bar_pixel_differs(idle: [u8; 4], bar: [u8; 4]) -> bool {
+        let sum = |pixel: [u8; 4]| u32::from(pixel[0]) + u32::from(pixel[1]) + u32::from(pixel[2]);
+        bar[2] > idle[2].saturating_add(40) || sum(bar) + 120 < sum(idle)
+    }
+
+    fn color_distance(left: [u8; 4], right: [u8; 4]) -> u32 {
+        left.into_iter()
+            .zip(right)
+            .map(|(a, b)| u32::from(a.abs_diff(b)))
+            .sum()
+    }
+
+    #[test]
     fn page_card_is_inset_below_toolbar() {
         assert_eq!(
             page_rect(640, 480, 1.0),
             Some(PixelRect {
                 x: 8,
-                y: 84,
+                y: 88,
                 width: 624,
-                height: 388
+                height: 384
             })
         );
         assert_eq!(
             page_rect(1280, 960, 2.0).map(|r| (r.x, r.y)),
-            Some((16, 168))
+            Some((16, 176))
         );
         assert_eq!(page_rect(640, 60, 1.0), None);
         assert_eq!(page_rect(16, 480, 1.0), None);
@@ -1037,25 +1262,23 @@ mod tests {
     fn hit_testing_finds_toolbar_controls() {
         // A 600-pixel window keeps the address field at its leftmost spot,
         // so the navigation buttons sit at their leading position.
+        assert_eq!(hit_test(26.0, CENTER_Y as f64, 600.0), Some(Control::Back));
         assert_eq!(
-            hit_test(26.0, CENTER_Y as f64, 600.0, 0.0),
-            Some(Control::Back)
-        );
-        assert_eq!(
-            hit_test(90.0, CENTER_Y as f64, 600.0, 0.0),
+            hit_test(90.0, CENTER_Y as f64, 600.0),
             Some(Control::Reload)
         );
         assert_eq!(
-            hit_test(500.0, CENTER_Y as f64, 1000.0, 0.0),
+            hit_test(500.0, CENTER_Y as f64, 1000.0),
             Some(Control::Address)
         );
         assert_eq!(
-            hit_test(1000.0 - 30.0, CENTER_Y as f64, 1000.0, 0.0),
+            hit_test(1000.0 - 30.0, CENTER_Y as f64, 1000.0),
             Some(Control::Menu)
         );
-        assert_eq!(hit_test(109.0, CENTER_Y as f64, 600.0, 0.0), None);
-        assert_eq!(hit_test(26.0, CENTER_Y as f64, 1000.0, 0.0), None);
-        assert_eq!(hit_test(500.0, 200.0, 1000.0, 0.0), None);
+        assert_eq!(hit_test(109.0, CENTER_Y as f64, 600.0), None);
+        // Wide windows center the address field but keep navigation left.
+        assert_eq!(hit_test(26.0, CENTER_Y as f64, 1000.0), Some(Control::Back));
+        assert_eq!(hit_test(500.0, 200.0, 1000.0), None);
         let state = ChromeState::default();
         assert!(!Control::Back.is_enabled(&state));
         assert!(Control::Reload.is_enabled(&state));
@@ -1063,22 +1286,17 @@ mod tests {
 
     #[test]
     fn site_info_has_a_separate_hit_region_before_address_text() {
-        for (width, inset) in [(420.0, 72.0), (1120.0, 0.0)] {
-            let field = control_rect(Control::Address, width as f32, inset).unwrap();
-            let button = control_rect(Control::SiteInfo, width as f32, inset).unwrap();
+        for width in [420.0, 1120.0] {
+            let field = control_rect(Control::Address, width as f32).unwrap();
+            let button = control_rect(Control::SiteInfo, width as f32).unwrap();
             let text_x = field.left() + ADDRESS_TEXT_LEADING;
             assert!(button.right() < text_x);
             assert_eq!(
-                hit_test(
-                    f64::from(button.left() + 1.0),
-                    f64::from(CENTER_Y),
-                    width,
-                    inset
-                ),
+                hit_test(f64::from(button.left() + 1.0), f64::from(CENTER_Y), width),
                 Some(Control::SiteInfo)
             );
             assert_eq!(
-                hit_test(f64::from(text_x), f64::from(CENTER_Y), width, inset),
+                hit_test(f64::from(text_x), f64::from(CENTER_Y), width),
                 Some(Control::Address)
             );
         }
@@ -1086,8 +1304,8 @@ mod tests {
 
     #[test]
     fn disabled_navigation_controls_still_occupy_hit_regions() {
-        let back = hit_test(26.0, CENTER_Y as f64, 600.0, 0.0);
-        let forward = hit_test(58.0, CENTER_Y as f64, 600.0, 0.0);
+        let back = hit_test(26.0, CENTER_Y as f64, 600.0);
+        let forward = hit_test(58.0, CENTER_Y as f64, 600.0);
 
         assert_eq!(back, Some(Control::Back));
         assert_eq!(forward, Some(Control::Forward));
@@ -1097,42 +1315,30 @@ mod tests {
     }
 
     #[test]
-    fn window_controls_inset_shifts_leading_controls() {
-        // Space reserved for macOS's traffic lights holds no toolbar control.
-        assert_eq!(hit_test(20.0, CENTER_Y as f64, 1000.0, 72.0), None);
-        assert_eq!(hit_test(60.0, CENTER_Y as f64, 1000.0, 72.0), None);
-        assert_eq!(
-            hit_test(98.0, CENTER_Y as f64, 600.0, 72.0),
-            Some(Control::Back)
-        );
-        assert_eq!(
-            hit_test(162.0, CENTER_Y as f64, 600.0, 72.0),
-            Some(Control::Reload)
-        );
-        assert_eq!(hit_test(181.0, CENTER_Y as f64, 600.0, 72.0), None);
-        // The address field never slides under the leading controls.
-        let narrow = control_rect(Control::Address, 400.0, 72.0).unwrap();
-        assert_eq!(narrow.x(), 72.0 + ADDRESS_LEADING);
-        let centered = control_rect(Control::Address, 2000.0, 72.0).unwrap();
-        assert_eq!(centered.x(), (2000.0 - ADDRESS_MAX_WIDTH) / 2.0);
-    }
-
-    #[test]
-    fn navigation_buttons_follow_the_centered_address_field() {
-        for (width, inset) in [(600.0, 72.0), (1120.0, 72.0), (2000.0, 0.0)] {
-            let field = control_rect(Control::Address, width, inset).unwrap();
-            let back = control_rect(Control::Back, width, inset).unwrap();
-            let forward = control_rect(Control::Forward, width, inset).unwrap();
-            let reload = control_rect(Control::Reload, width, inset).unwrap();
-            assert_eq!(field.x() - reload.right(), NAV_ADDRESS_GAP);
+    fn navigation_buttons_stay_left_under_the_traffic_lights() {
+        for width in [200.0, 600.0, 1120.0, 2000.0] {
+            let back = control_rect(Control::Back, width).unwrap();
+            let forward = control_rect(Control::Forward, width).unwrap();
+            let reload = control_rect(Control::Reload, width).unwrap();
+            assert_eq!(back.x(), NAV_LEADING);
             assert_eq!(forward.x() - back.x(), NAV_STRIDE);
             assert_eq!(reload.x() - forward.x(), NAV_STRIDE);
-            assert!(back.x() >= inset + NAV_LEADING);
+            if let Some(field) = control_rect(Control::Address, width) {
+                assert!(field.x() - reload.right() >= NAV_ADDRESS_GAP);
+            }
         }
-        // Without an address field the buttons fall back to the leading edge.
-        assert!(control_rect(Control::Address, 200.0, 0.0).is_none());
-        let back = control_rect(Control::Back, 200.0, 0.0).unwrap();
-        assert_eq!(back.x(), NAV_LEADING);
+        assert_eq!(
+            hit_test(f64::from(NAV_LEADING) + 1.0, CENTER_Y as f64, 1000.0),
+            Some(Control::Back)
+        );
+        assert_eq!(hit_test(2.0, CENTER_Y as f64, 1000.0), None);
+        // The address field never slides under the navigation buttons, and
+        // still centers in wide windows.
+        let narrow = control_rect(Control::Address, 400.0).unwrap();
+        assert_eq!(narrow.x(), ADDRESS_LEADING);
+        let centered = control_rect(Control::Address, 2000.0).unwrap();
+        assert_eq!(centered.x(), (2000.0 - ADDRESS_MAX_WIDTH) / 2.0);
+        assert!(control_rect(Control::Address, 200.0).is_none());
     }
 
     #[test]
@@ -1147,9 +1353,9 @@ mod tests {
             return;
         };
         let address = "byui://welcome";
-        let field = control_rect(Control::Address, 1000.0, 0.0).unwrap();
+        let field = control_rect(Control::Address, 1000.0).unwrap();
         let text_x = f64::from(field.x() + ADDRESS_TEXT_LEADING);
-        let at = |x: f64| address_offset_at(x, 1000.0, 0.0, 2.0, Some(&font), address);
+        let at = |x: f64| address_offset_at(x, 1000.0, 2.0, Some(&font), address);
         assert_eq!(at(f64::from(field.x())), 0);
         assert_eq!(at(f64::from(field.right())), address.len());
         // The pen position after "byui" maps back to offset 4.
@@ -1160,7 +1366,7 @@ mod tests {
         assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
         // Without a font every point maps to the start.
         assert_eq!(
-            address_offset_at(text_x + 50.0, 1000.0, 0.0, 1.0, None, address),
+            address_offset_at(text_x + 50.0, 1000.0, 1.0, None, address),
             0
         );
     }
@@ -1168,10 +1374,10 @@ mod tests {
     #[test]
     fn toolbar_plus_is_removed_and_controls_stay_below_tabs() {
         for width in [420.0, 640.0, 1120.0] {
-            assert_eq!(hit_test(width - 66.0, CENTER_Y as f64, width, 72.0), None);
+            assert_eq!(hit_test(width - 66.0, CENTER_Y as f64, width), None);
             for control in CONTROLS {
                 assert!(
-                    control_rect(control, width as f32, 72.0).unwrap().top()
+                    control_rect(control, width as f32).unwrap().top()
                         >= crate::tab_strip::HEIGHT as f32
                 );
             }
@@ -1191,10 +1397,10 @@ mod tests {
 
     #[test]
     fn narrow_windows_drop_trailing_controls_then_the_address_field() {
-        assert!(control_rect(Control::Menu, 340.0, 0.0).is_none());
-        assert!(control_rect(Control::Address, 340.0, 0.0).is_some());
-        assert!(control_rect(Control::Address, 200.0, 0.0).is_none());
-        let wide = control_rect(Control::Address, 2000.0, 0.0).unwrap();
+        assert!(control_rect(Control::Menu, 340.0).is_none());
+        assert!(control_rect(Control::Address, 340.0).is_some());
+        assert!(control_rect(Control::Address, 200.0).is_none());
+        let wide = control_rect(Control::Address, 2000.0).unwrap();
         assert_eq!(wide.width(), ADDRESS_MAX_WIDTH);
         assert_eq!(wide.x(), (2000.0 - ADDRESS_MAX_WIDTH) / 2.0);
     }
@@ -1221,13 +1427,13 @@ mod tests {
                         pressed: hovered,
                         dark,
                         loading: false,
+                        load_progress: 0.0,
                         can_go_back: false,
                         can_go_forward: false,
                         find_open: false,
                         address_focused: false,
                         address_anchor: None,
                         address_caret: 0,
-                        window_controls_inset: if dark { 72.0 } else { 0.0 },
                     };
                     let out =
                         compose(width, height, 1.5, &state, "byui://welcome", None, None).unwrap();
@@ -1321,7 +1527,7 @@ mod tests {
             };
             let with_caret = compose(400, 200, 1.0, &focused, "x", None, None).unwrap();
             let without = compose(400, 200, 1.0, &selected, "x", None, None).unwrap();
-            let rect = control_rect(Control::Address, 400.0, 0.0).unwrap();
+            let rect = control_rect(Control::Address, 400.0).unwrap();
             // With no font the caret sits at the text origin.
             let x = (rect.x() + 31.5) as u32;
             let caret = pixel(&with_caret, x, CENTER_Y as u32);

@@ -32,40 +32,40 @@ impl RequestPolicy {
         max_keepalive_body_size: u64,
     ) -> Result<ValidatedUrl, RequestError> {
         request.validate_body_state(max_keepalive_body_size)?;
-        if request.keepalive {
+        if request.keepalive() {
             return Err(RequestError::UnsupportedFeature("keepalive lifetime"));
         }
-        if request.context.mode == crate::RequestMode::SameOrigin
-            && request.context.environment.origin.is_none()
+        if request.mode() == crate::RequestMode::SameOrigin
+            && request.environment().origin.is_none()
         {
             return Err(RequestError::UnsupportedFeature("client origin"));
         }
-        if request.context.credentials == CredentialsMode::Include
-            && request.context.environment.origin.is_none()
+        if request.credentials_mode() == CredentialsMode::Include
+            && request.environment().origin.is_none()
         {
             return Err(RequestError::UnsupportedFeature("client origin"));
         }
-        if request.integrity.is_some() {
+        if request.integrity().is_some() {
             return Err(RequestError::UnsupportedFeature("subresource integrity"));
         }
-        if request.cache_mode == CacheMode::NoCache {
+        if request.cache_mode() == CacheMode::NoCache {
             return Err(RequestError::UnsupportedFeature("HTTP cache revalidation"));
         }
-        if request.priority != RequestPriority::Auto {
+        if request.priority() != RequestPriority::Auto {
             return Err(RequestError::UnsupportedFeature("priority scheduling"));
         }
-        let url = match reqwest::Url::parse(&request.url) {
+        let url = match reqwest::Url::parse(request.url()) {
             Ok(url) => url,
-            Err(_) => match &request.context.environment.base_url {
+            Err(_) => match &request.environment().base_url {
                 Some(base_url) => base_url
-                    .join(&request.url)
-                    .map_err(|_| RequestError::InvalidUrl(request.url.clone()))?,
-                None => return Err(RequestError::InvalidUrl(request.url.clone())),
+                    .join(request.url())
+                    .map_err(|_| RequestError::InvalidUrl(request.url().to_owned()))?,
+                None => return Err(RequestError::InvalidUrl(request.url().to_owned())),
             },
         };
         self.validate_target(request, &url)?;
         let scheme = FetchScheme::from_url(&url)?;
-        if request.context.mode == crate::RequestMode::Navigate && scheme != FetchScheme::File {
+        if request.mode() == crate::RequestMode::Navigate && scheme != FetchScheme::File {
             return Err(RequestError::UnsupportedFeature("navigation fetch"));
         }
         log::trace!(
@@ -86,11 +86,11 @@ impl RequestPolicy {
             );
             return Err(RequestError::InvalidUrl(url.to_string()));
         }
-        if request.context.mode == crate::RequestMode::SameOrigin
+        if request.mode() == crate::RequestMode::SameOrigin
             && request.effective_origin().is_some_and(|origin| {
                 crate::Origin::from_url(url).is_ok_and(|target| !origin.is_same_origin(&target))
             })
-            && request.redirect_count > 0
+            && request.redirect_count() > 0
         {
             log::warn!(
                 "same-origin redirect target blocked before transport: {}",

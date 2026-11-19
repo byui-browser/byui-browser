@@ -21,7 +21,7 @@ pub use page::PageProvider;
 pub type ProviderFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SchemeResource, RequestError>> + Send + 'a>>;
 
-/// Browser-owned providers installed beside [`FetchServices`](crate::FetchServices).
+/// Browser-owned providers installed beside the controller's policy capabilities.
 ///
 /// Providers are optional capabilities. They are held by shared, thread-safe
 /// references and are selected strictly by URL scheme; `net` never performs a

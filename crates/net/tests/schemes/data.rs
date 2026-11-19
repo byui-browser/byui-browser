@@ -162,7 +162,7 @@ fn data_url_service_failures_do_not_expose_a_response() {
     ] {
         let services = Arc::new(FailingServices(failure));
         let controller = RequestController::builder(Config::default())
-            .with_fetch_services(services)
+            .with_browser_capabilities(services)
             .build()
             .unwrap();
         let error = runtime()

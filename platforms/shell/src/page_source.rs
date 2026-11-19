@@ -143,7 +143,13 @@ impl PageSource {
     }
 
     /// Draws the panel within the window using the latest wrapped layout.
-    pub(crate) fn draw(&mut self, frame: &mut Pixmap, scale: f64, font: Option<&FontVec>) {
+    pub(crate) fn draw(
+        &mut self,
+        frame: &mut Pixmap,
+        scale: f64,
+        dark: bool,
+        font: Option<&FontVec>,
+    ) {
         self.resize(
             f64::from(frame.width()) / scale,
             f64::from(frame.height()) / scale,
@@ -152,11 +158,21 @@ impl PageSource {
             return;
         };
         let transform = Transform::from_scale(scale as f32, scale as f32);
+        let palette = crate::toolbar::palette(dark);
         let mut paint = Paint::default();
-        paint.set_color_rgba8(245, 247, 250, 255);
+        paint.set_color(palette.panel);
         frame.fill_rect(panel, &paint, transform, None);
+        if dark {
+            crate::toolbar::stroke(
+                frame,
+                &tiny_skia::PathBuilder::from_rect(panel),
+                palette.panel_border,
+                1.0,
+                transform,
+            );
+        }
         if let Some(close) = self.close_rect() {
-            paint.set_color_rgba8(210, 222, 240, 255);
+            paint.set_color(palette.selection);
             frame.fill_rect(close, &paint, transform, None);
         }
         let Some(font) = font else {
@@ -185,7 +201,7 @@ impl PageSource {
             left,
             panel.top() + 25.0,
             title_right,
-            Color::BLACK,
+            palette.text,
         );
         if let Some(close) = self.close_rect() {
             text(
@@ -193,7 +209,7 @@ impl PageSource {
                 close.left() + 10.0,
                 close.top() + 18.0,
                 close.right() - 4.0,
-                Color::BLACK,
+                palette.text,
             );
         }
         text(
@@ -201,14 +217,14 @@ impl PageSource {
             left,
             panel.top() + 48.0,
             right,
-            Color::BLACK,
+            palette.text,
         );
         text(
             "Scroll / arrows / PgUp PgDn / Home End | Esc closes",
             left,
             panel.top() + 70.0,
             right,
-            Color::BLACK,
+            palette.text,
         );
         for (index, (line_number, row)) in self
             .rows
@@ -223,15 +239,9 @@ impl PageSource {
                 left,
                 y,
                 left + 38.0,
-                Color::from_rgba8(100, 110, 125, 255),
+                palette.text_muted,
             );
-            text(
-                row,
-                left + 48.0,
-                y,
-                right,
-                Color::from_rgba8(25, 50, 90, 255),
-            );
+            text(row, left + 48.0, y, right, palette.text);
         }
         let end = (self.offset + self.visible).min(self.rows.len());
         let start = if end == 0 { 0 } else { self.offset + 1 };
@@ -240,7 +250,7 @@ impl PageSource {
             left,
             panel.bottom() - 10.0,
             right,
-            Color::BLACK,
+            palette.text,
         );
         // A position indicator alongside the source; scrolling uses wheel/keys.
         let track_height = (panel.height() - 126.0).max(0.0);
@@ -253,7 +263,7 @@ impl PageSource {
             4.0,
             thumb_height,
         ) {
-            paint.set_color_rgba8(110, 130, 160, 255);
+            paint.set_color(palette.text_muted);
             frame.fill_rect(thumb, &paint, transform, None);
         }
     }
@@ -280,8 +290,11 @@ mod tests {
                 crate::toolbar::compose(800, 600, scale, &Default::default(), "", None, None)
                     .unwrap();
             let mut frame = base.clone();
-            PageSource::new("<html>source</html>").draw(&mut frame, scale, None);
+            PageSource::new("<html>source</html>").draw(&mut frame, scale, false, None);
             assert_ne!(frame.data(), base.data());
+            let mut dark = base.clone();
+            PageSource::new("<html>source</html>").draw(&mut dark, scale, true, None);
+            assert_ne!(dark.data(), frame.data());
             let restored =
                 crate::toolbar::compose(800, 600, scale, &Default::default(), "", None, None)
                     .unwrap();

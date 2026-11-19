@@ -27,11 +27,12 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
 use crate::compat_panel::{CompatState, ShellAuditor, ShellScriptEngine};
-use crate::context_menu::{ContextMenu, MenuAction};
+use crate::context_menu::{Appearance, ContextMenu, MenuAction};
 use crate::elements_panel::{DockTab, ElementsPanel};
 use crate::find_in_page::{Action as FindAction, FindInPage};
 use crate::page_source::PageSource;
 use crate::site_info;
+use crate::theme_preference;
 use crate::toolbar::{self, Control};
 use devtools::performance::{EventCategory, PerformanceLog, TimelineEvent};
 
@@ -117,9 +118,11 @@ pub struct Platform {
     /// one that loads is used; if none loads, pages use the built-in bitmap
     /// font.
     pub page_font_files: fn() -> Vec<PathBuf>,
-    /// Logical width at the toolbar's left that the system's window buttons
-    /// cover when they overlap the toolbar, as macOS's traffic lights do on a
-    /// transparent titlebar. Zero when the system draws its buttons in a
+    /// Logical width at the tab strip's left reserved for the system's window
+    /// buttons when they overlap the window contents, as macOS's traffic
+    /// lights do on a transparent titlebar, including the gap before the
+    /// first tab. Only the tab strip row reserves it; the toolbar below starts
+    /// at the window edge. Zero when the system draws its buttons in a
     /// separate titlebar above the window contents.
     pub window_controls_inset: f32,
 }
@@ -137,6 +140,9 @@ struct App {
     tabs: TabManager,
     inactive: HashMap<TabId, TabState>,
     tab_pressed: Option<TabAction>,
+    /// Tab under the middle button when it was pressed; released over the
+    /// same tab, that tab closes.
+    middle_tab_pressed: Option<TabId>,
     strip_offset: usize,
     refresh: Option<browser::refresh::RefreshClient>,
     modifiers: ModifiersState,
@@ -153,6 +159,9 @@ struct App {
     page_press: bool,
     find_pressed: Option<FindAction>,
     context_menu: Option<ContextMenu>,
+    appearance: Appearance,
+    appearance_path: Option<PathBuf>,
+    system_dark: Option<bool>,
     site_info_open: bool,
     menu_pressed: Option<MenuAction>,
     source_font: Option<FontVec>,
@@ -212,11 +221,24 @@ impl App {
         let root = browser::application_data_directory()
             .expect("application data directory should be available");
         let runtime =
-            browser::BrowserRuntime::open(root).expect("browser storage should initialize");
-        Self::with_runtime(platform, runtime)
+            browser::BrowserRuntime::open(&root).expect("browser storage should initialize");
+        Self::with_runtime(platform, runtime, Some(root.join("appearance")))
     }
 
-    fn with_runtime(platform: Platform, runtime: browser::BrowserRuntime) -> Self {
+    fn with_runtime(
+        platform: Platform,
+        runtime: browser::BrowserRuntime,
+        appearance_path: Option<PathBuf>,
+    ) -> Self {
+        let appearance = appearance_path
+            .as_deref()
+            .map_or(Appearance::System, |path| {
+                theme_preference::load(path)
+                    .inspect_err(|error| {
+                        log::warn!("could not load appearance preference: {error}")
+                    })
+                    .unwrap_or_default()
+            });
         let refresh = browser::refresh::RefreshClient::new()
             .map_err(|error| {
                 log::error!("refresh initialization failed: {error}");
@@ -226,6 +248,8 @@ impl App {
         let id = tabs.open("byui://welcome");
         let alerts = Arc::new(PageAlerts::new());
         alerts.set_document(id, 0);
+        let mut tab = TabState::new(id);
+        tab.chrome.dark = appearance.is_dark(None);
         Self {
             refresh,
             platform,
@@ -236,10 +260,11 @@ impl App {
             devtools_cursor: None,
             address_press: None,
             font: None,
-            tab: TabState::new(id, platform.window_controls_inset),
+            tab,
             tabs,
             inactive: HashMap::new(),
             tab_pressed: None,
+            middle_tab_pressed: None,
             strip_offset: 0,
             modifiers: ModifiersState::default(),
             cursor: None,
@@ -252,6 +277,9 @@ impl App {
             page_press: false,
             find_pressed: None,
             context_menu: None,
+            appearance,
+            appearance_path,
+            system_dark: None,
             site_info_open: false,
             menu_pressed: None,
             source_font: None,
@@ -346,9 +374,8 @@ impl App {
         self.elements_close_pressed = false;
         self.page_press = false;
         self.tab_pressed = None;
-        if let Some(window) = &self.window {
-            self.tab.chrome.dark = window.theme() == Some(Theme::Dark);
-        }
+        self.middle_tab_pressed = None;
+        self.tab.chrome.dark = self.appearance_dark();
         self.tab.chrome.hovered = None;
         self.tab.chrome.pressed = None;
         self.last_toolbar_click = None;
@@ -378,10 +405,7 @@ impl App {
 
     fn new_tab(&mut self) {
         let id = self.tabs.open("byui://welcome");
-        let old = std::mem::replace(
-            &mut self.tab,
-            TabState::new(id, self.platform.window_controls_inset),
-        );
+        let old = std::mem::replace(&mut self.tab, TabState::new(id));
         self.inactive.insert(old.id, old);
         self.alerts.set_document(id, 0);
         if let Some(proxy) = self.proxy.clone() {
@@ -526,6 +550,10 @@ impl App {
     fn begin_loading(&mut self) -> u64 {
         self.tab.loading_id += 1;
         self.tab.chrome.loading = true;
+        self.tab.loading_started = Some(Instant::now());
+        // The first paint is requested below. The next sample waits a frame
+        // so the bar keeps moving without redrawing in a tight loop.
+        self.tab.loading_bar_frame = Some(Instant::now() + ANIMATION_FRAME_INTERVAL);
         self.redraw();
         self.tab.loading_id
     }
@@ -533,8 +561,30 @@ impl App {
     fn finish_loading(&mut self, id: u64) {
         if id == self.tab.loading_id {
             self.tab.chrome.loading = false;
+            self.tab.chrome.load_progress = 0.0;
+            self.tab.loading_started = None;
+            self.tab.loading_bar_frame = None;
             self.redraw();
         }
+    }
+
+    /// Schedules the next address-bar load sample. Hidden tabs keep their
+    /// start time and are not woken until they are selected again.
+    fn pump_loading_bar_at(&mut self, now: Instant) -> Option<Instant> {
+        if !self.tab.chrome.loading {
+            self.tab.loading_bar_frame = None;
+            return None;
+        }
+        let due = self.tab.loading_bar_frame.unwrap_or(now);
+        if now < due {
+            return Some(due);
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        let next = now + ANIMATION_FRAME_INTERVAL;
+        self.tab.loading_bar_frame = Some(next);
+        Some(next)
     }
 
     fn poll_reload(&mut self) {
@@ -658,6 +708,38 @@ impl App {
         true
     }
 
+    fn appearance_dark(&self) -> bool {
+        self.appearance.is_dark(self.system_dark)
+    }
+
+    fn set_appearance(&mut self, appearance: Appearance) {
+        self.appearance = appearance;
+        self.apply_appearance();
+        if let Some(path) = &self.appearance_path
+            && let Err(error) = theme_preference::save(path, appearance)
+        {
+            log::warn!("could not save appearance preference: {error}");
+        }
+    }
+
+    fn set_system_appearance(&mut self, theme: Option<Theme>) {
+        self.system_dark = theme.map(|theme| theme == Theme::Dark);
+        self.apply_appearance();
+    }
+
+    fn apply_appearance(&mut self) {
+        let dark = self.appearance_dark();
+        if self.tab.chrome.dark != dark {
+            self.tab.chrome.dark = dark;
+            self.frame_key = None;
+            if self.tab.find.is_some() {
+                // Find highlights are painted into the page bitmap.
+                self.tab.page = None;
+            }
+        }
+        self.redraw();
+    }
+
     fn redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -753,29 +835,7 @@ impl App {
         let Some(mut pixmap) = Pixmap::new(size.width.max(1), size.height.max(1)) else {
             return;
         };
-        let dark = window.theme() != Some(Theme::Light);
-        let background = if dark {
-            tiny_skia::Color::from_rgba8(17, 24, 39, 255)
-        } else {
-            tiny_skia::Color::from_rgba8(249, 250, 251, 255)
-        };
-        pixmap.fill(background);
-        if let Some(panel) = &mut self.tab.devtools_panel {
-            sync_devtools_panel(
-                panel,
-                &self.tab.network_log,
-                &self.tab.console,
-                &self.tab.performance,
-            );
-            panel.draw(
-                &mut pixmap,
-                scale,
-                dark,
-                self.devtools_cursor,
-                self.font.as_ref(),
-                self.source_font.as_ref(),
-            );
-        }
+        self.draw_devtools(&mut pixmap, scale);
         let Some(surface) = &mut self.devtools_surface else {
             return;
         };
@@ -789,6 +849,32 @@ impl App {
         }
         if let Err(error) = buffer.present() {
             log::warn!("failed to present DevTools window: {error}");
+        }
+    }
+
+    fn draw_devtools(&mut self, pixmap: &mut Pixmap, scale: f64) {
+        let dark = self.appearance_dark();
+        let background = if dark {
+            toolbar::palette(dark).panel
+        } else {
+            tiny_skia::Color::from_rgba8(249, 250, 251, 255)
+        };
+        pixmap.fill(background);
+        if let Some(panel) = &mut self.tab.devtools_panel {
+            sync_devtools_panel(
+                panel,
+                &self.tab.network_log,
+                &self.tab.console,
+                &self.tab.performance,
+            );
+            panel.draw(
+                pixmap,
+                scale,
+                dark,
+                self.devtools_cursor,
+                self.font.as_ref(),
+                self.source_font.as_ref(),
+            );
         }
     }
 
@@ -1422,7 +1508,6 @@ impl App {
         Some(toolbar::address_offset_at(
             x,
             width,
-            self.platform.window_controls_inset,
             scale as f32,
             self.font.as_ref(),
             &self.tab.address,
@@ -1511,12 +1596,7 @@ impl App {
             .inner_size()
             .to_logical::<f64>(window.scale_factor())
             .width;
-        self.set_hovered(toolbar::hit_test(
-            x,
-            y,
-            width,
-            self.platform.window_controls_inset,
-        ));
+        self.set_hovered(toolbar::hit_test(x, y, width));
     }
 
     fn dismiss_context_menu(&mut self) {
@@ -1532,7 +1612,7 @@ impl App {
     fn site_info_popup(&self) -> Option<site_info::Popup> {
         let window = self.window.as_ref()?;
         let size = window.inner_size().to_logical::<f64>(window.scale_factor());
-        site_info::Popup::new(size.width, size.height, self.platform.window_controls_inset)
+        site_info::Popup::new(size.width, size.height)
     }
 
     fn site_info_url(&self) -> &str {
@@ -1582,6 +1662,19 @@ impl App {
         self.tab.chrome.pressed = None;
         self.set_hovered(None);
         self.frame_key = None;
+        self.redraw();
+    }
+
+    fn open_appearance_menu(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+        self.context_menu = Some(ContextMenu::appearance(
+            size.width,
+            size.height,
+            self.appearance,
+        ));
         self.redraw();
     }
 
@@ -1864,7 +1957,12 @@ impl App {
                 .values()
                 .any(|tab| tab.reload_completion.is_some()))
         .then_some(now + Duration::from_millis(40));
-        [reload, animation, self.hover_update_after]
+        let loading_bar = self
+            .tab
+            .chrome
+            .loading
+            .then(|| self.tab.loading_bar_frame.unwrap_or(now));
+        [reload, animation, self.hover_update_after, loading_bar]
             .into_iter()
             .flatten()
             .min()
@@ -2003,7 +2101,43 @@ impl App {
         self.redraw();
     }
 
+    /// Middle-clicking a tab closes it, like other desktop browsers. The tab
+    /// closes on release, and only when the release lands on the pressed tab.
+    fn middle_mouse_input(&mut self, state: ElementState) {
+        let on_strip = self
+            .cursor
+            .is_some_and(|(_, y)| (0.0..crate::tab_strip::HEIGHT).contains(&y));
+        let tab = if on_strip {
+            self.strip().tab_at(self.cursor)
+        } else {
+            None
+        };
+        match state {
+            ElementState::Pressed => self.middle_tab_pressed = tab,
+            ElementState::Released => {
+                if let Some(id) = self.middle_tab_pressed.take().filter(|id| Some(*id) == tab) {
+                    self.dismiss_context_menu();
+                    self.dismiss_site_info();
+                    self.close_tab(id);
+                }
+            }
+        }
+    }
+
     fn left_mouse_input(&mut self, state: ElementState) {
+        let previous_tab = self.tab.elements.as_ref().map(ElementsPanel::tab);
+        if let Some(panel) = &mut self.tab.elements
+            && panel.dock_mouse(self.cursor, state == ElementState::Pressed)
+        {
+            let tab = panel.tab();
+            if previous_tab != Some(tab) {
+                self.select_dock_tab(tab);
+            }
+            self.page_press = false;
+            self.redraw();
+            return;
+        }
+
         if self.site_info_open
             && let Some(popup) = self.site_info_popup()
             && self.site_info_mouse_input(popup, state)
@@ -2032,6 +2166,10 @@ impl App {
                     match action {
                         Some(MenuAction::Reload) => self.activate(Control::Reload),
                         Some(MenuAction::ClearCache) => self.clear_cache(),
+                        Some(MenuAction::OpenAppearance) => self.open_appearance_menu(),
+                        Some(MenuAction::SetAppearance(appearance)) => {
+                            self.set_appearance(appearance)
+                        }
                         Some(MenuAction::PageSource) => self.show_page_source(),
                         Some(MenuAction::Inspect) => self.show_elements(),
                         Some(MenuAction::Compatibility) => self.show_compatibility(),
@@ -2285,6 +2423,7 @@ impl App {
         let strip_entries = self.tab_entries();
         let strip = self.strip();
         let address = self.tab.address.clone();
+        let dark = self.appearance_dark();
         let site_info = self
             .site_info_open
             .then(|| self.site_info_popup())
@@ -2302,8 +2441,17 @@ impl App {
         };
         let scale = window.scale_factor();
         let page_scale = scale * self.tab.page_zoom;
-        let dark = window.theme() == Some(Theme::Dark);
         self.tab.chrome.dark = dark;
+        self.tab.chrome.load_progress = if self.tab.chrome.loading {
+            toolbar::loading_bar_fraction(
+                self.tab
+                    .loading_started
+                    .map(|started| started.elapsed())
+                    .unwrap_or_default(),
+            )
+        } else {
+            0.0
+        };
         let card =
             toolbar::page_rect_with_find(size.width, size.height, scale, self.tab.find.is_some());
         let card_size = card.map(|card| (card.width, card.height));
@@ -2455,6 +2603,7 @@ impl App {
             source.draw(
                 &mut composed,
                 scale,
+                dark,
                 self.source_font.as_ref().or(self.font.as_ref()),
             );
         }
@@ -2506,6 +2655,19 @@ impl App {
         let Some(window) = &self.window else {
             return;
         };
+        if let Some(panel) = &mut self.tab.elements {
+            let dragged = panel.drag_to(x, y);
+            if let Some(icon) = panel.resize_cursor(Some((x, y))) {
+                window.set_cursor(icon);
+                self.cursor = Some((x, y));
+                self.tab.chrome.hovered = None;
+                if dragged {
+                    self.redraw();
+                }
+                return;
+            }
+            window.set_cursor(CursorIcon::Default);
+        }
         let scale = window.scale_factor();
         let width = window.inner_size().to_logical::<f64>(scale).width;
         // Leaving the inspector must repaint it once to clear row and
@@ -2546,8 +2708,7 @@ impl App {
             self.redraw();
             return;
         }
-        let inset = self.platform.window_controls_inset;
-        self.set_hovered(toolbar::hit_test(x, y, width, inset));
+        self.set_hovered(toolbar::hit_test(x, y, width));
     }
 
     /// Sets the page's `:hover` element to the one under the pointer and
@@ -2593,7 +2754,7 @@ impl App {
                     .inner_size()
                     .to_logical::<f64>(window.scale_factor())
                     .width;
-                toolbar::hit_test(x, y, width, self.platform.window_controls_inset)
+                toolbar::hit_test(x, y, width)
             });
             // Disabled controls still occupy toolbar space. Do not let a
             // click on Back or Forward fall through to dragging or zooming.
@@ -2686,7 +2847,7 @@ impl App {
             } else {
                 0.0
             }
-            && toolbar::hit_test(x, y, width, self.platform.window_controls_inset).is_none()
+            && toolbar::hit_test(x, y, width).is_none()
     }
 }
 
@@ -2726,8 +2887,9 @@ impl ApplicationHandler<UserEvent> for App {
             );
             self.font = toolbar::load_ui_font((self.platform.ui_font_files)());
             self.source_font = crate::page_source::load_font();
-            window.request_redraw();
+            let theme = window.theme();
             self.window = Some(window);
+            self.set_system_appearance(theme);
         }
     }
 
@@ -2902,9 +3064,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.key_input(event);
             }
-            WindowEvent::Resized(_)
-            | WindowEvent::ScaleFactorChanged { .. }
-            | WindowEvent::ThemeChanged(_) => {
+            WindowEvent::ThemeChanged(theme) => self.set_system_appearance(Some(theme)),
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.sync_platform_window();
                 if log::log_enabled!(log::Level::Debug) {
                     match &event {
@@ -2913,9 +3074,6 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                             log::trace!("scale factor changed: {scale_factor}")
-                        }
-                        WindowEvent::ThemeChanged(theme) => {
-                            log::debug!("theme changed: {theme:?}")
                         }
                         _ => {}
                     }
@@ -2926,9 +3084,6 @@ impl ApplicationHandler<UserEvent> for App {
                     self.tab
                         .page_events
                         .set_device_pixel_ratio(window.scale_factor() * self.tab.page_zoom);
-                }
-                if matches!(event, WindowEvent::ThemeChanged(_)) && self.tab.find.is_some() {
-                    self.tab.page = None;
                 }
                 self.dismiss_context_menu();
                 if self.site_info_open && self.site_info_popup().is_none() {
@@ -2964,6 +3119,11 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => self.left_mouse_input(state),
             WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Middle,
+                ..
+            } => self.middle_mouse_input(state),
+            WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Right,
                 ..
@@ -2983,6 +3143,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::Focused(false) => {
+                if let Some(panel) = &mut self.tab.elements {
+                    panel.dock_mouse(None, false);
+                }
                 self.dismiss_context_menu();
                 self.dismiss_site_info();
             }
@@ -3050,8 +3213,14 @@ impl ApplicationHandler<UserEvent> for App {
         }
         self.settle_scroll_hover(Instant::now());
         let animation_frame = self.pump_animations();
+        let loading_frame = self.pump_loading_bar_at(Instant::now());
         event_loop.set_control_flow(
-            match self.wakeup_deadline(Instant::now(), animation_frame) {
+            match self
+                .wakeup_deadline(Instant::now(), animation_frame)
+                .into_iter()
+                .chain(loading_frame)
+                .min()
+            {
                 Some(deadline) => ControlFlow::WaitUntil(deadline),
                 None => ControlFlow::Wait,
             },
@@ -3396,6 +3565,7 @@ mod tests {
                 window_controls_inset: 0.0,
             },
             browser::BrowserRuntime::in_memory(),
+            None,
         )
     }
 
@@ -3575,6 +3745,38 @@ mod tests {
         app.activate(Control::Reload);
         assert_eq!(app.tab.browser_state, history);
         assert!(app.tab.find.is_some());
+    }
+
+    #[test]
+    fn address_load_bar_animates_only_while_the_active_tab_is_loading() {
+        let mut app = app();
+        let now = Instant::now();
+        let id = app.begin_loading();
+        let loading_tab = app.tab.id;
+        app.tab.loading_started = Some(now);
+        app.tab.loading_bar_frame = Some(now + ANIMATION_FRAME_INTERVAL);
+        assert_eq!(
+            app.pump_loading_bar_at(now),
+            Some(now + ANIMATION_FRAME_INTERVAL)
+        );
+        let next = app
+            .pump_loading_bar_at(now + ANIMATION_FRAME_INTERVAL)
+            .expect("another frame");
+        assert_eq!(next, now + 2 * ANIMATION_FRAME_INTERVAL);
+        app.new_tab();
+        assert_eq!(app.pump_loading_bar_at(now), None);
+        assert_eq!(app.wakeup_deadline(now, None), None);
+        app.switch_tab(loading_tab);
+        assert!(app.tab.chrome.loading);
+        assert_eq!(
+            app.wakeup_deadline(now, None),
+            Some(now + 2 * ANIMATION_FRAME_INTERVAL)
+        );
+        app.finish_loading(id);
+        assert!(!app.tab.chrome.loading);
+        assert!(app.tab.loading_started.is_none());
+        assert_eq!(app.pump_loading_bar_at(now), None);
+        assert_eq!(app.wakeup_deadline(now, None), None);
     }
 
     #[test]
@@ -3824,6 +4026,36 @@ mod tests {
     }
 
     #[test]
+    fn narrow_dock_selector_switches_tabs_and_runs_compatibility_audit() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        app.show_elements();
+        app.tab.elements.as_mut().unwrap().resize(360.0, 600.0);
+        app.cursor = Some(
+            app.tab
+                .elements
+                .as_ref()
+                .unwrap()
+                .tab_center(DockTab::Elements),
+        );
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        app.cursor = Some(
+            app.tab
+                .elements
+                .as_ref()
+                .unwrap()
+                .tab_choice_center(DockTab::Compatibility),
+        );
+        app.left_mouse_input(ElementState::Pressed);
+        app.left_mouse_input(ElementState::Released);
+        let panel = app.tab.elements.as_ref().unwrap();
+        assert_eq!(panel.tab(), DockTab::Compatibility);
+        assert!(matches!(panel.compat.state(), CompatState::Ready(_)));
+        assert!(!app.page_press);
+    }
+
+    #[test]
     fn dock_tabs_switch_on_click_and_audit_only_once() {
         let mut app = app();
         app.ensure_welcome_loaded();
@@ -3833,7 +4065,13 @@ mod tests {
         assert_eq!(panel.tab(), DockTab::Elements);
         assert_eq!(*panel.compat.state(), CompatState::Idle);
         // The second header tab starts after the 84px Elements tab.
-        app.cursor = Some((8.0 + 6.0 + 84.0 + 40.0, 340.0));
+        app.cursor = Some(
+            app.tab
+                .elements
+                .as_ref()
+                .unwrap()
+                .tab_center(DockTab::Compatibility),
+        );
         app.left_mouse_input(ElementState::Pressed);
         app.left_mouse_input(ElementState::Released);
         assert!(
@@ -3845,7 +4083,13 @@ mod tests {
             DockTab::Compatibility
         );
         let first = app.tab.audit_id;
-        app.cursor = Some((8.0 + 6.0 + 20.0, 340.0));
+        app.cursor = Some(
+            app.tab
+                .elements
+                .as_ref()
+                .unwrap()
+                .tab_center(DockTab::Elements),
+        );
         app.left_mouse_input(ElementState::Pressed);
         app.left_mouse_input(ElementState::Released);
         assert_eq!(app.tab.elements.as_ref().unwrap().tab(), DockTab::Elements);
@@ -3892,7 +4136,7 @@ mod tests {
             if escape {
                 app.key_pressed(&Key::Named(NamedKey::Escape));
             } else {
-                app.cursor = Some((770.0, 340.0));
+                app.cursor = Some(app.tab.elements.as_ref().unwrap().close_center());
                 app.left_mouse_input(ElementState::Pressed);
                 assert!(app.tab.elements.is_some());
                 app.left_mouse_input(ElementState::Released);
@@ -4524,6 +4768,10 @@ mod tests {
 mod tab_tests {
     use super::*;
     fn app() -> App {
+        app_with_appearance_path(None)
+    }
+
+    fn app_with_appearance_path(path: Option<PathBuf>) -> App {
         App::with_runtime(
             Platform {
                 configure_window: |attributes| attributes,
@@ -4534,6 +4782,7 @@ mod tab_tests {
                 window_controls_inset: 0.0,
             },
             browser::BrowserRuntime::in_memory(),
+            path,
         )
     }
 
@@ -4557,6 +4806,128 @@ mod tab_tests {
             timeline: Vec::new(),
             network_events: Vec::new(),
         }
+    }
+
+    #[test]
+    fn appearance_survives_restart_and_recovers_from_preference_errors() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("byui-appearance-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("appearance");
+        let mut app = app_with_appearance_path(Some(path.clone()));
+        assert_eq!(app.appearance, Appearance::System);
+
+        for choice in [Appearance::Dark, Appearance::Light, Appearance::System] {
+            app.set_appearance(choice);
+            let mut reopened = app_with_appearance_path(Some(path.clone()));
+            assert_eq!(reopened.appearance, choice);
+            assert_eq!(reopened.tab.chrome.dark, choice == Appearance::Dark);
+            reopened.set_system_appearance(Some(Theme::Dark));
+            assert_eq!(reopened.tab.chrome.dark, choice != Appearance::Light);
+        }
+
+        std::fs::write(&path, "unknown").unwrap();
+        let recovered = app_with_appearance_path(Some(path.clone()));
+        assert_eq!(recovered.appearance, Appearance::System);
+        assert!(!recovered.tab.chrome.dark);
+
+        // A directory at the destination forces replacement to fail.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        app.set_appearance(Appearance::Dark);
+        assert!(app.tab.chrome.dark);
+        assert_eq!(app.appearance, Appearance::Dark);
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn appearance_menu_selects_each_mode_and_system_updates_respect_overrides() {
+        let mut app = app();
+        assert_eq!(app.appearance, Appearance::System);
+        assert!(!app.tab.chrome.dark);
+        app.set_system_appearance(Some(Theme::Dark));
+        assert!(app.tab.chrome.dark);
+
+        for (index, mode, dark) in [
+            (1, Appearance::Light, false),
+            (2, Appearance::Dark, true),
+            (0, Appearance::System, false),
+        ] {
+            app.set_system_appearance(Some(Theme::Light));
+            let menu = ContextMenu::appearance(800.0, 600.0, app.appearance);
+            app.context_menu = Some(menu);
+            app.cursor = Some(menu.item_center(index));
+            app.left_mouse_input(ElementState::Pressed);
+            app.left_mouse_input(ElementState::Released);
+            assert_eq!(app.appearance, mode);
+            assert_eq!(app.tab.chrome.dark, dark);
+            assert!(app.context_menu.is_none());
+            if mode == Appearance::Light {
+                app.set_system_appearance(Some(Theme::Dark));
+                assert!(!app.tab.chrome.dark);
+            }
+            if mode == Appearance::Dark {
+                app.set_system_appearance(None);
+                assert!(app.tab.chrome.dark);
+            }
+        }
+        app.set_system_appearance(Some(Theme::Dark));
+        assert!(app.tab.chrome.dark);
+        app.set_system_appearance(None);
+        assert!(!app.tab.chrome.dark);
+    }
+
+    #[test]
+    fn appearance_repaints_find_highlights_and_keeps_the_current_query() {
+        let mut app = app();
+        app.tab.page = Some(((1, 1), Pixmap::new(1, 1).unwrap()));
+        app.set_appearance(Appearance::Dark);
+        assert!(app.tab.page.is_some());
+
+        let mut find = FindInPage::default();
+        find.insert("welcome");
+        app.tab.find = Some(find);
+        app.set_appearance(Appearance::Light);
+        assert!(app.tab.page.is_none());
+        assert_eq!(app.tab.find.as_ref().unwrap().query, "welcome");
+    }
+
+    #[test]
+    fn appearance_updates_open_devtools_and_survives_tab_switching_without_navigation() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let first = app.tab.id;
+        app.ensure_devtools_panel();
+        let page = app.tab.loaded_page.clone();
+        let document = app.tab.document_id;
+        let navigation = app.tab.navigation_id;
+        app.tab.scripts_evaluated = true;
+        let mut light = Pixmap::new(800, 600).unwrap();
+        let mut dark = Pixmap::new(800, 600).unwrap();
+
+        app.draw_devtools(&mut light, 1.0);
+        app.set_appearance(Appearance::Dark);
+        app.draw_devtools(&mut dark, 1.0);
+        assert_ne!(light.data(), dark.data());
+        assert!(app.tab.devtools_panel.is_some());
+        assert_eq!(app.tab.loaded_page, page);
+        assert_eq!(app.tab.document_id, document);
+        assert_eq!(app.tab.navigation_id, navigation);
+        assert!(app.tab.scripts_evaluated);
+
+        app.new_tab();
+        assert!(app.tab.chrome.dark);
+        app.switch_tab(first);
+        assert!(app.tab.chrome.dark);
+        assert_eq!(app.appearance, Appearance::Dark);
+        assert_eq!(app.tab.loaded_page, page);
+        assert!(app.tab.devtools_panel.is_some());
     }
 
     #[test]
@@ -4598,7 +4969,7 @@ mod tab_tests {
     #[test]
     fn site_info_dismissal_preserves_address_editing_and_find_state() {
         let mut app = app();
-        let popup = site_info::Popup::new(800.0, 600.0, 0.0).unwrap();
+        let popup = site_info::Popup::new(800.0, 600.0).unwrap();
         app.tab.address = "https://draft.test/".into();
         app.tab.chrome.address_focused = true;
         app.tab.chrome.address_caret = 11;
@@ -5088,6 +5459,59 @@ mod tab_tests {
     }
 
     #[test]
+    fn middle_click_closes_the_tab_released_on_and_ignores_drags_off_it() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let first = app.tab.id;
+        app.new_tab();
+        let second = app.tab.id;
+        app.new_tab();
+        let third = app.tab.id;
+        let center = |app: &App, id: TabId| {
+            let rect = app
+                .strip()
+                .regions
+                .into_iter()
+                .find(|(a, _)| *a == TabAction::Select(id))
+                .unwrap()
+                .1;
+            Some((
+                (rect.x() + rect.width() / 3.0) as f64,
+                (rect.y() + rect.height() / 2.0) as f64,
+            ))
+        };
+
+        // Pressing on one tab and releasing on another closes nothing.
+        app.cursor = center(&app, first);
+        app.middle_mouse_input(ElementState::Pressed);
+        app.cursor = center(&app, second);
+        app.middle_mouse_input(ElementState::Released);
+        assert_eq!(app.tabs.tab_count(), 3);
+
+        // Middle-clicking an inactive tab closes it without changing selection.
+        app.cursor = center(&app, first);
+        app.middle_mouse_input(ElementState::Pressed);
+        app.middle_mouse_input(ElementState::Released);
+        assert!(app.tab_state(first).is_none());
+        assert_eq!(app.tab.id, third);
+
+        // Middle-clicking the active tab closes it and activates a neighbor.
+        app.cursor = center(&app, third);
+        app.middle_mouse_input(ElementState::Pressed);
+        app.middle_mouse_input(ElementState::Released);
+        assert!(app.tab_state(third).is_none());
+        assert_eq!(app.tab.id, second);
+        assert!(!app.page_press);
+
+        // Middle-clicking the page leaves the last tab alone.
+        app.cursor = Some((200.0, crate::tab_strip::HEIGHT + 200.0));
+        app.middle_mouse_input(ElementState::Pressed);
+        app.middle_mouse_input(ElementState::Released);
+        assert_eq!(app.tabs.tab_count(), 1);
+        assert!(!app.exit_requested);
+    }
+
+    #[test]
     fn live_javascript_sessions_survive_switches_and_are_independent() {
         struct Recording(std::sync::mpsc::Sender<String>);
         impl webapis::AlertSink for Recording {
@@ -5440,11 +5864,16 @@ mod tab_tests {
         let task = Arc::clone(&completed);
         let id = app.begin_loading();
         app.tab.reload_completion = Some((id, Box::new(move || task.load(Ordering::SeqCst))));
-        assert_eq!(app.wakeup_deadline(now, Some(animation)), Some(animation));
-        // A future animation deadline must not delay the next Reload poll.
+        let loading_frame = app.tab.loading_bar_frame.expect("load bar animates");
+        assert_eq!(
+            app.wakeup_deadline(now, Some(animation)),
+            Some(animation.min(loading_frame))
+        );
+        // A future animation deadline must not delay the next Reload poll
+        // or the address-bar load indicator.
         assert_eq!(
             app.wakeup_deadline(now, Some(now + Duration::from_millis(60))),
-            Some(now + Duration::from_millis(40))
+            Some((now + Duration::from_millis(40)).min(loading_frame))
         );
         let animated = app.tab.id;
         app.new_tab();

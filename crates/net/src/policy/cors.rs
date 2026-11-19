@@ -34,10 +34,10 @@ impl CorsChecker {
                         .and_then(|url| Origin::from_url(&url).ok())
                         .is_some_and(|target| origin.is_same_origin(&target))
             });
-        if same_origin || (origin.is_none() && request.context.mode != RequestMode::NoCors) {
+        if same_origin || (origin.is_none() && request.mode() != RequestMode::NoCors) {
             return Ok(ResponseType::Basic);
         }
-        match request.context.mode {
+        match request.mode() {
             RequestMode::SameOrigin => {
                 log::warn!(
                     "same-origin request blocked from reaching {}",
@@ -77,8 +77,8 @@ impl CorsChecker {
         let serialized = request.serialized_origin().unwrap_or_default();
         let allowed = allowed_origin == Some(serialized.as_str())
             || (allowed_origin == Some("*")
-                && request.context.credentials != CredentialsMode::Include);
-        let credentials_ok = request.context.credentials != CredentialsMode::Include
+                && request.credentials_mode() != CredentialsMode::Include);
+        let credentials_ok = request.credentials_mode() != CredentialsMode::Include
             || single_header_value(headers, "access-control-allow-credentials") == Some("true");
         log::trace!(
             "cors response headers: allow-origin={allowed_origin:?} \
@@ -122,7 +122,10 @@ mod tests {
     /// Builds a request with an explicit CORS mode for policy tests.
     fn request(mode: RequestMode) -> Request {
         let mut request = Request::get("https://remote.test/data");
-        request.context.environment.origin = Some(Origin::parse("https://client.test").unwrap());
+        request.set_environment(crate::FetchEnvironment {
+            origin: Some(Origin::parse("https://client.test").unwrap()),
+            ..crate::FetchEnvironment::default()
+        });
         request.set_mode(mode).unwrap();
         request
     }
@@ -186,15 +189,9 @@ mod tests {
     fn tainted_same_origin_return_still_requires_cors_approval() {
         let checker = CorsChecker;
         let mut request = request(RequestMode::Cors);
-        request.request_origin = Some(Origin::parse("https://client.test").unwrap());
-        request.url_list = [
-            "https://client.test/start",
-            "https://remote.test/middle",
-            "https://client.test/final",
-        ]
-        .into_iter()
-        .map(|url| reqwest::Url::parse(url).unwrap())
-        .collect();
+        request.prepare_url(reqwest::Url::parse("https://client.test/start").unwrap());
+        request.follow_url(reqwest::Url::parse("https://remote.test/middle").unwrap());
+        request.follow_url(reqwest::Url::parse("https://client.test/final").unwrap());
 
         let mut final_response = response(reqwest::header::HeaderMap::new());
         final_response.url_list = vec!["https://client.test/final".into()];

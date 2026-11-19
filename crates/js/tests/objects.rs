@@ -462,11 +462,12 @@ fn missing_properties_read_as_undefined() {
 #[test]
 fn reading_through_a_missing_property_is_a_runtime_error() {
     let (realm, _) = realm_with_object();
+    // `object.value` is a number; missing properties read as undefined.
+    assert_eq!(
+        realm.evaluate_script("object.value.missing").unwrap(),
+        Value::Undefined
+    );
     for (source, message) in [
-        (
-            "object.value.missing",
-            "Cannot read property `missing` of a number",
-        ),
         (
             "object.nested.deep",
             "Cannot read property `deep` of undefined",
@@ -480,13 +481,14 @@ fn reading_through_a_missing_property_is_a_runtime_error() {
 
 #[test]
 fn property_access_on_non_objects_is_a_runtime_error() {
+    assert_eq!(eval("(1).x"), Ok(Value::Undefined));
+    assert_eq!(eval("'text'.length"), Ok(Value::Number(4.0)));
+    assert_eq!(eval("'text'[0]"), Ok(Value::String("t".into())));
+
     for (source, message) in [
         ("undefined.x", "Cannot read property `x` of undefined"),
         ("null.x", "Cannot read property `x` of null"),
         ("true.x", "Cannot read property `x` of a boolean"),
-        ("(1).x", "Cannot read property `x` of a number"),
-        ("'text'.length", "Cannot read property `length` of a string"),
-        ("'text'[0]", "Cannot read property `0` of a string"),
         ("let n = null; n.x = 1", "Cannot set property `x` of null"),
         (
             "let s = 's'; s['x'] = 1",

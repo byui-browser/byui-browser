@@ -40,7 +40,8 @@ impl Request {
 
     /// Returns the request origin after any redirect-time origin transitions.
     pub(crate) fn effective_origin(&self) -> Option<&Origin> {
-        self.request_origin
+        self.execution
+            .request_origin
             .as_ref()
             .or(self.context.environment.origin.as_ref())
     }
@@ -51,7 +52,7 @@ impl Request {
             return RedirectTaint::SameOrigin;
         };
         let mut taint = RedirectTaint::SameOrigin;
-        for pair in self.url_list.windows(2) {
+        for pair in self.execution.url_list.windows(2) {
             let previous = &pair[0];
             let current = &pair[1];
             if !urls_are_same_site(current, previous) && !origin.is_same_site_url(previous) {

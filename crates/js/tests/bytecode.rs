@@ -204,6 +204,38 @@ fn arrows_capture_lexical_this() {
 }
 
 #[test]
+fn additional_statement_forms_run_in_bytecode() {
+    assert_eq!(
+        execute("let i = 0; do { i = i + 1; } while (i < 3); i"),
+        Value::Number(3.0)
+    );
+    assert_eq!(
+        execute("let total = 0; for (const value of [1, 2, 3]) { total = total + value; } total"),
+        Value::Number(6.0)
+    );
+    assert_eq!(
+        execute(
+            "let total = ''; for (const key in ({ a: 1, b: 2 })) { total = total + key; } total"
+        ),
+        Value::String("ab".into())
+    );
+    assert_eq!(
+        execute("switch (2) { case 1: 10; break; case 2: 20; break; default: 30; }"),
+        Value::Number(20.0)
+    );
+    assert_eq!(
+        execute("let n = 0; outer: while (n < 3) { n = n + 1; continue outer; } n"),
+        Value::Number(3.0)
+    );
+    assert_eq!(
+        execute(
+            "let n = 0; for (const a of [1, 2]) { for (const b of [3]) { break; } n = n + 1; } n"
+        ),
+        Value::Number(2.0)
+    );
+}
+
+#[test]
 fn binding_errors_are_reported() {
     let program = parse("{ value; let value = 1; }").expect("source should parse");
     let chunk = compile(&program).expect("source should compile");

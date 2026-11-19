@@ -80,3 +80,17 @@ fn is_forbidden_request_header(name: &HeaderName) -> bool {
     ) || name.starts_with("proxy-")
         || name.starts_with("sec-")
 }
+
+/// Reports whether Fetch, rather than browser identity policy, owns a field.
+pub(super) fn is_fetch_owned_generated_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "origin"
+            | "referer"
+            | "cookie"
+            | "content-type"
+            | "content-length"
+            | "access-control-request-headers"
+            | "access-control-request-method"
+    )
+}

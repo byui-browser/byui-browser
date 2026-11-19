@@ -9,6 +9,11 @@ use std::{
 
 use crate::crypto::register_crypto;
 use crate::custom_elements::CustomElementRegistry;
+use crate::event::{
+    EventTarget, EventTargetRef, add_event_listener_to_target, dispatch_event_target,
+    dispatch_event_target_with_target, event_constructor, event_object,
+    hashchange_event_constructor, remove_event_listener_from_target,
+};
 use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
 use security::RendererSecurityContext;
@@ -27,6 +32,61 @@ struct TimerCallback {
     arguments: Vec<Value>,
     repeat: bool,
     nesting_level: u32,
+}
+
+/// Per-Window state for the page `load` event.
+#[derive(Default)]
+struct WindowLoadState {
+    /// The current `window.onload` event handler, if any.
+    onload: Option<Function>,
+    /// Whether the load event has already been dispatched.
+    fired: bool,
+}
+
+/// Per-Window state for the `popstate` event handler attribute.
+#[derive(Default)]
+struct WindowPopstateState {
+    /// The current `window.onpopstate` event handler, if any.
+    handler: Option<Function>,
+}
+
+/// Per-Window state for the `hashchange` event handler attribute.
+#[derive(Default)]
+struct WindowHashchangeState {
+    /// The current `window.onhashchange` event handler, if any.
+    handler: Option<Function>,
+}
+
+fn dispatch_load_event(
+    window: &Object,
+    event_target: &EventTargetRef,
+    state: &Mutex<WindowLoadState>,
+) -> JsResult<()> {
+    {
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.fired {
+            return Ok(());
+        }
+        state.fired = true;
+    }
+
+    let options = Object::new();
+    options.set("bubbles", Value::Boolean(false));
+    options.set("cancelable", Value::Boolean(false));
+    let Value::Object(event) =
+        event_constructor(&[Value::String("load".into()), Value::Object(options)])?
+    else {
+        return Err(JsError::runtime(
+            "load event constructor returned a non-object",
+        ));
+    };
+    // HTML: the Window's load event targets the Document.
+    let target = window
+        .get("document")
+        .filter(|value| matches!(value, Value::Object(_) | Value::Array(_)))
+        .unwrap_or_else(|| Value::Object(window.clone()));
+    dispatch_event_target_with_target(event_target, window, target, &[Value::Object(event)])?;
+    Ok(())
 }
 
 struct AnimationFrameCallbacks {
@@ -115,6 +175,10 @@ struct MessageQueue {
     messages: VecDeque<Value>,
 }
 
+struct HashchangeQueue {
+    events: VecDeque<(Url, Url)>,
+}
+
 impl MicrotaskQueue {
     fn new() -> Self {
         Self {
@@ -135,6 +199,14 @@ impl MessageQueue {
     fn new() -> Self {
         Self {
             messages: VecDeque::new(),
+        }
+    }
+}
+
+impl HashchangeQueue {
+    fn new() -> Self {
+        Self {
+            events: VecDeque::new(),
         }
     }
 }
@@ -280,27 +352,7 @@ fn lock_history(history: &Mutex<SessionHistory>) -> std::sync::MutexGuard<'_, Se
 }
 
 fn clone_for_storage(value: &Value) -> JsResult<Value> {
-    match value {
-        Value::Undefined
-        | Value::Null
-        | Value::Boolean(_)
-        | Value::Number(_)
-        | Value::String(_) => Ok(value.clone()),
-        Value::Function(_) => Err(JsError::runtime("history state cannot contain a function")),
-        Value::Object(object) | Value::Array(object) => {
-            let cloned = Object::new();
-            for key in object.keys() {
-                if let Some(property) = object.get_own(&key) {
-                    cloned.set(key, clone_for_storage(&property)?);
-                }
-            }
-            Ok(if matches!(value, Value::Array(_)) {
-                Value::Array(cloned)
-            } else {
-                Value::Object(cloned)
-            })
-        }
-    }
+    structured_clone_value(value, &mut Vec::new())
 }
 
 fn data_clone_error(message: impl Into<String>) -> JsError {
@@ -378,6 +430,9 @@ fn resolve_history_url(base: &Url, requested: Option<&Value>) -> JsResult<Url> {
     let Some(requested) = requested else {
         return Ok(base.clone());
     };
+    if matches!(requested, Value::Null | Value::Undefined) {
+        return Ok(base.clone());
+    }
     let Value::String(requested) = requested else {
         return Err(JsError::runtime("history URL must be a string or null"));
     };
@@ -395,42 +450,56 @@ fn resolve_history_url(base: &Url, requested: Option<&Value>) -> JsResult<Url> {
     Ok(resolved)
 }
 
-fn sync_history_properties(history: &Object, location: &Object, session: &SessionHistory) {
+fn sync_history_properties(
+    history: &Object,
+    location: &Object,
+    window: &Object,
+    session: &SessionHistory,
+) {
     history.set("length", Value::Number(session.entries.len() as f64));
-    history.set("state", session.current().state.clone());
-    location.set(
-        "href",
-        Value::String(session.current().url.as_str().to_owned()),
-    );
+    let href = session.current().url.as_str().to_owned();
+    location.set("href", Value::String(href.clone()));
+    if let Some(Value::Function(sync)) = window.get("__syncLocation")
+        && let Err(error) = sync.call(&[Value::String(href)])
+    {
+        log::warn!("failed to synchronize the live Location: {error}");
+    }
 }
 
-fn invoke_popstate(window: &Object, state: &Value) {
+fn invoke_popstate(window: &Object, event_target: &EventTargetRef, state: &Value) {
     let event = Object::new();
     event.set("type", Value::String("popstate".into()));
-    event.set("state", state.clone());
+    // PopStateEvent.state is a copy of the entry's structured-cloned state;
+    // mutations made by the handler must not mutate session history.
+    event.set("state", clone_for_storage(state).unwrap_or(Value::Null));
+    event.set("hasUAVisualTransition", Value::Boolean(false));
     event.set("bubbles", Value::Boolean(false));
     event.set("cancelable", Value::Boolean(false));
     event.set("target", Value::Object(window.clone()));
     event.set("currentTarget", Value::Object(window.clone()));
 
-    let mut callbacks = Vec::new();
-    if let Some(Value::Object(list)) = window.get("__popstateListeners") {
-        for index in 0..list.len() {
-            if let Some(callback) = list.get(&index.to_string()) {
-                callbacks.push(callback);
-            }
-        }
+    if let Err(error) = dispatch_event_target(event_target, window, &[Value::Object(event.clone())])
+    {
+        log::warn!("popstate event dispatch failed: {error}");
     }
-    if let Some(Value::Function(callback)) = window.get("onpopstate") {
-        callbacks.push(Value::Function(callback));
+}
+
+fn invoke_hashchange(window: &Object, event_target: &EventTargetRef, old_url: &Url, new_url: &Url) {
+    let event = event_object("hashchange".into(), false, false);
+    event.set("oldURL", Value::String(old_url.as_str().to_owned()));
+    event.set("newURL", Value::String(new_url.as_str().to_owned()));
+
+    if let Err(error) = dispatch_event_target(event_target, window, &[Value::Object(event)]) {
+        log::warn!("hashchange event dispatch failed: {error}");
     }
-    for callback in callbacks {
-        if let Value::Function(callback) = callback
-            && let Err(error) = callback.call(&[Value::Object(event.clone())])
-        {
-            log::warn!("popstate listener threw: {error}");
-        }
-    }
+}
+
+fn queue_hashchange(queue: &Mutex<HashchangeQueue>, old_url: Url, new_url: Url) {
+    queue
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .events
+        .push_back((old_url, new_url));
 }
 
 fn message_target_origin(arguments: &[Value]) -> JsResult<String> {
@@ -473,36 +542,36 @@ fn message_origin(window: &Object) -> String {
         .unwrap_or_else(|| "null".into())
 }
 
-fn invoke_message(window: &Object, data: Value, origin: String) {
-    let event = Object::new();
-    event.set("type", Value::String("message".into()));
+fn invoke_message(window: &Object, event_target: &EventTargetRef, data: Value, origin: String) {
+    let event = event_object("message".into(), false, false);
     event.set("data", data);
     event.set("origin", Value::String(origin));
     event.set("source", Value::Object(window.clone()));
+    event.set("lastEventId", Value::String(String::new()));
     event.set("ports", Value::Array(Object::new()));
-    event.set("bubbles", Value::Boolean(false));
-    event.set("cancelable", Value::Boolean(false));
     event.set("target", Value::Object(window.clone()));
     event.set("currentTarget", Value::Object(window.clone()));
 
-    let mut callbacks = Vec::new();
-    if let Some(Value::Object(list)) = window.get("__messageListeners") {
-        for index in 0..list.len() {
-            if let Some(callback) = list.get(&index.to_string()) {
-                callbacks.push(callback);
-            }
+    if let Err(error) = dispatch_event_target(event_target, window, &[Value::Object(event.clone())])
+    {
+        log::warn!("message event dispatch failed: {error}");
+    }
+    if !matches!(
+        event.get("__stopImmediatePropagation"),
+        Some(Value::Boolean(true))
+    ) && let Some(Value::Function(callback)) = window.get("onmessage")
+    {
+        event.set("currentTarget", Value::Object(window.clone()));
+        event.set("eventPhase", Value::Number(2.0));
+        if let Err(error) = callback.call_with_this(
+            Value::Object(window.clone()),
+            &[Value::Object(event.clone())],
+        ) {
+            log::warn!("message event handler threw: {error}");
         }
     }
-    if let Some(Value::Function(callback)) = window.get("onmessage") {
-        callbacks.push(Value::Function(callback));
-    }
-    for callback in callbacks {
-        if let Value::Function(callback) = callback
-            && let Err(error) = callback.call(&[Value::Object(event.clone())])
-        {
-            log::warn!("message listener threw: {error}");
-        }
-    }
+    event.set("eventPhase", Value::Number(0.0));
+    event.set("currentTarget", Value::Null);
 }
 
 /// The viewport dimensions exposed to a script-visible Window.
@@ -728,7 +797,10 @@ fn register_window_object(
     let timers = Arc::new(Mutex::new(WindowTimers::new()));
     let microtasks = Arc::new(Mutex::new(MicrotaskQueue::new()));
     let messages = Arc::new(Mutex::new(MessageQueue::new()));
+    let hashchange_events = Arc::new(Mutex::new(HashchangeQueue::new()));
+    let event_target: EventTargetRef = Arc::new(Mutex::new(EventTarget::default()));
     let animation_frames = Arc::new(Mutex::new(AnimationFrameCallbacks::new()));
+    let load_state = Arc::new(Mutex::new(WindowLoadState::default()));
     let performance = Object::new();
     let performance_clock = Arc::new(PerformanceClock::new());
     let evaluator = realm.script_evaluator();
@@ -743,6 +815,9 @@ fn register_window_object(
         "navigator",
         Arc::new(move |_| Ok(Value::Object(navigator_for_window.clone()))),
     );
+    // A Window without an associated Document has no selection. Document
+    // registration replaces this with the document's singleton Selection.
+    window.set_method("getSelection", Arc::new(|_| Ok(Value::Null)));
     window.set("customElements", Value::Object(custom_elements.clone()));
     // HTML's structured cloning API deep-copies primitives, plain objects,
     // and arrays, preserving cycles and repeated references. This runtime
@@ -789,13 +864,236 @@ fn register_window_object(
     // replaceable.
     let inner_height = Value::Number(viewport.map_or(0, |size| size.height) as f64);
     window.set("innerHeight", inner_height.clone());
-    window.set("onpopstate", Value::Null);
     window.set("onmessage", Value::Null);
+    window.set("onerror", Value::Null);
+    // The `onload` event handler is backed by one stable listener on the
+    // Window's EventTarget, so it runs in registration order alongside
+    // `addEventListener("load", ...)` listeners.
+    let onload_listener = {
+        let window = window.clone();
+        let load_state = Arc::clone(&load_state);
+        Function::from_host(
+            "onload",
+            Arc::new(move |arguments| {
+                let handler = load_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .onload
+                    .clone();
+                match handler {
+                    Some(handler) => {
+                        handler.call_with_this(Value::Object(window.clone()), arguments)
+                    }
+                    None => Ok(Value::Undefined),
+                }
+            }),
+        )
+    };
+    let load_state_for_get = Arc::clone(&load_state);
+    let load_state_for_set = Arc::clone(&load_state);
+    let onload_event_target = event_target.clone();
+    window.define_accessor(
+        "onload",
+        Arc::new(move || {
+            let state = load_state_for_get
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(state.onload.clone().map_or(Value::Null, Value::Function))
+        }),
+        Some(Arc::new(move |value| {
+            let handler = match value {
+                Value::Null | Value::Undefined => None,
+                Value::Function(handler) => Some(handler),
+                _ => return Err(type_error("window.onload must be a function or null")),
+            };
+            let had_handler = {
+                let mut state = load_state_for_set
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let had_handler = state.onload.is_some();
+                state.onload = handler.clone();
+                had_handler
+            };
+            let listener_arguments = [
+                Value::String("load".into()),
+                Value::Function(onload_listener.clone()),
+            ];
+            match (had_handler, handler.is_some()) {
+                (false, true) => {
+                    add_event_listener_to_target(
+                        &onload_event_target,
+                        &listener_arguments,
+                        "window",
+                    )?;
+                }
+                (true, false) => {
+                    remove_event_listener_from_target(&onload_event_target, &listener_arguments)?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })),
+    );
+    // `window.onpopstate` is an event handler IDL attribute. Keep its handler
+    // in private state and expose one stable event listener so it participates
+    // in Window listener ordering.
+    let popstate_state = Arc::new(Mutex::new(WindowPopstateState::default()));
+    let onpopstate_listener = {
+        let window = window.clone();
+        let popstate_state = Arc::clone(&popstate_state);
+        Function::from_host(
+            "onpopstate",
+            Arc::new(move |arguments| {
+                let handler = popstate_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .handler
+                    .clone();
+                match handler {
+                    Some(handler) => {
+                        handler.call_with_this(Value::Object(window.clone()), arguments)
+                    }
+                    None => Ok(Value::Undefined),
+                }
+            }),
+        )
+    };
+    let popstate_state_for_get = Arc::clone(&popstate_state);
+    let popstate_state_for_set = Arc::clone(&popstate_state);
+    let onpopstate_event_target = event_target.clone();
+    window.define_accessor(
+        "onpopstate",
+        Arc::new(move || {
+            let state = popstate_state_for_get
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(state.handler.clone().map_or(Value::Null, Value::Function))
+        }),
+        Some(Arc::new(move |value| {
+            let handler = match value {
+                Value::Null | Value::Undefined => None,
+                Value::Function(handler) => Some(handler),
+                _ => return Err(type_error("window.onpopstate must be a function or null")),
+            };
+            let had_handler = {
+                let mut state = popstate_state_for_set
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let had_handler = state.handler.is_some();
+                state.handler = handler.clone();
+                had_handler
+            };
+            let listener_arguments = [
+                Value::String("popstate".into()),
+                Value::Function(onpopstate_listener.clone()),
+            ];
+            match (had_handler, handler.is_some()) {
+                (false, true) => {
+                    add_event_listener_to_target(
+                        &onpopstate_event_target,
+                        &listener_arguments,
+                        "window",
+                    )?;
+                }
+                (true, false) => {
+                    remove_event_listener_from_target(
+                        &onpopstate_event_target,
+                        &listener_arguments,
+                    )?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })),
+    );
+    // `window.onhashchange` is an event handler IDL attribute. Keep its
+    // handler in private state and expose one stable event listener so it
+    // participates in Window listener ordering.
+    let hashchange_state = Arc::new(Mutex::new(WindowHashchangeState::default()));
+    let onhashchange_listener = {
+        let window = window.clone();
+        let hashchange_state = Arc::clone(&hashchange_state);
+        Function::from_host(
+            "onhashchange",
+            Arc::new(move |arguments| {
+                let handler = hashchange_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .handler
+                    .clone();
+                match handler {
+                    Some(handler) => {
+                        handler.call_with_this(Value::Object(window.clone()), arguments)
+                    }
+                    None => Ok(Value::Undefined),
+                }
+            }),
+        )
+    };
+    let hashchange_state_for_get = Arc::clone(&hashchange_state);
+    let hashchange_state_for_set = Arc::clone(&hashchange_state);
+    let onhashchange_event_target = event_target.clone();
+    window.define_accessor(
+        "onhashchange",
+        Arc::new(move || {
+            let state = hashchange_state_for_get
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(state.handler.clone().map_or(Value::Null, Value::Function))
+        }),
+        Some(Arc::new(move |value| {
+            let handler = match value {
+                Value::Null | Value::Undefined => None,
+                Value::Function(handler) => Some(handler),
+                _ => return Err(type_error("window.onhashchange must be a function or null")),
+            };
+            let had_handler = {
+                let mut state = hashchange_state_for_set
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let had_handler = state.handler.is_some();
+                state.handler = handler.clone();
+                had_handler
+            };
+            let listener_arguments = [
+                Value::String("hashchange".into()),
+                Value::Function(onhashchange_listener.clone()),
+            ];
+            match (had_handler, handler.is_some()) {
+                (false, true) => {
+                    add_event_listener_to_target(
+                        &onhashchange_event_target,
+                        &listener_arguments,
+                        "window",
+                    )?;
+                }
+                (true, false) => {
+                    remove_event_listener_from_target(
+                        &onhashchange_event_target,
+                        &listener_arguments,
+                    )?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })),
+    );
     history.set("scrollRestoration", Value::String("auto".into()));
-    window.set("__popstateListeners", Value::Object(Object::new()));
-    window.set("__messageListeners", Value::Object(Object::new()));
-    window.set("__storageListeners", Value::Object(Object::new()));
     window.set("__mediaQueryLists", Value::Object(Object::new()));
+    let load_window = window.clone();
+    let load_state_for_dispatch = Arc::clone(&load_state);
+    let load_dispatch_event_target = event_target.clone();
+    window.set_method(
+        "__dispatchLoad",
+        Arc::new(move |_| {
+            dispatch_load_event(
+                &load_window,
+                &load_dispatch_event_target,
+                &load_state_for_dispatch,
+            )?;
+            Ok(Value::Undefined)
+        }),
+    );
 
     let window_origin = Url::parse(initial_url)
         .map(|url| url.origin().ascii_serialization())
@@ -1162,60 +1460,38 @@ fn register_window_object(
         }),
     );
 
-    let listeners_window = window.clone();
+    let window_event_target = event_target.clone();
     window.set_method(
         "addEventListener",
         Arc::new(move |arguments| {
-            let [Value::String(event_type), Value::Function(callback), ..] = arguments else {
-                return Err(JsError::runtime(
-                    "window.addEventListener() expects an event type and callback",
-                ));
-            };
-            if event_type == "popstate" || event_type == "storage" || event_type == "message" {
-                let list_name = if event_type == "popstate" {
-                    "__popstateListeners"
-                } else if event_type == "storage" {
-                    "__storageListeners"
-                } else {
-                    "__messageListeners"
-                };
-                let list = match listeners_window.get(list_name) {
-                    Some(Value::Object(list)) => list,
-                    _ => return Ok(Value::Undefined),
-                };
-                let index = list.len();
-                list.set(index.to_string(), Value::Function(callback.clone()));
-            }
-            Ok(Value::Undefined)
+            add_event_listener_to_target(&window_event_target, arguments, "window")
         }),
     );
 
-    let remove_window = window.clone();
+    let window_event_target = event_target.clone();
     window.set_method(
         "removeEventListener",
         Arc::new(move |arguments| {
-            let [Value::String(event_type), Value::Function(callback), ..] = arguments else {
-                return Ok(Value::Undefined);
-            };
-            if (event_type == "popstate" || event_type == "storage" || event_type == "message")
-                && let Some(Value::Object(list)) = remove_window.get(if event_type == "popstate" {
-                    "__popstateListeners"
-                } else if event_type == "storage" {
-                    "__storageListeners"
-                } else {
-                    "__messageListeners"
-                })
-            {
-                for index in 0..list.len() {
-                    if list
-                        .get(&index.to_string())
-                        .is_some_and(|value| value == Value::Function(callback.clone()))
-                    {
-                        list.set(index.to_string(), Value::Undefined);
-                    }
-                }
-            }
-            Ok(Value::Undefined)
+            remove_event_listener_from_target(&window_event_target, arguments)
+        }),
+    );
+
+    let dispatch_window_event_target = event_target.clone();
+    let dispatch_window = window.clone();
+    window.set_method(
+        "dispatchEvent",
+        Arc::new(move |arguments| {
+            dispatch_event_target(&dispatch_window_event_target, &dispatch_window, arguments)
+        }),
+    );
+    window.set_method("HashChangeEvent", Arc::new(hashchange_event_constructor));
+
+    let report_window_event_target = event_target.clone();
+    let report_window = window.clone();
+    window.set_method(
+        "__reportError",
+        Arc::new(move |arguments| {
+            dispatch_event_target(&report_window_event_target, &report_window, arguments)
         }),
     );
 
@@ -1223,6 +1499,7 @@ fn register_window_object(
     let microtasks_for_message = Arc::clone(&microtasks);
     let evaluator_for_message = evaluator.clone();
     let message_window = window.clone();
+    let event_target_for_message = event_target.clone();
     window.set_method(
         "__runMessages",
         Arc::new(move |_| {
@@ -1234,41 +1511,167 @@ fn register_window_object(
                     .messages
                     .pop_front();
                 let Some(message) = message else { break };
-                invoke_message(&message_window, message, message_origin(&message_window));
+                invoke_message(
+                    &message_window,
+                    &event_target_for_message,
+                    message,
+                    message_origin(&message_window),
+                );
                 drain_microtasks(&microtasks_for_message, &evaluator_for_message);
                 delivered += 1;
             }
             Ok(Value::Number(delivered as f64))
         }),
     );
-
-    let history_for_window = history.clone();
+    let hashchange_events_for_pump = Arc::clone(&hashchange_events);
+    let hashchange_window = window.clone();
+    let hashchange_event_target = event_target.clone();
     window.set_method(
-        "history",
-        Arc::new(move |_| Ok(Value::Object(history_for_window.clone()))),
+        "__runHashchangeEvents",
+        Arc::new(move |_| {
+            let mut delivered = 0;
+            loop {
+                let event = hashchange_events_for_pump
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .events
+                    .pop_front();
+                let Some((old_url, new_url)) = event else {
+                    break;
+                };
+                invoke_hashchange(
+                    &hashchange_window,
+                    &hashchange_event_target,
+                    &old_url,
+                    &new_url,
+                );
+                delivered += 1;
+            }
+            Ok(Value::Number(delivered as f64))
+        }),
     );
+    window.set("history", Value::Object(history.clone()));
     let location_for_window = location.clone();
     window.set_method(
         "location",
         Arc::new(move |_| Ok(Value::Object(location_for_window.clone()))),
     );
+    let location_for_sync = location.clone();
+    window.set_method(
+        "__syncLocation",
+        Arc::new(move |arguments| {
+            if let Some(Value::String(href)) = arguments.first() {
+                location_for_sync.set("href", Value::String(href.clone()));
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+
+    let history_for_state = Arc::clone(&session);
+    history.define_accessor(
+        "state",
+        Arc::new(move || {
+            let session = lock_history(&history_for_state);
+            clone_for_storage(&session.current().state)
+        }),
+        None,
+    );
+
+    let history_for_same_document = history.clone();
+    let location_for_same_document = location.clone();
+    let window_for_same_document = window.clone();
+    let session_for_same_document = Arc::clone(&session);
+    let event_target_for_same_document = event_target.clone();
+    let hashchange_events_for_same_document = Arc::clone(&hashchange_events);
+    window.set_method(
+        "__navigateSameDocument",
+        Arc::new(move |arguments| {
+            let Some(Value::String(serialized_url)) = arguments.first() else {
+                return Err(JsError::runtime(
+                    "same-document navigation requires a URL string",
+                ));
+            };
+            let target = Url::parse(serialized_url)
+                .map_err(|error| JsError::runtime(format!("invalid same-document URL: {error}")))?;
+            let replace = matches!(arguments.get(1), Some(Value::Boolean(true)));
+            let mut session = lock_history(&session_for_same_document);
+            let current_url = session.current().url.clone();
+            if current_url.origin() != target.origin()
+                || current_url.path() != target.path()
+                || current_url.query() != target.query()
+            {
+                return Err(JsError::runtime(
+                    "same-document navigation must only change the fragment",
+                ));
+            }
+            if current_url.fragment() == target.fragment() {
+                return Ok(Value::Undefined);
+            }
+            let old_url = current_url;
+            let state = session.current().state.clone();
+            if replace {
+                let current = session.current;
+                session.entries[current] = HistoryEntry { url: target, state };
+            } else {
+                let current = session.current;
+                session.entries.truncate(current + 1);
+                session.entries.push(HistoryEntry { url: target, state });
+                session.current += 1;
+            }
+            let new_url = session.current().url.clone();
+            sync_history_properties(
+                &history_for_same_document,
+                &location_for_same_document,
+                &window_for_same_document,
+                &session,
+            );
+            invoke_popstate(
+                &window_for_same_document,
+                &event_target_for_same_document,
+                &session.current().state,
+            );
+            if old_url.fragment() != new_url.fragment() {
+                queue_hashchange(&hashchange_events_for_same_document, old_url, new_url);
+            }
+            Ok(Value::Undefined)
+        }),
+    );
 
     let initial_session = lock_history(&session);
-    sync_history_properties(&history, &location, &initial_session);
+    sync_history_properties(&history, &location, &window, &initial_session);
     drop(initial_session);
 
     let history_for_back = history.clone();
     let location_for_back = location.clone();
     let window_for_back = window.clone();
+    let event_target_for_back = event_target.clone();
     let session_for_back = Arc::clone(&session);
+    let hashchange_events_for_back = Arc::clone(&hashchange_events);
     history.set_method(
         "back",
         Arc::new(move |_| {
             let mut session = lock_history(&session_for_back);
             if session.current > 0 {
+                let old_url = session.current().url.clone();
                 session.current -= 1;
-                sync_history_properties(&history_for_back, &location_for_back, &session);
-                invoke_popstate(&window_for_back, &session.current().state);
+                sync_history_properties(
+                    &history_for_back,
+                    &location_for_back,
+                    &window_for_back,
+                    &session,
+                );
+                invoke_popstate(
+                    &window_for_back,
+                    &event_target_for_back,
+                    &session.current().state,
+                );
+                if old_url.fragment() != session.current().url.fragment() {
+                    queue_hashchange(
+                        &hashchange_events_for_back,
+                        old_url,
+                        session.current().url.clone(),
+                    );
+                }
             }
             Ok(Value::Undefined)
         }),
@@ -1277,15 +1680,34 @@ fn register_window_object(
     let history_for_forward = history.clone();
     let location_for_forward = location.clone();
     let window_for_forward = window.clone();
+    let event_target_for_forward = event_target.clone();
     let session_for_forward = Arc::clone(&session);
+    let hashchange_events_for_forward = Arc::clone(&hashchange_events);
     history.set_method(
         "forward",
         Arc::new(move |_| {
             let mut session = lock_history(&session_for_forward);
             if session.current + 1 < session.entries.len() {
+                let old_url = session.current().url.clone();
                 session.current += 1;
-                sync_history_properties(&history_for_forward, &location_for_forward, &session);
-                invoke_popstate(&window_for_forward, &session.current().state);
+                sync_history_properties(
+                    &history_for_forward,
+                    &location_for_forward,
+                    &window_for_forward,
+                    &session,
+                );
+                invoke_popstate(
+                    &window_for_forward,
+                    &event_target_for_forward,
+                    &session.current().state,
+                );
+                if old_url.fragment() != session.current().url.fragment() {
+                    queue_hashchange(
+                        &hashchange_events_for_forward,
+                        old_url,
+                        session.current().url.clone(),
+                    );
+                }
             }
             Ok(Value::Undefined)
         }),
@@ -1294,7 +1716,9 @@ fn register_window_object(
     let history_for_go = history.clone();
     let location_for_go = location.clone();
     let window_for_go = window.clone();
+    let event_target_for_go = event_target.clone();
     let session_for_go = Arc::clone(&session);
+    let hashchange_events_for_go = Arc::clone(&hashchange_events);
     history.set_method(
         "go",
         Arc::new(move |arguments| {
@@ -1308,9 +1732,26 @@ fn register_window_object(
                 .clamp(0, session.entries.len().saturating_sub(1) as i64)
                 as usize;
             if target != session.current {
+                let old_url = session.current().url.clone();
                 session.current = target;
-                sync_history_properties(&history_for_go, &location_for_go, &session);
-                invoke_popstate(&window_for_go, &session.current().state);
+                sync_history_properties(
+                    &history_for_go,
+                    &location_for_go,
+                    &window_for_go,
+                    &session,
+                );
+                invoke_popstate(
+                    &window_for_go,
+                    &event_target_for_go,
+                    &session.current().state,
+                );
+                if old_url.fragment() != session.current().url.fragment() {
+                    queue_hashchange(
+                        &hashchange_events_for_go,
+                        old_url,
+                        session.current().url.clone(),
+                    );
+                }
             }
             Ok(Value::Undefined)
         }),
@@ -1318,6 +1759,7 @@ fn register_window_object(
 
     let history_for_push = history.clone();
     let location_for_push = location.clone();
+    let window_for_push = window.clone();
     let session_for_push = Arc::clone(&session);
     history.set_method(
         "pushState",
@@ -1337,13 +1779,19 @@ fn register_window_object(
                 state,
             });
             session.current += 1;
-            sync_history_properties(&history_for_push, &location_for_push, &session);
+            sync_history_properties(
+                &history_for_push,
+                &location_for_push,
+                &window_for_push,
+                &session,
+            );
             Ok(Value::Undefined)
         }),
     );
 
     let history_for_replace = history.clone();
     let location_for_replace = location.clone();
+    let window_for_replace = window.clone();
     let session_for_replace = Arc::clone(&session);
     history.set_method(
         "replaceState",
@@ -1361,13 +1809,20 @@ fn register_window_object(
                 url: new_url,
                 state,
             };
-            sync_history_properties(&history_for_replace, &location_for_replace, &session);
+            sync_history_properties(
+                &history_for_replace,
+                &location_for_replace,
+                &window_for_replace,
+                &session,
+            );
             Ok(Value::Undefined)
         }),
     );
 
     realm.register_global_value("window", Value::Object(window.clone()))?;
+    realm.register_global_function("HashChangeEvent", Arc::new(hashchange_event_constructor))?;
     realm.register_global_value("self", Value::Object(window.clone()))?;
+    realm.register_global_value("history", Value::Object(history.clone()))?;
     realm.register_global_value(
         "structuredClone",
         window
@@ -1376,6 +1831,12 @@ fn register_window_object(
     )?;
     realm.register_global_value("customElements", Value::Object(custom_elements))?;
     realm.register_global_value("navigator", Value::Object(navigator))?;
+    realm.register_global_value(
+        "getSelection",
+        window
+            .get("getSelection")
+            .expect("getSelection should be installed on Window"),
+    )?;
     realm.register_global_value("performance", Value::Object(performance))?;
     realm.register_global_value("innerWidth", inner_width)?;
     realm.register_global_value("innerHeight", inner_height)?;
@@ -1442,6 +1903,21 @@ pub fn run_window_timers(window: &Object) -> JsResult<usize> {
     }
 }
 
+/// Dispatches the page's `load` event on its `Window` and runs the resulting
+/// microtask checkpoint. Browser integrations should call this once after
+/// page scripts and resources have finished loading.
+///
+/// `window.onload` and `window.addEventListener("load", ...)` listeners run
+/// in registration order. The event fires at most once per Window; later
+/// calls are no-ops apart from the microtask checkpoint.
+pub fn dispatch_window_load(window: &Object) -> JsResult<()> {
+    let Some(Value::Function(dispatch)) = window.get("__dispatchLoad") else {
+        return Err(JsError::runtime("window load dispatcher is not installed"));
+    };
+    dispatch.call(&[])?;
+    run_window_microtasks(window).map(|_| ())
+}
+
 /// Runs the Window's microtask checkpoint.
 ///
 /// Browser integrations call this from the owning page/event-loop thread
@@ -1475,6 +1951,25 @@ pub fn run_window_messages(window: &Object) -> JsResult<usize> {
         Ok(Value::Number(delivered)) => Ok(delivered as usize),
         Ok(_) => Err(JsError::runtime(
             "window message pump returned a non-number",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+/// Delivers queued `hashchange` events for a Window.
+///
+/// Browser integrations should call this at a task checkpoint after the
+/// synchronous history or fragment-navigation algorithm completes.
+pub fn run_window_hashchange_events(window: &Object) -> JsResult<usize> {
+    let Some(Value::Function(pump)) = window.get("__runHashchangeEvents") else {
+        return Err(JsError::runtime(
+            "window hashchange event pump is not installed",
+        ));
+    };
+    match pump.call(&[]) {
+        Ok(Value::Number(delivered)) => Ok(delivered as usize),
+        Ok(_) => Err(JsError::runtime(
+            "window hashchange event pump returned a non-number",
         )),
         Err(error) => Err(error),
     }

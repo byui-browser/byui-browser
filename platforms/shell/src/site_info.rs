@@ -30,8 +30,8 @@ pub(crate) struct Popup {
 }
 
 impl Popup {
-    pub(crate) fn new(width: f64, height: f64, inset: f32) -> Option<Self> {
-        let anchor = toolbar::site_info_anchor(width, inset)?;
+    pub(crate) fn new(width: f64, height: f64) -> Option<Self> {
+        let anchor = toolbar::site_info_anchor(width)?;
         let top = toolbar::PAGE_TOP as f32;
         let width = width as f32;
         let w = width.min(272.0);
@@ -78,8 +78,8 @@ impl Popup {
         if let Some(surface) =
             toolbar::rounded_rect(rect.x(), rect.y(), rect.width(), rect.height(), 9.0)
         {
-            toolbar::fill(frame, &surface, palette.frame_top, transform);
-            toolbar::stroke(frame, &surface, palette.field_border, 1.0, transform);
+            toolbar::fill(frame, &surface, palette.panel, transform);
+            toolbar::stroke(frame, &surface, palette.panel_border, 1.0, transform);
         }
         let close = self.close;
         if self.close_at(cursor)
@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn popup_paints_in_both_palettes_without_covering_the_toolbar() {
-        let popup = Popup::new(420.0, 280.0, 72.0).unwrap();
+        let popup = Popup::new(420.0, 280.0).unwrap();
         let mut surfaces = Vec::new();
         for dark in [false, true] {
             let mut frame = Pixmap::new(840, 560).unwrap();
@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn popup_and_close_button_fit_at_narrow_and_wide_sizes() {
         for width in [330.0, 420.0, 1120.0] {
-            let popup = Popup::new(width, 280.0, 72.0).unwrap();
+            let popup = Popup::new(width, 280.0).unwrap();
             assert!(popup.bounds.left() >= 0.0);
             assert!(f64::from(popup.bounds.right()) <= width);
             assert!(f64::from(popup.bounds.top()) >= toolbar::PAGE_TOP);
@@ -182,7 +182,7 @@ mod tests {
             assert!(popup.close_at(close));
             assert!(!popup.contains(Some((0.0, 0.0))));
         }
-        assert!(Popup::new(180.0, 280.0, 72.0).is_none());
-        assert!(Popup::new(420.0, 100.0, 72.0).is_none());
+        assert!(Popup::new(180.0, 280.0).is_none());
+        assert!(Popup::new(420.0, 100.0).is_none());
     }
 }

@@ -42,7 +42,7 @@ internal pages, saved URLs, error reporting, and unchanged history.
 
 Run `cargo test -p browser-shell app::tests` to verify visit recording and
 that redraw/resize/Reload work does not append history. Run
-`cargo run -p browser-macos` on macOS or `cargo run -p byui-browser-windows`
+`cargo run -p byui-browser` on macOS or `cargo run -p byui-browser-windows`
 on Windows to check that the existing welcome page and toolbar still work.
 
 ### Page context menu
@@ -66,9 +66,13 @@ long documents (the indicator is not draggable). Wrapped text is cached until
 width changes, and resizing preserves the reading position where possible.
 Click the visible **Close** button, press Escape, or click the toolbar to close
 the panel and restore the cached page. Keyboard menu-item navigation remains
-future work; the three-dot menu provides Clear cache. macOS and Windows use the same implementation.
+future work. The three-dot menu provides **Clear cache** and **Appearance**.
+The browser saves the selected System, Light, or Dark appearance in its
+application-data directory and restores it on startup. System follows the OS
+appearance when available and uses Light otherwise. The native desktop shells
+share this implementation.
 
-For a manual demo, run `cargo run -p browser-macos`, right-click the welcome page,
+For a manual demo, run `cargo run -p byui-browser`, right-click the welcome page,
 click Reload, and look for `Refresh byui://welcome`, `Status: 200`, and the HTML.
 Try the bottom-right corner, outside-click and Escape dismissal, and resizing;
 no popup pixels should remain after dismissal. On Windows, run
@@ -159,7 +163,7 @@ the document or add history. Its task handle is checked on the UI thread at
 The label tracks fetching/loading, not completion of all page-script execution.
 Immediate embedded welcome loads may finish before a visible loading frame.
 
-On macOS run `cargo run -p browser-macos`. Submit a slow local HTTP URL and check
+On macOS run `cargo run -p byui-browser`. Submit a slow local HTTP URL and check
 that Loading... appears, then disappears on success or failure. Start a second
 load before the first finishes: the first result must not hide the second label.
 Try toolbar Reload, right-click Reload and Command-R; terminal output and history
@@ -197,7 +201,7 @@ options, or locale-sensitive search. The bottom inspector remains independent an
 it when checking results near the bottom. Source and context menus retain their
 own Escape behavior. No extra request is made and no history is recorded by Find.
 
-Manual macOS check: run `cargo run -p browser-macos`, press Command-F and search
+Manual macOS check: run `cargo run -p byui-browser`, press Command-F and search
 `welcome` on `byui://welcome`. Expect `1/1`. Try `o` for repeated results, Enter,
 Shift-Enter, an absent word, then Escape and ×. Load a long page containing repeated
 paragraphs and inline spans, search a phrase, and cycle to offscreen results.
@@ -308,7 +312,7 @@ Animation relayout updates Find runs/highlights and clamps scroll when content
 shrinks. Page layouts retain their own decoded images/SVG and font collections;
 Find measurements use each text fragment's selected font from main's renderer.
 
-Manual macOS check (`cargo run -p browser-macos`):
+Manual macOS check (`cargo run -p byui-browser`):
 
 1. Open `https://example.com`, then use + and Command-T. Each new tab starts at
    welcome. Switch back and confirm the original page/address remain.

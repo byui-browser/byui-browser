@@ -124,6 +124,10 @@ struct Parser<'tokens> {
     /// `break` and `continue` are valid only when the innermost loop belongs
     /// to the function being parsed.
     loops: Vec<usize>,
+    /// For each breakable non-loop statement being parsed, its function depth.
+    breakables: Vec<usize>,
+    /// Active labels as `(name, loop_target, function_depth)`.
+    labels: Vec<(String, bool, usize)>,
     /// Nonzero while parsing a class method body, where `super` is valid.
     method_depth: usize,
     line_terminators_before: &'tokens [bool],
@@ -137,6 +141,8 @@ impl<'tokens> Parser<'tokens> {
             depth: 0,
             function_depth: 0,
             loops: Vec::new(),
+            breakables: Vec::new(),
+            labels: Vec::new(),
             method_depth: 0,
             line_terminators_before,
         }
@@ -282,5 +288,27 @@ impl<'tokens> Parser<'tokens> {
             .get(self.position)
             .copied()
             .unwrap_or(false)
+    }
+
+    fn push_label(&mut self, name: String, loop_target: bool) -> ParseResult<()> {
+        if self
+            .labels
+            .iter()
+            .any(|(active, _, depth)| active == &name && *depth == self.function_depth)
+        {
+            return Err(self.error("Duplicate label", "labeled statement"));
+        }
+        self.labels.push((name, loop_target, self.function_depth));
+        Ok(())
+    }
+
+    fn pop_label(&mut self) {
+        self.labels.pop();
+    }
+
+    pub(super) fn labeled_target(&self, name: &str, require_loop: bool) -> bool {
+        self.labels.iter().rev().any(|(label, loop_target, depth)| {
+            label == name && *depth == self.function_depth && (!require_loop || *loop_target)
+        })
     }
 }
