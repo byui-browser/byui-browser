@@ -11,7 +11,7 @@ use reqwest::Url;
 use crate::api::request::Request;
 
 use super::{
-    entry::{CachedResponse, StoredResponse, vary_header_names},
+    entry::{CacheValidator, CachedResponse, StoredResponse, vary_header_names},
     freshness::{CacheClock, FreshnessMetadata, SystemCacheClock},
     key::{cache_key, has_authorization},
     storage::{CacheEntries, CacheLimits},
@@ -35,6 +35,8 @@ pub(crate) enum CacheLookup {
     Stale {
         response: StoredResponse,
         may_serve_stale: bool,
+        /// Validator available for a conditional network request.
+        validator: Option<CacheValidator>,
     },
 }
 
@@ -114,8 +116,63 @@ impl ResponseCache {
             Some(CacheLookup::Stale {
                 response: cached.as_response(),
                 may_serve_stale: cached.freshness.may_serve_stale(),
+                validator: cached.validator.clone(),
             })
         }
+    }
+
+    /// Returns a matching representation and its validator, regardless of freshness.
+    ///
+    /// This is used for `no-cache`, which must revalidate even a fresh entry.
+    pub(crate) fn lookup_for_revalidation(
+        &self,
+        request: &Request,
+        url: &Url,
+    ) -> Option<(StoredResponse, CacheValidator)> {
+        let key = cache_key(request, url);
+        let mut entries = self.entries.write().expect("cache lock poisoned");
+        let access = entries.next_access();
+        let cached = entries.entries.get_mut(&key)?.iter_mut().find(|entry| {
+            entry
+                .vary_headers
+                .iter()
+                .all(|(name, original_value)| request.headers().get(name) == *original_value)
+        })?;
+        cached.last_access = access;
+        cached
+            .validator
+            .clone()
+            .map(|validator| (cached.as_response(), validator))
+    }
+
+    /// Merges a 304 response into its matching stored representation.
+    ///
+    /// The stored status and body remain authoritative; 304 metadata replaces
+    /// corresponding representation metadata and establishes new freshness.
+    pub(crate) fn merge_not_modified(
+        &self,
+        request: &Request,
+        url: &Url,
+        headers: &reqwest::header::HeaderMap,
+    ) -> Option<StoredResponse> {
+        let key = cache_key(request, url);
+        let now = self.clock.now();
+        let mut entries = self.entries.write().expect("cache lock poisoned");
+        let access = entries.next_access();
+        let cached = entries.entries.get_mut(&key)?.iter_mut().find(|entry| {
+            entry
+                .vary_headers
+                .iter()
+                .all(|(name, original_value)| request.headers().get(name) == *original_value)
+        })?;
+        let mut merged_headers = cached.response.headers.clone();
+        for (name, value) in headers {
+            if name != http::header::CONTENT_LENGTH {
+                merged_headers.insert(name.clone(), value.clone());
+            }
+        }
+        let freshness = FreshnessMetadata::from_headers(&merged_headers, now)?;
+        Some(cached.merge_not_modified(headers, freshness, access))
     }
 
     /// Stores a successful response when its headers provide a positive TTL.

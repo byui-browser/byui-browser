@@ -7,7 +7,7 @@ mod key;
 mod storage;
 
 pub(crate) use cache::{CacheLookup, ResponseCache};
-pub(crate) use entry::StoredResponse;
+pub(crate) use entry::{CacheValidator, StoredResponse};
 
 #[cfg(test)]
 use std::{
@@ -20,7 +20,7 @@ use bytes::Bytes;
 #[cfg(test)]
 use reqwest::{
     StatusCode, Url,
-    header::{AGE, AUTHORIZATION, CACHE_CONTROL, DATE, EXPIRES, HeaderMap, LAST_MODIFIED},
+    header::{AGE, AUTHORIZATION, CACHE_CONTROL, DATE, ETAG, EXPIRES, HeaderMap, LAST_MODIFIED},
 };
 
 #[cfg(test)]

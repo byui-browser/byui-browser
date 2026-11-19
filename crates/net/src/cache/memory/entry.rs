@@ -1,7 +1,10 @@
 //! Cached response representations and `Vary` matching.
 
 use bytes::Bytes;
-use reqwest::{StatusCode, header::HeaderMap};
+use reqwest::{
+    StatusCode,
+    header::{ETAG, HeaderMap, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED},
+};
 
 use crate::api::request::Request;
 
@@ -29,6 +32,28 @@ pub(crate) struct CachedResponse {
     pub(super) freshness: FreshnessMetadata,
     pub(super) vary_headers: Vec<(String, Option<String>)>,
     pub(super) last_access: u64,
+    pub(super) validator: Option<CacheValidator>,
+}
+
+/// A validator retained with a cached representation for conditional requests.
+#[derive(Clone, Debug)]
+pub(crate) enum CacheValidator {
+    /// Revalidate using the response entity tag.
+    EntityTag(HeaderValue),
+    /// Revalidate using the response modification time when no entity tag exists.
+    LastModified(HeaderValue),
+}
+
+impl CacheValidator {
+    /// Adds this validator to internal transport headers.
+    pub(crate) fn apply(&self, headers: &mut crate::Headers) -> Result<(), crate::RequestError> {
+        match self {
+            Self::EntityTag(value) => headers.insert_internal_header(IF_NONE_MATCH, value.clone()),
+            Self::LastModified(value) => {
+                headers.insert_internal_header(IF_MODIFIED_SINCE, value.clone())
+            }
+        }
+    }
 }
 
 impl CachedResponse {
@@ -41,6 +66,7 @@ impl CachedResponse {
     ) -> Self {
         let vary_headers = capture_vary_headers(request, &response.headers);
         Self {
+            validator: response_validator(&response.headers),
             response,
             freshness,
             vary_headers,
@@ -66,6 +92,40 @@ impl CachedResponse {
             .map(|(name, _)| name.as_str())
             .collect()
     }
+
+    /// Merges successful revalidation metadata while retaining the representation body.
+    pub(super) fn merge_not_modified(
+        &mut self,
+        headers: &HeaderMap,
+        freshness: FreshnessMetadata,
+        access: u64,
+    ) -> StoredResponse {
+        for (name, value) in headers {
+            // A 304 has no representation body, so its content length cannot
+            // describe the retained body.
+            if name != http::header::CONTENT_LENGTH {
+                self.response.headers.insert(name.clone(), value.clone());
+            }
+        }
+        self.validator = response_validator(&self.response.headers);
+        self.freshness = freshness;
+        self.last_access = access;
+        self.as_response()
+    }
+}
+
+/// Prefers an entity tag over a date validator, as required for conditional GET.
+fn response_validator(headers: &HeaderMap) -> Option<CacheValidator> {
+    headers
+        .get(ETAG)
+        .cloned()
+        .map(CacheValidator::EntityTag)
+        .or_else(|| {
+            headers
+                .get(LAST_MODIFIED)
+                .cloned()
+                .map(CacheValidator::LastModified)
+        })
 }
 
 /// Returns the request header names listed in the response's `Vary` header.

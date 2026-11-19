@@ -61,6 +61,47 @@ fn fully_consumed_stream_is_cached() {
 }
 
 #[test]
+fn no_cache_revalidates_with_etag_and_reuses_the_merged_representation() {
+    let server = TestServer::start(2, |request| {
+        if request.contains("if-none-match: \"version-1\"") {
+            b"HTTP/1.1 304 Not Modified\r\nCache-Control: max-age=60\r\nETag: \"version-2\"\r\nX-Revalidated: yes\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        } else {
+            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nETag: \"version-1\"\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
+        }
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+
+    let (revalidated, cached) = runtime().block_on(async {
+        let request = Request::get(server.url());
+        let first = controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(collect_body(first).await.unwrap(), b"cached");
+        let mut no_cache = request;
+        no_cache.set_cache_mode(CacheMode::NoCache);
+        let revalidated = controller.fetch(no_cache).await.unwrap();
+        let revalidated = (
+            revalidated.from_cache,
+            revalidated.headers.get("x-revalidated"),
+            collect_body(revalidated).await.unwrap(),
+        );
+        let cached = controller.fetch(Request::get(server.url())).await.unwrap();
+        let cached = (cached.from_cache, collect_body(cached).await.unwrap());
+        (revalidated, cached)
+    });
+
+    server.join();
+    assert!(revalidated.0);
+    assert_eq!(revalidated.1.as_deref(), Some("yes"));
+    assert_eq!(revalidated.2, b"cached");
+    assert!(cached.0);
+    assert_eq!(cached.1, b"cached");
+}
+
+#[test]
 fn bodies_larger_than_the_capture_limit_are_not_cached() {
     let hits = Arc::new(AtomicUsize::new(0));
     let observed_hits = Arc::clone(&hits);

@@ -281,6 +281,64 @@ fn no_cache_and_must_revalidate_entries_require_revalidation_when_stale() {
 }
 
 #[test]
+fn revalidation_prefers_etag_and_merges_304_metadata() {
+    let clock = Arc::new(TestClock::new(Duration::ZERO));
+    let cache = ResponseCache::with_clock(4, 64, clock);
+    let url = Url::parse("https://example.test/revalidate").unwrap();
+    let request = Request::get(url.as_str());
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, "max-age=0".parse().unwrap());
+    headers.insert(ETAG, "\"first\"".parse().unwrap());
+    headers.insert(
+        LAST_MODIFIED,
+        "Sun, 06 Nov 1994 08:49:37 GMT".parse().unwrap(),
+    );
+    cache.insert(
+        &request,
+        &url,
+        StoredResponse {
+            status: StatusCode::OK,
+            headers,
+            url: url.to_string(),
+            body: Bytes::from_static(b"cached"),
+            cookie_headers_processed: false,
+        },
+    );
+
+    let (_, validator) = cache.lookup_for_revalidation(&request, &url).unwrap();
+    let mut conditional_headers = crate::Headers::new();
+    validator.apply(&mut conditional_headers).unwrap();
+    assert_eq!(
+        conditional_headers
+            .to_reqwest()
+            .get("if-none-match")
+            .unwrap(),
+        "\"first\""
+    );
+    assert!(
+        conditional_headers
+            .to_reqwest()
+            .get("if-modified-since")
+            .is_none()
+    );
+
+    let mut not_modified = HeaderMap::new();
+    not_modified.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+    not_modified.insert(ETAG, "\"second\"".parse().unwrap());
+    not_modified.insert("x-revalidated", "yes".parse().unwrap());
+    let merged = cache
+        .merge_not_modified(&request, &url, &not_modified)
+        .unwrap();
+    assert_eq!(merged.status, StatusCode::OK);
+    assert_eq!(merged.body, Bytes::from_static(b"cached"));
+    assert_eq!(merged.headers.get("x-revalidated").unwrap(), "yes");
+    assert!(matches!(
+        cache.lookup(&request, &url),
+        Some(CacheLookup::Fresh(_))
+    ));
+}
+
+#[test]
 fn malformed_expiry_and_negative_age_do_not_extend_freshness() {
     let now = CacheTime {
         wall: Duration::from_secs(1_000),

@@ -78,8 +78,8 @@ pub enum RedirectMode {
 }
 /// Controls which process-local cache behavior a request selects.
 ///
-/// This is a documented HTTP cache subset. `NoCache` is rejected until
-/// revalidation exists; full Fetch cache matching belongs to a later step.
+/// This is a documented HTTP cache subset. Matching validators are revalidated
+/// for `NoCache`; full Fetch cache matching belongs to a later step.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CacheMode {
     #[default]

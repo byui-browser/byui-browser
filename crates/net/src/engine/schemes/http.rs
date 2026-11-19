@@ -8,7 +8,7 @@ use crate::{
         request::{CacheMode, PreparedRequest, Request, ValidatedHop},
         response::{InternalResponse, Response, has_null_body},
     },
-    cache::{CacheLookup, StoredResponse},
+    cache::{CacheLookup, CacheValidator, StoredResponse},
     engine::{
         RequestController, cache_capture::with_cache_capture,
         process_response::ResponseFinalization,
@@ -27,20 +27,41 @@ impl RequestController {
             let transport_headers = self.validate_http_hop(&mut request, &url).await?;
 
             let cacheable = request.is_cacheable_method();
-            let cache_lookup = match request.cache_mode() {
-                CacheMode::Default | CacheMode::OnlyIfCached | CacheMode::ForceCache => Some(true),
-                CacheMode::NoStore | CacheMode::Reload | CacheMode::NoCache => None,
-            };
+            let cache_lookup = matches!(
+                request.cache_mode(),
+                CacheMode::Default
+                    | CacheMode::OnlyIfCached
+                    | CacheMode::ForceCache
+                    | CacheMode::NoCache
+            );
+            let mut revalidation: Option<(StoredResponse, CacheValidator)> = None;
             if cacheable {
                 self.observe(&request, NetworkPhase::CacheLookup, &url, None, false);
-                let cached = cache_lookup.and_then(|_| self.inner.cache.lookup(&request, &url));
-                let cached = match cached {
-                    Some(CacheLookup::Fresh(response)) => Some(response),
-                    Some(CacheLookup::Stale {
-                        response,
-                        may_serve_stale: true,
-                    }) if request.cache_mode() == CacheMode::ForceCache => Some(response),
-                    Some(CacheLookup::Stale { .. }) | None => None,
+                let cached = match request.cache_mode() {
+                    CacheMode::NoCache => {
+                        revalidation = self.inner.cache.lookup_for_revalidation(&request, &url);
+                        None
+                    }
+                    _ => match cache_lookup
+                        .then(|| self.inner.cache.lookup(&request, &url))
+                        .flatten()
+                    {
+                        Some(CacheLookup::Fresh(response)) => Some(response),
+                        Some(CacheLookup::Stale {
+                            response,
+                            may_serve_stale: true,
+                            ..
+                        }) if request.cache_mode() == CacheMode::ForceCache => Some(response),
+                        Some(CacheLookup::Stale {
+                            response,
+                            validator,
+                            ..
+                        }) => {
+                            revalidation = validator.map(|validator| (response, validator));
+                            None
+                        }
+                        None => None,
+                    },
                 };
                 if let Some(cached) = cached {
                     self.observe(
@@ -86,7 +107,7 @@ impl RequestController {
                     );
                     return Ok(internal.expose());
                 }
-                if cache_lookup.is_some() {
+                if cache_lookup {
                     self.observe(&request, NetworkPhase::CacheMiss, &url, None, false);
                     log::debug!(
                         "cache miss: {} {}",
@@ -107,6 +128,10 @@ impl RequestController {
                 .body()
                 .as_ref()
                 .is_some_and(|body| !body.is_replayable());
+            let mut transport_headers = transport_headers;
+            if let Some((_, validator)) = &revalidation {
+                validator.apply(&mut transport_headers)?;
+            }
             let validated = self.finish_http_hop(&mut request, &url, transport_headers)?;
             let mut candidate = self
                 .inner
@@ -123,6 +148,31 @@ impl RequestController {
                 request.method(),
                 crate::log_url::loggable(url.as_str())
             );
+            if status == http::StatusCode::NOT_MODIFIED.as_u16()
+                && revalidation.is_some()
+                && let Some(cached) =
+                    self.inner
+                        .cache
+                        .merge_not_modified(&request, &url, &candidate.headers)
+            {
+                let mut body = if has_null_body(request.method(), cached.status) {
+                    Body::null()
+                } else {
+                    Body::once_bytes_with_signal(cached.body, request.signal().clone())
+                };
+                body.set_response_metadata(&cached.headers, None);
+                response = InternalResponse::from_http_parts(
+                    cached.status,
+                    cached.headers,
+                    cached.url,
+                    request.context(),
+                    body,
+                    true,
+                    cached.cookie_headers_processed,
+                );
+                response.apply_request_state(&request);
+                break;
+            }
             if !matches!(status, 301 | 302 | 303 | 307 | 308) {
                 response = candidate;
                 break;

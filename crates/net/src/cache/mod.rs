@@ -9,5 +9,5 @@
 mod memory;
 mod preflight;
 
-pub(crate) use memory::{CacheLookup, ResponseCache, StoredResponse};
+pub(crate) use memory::{CacheLookup, CacheValidator, ResponseCache, StoredResponse};
 pub(crate) use preflight::{PreflightCache, PreflightPermissions};
