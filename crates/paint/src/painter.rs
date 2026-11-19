@@ -561,8 +561,9 @@ mod tests {
             })
             .expect("the value is painted");
         assert_eq!(text, "much too long");
+        // The padding box: inside the input's 2px user-agent border.
         let clip = clip.expect("control text is clipped");
-        assert_eq!((clip.x, clip.width), (0.0, 44.0));
+        assert_eq!((clip.x, clip.width), (2.0, 44.0));
     }
 
     #[test]

@@ -1610,7 +1610,48 @@ mod control_text {
         let (document, tree) = lay_out(html, CSS, 800.0);
         let input = box_for(&tree, &document, "a");
         // The 19.2px line overflows the 9.2px box by 5px on each side.
-        assert_close(input.lines[0].rect.y - input.rect.y, -5.0);
+        assert_close(input.lines[0].rect.y - input.content_rect().y, -5.0);
+    }
+
+    /// Guards the merge with floats and positioning (#413): controls with
+    /// drawn text go out of flow like other boxes and keep their text.
+    #[test]
+    fn floated_and_positioned_inputs_go_out_of_flow_with_their_text() {
+        let html = "<div style='position: relative'>\
+            <input id='f' style='float: right' value='floated'>\
+            <input id='a' style='position: absolute; top: 5px; left: 7px' value='placed'>\
+            <textarea id='t' style='position: absolute; top: 0; right: 0'>area</textarea>\
+            <p id='p'>after</p></div>";
+        let (document, tree) = lay_out(html, CSS, 800.0);
+        let floated = box_for(&tree, &document, "f");
+        assert_eq!(floated.placement, Placement::Float);
+        assert_eq!(texts(floated), ["floated"]);
+        assert_close(floated.rect.right(), 800.0);
+        let placed = box_for(&tree, &document, "a");
+        assert_eq!(placed.placement, Placement::Absolute);
+        assert_eq!(texts(placed), ["placed"]);
+        assert_eq!((placed.rect.x, placed.rect.y), (7.0, 5.0));
+        let area = box_for(&tree, &document, "t");
+        assert_eq!(area.placement, Placement::Absolute);
+        assert_eq!(texts(area), ["area"]);
+        // None of them takes space in the flow.
+        assert_close(box_for(&tree, &document, "p").rect.y, 0.0);
+    }
+
+    /// Guards the merge with generated content (#393): inputs and textareas
+    /// show only their own text, never `::before` / `::after` content.
+    #[test]
+    fn controls_never_show_before_or_after_content() {
+        let html = "<p><input id='a' value='v'><input id='b' placeholder='p'>\
+            <textarea id='c'>t</textarea></p>";
+        let css = format!(
+            "{CSS} input::before, textarea::before {{ content: 'BEFORE' }} \
+             input::after, textarea::after {{ content: 'AFTER' }}"
+        );
+        let (document, tree) = lay_out(html, &css, 800.0);
+        assert_eq!(texts(box_for(&tree, &document, "a")), ["v"]);
+        assert_eq!(texts(box_for(&tree, &document, "b")), ["p"]);
+        assert_eq!(texts(box_for(&tree, &document, "c")), ["t"]);
     }
 
     #[test]
