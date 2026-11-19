@@ -26,12 +26,28 @@ const CSS_WIDE_KEYWORDS: [&str; 5] = ["inherit", "initial", "unset", "revert", "
 ///
 /// `animation` is expanded to the eight `animation-*` longhands, each a
 /// comma-separated list with one entry per animation (CSS Animations 1
-/// §3.10).
+/// §3.10). The supported WebKit animation and flexbox aliases normalize to
+/// their standard property names; legacy box alignment values are translated
+/// to their modern flex equivalents.
 ///
 /// Other declarations are returned unchanged. An invalid shorthand value
 /// expands to nothing, matching CSS's rule that invalid declarations are
 /// dropped. CSS-wide keywords such as `inherit` are copied to every longhand.
 pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
+    if let Some(property) = declaration.property.strip_prefix("-webkit-") {
+        let (property, value) = match property {
+            "box-align" => ("align-items", legacy_box_align(&declaration.value)),
+            "box-pack" => ("justify-content", legacy_box_pack(&declaration.value)),
+            "align-items" | "justify-content" | "animation" => {
+                (property, declaration.value.clone())
+            }
+            _ => return vec![declaration.clone()],
+        };
+        return expand(&Declaration {
+            property: property.to_owned(),
+            value,
+        });
+    }
     if matches!(
         declaration.property.as_str(),
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left"
@@ -94,6 +110,25 @@ pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
             value: value.to_owned(),
         })
         .collect()
+}
+
+fn legacy_box_align(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "start" => "flex-start".to_owned(),
+        "end" => "flex-end".to_owned(),
+        "center" | "baseline" | "stretch" => value.trim().to_ascii_lowercase(),
+        _ => value.to_owned(),
+    }
+}
+
+fn legacy_box_pack(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "start" => "flex-start".to_owned(),
+        "end" => "flex-end".to_owned(),
+        "center" => "center".to_owned(),
+        "justify" => "space-between".to_owned(),
+        _ => value.to_owned(),
+    }
 }
 
 fn expand_border(declaration: &Declaration) -> Vec<Declaration> {
@@ -311,6 +346,29 @@ mod tests {
         );
         assert_eq!(expanded("border-radius", "1px / "), []);
         assert_eq!(expanded("border-radius", "1px 2px 3px 4px 5px"), []);
+    }
+
+    #[test]
+    fn webkit_flexbox_and_animation_aliases_normalize_to_standard_properties() {
+        assert_eq!(
+            expanded("-webkit-align-items", "center"),
+            [("align-items".into(), "center".into())]
+        );
+        assert_eq!(
+            expanded("-webkit-box-align", "start"),
+            [("align-items".into(), "flex-start".into())]
+        );
+        assert_eq!(
+            expanded("-webkit-box-pack", "justify"),
+            [("justify-content".into(), "space-between".into())]
+        );
+        assert_eq!(
+            expanded("-webkit-justify-content", "center"),
+            [("justify-content".into(), "center".into())]
+        );
+        let animation = expanded("-webkit-animation", "fade 1s linear");
+        assert_eq!(animation.len(), 8);
+        assert_eq!(animation[0], ("animation-name".into(), "fade".into()));
     }
 }
 

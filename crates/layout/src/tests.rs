@@ -135,6 +135,20 @@ fn flex_row_distributes_grow_space_and_places_the_gap() {
 }
 
 #[test]
+fn webkit_flexbox_aliases_place_items_on_both_axes() {
+    let (document, tree) = lay_out(
+        "<body><div id='container'><div id='item'></div></div></body>",
+        "body { margin: 0 } #container { display: flex; width: 200px; height: 100px; \
+         -webkit-box-pack: center; -webkit-box-align: center } \
+         #item { width: 50px; height: 20px }",
+        300.0,
+    );
+    let item = box_for(&tree, &document, "item");
+    assert_close(item.rect.x, 75.0);
+    assert_close(item.rect.y, 40.0);
+}
+
+#[test]
 fn flex_basis_overrides_the_main_size_before_growth() {
     let (document, tree) = lay_out(
         "<body><div id='container'><div id='first'></div><div id='second'></div></div></body>",

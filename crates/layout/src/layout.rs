@@ -32,8 +32,10 @@ pub(crate) struct Context<'a> {
 ///
 /// `display:flex` and `display:inline-flex` use a single-line flex subset with
 /// `flex-direction:row|column`, `flex-basis`, `flex-grow`, `flex-shrink`, and
-/// `gap`. Wrapping, alignment, and anonymous flex items for mixed text are not
-/// implemented.
+/// `gap`. Main-axis free-space distribution and `align-items` start, center,
+/// and end placement are supported for definite cross sizes. Wrapping, full
+/// baseline/stretch alignment, and anonymous flex items for mixed text are
+/// not implemented.
 /// Grid modes are preserved distinctly in computed display values, but still
 /// use ordinary flow layout. Tables lay out direct children in one row; full
 /// row groups, column sizing, and collapsed borders are not implemented.
