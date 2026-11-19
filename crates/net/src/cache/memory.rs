@@ -2,14 +2,15 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     sync::{Arc, RwLock},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
 use reqwest::{
     StatusCode, Url,
-    header::{AUTHORIZATION, CACHE_CONTROL, HeaderMap, PROXY_AUTHORIZATION},
+    header::{AGE, AUTHORIZATION, CACHE_CONTROL, DATE, EXPIRES, HeaderMap, PROXY_AUTHORIZATION},
 };
 
 use crate::api::request::{CredentialsMode, RedirectTaint, Request, RequestMode};
@@ -27,10 +28,11 @@ pub(crate) struct StoredResponse {
 }
 
 /// Thread-safe, bounded process-local cache shared by cloned request clients.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct ResponseCache {
     entries: Arc<RwLock<CacheEntries>>,
     limits: CacheLimits,
+    clock: Arc<dyn CacheClock>,
 }
 
 impl Default for ResponseCache {
@@ -42,12 +44,61 @@ impl Default for ResponseCache {
 impl ResponseCache {
     /// Creates a bounded process-local response cache.
     pub(crate) fn new(max_entries: usize, max_body_size: usize) -> Self {
+        Self::with_clock(
+            max_entries,
+            max_body_size,
+            Arc::new(SystemCacheClock {
+                started: Instant::now(),
+            }),
+        )
+    }
+
+    fn with_clock(max_entries: usize, max_body_size: usize, clock: Arc<dyn CacheClock>) -> Self {
         Self {
             entries: Arc::new(RwLock::new(CacheEntries::default())),
             limits: CacheLimits {
                 max_entries,
                 max_body_size,
             },
+            clock,
+        }
+    }
+}
+
+impl fmt::Debug for ResponseCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResponseCache")
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Clock reading used for cache freshness and deterministic tests.
+#[derive(Clone, Copy, Debug)]
+struct CacheTime {
+    wall: Duration,
+    elapsed: Duration,
+}
+
+/// Source of wall-clock and monotonic time for cache freshness calculations.
+trait CacheClock: fmt::Debug + Send + Sync {
+    fn now(&self) -> CacheTime;
+}
+
+/// Production clock with a monotonic origin shared by one cache instance.
+#[derive(Debug)]
+struct SystemCacheClock {
+    started: Instant,
+}
+
+impl CacheClock for SystemCacheClock {
+    fn now(&self) -> CacheTime {
+        CacheTime {
+            wall: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO),
+            elapsed: self.started.elapsed(),
         }
     }
 }
@@ -92,23 +143,24 @@ enum CachePartition {
     Standalone,
 }
 
-impl ResponseCache {
-    /// Returns a fresh cached response for the request, if one exists.
-    #[cfg(test)]
-    pub(crate) fn get(&self, request: &Request, url: &Url) -> Option<StoredResponse> {
-        self.get_with_staleness(request, url, false)
-    }
+/// Freshness result for a matching cache entry.
+#[derive(Debug)]
+pub(crate) enum CacheLookup {
+    /// The cached representation may be used without revalidation.
+    Fresh(StoredResponse),
+    /// The cached representation is stale; only callers allowed to use stale
+    /// data may use it, and must honor `may_serve_stale`.
+    Stale {
+        response: StoredResponse,
+        may_serve_stale: bool,
+    },
+}
 
-    /// Returns a cached response, optionally allowing an expired entry.
-    pub(crate) fn get_with_staleness(
-        &self,
-        request: &Request,
-        url: &Url,
-        allow_stale: bool,
-    ) -> Option<StoredResponse> {
+impl ResponseCache {
+    /// Looks up a matching cached representation and reports its freshness.
+    pub(crate) fn lookup(&self, request: &Request, url: &Url) -> Option<CacheLookup> {
         let key = cache_key(request, url);
-        // Clone the response while the read lock is held, then release the lock
-        // before returning so callers never hold cache state during network work.
+        let now = self.clock.now();
         let mut entries = self.entries.write().expect("cache lock poisoned");
         let access = entries.next_access();
         let Some(cached) = entries.entries.get_mut(&key) else {
@@ -120,7 +172,6 @@ impl ResponseCache {
             return None;
         };
 
-        // Find the cached response that matches this request's Vary headers.
         let Some(cached) = cached.iter_mut().find(|entry| {
             entry
                 .vary_headers
@@ -130,19 +181,14 @@ impl ResponseCache {
             log::trace!("cache miss: no matching Vary response");
             return None;
         };
-        let usable = allow_stale || cached.expires_at > Instant::now();
-        if !usable {
-            log::trace!(
-                "cache entry expired for {} {}",
-                request.method(),
-                crate::log_url::loggable(url.as_str())
-            );
-        }
-        if usable {
-            cached.last_access = access;
-            Some(cached.as_response())
+        cached.last_access = access;
+        if cached.freshness.is_fresh(now) {
+            Some(CacheLookup::Fresh(cached.as_response()))
         } else {
-            None
+            Some(CacheLookup::Stale {
+                response: cached.as_response(),
+                may_serve_stale: cached.freshness.may_serve_stale(),
+            })
         }
     }
 
@@ -174,7 +220,8 @@ impl ResponseCache {
             );
             return;
         }
-        let Some(ttl) = cache_ttl(&response.headers) else {
+        let now = self.clock.now();
+        let Some(freshness) = FreshnessMetadata::from_headers(&response.headers, now) else {
             log::trace!(
                 "cache store skipped for {}: no usable max-age",
                 crate::log_url::loggable(url.as_str())
@@ -182,11 +229,11 @@ impl ResponseCache {
             return;
         };
         log::debug!(
-            "cache store: {} {} ({} bytes, ttl {}s)",
+            "cache store: {} {} ({} bytes, freshness {}s)",
             request.method(),
             crate::log_url::loggable(url.as_str()),
             response.body.len(),
-            ttl.as_secs()
+            freshness.lifetime.as_secs()
         );
         let key = cache_key(request, url);
         let body_size = response.body.len();
@@ -199,9 +246,9 @@ impl ResponseCache {
         }
 
         let mut entries = self.entries.write().expect("cache lock poisoned");
-        entries.prune_expired();
+        entries.prune_stale(now);
         let access = entries.next_access();
-        let cached_response = CachedResponse::from_response(request, response, ttl, access);
+        let cached_response = CachedResponse::from_response(request, response, freshness, access);
         let new_vary_names = cached_response.vary_names();
         let replaced_body_size = entries.body_size_for(&key);
         let existing = entries.entries.remove(&key).unwrap_or_default();
@@ -241,23 +288,23 @@ impl ResponseCache {
 #[derive(Clone, Debug)]
 pub(crate) struct CachedResponse {
     response: StoredResponse,
-    pub(crate) expires_at: Instant,
+    freshness: FreshnessMetadata,
     vary_headers: Vec<(String, Option<String>)>,
     last_access: u64,
 }
 
 impl CachedResponse {
-    /// Moves a response into the cache with a caller-supplied lifetime.
-    pub(crate) fn from_response(
+    /// Moves a response into the cache with parsed freshness metadata.
+    fn from_response(
         request: &Request,
         response: StoredResponse,
-        ttl: Duration,
+        freshness: FreshnessMetadata,
         last_access: u64,
     ) -> Self {
         let vary_headers = capture_vary_headers(request, &response.headers);
         Self {
             response,
-            expires_at: Instant::now() + ttl,
+            freshness,
             vary_headers,
             last_access,
         }
@@ -324,12 +371,11 @@ impl CacheEntries {
             .sum()
     }
 
-    /// Drops expired data before an insertion; stale data may still be served
+    /// Drops stale data before an insertion; stale data may still be served
     /// by `ForceCache` until a later insertion makes it eligible for eviction.
-    fn prune_expired(&mut self) {
-        let now = Instant::now();
+    fn prune_stale(&mut self, now: CacheTime) {
         self.entries.retain(|_, variants| {
-            variants.retain(|entry| entry.expires_at > now);
+            variants.retain(|entry| entry.freshness.is_fresh(now));
             !variants.is_empty()
         });
         self.total_body_size = self
@@ -397,28 +443,128 @@ fn capture_vary_headers(
         .collect()
 }
 
-/// Reads a conservative cache lifetime from the response's `Cache-Control` header.
-/// Responses without `max-age`, or with `no-store`/`no-cache`, are not cached.
+/// Parsed response directives that affect the supported freshness subset.
+#[derive(Clone, Copy, Debug, Default)]
+struct CacheControl {
+    max_age: Option<Duration>,
+    no_cache: bool,
+    no_store: bool,
+    must_revalidate: bool,
+}
+
+/// Stored age and freshness state for one cached response.
+#[derive(Clone, Copy, Debug)]
+struct FreshnessMetadata {
+    response_time: CacheTime,
+    date: Option<Duration>,
+    age: Duration,
+    lifetime: Duration,
+    requires_revalidation: bool,
+    must_revalidate: bool,
+}
+
+impl FreshnessMetadata {
+    /// Builds cache metadata for the supported explicit-freshness subset.
+    ///
+    /// Responses without `max-age` or a valid `Expires` value are not stored;
+    /// heuristic freshness is intentionally deferred.
+    fn from_headers(headers: &HeaderMap, response_time: CacheTime) -> Option<Self> {
+        let directives = cache_control(headers);
+        if directives.no_store {
+            return None;
+        }
+        let date = parse_http_date(headers.get(DATE));
+        let expires = parse_http_date(headers.get(EXPIRES));
+        let lifetime = if directives.no_cache {
+            Duration::ZERO
+        } else if let Some(max_age) = directives.max_age {
+            max_age
+        } else {
+            expires?.saturating_sub(date.unwrap_or(response_time.wall))
+        };
+        Some(Self {
+            response_time,
+            date,
+            age: parse_age(headers),
+            lifetime,
+            requires_revalidation: directives.no_cache,
+            must_revalidate: directives.must_revalidate,
+        })
+    }
+
+    fn is_fresh(&self, now: CacheTime) -> bool {
+        !self.requires_revalidation && self.current_age(now) < self.lifetime
+    }
+
+    fn may_serve_stale(&self) -> bool {
+        !self.requires_revalidation && !self.must_revalidate
+    }
+
+    fn current_age(&self, now: CacheTime) -> Duration {
+        let apparent_age = self
+            .date
+            .map(|date| self.response_time.wall.saturating_sub(date))
+            .unwrap_or(Duration::ZERO);
+        let corrected_received_age = apparent_age.max(self.age);
+        corrected_received_age
+            .saturating_add(now.elapsed.saturating_sub(self.response_time.elapsed))
+    }
+}
+
+/// Parses the supported `Cache-Control` directives without retaining raw values.
+fn cache_control(headers: &HeaderMap) -> CacheControl {
+    let mut directives = CacheControl::default();
+    for value in headers.get_all(CACHE_CONTROL).iter() {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for directive in value.split(',') {
+            let directive = directive.trim();
+            if directive.eq_ignore_ascii_case("no-cache") {
+                directives.no_cache = true;
+            } else if directive.eq_ignore_ascii_case("no-store") {
+                directives.no_store = true;
+            } else if directive.eq_ignore_ascii_case("must-revalidate") {
+                directives.must_revalidate = true;
+            } else if let Some((name, value)) = directive.split_once('=')
+                && name.trim().eq_ignore_ascii_case("max-age")
+                && let Ok(seconds) = value.trim().trim_matches('"').parse::<u64>()
+            {
+                directives.max_age = Some(Duration::from_secs(seconds));
+            }
+        }
+    }
+    directives
+}
+
+/// Parses an HTTP-date header into seconds since the Unix epoch.
+fn parse_http_date(value: Option<&reqwest::header::HeaderValue>) -> Option<Duration> {
+    let value = value?.to_str().ok()?;
+    httpdate::parse_http_date(value)
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+}
+
+/// Parses the non-negative seconds in an `Age` header.
+fn parse_age(headers: &HeaderMap) -> Duration {
+    headers
+        .get(AGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::ZERO)
+}
+
+/// Reads an explicit `max-age` lifetime for compatibility tests.
+/// Responses with `no-store` or `no-cache` have no reusable max-age lifetime.
+#[cfg(test)]
 pub(crate) fn cache_ttl(headers: &HeaderMap) -> Option<Duration> {
-    let value = headers.get(CACHE_CONTROL)?.to_str().ok()?;
-    if value.split(',').any(|directive| {
-        matches!(
-            directive.trim().to_ascii_lowercase().as_str(),
-            "no-store" | "no-cache"
-        )
-    }) {
+    let directives = cache_control(headers);
+    if directives.no_store || directives.no_cache {
         return None;
     }
-    value
-        .split(',')
-        .find_map(|directive| {
-            let (name, value) = directive.trim().split_once('=')?;
-            if !name.trim().eq_ignore_ascii_case("max-age") {
-                return None;
-            }
-            value.trim().trim_matches('"').parse::<u64>().ok()
-        })
-        .map(Duration::from_secs)
+    directives.max_age
 }
 
 #[cfg(test)]
@@ -464,7 +610,7 @@ mod tests {
         cache.insert(&english, &url, response);
 
         // Same language should produce a cache hit.
-        assert!(cache.get(&english, &url).is_some());
+        assert!(fresh_response(&cache, &english, &url).is_some());
 
         // Different language should produce a cache miss.
         let mut spanish = Request::get(url.as_str());
@@ -472,7 +618,7 @@ mod tests {
             .set_header("Accept-Language".parse().unwrap(), "es".parse().unwrap())
             .unwrap();
 
-        assert!(cache.get(&spanish, &url).is_none());
+        assert!(fresh_response(&cache, &spanish, &url).is_none());
     }
 
     #[test]
@@ -496,7 +642,7 @@ mod tests {
         cache.insert(&request, &url, response);
 
         // Vary: * responses must not be stored.
-        assert!(cache.get(&request, &url).is_none());
+        assert!(fresh_response(&cache, &request, &url).is_none());
     }
 
     #[test]
@@ -522,6 +668,154 @@ mod tests {
     }
 
     #[test]
+    fn freshness_uses_age_and_resident_time() {
+        let date = httpdate::parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT")
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap();
+        let clock = Arc::new(TestClock::new(date + Duration::from_secs(10)));
+        let cache = ResponseCache::with_clock(4, 64, clock.clone());
+        let url = Url::parse("https://example.test/freshness").unwrap();
+        let request = Request::get(url.as_str());
+        let mut headers = HeaderMap::new();
+        headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+        headers.insert(DATE, "Sun, 06 Nov 1994 08:49:37 GMT".parse().unwrap());
+        headers.insert(AGE, "30".parse().unwrap());
+
+        cache.insert(
+            &request,
+            &url,
+            StoredResponse {
+                status: StatusCode::OK,
+                headers,
+                url: url.to_string(),
+                body: Bytes::from_static(b"fresh"),
+                cookie_headers_processed: false,
+            },
+        );
+        clock.advance(Duration::from_secs(29));
+        assert!(matches!(
+            cache.lookup(&request, &url),
+            Some(CacheLookup::Fresh(_))
+        ));
+
+        clock.advance(Duration::from_secs(1));
+        assert!(matches!(
+            cache.lookup(&request, &url),
+            Some(CacheLookup::Stale { .. })
+        ));
+    }
+
+    #[test]
+    fn expires_is_used_when_max_age_is_absent() {
+        let date = httpdate::parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT")
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap();
+        let clock = Arc::new(TestClock::new(date));
+        let cache = ResponseCache::with_clock(4, 64, clock.clone());
+        let url = Url::parse("https://example.test/expires").unwrap();
+        let request = Request::get(url.as_str());
+        let mut headers = HeaderMap::new();
+        headers.insert(DATE, "Sun, 06 Nov 1994 08:49:37 GMT".parse().unwrap());
+        headers.insert(EXPIRES, "Sun, 06 Nov 1994 08:50:37 GMT".parse().unwrap());
+
+        cache.insert(
+            &request,
+            &url,
+            StoredResponse {
+                status: StatusCode::OK,
+                headers,
+                url: url.to_string(),
+                body: Bytes::from_static(b"expires"),
+                cookie_headers_processed: false,
+            },
+        );
+        clock.advance(Duration::from_secs(59));
+        assert!(matches!(
+            cache.lookup(&request, &url),
+            Some(CacheLookup::Fresh(_))
+        ));
+        clock.advance(Duration::from_secs(1));
+        assert!(matches!(
+            cache.lookup(&request, &url),
+            Some(CacheLookup::Stale { .. })
+        ));
+    }
+
+    #[test]
+    fn no_cache_and_must_revalidate_entries_require_revalidation_when_stale() {
+        let clock = Arc::new(TestClock::new(Duration::ZERO));
+        let cache = ResponseCache::with_clock(4, 64, clock);
+        let url = Url::parse("https://example.test/revalidate").unwrap();
+        let request = Request::get(url.as_str());
+
+        let mut no_cache_headers = HeaderMap::new();
+        no_cache_headers.insert(CACHE_CONTROL, "no-cache, max-age=60".parse().unwrap());
+        cache.insert(
+            &request,
+            &url,
+            StoredResponse {
+                status: StatusCode::OK,
+                headers: no_cache_headers,
+                url: url.to_string(),
+                body: Bytes::from_static(b"no-cache"),
+                cookie_headers_processed: false,
+            },
+        );
+        assert!(matches!(
+            cache.lookup(&request, &url),
+            Some(CacheLookup::Stale {
+                may_serve_stale: false,
+                ..
+            })
+        ));
+
+        let mut must_revalidate_headers = HeaderMap::new();
+        must_revalidate_headers
+            .insert(CACHE_CONTROL, "max-age=0, must-revalidate".parse().unwrap());
+        cache.insert(
+            &request,
+            &url,
+            StoredResponse {
+                status: StatusCode::OK,
+                headers: must_revalidate_headers,
+                url: url.to_string(),
+                body: Bytes::from_static(b"must-revalidate"),
+                cookie_headers_processed: false,
+            },
+        );
+        assert!(matches!(
+            cache.lookup(&request, &url),
+            Some(CacheLookup::Stale {
+                may_serve_stale: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn malformed_expiry_and_negative_age_do_not_extend_freshness() {
+        let now = CacheTime {
+            wall: Duration::from_secs(1_000),
+            elapsed: Duration::ZERO,
+        };
+        let mut invalid_expiry = HeaderMap::new();
+        invalid_expiry.insert(EXPIRES, "not a date".parse().unwrap());
+        assert!(FreshnessMetadata::from_headers(&invalid_expiry, now).is_none());
+
+        let mut negative_age = HeaderMap::new();
+        negative_age.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+        negative_age.insert(AGE, "-1".parse().unwrap());
+        assert_eq!(parse_age(&negative_age), Duration::ZERO);
+        assert!(
+            FreshnessMetadata::from_headers(&negative_age, now)
+                .unwrap()
+                .is_fresh(now)
+        );
+    }
+
+    #[test]
     /// Verifies only successful responses enter the cache.
     fn cache_does_not_store_non_success_responses() {
         let cache = ResponseCache::default();
@@ -539,7 +833,7 @@ mod tests {
         let url = Url::parse(request.url()).unwrap();
         cache.insert(&request, &url, response);
 
-        assert!(cache.get(&request, &url).is_none());
+        assert!(fresh_response(&cache, &request, &url).is_none());
     }
 
     #[test]
@@ -608,18 +902,17 @@ mod tests {
             body: Bytes::from_static(b"stale"),
             cookie_headers_processed: false,
         };
-        let cached = CachedResponse::from_response(&request, response, Duration::ZERO, 0);
+        let cached = CachedResponse::from_response(&request, response, expired_freshness(), 0);
 
         cache.entries.write().unwrap().entries.insert(
             cache_key(&request, &Url::parse(request.url()).unwrap()),
             vec![cached],
         );
 
-        assert!(
-            cache
-                .get(&request, &Url::parse(request.url()).unwrap())
-                .is_none()
-        );
+        assert!(matches!(
+            cache.lookup(&request, &Url::parse(request.url()).unwrap()),
+            Some(CacheLookup::Stale { .. })
+        ));
     }
 
     #[test]
@@ -633,18 +926,17 @@ mod tests {
             body: Bytes::from_static(b"stale"),
             cookie_headers_processed: false,
         };
-        let cached = CachedResponse::from_response(&request, response, Duration::ZERO, 0);
+        let cached = CachedResponse::from_response(&request, response, expired_freshness(), 0);
 
         cache.entries.write().unwrap().entries.insert(
             cache_key(&request, &Url::parse(request.url()).unwrap()),
             vec![cached],
         );
 
-        assert!(
-            cache
-                .get(&request, &Url::parse(request.url()).unwrap())
-                .is_none()
-        );
+        assert!(matches!(
+            cache.lookup(&request, &Url::parse(request.url()).unwrap()),
+            Some(CacheLookup::Stale { .. })
+        ));
     }
 
     #[test]
@@ -689,8 +981,20 @@ mod tests {
         cache.insert(&spanish, &url, spanish_response);
 
         // Each language should retrieve its own response.
-        assert_eq!(cache.get(&english, &url).unwrap().body.as_ref(), b"Hello");
-        assert_eq!(cache.get(&spanish, &url).unwrap().body.as_ref(), b"Hola");
+        assert_eq!(
+            fresh_response(&cache, &english, &url)
+                .unwrap()
+                .body
+                .as_ref(),
+            b"Hello"
+        );
+        assert_eq!(
+            fresh_response(&cache, &spanish, &url)
+                .unwrap()
+                .body
+                .as_ref(),
+            b"Hola"
+        );
 
         // Update the English response with new content.
         let updated_english_response = StoredResponse {
@@ -702,12 +1006,21 @@ mod tests {
 
         // English should return the updated response.
         assert_eq!(
-            cache.get(&english, &url).unwrap().body.as_ref(),
+            fresh_response(&cache, &english, &url)
+                .unwrap()
+                .body
+                .as_ref(),
             b"Hello again"
         );
 
         // Spanish should still return its original response.
-        assert_eq!(cache.get(&spanish, &url).unwrap().body.as_ref(), b"Hola");
+        assert_eq!(
+            fresh_response(&cache, &spanish, &url)
+                .unwrap()
+                .body
+                .as_ref(),
+            b"Hola"
+        );
     }
 
     #[test]
@@ -790,7 +1103,7 @@ mod tests {
             },
         );
 
-        let hit = cache.get(&request, &url).unwrap();
+        let hit = fresh_response(&cache, &request, &url).unwrap();
         let entries = cache.entries.read().unwrap();
         let cached = &entries.entries[&cache_key(&request, &url)][0];
 
@@ -834,12 +1147,12 @@ mod tests {
             &second,
             cached_response(&second, b"second"),
         );
-        assert!(cache.get(&first_request, &first).is_some());
+        assert!(fresh_response(&cache, &first_request, &first).is_some());
         cache.insert(&third_request, &third, cached_response(&third, b"third"));
 
-        assert!(cache.get(&first_request, &first).is_some());
-        assert!(cache.get(&second_request, &second).is_none());
-        assert!(cache.get(&third_request, &third).is_some());
+        assert!(fresh_response(&cache, &first_request, &first).is_some());
+        assert!(fresh_response(&cache, &second_request, &second).is_none());
+        assert!(fresh_response(&cache, &third_request, &third).is_some());
     }
 
     #[test]
@@ -854,8 +1167,8 @@ mod tests {
         cache.insert(&first, &url, cached_response(&url, b"first"));
         cache.insert(&second, &url, cached_response(&url, b"second"));
 
-        assert!(cache.get(&first, &url).is_none());
-        assert!(cache.get(&second, &url).is_some());
+        assert!(fresh_response(&cache, &first, &url).is_none());
+        assert!(fresh_response(&cache, &second, &url).is_some());
         assert_eq!(cache.entries.read().unwrap().total_body_size, 6);
     }
 
@@ -880,7 +1193,7 @@ mod tests {
             .entries
             .get_mut(&expired_key)
             .unwrap()[0]
-            .expires_at = Instant::now();
+            .freshness = expired_freshness();
 
         cache.insert(
             &fresh_request,
@@ -905,7 +1218,7 @@ mod tests {
 
         cache.insert(&request, &url, cached_response(&url, b"private"));
 
-        assert!(cache.get(&request, &url).is_none());
+        assert!(fresh_response(&cache, &request, &url).is_none());
     }
 
     fn cached_response(url: &Url, body: &'static [u8]) -> StoredResponse {
@@ -917,6 +1230,59 @@ mod tests {
             url: url.to_string(),
             body: Bytes::from_static(body),
             cookie_headers_processed: false,
+        }
+    }
+
+    fn fresh_response(
+        cache: &ResponseCache,
+        request: &Request,
+        url: &Url,
+    ) -> Option<StoredResponse> {
+        match cache.lookup(request, url) {
+            Some(CacheLookup::Fresh(response)) => Some(response),
+            Some(CacheLookup::Stale { .. }) | None => None,
+        }
+    }
+
+    fn expired_freshness() -> FreshnessMetadata {
+        FreshnessMetadata {
+            response_time: CacheTime {
+                wall: Duration::ZERO,
+                elapsed: Duration::ZERO,
+            },
+            date: None,
+            age: Duration::ZERO,
+            lifetime: Duration::ZERO,
+            requires_revalidation: false,
+            must_revalidate: false,
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestClock {
+        now: RwLock<CacheTime>,
+    }
+
+    impl TestClock {
+        fn new(wall: Duration) -> Self {
+            Self {
+                now: RwLock::new(CacheTime {
+                    wall,
+                    elapsed: Duration::ZERO,
+                }),
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            let mut now = self.now.write().unwrap();
+            now.wall = now.wall.saturating_add(duration);
+            now.elapsed = now.elapsed.saturating_add(duration);
+        }
+    }
+
+    impl CacheClock for TestClock {
+        fn now(&self) -> CacheTime {
+            *self.now.read().unwrap()
         }
     }
 }

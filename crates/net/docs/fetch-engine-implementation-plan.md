@@ -23,7 +23,7 @@ focused regression coverage before changing each area.
 
 | Priority | Issue                                                                                                                                                                                                                                                                      | Potential solution                                                                                                                                                                                                              |
 | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Medium   | The process-local response cache has bounded storage and structured request identity, but supports only a narrow `Cache-Control` subset. Authorized requests are conservatively excluded while complete authorization policy, validators, revalidation, 304 merging, and unsafe-method invalidation remain absent. | Expand the bounded adapter with standards-aware freshness and revalidation, or delegate those decisions to the browser cache owner. |
+| Medium   | The process-local response cache has bounded storage, structured request identity, and explicit freshness metadata, but lacks complete authorization policy, validators, revalidation, 304 merging, and unsafe-method invalidation. | Expand the bounded adapter with conditional revalidation and invalidation, or delegate those decisions to the browser cache owner. |
 | Low      | Production cache and body-state locks still use `expect` on poisoning, so a poisoned lock becomes a panic rather than an explicit engine failure policy.                                                                                                                   | Map poisoned locks to typed errors where callers can recover, or document and test the deliberate process-failure policy for each remaining lock.                                                                               |
 | Medium   | Lifecycle diagnostics stop at response headers. Body consumption, completion timing, cancellation timing, and transport/body failure details are not yet exposed through the browser-owned diagnostics boundary.                                                           | Extend the diagnostics contract with non-sensitive body and timing events, route transport failures through the redaction helpers, and add focused coverage for successful, failed, dropped, and cancelled streams.             |
 
@@ -129,8 +129,10 @@ and eligibility, request mode, redirect taint, and authorization presence.
 Authorization values are never retained: authorized requests are
 conservatively not stored until complete authorization caching exists. Config
 limits bound primary entries and aggregate body bytes, with least-recently-used
-primary-entry eviction and expired-entry pruning before insertion. Later slices
-add standards-aware freshness, revalidation, and invalidation. Cache entries own one
+primary-entry eviction and stale-entry pruning before insertion. Freshness uses
+`Date`, `Expires`, `Age`, and the supported `Cache-Control` directives through
+a test-controlled clock. Later slices add conditional revalidation and
+invalidation. Cache entries own one
 `StoredResponse` representation rather than mirroring its fields in
 `CachedResponse`; immutable buffered body bytes may be shared with each
 independent public body view, while headers remain independently owned for

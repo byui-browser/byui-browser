@@ -148,6 +148,6 @@ mod tests {
             ),
             Err(RequestError::BodyAlreadyConsumed)
         ));
-        assert!(cache.get(&request, &url).is_none());
+        assert!(cache.lookup(&request, &url).is_none());
     }
 }

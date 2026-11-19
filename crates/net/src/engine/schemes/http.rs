@@ -8,7 +8,7 @@ use crate::{
         request::{CacheMode, PreparedRequest, Request, ValidatedHop},
         response::{InternalResponse, Response, has_null_body},
     },
-    cache::StoredResponse,
+    cache::{CacheLookup, StoredResponse},
     engine::{
         RequestController, cache_capture::with_cache_capture,
         process_response::ResponseFinalization,
@@ -28,18 +28,21 @@ impl RequestController {
 
             let cacheable = request.is_cacheable_method();
             let cache_lookup = match request.cache_mode() {
-                CacheMode::Default | CacheMode::OnlyIfCached => Some(false),
-                CacheMode::ForceCache => Some(true),
+                CacheMode::Default | CacheMode::OnlyIfCached | CacheMode::ForceCache => Some(true),
                 CacheMode::NoStore | CacheMode::Reload | CacheMode::NoCache => None,
             };
             if cacheable {
                 self.observe(&request, NetworkPhase::CacheLookup, &url, None, false);
-                if let Some(allow_stale) = cache_lookup
-                    && let Some(cached) =
-                        self.inner
-                            .cache
-                            .get_with_staleness(&request, &url, allow_stale)
-                {
+                let cached = cache_lookup.and_then(|_| self.inner.cache.lookup(&request, &url));
+                let cached = match cached {
+                    Some(CacheLookup::Fresh(response)) => Some(response),
+                    Some(CacheLookup::Stale {
+                        response,
+                        may_serve_stale: true,
+                    }) if request.cache_mode() == CacheMode::ForceCache => Some(response),
+                    Some(CacheLookup::Stale { .. }) | None => None,
+                };
+                if let Some(cached) = cached {
                     self.observe(
                         &request,
                         NetworkPhase::CacheHit,
@@ -48,7 +51,7 @@ impl RequestController {
                         true,
                     );
                     log::debug!(
-                        "cache hit: {} {} -> {} ({} bytes, allow_stale={allow_stale})",
+                        "cache hit: {} {} -> {} ({} bytes)",
                         request.method(),
                         crate::log_url::loggable(url.as_str()),
                         cached.status,
