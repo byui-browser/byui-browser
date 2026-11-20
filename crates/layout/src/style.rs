@@ -243,6 +243,41 @@ impl Float {
     }
 }
 
+/// The computed `clear` value (CSS 2.2 §9.5.2): which earlier floats in
+/// the same block formatting context a block-level box or float must be
+/// placed below. As with [`Float`], text is left-to-right, so
+/// `inline-start` is `left` and `inline-end` is `right`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Clear {
+    #[default]
+    None,
+    Left,
+    Right,
+    Both,
+}
+
+impl Clear {
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "left" | "inline-start" => Some(Self::Left),
+            "right" | "inline-end" => Some(Self::Right),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    /// Whether this value clears floats on the left (`left`) or right side.
+    pub(crate) fn clears(self, left: bool) -> bool {
+        match self {
+            Self::None => false,
+            Self::Left => left,
+            Self::Right => !left,
+            Self::Both => true,
+        }
+    }
+}
+
 /// A sizing value with lengths resolved to CSS pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Dimension {
@@ -508,8 +543,11 @@ pub(crate) struct ComputedStyle {
     pub min_width_auto: bool,
     /// Whether `min-height` was left at the flex item's automatic minimum.
     pub min_height_auto: bool,
-    /// `max-width`, with `none` stored as [`Dimension::Auto`]; only replaced
-    /// elements honor it so far.
+    /// `max-width`, with `none` stored as [`Dimension::Auto`]. Blocks in
+    /// normal flow, inline-blocks, floats, and replaced elements honor it;
+    /// flex items do not yet. Like `min-width`, it accepts the
+    /// `min-content`, `max-content`, and `fit-content` keywords on
+    /// non-replaced boxes.
     pub max_width: Dimension,
     /// `max-height`, with `none` stored as Auto; blocks and replaced elements honor it.
     pub max_height: Dimension,
@@ -568,6 +606,8 @@ pub(crate) struct ComputedStyle {
     /// The computed `float`; always [`Float::None`] for absolutely
     /// positioned boxes (CSS 2.2 §9.7).
     pub float: Float,
+    /// `clear`; honored by in-flow block-level boxes and floats.
+    pub clear: Clear,
     /// The `top`, `right`, `bottom`, and `left` insets; `auto` by default.
     pub inset: Sides<Dimension>,
     /// Whether the specified `display` was inline-level before floating or
@@ -772,6 +812,7 @@ impl ComputedStyle {
             gap: 0.0,
             position: Position::Static,
             float: Float::None,
+            clear: Clear::None,
             inset: Sides::from_array([Dimension::Auto; 4]),
             blockified_from_inline: false,
         }
@@ -932,6 +973,13 @@ impl ComputedStyle {
                 None => log::debug!("ignoring invalid float value {value:?}; using none"),
             }
         }
+        if let Some(value) = get("clear") {
+            match Clear::parse(value) {
+                Some(clear) => style.clear = clear,
+                None if is_css_wide_keyword(value) => {}
+                None => log::debug!("ignoring invalid clear value {value:?}; using none"),
+            }
+        }
         // CSS 2.2 §9.7: absolute positioning wins over floating, and both
         // blockify the display type. `display: contents` generates no box,
         // so there is nothing to blockify.
@@ -1017,7 +1065,7 @@ impl ComputedStyle {
             });
         let dimension = |property: &str, allow_auto: bool, allow_negative: bool| {
             let value = get(property)?;
-            if property == "width" {
+            if matches!(property, "width" | "min-width" | "max-width") {
                 match value.to_ascii_lowercase().as_str() {
                     "min-content" => return Some(Dimension::MinContent),
                     "max-content" => return Some(Dimension::MaxContent),

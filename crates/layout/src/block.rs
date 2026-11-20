@@ -139,10 +139,18 @@ impl Context<'_> {
                 }
             }
         };
-        if let Some(min_width) = style.content_width_for(style.min_width, basis)
-            && width < min_width
-        {
-            width = min_width;
+        // CSS 2.2 §10.4: clamp to `max-width`, then `min-width`, and redo
+        // the margins for the clamped width.
+        let available = (cb.width - padding).max(0.0);
+        let mut clamped = width;
+        if let Some(max_width) = self.width_limit(block, style.max_width, basis, available) {
+            clamped = clamped.min(max_width);
+        }
+        if let Some(min_width) = self.width_limit(block, style.min_width, basis, available) {
+            clamped = clamped.max(min_width);
+        }
+        if clamped != width {
+            width = clamped;
             let remaining = cb.width - padding - width;
             match (margin_left, margin_right) {
                 (None, None) if remaining >= 0.0 => {
@@ -216,7 +224,11 @@ impl Context<'_> {
             );
             width
         });
-        if let Some(min_width) = style.content_width_for(style.min_width, basis) {
+        let available = (cb_width - margin_left - margin_right - padding).max(0.0);
+        if let Some(max_width) = self.width_limit(block, style.max_width, basis, available) {
+            width = width.min(max_width);
+        }
+        if let Some(min_width) = self.width_limit(block, style.min_width, basis, available) {
             width = width.max(min_width);
         }
         self.layout_block_container(
@@ -636,7 +648,7 @@ impl Context<'_> {
             }
             // Where the child's top border edge is expected, so floats can
             // be found before its own margins finish collapsing.
-            let expected_y = if still_collapsing_top {
+            let mut expected_y = if still_collapsing_top {
                 0.0
             } else {
                 let mut margin = pending;
@@ -645,8 +657,24 @@ impl Context<'_> {
                 ));
                 cursor + margin.resolve()
             };
+            // Clearance (CSS 2.2 §9.5.2): a box whose border edge would sit
+            // beside a float it clears moves down to that float's bottom.
+            let clearance = floats
+                .clear_bottom(child.style.clear)
+                .filter(|bottom| *bottom > expected_y);
+            if let Some(bottom) = clearance {
+                expected_y = bottom;
+            }
             let result = self.layout_block_level(child, cb, Some(floats.reborrow(0.0, expected_y)));
-            let y = if still_collapsing_top {
+            let y = if let Some(bottom) = clearance {
+                log::trace!("child cleared floats; border edge placed at y {bottom}");
+                // Clearance keeps the child's margins from collapsing with
+                // the margins above it (and with the parent's top margin).
+                has_content = true;
+                cursor = bottom + result.fragment.rect.height;
+                pending = result.margin_bottom;
+                bottom
+            } else if still_collapsing_top {
                 log::trace!("child margin collapses with parent top margin");
                 // Still adjoining the parent's top margin: the child's margins
                 // collapse with it and the child sits at the content edge.
@@ -970,10 +998,47 @@ impl Context<'_> {
         }
     }
 
-    /// Resolves intrinsic width keywords for a non-replaced box.
+    /// Resolves intrinsic width keywords in `width` for a non-replaced box.
     fn intrinsic_content_width(&self, block: &BlockBox, available: f32) -> Option<f32> {
+        self.intrinsic_width_for(block, block.style.width, available)
+    }
+
+    /// The used content-box width for a `min-width` or `max-width` value
+    /// `size`, resolving intrinsic keywords against the box's contents and
+    /// lengths and percentages against `basis`. `None` means no limit.
+    fn width_limit(
+        &self,
+        block: &BlockBox,
+        size: Dimension,
+        basis: Option<f32>,
+        available: f32,
+    ) -> Option<f32> {
+        match size {
+            Dimension::MinContent | Dimension::MaxContent | Dimension::FitContent => {
+                self.intrinsic_width_for(block, size, available)
+            }
+            _ => block.style.content_width_for(size, basis),
+        }
+    }
+
+    /// Resolves an intrinsic width keyword `size` for a non-replaced box;
+    /// `None` when `size` is not one.
+    fn intrinsic_width_for(
+        &self,
+        block: &BlockBox,
+        size: Dimension,
+        available: f32,
+    ) -> Option<f32> {
+        if matches!(block.contents, BlockContents::Replaced(_))
+            || !matches!(
+                size,
+                Dimension::MinContent | Dimension::MaxContent | Dimension::FitContent
+            )
+        {
+            return None;
+        }
         let (min_content, max_content) = self.intrinsic_content_sizes(block);
-        match block.style.width {
+        match size {
             Dimension::MinContent => Some(min_content),
             Dimension::MaxContent => Some(max_content),
             Dimension::FitContent => Some(max_content.min(available.max(min_content))),

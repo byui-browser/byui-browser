@@ -158,6 +158,27 @@ fn border_color_sets_each_side_and_transparent_shows_the_background() {
 }
 
 #[test]
+fn border_left_color_paints_only_the_left_side() {
+    let frame = render(
+        "<div></div>",
+        "div { width: 20px; height: 20px; border: 4px solid red; border-left-color: green }",
+    );
+    assert_pixel(&frame, 1, 14, GREEN);
+    assert_pixel(&frame, 14, 1, RED);
+    assert_pixel(&frame, 26, 14, RED);
+    assert_pixel(&frame, 14, 26, RED);
+    // The logical `border-inline-start-color` is the left side in LTR and
+    // the right side in RTL.
+    let rtl = render(
+        "<div></div>",
+        "div { width: 20px; height: 20px; border: 4px solid red; direction: rtl;
+               border-inline-start-color: green }",
+    );
+    assert_pixel(&rtl, 26, 14, GREEN);
+    assert_pixel(&rtl, 1, 14, RED);
+}
+
+#[test]
 fn font_shorthand_sets_size_line_height_weight_and_style() {
     let (_, tree) = lay_out(
         "<p>Hi</p>",

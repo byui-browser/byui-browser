@@ -1216,6 +1216,14 @@ fn property_has_effect(property: &str, values: &[String]) -> bool {
             "#t{padding-inline-end:20px}",
             "#t{padding-right:20px}",
         )),
+        "border-left-color" => Some(differs(
+            "#t{border:4px solid;border-left-color:#ff0000}",
+            "#t{border:4px solid}",
+        )),
+        "clear" => Some(differs(
+            "#c{float:left;width:50px;height:40px}#d{clear:left}",
+            "#c{float:left;width:50px;height:40px}",
+        )),
         "border-color" => Some(differs(
             "#t{border:4px solid;border-color:#ff0000}",
             "#t{border:4px solid}",
@@ -1366,7 +1374,7 @@ fn audit_partial_support(declarations: &[Decl], report: &mut AuditReport) {
             {
                 Some((
                     "Intrinsic minimum sizes",
-                    "Intrinsic sizing keywords are not implemented for min-width, min-height, or max-block-size.",
+                    "Intrinsic sizing keywords in min-width apply to blocks, inline-blocks, and floats but not flex items; they are not implemented for min-height or max-block-size.",
                 ))
             }
             _ => None,

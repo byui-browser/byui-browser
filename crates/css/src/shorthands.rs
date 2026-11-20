@@ -37,7 +37,10 @@ const CSS_WIDE_KEYWORDS: [&str; 5] = ["inherit", "initial", "unset", "revert", "
 /// `font-stretch`, `font-size`, `line-height`, and `font-family`, resetting
 /// omitted components to `normal` (CSS Fonts 4 §2.8). System font keywords
 /// such as `caption` are not supported and drop the declaration. `overflow`
-/// expands to `overflow-x` and `overflow-y`. The `-webkit-`, `-ms-`,
+/// expands to `overflow-x` and `overflow-y`. The logical box shorthands
+/// `margin-block`, `margin-inline`, `padding-block`, and `padding-inline` take
+/// one or two values and set their `-start` and `-end` longhands (CSS Logical
+/// Properties 1 §4.4); the cascade maps those to physical sides. The `-webkit-`, `-ms-`,
 /// `-moz-`, and `-o-` prefixed `transform` and `transform-origin` map to the
 /// standard properties.
 /// `outline` expands width, style, and color. `text-decoration` currently
@@ -104,6 +107,12 @@ pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
     }
     if declaration.property == "overflow" {
         return expand_overflow(&declaration.value);
+    }
+    if matches!(
+        declaration.property.as_str(),
+        "margin-block" | "margin-inline" | "padding-block" | "padding-inline"
+    ) {
+        return expand_logical_pair(declaration);
     }
     if matches!(
         declaration.property.as_str(),
@@ -483,6 +492,32 @@ fn expand_border(declaration: &Declaration) -> Vec<Declaration> {
         .collect()
 }
 
+/// Expands a two-value logical box shorthand such as `margin-block: 1px 2px`
+/// to its `-start` and `-end` longhands. One value sets both; more than two
+/// values are invalid and drop the declaration.
+fn expand_logical_pair(declaration: &Declaration) -> Vec<Declaration> {
+    let parts = split_components(&declaration.value);
+    let (start, end) = match *parts {
+        [both] => (both, both),
+        [start, end] => (start, end),
+        _ => {
+            log::debug!(
+                "dropping invalid {} shorthand value `{}`",
+                declaration.property,
+                declaration.value
+            );
+            return Vec::new();
+        }
+    };
+    [("start", start), ("end", end)]
+        .into_iter()
+        .map(|(edge, value)| Declaration {
+            property: format!("{}-{edge}", declaration.property),
+            value: value.to_owned(),
+        })
+        .collect()
+}
+
 /// Applies the one-to-four value rule, returning values for top, right,
 /// bottom, and left (or top-left, top-right, bottom-right, and bottom-left).
 fn one_to_four<'a>(parts: &[&'a str]) -> Option<[&'a str; 4]> {
@@ -659,6 +694,32 @@ mod tests {
         let animation = expanded("-webkit-animation", "fade 1s linear");
         assert_eq!(animation.len(), 8);
         assert_eq!(animation[0], ("animation-name".into(), "fade".into()));
+    }
+
+    #[test]
+    fn logical_box_shorthands_expand_to_start_and_end() {
+        assert_eq!(
+            expanded("margin-block", "1px 2px"),
+            [
+                ("margin-block-start".into(), "1px".into()),
+                ("margin-block-end".into(), "2px".into()),
+            ]
+        );
+        assert_eq!(
+            expanded("padding-inline", "3px"),
+            [
+                ("padding-inline-start".into(), "3px".into()),
+                ("padding-inline-end".into(), "3px".into()),
+            ]
+        );
+        assert_eq!(
+            expanded("padding-block", "inherit"),
+            [
+                ("padding-block-start".into(), "inherit".into()),
+                ("padding-block-end".into(), "inherit".into()),
+            ]
+        );
+        assert_eq!(expanded("margin-inline", "1px 2px 3px"), []);
     }
 
     #[test]

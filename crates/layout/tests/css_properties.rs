@@ -313,3 +313,178 @@ fn outline_offset_still_paints_outside_rounded_borders() {
     );
     assert!(paint::paint_document(&tree).items.iter().any(|item| matches!(item, paint::DisplayItem::FillRect {color, ..} if color.r == 255 && color.g == 0 && color.b == 0)));
 }
+
+#[test]
+fn logical_block_margins_and_padding_map_to_physical_sides() {
+    let (doc, tree) = lay_out(
+        "<div id='a'>text</div><div id='b'>next</div>",
+        "body { margin:0 } #a { margin-block: 10px 20px; padding-block: 3px 4px; padding-inline: 5px 7px }",
+        200.0,
+    );
+    let a = find(&tree.root, id(&doc, "a")).unwrap();
+    assert_eq!((a.margin.top, a.margin.bottom), (10.0, 20.0));
+    assert_eq!((a.padding.top, a.padding.bottom), (3.0, 4.0));
+    assert_eq!((a.padding.left, a.padding.right), (5.0, 7.0));
+    assert_eq!(a.rect.y, 10.0);
+    assert_eq!(a.rect.height, 3.0 + 19.2 + 4.0);
+    let b = find(&tree.root, id(&doc, "b")).unwrap();
+    assert_eq!(b.rect.y, 10.0 + a.rect.height + 20.0);
+
+    // One value sets both edges; right-to-left swaps the inline sides.
+    let (doc, tree) = lay_out(
+        "<div id='a'>text</div>",
+        "#a { direction: rtl; margin-block: 6px; padding-inline: 5px 7px }",
+        200.0,
+    );
+    let a = find(&tree.root, id(&doc, "a")).unwrap();
+    assert_eq!((a.margin.top, a.margin.bottom), (6.0, 6.0));
+    assert_eq!((a.padding.left, a.padding.right), (7.0, 5.0));
+}
+
+#[test]
+fn logical_and_physical_box_properties_compete_in_source_order() {
+    for (rule, top, left) in [
+        ("margin-block: 10px; margin-top: 2px", 2.0, 0.0),
+        ("margin-top: 2px; margin-block: 10px", 10.0, 0.0),
+        ("padding-left: 1px; padding-inline: 9px", 0.0, 9.0),
+        ("padding-inline: 9px; padding-left: 1px", 0.0, 1.0),
+    ] {
+        let (doc, tree) = lay_out(
+            "<div id='a'>x</div>",
+            &format!("body {{margin:0}} #a {{{rule}}}"),
+            200.0,
+        );
+        let a = find(&tree.root, id(&doc, "a")).unwrap();
+        assert_eq!((a.margin.top, a.padding.left), (top, left), "{rule}");
+    }
+}
+
+#[test]
+fn logical_sizes_set_width_height_and_minimum_width() {
+    let (doc, tree) = lay_out(
+        "<div id='a'></div><div id='b'></div>",
+        "body { margin:0 } #a { inline-size: 50px; block-size: 30px }
+         #b { inline-size: 10px; min-inline-size: 70px; block-size: 5px }",
+        200.0,
+    );
+    let a = find(&tree.root, id(&doc, "a")).unwrap();
+    assert_eq!((a.rect.width, a.rect.height), (50.0, 30.0));
+    let b = find(&tree.root, id(&doc, "b")).unwrap();
+    assert_eq!((b.rect.width, b.rect.height), (70.0, 5.0));
+    // In a vertical writing mode the inline axis is vertical.
+    let (doc, tree) = lay_out(
+        "<div id='a'></div>",
+        "body { margin:0 } #a { writing-mode: vertical-rl; inline-size: 50px; block-size: 30px }",
+        200.0,
+    );
+    let a = find(&tree.root, id(&doc, "a")).unwrap();
+    assert_eq!((a.rect.width, a.rect.height), (30.0, 50.0));
+}
+
+#[test]
+fn max_width_limits_blocks_and_auto_margins_center_them() {
+    for (rule, x, width) in [
+        ("max-width: 100px", 0.0, 100.0),
+        ("max-width: 50%", 0.0, 100.0),
+        ("max-width: 100px; margin: 0 auto", 50.0, 100.0),
+        ("max-width: 100px; margin-left: auto", 100.0, 100.0),
+        ("width: 150px; max-width: 100px", 0.0, 100.0),
+        ("max-width: 100px; min-width: 120px", 0.0, 120.0),
+        (
+            "max-width: 100px; padding: 0 10px; box-sizing: border-box",
+            0.0,
+            100.0,
+        ),
+        ("max-width: none", 0.0, 200.0),
+        ("max-width: 300px", 0.0, 200.0),
+        ("max-width: min-content", 0.0, 32.0),
+    ] {
+        let (doc, tree) = lay_out(
+            "<div id='a'>abcd efgh</div>",
+            &format!("body {{margin:0}} #a {{{rule}}}"),
+            200.0,
+        );
+        let a = find(&tree.root, id(&doc, "a")).unwrap();
+        assert_eq!((a.rect.x, a.rect.width), (x, width), "{rule}");
+    }
+    // Text wraps to the limited width.
+    let (doc, tree) = lay_out(
+        "<div id='a'>abcd efgh</div>",
+        "body { margin:0 } #a { max-width: 40px }",
+        200.0,
+    );
+    assert_eq!(find(&tree.root, id(&doc, "a")).unwrap().lines.len(), 2);
+}
+
+#[test]
+fn max_width_limits_floats_and_inline_blocks() {
+    let (doc, tree) = lay_out(
+        "<div id='f'>abcd efgh ijkl</div><span id='i' style='display:inline-block'>abcd efgh ijkl</span>",
+        "body { margin:0 } #f { float: left; max-width: 40px } #i { max-width: 72px }",
+        400.0,
+    );
+    assert_eq!(find(&tree.root, id(&doc, "f")).unwrap().rect.width, 40.0);
+    assert_eq!(find(&tree.root, id(&doc, "i")).unwrap().rect.width, 72.0);
+}
+
+#[test]
+fn clear_moves_blocks_below_the_floats_they_clear() {
+    let html = "<div id='l'></div><div id='r'></div><div id='c'>x</div>";
+    let floats = "body { margin:0 }
+        #l { float: left; width: 20px; height: 50px }
+        #r { float: right; width: 20px; height: 80px }";
+    for (clear, y) in [
+        ("none", 0.0),
+        ("left", 50.0),
+        ("right", 80.0),
+        ("both", 80.0),
+        ("inline-start", 50.0),
+        ("inline-end", 80.0),
+        ("bogus", 0.0),
+    ] {
+        let (doc, tree) = lay_out(html, &format!("{floats} #c {{ clear: {clear} }}"), 200.0);
+        assert_eq!(
+            find(&tree.root, id(&doc, "c")).unwrap().rect.y,
+            y,
+            "clear: {clear}"
+        );
+    }
+}
+
+#[test]
+fn cleared_block_grows_its_parent_and_skips_margin_collapsing() {
+    let (doc, tree) = lay_out(
+        "<div id='p'><div id='f'></div><div id='c'>x</div></div><div id='n'>y</div>",
+        "body { margin:0 } #f { float: left; width: 20px; height: 50px }
+         #c { clear: both; margin-top: 10px; margin-bottom: 5px }",
+        200.0,
+    );
+    let c = find(&tree.root, id(&doc, "c")).unwrap();
+    assert_eq!(c.rect.y, 50.0);
+    // The bottom margin still collapses through the parent's bottom edge.
+    let p = find(&tree.root, id(&doc, "p")).unwrap();
+    assert_eq!(p.rect.height, 50.0 + 19.2);
+    assert_eq!(
+        find(&tree.root, id(&doc, "n")).unwrap().rect.y,
+        50.0 + 19.2 + 5.0
+    );
+    // A top margin that already clears the float needs no clearance.
+    let (doc, tree) = lay_out(
+        "<div>t</div><div id='f'></div><div id='c'>x</div>",
+        "body { margin:0 } #f { float: left; width: 20px; height: 50px }
+         #c { clear: left; margin-top: 60px }",
+        200.0,
+    );
+    assert_eq!(find(&tree.root, id(&doc, "c")).unwrap().rect.y, 19.2 + 60.0);
+}
+
+#[test]
+fn cleared_floats_go_below_earlier_floats() {
+    let (doc, tree) = lay_out(
+        "<div id='a'></div><div id='b'></div>",
+        "body { margin:0 } div { float: left; width: 20px; height: 30px } #b { clear: left }",
+        200.0,
+    );
+    let b = find(&tree.root, id(&doc, "b")).unwrap();
+    assert_eq!((b.rect.x, b.rect.y), (0.0, 30.0));
+}
