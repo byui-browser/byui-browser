@@ -66,6 +66,17 @@ pub trait FontMetrics {
         FontId::DEFAULT
     }
 
+    /// Whether text in `font` must be drawn with synthetic bold and
+    /// synthetic italic (CSS Fonts 4 §5.4, `font-synthesis: weight style`)
+    /// to look like the wanted `weight` (1–1000) and `italic` style.
+    ///
+    /// The default implementation assumes every face is an upright regular
+    /// face, so weights of 600 and more embolden and italic slants.
+    fn font_synthesis(&self, font: FontId, weight: u16, italic: bool) -> (bool, bool) {
+        let _ = font;
+        (weight >= 600, italic)
+    }
+
     /// Horizontal advance of `character` in `font` at `font_size` CSS
     /// pixels.
     fn font_advance(&self, font: FontId, character: char, font_size: f32) -> f32 {

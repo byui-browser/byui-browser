@@ -11,6 +11,219 @@ enum FontChoice<'a> {
     Single(&'a OutlineFont),
     /// The face each run's [`paint::FontId`] names.
     Collection(&'a FontCollection),
+    /// The built-in [`BitmapFont`] for every run.
+    Bitmap,
+}
+
+/// The slant of synthetic italic: horizontal shift per pixel of height,
+/// about 14 degrees, as browsers use for synthetic oblique.
+const SYNTHETIC_SLANT: f32 = 0.25;
+
+/// The largest layer surface, in pixels, a transformed group may allocate.
+/// Larger groups are drawn clipped to this many pixels around their content.
+const MAX_LAYER_PIXELS: u64 = 1 << 24;
+
+/// A drawing surface: RGBA8 pixels with straight alpha, the clip in
+/// effect, and where it sits in device space.
+struct Canvas {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+    /// The [`paint::DisplayItem::Clip`] in effect, in this canvas's pixels.
+    clip: Option<PixelBounds>,
+    /// The device pixel this canvas's pixel `(0, 0)` shows. The frame's
+    /// canvas is at `(0, 0)`; a layer's covers only part of device space.
+    origin: (i32, i32),
+}
+
+impl Canvas {
+    /// A `width` by `height` canvas at `origin` filled with `rgba`.
+    fn new(width: u32, height: u32, rgba: [u8; 4], origin: (i32, i32)) -> Self {
+        Self {
+            width,
+            height,
+            pixels: rgba.repeat(width as usize * height as usize),
+            clip: None,
+            origin,
+        }
+    }
+
+    fn into_frame(self) -> Frame {
+        Frame {
+            width: self.width,
+            height: self.height,
+            pixels: self.pixels,
+        }
+    }
+
+    /// The straight-alpha pixel at `(x, y)`; the caller keeps it in bounds.
+    fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
+        let offset = (y as usize * self.width as usize + x as usize) * 4;
+        let mut pixel = [0; 4];
+        pixel.copy_from_slice(&self.pixels[offset..offset + 4]);
+        pixel
+    }
+
+    /// Bilinearly samples the canvas at pixel coordinates `(x, y)`, where
+    /// pixel `(i, j)`'s center is at `(i, j)`, blending in premultiplied
+    /// alpha. Outside the canvas is transparent.
+    fn sample(&self, x: f32, y: f32) -> [u8; 4] {
+        let (x0, y0) = (x.floor(), y.floor());
+        let (tx, ty) = (x - x0, y - y0);
+        let mut sum = [0.0_f32; 4];
+        for (dy, wy) in [(0.0, 1.0 - ty), (1.0, ty)] {
+            for (dx, wx) in [(0.0, 1.0 - tx), (1.0, tx)] {
+                let weight = wx * wy;
+                let (px, py) = (x0 + dx, y0 + dy);
+                if weight <= 0.0
+                    || px < 0.0
+                    || py < 0.0
+                    || px >= self.width as f32
+                    || py >= self.height as f32
+                {
+                    continue;
+                }
+                let pixel = self.pixel(px as u32, py as u32);
+                let alpha = f32::from(pixel[3]) * weight;
+                for channel in 0..3 {
+                    sum[channel] += f32::from(pixel[channel]) * alpha;
+                }
+                sum[3] += alpha;
+            }
+        }
+        if sum[3] <= 0.0 {
+            return [0; 4];
+        }
+        let channel = |value: f32| (value / sum[3]).round().clamp(0.0, 255.0) as u8;
+        [
+            channel(sum[0]),
+            channel(sum[1]),
+            channel(sum[2]),
+            sum[3].round().clamp(0.0, 255.0) as u8,
+        ]
+    }
+}
+
+/// The index of the [`paint::DisplayItem::EndLayer`] matching a
+/// [`paint::DisplayItem::BeginLayer`] just before `items[start]`, or
+/// `items.len()` when it is missing.
+fn matching_end(items: &[paint::DisplayItem], start: usize) -> usize {
+    let mut depth = 0_usize;
+    for (index, item) in items.iter().enumerate().skip(start) {
+        match item {
+            paint::DisplayItem::BeginLayer { .. } => depth += 1,
+            paint::DisplayItem::EndLayer if depth == 0 => return index,
+            paint::DisplayItem::EndLayer => depth -= 1,
+            _ => {}
+        }
+    }
+    items.len()
+}
+
+/// The smallest rectangle containing both.
+fn union(a: paint::Rect, b: paint::Rect) -> paint::Rect {
+    let (x, y) = (a.x.min(b.x), a.y.min(b.y));
+    paint::Rect {
+        x,
+        y,
+        width: a.right().max(b.right()) - x,
+        height: a.bottom().max(b.bottom()) - y,
+    }
+}
+
+/// A generous bound, in CSS pixels, of what `items` can paint, nested
+/// layers' transforms included; `None` when they paint nothing.
+fn list_bounds(items: &[paint::DisplayItem]) -> Option<paint::Rect> {
+    let mut bounds: Option<paint::Rect> = None;
+    let mut index = 0;
+    while index < items.len() {
+        let item = match &items[index] {
+            paint::DisplayItem::BeginLayer { transform, .. } => {
+                let end = matching_end(items, index + 1);
+                let inner = list_bounds(&items[index + 1..end]);
+                index = end;
+                inner.map(|rect| transform.map_or(rect, |matrix| matrix.bounds(rect)))
+            }
+            paint::DisplayItem::EndLayer | paint::DisplayItem::Clip { .. } => None,
+            paint::DisplayItem::FillRect { rect, .. }
+            | paint::DisplayItem::FillRoundedRect { rect, .. }
+            | paint::DisplayItem::Image { rect, .. } => Some(*rect),
+            paint::DisplayItem::BoxShadow { rect, blur, .. } => {
+                let reach = 1.5 * blur.max(0.0) + 1.0;
+                Some(paint::Rect {
+                    x: rect.x - reach,
+                    y: rect.y - reach,
+                    width: rect.width + 2.0 * reach,
+                    height: rect.height + 2.0 * reach,
+                })
+            }
+            paint::DisplayItem::Text {
+                x,
+                baseline,
+                font_size,
+                text,
+                ..
+            } => {
+                // Every glyph is assumed at most 1em wide, with an em of
+                // margin each side for overhangs and synthetic styles.
+                let size = font_size.max(0.0);
+                Some(paint::Rect {
+                    x: x - size,
+                    y: baseline - 1.5 * size,
+                    width: (text.chars().count() as f32 + 2.0) * size,
+                    height: 2.5 * size,
+                })
+            }
+            paint::DisplayItem::StrokeLine {
+                from, to, width, ..
+            } => {
+                let half = width.max(0.0) / 2.0 + 1.0;
+                Some(paint::Rect {
+                    x: from.0.min(to.0) - half,
+                    y: from.1.min(to.1) - half,
+                    width: (from.0 - to.0).abs() + 2.0 * half,
+                    height: (from.1 - to.1).abs() + 2.0 * half,
+                })
+            }
+        };
+        if let Some(item) = item {
+            bounds = Some(bounds.map_or(item, |bounds| union(bounds, item)));
+        }
+        index += 1;
+    }
+    bounds
+}
+
+/// `item` moved by `(dx, dy)` CSS pixels.
+fn translate_item(item: &paint::DisplayItem, dx: f32, dy: f32) -> paint::DisplayItem {
+    let mut item = item.clone();
+    match &mut item {
+        paint::DisplayItem::FillRect { rect, .. }
+        | paint::DisplayItem::FillRoundedRect { rect, .. }
+        | paint::DisplayItem::BoxShadow { rect, .. }
+        | paint::DisplayItem::Image { rect, .. } => *rect = rect.translate(dx, dy),
+        paint::DisplayItem::Text {
+            x, baseline, clip, ..
+        } => {
+            *x += dx;
+            *baseline += dy;
+            *clip = clip.map(|clip| clip.translate(dx, dy));
+        }
+        paint::DisplayItem::StrokeLine { from, to, .. } => {
+            *from = (from.0 + dx, from.1 + dy);
+            *to = (to.0 + dx, to.1 + dy);
+        }
+        paint::DisplayItem::Clip { rect } => *rect = rect.map(|rect| rect.translate(dx, dy)),
+        paint::DisplayItem::BeginLayer { transform, .. } => {
+            *transform = transform.map(|matrix| {
+                paint::Affine::translate(dx, dy)
+                    .then_after(matrix)
+                    .then_after(paint::Affine::translate(-dx, -dy))
+            });
+        }
+        paint::DisplayItem::EndLayer => {}
+    }
+    item
 }
 
 /// A clip rectangle in device pixels: a pixel `(x, y)` may be drawn when
@@ -63,11 +276,7 @@ impl Compositor {
                 self.height
             );
         }
-        let mut frame = Frame {
-            width: self.width,
-            height: self.height,
-            pixels: Self::CLEAR_COLOR.repeat((self.width * self.height) as usize),
-        };
+        let mut frame = Canvas::new(self.width, self.height, Self::CLEAR_COLOR, (0, 0));
         for item in items {
             match item {
                 DisplayItem::FillRect {
@@ -78,8 +287,8 @@ impl Compositor {
                     rgba,
                 } => {
                     log::trace!("fill rect {width}x{height} at ({x}, {y}) rgba {rgba:?}");
-                    let x_end = x.saturating_add(*width).min(self.width);
-                    let y_end = y.saturating_add(*height).min(self.height);
+                    let x_end = x.saturating_add(*width).min(frame.width);
+                    let y_end = y.saturating_add(*height).min(frame.height);
                     for py in *y..y_end {
                         for px in *x..x_end {
                             self.put_pixel(&mut frame, px, py, *rgba);
@@ -105,7 +314,16 @@ impl Compositor {
                     font_size,
                     text,
                     rgba,
-                } => self.draw_text(&mut frame, *x, *baseline, *font_size, text, *rgba, None),
+                } => self.draw_text(
+                    &mut frame,
+                    *x,
+                    *baseline,
+                    *font_size,
+                    text,
+                    *rgba,
+                    None,
+                    (false, false),
+                ),
                 DisplayItem::StrokeLine {
                     from,
                     to,
@@ -129,7 +347,7 @@ impl Compositor {
                 ),
             }
         }
-        frame
+        frame.into_frame()
     }
 
     /// Fills the rounded rectangle `[left, top, right, bottom]` (device
@@ -141,7 +359,7 @@ impl Compositor {
     /// 0, edges are anti-aliased over one pixel.
     fn fill_box_shadow(
         &self,
-        frame: &mut Frame,
+        frame: &mut Canvas,
         [left, top, right, bottom]: [f32; 4],
         radii: [[f32; 2]; 4],
         sigma: f32,
@@ -155,8 +373,8 @@ impl Compositor {
         let first =
             |value: f32, limit: u32| (value - reach).floor().clamp(0.0, limit as f32) as u32;
         let last = |value: f32, limit: u32| (value + reach).ceil().clamp(0.0, limit as f32) as u32;
-        let (x_start, x_end) = (first(left, self.width), last(right, self.width));
-        let (y_start, y_end) = (first(top, self.height), last(bottom, self.height));
+        let (x_start, x_end) = (first(left, frame.width), last(right, frame.width));
+        let (y_start, y_end) = (first(top, frame.height), last(bottom, frame.height));
         let [tl, tr, br, bl] = radii;
         // Each corner as (center x, center y, radius x, radius y, which
         // side of the center the curve is on).
@@ -203,7 +421,7 @@ impl Compositor {
     /// a 4x4 grid of samples that falls inside the shape.
     fn fill_rounded_rect(
         &self,
-        frame: &mut Frame,
+        frame: &mut Canvas,
         [left, top, right, bottom]: [f32; 4],
         radii: [[f32; 2]; 4],
         rgba: [u8; 4],
@@ -243,8 +461,8 @@ impl Compositor {
                 ..end.ceil().clamp(0.0, limit as f32) as u32
         };
         const SAMPLES: u32 = 4;
-        for py in range(top, bottom, self.height) {
-            for px in range(left, right, self.width) {
+        for py in range(top, bottom, frame.height) {
+            for px in range(left, right, frame.width) {
                 let (x, y) = (px as f32, py as f32);
                 let coverage = if in_corner(x, y) {
                     let mut hits = 0;
@@ -360,17 +578,21 @@ impl Compositor {
     }
 
     /// Draws text by sampling each scaled glyph bitmap at device-pixel
-    /// centers (nearest-neighbor scaling).
+    /// centers (nearest-neighbor scaling). `(bold, italic)` request
+    /// synthetic styles: bold thickens strokes by one glyph pixel to the
+    /// right, and italic slants rows by [`SYNTHETIC_SLANT`] about the
+    /// baseline.
     #[allow(clippy::too_many_arguments)]
     fn draw_text(
         &self,
-        frame: &mut Frame,
+        frame: &mut Canvas,
         x: f32,
         baseline: f32,
         font_size: f32,
         text: &str,
         rgba: [u8; 4],
         clip: Option<PixelBounds>,
+        (bold, italic): (bool, bool),
     ) {
         let scale = BitmapFont::scale(font_size);
         if scale <= 0.0 {
@@ -383,23 +605,40 @@ impl Compositor {
         );
         let top = baseline - BitmapFont::GLYPH_HEIGHT as f32 * scale;
         let rows = top.floor().max(0.0) as u32..baseline.ceil().max(0.0) as u32;
+        let thicken = if bold { scale } else { 0.0 };
+        let shift = |py: u32| {
+            if italic {
+                SYNTHETIC_SLANT * (baseline - (py as f32 + 0.5))
+            } else {
+                0.0
+            }
+        };
+        let max_shift = if italic {
+            SYNTHETIC_SLANT * (baseline - top)
+        } else {
+            0.0
+        };
         let mut cell_x = x;
         for character in text.chars() {
             if let Some(glyph) = glyph(character) {
-                let right = cell_x + BitmapFont::GLYPH_WIDTH as f32 * scale;
+                let right = cell_x + BitmapFont::GLYPH_WIDTH as f32 * scale + thicken + max_shift;
                 let columns = cell_x.floor().max(0.0) as u32..right.ceil().max(0.0) as u32;
                 for py in rows.clone() {
                     let row = ((py as f32 + 0.5 - top) / scale).floor();
                     if !(0.0..BitmapFont::GLYPH_HEIGHT as f32).contains(&row) {
                         continue;
                     }
+                    let bits = glyph[row as usize];
+                    // Whether the glyph covers horizontal position `sample`.
+                    let lit = |sample: f32| {
+                        let column = ((sample - cell_x) / scale).floor();
+                        (0.0..BitmapFont::GLYPH_WIDTH as f32).contains(&column)
+                            && bits & (1 << (BitmapFont::GLYPH_WIDTH - 1 - column as u32)) != 0
+                    };
+                    let row_shift = shift(py);
                     for px in columns.clone() {
-                        let column = ((px as f32 + 0.5 - cell_x) / scale).floor();
-                        if !(0.0..BitmapFont::GLYPH_WIDTH as f32).contains(&column) {
-                            continue;
-                        }
-                        let bit = BitmapFont::GLYPH_WIDTH - 1 - column as u32;
-                        if glyph[row as usize] & (1 << bit) != 0
+                        let sample = px as f32 + 0.5 - row_shift;
+                        if (lit(sample) || (bold && lit(sample - thicken)))
                             && PixelBounds::allows(clip, px, py)
                         {
                             self.put_pixel(frame, px, py, rgba);
@@ -413,11 +652,11 @@ impl Compositor {
         }
     }
 
-    fn put_pixel(&self, frame: &mut Frame, x: u32, y: u32, rgba: [u8; 4]) {
-        if x >= self.width || y >= self.height {
+    fn put_pixel(&self, frame: &mut Canvas, x: u32, y: u32, rgba: [u8; 4]) {
+        if x >= frame.width || y >= frame.height || !PixelBounds::allows(frame.clip, x, y) {
             return;
         }
-        let offset = ((y * self.width + x) * 4) as usize;
+        let offset = ((y * frame.width + x) * 4) as usize;
         let destination = &mut frame.pixels[offset..offset + 4];
         let alpha = u32::from(rgba[3]);
         if alpha == 255 {
@@ -444,73 +683,16 @@ impl Compositor {
     ///
     /// One CSS pixel maps to one device pixel. Rectangle edges are rounded to
     /// the nearest pixel boundary, so a rectangle covers the pixels whose
-    /// centers it contains, and parts outside the frame are clipped. Text
-    /// clip rectangles are ignored here; [`Compositor::compose_page`]
-    /// honors them.
+    /// centers it contains, and parts outside the frame are clipped. Text is
+    /// drawn with the built-in [`BitmapFont`]; [`paint::DisplayItem::Image`]
+    /// items are skipped (use [`Compositor::compose_page`]). Clips and
+    /// layers are honored as in [`Compositor::compose_page`].
     pub fn compose_paint(&self, list: &paint::DisplayList) -> Frame {
         log::debug!(
             "compositing paint display list with {} items",
             list.items.len()
         );
-        let items = list
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                paint::DisplayItem::FillRect { rect, color } => {
-                    let edge =
-                        |value: f32, limit: u32| value.round().clamp(0.0, limit as f32) as u32;
-                    let (left, right) = (edge(rect.x, self.width), edge(rect.right(), self.width));
-                    let (top, bottom) =
-                        (edge(rect.y, self.height), edge(rect.bottom(), self.height));
-                    (right > left && bottom > top).then(|| DisplayItem::FillRect {
-                        x: left,
-                        y: top,
-                        width: right - left,
-                        height: bottom - top,
-                        rgba: [color.r, color.g, color.b, color.a],
-                    })
-                }
-                paint::DisplayItem::FillRoundedRect { rect, radii, color } => {
-                    Some(Self::rounded_rect_item(rect, radii, color, 1.0))
-                }
-                paint::DisplayItem::BoxShadow {
-                    rect,
-                    radii,
-                    blur,
-                    color,
-                } => Some(Self::box_shadow_item(rect, radii, *blur, color, 1.0)),
-                paint::DisplayItem::Text {
-                    x,
-                    baseline,
-                    font_size,
-                    text,
-                    color,
-                    ..
-                } => Some(DisplayItem::Text {
-                    x: x.round(),
-                    baseline: baseline.round(),
-                    font_size: *font_size,
-                    text: text.clone(),
-                    rgba: [color.r, color.g, color.b, color.a],
-                }),
-                paint::DisplayItem::Image { image, .. } => {
-                    log::trace!("no image store to draw {image:?}; use compose_page");
-                    None
-                }
-                paint::DisplayItem::StrokeLine {
-                    from,
-                    to,
-                    width,
-                    color,
-                } => Some(DisplayItem::StrokeLine {
-                    from: *from,
-                    to: *to,
-                    width: *width,
-                    rgba: [color.r, color.g, color.b, color.a],
-                }),
-            })
-            .collect::<Vec<_>>();
-        self.compose(&items)
+        self.compose_scaled(list, FontChoice::Bitmap, None, 1.0)
     }
 
     /// Rasterizes a paint crate display list into a new frame, drawing text
@@ -579,130 +761,338 @@ impl Compositor {
                 self.height
             );
         }
-        let mut frame = Frame {
-            width: self.width,
-            height: self.height,
-            pixels: Self::CLEAR_COLOR.repeat((self.width * self.height) as usize),
-        };
-        for item in &list.items {
+        let mut canvas = Canvas::new(self.width, self.height, Self::CLEAR_COLOR, (0, 0));
+        self.draw_items(&mut canvas, &list.items, fonts, images, scale);
+        canvas.into_frame()
+    }
+
+    /// Draws `items` onto `canvas` at `scale` device pixels per CSS pixel,
+    /// handling clips and layers.
+    fn draw_items(
+        &self,
+        canvas: &mut Canvas,
+        items: &[paint::DisplayItem],
+        fonts: FontChoice<'_>,
+        images: Option<&ImageStore>,
+        scale: f32,
+    ) {
+        // Items are in CSS pixels relative to the viewport; a layer canvas
+        // starts at `origin` device pixels, so its items move back by that.
+        let (dx, dy) = (
+            -(canvas.origin.0 as f32) / scale,
+            -(canvas.origin.1 as f32) / scale,
+        );
+        let mut index = 0;
+        while index < items.len() {
+            let item = &items[index];
+            index += 1;
             match item {
-                paint::DisplayItem::FillRect { rect, color } => {
-                    let edge = |value: f32, limit: u32| {
-                        (value * scale).round().clamp(0.0, limit as f32) as u32
-                    };
-                    let rgba = [color.r, color.g, color.b, color.a];
-                    for py in edge(rect.y, self.height)..edge(rect.bottom(), self.height) {
-                        for px in edge(rect.x, self.width)..edge(rect.right(), self.width) {
-                            self.put_pixel(&mut frame, px, py, rgba);
-                        }
-                    }
+                paint::DisplayItem::BeginLayer { opacity, transform } => {
+                    let end = matching_end(items, index);
+                    self.draw_layer(
+                        canvas,
+                        &items[index..end],
+                        *opacity,
+                        *transform,
+                        fonts,
+                        images,
+                        scale,
+                    );
+                    index = end + 1;
                 }
-                paint::DisplayItem::FillRoundedRect { rect, radii, color } => {
-                    if let DisplayItem::FillRoundedRect {
-                        left,
-                        top,
-                        right,
-                        bottom,
-                        radii,
-                        rgba,
-                    } = Self::rounded_rect_item(rect, radii, color, scale)
-                    {
-                        self.fill_rounded_rect(&mut frame, [left, top, right, bottom], radii, rgba);
-                    }
-                }
-                paint::DisplayItem::BoxShadow {
-                    rect,
-                    radii,
-                    blur,
-                    color,
-                } => {
-                    if let DisplayItem::BoxShadow {
-                        left,
-                        top,
-                        right,
-                        bottom,
-                        radii,
-                        sigma,
-                        rgba,
-                    } = Self::box_shadow_item(rect, radii, *blur, color, scale)
-                    {
-                        self.fill_box_shadow(
-                            &mut frame,
-                            [left, top, right, bottom],
-                            radii,
-                            sigma,
-                            rgba,
-                        );
-                    }
-                }
-                paint::DisplayItem::Text {
-                    x,
-                    baseline,
-                    font_size,
-                    font,
-                    text,
-                    color,
-                    clip,
-                    snap_glyphs,
-                } => {
-                    let clip = clip.map(|clip| {
+                paint::DisplayItem::EndLayer => log::debug!("ignoring unmatched end of layer"),
+                paint::DisplayItem::Clip { rect } => {
+                    canvas.clip = rect.map(|rect| {
+                        let rect = rect.translate(dx, dy);
                         let edge = |value: f32, limit: u32| {
                             (value * scale).round().clamp(0.0, limit as f32) as u32
                         };
                         PixelBounds {
-                            left: edge(clip.x, self.width),
-                            top: edge(clip.y, self.height),
-                            right: edge(clip.right(), self.width),
-                            bottom: edge(clip.bottom(), self.height),
+                            left: edge(rect.x, canvas.width),
+                            top: edge(rect.y, canvas.height),
+                            right: edge(rect.right(), canvas.width),
+                            bottom: edge(rect.bottom(), canvas.height),
                         }
                     });
-                    let rgba = [color.r, color.g, color.b, color.a];
-                    let outline = match fonts {
-                        FontChoice::Single(font) => Some(font),
-                        FontChoice::Collection(fonts) => fonts.outline(*font),
-                    };
-                    match outline {
-                        Some(font) => self.draw_outline_text(
-                            &mut frame,
-                            font,
-                            *font_size * scale,
-                            *x * scale,
-                            (*baseline * scale).round(),
-                            text,
-                            rgba,
-                            clip,
-                            *snap_glyphs,
-                        ),
-                        None => self.draw_text(
-                            &mut frame,
-                            (*x * scale).round(),
-                            (*baseline * scale).round(),
-                            *font_size * scale,
-                            text,
-                            rgba,
-                            clip,
-                        ),
-                    }
                 }
-                paint::DisplayItem::StrokeLine {
-                    from,
-                    to,
-                    width,
-                    color,
-                } => self.stroke_line(
-                    &mut frame,
-                    (from.0 * scale, from.1 * scale),
-                    (to.0 * scale, to.1 * scale),
-                    *width * scale,
-                    [color.r, color.g, color.b, color.a],
-                ),
-                paint::DisplayItem::Image { rect, image } => match images {
-                    Some(images) => self.draw_image(&mut frame, images, image, rect, scale),
-                    None => log::trace!("no image store to draw {image:?}"),
-                },
+                _ if dx == 0.0 && dy == 0.0 => self.draw_item(canvas, item, fonts, images, scale),
+                _ => self.draw_item(canvas, &translate_item(item, dx, dy), fonts, images, scale),
             }
         }
-        frame
+    }
+
+    /// Draws a group: `items` onto a transparent surface, then that surface
+    /// through `transform` (CSS pixels) at `opacity` onto `canvas`, within
+    /// the canvas's clip.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_layer(
+        &self,
+        canvas: &mut Canvas,
+        items: &[paint::DisplayItem],
+        opacity: f32,
+        transform: Option<paint::Affine>,
+        fonts: FontChoice<'_>,
+        images: Option<&ImageStore>,
+        scale: f32,
+    ) {
+        let opacity = if opacity.is_finite() {
+            opacity.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        if opacity <= 0.0 || items.is_empty() {
+            return;
+        }
+        // The canvas pixels the group may change.
+        let dest = canvas.clip.unwrap_or(PixelBounds {
+            left: 0,
+            top: 0,
+            right: canvas.width,
+            bottom: canvas.height,
+        });
+        if dest.right <= dest.left || dest.bottom <= dest.top {
+            return;
+        }
+        let (origin_x, origin_y) = canvas.origin;
+        let fade = |pixel: [u8; 4]| {
+            let alpha = (f32::from(pixel[3]) * opacity).round() as u8;
+            [pixel[0], pixel[1], pixel[2], alpha]
+        };
+        let Some(matrix) = transform.filter(|matrix| !matrix.is_identity()) else {
+            log::trace!("layer at opacity {opacity}");
+            let mut layer = Canvas::new(
+                dest.right - dest.left,
+                dest.bottom - dest.top,
+                [0; 4],
+                (origin_x + dest.left as i32, origin_y + dest.top as i32),
+            );
+            self.draw_items(&mut layer, items, fonts, images, scale);
+            for y in 0..layer.height {
+                for x in 0..layer.width {
+                    let pixel = fade(layer.pixel(x, y));
+                    if pixel[3] > 0 {
+                        self.put_pixel(canvas, x + dest.left, y + dest.top, pixel);
+                    }
+                }
+            }
+            return;
+        };
+        // The matrix in device pixels: the linear part is unchanged and
+        // the translation scales.
+        let device = paint::Affine {
+            e: matrix.e * scale,
+            f: matrix.f * scale,
+            ..matrix
+        };
+        let Some(inverse) = device.inverse() else {
+            log::trace!("singular layer transform {matrix:?}; nothing drawn");
+            return;
+        };
+        let dest_device = paint::Rect {
+            x: (origin_x + dest.left as i32) as f32,
+            y: (origin_y + dest.top as i32) as f32,
+            width: (dest.right - dest.left) as f32,
+            height: (dest.bottom - dest.top) as f32,
+        };
+        // Draw only the content that can land on the destination.
+        let mut source = inverse.bounds(dest_device);
+        match list_bounds(items) {
+            Some(content) => {
+                let content = paint::Rect {
+                    x: content.x * scale,
+                    y: content.y * scale,
+                    width: content.width * scale,
+                    height: content.height * scale,
+                };
+                let (x, y) = (source.x.max(content.x), source.y.max(content.y));
+                source = paint::Rect {
+                    x,
+                    y,
+                    width: source.right().min(content.right()) - x,
+                    height: source.bottom().min(content.bottom()) - y,
+                };
+            }
+            None => return,
+        }
+        if !(source.width > 0.0 && source.height > 0.0) {
+            return;
+        }
+        // One pixel of margin keeps bilinear samples at the edges exact.
+        let left = source.x.floor() as i64 - 1;
+        let top = source.y.floor() as i64 - 1;
+        let width = (source.right().ceil() as i64 + 1 - left).max(0) as u64;
+        let height = (source.bottom().ceil() as i64 + 1 - top).max(0) as u64;
+        if width * height > MAX_LAYER_PIXELS {
+            log::debug!("transformed layer of {width}x{height} pixels is too large; skipped");
+            return;
+        }
+        log::trace!(
+            "layer at opacity {opacity} through {matrix:?}, {width}x{height} at ({left}, {top})"
+        );
+        let mut layer = Canvas::new(
+            width as u32,
+            height as u32,
+            [0; 4],
+            (left as i32, top as i32),
+        );
+        self.draw_items(&mut layer, items, fonts, images, scale);
+        let covered = device.bounds(paint::Rect {
+            x: left as f32,
+            y: top as f32,
+            width: width as f32,
+            height: height as f32,
+        });
+        let span = |low: f32, high: f32, origin: i32, min: u32, max: u32| {
+            let low =
+                (low.floor() as i64 - i64::from(origin)).clamp(i64::from(min), i64::from(max));
+            let high =
+                (high.ceil() as i64 - i64::from(origin)).clamp(i64::from(min), i64::from(max));
+            low as u32..high as u32
+        };
+        let rows = span(covered.y, covered.bottom(), origin_y, dest.top, dest.bottom);
+        let columns = span(covered.x, covered.right(), origin_x, dest.left, dest.right);
+        for py in rows {
+            for px in columns.clone() {
+                let (sx, sy) = inverse.apply(
+                    (i64::from(origin_x) + i64::from(px)) as f32 + 0.5,
+                    (i64::from(origin_y) + i64::from(py)) as f32 + 0.5,
+                );
+                let pixel = fade(layer.sample(sx - left as f32 - 0.5, sy - top as f32 - 0.5));
+                if pixel[3] > 0 {
+                    self.put_pixel(canvas, px, py, pixel);
+                }
+            }
+        }
+    }
+
+    /// Draws one item other than a clip or layer marker onto `frame`.
+    fn draw_item(
+        &self,
+        frame: &mut Canvas,
+        item: &paint::DisplayItem,
+        fonts: FontChoice<'_>,
+        images: Option<&ImageStore>,
+        scale: f32,
+    ) {
+        match item {
+            paint::DisplayItem::FillRect { rect, color } => {
+                let edge = |value: f32, limit: u32| {
+                    (value * scale).round().clamp(0.0, limit as f32) as u32
+                };
+                let rgba = [color.r, color.g, color.b, color.a];
+                for py in edge(rect.y, frame.height)..edge(rect.bottom(), frame.height) {
+                    for px in edge(rect.x, frame.width)..edge(rect.right(), frame.width) {
+                        self.put_pixel(frame, px, py, rgba);
+                    }
+                }
+            }
+            paint::DisplayItem::FillRoundedRect { rect, radii, color } => {
+                if let DisplayItem::FillRoundedRect {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    radii,
+                    rgba,
+                } = Self::rounded_rect_item(rect, radii, color, scale)
+                {
+                    self.fill_rounded_rect(frame, [left, top, right, bottom], radii, rgba);
+                }
+            }
+            paint::DisplayItem::BoxShadow {
+                rect,
+                radii,
+                blur,
+                color,
+            } => {
+                if let DisplayItem::BoxShadow {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    radii,
+                    sigma,
+                    rgba,
+                } = Self::box_shadow_item(rect, radii, *blur, color, scale)
+                {
+                    self.fill_box_shadow(frame, [left, top, right, bottom], radii, sigma, rgba);
+                }
+            }
+            paint::DisplayItem::Text {
+                x,
+                baseline,
+                font_size,
+                font,
+                text,
+                color,
+                clip,
+                snap_glyphs,
+                synthetic_bold,
+                synthetic_italic,
+            } => {
+                let synthesis = (*synthetic_bold, *synthetic_italic);
+                let clip = clip.map(|clip| {
+                    let edge = |value: f32, limit: u32| {
+                        (value * scale).round().clamp(0.0, limit as f32) as u32
+                    };
+                    PixelBounds {
+                        left: edge(clip.x, frame.width),
+                        top: edge(clip.y, frame.height),
+                        right: edge(clip.right(), frame.width),
+                        bottom: edge(clip.bottom(), frame.height),
+                    }
+                });
+                let rgba = [color.r, color.g, color.b, color.a];
+                let outline = match fonts {
+                    FontChoice::Single(font) => Some(font),
+                    FontChoice::Collection(fonts) => fonts.outline(*font),
+                    FontChoice::Bitmap => None,
+                };
+                match outline {
+                    Some(font) => self.draw_outline_text(
+                        frame,
+                        font,
+                        *font_size * scale,
+                        *x * scale,
+                        (*baseline * scale).round(),
+                        text,
+                        rgba,
+                        clip,
+                        *snap_glyphs,
+                        synthesis,
+                    ),
+                    None => self.draw_text(
+                        frame,
+                        (*x * scale).round(),
+                        (*baseline * scale).round(),
+                        *font_size * scale,
+                        text,
+                        rgba,
+                        clip,
+                        synthesis,
+                    ),
+                }
+            }
+            paint::DisplayItem::StrokeLine {
+                from,
+                to,
+                width,
+                color,
+            } => self.stroke_line(
+                frame,
+                (from.0 * scale, from.1 * scale),
+                (to.0 * scale, to.1 * scale),
+                *width * scale,
+                [color.r, color.g, color.b, color.a],
+            ),
+            paint::DisplayItem::Image { rect, image } => match images {
+                Some(images) => self.draw_image(frame, images, image, rect, scale),
+                None => log::trace!("no image store to draw {image:?}"),
+            },
+            paint::DisplayItem::Clip { .. }
+            | paint::DisplayItem::BeginLayer { .. }
+            | paint::DisplayItem::EndLayer => {}
+        }
     }
 
     /// Strokes the segment `from`-`to` (device pixels) with round caps,
@@ -710,7 +1100,7 @@ impl Compositor {
     /// distance to the stroke's outline.
     fn stroke_line(
         &self,
-        frame: &mut Frame,
+        frame: &mut Canvas,
         (ax, ay): (f32, f32),
         (bx, by): (f32, f32),
         width: f32,
@@ -727,8 +1117,8 @@ impl Compositor {
             (a.min(b) - half - 1.0).floor().clamp(0.0, limit as f32) as u32
                 ..(a.max(b) + half + 1.0).ceil().clamp(0.0, limit as f32) as u32
         };
-        for py in range(ay, by, self.height) {
-            for px in range(ax, bx, self.width) {
+        for py in range(ay, by, frame.height) {
+            for px in range(ax, bx, frame.width) {
                 let (x, y) = (px as f32 + 0.5, py as f32 + 0.5);
                 let t = if length_squared > 0.0 {
                     (((x - ax) * dx + (y - ay) * dy) / length_squared).clamp(0.0, 1.0)
@@ -749,7 +1139,7 @@ impl Compositor {
     /// device pixels per CSS pixel.
     fn draw_image(
         &self,
-        frame: &mut Frame,
+        frame: &mut Canvas,
         images: &ImageStore,
         key: &paint::ImageKey,
         rect: &paint::Rect,
@@ -762,15 +1152,16 @@ impl Compositor {
             return;
         }
         // Skip pictures entirely outside the frame before resampling them.
-        if right <= 0.0 || bottom <= 0.0 || left >= self.width as f32 || top >= self.height as f32 {
+        if right <= 0.0 || bottom <= 0.0 || left >= frame.width as f32 || top >= frame.height as f32
+        {
             return;
         }
         let (width, height) = ((right - left) as u32, (bottom - top) as u32);
         log::trace!("draw image {key:?} {width}x{height} at ({left}, {top})");
         // Blends `sample(x, y)`, in picture pixels, over the visible part.
-        let blit = |frame: &mut Frame, sample: &dyn Fn(u32, u32) -> [u8; 4]| {
-            let columns = left.max(0.0) as u32..(right as u32).min(self.width);
-            for py in top.max(0.0) as u32..(bottom as u32).min(self.height) {
+        let blit = |frame: &mut Canvas, sample: &dyn Fn(u32, u32) -> [u8; 4]| {
+            let columns = left.max(0.0) as u32..(right as u32).min(frame.width);
+            for py in top.max(0.0) as u32..(bottom as u32).min(frame.height) {
                 for px in columns.clone() {
                     let pixel = sample(px - left as u32, py - top as u32);
                     if pixel[3] > 0 {
@@ -807,7 +1198,7 @@ impl Compositor {
     #[allow(clippy::too_many_arguments)]
     fn draw_outline_text(
         &self,
-        frame: &mut Frame,
+        frame: &mut Canvas,
         font: &OutlineFont,
         font_size: f32,
         x: f32,
@@ -816,6 +1207,7 @@ impl Compositor {
         rgba: [u8; 4],
         clip: Option<PixelBounds>,
         snap_glyphs: bool,
+        (bold, italic): (bool, bool),
     ) {
         use ab_glyph::{Font, ScaleFont};
         if font_size <= 0.0 {
@@ -840,6 +1232,18 @@ impl Compositor {
                 continue;
             };
             let bounds = outline.px_bounds();
+            if bold || italic {
+                self.draw_synthetic_glyph(
+                    frame,
+                    &outline,
+                    font_size,
+                    baseline,
+                    rgba,
+                    clip,
+                    (bold, italic),
+                );
+                continue;
+            }
             outline.draw(|gx, gy, coverage| {
                 let px = bounds.min.x as i64 + i64::from(gx);
                 let py = bounds.min.y as i64 + i64::from(gy);
@@ -856,6 +1260,86 @@ impl Compositor {
                     );
                 }
             });
+        }
+    }
+}
+
+impl Compositor {
+    /// Draws one outlined glyph emboldened and/or slanted: its coverage is
+    /// rasterized, then each row is shifted by [`SYNTHETIC_SLANT`] times
+    /// its height above `baseline` (italic) and smeared right by
+    /// `font_size / 24` device pixels (bold), sampling coverage linearly.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_synthetic_glyph(
+        &self,
+        frame: &mut Canvas,
+        outline: &ab_glyph::OutlinedGlyph,
+        font_size: f32,
+        baseline: f32,
+        rgba: [u8; 4],
+        clip: Option<PixelBounds>,
+        (bold, italic): (bool, bool),
+    ) {
+        let bounds = outline.px_bounds();
+        let width = bounds.width().max(0.0) as usize;
+        let height = bounds.height().max(0.0) as usize;
+        if width == 0 || height == 0 {
+            return;
+        }
+        let mut coverage = vec![0.0_f32; width * height];
+        outline.draw(|gx, gy, value| {
+            if let Some(cell) = coverage.get_mut(gy as usize * width + gx as usize) {
+                *cell = value.clamp(0.0, 1.0);
+            }
+        });
+        let embolden = if bold {
+            (font_size / 24.0).max(0.5)
+        } else {
+            0.0
+        };
+        let slant = if italic { SYNTHETIC_SLANT } else { 0.0 };
+        for gy in 0..height {
+            let row = &coverage[gy * width..(gy + 1) * width];
+            let at = |column: f32| {
+                let index = column.floor();
+                let t = column - index;
+                let get = |i: f32| {
+                    if i < 0.0 || i >= width as f32 {
+                        0.0
+                    } else {
+                        row[i as usize]
+                    }
+                };
+                get(index) * (1.0 - t) + get(index + 1.0) * t
+            };
+            let py = bounds.min.y as i64 + gy as i64;
+            if py < 0 {
+                continue;
+            }
+            let shift = slant * (baseline - (py as f32 + 0.5));
+            let start = (bounds.min.x + shift).floor() as i64;
+            let end = (bounds.min.x + width as f32 + embolden + shift).ceil() as i64 + 1;
+            for px in start.max(0)..end {
+                let column = px as f32 - bounds.min.x - shift;
+                let mut value = at(column);
+                if embolden > 0.0 {
+                    value = value
+                        .max(at(column - embolden))
+                        .max(at(column - embolden / 2.0));
+                }
+                if !PixelBounds::allows(clip, px as u32, py as u32) {
+                    continue;
+                }
+                let alpha = (value.clamp(0.0, 1.0) * f32::from(rgba[3])).round() as u8;
+                if alpha > 0 {
+                    self.put_pixel(
+                        frame,
+                        px as u32,
+                        py as u32,
+                        [rgba[0], rgba[1], rgba[2], alpha],
+                    );
+                }
+            }
         }
     }
 }
@@ -984,6 +1468,197 @@ mod tests {
         assert_eq!(dark, 15 * 4);
     }
 
+    fn pixel(frame: &Frame, x: u32, y: u32) -> [u8; 4] {
+        let offset = ((y * frame.width + x) * 4) as usize;
+        frame.pixels[offset..offset + 4].try_into().unwrap()
+    }
+
+    fn color(r: u8, g: u8, b: u8, a: u8) -> paint::Color {
+        paint::Color { r, g, b, a }
+    }
+
+    fn fill(x: f32, y: f32, width: f32, height: f32, color: paint::Color) -> paint::DisplayItem {
+        paint::DisplayItem::FillRect {
+            rect: paint::Rect {
+                x,
+                y,
+                width,
+                height,
+            },
+            color,
+        }
+    }
+
+    fn text_item(text: &str, bold: bool, italic: bool) -> paint::DisplayItem {
+        paint::DisplayItem::Text {
+            snap_glyphs: false,
+            synthetic_bold: bold,
+            synthetic_italic: italic,
+            x: 4.0,
+            baseline: 30.0,
+            font_size: 24.0,
+            font: paint::FontId::DEFAULT,
+            text: text.into(),
+            color: color(0, 0, 0, 255),
+            clip: None,
+        }
+    }
+
+    fn inked(frame: &Frame) -> usize {
+        frame
+            .pixels
+            .chunks(4)
+            .filter(|pixel| pixel[..3] != [255, 255, 255])
+            .count()
+    }
+
+    #[test]
+    fn clips_limit_drawing_until_cleared() {
+        let red = color(255, 0, 0, 255);
+        let list = paint::DisplayList {
+            items: vec![
+                paint::DisplayItem::Clip {
+                    rect: Some(paint::Rect {
+                        x: 2.0,
+                        y: 2.0,
+                        width: 4.0,
+                        height: 4.0,
+                    }),
+                },
+                fill(0.0, 0.0, 10.0, 10.0, red),
+                paint::DisplayItem::Clip { rect: None },
+                fill(8.0, 8.0, 2.0, 2.0, red),
+            ],
+        };
+        let frame = Compositor::new(10, 10).compose_paint(&list);
+        assert_eq!(pixel(&frame, 3, 3), [255, 0, 0, 255]);
+        assert_eq!(pixel(&frame, 1, 1), [255, 255, 255, 255]);
+        assert_eq!(pixel(&frame, 7, 3), [255, 255, 255, 255]);
+        assert_eq!(pixel(&frame, 9, 9), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn layers_blend_as_a_group_restore_the_outer_clip_and_scale() {
+        let items = vec![
+            paint::DisplayItem::Clip {
+                rect: Some(paint::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 5.0,
+                    height: 10.0,
+                }),
+            },
+            paint::DisplayItem::BeginLayer {
+                opacity: 0.5,
+                transform: Some(paint::Affine::translate(2.0, 0.0)),
+            },
+            fill(0.0, 0.0, 4.0, 4.0, color(255, 0, 0, 255)),
+            fill(0.0, 0.0, 4.0, 4.0, color(0, 0, 255, 255)),
+            paint::DisplayItem::EndLayer,
+            fill(0.0, 8.0, 10.0, 2.0, color(0, 0, 0, 255)),
+        ];
+        let list = paint::DisplayList { items };
+        for scale in [1.0, 2.0] {
+            let size = (10.0 * scale) as u32;
+            let frame = Compositor::new(size, size).compose_page(
+                &list,
+                &FontCollection::new(None),
+                &ImageStore::default(),
+                scale,
+            );
+            let at = |x: f32, y: f32| pixel(&frame, (x * scale) as u32, (y * scale) as u32);
+            // The blue square, moved right by 2, blended at half opacity
+            // with no red from beneath it.
+            assert_eq!(at(3.0, 1.0), [127, 127, 255, 255], "scale {scale}");
+            assert_eq!(at(1.0, 1.0), [255, 255, 255, 255], "scale {scale}");
+            // The outer clip cuts the layer off at x = 5 ...
+            assert_eq!(at(5.5, 1.0), [255, 255, 255, 255], "scale {scale}");
+            // ... and still applies after it ends.
+            assert_eq!(at(3.0, 9.0), [0, 0, 0, 255], "scale {scale}");
+            assert_eq!(at(7.0, 9.0), [255, 255, 255, 255], "scale {scale}");
+        }
+    }
+
+    #[test]
+    fn transformed_layers_draw_content_from_outside_the_frame() {
+        // The square starts left of the frame and is moved into it.
+        let list = paint::DisplayList {
+            items: vec![
+                paint::DisplayItem::BeginLayer {
+                    opacity: 1.0,
+                    transform: Some(paint::Affine::translate(20.0, 0.0)),
+                },
+                fill(-15.0, 0.0, 10.0, 10.0, color(255, 0, 0, 255)),
+                paint::DisplayItem::EndLayer,
+            ],
+        };
+        let frame = Compositor::new(20, 10).compose_paint(&list);
+        assert_eq!(pixel(&frame, 7, 5), [255, 0, 0, 255]);
+        assert_eq!(pixel(&frame, 2, 5), [255, 255, 255, 255]);
+        // A singular transform draws nothing.
+        let flat = paint::DisplayList {
+            items: vec![
+                paint::DisplayItem::BeginLayer {
+                    opacity: 1.0,
+                    transform: Some(paint::Affine {
+                        a: 0.0,
+                        d: 0.0,
+                        ..paint::Affine::IDENTITY
+                    }),
+                },
+                fill(0.0, 0.0, 10.0, 10.0, color(255, 0, 0, 255)),
+                paint::DisplayItem::EndLayer,
+            ],
+        };
+        assert_eq!(inked(&Compositor::new(20, 10).compose_paint(&flat)), 0);
+    }
+
+    #[test]
+    fn synthetic_bold_and_italic_change_outline_glyphs() {
+        let Some(font) = crate::fonts::tests::system_font() else {
+            return;
+        };
+        let draw = |bold, italic| {
+            Compositor::new(80, 40).compose_paint_with_font(
+                &paint::DisplayList {
+                    items: vec![text_item("Il", bold, italic)],
+                },
+                &font,
+                1.0,
+            )
+        };
+        let regular = draw(false, false);
+        let bold = draw(true, false);
+        let italic = draw(false, true);
+        assert!(inked(&bold) > inked(&regular));
+        assert_ne!(italic, regular);
+        // Rows above the baseline lean right.
+        let first_ink =
+            |frame: &Frame, y: u32| (0..80).find(|&x| pixel(frame, x, y)[..3] != [255, 255, 255]);
+        let top = (0..40).find(|&y| first_ink(&regular, y).is_some()).unwrap();
+        assert!(first_ink(&italic, top).unwrap() > first_ink(&regular, top).unwrap());
+    }
+
+    #[test]
+    fn font_synthesis_skips_faces_that_already_match() {
+        use layout::FontMetrics;
+        let Some(font) = crate::fonts::tests::system_font() else {
+            return;
+        };
+        let mut fonts = FontCollection::new(Some(font.clone()));
+        fonts.add_font("Face", (700, 700), true, font.clone());
+        fonts.add_font("Face", (400, 400), false, font);
+        let bold_italic = fonts.select_font(&["Face".into()], 700, true);
+        assert_eq!(fonts.font_synthesis(bold_italic, 700, true), (false, false));
+        let regular = fonts.select_font(&["Face".into()], 400, false);
+        assert_eq!(fonts.font_synthesis(regular, 400, false), (false, false));
+        assert_eq!(fonts.font_synthesis(regular, 700, false), (true, false));
+        assert_eq!(
+            fonts.font_synthesis(layout::FontId::DEFAULT, 800, true),
+            (true, true)
+        );
+    }
+
     #[test]
     fn outline_text_is_drawn_at_device_scale_within_its_advance() {
         use layout::FontMetrics;
@@ -999,6 +1674,8 @@ mod tests {
         let list = paint::DisplayList {
             items: vec![paint::DisplayItem::Text {
                 snap_glyphs: false,
+                synthetic_bold: false,
+                synthetic_italic: false,
                 x: 4.0,
                 baseline: 20.0,
                 font_size: 16.0,
@@ -1335,6 +2012,8 @@ mod image_tests {
                 },
                 paint::DisplayItem::Text {
                     snap_glyphs: false,
+                    synthetic_bold: false,
+                    synthetic_italic: false,
                     x: 1.2,
                     baseline: 9.4,
                     font_size: 10.0,
@@ -1378,6 +2057,8 @@ mod image_tests {
                 },
                 paint::DisplayItem::Text {
                     snap_glyphs: false,
+                    synthetic_bold: false,
+                    synthetic_italic: false,
                     x: 0.0,
                     baseline: 12.0,
                     font_size: 12.0,

@@ -39,6 +39,12 @@ pub const CANVAS_COLOR: Color = Color {
 /// padding-box background); any other rounded border keeps square strips.
 /// Outlines use square strips with outline-offset; border images are not supported.
 ///
+/// Boxes with an opacity below 1 or a transform are wrapped in
+/// [`DisplayItem::BeginLayer`] and [`DisplayItem::EndLayer`], and `overflow`
+/// clipping produces [`DisplayItem::Clip`] items, both following
+/// [`LayoutTree::paint_order`]. Text whose face lacks the wanted weight or
+/// slant is marked for synthetic bold or italic.
+///
 /// Replaced boxes (`<img>`, inline `<svg>`) produce a [`DisplayItem::Image`]
 /// covering their content box, after their background. Their pictures are
 /// not clipped to `border-radius`. Checkbox and radio inputs instead draw
@@ -87,23 +93,54 @@ fn paint(
 ) -> DisplayList {
     log::trace!("building display list (scroll_y {scroll_y}, cull {cull})");
     let viewport = tree.root.rect;
-    // Whether a content rect in document coordinates is (partly) on screen.
-    let visible = |rect: &layout::Rect| {
-        !cull || (rect.bottom() - scroll_y > viewport.y && rect.y - scroll_y < viewport.bottom())
-    };
+    // How many enclosing layers are transformed. Their content may be drawn
+    // far from where it was laid out, so it is never culled.
+    let mut transformed = 0_usize;
+    let mut transformed_layers = Vec::new();
     let scrolled = |rect: layout::Rect| rect.translate(0.0, -scroll_y);
     let mut items = Vec::new();
     for item in tree.paint_order() {
+        // Whether a content rect in document coordinates is (partly) on screen.
+        let visible = |rect: &layout::Rect| {
+            !cull
+                || transformed > 0
+                || (rect.bottom() - scroll_y > viewport.y && rect.y - scroll_y < viewport.bottom())
+        };
         if match item {
             PaintItem::BoxDecorations(b) | PaintItem::Image(b) => {
                 b.style.hidden && b.kind != BoxKind::Viewport
             }
             PaintItem::InlineBox(b) => b.style.hidden,
             PaintItem::Text(t) => t.hidden,
+            PaintItem::Clip(_) | PaintItem::BeginLayer(_) | PaintItem::EndLayer(_) => false,
         } {
             continue;
         }
         match item {
+            PaintItem::Clip(rect) => items.push(DisplayItem::Clip {
+                rect: rect.map(scrolled),
+            }),
+            PaintItem::BeginLayer(layer) => {
+                // Content is drawn scrolled, so the matrix is conjugated by
+                // the scroll: move content back, transform, scroll again.
+                let transform = layer.transform_matrix().map(|matrix| {
+                    layout::Affine::translate(0.0, -scroll_y)
+                        .then_after(matrix)
+                        .then_after(layout::Affine::translate(0.0, scroll_y))
+                });
+                transformed += usize::from(transform.is_some());
+                transformed_layers.push(transform.is_some());
+                items.push(DisplayItem::BeginLayer {
+                    opacity: layer.style.opacity,
+                    transform,
+                });
+            }
+            PaintItem::EndLayer(_) => {
+                if transformed_layers.pop() == Some(true) {
+                    transformed -= 1;
+                }
+                items.push(DisplayItem::EndLayer);
+            }
             PaintItem::BoxDecorations(layout_box) => match layout_box.kind {
                 // The canvas is infinite, so it is never rounded.
                 BoxKind::Viewport => items.push(DisplayItem::FillRect {
@@ -173,6 +210,8 @@ fn paint(
                         font: text.font,
                         text: text.text.clone(),
                         color: text.color.into(),
+                        synthetic_bold: text.synthetic_bold,
+                        synthetic_italic: text.synthetic_italic,
                         clip: text.clip.map(scrolled),
                     });
                     if text.clip.is_none() {
@@ -898,6 +937,9 @@ mod tests {
                 DisplayItem::Image { .. } => "image".to_owned(),
                 DisplayItem::BoxShadow { .. } => "shadow".to_owned(),
                 DisplayItem::StrokeLine { .. } => "line".to_owned(),
+                DisplayItem::Clip { .. } => "clip".to_owned(),
+                DisplayItem::BeginLayer { .. } => "layer".to_owned(),
+                DisplayItem::EndLayer => "end layer".to_owned(),
             })
             .collect::<Vec<_>>();
         // Canvas, then both block backgrounds, then the text of both blocks

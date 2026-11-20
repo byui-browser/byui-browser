@@ -866,6 +866,9 @@ mod images {
                 PaintItem::InlineBox(_) => "inline".into(),
                 PaintItem::Text(text) => format!("text {}", text.text),
                 PaintItem::Image(layout_box) => format!("image {:?}", layout_box.image),
+                PaintItem::Clip(_) | PaintItem::BeginLayer(_) | PaintItem::EndLayer(_) => {
+                    "marker".into()
+                }
             })
             .collect::<Vec<_>>();
         let image = order

@@ -33,6 +33,13 @@ const CSS_WIDE_KEYWORDS: [&str; 5] = ["inherit", "initial", "unset", "revert", "
 /// layer components are ignored. Numeric `flex` forms and the common
 /// `-webkit-flex`, `-webkit-box-flex`, `-webkit-box-sizing`, and
 /// `-webkit-box-shadow` aliases map to the corresponding supported longhands.
+/// `font` expands to `font-style`, `font-variant`, `font-weight`,
+/// `font-stretch`, `font-size`, `line-height`, and `font-family`, resetting
+/// omitted components to `normal` (CSS Fonts 4 §2.8). System font keywords
+/// such as `caption` are not supported and drop the declaration. `overflow`
+/// expands to `overflow-x` and `overflow-y`. The `-webkit-`, `-ms-`,
+/// `-moz-`, and `-o-` prefixed `transform` and `transform-origin` map to the
+/// standard properties.
 /// `outline` expands width, style, and color. `text-decoration` currently
 /// expands its line component; style, thickness, and explicit color are not
 /// interpreted.
@@ -41,11 +48,23 @@ const CSS_WIDE_KEYWORDS: [&str; 5] = ["inherit", "initial", "unset", "revert", "
 /// expands to nothing, matching CSS's rule that invalid declarations are
 /// dropped. CSS-wide keywords such as `inherit` are copied to every longhand.
 pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
+    // `-ms-`, `-moz-`, and `-o-` only ever prefixed the transform properties
+    // this engine supports; other prefixed properties pass through unchanged.
+    for prefix in ["-ms-", "-moz-", "-o-"] {
+        if let Some(property) = declaration.property.strip_prefix(prefix)
+            && matches!(property, "transform" | "transform-origin")
+        {
+            return vec![Declaration {
+                property: property.to_owned(),
+                value: declaration.value.clone(),
+            }];
+        }
+    }
     if let Some(property) = declaration.property.strip_prefix("-webkit-") {
         let (property, value) = match property {
             "box-align" => ("align-items", legacy_box_align(&declaration.value)),
             "box-pack" => ("justify-content", legacy_box_pack(&declaration.value)),
-            "align-items" | "justify-content" | "animation" => {
+            "align-items" | "justify-content" | "animation" | "transform" | "transform-origin" => {
                 (property, declaration.value.clone())
             }
             "box-shadow" => ("box-shadow", declaration.value.clone()),
@@ -73,6 +92,18 @@ pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
     }
     if declaration.property == "flex" {
         return expand_flex(&declaration.value);
+    }
+    if declaration.property == "font" {
+        return expand_font(&declaration.value).unwrap_or_else(|| {
+            log::debug!(
+                "dropping invalid font shorthand value `{}`",
+                declaration.value
+            );
+            Vec::new()
+        });
+    }
+    if declaration.property == "overflow" {
+        return expand_overflow(&declaration.value);
     }
     if matches!(
         declaration.property.as_str(),
@@ -220,6 +251,137 @@ fn expand_outline(value: &str) -> Vec<Declaration> {
             value: value.to_owned(),
         })
         .collect()
+}
+
+/// The longhands the `font` shorthand sets, in the order it lists them.
+const FONT_LONGHANDS: [&str; 7] = [
+    "font-style",
+    "font-variant",
+    "font-weight",
+    "font-stretch",
+    "font-size",
+    "line-height",
+    "font-family",
+];
+
+/// Expands `font: [style || variant || weight || stretch]? size[/line-height]? family`.
+/// Returns `None` for invalid values, including the unsupported system font
+/// keywords.
+fn expand_font(value: &str) -> Option<Vec<Declaration>> {
+    let value = value.trim();
+    let longhands = |values: [&str; 7]| {
+        FONT_LONGHANDS
+            .into_iter()
+            .zip(values)
+            .map(|(property, value)| Declaration {
+                property: property.to_owned(),
+                value: value.to_owned(),
+            })
+            .collect()
+    };
+    if CSS_WIDE_KEYWORDS
+        .iter()
+        .any(|keyword| value.eq_ignore_ascii_case(keyword))
+    {
+        return Some(longhands([value; 7]));
+    }
+    // Everything from the first quote or comma on belongs to the family
+    // list, so only the part before it is split into keyword tokens.
+    let prefix_end = value.find(['"', '\'', ',']).unwrap_or(value.len());
+    let mut values = ["normal"; 7];
+    let mut seen = [false; 4];
+    let mut rest = value;
+    loop {
+        let trimmed = rest.trim_start();
+        let token_end = trimmed
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(trimmed.len());
+        let offset = value.len() - trimmed.len();
+        if token_end == 0 || offset >= prefix_end {
+            return None;
+        }
+        let token = &trimmed[..token_end];
+        let lower = token.to_ascii_lowercase();
+        let slot = match lower.as_str() {
+            "normal" => {
+                rest = &trimmed[token_end..];
+                continue;
+            }
+            "italic" | "oblique" => Some(0),
+            "small-caps" => Some(1),
+            "bold" | "bolder" | "lighter" => Some(2),
+            "ultra-condensed" | "extra-condensed" | "condensed" | "semi-condensed"
+            | "semi-expanded" | "expanded" | "extra-expanded" | "ultra-expanded" => Some(3),
+            _ if crate::fonts::parse_font_weight(token).is_some()
+                && token.parse::<f32>().is_ok() =>
+            {
+                Some(2)
+            }
+            _ => None,
+        };
+        match slot {
+            Some(slot) if !seen[slot] => {
+                seen[slot] = true;
+                values[slot] = token;
+                rest = &trimmed[token_end..];
+            }
+            Some(_) => return None,
+            None => {
+                rest = trimmed;
+                break;
+            }
+        }
+    }
+    // The size, optionally followed by `/ line-height`, then the family list.
+    let size_end = rest
+        .find(|c: char| c.is_whitespace() || c == '/')
+        .unwrap_or(rest.len());
+    let size = &rest[..size_end];
+    // The size is validated here; the cascade computes it.
+    crate::values::compute_font_size(size, 16.0, 16.0)?;
+    values[4] = size;
+    let mut after = rest[size_end..].trim_start();
+    if let Some(line_height) = after.strip_prefix('/') {
+        let line_height = line_height.trim_start();
+        let end = line_height
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(line_height.len());
+        if end == 0 {
+            return None;
+        }
+        values[5] = &line_height[..end];
+        after = line_height[end..].trim_start();
+    }
+    if after.is_empty() {
+        return None;
+    }
+    values[6] = after;
+    log::trace!("expanding font shorthand `{value}`");
+    Some(longhands(values))
+}
+
+/// Expands `overflow: <x> [<y>]` into `overflow-x` and `overflow-y`; one
+/// value sets both.
+fn expand_overflow(value: &str) -> Vec<Declaration> {
+    let parts = split_components(value);
+    let (x, y) = match parts.as_slice() {
+        [both] => (*both, *both),
+        [x, y] => (*x, *y),
+        _ => {
+            log::debug!("dropping invalid overflow shorthand value `{value}`");
+            return Vec::new();
+        }
+    };
+    vec![
+        Declaration {
+            property: "overflow-x".to_owned(),
+            value: x.to_owned(),
+        },
+        Declaration {
+            property: "overflow-y".to_owned(),
+            value: y.to_owned(),
+        },
+    ]
 }
 
 /// Expands the numeric and keyword forms of the `flex` shorthand.
@@ -530,6 +692,29 @@ mod tests {
             [("flex-grow".into(), "2".into())]
         );
         assert_eq!(
+            expanded("-ms-transform", "rotate(45deg)"),
+            [("transform".into(), "rotate(45deg)".into())]
+        );
+        assert_eq!(
+            expanded("-webkit-transform", "scale(2)"),
+            [("transform".into(), "scale(2)".into())]
+        );
+        assert_eq!(
+            expanded("-webkit-transform-origin", "0 0"),
+            [("transform-origin".into(), "0 0".into())]
+        );
+        assert_eq!(
+            expanded("-ms-filter", "x"),
+            [("-ms-filter".into(), "x".into())]
+        );
+        assert_eq!(
+            expanded("overflow", "hidden auto"),
+            [
+                ("overflow-x".into(), "hidden".into()),
+                ("overflow-y".into(), "auto".into()),
+            ]
+        );
+        assert_eq!(
             expanded("-webkit-flex", "2"),
             [
                 ("flex-grow".into(), "2".into()),
@@ -537,6 +722,66 @@ mod tests {
                 ("flex-basis".into(), "0%".into()),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+
+    fn font(value: &str) -> Vec<(String, String)> {
+        expand(&Declaration {
+            property: "font".into(),
+            value: value.into(),
+        })
+        .into_iter()
+        .map(|declaration| (declaration.property, declaration.value))
+        .collect()
+    }
+
+    fn get<'a>(expanded: &'a [(String, String)], property: &str) -> &'a str {
+        &expanded
+            .iter()
+            .find(|(name, _)| name == property)
+            .unwrap_or_else(|| panic!("{property} missing from {expanded:?}"))
+            .1
+    }
+
+    #[test]
+    fn font_shorthand_sets_every_component_and_resets_the_rest() {
+        let full = font("italic small-caps bold 12px/1.5 \"Helvetica Neue\", Arial, sans-serif");
+        assert_eq!(get(&full, "font-style"), "italic");
+        assert_eq!(get(&full, "font-variant"), "small-caps");
+        assert_eq!(get(&full, "font-weight"), "bold");
+        assert_eq!(get(&full, "font-stretch"), "normal");
+        assert_eq!(get(&full, "font-size"), "12px");
+        assert_eq!(get(&full, "line-height"), "1.5");
+        assert_eq!(
+            get(&full, "font-family"),
+            "\"Helvetica Neue\", Arial, sans-serif"
+        );
+
+        let minimal = font("2em serif");
+        assert_eq!(minimal.len(), 7);
+        assert_eq!(get(&minimal, "font-weight"), "normal");
+        assert_eq!(get(&minimal, "line-height"), "normal");
+        assert_eq!(get(&minimal, "font-size"), "2em");
+
+        let spaced = font("600 large / 20px monospace");
+        assert_eq!(get(&spaced, "font-weight"), "600");
+        assert_eq!(get(&spaced, "font-size"), "large");
+        assert_eq!(get(&spaced, "line-height"), "20px");
+
+        assert_eq!(get(&font("inherit"), "font-family"), "inherit");
+    }
+
+    #[test]
+    fn invalid_font_shorthands_are_dropped() {
+        assert!(font("bold").is_empty());
+        assert!(font("12px").is_empty());
+        assert!(font("bold bold 12px serif").is_empty());
+        assert!(font("caption").is_empty());
+        assert!(font("\"Arial\" 12px").is_empty());
     }
 }
 

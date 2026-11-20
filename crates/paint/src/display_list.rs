@@ -1,6 +1,6 @@
 //! Display-list commands.
 
-use crate::{Color, CornerRadii, FontId, ImageKey, PaintBox, Rect};
+use crate::{Affine, Color, CornerRadii, FontId, ImageKey, PaintBox, Rect};
 
 /// One ordered drawing command. Coordinates are CSS pixels.
 #[derive(Debug, Clone, PartialEq)]
@@ -60,6 +60,12 @@ pub enum DisplayItem {
         text: String,
         /// Text color.
         color: Color,
+        /// Embolden the glyphs: the run wants a bold weight (600 or more)
+        /// but its face is not bold. Advances are unchanged.
+        synthetic_bold: bool,
+        /// Slant the glyphs: the run wants italic or oblique but its face
+        /// is upright.
+        synthetic_italic: bool,
         /// A rectangle the glyphs must not paint outside; `None` means
         /// unclipped. Set for text inside form controls
         /// ([`layout::TextFragment::clip`]).
@@ -91,6 +97,32 @@ pub enum DisplayItem {
         /// Which picture to draw.
         image: ImageKey,
     },
+    /// Clips the items that follow, up to the next `Clip` or the end of the
+    /// current layer, to `rect`; `None` removes the clip.
+    ///
+    /// Painted for `overflow` other than `visible`. The rectangle is in the
+    /// current layer's coordinates. A layer starts unclipped; the clip in
+    /// effect before [`DisplayItem::BeginLayer`] returns after the matching
+    /// [`DisplayItem::EndLayer`] and clips the finished layer as it is drawn.
+    Clip {
+        /// The clip rectangle, or `None` for no clip.
+        rect: Option<Rect>,
+    },
+    /// Starts a group: the items up to the matching [`DisplayItem::EndLayer`]
+    /// are drawn onto a transparent surface, which is then mapped through
+    /// `transform` and blended over what is below at `opacity`.
+    ///
+    /// Painted for boxes with an `opacity` below 1 or a `transform`. Groups
+    /// nest.
+    BeginLayer {
+        /// Group opacity, from 0 to 1.
+        opacity: f32,
+        /// Maps the group's content (CSS pixels) to where it is drawn;
+        /// `None` draws it in place.
+        transform: Option<Affine>,
+    },
+    /// Ends the group the matching [`DisplayItem::BeginLayer`] started.
+    EndLayer,
 }
 
 /// An ordered list of paint commands, drawn back to front.

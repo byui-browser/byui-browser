@@ -1099,5 +1099,12 @@ pub(crate) fn box_style(style: &ComputedStyle) -> BoxStyle {
         outline_style: style.outline_style.clone(),
         border_radius: style.border_radius,
         box_shadow: Arc::clone(&style.box_shadow),
+        opacity: style.opacity,
+        transform: style.transform.clone(),
+        z_index: style
+            .z_index
+            .filter(|_| style.is_positioned() || style.flex_item),
+        clip_x: style.clip_x,
+        clip_y: style.clip_y,
     }
 }

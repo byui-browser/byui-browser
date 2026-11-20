@@ -25,6 +25,7 @@ mod rectangle;
 mod replaced;
 mod shadow;
 mod style;
+mod transform;
 mod tree;
 
 pub use control::{CHECKBOX_RADIO_SIZE, ControlKind, ToggleControl};
@@ -35,6 +36,7 @@ pub use radius::{BorderRadius, CornerRadii, CornerRadius, Corners, LengthPercent
 pub use rectangle::create_rectangle;
 pub use replaced::{ImageKey, ImageMetrics, NoImages};
 pub use shadow::BoxShadow;
+pub use transform::{Affine, Transform, TransformFunction};
 pub use tree::{
     BoxKind, BoxStyle, InlineBoxFragment, LayoutBox, LayoutTree, LineBox, LineFragment, PaintItem,
     Placement, TextFragment,
