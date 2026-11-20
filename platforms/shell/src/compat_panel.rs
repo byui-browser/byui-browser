@@ -50,7 +50,7 @@ impl PageScriptEngine for ShellScriptEngine {
                 Arc::new(Silent),
                 Arc::new(Silent),
                 Arc::clone(&self.controller),
-                browser::security_context_for_url(PROBE_ORIGIN),
+                self.runtime.security_context_for_url(PROBE_ORIGIN),
             )
             .map(|values| values.last().cloned().unwrap_or(js::Value::Undefined))
     }

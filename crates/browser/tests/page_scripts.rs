@@ -127,6 +127,39 @@ fn policy_context_controls_runtime_local_storage() {
 }
 
 #[test]
+fn runtime_policy_is_shared_by_cloned_handles_and_can_be_revoked() {
+    let runtime = BrowserRuntime::in_memory();
+    let cloned_runtime = runtime.clone();
+    let example = Origin::new("https", "example.com", None);
+    cloned_runtime.deny_permission(example.clone(), PermissionKind::Storage);
+
+    let denied = runtime.security_context_for_url("https://example.com/page");
+    assert!(!denied.can_read_storage());
+    assert!(!denied.can_write_storage());
+
+    runtime.revoke_permission(&example, PermissionKind::Storage);
+
+    let restored = runtime.security_context_for_url("https://example.com/other");
+    assert!(restored.can_read_storage());
+    assert!(restored.can_write_storage());
+}
+
+#[test]
+fn runtime_policy_is_scoped_by_origin() {
+    let runtime = BrowserRuntime::in_memory();
+    runtime.deny_permission(
+        Origin::new("https", "example.com", None),
+        PermissionKind::Storage,
+    );
+
+    let denied = runtime.security_context_for_url("https://example.com/");
+    let allowed = runtime.security_context_for_url("https://other.example/");
+
+    assert!(!denied.can_read_storage());
+    assert!(allowed.can_read_storage());
+}
+
+#[test]
 fn page_script_runs_queued_microtasks_before_the_next_script() {
     let controller = Arc::new(
         net::RequestController::builder(net::Config::default())
