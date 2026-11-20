@@ -424,6 +424,14 @@ fn revalidation_sends_all_validators_and_merges_304_metadata() {
         LAST_MODIFIED,
         "Sun, 06 Nov 1994 08:49:37 GMT".parse().unwrap(),
     );
+    headers.append(
+        http::header::WARNING,
+        "110 example.test \"stale\"".parse().unwrap(),
+    );
+    headers.append(
+        http::header::WARNING,
+        "214 example.test \"transformed\"".parse().unwrap(),
+    );
     cache.insert_with_headers(
         &request,
         &url,
@@ -437,7 +445,7 @@ fn revalidation_sends_all_validators_and_merges_304_metadata() {
         },
     );
 
-    let (_, validator) = cache
+    let (stored, validator) = cache
         .lookup_for_revalidation_with_headers(&request, &url, request.headers())
         .unwrap();
     let mut conditional_headers = crate::Headers::new();
@@ -463,12 +471,18 @@ fn revalidation_sends_all_validators_and_merges_304_metadata() {
     not_modified.insert("x-revalidated", "yes".parse().unwrap());
     not_modified.insert("set-cookie", "session=updated".parse().unwrap());
     let merged = cache
-        .merge_not_modified_with_headers(&request, &url, request.headers(), &not_modified)
+        .merge_not_modified_with_headers(&request, &url, request.headers(), &stored, &not_modified)
         .unwrap();
     assert_eq!(merged.status, StatusCode::OK);
     assert_eq!(merged.body, Bytes::from_static(b"cached"));
     assert_eq!(merged.headers.get("x-revalidated").unwrap(), "yes");
     assert!(merged.headers.get("set-cookie").is_none());
+    let warnings: Vec<_> = merged
+        .headers
+        .get_all(http::header::WARNING)
+        .iter()
+        .collect();
+    assert_eq!(warnings, ["214 example.test \"transformed\""]);
     let (_, refreshed_validator) = cache
         .lookup_for_revalidation_with_headers(&request, &url, request.headers())
         .unwrap();
@@ -482,6 +496,69 @@ fn revalidation_sends_all_validators_and_merges_304_metadata() {
         cache.lookup_with_headers(&request, &url, request.headers()),
         Some(CacheLookup::Fresh(_))
     ));
+}
+
+#[test]
+fn late_304_does_not_freshen_a_concurrently_replaced_representation() {
+    let cache = ResponseCache::default();
+    let url = Url::parse("https://example.test/concurrent-revalidation").unwrap();
+    let request = Request::get(url.as_str());
+    let mut original_headers = HeaderMap::new();
+    original_headers.insert(CACHE_CONTROL, "max-age=0".parse().unwrap());
+    original_headers.insert(ETAG, "\"old\"".parse().unwrap());
+    cache.insert_with_headers(
+        &request,
+        &url,
+        request.headers(),
+        StoredResponse {
+            status: StatusCode::OK,
+            headers: original_headers,
+            url: url.to_string(),
+            body: Bytes::from_static(b"old"),
+            cookie_headers_processed: false,
+        },
+    );
+    let (validated, _) = cache
+        .lookup_for_revalidation_with_headers(&request, &url, request.headers())
+        .unwrap();
+
+    let mut replacement_headers = HeaderMap::new();
+    replacement_headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+    replacement_headers.insert(ETAG, "\"new\"".parse().unwrap());
+    cache.insert_with_headers(
+        &request,
+        &url,
+        request.headers(),
+        StoredResponse {
+            status: StatusCode::OK,
+            headers: replacement_headers,
+            url: url.to_string(),
+            body: Bytes::from_static(b"new"),
+            cookie_headers_processed: false,
+        },
+    );
+
+    let mut late_not_modified = HeaderMap::new();
+    late_not_modified.insert(CACHE_CONTROL, "max-age=600".parse().unwrap());
+    late_not_modified.insert("x-late-validation", "old".parse().unwrap());
+    assert!(
+        cache
+            .merge_not_modified_with_headers(
+                &request,
+                &url,
+                request.headers(),
+                &validated,
+                &late_not_modified,
+            )
+            .is_none()
+    );
+
+    let cached = cache
+        .lookup_matching_with_headers(&request, &url, request.headers())
+        .unwrap();
+    assert_eq!(cached.body, Bytes::from_static(b"new"));
+    assert_eq!(cached.headers.get(ETAG).unwrap(), "\"new\"");
+    assert!(cached.headers.get("x-late-validation").is_none());
 }
 
 #[test]
@@ -519,8 +596,17 @@ fn revalidation_updates_vary_snapshot_when_304_changes_vary_fields() {
     let mut not_modified = HeaderMap::new();
     not_modified.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
     not_modified.insert("vary", "User-Agent".parse().unwrap());
+    let (stored, _) = cache
+        .lookup_for_revalidation_with_headers(&original, &url, original.headers())
+        .unwrap();
     cache
-        .merge_not_modified_with_headers(&original, &url, original.headers(), &not_modified)
+        .merge_not_modified_with_headers(
+            &original,
+            &url,
+            original.headers(),
+            &stored,
+            &not_modified,
+        )
         .unwrap();
 
     let mut same_agent = Request::get(url.as_str());

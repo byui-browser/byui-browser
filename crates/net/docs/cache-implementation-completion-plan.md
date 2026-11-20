@@ -70,11 +70,12 @@ changed `Vary` field set, and sends validation-response `Set-Cookie` fields to
 browser storage without retaining them for later cache hits. A validation
 response without a stored validator replaces the representation normally, and
 an unsuccessful validation response leaves the existing representation intact.
+A late `304` cannot freshen a representation that a concurrent revalidation
+has already replaced; that caller uses the newer cached representation.
 Remaining work is to:
 
 1. apply the complete HTTP freshening rules when merging `304` headers;
 2. process non-cookie response-side effects from the validation response; and
-3. cover transport-level validation failure and concurrent revalidation.
 
 `CacheMode::NoCache` now uses this path, but its request-header interaction is
 not yet fully Fetch-compatible.
@@ -176,8 +177,8 @@ Add focused unit and integration coverage for:
 
 Add focused coverage for:
 
-- validation failure, missing validators, changed validators,
-  revalidation, and `Set-Cookie` during `304`;
+- validation failure, missing validators, changed validators, revalidation,
+  concurrent replacement, and `Set-Cookie` during `304`;
 - generated-header-aware `Vary` matching;
 - cacheable non-2xx responses and cached redirects; and
 - missing browser cache partitions and the resulting `no-store` behavior.

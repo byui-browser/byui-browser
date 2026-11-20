@@ -83,6 +83,20 @@ impl CachedResponse {
         self.response.clone()
     }
 
+    /// Reports whether this entry is still the representation that a
+    /// conditional request validated.
+    ///
+    /// A concurrent fetch can replace a variant between validator selection
+    /// and receipt of its `304 Not Modified`. A late `304` must not freshen
+    /// that newer representation.
+    pub(super) fn matches_revalidation(&self, response: &StoredResponse) -> bool {
+        self.response.status == response.status
+            && self.response.headers == response.headers
+            && self.response.url == response.url
+            && self.response.body == response.body
+            && self.response.cookie_headers_processed == response.cookie_headers_processed
+    }
+
     pub(super) fn body_size(&self) -> usize {
         self.response.body.len()
     }
@@ -102,6 +116,27 @@ impl CachedResponse {
         freshness: FreshnessMetadata,
         access: u64,
     ) -> StoredResponse {
+        // RFC 9111 requires removal of stale warning fields after successful
+        // validation. Warnings in the 1xx range describe a stale response and
+        // must not survive a `304` refresh.
+        let retained_warnings: Vec<_> = self
+            .response
+            .headers
+            .get_all(http::header::WARNING)
+            .iter()
+            .filter(|value| {
+                let bytes = value.as_bytes();
+                !(bytes.len() >= 3
+                    && bytes[0] == b'1'
+                    && bytes[1].is_ascii_digit()
+                    && bytes[2].is_ascii_digit())
+            })
+            .cloned()
+            .collect();
+        self.response.headers.remove(http::header::WARNING);
+        for warning in retained_warnings {
+            self.response.headers.append(http::header::WARNING, warning);
+        }
         for (name, value) in headers {
             // A 304 has no representation body, so its content length cannot
             // describe the retained body. `Set-Cookie` is a response-side

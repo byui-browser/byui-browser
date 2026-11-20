@@ -248,6 +248,7 @@ impl ResponseCache {
         request: &Request,
         url: &Url,
         request_headers: &crate::Headers,
+        validated_response: &StoredResponse,
         headers: &reqwest::header::HeaderMap,
     ) -> Option<StoredResponse> {
         let key = cache_key(request, url);
@@ -261,6 +262,7 @@ impl ResponseCache {
                     .vary_headers
                     .iter()
                     .all(|(name, original_value)| request_headers.get(name) == *original_value)
+                    && entry.matches_revalidation(validated_response)
             })?;
             let mut merged_headers = variants[cached_index].response.headers.clone();
             for (name, value) in headers {

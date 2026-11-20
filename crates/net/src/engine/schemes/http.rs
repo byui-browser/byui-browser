@@ -311,11 +311,12 @@ impl RequestController {
             self.invalidate_after_unsafe_response(request, url, &response);
         }
         if response.status == http::StatusCode::NOT_MODIFIED
-            && revalidation.is_some()
+            && let Some((validated_response, _)) = &revalidation
             && let Some(cached) = self.inner.cache.merge_not_modified_with_headers(
                 request,
                 url,
                 transport_headers,
+                validated_response,
                 &response.headers,
             )
         {
@@ -328,6 +329,27 @@ impl RequestController {
             let mut merged = self.response_from_stored(request, cached);
             merged.validation_cookie_headers = Some(validation_cookie_headers.into_boxed_slice());
             return Ok((merged, transport_headers.clone()));
+        }
+        if response.status == http::StatusCode::NOT_MODIFIED
+            && revalidation.is_some()
+            && let Some(cached) =
+                self.inner
+                    .cache
+                    .lookup_matching_with_headers(request, url, transport_headers)
+        {
+            // A concurrent revalidation replaced the variant after this
+            // request selected its validator. The newer cached
+            // representation, rather than this obsolete `304`, is the only
+            // safe response to expose.
+            let validation_cookie_headers: Vec<http::HeaderValue> = response
+                .headers
+                .get_all(http::header::SET_COOKIE)
+                .iter()
+                .cloned()
+                .collect();
+            let mut cached = self.response_from_stored(request, cached);
+            cached.validation_cookie_headers = Some(validation_cookie_headers.into_boxed_slice());
+            return Ok((cached, transport_headers.clone()));
         }
         Ok((response, transport_headers.clone()))
     }
