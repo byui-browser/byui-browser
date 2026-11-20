@@ -50,7 +50,6 @@ struct CacheControl {
     max_age: Option<Duration>,
     no_cache: bool,
     no_store: bool,
-    must_revalidate: bool,
 }
 
 /// Stored age and freshness state for one cached response.
@@ -61,7 +60,6 @@ pub(super) struct FreshnessMetadata {
     pub(super) age: Duration,
     pub(super) lifetime: Duration,
     pub(super) requires_revalidation: bool,
-    pub(super) must_revalidate: bool,
 }
 
 impl FreshnessMetadata {
@@ -99,16 +97,11 @@ impl FreshnessMetadata {
             age: parse_age(headers),
             lifetime,
             requires_revalidation: directives.no_cache,
-            must_revalidate: directives.must_revalidate,
         })
     }
 
     pub(super) fn is_fresh(&self, now: CacheTime) -> bool {
         !self.requires_revalidation && self.current_age(now) < self.lifetime
-    }
-
-    pub(super) fn may_serve_stale(&self) -> bool {
-        !self.requires_revalidation && !self.must_revalidate
     }
 
     fn current_age(&self, now: CacheTime) -> Duration {
@@ -135,8 +128,6 @@ fn cache_control(headers: &HeaderMap) -> CacheControl {
                 directives.no_cache = true;
             } else if directive.eq_ignore_ascii_case("no-store") {
                 directives.no_store = true;
-            } else if directive.eq_ignore_ascii_case("must-revalidate") {
-                directives.must_revalidate = true;
             } else if let Some((name, value)) = directive.split_once('=')
                 && name.trim().eq_ignore_ascii_case("max-age")
                 && let Ok(seconds) = value.trim().trim_matches('"').parse::<u64>()

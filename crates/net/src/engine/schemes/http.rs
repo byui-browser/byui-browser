@@ -101,16 +101,14 @@ impl RequestController {
                 revalidation = self.inner.cache.lookup_for_revalidation(request, url);
                 None
             }
+            CacheMode::ForceCache | CacheMode::OnlyIfCached => {
+                self.inner.cache.lookup_matching(request, url)
+            }
             _ => match cache_lookup
                 .then(|| self.inner.cache.lookup(request, url))
                 .flatten()
             {
                 Some(CacheLookup::Fresh(response)) => Some(response),
-                Some(CacheLookup::Stale {
-                    response,
-                    may_serve_stale: true,
-                    ..
-                }) if request.cache_mode() == CacheMode::ForceCache => Some(response),
                 Some(CacheLookup::Stale {
                     response,
                     validator,

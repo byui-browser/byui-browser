@@ -31,10 +31,9 @@ pub(crate) enum CacheLookup {
     /// The cached representation may be used without revalidation.
     Fresh(StoredResponse),
     /// The cached representation is stale; only callers allowed to use stale
-    /// data may use it, and must honor `may_serve_stale`.
+    /// data may use it after applying their cache-mode policy.
     Stale {
         response: StoredResponse,
-        may_serve_stale: bool,
         /// Validator available for a conditional network request.
         validator: Option<CacheValidator>,
     },
@@ -115,10 +114,29 @@ impl ResponseCache {
         } else {
             Some(CacheLookup::Stale {
                 response: cached.as_response(),
-                may_serve_stale: cached.freshness.may_serve_stale(),
                 validator: cached.validator.clone(),
             })
         }
+    }
+
+    /// Returns a matching stored representation without applying freshness policy.
+    ///
+    /// `force-cache` and `only-if-cached` select a matching entry even when
+    /// its response directives would otherwise require revalidation. Normal
+    /// cache lookup must continue to use [`Self::lookup`] so it can enforce
+    /// freshness and validator rules.
+    pub(crate) fn lookup_matching(&self, request: &Request, url: &Url) -> Option<StoredResponse> {
+        let key = cache_key(request, url);
+        let mut entries = self.entries.write().expect("cache lock poisoned");
+        let access = entries.next_access();
+        let cached = entries.entries.get_mut(&key)?.iter_mut().find(|entry| {
+            entry
+                .vary_headers
+                .iter()
+                .all(|(name, original_value)| request.headers().get(name) == *original_value)
+        })?;
+        cached.last_access = access;
+        Some(cached.as_response())
     }
 
     /// Returns a matching representation and its validator, regardless of freshness.

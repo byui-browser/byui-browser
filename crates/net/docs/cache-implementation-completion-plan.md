@@ -97,8 +97,7 @@ Complete the behavior selected by each cache mode:
 - `Reload`: bypass an existing entry, send the required reload directives,
   and allow the refreshed response to replace the entry;
 - `NoCache`: revalidate matching entries before use;
-- `ForceCache`: use a matching stored response, including permitted stale
-  behavior, while respecting revalidation restrictions;
+- `ForceCache`: use a matching stored response regardless of freshness;
 - `OnlyIfCached`: enforce the same-origin restriction and return a Fetch
   network error without network access on a miss.
 
@@ -112,9 +111,6 @@ remain incorrect:
 - `NoStore`/`Reload` do not cover all standard request-directive interactions.
 - A request with caller-supplied validators does not force default mode to
   `no-store`.
-- `ForceCache` and `OnlyIfCached` must use any matching response regardless of
-  staleness. The implementation currently rejects some stale entries marked
-  `no-cache` or `must-revalidate`.
 - Cached redirects are not stored or followed for `OnlyIfCached`.
 - The Rust error boundary should be aligned with the JavaScript-facing
   `TypeError` required when `only-if-cached` is used outside same-origin mode.
@@ -171,8 +167,6 @@ Add focused unit and integration coverage for:
 
 Add focused coverage for:
 
-- `force-cache` and `only-if-cached` with stale, `no-cache`, and
-  `must-revalidate` entries;
 - stale-while-revalidate behavior;
 - `Pragma`, caller-supplied cache directives, and caller-supplied validators;
 - validation failure, missing validators, changed validators, concurrent

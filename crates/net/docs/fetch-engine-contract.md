@@ -133,8 +133,8 @@ work.
   partition, and a response-header observation hook. `Set-Cookie` reaches only
   the trusted cookie capability. Credential mode still decides whether the
   engine invokes it.
-- Integrity, navigation fetch, keepalive lifetime, nondefault
-  priority scheduling, and cache revalidation fail with `UnsupportedFeature`.
+- Integrity, navigation fetch, keepalive lifetime, and nondefault priority
+  scheduling fail with `UnsupportedFeature`.
   Manual/error redirect modes are handled by the controller. A service-worker
   `Intercept` decision also
   fails closed until worker responses are integrated. The default standalone
@@ -144,19 +144,21 @@ work.
   error mode fails before public headers. Per-hop policy checks remain
   incomplete. Fetch errors currently return a `RequestError`, not a
   `ResponseType::Error` value.
-- `Default`, `NoStore`, `Reload`, `ForceCache`, and `OnlyIfCached` retain their
-  documented process-local cache subset; `NoCache` fails until revalidation
-  exists. Browser service providers choose the partition key. This cache is
-   neither durable nor a full Fetch HTTP cache. Successful responses with
+- All six cache modes retain their documented process-local subset. `NoCache`
+  revalidates a matching entry with its stored validators; `ForceCache` and
+  same-origin `OnlyIfCached` use any matching stored entry, including one that
+  otherwise requires revalidation, while `OnlyIfCached` never starts network
+  I/O on a miss. Browser service providers choose the partition key. This
+  cache is neither durable nor a full Fetch HTTP cache. Successful responses with
    explicit freshness from `Cache-Control: max-age` or `Expires` are stored by structured partition,
    method, normalized URL, credential mode/eligibility, request mode, redirect
    taint, and authorization-presence identity; authorized requests are not
    stored. Response `Vary` fields select among request-header variants, and
    `Vary: *` responses are not stored. Configured entry and aggregate-body-byte
    limits evict least-recently-used primary entries. `Date` and `Age` contribute
-   to current-age calculation; response `no-cache` and stale `must-revalidate`
-   entries require a future revalidation implementation. Cache hits still pass through the
-   normal response finalization and filtering path. `net` owns the
+  to current-age calculation; response `no-cache` and stale `must-revalidate`
+  entries revalidate in normal modes. Cache hits still pass through the normal
+  response finalization and filtering path. `net` owns the
    transport-independent cache algorithm and capture boundary; browser/storage
    integrations provide partition identity and may replace process-local
    persistence later. Each entry owns one stored response representation, and

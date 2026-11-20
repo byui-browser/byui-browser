@@ -252,10 +252,7 @@ fn no_cache_and_must_revalidate_entries_require_revalidation_when_stale() {
     );
     assert!(matches!(
         cache.lookup(&request, &url),
-        Some(CacheLookup::Stale {
-            may_serve_stale: false,
-            ..
-        })
+        Some(CacheLookup::Stale { .. })
     ));
 
     let mut must_revalidate_headers = HeaderMap::new();
@@ -273,11 +270,44 @@ fn no_cache_and_must_revalidate_entries_require_revalidation_when_stale() {
     );
     assert!(matches!(
         cache.lookup(&request, &url),
-        Some(CacheLookup::Stale {
-            may_serve_stale: false,
-            ..
-        })
+        Some(CacheLookup::Stale { .. })
     ));
+}
+
+#[test]
+fn matching_lookup_returns_entries_that_normally_require_revalidation() {
+    let clock = Arc::new(TestClock::new(Duration::ZERO));
+    let cache = ResponseCache::with_clock(4, 64, clock);
+    let url = Url::parse("https://example.test/revalidation-restricted").unwrap();
+    let request = Request::get(url.as_str());
+
+    for (directives, body) in [
+        ("no-cache, max-age=60", b"no-cache".as_slice()),
+        ("max-age=0, must-revalidate", b"must-revalidate".as_slice()),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(CACHE_CONTROL, directives.parse().unwrap());
+        cache.insert(
+            &request,
+            &url,
+            StoredResponse {
+                status: StatusCode::OK,
+                headers,
+                url: url.to_string(),
+                body: Bytes::copy_from_slice(body),
+                cookie_headers_processed: false,
+            },
+        );
+
+        assert!(matches!(
+            cache.lookup(&request, &url),
+            Some(CacheLookup::Stale { .. })
+        ));
+        assert_eq!(
+            cache.lookup_matching(&request, &url).unwrap().body.as_ref(),
+            body
+        );
+    }
 }
 
 #[test]
@@ -891,7 +921,6 @@ fn expired_freshness() -> FreshnessMetadata {
         age: Duration::ZERO,
         lifetime: Duration::ZERO,
         requires_revalidation: false,
-        must_revalidate: false,
     }
 }
 

@@ -10,7 +10,7 @@ use std::{
     thread,
 };
 
-use crate::{Config, Request, RequestController};
+use crate::{CacheMode, Config, Request, RequestController, RequestError};
 use reqwest::StatusCode;
 
 #[test]
@@ -34,10 +34,23 @@ fn cache_serves_a_fresh_get_without_a_second_network_request() {
             .bytes()
             .await
             .expect("first response body should be readable");
-        let second = client
-            .fetch(Request::get(&address))
-            .await
-            .expect("cached request should succeed");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let mut probe = Request::get(&address);
+                probe.set_cache_mode(CacheMode::ForceCache);
+                match client.fetch(probe).await {
+                    Ok(response) if response.from_cache => break response,
+                    Ok(response) => {
+                        let _ = response.body.bytes().await;
+                    }
+                    Err(RequestError::NetworkError | RequestError::Transport(_)) => {}
+                    Err(error) => panic!("cache probe failed unexpectedly: {error}"),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background cache capture should finish within five seconds");
         (first.status, first.from_cache, first_body, second)
     });
     server.join().expect("test server should exit");

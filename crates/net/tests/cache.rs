@@ -263,6 +263,60 @@ fn force_cache_serves_a_permitted_stale_representation_without_network_io() {
 }
 
 #[test]
+fn force_cache_and_only_if_cached_serve_entries_that_require_revalidation() {
+    let server = TestServer::start(2, |request| {
+        if request.starts_with("GET /force ") {
+            b"HTTP/1.1 200 OK\r\nCache-Control: no-cache, max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nforce".to_vec()
+        } else if request.starts_with("GET /only ") {
+            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=0, must-revalidate\r\nContent-Length: 4\r\nConnection: close\r\n\r\nonly".to_vec()
+        } else {
+            panic!("unexpected request: {request}");
+        }
+    });
+    let controller = RequestController::builder(Config::default())
+        .with_browser_capabilities(Arc::new(SameOriginCacheServices))
+        .build()
+        .unwrap();
+
+    let (force, only_if_cached) = runtime().block_on(async {
+        let force_url = format!("{}/force", server.url());
+        let force_request = Request::get(&force_url);
+        let first = controller
+            .fetch(force_request.try_clone().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(collect_body(first).await.unwrap(), b"force");
+        let force = wait_for_cached(&controller, &force_request).await;
+
+        let only_url = format!("{}/only", server.url());
+        let mut only_request = Request::get(&only_url);
+        only_request.set_mode(RequestMode::SameOrigin).unwrap();
+        only_request.set_environment(
+            FetchEnvironment::from_url(url::Url::parse(only_request.url()).unwrap()).unwrap(),
+        );
+        let first = controller
+            .fetch(only_request.try_clone().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(collect_body(first).await.unwrap(), b"only");
+        wait_for_cached(&controller, &only_request).await;
+        only_request.set_cache_mode(CacheMode::OnlyIfCached);
+        let only_if_cached = controller.fetch(only_request).await.unwrap();
+
+        (force, only_if_cached)
+    });
+
+    server.join();
+    assert!(force.from_cache);
+    assert_eq!(runtime().block_on(force.body.bytes()).unwrap(), b"force");
+    assert!(only_if_cached.from_cache);
+    assert_eq!(
+        runtime().block_on(only_if_cached.body.bytes()).unwrap(),
+        b"only"
+    );
+}
+
+#[test]
 fn reload_bypasses_cache_and_caches_the_refresh_when_consumed() {
     let hits = Arc::new(AtomicUsize::new(0));
     let observed_hits = Arc::clone(&hits);
@@ -295,11 +349,20 @@ fn reload_bypasses_cache_and_caches_the_refresh_when_consumed() {
             refreshed_response.from_cache,
             collect_body(refreshed_response).await.unwrap(),
         );
-        let cached_response = wait_for_cached(&controller, &Request::get(server.url())).await;
-        let cached = (
-            cached_response.from_cache,
-            collect_body(cached_response).await.unwrap(),
-        );
+        let cached = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut probe = Request::get(server.url());
+                probe.set_cache_mode(CacheMode::ForceCache);
+                let response = controller.fetch(probe).await.unwrap();
+                let cached = (response.from_cache, collect_body(response).await.unwrap());
+                if cached.0 && cached.1 == b"second" {
+                    break cached;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refreshed background body capture should finish within five seconds");
         (first, refreshed, cached)
     });
 
