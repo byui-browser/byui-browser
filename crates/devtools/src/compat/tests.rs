@@ -465,3 +465,32 @@ fn interaction_and_text_quality_limitations_are_reported_precisely() {
         assert!(has(&report, Area::CssValue, feature), "{feature}");
     }
 }
+
+#[test]
+fn logical_sizing_and_clear_properties_are_not_flagged_as_missing() {
+    let report = audit(
+        "",
+        &[
+            ".a {margin-block:4px;inline-size:40px;border-left-color:red;max-width:30px;block-size:20px;padding-inline:3px;clear:both;min-inline-size:10px;padding-block:2px}",
+        ],
+        &[],
+        None,
+    );
+    for property in [
+        "margin-block",
+        "inline-size",
+        "border-left-color",
+        "max-width",
+        "block-size",
+        "padding-inline",
+        "clear",
+        "min-inline-size",
+        "padding-block",
+    ] {
+        assert!(
+            !has(&report, Area::CssProperty, property),
+            "{property}: {:?}",
+            report.findings
+        );
+    }
+}
