@@ -6,15 +6,16 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
 use js::{JsResult, Realm, Value};
 use net::{Request, RequestController, SchemeProviders};
 use security::{
-    RendererSecurityContext,
+    Origin, RendererSecurityContext,
     file_access::{FileAccessCapability, FileAccessError, TrustedDirectorySelection},
+    permissions::{PermissionKind, PermissionPolicy},
 };
 use storage::{
     OriginStorage, PersistentOriginStorage, SharedStorage, StorageError, shared_storage,
@@ -457,6 +458,7 @@ fn home_directory() -> io::Result<PathBuf> {
 #[derive(Debug, Clone)]
 pub struct BrowserRuntime {
     storage: SharedStorage,
+    permission_policy: Arc<RwLock<PermissionPolicy>>,
 }
 
 impl BrowserRuntime {
@@ -476,6 +478,7 @@ impl BrowserRuntime {
         log::info!("runtime opened: data directory {}", root.display());
         Ok(Self {
             storage: shared_storage(storage),
+            permission_policy: Arc::new(RwLock::new(PermissionPolicy::new())),
         })
     }
 
@@ -485,7 +488,48 @@ impl BrowserRuntime {
         log::debug!("runtime opened with in-memory storage");
         Self {
             storage: shared_storage(OriginStorage::new()),
+            permission_policy: Arc::new(RwLock::new(PermissionPolicy::new())),
         }
+    }
+
+    /// Grants `permission` to `origin` for the lifetime of this browser
+    /// runtime and all of its cloned renderer handles.
+    pub fn grant_permission(&self, origin: Origin, permission: PermissionKind) {
+        self.permission_policy
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .grant(origin, permission);
+    }
+
+    /// Explicitly denies `permission` for `origin` for the lifetime of this
+    /// browser runtime and all of its cloned renderer handles.
+    pub fn deny_permission(&self, origin: Origin, permission: PermissionKind) {
+        self.permission_policy
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .deny(origin, permission);
+    }
+
+    /// Removes the recorded decision for `origin` and `permission`.
+    pub fn revoke_permission(&self, origin: &Origin, permission: PermissionKind) {
+        self.permission_policy
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .revoke(origin, permission);
+    }
+
+    /// Creates a renderer security context using this runtime's shared
+    /// permission policy.
+    ///
+    /// Same-document URL changes do not call this method; a new document
+    /// navigation should call it with the final document URL.
+    #[must_use]
+    pub fn security_context_for_url(&self, url: &str) -> RendererSecurityContext {
+        let policy = self
+            .permission_policy
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        security_context_for_url_with_policy(url, &policy)
     }
 
     /// Parses a page, installs its Web APIs, and evaluates its scripts.

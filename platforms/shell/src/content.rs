@@ -871,7 +871,7 @@ fn evaluate_page_script(page: &Page, alert_sink: Arc<dyn AlertSink>, runtime: Br
             Arc::new(NoopConsole),
             alert_sink,
             controller,
-            browser::security_context_for_url(&page.url),
+            runtime.security_context_for_url(&page.url),
         )
         .expect("the page script should execute");
 }
@@ -1190,7 +1190,7 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
                             console,
                             alert_sink,
                             controller,
-                            browser::security_context_for_url(&page.url),
+                            runtime.security_context_for_url(&page.url),
                             device_pixel_ratio,
                             viewport,
                             navigate,
