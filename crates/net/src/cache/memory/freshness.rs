@@ -48,8 +48,27 @@ impl CacheClock for SystemCacheClock {
 #[derive(Clone, Copy, Debug, Default)]
 struct CacheControl {
     max_age: Option<Duration>,
+    s_maxage: Option<Duration>,
+    stale_while_revalidate: Option<Duration>,
+    stale_if_error: Option<Duration>,
     no_cache: bool,
     no_store: bool,
+    must_revalidate: bool,
+    immutable: bool,
+    visibility: CacheVisibility,
+}
+
+/// Visibility directives understood by the private browser cache.
+///
+/// `public` and `private` constrain shared caches. This process-local cache is
+/// private to its browser partition, so it records both directives for
+/// diagnostics and future durable backends without changing admission.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CacheVisibility {
+    #[default]
+    Unspecified,
+    Public,
+    Private,
 }
 
 /// Stored age and freshness state for one cached response.
@@ -60,6 +79,9 @@ pub(super) struct FreshnessMetadata {
     pub(super) age: Duration,
     pub(super) lifetime: Duration,
     pub(super) requires_revalidation: bool,
+    pub(crate) stale_while_revalidate: Duration,
+    pub(crate) stale_if_error: Duration,
+    pub(crate) forbids_stale: bool,
 }
 
 impl FreshnessMetadata {
@@ -78,6 +100,9 @@ impl FreshnessMetadata {
         let date = parse_http_date(headers.get(DATE));
         let expires = parse_http_date(headers.get(EXPIRES));
         let last_modified = parse_http_date(headers.get(LAST_MODIFIED));
+        // `s-maxage` is deliberately ignored here: this is a private browser
+        // cache, not a shared intermediary. A durable shared backend can use
+        // the retained parser field when it supplies a different policy.
         let lifetime = if directives.no_cache {
             Duration::ZERO
         } else if let Some(max_age) = directives.max_age {
@@ -91,17 +116,39 @@ impl FreshnessMetadata {
                 .saturating_sub(last_modified);
             apparent_age / HEURISTIC_FRESHNESS_FRACTION
         };
+        let _visibility = directives.visibility;
+        let _shared_lifetime = directives.s_maxage;
         Some(Self {
             response_time,
             date,
             age: parse_age(headers),
             lifetime,
             requires_revalidation: directives.no_cache,
+            stale_while_revalidate: directives.stale_while_revalidate.unwrap_or(Duration::ZERO),
+            stale_if_error: directives.stale_if_error.unwrap_or(Duration::ZERO),
+            forbids_stale: directives.no_cache || directives.must_revalidate,
         })
     }
 
     pub(super) fn is_fresh(&self, now: CacheTime) -> bool {
         !self.requires_revalidation && self.current_age(now) < self.lifetime
+    }
+
+    /// Reports whether this stale entry may be returned while it is refreshed.
+    pub(super) fn allows_stale_while_revalidate(&self, now: CacheTime) -> bool {
+        !self.forbids_stale
+            && self.current_age(now) < self.lifetime.saturating_add(self.stale_while_revalidate)
+    }
+
+    /// Reports whether this stale entry may mask a network or server failure.
+    pub(super) fn allows_stale_if_error(&self, now: CacheTime) -> bool {
+        !self.forbids_stale
+            && self.current_age(now) < self.lifetime.saturating_add(self.stale_if_error)
+    }
+
+    /// Reports whether a stale entry should remain stored for an extension.
+    pub(super) fn retains_stale_representation(&self, now: CacheTime) -> bool {
+        self.allows_stale_while_revalidate(now) || self.allows_stale_if_error(now)
     }
 
     fn current_age(&self, now: CacheTime) -> Duration {
@@ -128,11 +175,32 @@ fn cache_control(headers: &HeaderMap) -> CacheControl {
                 directives.no_cache = true;
             } else if directive.eq_ignore_ascii_case("no-store") {
                 directives.no_store = true;
-            } else if let Some((name, value)) = directive.split_once('=')
-                && name.trim().eq_ignore_ascii_case("max-age")
-                && let Ok(seconds) = value.trim().trim_matches('"').parse::<u64>()
-            {
-                directives.max_age = Some(Duration::from_secs(seconds));
+            } else if directive.eq_ignore_ascii_case("must-revalidate") {
+                directives.must_revalidate = true;
+            } else if directive.eq_ignore_ascii_case("immutable") {
+                directives.immutable = true;
+            } else if directive.eq_ignore_ascii_case("public") {
+                directives.visibility = CacheVisibility::Public;
+            } else if directive.eq_ignore_ascii_case("private") {
+                directives.visibility = CacheVisibility::Private;
+            } else if let Some((name, value)) = directive.split_once('=') {
+                let Ok(seconds) = value.trim().trim_matches('"').parse::<u64>() else {
+                    continue;
+                };
+                match name.trim().to_ascii_lowercase().as_str() {
+                    "max-age" => directives.max_age = Some(Duration::from_secs(seconds)),
+                    // This process-local cache is private. Keep parsing
+                    // s-maxage so a future shared backend can use it, but do
+                    // not apply it as a private-cache lifetime.
+                    "s-maxage" => directives.s_maxage = Some(Duration::from_secs(seconds)),
+                    "stale-while-revalidate" => {
+                        directives.stale_while_revalidate = Some(Duration::from_secs(seconds));
+                    }
+                    "stale-if-error" => {
+                        directives.stale_if_error = Some(Duration::from_secs(seconds));
+                    }
+                    _ => {}
+                }
             }
         }
     }

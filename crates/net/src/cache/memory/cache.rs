@@ -1,8 +1,9 @@
 //! Thread-safe response-cache operations.
 
 use std::{
+    collections::HashSet,
     fmt,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
 
@@ -21,6 +22,7 @@ use super::{
 #[derive(Clone)]
 pub(crate) struct ResponseCache {
     pub(super) entries: Arc<RwLock<CacheEntries>>,
+    revalidating: Arc<Mutex<HashSet<RevalidationKey>>>,
     limits: CacheLimits,
     clock: Arc<dyn CacheClock>,
 }
@@ -36,7 +38,32 @@ pub(crate) enum CacheLookup {
         response: StoredResponse,
         /// Validator available for a conditional network request.
         validator: Option<CacheValidator>,
+        /// Whether `Default` may return the stale response while refreshing it.
+        stale_while_revalidate: bool,
+        /// Whether a network or server failure may return this stale response.
+        stale_if_error: bool,
     },
+}
+
+/// One in-progress background refresh, released when its task finishes.
+pub(crate) struct RevalidationLease {
+    revalidating: Arc<Mutex<HashSet<RevalidationKey>>>,
+    key: RevalidationKey,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RevalidationKey {
+    cache: super::key::CacheKey,
+    vary_headers: Vec<(String, Option<String>)>,
+}
+
+impl Drop for RevalidationLease {
+    fn drop(&mut self) {
+        self.revalidating
+            .lock()
+            .expect("cache revalidation lock poisoned")
+            .remove(&self.key);
+    }
 }
 
 impl Default for ResponseCache {
@@ -65,6 +92,7 @@ impl ResponseCache {
     ) -> Self {
         Self {
             entries: Arc::new(RwLock::new(CacheEntries::default())),
+            revalidating: Arc::new(Mutex::new(HashSet::new())),
             limits: CacheLimits {
                 max_entries,
                 max_body_size,
@@ -77,6 +105,7 @@ impl ResponseCache {
     fn with_clock(max_entries: usize, max_body_size: usize, clock: Arc<dyn CacheClock>) -> Self {
         Self {
             entries: Arc::new(RwLock::new(CacheEntries::default())),
+            revalidating: Arc::new(Mutex::new(HashSet::new())),
             limits: CacheLimits {
                 max_entries,
                 max_body_size,
@@ -120,8 +149,45 @@ impl ResponseCache {
             Some(CacheLookup::Stale {
                 response: cached.as_response(),
                 validator: cached.validator.clone(),
+                stale_while_revalidate: cached.freshness.allows_stale_while_revalidate(now),
+                stale_if_error: cached.freshness.allows_stale_if_error(now),
             })
         }
+    }
+
+    /// Starts one background refresh for the matching response, if none runs.
+    ///
+    /// The lease owns the in-flight marker and removes it when the spawned
+    /// refresh task completes or is cancelled.
+    pub(crate) fn begin_background_revalidation(
+        &self,
+        request: &Request,
+        url: &Url,
+        request_headers: &crate::Headers,
+    ) -> Option<RevalidationLease> {
+        let cache = cache_key(request, url);
+        let entries = self.entries.read().expect("cache lock poisoned");
+        let entry = entries.entries.get(&cache)?.iter().find(|entry| {
+            entry
+                .vary_headers
+                .iter()
+                .all(|(name, original_value)| request_headers.get(name) == *original_value)
+        })?;
+        let key = RevalidationKey {
+            cache,
+            vary_headers: entry.vary_headers.clone(),
+        };
+        drop(entries);
+        let mut revalidating = self
+            .revalidating
+            .lock()
+            .expect("cache revalidation lock poisoned");
+        let acquired = revalidating.insert(key.clone());
+        drop(revalidating);
+        acquired.then_some(RevalidationLease {
+            revalidating: Arc::clone(&self.revalidating),
+            key,
+        })
     }
 
     /// Returns a matching stored representation using the complete outgoing headers.

@@ -35,11 +35,13 @@ impl CacheEntries {
             .sum()
     }
 
-    /// Drops stale data before an insertion; stale data may still be served
-    /// by `ForceCache` until a later insertion makes it eligible for eviction.
+    /// Drops stale data before insertion, retaining directive-authorized stale
+    /// representations for `stale-while-revalidate` and `stale-if-error`.
     pub(super) fn prune_stale(&mut self, now: CacheTime) {
         self.entries.retain(|_, variants| {
-            variants.retain(|entry| entry.freshness.is_fresh(now));
+            variants.retain(|entry| {
+                entry.freshness.is_fresh(now) || entry.freshness.retains_stale_representation(now)
+            });
             !variants.is_empty()
         });
         self.total_body_size = self

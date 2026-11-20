@@ -10,7 +10,7 @@ use crate::{
         },
         response::{InternalResponse, Response, has_null_body},
     },
-    cache::{CacheLookup, CacheValidator, StoredResponse},
+    cache::{CacheLookup, CacheValidator, RevalidationLease, StoredResponse},
     engine::{
         RequestController, cache_capture::with_cache_capture,
         process_response::ResponseFinalization,
@@ -21,8 +21,12 @@ use crate::{
 enum CacheDecision {
     /// A finalized response can return without a transport attempt.
     Hit(Response),
-    /// A transport attempt is required, optionally with a cached validator.
-    Miss(Option<(StoredResponse, CacheValidator)>),
+    /// A transport attempt is required, optionally with a cached validator and
+    /// a stale representation that may mask a network or server failure.
+    Miss {
+        revalidation: Option<(StoredResponse, CacheValidator)>,
+        stale_if_error: Option<StoredResponse>,
+    },
 }
 
 /// Result of processing one HTTP transport response.
@@ -54,18 +58,45 @@ impl RequestController {
         let (response, request_headers) = loop {
             let mut transport_headers = self.validate_http_hop(&mut request, &url).await?;
             self.select_cookies(&request, &url, &mut transport_headers)?;
-            let revalidation = match self.lookup_http_cache(&request, &url, &transport_headers)? {
-                CacheDecision::Hit(response) => return Ok(response),
-                CacheDecision::Miss(revalidation) => revalidation,
-            };
+            let (revalidation, stale_if_error) =
+                match self.lookup_http_cache(&request, &url, &transport_headers)? {
+                    CacheDecision::Hit(response) => return Ok(response),
+                    CacheDecision::Miss {
+                        revalidation,
+                        stale_if_error,
+                    } => (revalidation, stale_if_error),
+                };
 
             let had_nonreplayable_body = request
                 .body()
                 .as_ref()
                 .is_some_and(|body| !body.is_replayable());
-            let (candidate, request_headers) = self
+            let (candidate, request_headers) = match self
                 .submit_http_hop(&mut request, &url, &mut transport_headers, revalidation)
-                .await?;
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Some(cached) = stale_if_error {
+                        log::debug!(
+                            "serving stale response after transport failure for {}",
+                            crate::log_url::loggable(url.as_str())
+                        );
+                        return self.serve_cached_response(&request, &url, cached);
+                    }
+                    return Err(error);
+                }
+            };
+            if candidate.status.is_server_error()
+                && let Some(cached) = stale_if_error
+            {
+                log::debug!(
+                    "serving stale response after {} for {}",
+                    candidate.status,
+                    crate::log_url::loggable(url.as_str())
+                );
+                return self.serve_cached_response(&request, &url, cached);
+            }
             match self.process_http_result(&mut request, &url, candidate, had_nonreplayable_body)? {
                 HopResult::Complete(response) => break (response, request_headers),
                 HopResult::Follow(next_url) => {
@@ -87,7 +118,10 @@ impl RequestController {
         request_headers: &crate::Headers,
     ) -> Result<CacheDecision, RequestError> {
         if !request.is_cacheable_method() {
-            return Ok(CacheDecision::Miss(None));
+            return Ok(CacheDecision::Miss {
+                revalidation: None,
+                stale_if_error: None,
+            });
         }
         self.observe(request, NetworkPhase::CacheLookup, url, None, false);
         let cache_lookup = matches!(
@@ -98,6 +132,7 @@ impl RequestController {
                 | CacheMode::NoCache
         );
         let mut revalidation = None;
+        let mut stale_if_error = None;
         let cached = match request.cache_mode() {
             CacheMode::NoCache => {
                 revalidation = self.inner.cache.lookup_for_revalidation_with_headers(
@@ -123,10 +158,31 @@ impl RequestController {
                 Some(CacheLookup::Stale {
                     response,
                     validator,
-                    ..
+                    stale_while_revalidate,
+                    stale_if_error: may_serve_stale_if_error,
                 }) => {
-                    revalidation = validator.map(|validator| (response, validator));
-                    None
+                    if stale_while_revalidate
+                        && let Ok(mut background_request) = request.try_clone()
+                    {
+                        if let Some(lease) = self.inner.cache.begin_background_revalidation(
+                            request,
+                            url,
+                            request_headers,
+                        ) {
+                            background_request.set_cache_mode(CacheMode::NoCache);
+                            self.spawn_background_revalidation(background_request, lease);
+                        }
+                        // A refresh already in progress is sufficient: every
+                        // caller inside the stale-while-revalidate window
+                        // receives the stale representation immediately.
+                        Some(response)
+                    } else {
+                        if may_serve_stale_if_error {
+                            stale_if_error = Some(response.clone());
+                        }
+                        revalidation = validator.map(|validator| (response, validator));
+                        None
+                    }
                 }
                 None => None,
             },
@@ -151,7 +207,24 @@ impl RequestController {
             );
             return Err(RequestError::NetworkError);
         }
-        Ok(CacheDecision::Miss(revalidation))
+        Ok(CacheDecision::Miss {
+            revalidation,
+            stale_if_error,
+        })
+    }
+
+    /// Refreshes one stale representation without delaying its caller.
+    fn spawn_background_revalidation(&self, request: Request, lease: RevalidationLease) {
+        let controller = self.clone();
+        tokio::spawn(async move {
+            // The lease remains alive for the full fetch, including body
+            // capture setup, and releases the duplicate-refresh marker when
+            // this task returns.
+            let _lease = lease;
+            if let Err(error) = controller.fetch(request).await {
+                log::debug!("background cache revalidation failed: {error}");
+            }
+        });
     }
 
     /// Finalizes and exposes a cached representation without selecting cookies.

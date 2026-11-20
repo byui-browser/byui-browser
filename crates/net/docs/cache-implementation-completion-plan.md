@@ -14,8 +14,10 @@ a partial Fetch HTTP-cache implementation. It currently provides:
 - `Vary` matching against the complete outgoing header set, including
   Fetch-generated, policy-generated, body-metadata, and cookie fields;
 - explicit freshness based on `Date`, `Expires`, `Age`, and supported
-  `Cache-Control` directives, plus conservative `Last-Modified` heuristic
-  freshness when explicit metadata is absent;
+  `Cache-Control` directives, including stale extensions, plus conservative
+  `Last-Modified` heuristic freshness when explicit metadata is absent;
+- `stale-while-revalidate` with one detached refresh per matching variant and
+  `stale-if-error` fallback for transport and 5xx failures;
 - validator retention, conditional requests, basic `304 Not Modified`
   merging, and unsafe-request invalidation;
 - independent public body readers sharing immutable cached body bytes; and
@@ -105,8 +107,6 @@ Complete the behavior selected by each cache mode:
 The current implementation has all six modes represented, but several details
 remain incorrect:
 
-- `Default` does not implement stale-while-revalidate and always waits for a
-  stale response's network update.
 - `Reload` and `NoStore` add `Pragma: no-cache` and `Cache-Control: no-cache`
   only when the caller did not already provide each field. `NoCache` likewise
   preserves a caller-provided `Cache-Control` field, and default requests with
@@ -131,11 +131,20 @@ original body is still being delivered, whereas this implementation does not.
 
 ### 7. Complete HTTP freshness policy
 
-The freshness parser remains intentionally small. Add support and focused
-behavior for `stale-while-revalidate`, `stale-if-error`, `s-maxage`,
-`private`/`public`, `immutable`, and more complete heuristic freshness rules.
-Document how these directives interact with `ForceCache`, stale responses,
-revalidation failures, and partitioned browser caches.
+The cache now supports `stale-while-revalidate` and `stale-if-error`. Default
+requests serve a stale matching response during its stale-while-revalidate
+window and share one detached `NoCache` refresh for that variant. A stale
+response in its stale-if-error window can mask transport and 5xx failures.
+`must-revalidate` and `no-cache` disable both extensions. `ForceCache` and
+`OnlyIfCached` continue to use any matching stored representation regardless
+of freshness.
+
+This process-local browser cache is private to its selected partition:
+`public`, `private`, and `immutable` are accepted without changing normal
+fresh-cache behavior, while `s-maxage` is parsed but does not replace
+`max-age`. A shared durable backend will need its own admission and s-maxage
+policy. Remaining work includes more complete heuristic freshness rules and
+documenting the durable-backend policy.
 
 ## Browser and storage integrations
 
@@ -167,8 +176,7 @@ Add focused unit and integration coverage for:
 
 Add focused coverage for:
 
-- stale-while-revalidate behavior;
-- validation failure, missing validators, changed validators, concurrent
+- validation failure, missing validators, changed validators,
   revalidation, and `Set-Cookie` during `304`;
 - generated-header-aware `Vary` matching;
 - cacheable non-2xx responses and cached redirects; and

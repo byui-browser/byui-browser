@@ -234,6 +234,97 @@ fn explicit_freshness_overrides_last_modified_heuristics() {
 }
 
 #[test]
+fn freshness_extensions_keep_stale_entries_only_within_their_windows() {
+    let now = CacheTime {
+        wall: Duration::from_secs(1_000),
+        elapsed: Duration::ZERO,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CACHE_CONTROL,
+        "public, private, immutable, max-age=10, s-maxage=1, stale-while-revalidate=5, stale-if-error=20"
+            .parse()
+            .unwrap(),
+    );
+    let freshness = FreshnessMetadata::from_headers(&headers, now).unwrap();
+
+    // This is a private browser cache, so s-maxage does not replace max-age.
+    assert_eq!(freshness.lifetime, Duration::from_secs(10));
+    assert!(freshness.is_fresh(CacheTime {
+        wall: now.wall + Duration::from_secs(9),
+        elapsed: Duration::from_secs(9),
+    }));
+    let stale = CacheTime {
+        wall: now.wall + Duration::from_secs(11),
+        elapsed: Duration::from_secs(11),
+    };
+    assert!(freshness.allows_stale_while_revalidate(stale));
+    assert!(freshness.allows_stale_if_error(stale));
+    assert!(freshness.retains_stale_representation(stale));
+    let only_if_error = CacheTime {
+        wall: now.wall + Duration::from_secs(16),
+        elapsed: Duration::from_secs(16),
+    };
+    assert!(!freshness.allows_stale_while_revalidate(only_if_error));
+    assert!(freshness.allows_stale_if_error(only_if_error));
+    let expired = CacheTime {
+        wall: now.wall + Duration::from_secs(31),
+        elapsed: Duration::from_secs(31),
+    };
+    assert!(!freshness.retains_stale_representation(expired));
+}
+
+#[test]
+fn must_revalidate_disables_stale_extensions() {
+    let now = CacheTime {
+        wall: Duration::ZERO,
+        elapsed: Duration::ZERO,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CACHE_CONTROL,
+        "max-age=0, must-revalidate, stale-while-revalidate=60, stale-if-error=60"
+            .parse()
+            .unwrap(),
+    );
+    let freshness = FreshnessMetadata::from_headers(&headers, now).unwrap();
+    let stale = CacheTime {
+        wall: Duration::from_secs(1),
+        elapsed: Duration::from_secs(1),
+    };
+    assert!(!freshness.allows_stale_while_revalidate(stale));
+    assert!(!freshness.allows_stale_if_error(stale));
+}
+
+#[test]
+fn background_revalidation_leases_coalesce_matching_variants() {
+    let cache = ResponseCache::default();
+    let url = Url::parse("https://example.test/revalidate-once").unwrap();
+    let request = Request::get(url.as_str());
+    cache.insert_with_headers(
+        &request,
+        &url,
+        request.headers(),
+        cached_response(&url, b"cached"),
+    );
+
+    let lease = cache
+        .begin_background_revalidation(&request, &url, request.headers())
+        .expect("first refresh should acquire the lease");
+    assert!(
+        cache
+            .begin_background_revalidation(&request, &url, request.headers())
+            .is_none()
+    );
+    drop(lease);
+    assert!(
+        cache
+            .begin_background_revalidation(&request, &url, request.headers())
+            .is_some()
+    );
+}
+
+#[test]
 fn no_cache_and_must_revalidate_entries_require_revalidation_when_stale() {
     let clock = Arc::new(TestClock::new(Duration::ZERO));
     let cache = ResponseCache::with_clock(4, 64, clock);
@@ -1002,6 +1093,9 @@ fn expired_freshness() -> FreshnessMetadata {
         age: Duration::ZERO,
         lifetime: Duration::ZERO,
         requires_revalidation: false,
+        stale_while_revalidate: Duration::ZERO,
+        stale_if_error: Duration::ZERO,
+        forbids_stale: false,
     }
 }
 

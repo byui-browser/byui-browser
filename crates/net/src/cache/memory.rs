@@ -6,7 +6,7 @@ mod freshness;
 mod key;
 mod storage;
 
-pub(crate) use cache::{CacheLookup, ResponseCache};
+pub(crate) use cache::{CacheLookup, ResponseCache, RevalidationLease};
 pub(crate) use entry::{CacheValidator, StoredResponse};
 
 #[cfg(test)]

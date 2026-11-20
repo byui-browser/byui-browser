@@ -440,7 +440,7 @@ fn failed_revalidation_keeps_the_existing_representation() {
         {
             b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfail".to_vec()
         } else {
-            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=0\r\nETag: \"version-1\"\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
+            b"HTTP/1.1 204 No Content\r\nCache-Control: max-age=0\r\nETag: \"version-1\"\r\nConnection: close\r\n\r\n".to_vec()
         }
     });
     let controller = RequestController::builder(Config::default())
@@ -453,8 +453,7 @@ fn failed_revalidation_keeps_the_existing_representation() {
             .fetch(request.try_clone().unwrap())
             .await
             .unwrap();
-        assert_eq!(collect_body(first).await.unwrap(), b"cached");
-        wait_for_cached(&controller, &request).await;
+        assert_eq!(collect_body(first).await.unwrap(), b"");
 
         let failure = controller
             .fetch(request.try_clone().unwrap())
@@ -467,7 +466,95 @@ fn failed_revalidation_keeps_the_existing_representation() {
         cached_request.set_cache_mode(CacheMode::ForceCache);
         let cached = controller.fetch(cached_request).await.unwrap();
         assert!(cached.from_cache);
-        assert_eq!(collect_body(cached).await.unwrap(), b"cached");
+        assert_eq!(collect_body(cached).await.unwrap(), b"");
+    });
+
+    server.join();
+}
+
+#[test]
+fn stale_while_revalidate_serves_stale_and_refreshes_once_in_the_background() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let observed_hits = Arc::clone(&hits);
+    let server = TestServer::start(2, move |request| {
+        let hit = observed_hits.fetch_add(1, Ordering::SeqCst);
+        if hit == 0 {
+            b"HTTP/1.1 204 No Content\r\nCache-Control: max-age=0, stale-while-revalidate=60\r\nETag: \"stale\"\r\nConnection: close\r\n\r\n".to_vec()
+        } else {
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("if-none-match: \"stale\"")
+            );
+            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh".to_vec()
+        }
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+
+    runtime().block_on(async {
+        let request = Request::get(server.url());
+        let initial = controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(collect_body(initial).await.unwrap(), b"");
+
+        let stale = controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
+        assert!(stale.from_cache);
+        assert_eq!(collect_body(stale).await.unwrap(), b"");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut probe = request.try_clone().unwrap();
+                probe.set_cache_mode(CacheMode::ForceCache);
+                let response = controller.fetch(probe).await.unwrap();
+                if response.from_cache && collect_body(response).await.unwrap() == b"fresh" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background refresh should complete");
+    });
+
+    server.join();
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn stale_if_error_returns_a_cached_representation_for_server_failures() {
+    let server = TestServer::start(2, |request| {
+        if request
+            .to_ascii_lowercase()
+            .contains("if-none-match: \"stale\"")
+        {
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfail".to_vec()
+        } else {
+            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=0, stale-if-error=60\r\nETag: \"stale\"\r\nContent-Length: 5\r\nConnection: close\r\n\r\nstale".to_vec()
+        }
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+
+    runtime().block_on(async {
+        let request = Request::get(server.url());
+        let initial = controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(collect_body(initial).await.unwrap(), b"stale");
+        wait_for_cached(&controller, &request).await;
+
+        let fallback = controller.fetch(request).await.unwrap();
+        assert!(fallback.from_cache);
+        assert_eq!(collect_body(fallback).await.unwrap(), b"stale");
     });
 
     server.join();
