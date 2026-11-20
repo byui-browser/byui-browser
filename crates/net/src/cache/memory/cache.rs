@@ -7,7 +7,10 @@ use std::{
     time::Instant,
 };
 
-use reqwest::Url;
+use reqwest::{
+    Url,
+    header::{CACHE_CONTROL, EXPIRES, HeaderMap},
+};
 
 use crate::api::request::Request;
 
@@ -306,9 +309,9 @@ impl ResponseCache {
             );
             return;
         }
-        if !response.status.is_success() {
+        if !is_cacheable_response_status(response.status, &response.headers) {
             log::trace!(
-                "cache store skipped for {}: status {} is not successful",
+                "cache store skipped for {}: status {} is not cacheable",
                 crate::log_url::loggable(url.as_str()),
                 response.status
             );
@@ -411,6 +414,19 @@ impl ResponseCache {
     pub(crate) fn clear(&self) {
         *self.entries.write().expect("cache lock poisoned") = CacheEntries::default();
     }
+}
+
+/// Reports whether this private cache may store a response with `status`.
+///
+/// RFC 9111 defines a small set of statuses cacheable by default. Other
+/// responses, including temporary redirects, require explicit freshness or
+/// cache-control metadata before this bounded private cache retains them.
+fn is_cacheable_response_status(status: http::StatusCode, headers: &HeaderMap) -> bool {
+    matches!(
+        status.as_u16(),
+        200 | 203 | 204 | 206 | 300 | 301 | 308 | 404 | 405 | 410 | 414 | 501
+    ) || headers.contains_key(CACHE_CONTROL)
+        || headers.contains_key(EXPIRES)
 }
 
 impl fmt::Debug for ResponseCache {

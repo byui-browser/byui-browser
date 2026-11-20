@@ -19,8 +19,10 @@ use crate::{
 
 /// Result of looking up an HTTP request in the cache.
 enum CacheDecision {
-    /// A finalized response can return without a transport attempt.
+    /// A finalized terminal response can return without a transport attempt.
     Hit(Response),
+    /// A stored redirect must continue through redirect processing.
+    Redirect(StoredResponse),
     /// A transport attempt is required, optionally with a cached validator and
     /// a stale representation that may mask a network or server failure.
     Miss {
@@ -61,6 +63,26 @@ impl RequestController {
             let (revalidation, stale_if_error) =
                 match self.lookup_http_cache(&request, &url, &transport_headers)? {
                     CacheDecision::Hit(response) => return Ok(response),
+                    CacheDecision::Redirect(cached) => {
+                        let response = self.response_from_cached_hit(&request, &url, cached);
+                        match self.process_http_result(
+                            &mut request,
+                            &url,
+                            response,
+                            &transport_headers,
+                            false,
+                        )? {
+                            HopResult::Complete(response) => {
+                                return self
+                                    .finalize_cached_http_response(&request, &url, response);
+                            }
+                            HopResult::Follow(next_url) => {
+                                url = next_url;
+                                continue;
+                            }
+                            HopResult::Expose(response) => return Ok(response),
+                        }
+                    }
                     CacheDecision::Miss {
                         revalidation,
                         stale_if_error,
@@ -97,7 +119,13 @@ impl RequestController {
                 );
                 return self.serve_cached_response(&request, &url, cached);
             }
-            match self.process_http_result(&mut request, &url, candidate, had_nonreplayable_body)? {
+            match self.process_http_result(
+                &mut request,
+                &url,
+                candidate,
+                &request_headers,
+                had_nonreplayable_body,
+            )? {
                 HopResult::Complete(response) => break (response, request_headers),
                 HopResult::Follow(next_url) => {
                     url = next_url;
@@ -188,6 +216,9 @@ impl RequestController {
             },
         };
         if let Some(cached) = cached {
+            if is_redirect_status(cached.status) {
+                return Ok(CacheDecision::Redirect(cached));
+            }
             return self
                 .serve_cached_response(request, url, cached)
                 .map(CacheDecision::Hit);
@@ -227,13 +258,13 @@ impl RequestController {
         });
     }
 
-    /// Finalizes and exposes a cached representation without selecting cookies.
-    fn serve_cached_response(
+    /// Records a cache hit and reconstructs its internal response state.
+    fn response_from_cached_hit(
         &self,
         request: &Request,
         url: &reqwest::Url,
         cached: StoredResponse,
-    ) -> Result<Response, RequestError> {
+    ) -> InternalResponse {
         self.observe(
             request,
             NetworkPhase::CacheHit,
@@ -248,7 +279,27 @@ impl RequestController {
             cached.status,
             cached.body.len()
         );
-        let mut response = self.response_from_stored(request, cached);
+        self.response_from_stored(request, cached)
+    }
+
+    /// Finalizes and exposes a terminal cached representation without selecting cookies.
+    fn serve_cached_response(
+        &self,
+        request: &Request,
+        url: &reqwest::Url,
+        cached: StoredResponse,
+    ) -> Result<Response, RequestError> {
+        let response = self.response_from_cached_hit(request, url, cached);
+        self.finalize_cached_http_response(request, url, response)
+    }
+
+    /// Applies terminal-response policy and exposes a cached representation.
+    fn finalize_cached_http_response(
+        &self,
+        request: &Request,
+        url: &reqwest::Url,
+        mut response: InternalResponse,
+    ) -> Result<Response, RequestError> {
         self.finalize_response(request, &mut response, ResponseFinalization::Standard)
             .inspect_err(|_| self.clear_preflight_cache_after_failure(request, url))?;
         self.observe(
@@ -360,10 +411,11 @@ impl RequestController {
         request: &mut Request,
         url: &reqwest::Url,
         mut response: InternalResponse,
+        request_headers: &crate::Headers,
         had_nonreplayable_body: bool,
     ) -> Result<HopResult, RequestError> {
         let status = response.status.as_u16();
-        if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+        if !is_redirect_status(response.status) {
             return Ok(HopResult::Complete(response));
         }
         let Some(location) = response.headers.get(http::header::LOCATION) else {
@@ -436,6 +488,7 @@ impl RequestController {
             );
             return Err(RequestError::RedirectFailure);
         }
+        self.cache_redirect_response(request, url, request_headers, &response);
         log::debug!(
             "following redirect {status}: {} -> {} (hop {})",
             crate::log_url::loggable(url.as_str()),
@@ -455,6 +508,38 @@ impl RequestController {
                 );
             })?;
         Ok(HopResult::Follow(next_url))
+    }
+
+    /// Stores an eligible followed redirect after response policy has approved it.
+    ///
+    /// Redirect bodies are never exposed while following, so retaining an
+    /// empty body preserves the reusable redirect metadata without buffering
+    /// discarded transport bytes.
+    fn cache_redirect_response(
+        &self,
+        request: &Request,
+        url: &reqwest::Url,
+        request_headers: &crate::Headers,
+        response: &InternalResponse,
+    ) {
+        if response.from_cache
+            || !request.is_cacheable_method()
+            || request.cache_mode() == CacheMode::NoStore
+        {
+            return;
+        }
+        self.inner.cache.insert_with_headers(
+            request,
+            url,
+            request_headers,
+            StoredResponse {
+                status: response.status,
+                headers: response.headers.clone(),
+                url: response.url_list.last().cloned().unwrap_or_default(),
+                body: bytes::Bytes::new(),
+                cookie_headers_processed: response.cookie_headers_processed,
+            },
+        );
     }
 
     /// Finalizes a terminal response and arranges cache storage when allowed.
@@ -642,4 +727,9 @@ impl RequestController {
         };
         Ok((headers, generated))
     }
+}
+
+/// Reports whether a response status triggers Fetch redirect processing.
+fn is_redirect_status(status: http::StatusCode) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
 }

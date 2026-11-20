@@ -1159,6 +1159,62 @@ fn only_if_cached_returns_a_cached_response_without_network_io() {
 }
 
 #[test]
+fn only_if_cached_follows_a_cached_redirect_without_network_io() {
+    let server = TestServer::start(2, |request| {
+        if request.starts_with("GET /start ") {
+            b"HTTP/1.1 302 Found\r\nLocation: /target\r\nCache-Control: max-age=60\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        } else if request.starts_with("GET /target ") {
+            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
+        } else {
+            panic!("unexpected request: {request}");
+        }
+    });
+    let controller = RequestController::builder(Config::default())
+        .with_browser_capabilities(Arc::new(SameOriginCacheServices))
+        .build()
+        .unwrap();
+    let start = format!("{}/start", server.url());
+    let target = format!("{}/target", server.url());
+
+    let response = runtime().block_on(async {
+        let mut request = Request::get(&start);
+        request.set_mode(RequestMode::SameOrigin).unwrap();
+        request
+            .set_environment(FetchEnvironment::from_url(url::Url::parse(&start).unwrap()).unwrap());
+        assert_eq!(
+            collect_body(
+                controller
+                    .fetch(request.try_clone().unwrap())
+                    .await
+                    .unwrap()
+            )
+            .await
+            .unwrap(),
+            b"cached"
+        );
+
+        let mut target_request = Request::get(&target);
+        target_request.set_mode(RequestMode::SameOrigin).unwrap();
+        target_request
+            .set_environment(FetchEnvironment::from_url(url::Url::parse(&start).unwrap()).unwrap());
+        let cached_target = wait_for_cached(&controller, &target_request).await;
+        assert!(cached_target.from_cache);
+        drop(cached_target);
+
+        request.set_cache_mode(CacheMode::OnlyIfCached);
+        controller.fetch(request).await.unwrap()
+    });
+
+    server.join();
+    assert!(response.from_cache);
+    assert!(response.redirected);
+    assert_eq!(
+        runtime().block_on(response.body.bytes()).unwrap(),
+        b"cached"
+    );
+}
+
+#[test]
 fn only_if_cached_requires_same_origin_mode_without_network_access() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()

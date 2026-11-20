@@ -660,8 +660,8 @@ fn malformed_expiry_and_negative_age_do_not_extend_freshness() {
 }
 
 #[test]
-/// Verifies only successful responses enter the cache.
-fn cache_does_not_store_non_success_responses() {
+/// Verifies default-cacheable error responses enter the cache.
+fn cache_stores_default_cacheable_error_responses() {
     let cache = ResponseCache::default();
     let request = Request::get("https://example.test/missing");
     let mut headers = HeaderMap::new();
@@ -677,7 +677,43 @@ fn cache_does_not_store_non_success_responses() {
     let url = Url::parse(request.url()).unwrap();
     cache.insert_with_headers(&request, &url, request.headers(), response);
 
+    assert_eq!(
+        fresh_response(&cache, &request, &url).unwrap().status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[test]
+/// Verifies temporary redirects need explicit cache metadata.
+fn cache_stores_temporary_redirects_only_with_explicit_metadata() {
+    let cache = ResponseCache::default();
+    let request = Request::get("https://example.test/redirect");
+    let url = Url::parse(request.url()).unwrap();
+
+    let no_metadata = StoredResponse {
+        status: StatusCode::FOUND,
+        headers: HeaderMap::new(),
+        url: request.url().to_owned(),
+        body: Bytes::new(),
+        cookie_headers_processed: false,
+    };
+    cache.insert_with_headers(&request, &url, request.headers(), no_metadata);
     assert!(fresh_response(&cache, &request, &url).is_none());
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+    let explicit_metadata = StoredResponse {
+        status: StatusCode::FOUND,
+        headers,
+        url: request.url().to_owned(),
+        body: Bytes::new(),
+        cookie_headers_processed: false,
+    };
+    cache.insert_with_headers(&request, &url, request.headers(), explicit_metadata);
+    assert_eq!(
+        fresh_response(&cache, &request, &url).unwrap().status,
+        StatusCode::FOUND
+    );
 }
 
 #[test]

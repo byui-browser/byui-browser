@@ -53,9 +53,11 @@ Remaining work:
   `no-store` when no browser HTTP cache is available.
 - Revisit the extra cache-key dimensions. They conservatively reduce reuse but
   do not model HTTP cache matching directly.
-- Support cacheable response statuses and cached redirects according to HTTP
-  caching rules; storage is currently limited to successful `GET`/`HEAD`
-  responses.
+- Extend the current status-admission subset and cached-redirect behavior to
+  the complete HTTP caching rules. The cache now admits default-cacheable
+  response statuses plus other responses with explicit cache metadata, and
+  follows stored redirects for cache hits (including `OnlyIfCached`), but the
+  status policy remains intentionally incomplete.
 
 Freshness uses explicit `Cache-Control`, `Date`, `Expires`, and `Age` metadata
 where available. If no explicit lifetime is present, a valid `Last-Modified`
