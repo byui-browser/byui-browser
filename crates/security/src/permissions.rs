@@ -50,20 +50,51 @@ impl PermissionPolicy {
     /// Unrecorded permissions are denied.
     #[must_use]
     pub fn check(&self, origin: &Origin, permission: PermissionKind) -> PermissionState {
-        self.decisions
-            .get(&(origin.clone(), permission))
-            .copied()
-            .unwrap_or(PermissionState::Denied)
+        let state = self.decisions.get(&(origin.clone(), permission)).copied();
+        match state {
+            Some(state) => {
+                log::trace!(
+                    "{permission:?} for {}: {state:?}",
+                    crate::origin_label(origin)
+                );
+                state
+            }
+            None => {
+                log::debug!(
+                    "{permission:?} denied for {}: no recorded decision",
+                    crate::origin_label(origin)
+                );
+                PermissionState::Denied
+            }
+        }
+    }
+
+    /// Returns the recorded decision for `origin` and `permission`.
+    ///
+    /// Unlike [`Self::check`], this distinguishes an unrecorded decision from
+    /// an explicit denial. Browser defaults can use the absence of a decision
+    /// without weakening fail-closed permission checks elsewhere.
+    #[must_use]
+    pub fn decision(&self, origin: &Origin, permission: PermissionKind) -> Option<PermissionState> {
+        self.decisions.get(&(origin.clone(), permission)).copied()
     }
 
     /// Grants `permission` to `origin` for the lifetime of this policy.
     pub fn grant(&mut self, origin: Origin, permission: PermissionKind) {
+        log::debug!(
+            "granting {permission:?} to {}",
+            crate::origin_label(&origin)
+        );
         self.decisions
             .insert((origin, permission), PermissionState::Granted);
     }
 
     /// Explicitly denies `permission` for `origin`.
     pub fn deny(&mut self, origin: Origin, permission: PermissionKind) {
+        log::debug!(
+            "denying {permission:?} for {}",
+            crate::origin_label(&origin)
+        );
         self.decisions
             .insert((origin, permission), PermissionState::Denied);
     }
@@ -73,6 +104,10 @@ impl PermissionPolicy {
     /// After revocation, [`Self::check`] returns [`PermissionState::Denied`]
     /// because denial is the default state.
     pub fn revoke(&mut self, origin: &Origin, permission: PermissionKind) {
+        log::debug!(
+            "revoking {permission:?} for {}",
+            crate::origin_label(origin)
+        );
         self.decisions.remove(&(origin.clone(), permission));
     }
 }
@@ -143,6 +178,21 @@ mod tests {
         assert_eq!(
             policy.check(&site, PermissionKind::Cookies),
             PermissionState::Denied
+        );
+    }
+
+    #[test]
+    fn decision_distinguishes_missing_from_explicit_denial() {
+        let site = origin("https", "example.com", 443);
+        let mut policy = PermissionPolicy::new();
+
+        assert_eq!(policy.decision(&site, PermissionKind::Storage), None);
+
+        policy.deny(site.clone(), PermissionKind::Storage);
+
+        assert_eq!(
+            policy.decision(&site, PermissionKind::Storage),
+            Some(PermissionState::Denied)
         );
     }
 }

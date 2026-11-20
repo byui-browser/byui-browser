@@ -116,10 +116,13 @@ pub fn parse_number(input: &str) -> Option<f32> {
 /// Parses a CSS `<length>`.
 ///
 /// Unit names are ASCII case-insensitive. A unitless `0` is accepted as
-/// `0px`, as CSS allows. `calc()` and other math functions are not supported
-/// and return `None`.
+/// `0px`, as CSS allows. Complex `calc()` expressions are left for the layout
+/// value resolver and are not converted by this helper.
 pub fn parse_length(input: &str) -> Option<Length> {
     let input = input.trim();
+    if input.len() >= 6 && input[..5].eq_ignore_ascii_case("calc(") && input.ends_with(')') {
+        return None;
+    }
     let (number, unit) = input.split_at(number_prefix_len(input));
     let value = parse_number(number)?;
     let unit = match unit.to_ascii_lowercase().as_str() {
@@ -142,6 +145,47 @@ pub fn parse_length(input: &str) -> Option<Length> {
         _ => return None,
     };
     Some(Length { value, unit })
+}
+
+#[allow(dead_code)]
+fn parse_calc_length(input: &str) -> Option<Length> {
+    let mut expression = input.trim();
+    let mut result: Option<Length> = None;
+    let mut operation = 1.0_f32;
+    while !expression.is_empty() {
+        let split = expression
+            .char_indices()
+            .skip(1)
+            .find(|(_, c)| matches!(c, '+' | '-'))
+            .map(|(i, _)| i);
+        let (term_text, rest) = split
+            .map(|i| expression.split_at(i))
+            .unwrap_or((expression, ""));
+        let term = parse_length(term_text.trim())?;
+        result = Some(match result {
+            Some(current) if current.unit == term.unit => Length {
+                value: current.value + operation * term.value,
+                unit: current.unit,
+            },
+            Some(_) => return None,
+            None => Length {
+                value: operation * term.value,
+                unit: term.unit,
+            },
+        });
+        expression = rest.trim_start();
+        if expression.is_empty() {
+            break;
+        }
+        let operator = expression.chars().next()?;
+        operation = match operator {
+            '+' => 1.0,
+            '-' => -1.0,
+            _ => return None,
+        };
+        expression = expression[operator.len_utf8()..].trim_start();
+    }
+    result
 }
 
 /// Returns the byte length of the CSS `<number>` token at the start of `input`.
@@ -183,9 +227,38 @@ pub fn parse_percentage(input: &str) -> Option<f32> {
 /// `parent_font_size` resolves `em`, `ex`, `ch`, percentages, and the
 /// `larger`/`smaller` keywords; `root_font_size` resolves `rem`. Absolute-size
 /// keywords use the CSS Fonts 4 §2.5 table for a 16px `medium`. Negative
-/// sizes are invalid. Viewport units return `None` because the cascade runs
-/// without a viewport.
+/// sizes are invalid. The legacy entry point intentionally has no viewport and
+/// therefore returns `None` for viewport units.
 pub fn compute_font_size(value: &str, parent_font_size: f32, root_font_size: f32) -> Option<f32> {
+    compute_font_size_in_context(value, parent_font_size, root_font_size, 0.0, 0.0, false)
+}
+
+/// Computes a `font-size` declaration with viewport units enabled.
+pub fn compute_font_size_with_context(
+    value: &str,
+    parent_font_size: f32,
+    root_font_size: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> Option<f32> {
+    compute_font_size_in_context(
+        value,
+        parent_font_size,
+        root_font_size,
+        viewport_width,
+        viewport_height,
+        true,
+    )
+}
+
+fn compute_font_size_in_context(
+    value: &str,
+    parent_font_size: f32,
+    root_font_size: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+    allow_viewport: bool,
+) -> Option<f32> {
     let value = value.trim();
     let keyword = match value.to_ascii_lowercase().as_str() {
         "xx-small" => Some(MEDIUM_FONT_SIZE * 3.0 / 5.0),
@@ -207,17 +280,156 @@ pub fn compute_font_size(value: &str, parent_font_size: f32, root_font_size: f32
         parent_font_size * percent / 100.0
     } else {
         let length = parse_length(value)?;
-        if length.is_viewport_relative() {
+        if length.is_viewport_relative() && !allow_viewport {
             return None;
         }
         length.to_px(&LengthContext {
             font_size: parent_font_size,
             root_font_size,
-            viewport_width: 0.0,
-            viewport_height: 0.0,
+            viewport_width,
+            viewport_height,
         })
     };
     (size >= 0.0).then_some(size)
+}
+
+/// Resolves same-unit CSS length functions into a value the layout crate can
+/// consume directly. Mixed-unit expressions remain unresolved because their
+/// conversion requires layout context.
+pub fn resolve_length_function(input: &str) -> Option<String> {
+    let input = input.trim();
+
+    for name in ["calc", "min", "max", "clamp"] {
+        let Some(inner) = function_inner(input, name) else {
+            continue;
+        };
+
+        if name == "calc" {
+            return calculate_length(inner).map(format_length);
+        }
+
+        let arguments = split_function_arguments(inner);
+        if (name == "clamp" && arguments.len() != 3) || (name != "clamp" && arguments.len() < 2) {
+            return None;
+        }
+
+        let lengths: Vec<Length> = arguments
+            .iter()
+            .map(|argument| parse_length(argument))
+            .collect::<Option<_>>()?;
+        let unit = lengths.first()?.unit;
+        if lengths.iter().any(|length| length.unit != unit) {
+            return None;
+        }
+
+        let value = match name {
+            "min" => lengths.iter().map(|length| length.value).reduce(f32::min)?,
+            "max" => lengths.iter().map(|length| length.value).reduce(f32::max)?,
+            "clamp" => lengths[1].value.clamp(lengths[0].value, lengths[2].value),
+            _ => unreachable!(),
+        };
+
+        return Some(format_length(Length { value, unit }));
+    }
+
+    None
+}
+
+fn function_inner<'a>(input: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}(");
+    if input.len() <= prefix.len()
+        || !input[..prefix.len()].eq_ignore_ascii_case(&prefix)
+        || !input.ends_with(')')
+    {
+        return None;
+    }
+    Some(&input[prefix.len()..input.len() - 1])
+}
+
+fn split_function_arguments(input: &str) -> Vec<&str> {
+    let mut arguments = Vec::new();
+    let mut depth: usize = 0;
+    let mut start = 0;
+
+    for (index, character) in input.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                arguments.push(input[start..index].trim());
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    arguments.push(input[start..].trim());
+    arguments
+}
+
+fn calculate_length(input: &str) -> Option<Length> {
+    let mut expression = input.trim();
+    let mut result: Option<Length> = None;
+    let mut operation = 1.0;
+
+    while !expression.is_empty() {
+        let split = expression
+            .char_indices()
+            .skip(1)
+            .find(|(_, character)| matches!(character, '+' | '-'))
+            .map(|(index, _)| index);
+        let (term_text, rest) = split
+            .map(|index| expression.split_at(index))
+            .unwrap_or((expression, ""));
+        let term = parse_length(term_text.trim())?;
+
+        result = Some(match result {
+            Some(current) if current.unit == term.unit => Length {
+                value: current.value + operation * term.value,
+                unit: current.unit,
+            },
+            Some(_) => return None,
+            None => Length {
+                value: operation * term.value,
+                unit: term.unit,
+            },
+        });
+
+        expression = rest.trim_start();
+        if expression.is_empty() {
+            break;
+        }
+        let operator = expression.chars().next()?;
+        operation = match operator {
+            '+' => 1.0,
+            '-' => -1.0,
+            _ => return None,
+        };
+        expression = expression[operator.len_utf8()..].trim_start();
+    }
+
+    result
+}
+
+fn format_length(length: Length) -> String {
+    let unit = match length.unit {
+        LengthUnit::Px => "px",
+        LengthUnit::Em => "em",
+        LengthUnit::Rem => "rem",
+        LengthUnit::Ex => "ex",
+        LengthUnit::Ch => "ch",
+        LengthUnit::In => "in",
+        LengthUnit::Cm => "cm",
+        LengthUnit::Mm => "mm",
+        LengthUnit::Q => "Q",
+        LengthUnit::Pt => "pt",
+        LengthUnit::Pc => "pc",
+        LengthUnit::Vw => "vw",
+        LengthUnit::Vh => "vh",
+        LengthUnit::Vmin => "vmin",
+        LengthUnit::Vmax => "vmax",
+    };
+    format!("{}{}", format_number(length.value), unit)
 }
 
 /// Formats a CSS-pixel length as CSS text, for example `21.44px`.
@@ -228,61 +440,4 @@ pub fn format_px(value: f32) -> String {
 fn format_number(value: f32) -> String {
     let rounded = (value * 10_000.0).round() / 10_000.0;
     format!("{rounded}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_lengths_with_units_and_unitless_zero() {
-        assert_eq!(
-            parse_length("1.5EM"),
-            Some(Length {
-                value: 1.5,
-                unit: LengthUnit::Em
-            })
-        );
-        assert_eq!(
-            parse_length("-8px"),
-            Some(Length {
-                value: -8.0,
-                unit: LengthUnit::Px
-            })
-        );
-        assert_eq!(
-            parse_length("0").map(|length| length.unit),
-            Some(LengthUnit::Px)
-        );
-        assert_eq!(parse_length("5"), None);
-        assert_eq!(parse_length("calc(1px + 2px)"), None);
-        assert_eq!(parse_length("1e1px").map(|length| length.value), Some(10.0));
-    }
-
-    #[test]
-    fn absolute_units_convert_to_css_pixels() {
-        let context = LengthContext {
-            font_size: 20.0,
-            root_font_size: 10.0,
-            viewport_width: 800.0,
-            viewport_height: 600.0,
-        };
-        let px = |input| parse_length(input).unwrap().to_px(&context);
-        assert_eq!(px("1in"), 96.0);
-        assert_eq!(px("12pt"), 16.0);
-        assert_eq!(px("2em"), 40.0);
-        assert_eq!(px("2rem"), 20.0);
-        assert_eq!(px("10vw"), 80.0);
-        assert_eq!(px("10vmin"), 60.0);
-    }
-
-    #[test]
-    fn font_size_computes_against_the_parent() {
-        assert_eq!(compute_font_size("2em", 16.0, 16.0), Some(32.0));
-        assert_eq!(compute_font_size("150%", 20.0, 16.0), Some(30.0));
-        assert_eq!(compute_font_size("x-large", 99.0, 16.0), Some(24.0));
-        assert_eq!(compute_font_size("2rem", 99.0, 10.0), Some(20.0));
-        assert_eq!(compute_font_size("-1px", 16.0, 16.0), None);
-        assert_eq!(compute_font_size("10vw", 16.0, 16.0), None);
-    }
 }

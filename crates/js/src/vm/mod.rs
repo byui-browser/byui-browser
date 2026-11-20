@@ -5,23 +5,47 @@
 //! of the caller is saved while a callee runs. Top-level bindings live in the
 //! outermost frame's first scope and are reachable from every frame.
 
-use crate::ast::{BinaryOperator, UnaryOperator};
-use crate::bytecode::{CallableKind, Chunk, FunctionTemplate, Instruction};
-use crate::runtime::{ExecutionLimits, non_object, to_property_key};
+use crate::bytecode::{CallableKind, Chunk, FunctionTemplate, Instruction, IterationKind};
+use crate::runtime::{
+    BytecodeCapture, ExecutionLimits, array_len, binary, builtins, copy_data_properties,
+    delete_property, get_array_property, is_nullish, is_truthy, non_object,
+    primitives_get_number_property, primitives_get_string_property, set_array_property,
+    spread_values, to_property_key, unary,
+};
 use crate::{Function, JsError, JsErrorCategory, JsResult, Object, Value};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Executes a [`Chunk`] using an owned operand stack.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Vm {
     stack: Vec<Value>,
     /// The running frame.
     frame: Frame,
     /// Suspended frames of the active callers, outermost first.
     callers: Vec<Frame>,
+    /// Active exception handlers, innermost last. Each was registered by an
+    /// `EnterTry` of the frame at `frame_depth` and has not been left yet.
+    handlers: Vec<Handler>,
     steps_remaining: u64,
     loop_iterations_remaining: u64,
     call_depth_limit: usize,
+    globals: Option<crate::runtime::GlobalState>,
+    persistent_globals: bool,
+}
+
+/// An active exception handler registered by [`Instruction::EnterTry`].
+#[derive(Debug, Clone, Copy)]
+struct Handler {
+    /// Instruction offset, in the registering frame's chunk, that receives
+    /// the thrown value.
+    target: usize,
+    /// Number of suspended callers when the handler was registered, which
+    /// identifies the registering frame.
+    frame_depth: usize,
+    /// Operand stack height to restore before delivering the exception.
+    stack_height: usize,
+    /// Lexical scope depth of the registering frame to restore.
+    scope_depth: usize,
 }
 
 /// Execution state of one chunk: the program or a single call.
@@ -31,6 +55,8 @@ struct Frame {
     /// Instruction to resume at; only meaningful while the frame is suspended.
     resume: usize,
     scopes: Vec<Vec<Slot>>,
+    captures: Vec<BytecodeCapture>,
+    iterators: Vec<IteratorState>,
     /// Height of the operand stack when the frame started.
     stack_base: usize,
     /// The receiver, or `None` in a derived constructor before `super(...)`.
@@ -40,7 +66,16 @@ struct Frame {
     callee: Option<Function>,
     /// The constructor `new` was applied to, for constructor frames.
     new_target: Option<Function>,
+    /// Normal script functions called as methods intentionally expose no
+    /// receiver in the tree-walk compatibility semantics.
+    method_without_receiver: bool,
     mode: ReturnMode,
+}
+
+#[derive(Debug, Clone)]
+enum IteratorState {
+    Values { values: Vec<Value>, index: usize },
+    Keys { keys: Vec<String>, index: usize },
 }
 
 /// What the caller does with the value a finished frame produces.
@@ -57,7 +92,7 @@ enum ReturnMode {
 
 #[derive(Debug, Clone)]
 struct Slot {
-    value: Option<Value>,
+    value: Arc<Mutex<Option<Value>>>,
     kind: Option<crate::ast::VarKind>,
 }
 
@@ -76,6 +111,101 @@ impl Vm {
         Self::default()
     }
 
+    /// Constructs an instance by running a bytecode function with `new`.
+    ///
+    /// The function's captured realm globals are not available to this
+    /// standalone construction path; constructors that read globals may
+    /// therefore fail. This is intended for host APIs that need to invoke a
+    /// constructor without an active script VM.
+    pub fn construct_function(function: Function, arguments: &[Value]) -> JsResult<Value> {
+        let argument_count = u16::try_from(arguments.len())
+            .map_err(|_| JsError::runtime("too many constructor arguments"))?;
+        let mut constants = Vec::with_capacity(arguments.len() + 1);
+        constants.push(Value::Function(function));
+        constants.extend_from_slice(arguments);
+        let mut code = Vec::with_capacity(arguments.len() + 3);
+        code.push(Instruction::Constant(0));
+        for index in 0..arguments.len() {
+            let index = u16::try_from(index + 1)
+                .map_err(|_| JsError::runtime("too many constructor arguments"))?;
+            code.push(Instruction::Constant(index));
+        }
+        code.push(Instruction::New(argument_count));
+        code.push(Instruction::Return);
+        let chunk = Chunk {
+            locations: vec![None; code.len()],
+            code,
+            constants,
+            names: Vec::new(),
+            functions: Vec::new(),
+        };
+        Self::new().execute(&chunk)
+    }
+
+    /// Calls `function` with an explicit receiver and arguments.
+    ///
+    /// Bytecode functions execute in a fresh VM without their original global
+    /// environment. This host entry point supports callbacks that only depend
+    /// on their receiver and arguments.
+    pub fn call_function(
+        function: Function,
+        receiver: Value,
+        arguments: &[Value],
+    ) -> JsResult<Value> {
+        Self::call_function_in(function, receiver, arguments, None)
+    }
+
+    /// Calls a bytecode function while retaining the supplied realm globals.
+    pub(crate) fn call_function_with_globals(
+        function: Function,
+        receiver: Value,
+        arguments: &[Value],
+        globals: crate::runtime::GlobalState,
+    ) -> JsResult<Value> {
+        Self::call_function_in(function, receiver, arguments, Some(globals))
+    }
+
+    fn call_function_in(
+        function: Function,
+        receiver: Value,
+        arguments: &[Value],
+        globals: Option<crate::runtime::GlobalState>,
+    ) -> JsResult<Value> {
+        let argument_count = u16::try_from(arguments.len())
+            .map_err(|_| JsError::runtime("too many function arguments"))?;
+        let mut constants = Vec::with_capacity(arguments.len() + 2);
+        constants.push(receiver);
+        constants.push(Value::Function(function));
+        constants.extend_from_slice(arguments);
+        let mut code = Vec::with_capacity(arguments.len() + 4);
+        code.push(Instruction::Constant(0));
+        code.push(Instruction::Constant(1));
+        for index in 0..arguments.len() {
+            let index = u16::try_from(index + 2)
+                .map_err(|_| JsError::runtime("too many function arguments"))?;
+            code.push(Instruction::Constant(index));
+        }
+        code.push(Instruction::CallMethod(argument_count));
+        code.push(Instruction::Return);
+        let chunk = Chunk {
+            locations: vec![None; code.len()],
+            code,
+            constants,
+            names: Vec::new(),
+            functions: Vec::new(),
+        };
+        let mut vm = Self::new();
+        match globals {
+            Some(globals) => vm.execute_with_globals_and_this(
+                &chunk,
+                ExecutionLimits::default(),
+                globals,
+                Value::Undefined,
+            ),
+            None => vm.execute(&chunk),
+        }
+    }
+
     /// Executes `chunk` and returns its completion value.
     pub fn execute(&mut self, chunk: &Chunk) -> JsResult<Value> {
         self.execute_with_limits(chunk, ExecutionLimits::default())
@@ -92,29 +222,112 @@ impl Vm {
         chunk: &Chunk,
         limits: ExecutionLimits,
     ) -> JsResult<Value> {
+        self.execute_with_limits_and_globals(chunk, limits, None, Value::Undefined)
+    }
+
+    /// Executes `chunk` with persistent globals and a top-level receiver.
+    pub(crate) fn execute_with_globals_and_this(
+        &mut self,
+        chunk: &Chunk,
+        limits: ExecutionLimits,
+        globals: crate::runtime::GlobalState,
+        this_value: Value,
+    ) -> JsResult<Value> {
+        self.execute_with_limits_and_globals(chunk, limits, Some(globals), this_value)
+    }
+
+    fn execute_with_limits_and_globals(
+        &mut self,
+        chunk: &Chunk,
+        limits: ExecutionLimits,
+        globals: Option<crate::runtime::GlobalState>,
+        this_value: Value,
+    ) -> JsResult<Value> {
+        log::debug!(
+            "executing chunk ({} instructions, {} functions)",
+            chunk.code.len(),
+            chunk.functions.len()
+        );
         self.stack.clear();
         self.callers.clear();
+        self.handlers.clear();
         self.frame = Frame {
             chunk: Arc::new(chunk.clone()),
-            this: Some(Value::Undefined),
+            this: Some(this_value),
             ..Frame::default()
         };
         self.steps_remaining = limits.step_limit;
         self.loop_iterations_remaining = limits.loop_iteration_limit;
         self.call_depth_limit = usize::try_from(limits.call_depth_limit).unwrap_or(usize::MAX);
+        self.globals = globals;
+        self.persistent_globals = self.globals.is_some();
         let result = self.run();
+        match &result {
+            Ok(_) => log::debug!("chunk finished with {} steps left", self.steps_remaining),
+            Err(error) => log::debug!("chunk failed ({:?}): {}", error.category, error.message),
+        }
         // Drop references to script values held by an abandoned run.
         self.stack.clear();
         self.callers.clear();
+        self.handlers.clear();
         self.frame = Frame::default();
+        self.globals = None;
+        self.persistent_globals = false;
         result
     }
 
+    /// Runs until the program returns or an error nothing handles.
+    ///
+    /// Exceptions are resolved here, entirely inside the VM: an error raised
+    /// by an instruction, a callee, or a host function is delivered to the
+    /// innermost active handler, and execution resumes at its target.
     fn run(&mut self) -> JsResult<Value> {
+        let mut start = 0;
+        loop {
+            match self.run_from(start) {
+                Ok(value) => return Ok(value),
+                Err(error) => start = self.unwind(error)?,
+            }
+        }
+    }
+
+    /// Delivers `error` to the innermost handler and returns the offset to
+    /// resume at in the (possibly different) running frame.
+    ///
+    /// Callee frames above the handler's frame are discarded without
+    /// finishing, and the operand stack and scope depth return to what the
+    /// handler recorded. Errors that scripts cannot catch, or any error with
+    /// no handler, are returned unchanged as the script's failure.
+    fn unwind(&mut self, error: JsError) -> JsResult<usize> {
+        if !error.category.is_catchable() {
+            return Err(error);
+        }
+        let Some(handler) = self.handlers.pop() else {
+            return Err(error);
+        };
+        log::debug!(
+            "unwinding {} frame(s) to a handler: {}",
+            self.callers.len().saturating_sub(handler.frame_depth),
+            error.message
+        );
+        while self.callers.len() > handler.frame_depth {
+            self.frame = self
+                .callers
+                .pop()
+                .ok_or_else(|| JsError::runtime("bytecode call stack underflow"))?;
+        }
+        self.stack.truncate(handler.stack_height);
+        self.frame.scopes.truncate(handler.scope_depth);
+        self.push(error.into_caught_value());
+        Ok(handler.target)
+    }
+
+    fn run_from(&mut self, start: usize) -> JsResult<Value> {
         let mut chunk = Arc::clone(&self.frame.chunk);
-        let mut instruction_pointer = 0;
+        let mut instruction_pointer = start;
         while let Some(instruction) = chunk.code.get(instruction_pointer).copied() {
             if self.steps_remaining == 0 {
+                log::warn!("instruction step limit reached in the bytecode VM");
                 return Err(JsError::with_context(
                     crate::JsErrorCategory::Limit,
                     "Script exceeded the evaluation step limit",
@@ -159,6 +372,29 @@ impl Vm {
                     }
                     instruction_pointer = target;
                 }
+                Instruction::Throw => {
+                    let value = self.pop()?;
+                    return Err(JsError::rethrown(value));
+                }
+                Instruction::EnterTry(target) => {
+                    validate_jump(target, &chunk, instruction_pointer - 1)?;
+                    self.handlers.push(Handler {
+                        target,
+                        frame_depth: self.callers.len(),
+                        stack_height: self.stack.len(),
+                        scope_depth: self.frame.scopes.len(),
+                    });
+                }
+                Instruction::ExitTry => match self.handlers.pop() {
+                    Some(handler) if handler.frame_depth == self.callers.len() => {}
+                    _ => {
+                        return Err(bytecode_error(
+                            &chunk,
+                            instruction_pointer - 1,
+                            "bytecode exited an exception handler it does not own",
+                        ));
+                    }
+                },
                 Instruction::Return => {
                     if self.callers.is_empty() {
                         return Ok(self.stack.pop().unwrap_or(Value::Undefined));
@@ -168,12 +404,173 @@ impl Vm {
                 }
                 Instruction::Unary(operator) => {
                     let value = self.pop()?;
-                    self.push(unary(operator, value)?);
+                    self.push(unary(operator, &value));
                 }
                 Instruction::Binary(operator) => {
                     let right = self.pop()?;
                     let left = self.pop()?;
-                    self.push(binary(operator, left, right)?);
+                    self.push(binary(operator, &left, &right)?);
+                }
+                Instruction::Dup2 => {
+                    let length = self.stack.len();
+                    if length < 2 {
+                        return Err(stack_underflow());
+                    }
+                    let (first, second) = (
+                        self.stack[length - 2].clone(),
+                        self.stack[length - 1].clone(),
+                    );
+                    self.push(first);
+                    self.push(second);
+                }
+                Instruction::MoveTop(passed) => {
+                    let value = self.pop()?;
+                    let at = self
+                        .stack
+                        .len()
+                        .checked_sub(usize::from(passed))
+                        .ok_or_else(stack_underflow)?;
+                    self.stack.insert(at, value);
+                }
+                Instruction::JumpIfNullish(target) => {
+                    validate_jump(target, &chunk, instruction_pointer - 1)?;
+                    if is_nullish(self.stack.last().ok_or_else(stack_underflow)?) {
+                        instruction_pointer = target;
+                    }
+                }
+                Instruction::DeleteProperty(index) => {
+                    let key = property_name(&chunk, index)?;
+                    let target = self.pop()?;
+                    self.push(Value::Boolean(delete_property(&target, &key)?));
+                }
+                Instruction::DeleteComputedProperty => {
+                    let key = to_property_key(&self.pop()?);
+                    let target = self.pop()?;
+                    self.push(Value::Boolean(delete_property(&target, &key)?));
+                }
+                Instruction::ArrayPush => {
+                    let value = self.pop()?;
+                    append_to_array(self.peek()?, value)?;
+                }
+                Instruction::ArrayExtend => {
+                    let source = self.pop()?;
+                    let values = spread_values(&source)?;
+                    let array = self.peek()?.clone();
+                    for value in values {
+                        append_to_array(&array, value)?;
+                    }
+                }
+                Instruction::IteratorStart(kind) => {
+                    let value = self.pop()?;
+                    let iterator = match kind {
+                        IterationKind::Of => match value {
+                            Value::Array(array) => IteratorState::Values {
+                                values: (0..array_len(&array))
+                                    .map(|i| get_array_property(&array, &i.to_string()))
+                                    .collect(),
+                                index: 0,
+                            },
+                            Value::String(text) => IteratorState::Values {
+                                values: text
+                                    .chars()
+                                    .map(|c| Value::String(c.to_string()))
+                                    .collect(),
+                                index: 0,
+                            },
+                            other => {
+                                return Err(JsError::runtime(format!("`{other}` is not iterable")));
+                            }
+                        },
+                        IterationKind::In => match value {
+                            value @ (Value::Object(_) | Value::Array(_)) => {
+                                let is_array = matches!(value, Value::Array(_));
+                                let object = match value {
+                                    Value::Object(object) | Value::Array(object) => object,
+                                    _ => unreachable!(),
+                                };
+                                IteratorState::Keys {
+                                    keys: object
+                                        .keys()
+                                        .into_iter()
+                                        .filter(|key| !(is_array && key == "length"))
+                                        .collect(),
+                                    index: 0,
+                                }
+                            }
+                            other => {
+                                return Err(JsError::runtime(format!(
+                                    "Cannot enumerate `{other}`"
+                                )));
+                            }
+                        },
+                    };
+                    self.frame.iterators.push(iterator);
+                }
+                Instruction::IteratorNext(target) => {
+                    let next = match self.frame.iterators.last_mut() {
+                        Some(IteratorState::Values { values, index }) if *index < values.len() => {
+                            let value = values[*index].clone();
+                            *index += 1;
+                            Some(value)
+                        }
+                        Some(IteratorState::Keys { keys, index }) if *index < keys.len() => {
+                            let value = Value::String(keys[*index].clone());
+                            *index += 1;
+                            Some(value)
+                        }
+                        Some(_) => {
+                            self.frame.iterators.pop();
+                            None
+                        }
+                        None => return Err(JsError::runtime("bytecode iterator stack underflow")),
+                    };
+                    if let Some(value) = next {
+                        self.push(value);
+                    } else {
+                        validate_jump(target, &chunk, instruction_pointer - 1)?;
+                        instruction_pointer = target;
+                    }
+                }
+                Instruction::IteratorEnd => {
+                    self.frame
+                        .iterators
+                        .pop()
+                        .ok_or_else(|| JsError::runtime("bytecode iterator stack underflow"))?;
+                }
+                Instruction::SpreadProperties => {
+                    let source = self.pop()?;
+                    let Value::Object(target) = self.peek()? else {
+                        return Err(JsError::runtime(
+                            "bytecode object spread target is not an object",
+                        ));
+                    };
+                    copy_data_properties(target, &source)?;
+                }
+                Instruction::CallSpread => {
+                    let arguments = self.pop_spread_arguments()?;
+                    let callee = self.pop()?;
+                    switched =
+                        self.call(callee, Value::Undefined, arguments, instruction_pointer)?;
+                }
+                Instruction::CallMethodSpread => {
+                    let arguments = self.pop_spread_arguments()?;
+                    let callee = self.pop()?;
+                    let receiver = self.pop()?;
+                    switched = self.call(callee, receiver, arguments, instruction_pointer)?;
+                }
+                Instruction::NewSpread => {
+                    let arguments = self.pop_spread_arguments()?;
+                    let constructor = self.pop()?;
+                    let Value::Function(function) = constructor else {
+                        return Err(not_a_constructor(&constructor));
+                    };
+                    switched = self.construct(
+                        function.clone(),
+                        function,
+                        arguments,
+                        ReturnMode::Construct,
+                        instruction_pointer,
+                    )?;
                 }
                 Instruction::JumpIfFalse(target) => {
                     validate_jump(target, &chunk, instruction_pointer - 1)?;
@@ -212,12 +609,23 @@ impl Vm {
                     self.push(value);
                 }
                 Instruction::LoadThis => {
-                    let this = self.frame.this.clone().ok_or_else(|| {
-                        JsError::new(
+                    if let Some(this) = self.frame.this.clone() {
+                        self.push(this);
+                    } else if self.frame.method_without_receiver {
+                        return Err(JsError::new("`this` is not defined"));
+                    } else if self
+                        .frame
+                        .callee
+                        .as_ref()
+                        .and_then(Function::template)
+                        .is_some_and(|template| template.kind == CallableKind::DerivedConstructor)
+                    {
+                        return Err(JsError::new(
                             "Must call super constructor in derived class before accessing `this`",
-                        )
-                    })?;
-                    self.push(this);
+                        ));
+                    } else {
+                        self.push(Value::Undefined);
+                    }
                 }
                 Instruction::LoadArgument(index) => {
                     let argument = self
@@ -228,9 +636,71 @@ impl Vm {
                         .unwrap_or(Value::Undefined);
                     self.push(argument);
                 }
+                Instruction::LoadCapture { index, name } => {
+                    let name = self.binding_name(name, &chunk)?.to_owned();
+                    let capture = self
+                        .frame
+                        .captures
+                        .get(usize::from(index))
+                        .ok_or_else(|| JsError::runtime("bytecode capture is invalid"))?;
+                    let value = capture.value.lock().unwrap().clone().ok_or_else(|| {
+                        JsError::new(format!("Cannot access `{name}` before initialization"))
+                    })?;
+                    self.push(value);
+                }
+                Instruction::StoreCapture { index, name } => {
+                    let name = self.binding_name(name, &chunk)?.to_owned();
+                    let value = self.peek()?.clone();
+                    let capture = self
+                        .frame
+                        .captures
+                        .get(usize::from(index))
+                        .ok_or_else(|| JsError::runtime("bytecode capture is invalid"))?;
+                    if capture.value.lock().unwrap().is_none() {
+                        return Err(JsError::new(format!(
+                            "Cannot access `{name}` before initialization"
+                        )));
+                    }
+                    if capture.kind == Some(crate::ast::VarKind::Const) {
+                        return Err(JsError::new(format!("Assignment to constant `{name}`")));
+                    }
+                    *capture.value.lock().unwrap() = Some(value);
+                }
                 Instruction::MakeFunction(index) => {
                     let template = function_template(&chunk, index)?;
-                    let function = Function::from_template(template, None, None, None);
+                    let mut captures = Vec::with_capacity(template.captures.len());
+                    for source in &template.captures {
+                        let capture = match source {
+                            crate::bytecode::CaptureSource::Local { depth, slot } => {
+                                let scope =
+                                    scope_index(self.frame.scopes.len(), Target::Local(*depth))?;
+                                let slot = self.frame.scopes[scope]
+                                    .get(usize::from(*slot))
+                                    .ok_or_else(|| JsError::runtime(format!("bytecode capture slot is invalid (depth {depth}, slot {slot}, scopes {})", self.frame.scopes.len())))?;
+                                BytecodeCapture {
+                                    value: Arc::clone(&slot.value),
+                                    kind: slot.kind,
+                                }
+                            }
+                            crate::bytecode::CaptureSource::Capture { index } => self
+                                .frame
+                                .captures
+                                .get(usize::from(*index))
+                                .cloned()
+                                .ok_or_else(|| JsError::runtime("bytecode capture is invalid"))?,
+                        };
+                        captures.push(capture);
+                    }
+                    let lexical_this = (template.kind == CallableKind::Arrow)
+                        .then(|| self.frame.this.clone().unwrap_or(Value::Undefined));
+                    let function = Function::from_template_with_captures(
+                        template,
+                        None,
+                        None,
+                        None,
+                        captures,
+                        lexical_this,
+                    );
                     self.push(Value::Function(function));
                 }
                 Instruction::Call(count) => {
@@ -245,12 +715,33 @@ impl Vm {
                     let receiver = self.pop()?;
                     switched = self.call(callee, receiver, arguments, instruction_pointer)?;
                 }
+                Instruction::CallMethodNamed { count, name } => {
+                    let arguments = self.pop_arguments(count)?;
+                    let callee = self.pop()?;
+                    let receiver = self.pop()?;
+                    if !matches!(callee, Value::Function(_)) {
+                        let name = match chunk.constants.get(usize::from(name)) {
+                            Some(Value::String(name)) => name,
+                            _ => return Err(JsError::runtime("bytecode property name is invalid")),
+                        };
+                        return Err(JsError::with_context(
+                            JsErrorCategory::Runtime,
+                            format!("`object.{name}` is not a function"),
+                            "function call",
+                        ));
+                    }
+                    switched = self.call(callee, receiver, arguments, instruction_pointer)?;
+                }
                 Instruction::New(count) => {
                     let arguments = self.pop_arguments(count)?;
                     let constructor = self.pop()?;
                     let Value::Function(function) = constructor else {
                         return Err(not_a_constructor(&constructor));
                     };
+                    if function.template().is_none() {
+                        self.push(function.construct(&arguments)?);
+                        continue;
+                    }
                     switched = self.construct(
                         function.clone(),
                         function,
@@ -347,13 +838,14 @@ impl Vm {
                     store_property(self.peek()?, key, &value)?;
                 }
                 Instruction::EnterScope(slot_count) => {
-                    self.frame.scopes.push(vec![
-                        Slot {
-                            value: None,
-                            kind: None
-                        };
-                        usize::from(slot_count)
-                    ]);
+                    self.frame.scopes.push(
+                        (0..usize::from(slot_count))
+                            .map(|_| Slot {
+                                value: Arc::new(Mutex::new(None)),
+                                kind: None,
+                            })
+                            .collect(),
+                    );
                 }
                 Instruction::ExitScope => {
                     self.frame
@@ -362,13 +854,23 @@ impl Vm {
                         .ok_or_else(|| JsError::runtime("bytecode scope underflow"))?;
                 }
                 Instruction::DeclareGlobal { slot, kind, name } => {
-                    self.declare(Target::Global, slot, kind, name, &chunk)?;
+                    if let Some(globals) = &self.globals {
+                        let name = self.binding_name(name, &chunk)?;
+                        globals.bytecode_declare(name, kind)?;
+                    } else {
+                        self.declare(Target::Global, slot, kind, name, &chunk)?;
+                    }
                 }
                 Instruction::DeclareLocal { slot, kind, name } => {
                     self.declare(Target::Local(0), slot, kind, name, &chunk)?;
                 }
                 Instruction::LoadGlobal { slot, name } => {
-                    let value = self.load(Target::Global, slot, name, &chunk)?;
+                    let value = if let Some(globals) = &self.globals {
+                        let name = self.binding_name(name, &chunk)?;
+                        globals.bytecode_load(name)?
+                    } else {
+                        self.load(Target::Global, slot, name, &chunk)?
+                    };
                     self.push(value);
                 }
                 Instruction::LoadLocal { depth, slot, name } => {
@@ -377,7 +879,12 @@ impl Vm {
                 }
                 Instruction::InitializeGlobal { slot, name } => {
                     let value = self.pop()?;
-                    self.initialize(Target::Global, slot, value, name, &chunk)?;
+                    if let Some(globals) = &self.globals {
+                        let name = self.binding_name(name, &chunk)?;
+                        globals.bytecode_initialize(name, value)?;
+                    } else {
+                        self.initialize(Target::Global, slot, value, name, &chunk)?;
+                    }
                 }
                 Instruction::InitializeLocal { depth, slot, name } => {
                     let value = self.pop()?;
@@ -385,7 +892,12 @@ impl Vm {
                 }
                 Instruction::StoreGlobal { slot, name } => {
                     let value = self.peek()?.clone();
-                    self.store(Target::Global, slot, value, name, &chunk)?;
+                    if let Some(globals) = &self.globals {
+                        let name = self.binding_name(name, &chunk)?;
+                        globals.bytecode_store(name, value)?;
+                    } else {
+                        self.store(Target::Global, slot, value, name, &chunk)?;
+                    }
                 }
                 Instruction::StoreLocal { depth, slot, name } => {
                     let value = self.peek()?.clone();
@@ -393,10 +905,25 @@ impl Vm {
                 }
                 Instruction::LoadUnresolved { name } => {
                     let name = self.binding_name(name, &chunk)?;
+                    if let Some(globals) = &self.globals
+                        && globals.bytecode_has(name)
+                    {
+                        self.push(globals.bytecode_load(name)?);
+                        continue;
+                    }
+                    if let Some(value) = builtins::value(name) {
+                        self.push(value);
+                        continue;
+                    }
                     return Err(JsError::new(format!("`{name}` is not defined")));
                 }
                 Instruction::StoreUnresolved { name } => {
                     let name = self.binding_name(name, &chunk)?;
+                    if let Some(globals) = &self.globals {
+                        let value = self.peek()?.clone();
+                        globals.bytecode_store(name, value)?;
+                        continue;
+                    }
                     return Err(JsError::new(format!("`{name}` is not defined")));
                 }
             }
@@ -406,6 +933,7 @@ impl Vm {
                 instruction_pointer = self.frame.resume;
             }
         }
+        log::error!("bytecode ended without a return instruction");
         Err(JsError::runtime(
             "bytecode ended without a return instruction",
         ))
@@ -424,6 +952,17 @@ impl Vm {
             .checked_sub(count)
             .ok_or_else(stack_underflow)?;
         Ok(self.stack.split_off(start))
+    }
+
+    /// Pops the array that holds the arguments of a spread call, returning
+    /// them in call order.
+    fn pop_spread_arguments(&mut self) -> JsResult<Vec<Value>> {
+        match self.pop()? {
+            array @ Value::Array(_) => spread_values(&array),
+            _ => Err(JsError::runtime(
+                "bytecode spread arguments are not an array",
+            )),
+        }
     }
 
     /// Pops the value after `extends`, which must be a constructor.
@@ -455,6 +994,18 @@ impl Vm {
         resume: usize,
     ) -> JsResult<bool> {
         let Value::Function(function) = callee else {
+            log::debug!("call target is not a function");
+            if let Some(name) = self
+                .globals
+                .as_ref()
+                .and_then(|globals| globals.bytecode_name_for_value(&callee))
+            {
+                return Err(JsError::with_context(
+                    JsErrorCategory::Runtime,
+                    format!("`{name}` is not a function"),
+                    "function call",
+                ));
+            }
             return Err(JsError::with_context(
                 JsErrorCategory::Runtime,
                 format!("`{callee}` is not a function"),
@@ -462,16 +1013,26 @@ impl Vm {
             ));
         };
         let Some(template) = function.template().cloned() else {
-            return match function.call_host(&arguments) {
+            log::trace!("calling host function with {} arguments", arguments.len());
+            return match function.call_host(&receiver, &arguments) {
                 Some(result) => {
                     self.push(result?);
                     Ok(false)
                 }
-                None => Err(JsError::runtime(
-                    "the bytecode VM cannot call functions from the tree-walk evaluator",
-                )),
+                None => {
+                    log::warn!("bytecode VM cannot call a tree-walk function");
+                    Err(JsError::runtime(
+                        "the bytecode VM cannot call functions from the tree-walk evaluator",
+                    ))
+                }
             };
         };
+        log::trace!(
+            "calling `{}` with {} arguments at depth {}",
+            template.name,
+            arguments.len(),
+            self.callers.len() + 1
+        );
         if template.kind.is_class() {
             return Err(JsError::with_context(
                 JsErrorCategory::Runtime,
@@ -482,12 +1043,31 @@ impl Vm {
                 "function call",
             ));
         }
+        let method_without_receiver = template.kind == CallableKind::Function
+            && self
+                .globals
+                .as_ref()
+                .and_then(|globals| globals.host_global_name(&receiver))
+                .is_some_and(|name| name == "object");
+        let call_receiver = if template.kind == CallableKind::Arrow {
+            Some(function.lexical_this().unwrap_or(Value::Undefined))
+        } else if template.kind == CallableKind::Function {
+            (!method_without_receiver).then_some(receiver)
+        } else {
+            Some(receiver)
+        };
+        let captures = function
+            .captures()
+            .map(|captures| captures.as_ref().clone())
+            .unwrap_or_default();
         self.enter(
             Frame {
                 chunk: Arc::clone(&template.chunk),
-                this: Some(receiver),
+                this: call_receiver,
+                method_without_receiver,
                 arguments,
                 callee: Some(function),
+                captures,
                 mode: ReturnMode::Call,
                 ..Frame::default()
             },
@@ -534,6 +1114,10 @@ impl Vm {
                 &new_target,
             )))),
         };
+        let captures = function
+            .captures()
+            .map(|captures| captures.as_ref().clone())
+            .unwrap_or_default();
         self.enter(
             Frame {
                 chunk: Arc::clone(&template.chunk),
@@ -541,6 +1125,7 @@ impl Vm {
                 arguments,
                 callee: Some(function),
                 new_target: Some(new_target),
+                captures,
                 mode,
                 ..Frame::default()
             },
@@ -552,6 +1137,10 @@ impl Vm {
     /// Suspends the running frame, to resume at `resume`, and starts `frame`.
     fn enter(&mut self, mut frame: Frame, resume: usize) -> JsResult<()> {
         if self.callers.len() + 1 >= self.call_depth_limit {
+            log::warn!(
+                "call depth limit of {} reached in the bytecode VM",
+                self.call_depth_limit
+            );
             return Err(JsError::with_context(
                 JsErrorCategory::Limit,
                 "Maximum call stack size exceeded",
@@ -583,6 +1172,14 @@ impl Vm {
             .pop()
             .ok_or_else(|| JsError::runtime("bytecode call stack underflow"))?;
         let finished = std::mem::replace(&mut self.frame, caller);
+        // Handlers of the finished frame cannot outlive it.
+        while self
+            .handlers
+            .last()
+            .is_some_and(|handler| handler.frame_depth > self.callers.len())
+        {
+            self.handlers.pop();
+        }
         let result = match finished.mode {
             ReturnMode::Call => returned,
             ReturnMode::Construct | ReturnMode::SuperCall => {
@@ -601,10 +1198,15 @@ impl Vm {
 
     fn next_loop_iteration(&mut self) -> JsResult<()> {
         if self.loop_iterations_remaining == 0 {
+            log::warn!("loop iteration limit reached in the bytecode VM");
             return Err(JsError::with_context(
                 crate::JsErrorCategory::Limit,
                 "Script exceeded the loop iteration limit",
-                "bytecode loop iteration",
+                if self.persistent_globals {
+                    "while loop iteration"
+                } else {
+                    "bytecode loop iteration"
+                },
             ));
         }
         self.loop_iterations_remaining -= 1;
@@ -646,7 +1248,7 @@ impl Vm {
         scopes
             .get(index)
             .and_then(|scope| scope.get(usize::from(slot)))
-            .ok_or_else(|| JsError::runtime("bytecode binding slot is invalid"))
+            .ok_or_else(|| JsError::runtime("bytecode binding slot is invalid (read)"))
     }
 
     fn binding_name<'a>(&self, name: u16, chunk: &'a Chunk) -> JsResult<&'a str> {
@@ -669,7 +1271,7 @@ impl Vm {
         let entry = self.slot_mut(target, slot)?;
         entry.kind = Some(kind);
         if kind == crate::ast::VarKind::Var {
-            entry.value = Some(Value::Undefined);
+            *entry.value.lock().unwrap() = Some(Value::Undefined);
         }
         let _ = name;
         Ok(())
@@ -679,6 +1281,8 @@ impl Vm {
         let name = self.binding_name(name, chunk)?;
         self.slot(target, slot)?
             .value
+            .lock()
+            .unwrap()
             .clone()
             .ok_or_else(|| JsError::new(format!("Cannot access `{name}` before initialization")))
     }
@@ -693,10 +1297,10 @@ impl Vm {
     ) -> JsResult<()> {
         let name = self.binding_name(name, chunk)?.to_owned();
         let entry = self.slot_mut(target, slot)?;
-        if entry.value.is_some() && entry.kind == Some(crate::ast::VarKind::Const) {
+        if entry.value.lock().unwrap().is_some() && entry.kind == Some(crate::ast::VarKind::Const) {
             return Err(JsError::new(format!("Assignment to constant `{name}`")));
         }
-        entry.value = Some(value);
+        *entry.value.lock().unwrap() = Some(value);
         Ok(())
     }
 
@@ -710,7 +1314,7 @@ impl Vm {
     ) -> JsResult<()> {
         let name = self.binding_name(name, chunk)?.to_owned();
         let entry = self.slot_mut(target, slot)?;
-        if entry.value.is_none() {
+        if entry.value.lock().unwrap().is_none() {
             return Err(JsError::new(format!(
                 "Cannot access `{name}` before initialization"
             )));
@@ -718,7 +1322,7 @@ impl Vm {
         if entry.kind == Some(crate::ast::VarKind::Const) {
             return Err(JsError::new(format!("Assignment to constant `{name}`")));
         }
-        entry.value = Some(value);
+        *entry.value.lock().unwrap() = Some(value);
         Ok(())
     }
 }
@@ -798,10 +1402,12 @@ fn validate_jump(target: usize, chunk: &Chunk, offset: usize) -> JsResult<()> {
 }
 
 fn stack_underflow() -> JsError {
+    log::error!("bytecode operand stack underflow");
     JsError::runtime("bytecode operand stack underflow")
 }
 
 fn bytecode_error(chunk: &Chunk, offset: usize, message: &'static str) -> JsError {
+    log::error!("invalid bytecode at offset {offset}: {message}");
     let error = JsError::runtime(message);
     chunk
         .location(offset)
@@ -818,122 +1424,40 @@ fn property_name(chunk: &Chunk, index: u16) -> JsResult<String> {
     }
 }
 
-/// Reads a property of an object, following its prototype chain, or an own
-/// property of a bytecode function such as a class's `prototype`.
+/// Reads a property of an object, array, string, or number, following
+/// prototype chains where they apply, or an own property of a host/bytecode
+/// function such as a constructor's `prototype`.
 ///
 /// A missing property reads as `undefined`. Reading a property of any other
 /// value is an error.
 fn load_property(target: &Value, key: &str) -> JsResult<Value> {
     match target {
-        Value::Object(object) | Value::Array(object) => {
-            Ok(object.get(key).unwrap_or(Value::Undefined))
-        }
-        Value::Function(function) if function.template().is_some() => {
-            Ok(function.get_own(key).unwrap_or(Value::Undefined))
-        }
+        Value::Object(object) => Ok(object.get_property(key)?.unwrap_or(Value::Undefined)),
+        Value::Array(array) => Ok(get_array_property(array, key)),
+        Value::String(text) => primitives_get_string_property(text, key),
+        Value::Number(_) => primitives_get_number_property(key),
+        Value::Function(function) => Ok(function.get_own(key).unwrap_or(Value::Undefined)),
         _ => Err(non_object(target, "read", key, "property access")),
     }
 }
 
+/// Appends `value` to the array literal being built, which must be an array.
+fn append_to_array(array: &Value, value: Value) -> JsResult<()> {
+    let Value::Array(array) = array else {
+        return Err(JsError::runtime(
+            "bytecode array append target is not an array",
+        ));
+    };
+    let length = array_len(array);
+    set_array_property(array, &length.to_string(), value)
+}
+
 fn store_property(target: &Value, key: String, value: &Value) -> JsResult<()> {
     match target {
-        Value::Object(object) | Value::Array(object) => object.set(key, value.clone()),
+        Value::Object(object) => object.set_property(key, value.clone())?,
+        Value::Array(array) => set_array_property(array, &key, value.clone())?,
         Value::Function(function) if function.set_own(&key, value.clone()) => {}
         _ => return Err(non_object(target, "set", &key, "property assignment")),
     }
     Ok(())
-}
-
-fn unary(operator: UnaryOperator, value: Value) -> JsResult<Value> {
-    match operator {
-        UnaryOperator::Negate => Ok(Value::Number(-to_number(&value)?)),
-        UnaryOperator::Not => Ok(Value::Boolean(!is_truthy(&value))),
-        UnaryOperator::BitwiseNot => Ok(Value::Number(f64::from(!to_int32(&value)?))),
-    }
-}
-
-fn binary(operator: BinaryOperator, left: Value, right: Value) -> JsResult<Value> {
-    match operator {
-        BinaryOperator::Add => match (left, right) {
-            (Value::String(left), right) => Ok(Value::String(left + &right.to_string())),
-            (left, Value::String(right)) => Ok(Value::String(left.to_string() + &right)),
-            (left, right) => Ok(Value::Number(to_number(&left)? + to_number(&right)?)),
-        },
-        BinaryOperator::Subtract => number_binary(left, right, |a, b| a - b),
-        BinaryOperator::Multiply => number_binary(left, right, |a, b| a * b),
-        BinaryOperator::Divide => number_binary(left, right, |a, b| a / b),
-        BinaryOperator::Remainder => number_binary(left, right, |a, b| a % b),
-        BinaryOperator::BitwiseAnd => int_binary(left, right, |a, b| a & b),
-        BinaryOperator::BitwiseOr => int_binary(left, right, |a, b| a | b),
-        BinaryOperator::BitwiseXor => int_binary(left, right, |a, b| a ^ b),
-        BinaryOperator::LeftShift => {
-            int_binary(left, right, |a, b| a.wrapping_shl((b as u32) & 31))
-        }
-        BinaryOperator::SignedRightShift => int_binary(left, right, |a, b| a >> ((b as u32) & 31)),
-        BinaryOperator::UnsignedRightShift => Ok(Value::Number(f64::from(
-            (to_int32(&left)? as u32).wrapping_shr((to_uint32(&right)? as u32) & 31),
-        ))),
-        BinaryOperator::Less => Ok(Value::Boolean(to_number(&left)? < to_number(&right)?)),
-        BinaryOperator::LessEqual => Ok(Value::Boolean(to_number(&left)? <= to_number(&right)?)),
-        BinaryOperator::Greater => Ok(Value::Boolean(to_number(&left)? > to_number(&right)?)),
-        BinaryOperator::GreaterEqual => Ok(Value::Boolean(to_number(&left)? >= to_number(&right)?)),
-        BinaryOperator::StrictEqual => Ok(Value::Boolean(left == right)),
-        BinaryOperator::StrictNotEqual => Ok(Value::Boolean(left != right)),
-        BinaryOperator::Equal => Ok(Value::Boolean(left == right)),
-        BinaryOperator::NotEqual => Ok(Value::Boolean(left != right)),
-    }
-}
-
-fn number_binary(
-    left: Value,
-    right: Value,
-    operation: impl FnOnce(f64, f64) -> f64,
-) -> JsResult<Value> {
-    Ok(Value::Number(operation(
-        to_number(&left)?,
-        to_number(&right)?,
-    )))
-}
-
-fn int_binary(
-    left: Value,
-    right: Value,
-    operation: impl FnOnce(i32, i32) -> i32,
-) -> JsResult<Value> {
-    Ok(Value::Number(f64::from(operation(
-        to_int32(&left)?,
-        to_int32(&right)?,
-    ))))
-}
-
-fn to_number(value: &Value) -> JsResult<f64> {
-    match value {
-        Value::Number(value) => Ok(*value),
-        Value::Boolean(value) => Ok(f64::from(*value as u8)),
-        Value::Null => Ok(0.0),
-        Value::Undefined => Ok(f64::NAN),
-        Value::String(value) if value.trim().is_empty() => Ok(0.0),
-        Value::String(value) => Ok(value.trim().parse().unwrap_or(f64::NAN)),
-        Value::Function(_) | Value::Object(_) | Value::Array(_) => {
-            Err(JsError::runtime("cannot convert object to number"))
-        }
-    }
-}
-
-fn to_int32(value: &Value) -> JsResult<i32> {
-    Ok(to_number(value)? as i32)
-}
-
-fn to_uint32(value: &Value) -> JsResult<u32> {
-    Ok(to_number(value)? as u32)
-}
-
-fn is_truthy(value: &Value) -> bool {
-    match value {
-        Value::Undefined | Value::Null => false,
-        Value::Boolean(value) => *value,
-        Value::Number(value) => *value != 0.0 && !value.is_nan(),
-        Value::String(value) => !value.is_empty(),
-        Value::Function(_) | Value::Object(_) | Value::Array(_) => true,
-    }
 }

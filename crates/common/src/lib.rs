@@ -10,3 +10,4 @@
 pub mod dom;
 pub mod error;
 pub mod ipc;
+pub mod logging;

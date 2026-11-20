@@ -1,33 +1,44 @@
 //! AST-to-bytecode compiler.
 
-use super::{CallableKind, Chunk, FunctionTemplate, Instruction};
+use super::{CallableKind, CaptureSource, Chunk, FunctionTemplate, Instruction};
 use crate::Value;
 use crate::ast::{
-    ClassDefinition, Expr, LogicalOperator, MemberProperty, Program, PropertyKey, Statement,
-    VarKind,
+    ArrowBody, ClassDefinition, Expr, MemberProperty, Program, PropertyKey, Statement, VarKind,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::rc::Rc;
 use std::sync::Arc;
 
 #[path = "control_flow.rs"]
 mod control_flow;
+#[path = "expressions.rs"]
+mod expressions;
 
 /// A source construct that the initial bytecode compiler cannot lower yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileError {
     /// Human-readable description of the unsupported construct.
     pub message: String,
+    /// Whether the compiler rejected syntax it does not support yet.
+    pub unsupported: bool,
     /// Source location of the unsupported construct, when the compiler has one.
     pub location: Option<super::SourceLocation>,
 }
 
 impl CompileError {
     fn unsupported(construct: &str) -> Self {
+        log::warn!("bytecode compiler does not support {construct}");
         Self {
             message: format!("bytecode compiler does not support {construct} yet"),
+            unsupported: true,
             location: None,
         }
+    }
+
+    /// Returns whether compilation rejected syntax that has not been lowered.
+    pub fn is_unsupported(&self) -> bool {
+        self.unsupported
     }
 
     /// Attaches a source location to this compilation failure.
@@ -63,9 +74,68 @@ pub struct Compiler {
     function: Option<CallableKind>,
     /// Top-level bindings, visible from every function body.
     globals: HashMap<String, Binding>,
-    /// Names of local variables of enclosing blocks and functions. A function
-    /// body cannot capture them, so referring to one is a compile error.
+    /// Captured bindings available to this function.
+    captures: HashMap<String, Binding>,
+    /// Names from enclosing non-global scopes, used to reject captures by
+    /// legacy function and method bodies.
     enclosing: HashSet<String>,
+    /// Runtime sources for this function's captured bindings.
+    capture_sources: Vec<CaptureSource>,
+    /// Number of statement-level values on the operand stack: completion
+    /// values waiting in enclosing sequences and loops. `break`, `continue`,
+    /// and `return` use it to discard exactly the values they leave behind.
+    live: usize,
+    /// Enclosing loops and exception handlers of the code being compiled,
+    /// outermost first.
+    control: Vec<Control>,
+    /// For each optional chain being compiled, the `?.` jumps waiting for the
+    /// chain's end, each with the number of extra values it must discard.
+    optional_exits: Vec<Vec<(usize, usize)>>,
+}
+
+/// A construct that an abrupt exit may have to leave.
+#[derive(Debug, Clone)]
+enum Control {
+    /// A `while` loop.
+    Loop {
+        /// Optional label targeting this loop.
+        label: Option<String>,
+        /// Value of `Compiler::live` inside the loop body.
+        live: usize,
+        /// Number of compile-time scopes outside the loop body.
+        scopes: usize,
+        /// Scope depth retained by `continue` for a lexical `for` loop.
+        continue_scopes: usize,
+        /// Jump target for `continue`; `usize::MAX` means the update target
+        /// is not known yet and jumps are kept in `continues`.
+        continue_target: usize,
+        /// `break` jumps, patched to the loop exit.
+        breaks: Vec<usize>,
+        /// `continue` jumps waiting for the update target.
+        continues: Vec<usize>,
+        /// Whether this loop owns an active iterator state.
+        iterator: bool,
+    },
+    /// A switch or labeled non-loop statement that can receive `break`.
+    Breakable {
+        /// Optional label.
+        label: Option<String>,
+        /// Statement completion stack depth.
+        live: usize,
+        /// Scope depth to restore.
+        scopes: usize,
+        /// Break jumps.
+        breaks: Vec<usize>,
+    },
+    /// An active runtime exception handler.
+    Handler {
+        /// Value of `Compiler::live` where the handler was entered.
+        live: usize,
+        /// Number of compile-time scopes where the handler was entered.
+        scopes: usize,
+        /// The `finally` block that runs when this handler's region is left.
+        finally: Option<Rc<[Statement]>>,
+    },
 }
 
 #[derive(Debug)]
@@ -80,6 +150,7 @@ struct Binding {
     slot: u16,
     kind: VarKind,
     global: bool,
+    capture: Option<u16>,
 }
 
 impl Compiler {
@@ -93,16 +164,69 @@ impl Compiler {
             }],
             function: None,
             globals: HashMap::new(),
+            captures: HashMap::new(),
             enclosing: HashSet::new(),
+            capture_sources: Vec::new(),
+            live: 0,
+            control: Vec::new(),
+            optional_exits: Vec::new(),
         }
     }
 
     /// Creates the compiler for a function body nested in this compiler's code.
     fn child(&self, kind: CallableKind) -> Self {
         let mut enclosing = self.enclosing.clone();
-        for (index, scope) in self.scopes.iter().enumerate() {
-            if !self.is_global_scope(index) {
+        for (scope_index, scope) in self.scopes.iter().enumerate() {
+            if !self.is_global_scope(scope_index) {
                 enclosing.extend(scope.bindings.keys().cloned());
+            }
+        }
+        let mut captures = HashMap::new();
+        let mut capture_sources = Vec::new();
+        for (scope_index, scope) in self.scopes.iter().enumerate().rev() {
+            if kind != CallableKind::Arrow {
+                break;
+            }
+            if self.is_global_scope(scope_index) {
+                continue;
+            }
+            for (name, binding) in &scope.bindings {
+                if captures.contains_key(name) {
+                    continue;
+                }
+                let index = u16::try_from(capture_sources.len()).unwrap();
+                capture_sources.push(CaptureSource::Local {
+                    depth: u16::try_from(self.scopes.len() - 1 - scope_index).unwrap(),
+                    slot: binding.slot,
+                });
+                captures.insert(
+                    name.clone(),
+                    Binding {
+                        scope: 0,
+                        slot: 0,
+                        kind: binding.kind,
+                        global: false,
+                        capture: Some(index),
+                    },
+                );
+            }
+        }
+        if kind == CallableKind::Arrow {
+            for (name, binding) in &self.captures {
+                if captures.contains_key(name) {
+                    continue;
+                }
+                let index = u16::try_from(capture_sources.len()).unwrap();
+                capture_sources.push(CaptureSource::Capture {
+                    index: binding.capture.expect("captured binding has an index"),
+                });
+                captures.insert(
+                    name.clone(),
+                    Binding {
+                        capture: Some(index),
+                        ..*binding
+                    },
+                );
             }
         }
         let globals = if self.function.is_none() {
@@ -118,7 +242,12 @@ impl Compiler {
             }],
             function: Some(kind),
             globals,
+            captures,
+            capture_sources,
             enclosing,
+            live: 0,
+            control: Vec::new(),
+            optional_exits: Vec::new(),
         }
     }
 
@@ -137,9 +266,11 @@ impl Compiler {
     ) -> Result<FunctionTemplate, CompileError> {
         let too_many = || CompileError {
             message: "function has too many parameters".into(),
+            unsupported: false,
             location: None,
         };
         let param_count = u16::try_from(params.len()).map_err(|_| too_many())?;
+        log::trace!("compiling function `{name}` ({} params)", params.len());
         let mut compiler = self.child(kind);
         for param in params {
             compiler.add_binding(0, param, VarKind::Var)?;
@@ -163,12 +294,69 @@ impl Compiler {
             name: name.to_owned(),
             kind,
             param_count,
+            captures: compiler.capture_sources,
+            chunk: Arc::new(compiler.chunk),
+        })
+    }
+
+    /// Compiles an expression-bodied arrow, whose final expression is its return value.
+    fn compile_arrow_expression(
+        &self,
+        params: &[String],
+        expression: &Expr,
+    ) -> Result<FunctionTemplate, CompileError> {
+        let too_many = || CompileError {
+            message: "function has too many parameters".into(),
+            unsupported: false,
+            location: None,
+        };
+        let param_count = u16::try_from(params.len()).map_err(|_| too_many())?;
+        let mut compiler = self.child(CallableKind::Arrow);
+        for param in params {
+            compiler.add_binding(0, param, VarKind::Var)?;
+        }
+        let enter = compiler.chunk.emit(Instruction::EnterScope(0));
+        for (position, param) in params.iter().enumerate() {
+            let argument = u16::try_from(position).map_err(|_| too_many())?;
+            compiler.chunk.emit(Instruction::LoadArgument(argument));
+            compiler.emit_initialize(param)?;
+        }
+        compiler.compile_expression(expression)?;
+        compiler.chunk.emit(Instruction::Return);
+        compiler.chunk.code[enter] = Instruction::EnterScope(compiler.scopes[0].slots);
+        Ok(FunctionTemplate {
+            name: "<arrow>".into(),
+            kind: CallableKind::Arrow,
+            param_count,
+            captures: compiler.capture_sources,
             chunk: Arc::new(compiler.chunk),
         })
     }
 
     /// Compiles `program`, returning an owned chunk ready for [`crate::vm::Vm`].
-    pub fn compile(mut self, program: &Program) -> Result<Chunk, CompileError> {
+    pub fn compile(self, program: &Program) -> Result<Chunk, CompileError> {
+        log::debug!("compiling program ({} statements)", program.body.len());
+        match self.compile_program(program) {
+            Ok(chunk) => {
+                log::debug!(
+                    "compile finished: {} instructions, {} functions, {} constants",
+                    chunk.code.len(),
+                    chunk.functions.len(),
+                    chunk.constants.len()
+                );
+                if log::log_enabled!(log::Level::Trace) {
+                    log::trace!("bytecode: {:?}", chunk.code);
+                }
+                Ok(chunk)
+            }
+            Err(error) => {
+                log::debug!("compile failed: {}", error.message);
+                Err(error)
+            }
+        }
+    }
+
+    fn compile_program(mut self, program: &Program) -> Result<Chunk, CompileError> {
         self.collect_root_bindings(program)?;
         let root_enter = self.chunk.emit(Instruction::EnterScope(0));
         self.emit_scope_declarations(0)?;
@@ -206,6 +394,7 @@ impl Compiler {
             .add_function(template)
             .map_err(|message| CompileError {
                 message: message.into(),
+                unsupported: false,
                 location: None,
             })
     }
@@ -216,6 +405,7 @@ impl Compiler {
         let name_index = self.name(name)?;
         let binding = self.binding(name).ok_or_else(|| CompileError {
             message: format!("unresolved declaration `{name}`"),
+            unsupported: false,
             location: None,
         })?;
         if binding.global {
@@ -227,6 +417,7 @@ impl Compiler {
             let depth =
                 u16::try_from(self.scopes.len() - 1 - binding.scope).map_err(|_| CompileError {
                     message: "scope nesting is too deep".into(),
+                    unsupported: false,
                     location: None,
                 })?;
             self.chunk.emit(Instruction::InitializeLocal {
@@ -263,10 +454,41 @@ impl Compiler {
                 }
             }
             Statement::While { body, .. } => self.collect_vars(body)?,
+            Statement::For { init, body, .. } => {
+                if let Some(init) = init {
+                    self.collect_vars(init)?;
+                }
+                self.collect_vars(body)?;
+            }
+            Statement::DoWhile { body, .. }
+            | Statement::ForOf { body, .. }
+            | Statement::ForIn { body, .. }
+            | Statement::Labeled { body, .. } => self.collect_vars(body)?,
+            Statement::Switch { cases, .. } => {
+                for case in cases {
+                    for statement in &case.consequent {
+                        self.collect_vars(statement)?;
+                    }
+                }
+            }
+            Statement::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                let clause = handler.iter().flat_map(|clause| &clause.body);
+                for statement in block.iter().chain(clause).chain(finalizer.iter().flatten()) {
+                    self.collect_vars(statement)?;
+                }
+            }
             Statement::FunctionDeclaration { .. }
             | Statement::ClassDeclaration(_)
             | Statement::Expression(_)
+            | Statement::Empty
             | Statement::Return(_)
+            | Statement::Throw(_)
+            | Statement::Break(_)
+            | Statement::Continue(_)
             | Statement::VariableDeclaration { .. } => {}
         }
         Ok(())
@@ -284,12 +506,14 @@ impl Compiler {
             }
             return Err(CompileError {
                 message: format!("redeclaration of `{name}`"),
+                unsupported: false,
                 location: None,
             });
         }
         let slot = self.scopes[scope].slots;
         self.scopes[scope].slots = slot.checked_add(1).ok_or_else(|| CompileError {
             message: "scope has too many bindings".into(),
+            unsupported: false,
             location: None,
         })?;
         let binding = Binding {
@@ -297,6 +521,7 @@ impl Compiler {
             slot,
             kind,
             global: self.is_global_scope(scope),
+            capture: None,
         };
         self.scopes[scope].bindings.insert(name.to_owned(), binding);
         Ok(binding)
@@ -364,29 +589,34 @@ impl Compiler {
             .iter()
             .rev()
             .find_map(|scope| scope.bindings.get(name).copied())
+            .or_else(|| self.captures.get(name).copied())
             .or_else(|| self.globals.get(name).copied())
     }
 
-    /// Resolves a name for reading or assignment. A name that belongs to an
-    /// enclosing function or block is an error because bytecode functions do
-    /// not capture variables.
+    /// Resolves a name for reading or assignment, including closure captures.
     fn resolve(&self, name: &str) -> Result<Option<Binding>, CompileError> {
         let own = self
             .scopes
             .iter()
             .rev()
             .find_map(|scope| scope.bindings.get(name).copied());
-        if own.is_none() && self.enclosing.contains(name) {
+        if own.is_none()
+            && self.function != Some(CallableKind::Arrow)
+            && self.enclosing.contains(name)
+        {
             return Err(CompileError::unsupported(&format!(
                 "functions that capture the enclosing local `{name}`"
             )));
         }
-        Ok(own.or_else(|| self.globals.get(name).copied()))
+        Ok(own
+            .or_else(|| self.captures.get(name).copied())
+            .or_else(|| self.globals.get(name).copied()))
     }
 
     fn name(&mut self, name: &str) -> Result<u16, CompileError> {
         self.chunk.add_name(name).map_err(|message| CompileError {
             message: message.into(),
+            unsupported: false,
             location: None,
         })
     }
@@ -397,7 +627,9 @@ impl Compiler {
         wants_completion: bool,
     ) -> Result<bool, CompileError> {
         let mut has_value = false;
+        let base = self.live;
         for statement in statements {
+            self.live = base + usize::from(has_value);
             let produced = self.compile_statement(statement, true)?;
             if produced {
                 if has_value {
@@ -407,6 +639,7 @@ impl Compiler {
                 has_value = true;
             }
         }
+        self.live = base;
         if wants_completion {
             if !has_value {
                 self.constant(Value::Undefined)?;
@@ -426,6 +659,13 @@ impl Compiler {
         is_completion: bool,
     ) -> Result<bool, CompileError> {
         match statement {
+            Statement::Empty => {
+                self.constant(Value::Undefined)?;
+                if !is_completion {
+                    self.chunk.emit(Instruction::Pop);
+                }
+                Ok(is_completion)
+            }
             Statement::Expression(expression) => {
                 self.compile_expression(expression)?;
                 if !is_completion {
@@ -433,28 +673,17 @@ impl Compiler {
                 }
                 Ok(is_completion)
             }
-            Statement::Block(statements) => {
-                let scope = self.enter_block()?;
-                self.collect_block_bindings(scope, statements)?;
-                let enter = self.chunk.emit(Instruction::EnterScope(0));
-                self.emit_scope_declarations(scope)?;
-                self.compile_sequence(statements, true)?;
-                self.chunk.code[enter] = Instruction::EnterScope(self.scopes[scope].slots);
-                self.chunk.emit(Instruction::ExitScope);
-                self.scopes.pop();
-                if !is_completion {
-                    self.chunk.emit(Instruction::Pop);
-                }
-                Ok(is_completion)
-            }
+            Statement::Block(statements) => self.compile_block(statements, is_completion),
             Statement::VariableDeclaration { kind, name, init } => {
+                if *kind == VarKind::Var && init.is_none() {
+                    return Ok(false);
+                }
                 if let Some(init) = init {
                     self.compile_expression(init)?;
                 } else {
                     self.constant(Value::Undefined)?;
                 }
                 self.emit_initialize(name)?;
-                let _ = kind;
                 Ok(false)
             }
             Statement::If {
@@ -463,8 +692,41 @@ impl Compiler {
                 else_branch,
             } => self.compile_if(condition, then_branch, else_branch, is_completion),
             Statement::While { condition, body } => {
-                self.compile_while(condition, body, is_completion)
+                self.compile_while(condition, body, is_completion, None)
             }
+            Statement::DoWhile { body, condition } => {
+                self.compile_do_while(body, condition, is_completion, None)
+            }
+            Statement::For {
+                init,
+                condition,
+                update,
+                body,
+            } => self.compile_for(
+                init.as_deref(),
+                condition.as_ref(),
+                update.as_ref(),
+                body,
+                is_completion,
+                None,
+            ),
+            Statement::ForOf {
+                kind,
+                name,
+                iterable,
+                body,
+            } => self.compile_for_of(*kind, name, iterable, body, is_completion, None),
+            Statement::ForIn {
+                kind,
+                name,
+                object,
+                body,
+            } => self.compile_for_in(*kind, name, object, body, is_completion, None),
+            Statement::Switch {
+                discriminant,
+                cases,
+            } => self.compile_switch(discriminant, cases, is_completion, None),
+            Statement::Labeled { label, body } => self.compile_labeled(label, body, is_completion),
             Statement::FunctionDeclaration { .. }
                 if self.function.is_none() && self.scopes.len() == 1 =>
             {
@@ -478,6 +740,26 @@ impl Compiler {
                 self.compile_class(class)?;
                 Ok(false)
             }
+            Statement::Throw(value) => {
+                self.compile_expression(value)?;
+                self.chunk.emit(Instruction::Throw);
+                // Unreachable, but keeps the stack shape that callers expect.
+                if is_completion {
+                    self.constant(Value::Undefined)?;
+                }
+                Ok(is_completion)
+            }
+            Statement::Try {
+                block,
+                handler,
+                finalizer,
+            } => self.compile_try(block, handler.as_ref(), finalizer.as_deref(), is_completion),
+            Statement::Break(label) => {
+                self.compile_loop_jump(true, label.as_deref(), is_completion)
+            }
+            Statement::Continue(label) => {
+                self.compile_loop_jump(false, label.as_deref(), is_completion)
+            }
             Statement::Return(value) => {
                 if self.function.is_none() {
                     return Err(CompileError::unsupported("return outside a function"));
@@ -486,6 +768,11 @@ impl Compiler {
                     Some(value) => self.compile_expression(value)?,
                     None => self.constant(Value::Undefined)?,
                 }
+                // The value waits on the stack while `finally` blocks run.
+                self.live += 1;
+                let unwound = self.unwind(0, None, None);
+                self.live -= 1;
+                unwound?;
                 self.chunk.emit(Instruction::Return);
                 // Unreachable, but keeps the stack shape that callers expect.
                 if is_completion {
@@ -496,19 +783,48 @@ impl Compiler {
         }
     }
 
+    /// Compiles statements in a new lexical scope. With `is_completion` the
+    /// block leaves its completion value on the stack.
+    fn compile_block(
+        &mut self,
+        statements: &[Statement],
+        is_completion: bool,
+    ) -> Result<bool, CompileError> {
+        let scope = self.enter_block()?;
+        self.collect_block_bindings(scope, statements)?;
+        let enter = self.chunk.emit(Instruction::EnterScope(0));
+        self.emit_scope_declarations(scope)?;
+        self.compile_sequence(statements, true)?;
+        self.chunk.code[enter] = Instruction::EnterScope(self.scopes[scope].slots);
+        self.chunk.emit(Instruction::ExitScope);
+        self.scopes.pop();
+        if !is_completion {
+            self.chunk.emit(Instruction::Pop);
+        }
+        Ok(is_completion)
+    }
+
     fn compile_expression(&mut self, expression: &Expr) -> Result<(), CompileError> {
         match expression {
-            Expr::ArrowFunction { .. } => Err(CompileError::unsupported("arrow functions")),
+            Expr::ArrowFunction { params, body } => {
+                let template = match body {
+                    ArrowBody::Block(statements) => {
+                        self.compile_function("<arrow>", CallableKind::Arrow, params, statements)?
+                    }
+                    ArrowBody::Expression(expression) => {
+                        self.compile_arrow_expression(params, expression)?
+                    }
+                };
+                let index = self.add_function(template)?;
+                self.chunk.emit(Instruction::MakeFunction(index));
+                Ok(())
+            }
             Expr::Number(value) => self.constant(Value::Number(*value)),
             Expr::String(value) => self.constant(Value::String(value.clone())),
             Expr::Boolean(value) => self.constant(Value::Boolean(*value)),
             Expr::Null => self.constant(Value::Null),
             Expr::Undefined => self.constant(Value::Undefined),
-            Expr::Unary { operator, operand } => {
-                self.compile_expression(operand)?;
-                self.chunk.emit(Instruction::Unary(*operator));
-                Ok(())
-            }
+            Expr::Unary { operator, operand } => self.compile_unary(*operator, operand),
             Expr::Binary {
                 left,
                 operator,
@@ -534,16 +850,12 @@ impl Compiler {
                 Ok(())
             }
             Expr::Call { callee, arguments } => self.compile_call(callee, arguments),
-            Expr::New { callee, arguments } => {
-                self.compile_expression(callee)?;
-                let count = self.compile_arguments(arguments)?;
-                self.chunk.emit(Instruction::New(count));
-                Ok(())
-            }
+            Expr::New { callee, arguments } => self.compile_new(callee, arguments),
             Expr::SuperCall { arguments } => {
                 if self.function != Some(CallableKind::DerivedConstructor) {
                     return Err(CompileError {
                         message: "`super(...)` is only valid in a derived class constructor".into(),
+                        unsupported: false,
                         location: None,
                     });
                 }
@@ -605,23 +917,48 @@ impl Compiler {
                             self.compile_expression(&property.value)?;
                             self.chunk.emit(Instruction::DefineComputedProperty);
                         }
+                        PropertyKey::Spread => {
+                            self.compile_expression(&property.value)?;
+                            self.chunk.emit(Instruction::SpreadProperties);
+                        }
                     }
                 }
                 Ok(())
             }
-            Expr::Array(elements) => {
-                for element in elements {
-                    match element {
-                        Some(element) => self.compile_expression(element)?,
-                        None => self.constant(Value::Undefined)?,
-                    }
-                }
-                let count = u16::try_from(elements.len()).map_err(|_| {
-                    CompileError::unsupported("array literal with too many elements")
-                })?;
-                self.chunk.emit(Instruction::NewArray(count));
-                Ok(())
+            Expr::Array(elements) => self.compile_array(elements),
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => self.compile_conditional(test, consequent, alternate),
+            Expr::Sequence(operands) => self.compile_comma(operands),
+            Expr::Template {
+                quasis,
+                expressions,
+            } => self.compile_template(quasis, expressions),
+            Expr::Update {
+                target,
+                operator,
+                prefix,
+            } => self.compile_update(target, *operator, *prefix),
+            Expr::CompoundAssign {
+                target,
+                operator,
+                value,
+            } => self.compile_compound(target, *operator, value),
+            Expr::Delete(operand) => self.compile_delete(operand),
+            Expr::OptionalChain(chain) => self.compile_optional_chain(chain),
+            Expr::OptionalMember { object, property } => {
+                self.compile_optional_member(object, property)
             }
+            Expr::OptionalCall { callee, arguments } => {
+                self.compile_optional_call(callee, arguments)
+            }
+            Expr::Spread(_) => Err(CompileError {
+                message: "spread is only valid in an array, call, or object literal".into(),
+                unsupported: false,
+                location: None,
+            }),
         }
     }
 
@@ -630,6 +967,7 @@ impl Compiler {
             Some(kind) if kind != CallableKind::Function => Ok(()),
             _ => Err(CompileError {
                 message: "`super` is only valid inside a class method".into(),
+                unsupported: false,
                 location: None,
             }),
         }
@@ -641,45 +979,9 @@ impl Compiler {
         }
         u16::try_from(arguments.len()).map_err(|_| CompileError {
             message: "call has too many arguments".into(),
+            unsupported: false,
             location: None,
         })
-    }
-
-    /// Lowers a call. A member callee is a method call: the object is kept
-    /// below the function so it becomes `this`.
-    fn compile_call(&mut self, callee: &Expr, arguments: &[Expr]) -> Result<(), CompileError> {
-        match callee {
-            Expr::Member { object, property } => {
-                self.compile_expression(object)?;
-                self.chunk.emit(Instruction::Dup);
-                match property {
-                    MemberProperty::Named(name) => {
-                        let index = self.name_constant(name)?;
-                        self.chunk.emit(Instruction::LoadProperty(index));
-                    }
-                    MemberProperty::Computed(key) => {
-                        self.compile_expression(key)?;
-                        self.chunk.emit(Instruction::LoadComputedProperty);
-                    }
-                }
-                let count = self.compile_arguments(arguments)?;
-                self.chunk.emit(Instruction::CallMethod(count));
-            }
-            Expr::SuperMember { name } => {
-                self.require_super()?;
-                self.chunk.emit(Instruction::LoadThis);
-                let index = self.name_constant(name)?;
-                self.chunk.emit(Instruction::LoadSuperProperty(index));
-                let count = self.compile_arguments(arguments)?;
-                self.chunk.emit(Instruction::CallMethod(count));
-            }
-            _ => {
-                self.compile_expression(callee)?;
-                let count = self.compile_arguments(arguments)?;
-                self.chunk.emit(Instruction::Call(count));
-            }
-        }
-        Ok(())
     }
 
     /// Lowers a class declaration: the optional superclass value, the
@@ -730,6 +1032,7 @@ impl Compiler {
             .add_constant(Value::String(name.to_owned()))
             .map_err(|message| CompileError {
                 message: message.into(),
+                unsupported: false,
                 location: None,
             })
     }
@@ -746,10 +1049,16 @@ impl Compiler {
                 slot: binding.slot,
                 name: name_index,
             });
+        } else if let Some(index) = binding.capture {
+            self.chunk.emit(Instruction::LoadCapture {
+                index,
+                name: name_index,
+            });
         } else {
             let depth =
                 u16::try_from(self.scopes.len() - 1 - binding.scope).map_err(|_| CompileError {
                     message: "scope nesting is too deep".into(),
+                    unsupported: false,
                     location: None,
                 })?;
             self.chunk.emit(Instruction::LoadLocal {
@@ -773,10 +1082,16 @@ impl Compiler {
                 slot: binding.slot,
                 name: name_index,
             });
+        } else if let Some(index) = binding.capture {
+            self.chunk.emit(Instruction::StoreCapture {
+                index,
+                name: name_index,
+            });
         } else {
             let depth =
                 u16::try_from(self.scopes.len() - 1 - binding.scope).map_err(|_| CompileError {
                     message: "scope nesting is too deep".into(),
+                    unsupported: false,
                     location: None,
                 })?;
             self.chunk.emit(Instruction::StoreLocal {
@@ -788,32 +1103,13 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_logical(
-        &mut self,
-        left: &Expr,
-        operator: LogicalOperator,
-        right: &Expr,
-    ) -> Result<(), CompileError> {
-        self.compile_expression(left)?;
-        let jump = match operator {
-            LogicalOperator::And => self.chunk.emit(Instruction::JumpIfFalse(usize::MAX)),
-            LogicalOperator::Or => self.chunk.emit(Instruction::JumpIfTrue(usize::MAX)),
-        };
-        self.chunk.emit(Instruction::Pop);
-        self.compile_expression(right)?;
-        self.chunk.code[jump] = match operator {
-            LogicalOperator::And => Instruction::JumpIfFalse(self.chunk.code.len()),
-            LogicalOperator::Or => Instruction::JumpIfTrue(self.chunk.code.len()),
-        };
-        Ok(())
-    }
-
     fn constant(&mut self, value: Value) -> Result<(), CompileError> {
         let index = self
             .chunk
             .add_constant(value)
             .map_err(|message| CompileError {
                 message: message.into(),
+                unsupported: false,
                 location: None,
             })?;
         self.chunk.emit(Instruction::Constant(index));

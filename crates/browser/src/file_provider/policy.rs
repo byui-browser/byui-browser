@@ -27,6 +27,7 @@ pub(super) fn request_context(request: &Request) -> FileRequestContext {
     } else {
         FileRequestKind::Subresource
     };
+    log::trace!("file request context: {kind:?}");
     FileRequestContext {
         initiating_origin,
         requested_origin: FileOrigin::LocalFile,
@@ -35,6 +36,7 @@ pub(super) fn request_context(request: &Request) -> FileRequestContext {
 }
 
 pub(super) fn provider_error(error: FileAccessError) -> RequestError {
+    log::trace!("file access error {error:?} mapped to a provider error");
     let kind = match error {
         FileAccessError::Missing => ProviderErrorKind::ResourceMissing,
         FileAccessError::Denied => ProviderErrorKind::AccessDenied,
@@ -55,7 +57,7 @@ pub(super) fn allows_content(
     policy: crate::FileAccessContentPolicy,
     media_type: Option<&str>,
 ) -> bool {
-    match policy {
+    let allowed = match policy {
         crate::FileAccessContentPolicy::StaticDocument => matches!(
             media_type,
             Some("text/html; charset=utf-8")
@@ -65,7 +67,16 @@ pub(super) fn allows_content(
                 | Some("image/gif")
                 | Some("image/webp")
         ),
-    }
+    };
+    log::trace!(
+        "file content policy {}: media type {media_type:?}",
+        if allowed {
+            "allowed"
+        } else {
+            "denied (not in the static document allowlist)"
+        }
+    );
+    allowed
 }
 
 /// Returns whether a bounded prefix identifies a native executable on this

@@ -1,12 +1,13 @@
 use crate::{
-    Attribute, ElementData, HTMLDocument, Namespace, NodeID, NodeKind, SourceSpan,
+    Attribute, Doctype, ElementData, HTMLDocument, Namespace, NodeID, NodeKind,
     escape_characters::decode_html_entities,
 };
 
 /// Parses raw HTML into an arena-backed document tree.
 pub fn parse_raw_html(raw: String) -> HTMLDocument {
+    log::debug!("parsing html document: {} bytes", raw.len());
     let mut document = HTMLDocument::new();
-    let root = document.root;
+    let root = *document.get_root();
     let mut stack = Vec::<NodeID>::new();
     let mut cursor = 0;
 
@@ -20,6 +21,7 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
             open,
         );
         let Some(relative_close) = raw[open..].find('>') else {
+            log::debug!("unterminated tag at byte {open}; treating rest as text");
             append_text(
                 &mut document,
                 current_parent(&stack, root),
@@ -32,10 +34,6 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
         };
         let close = open + relative_close;
         let tag = raw[open + 1..close].trim();
-        let span = Some(SourceSpan {
-            start: open,
-            end: close + 1,
-        });
         cursor = close + 1;
 
         // A '<' followed by whitespace is not the start of a tag. Preserve
@@ -45,6 +43,7 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
             .next()
             .is_some_and(char::is_whitespace)
         {
+            log::debug!("`<` followed by whitespace at byte {open}; treating as text");
             append_text(
                 &mut document,
                 current_parent(&stack, root),
@@ -57,7 +56,8 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
 
         if let Some(comment_body) = tag.strip_prefix("!--") {
             let comment = comment_body.strip_suffix("--").unwrap_or(comment_body);
-            let id = document.push_node(NodeKind::Comment(comment.to_owned()), span);
+            log::trace!("comment at byte {open} ({} bytes)", comment.len());
+            let id = document.push_node(NodeKind::Comment(comment.to_owned()));
             document.append_child(current_parent(&stack, root), id);
             continue;
         }
@@ -65,14 +65,12 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
             .get(..8)
             .is_some_and(|name| name.eq_ignore_ascii_case("!doctype"))
         {
-            let id = document.push_node(
-                NodeKind::Doctype {
-                    name: Some(tag[8..].trim().to_ascii_lowercase()),
-                    public_id: None,
-                    system_id: None,
-                },
-                span,
-            );
+            log::trace!("doctype at byte {open}");
+            let id = document.push_node(NodeKind::Doctype(Doctype::new(
+                Some(tag[8..].trim().to_ascii_lowercase()),
+                None,
+                None,
+            )));
             document.append_child(root, id);
             continue;
         }
@@ -86,17 +84,22 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
                 .iter()
                 .rposition(|id| element_name(&document, *id) == Some(name.as_str()))
             {
+                log::trace!("end tag </{name}> closes element at depth {position}");
                 stack.truncate(position);
+            } else {
+                log::debug!("ignoring unmatched end tag </{name}> at byte {open}");
             }
             continue;
         }
         if tag.starts_with('!') || tag.starts_with('?') {
+            log::debug!("ignoring unsupported markup declaration at byte {open}");
             continue;
         }
 
         let self_closing = tag.ends_with('/');
         let (name, attributes) = parse_start_tag(tag.trim_end_matches('/').trim());
         if name.is_empty() {
+            log::debug!("ignoring tag with empty name at byte {open}");
             continue;
         }
         let namespace = match name.as_str() {
@@ -104,7 +107,7 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
             "math" => Namespace::MathMl,
             _ if stack.iter().any(|id| {
                 matches!(
-                    document.node(*id).map(|node| &node.kind),
+                    document.get_node(*id).map(|node| node.get_kind()),
                     Some(NodeKind::Element(element))
                         if *element.get_namespace() == Namespace::Svg
                 )
@@ -114,10 +117,15 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
             }
             _ => Namespace::Html,
         };
-        let id = document.push_node(
-            NodeKind::Element(ElementData::new(name.clone(), namespace, attributes)),
-            span,
+        log::trace!(
+            "start tag <{name}> at byte {open} ({} attributes, self_closing={self_closing})",
+            attributes.len()
         );
+        let id = document.push_node(NodeKind::Element(ElementData::new(
+            name.clone(),
+            namespace,
+            attributes,
+        )));
         document.append_child(current_parent(&stack, root), id);
         if !self_closing && !is_void_element(&name) {
             stack.push(id);
@@ -132,6 +140,11 @@ pub fn parse_raw_html(raw: String) -> HTMLDocument {
             raw.len(),
         );
     }
+    log::debug!(
+        "parsed html document: {} nodes, {} elements left open at eof",
+        document.get_nodes_count(),
+        stack.len()
+    );
     document
 }
 
@@ -143,17 +156,17 @@ fn append_text(document: &mut HTMLDocument, parent: NodeID, text: &str, start: u
     if text.is_empty() {
         return;
     }
+    log::trace!("text node at bytes {start}..{end}");
     let id = document.push_node(
         // Decode after tokenizing markup so a decoded `<` remains text and
         // cannot introduce new elements into the tree.
         NodeKind::Text(decode_html_entities(text, false)),
-        Some(SourceSpan { start, end }),
     );
     document.append_child(parent, id);
 }
 
 fn element_name(document: &HTMLDocument, id: NodeID) -> Option<&str> {
-    match &document.node(id)?.kind {
+    match document.get_node(id)?.get_kind() {
         NodeKind::Element(element) => Some(element.get_name()),
         _ => None,
     }

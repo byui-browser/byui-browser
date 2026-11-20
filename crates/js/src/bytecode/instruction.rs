@@ -2,6 +2,15 @@
 
 use crate::ast::{BinaryOperator, UnaryOperator, VarKind};
 
+/// The iteration source used by a `for...of` or `for...in` loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IterationKind {
+    /// Iterate values from arrays and strings.
+    Of,
+    /// Iterate enumerable own keys from objects and arrays.
+    In,
+}
+
 /// A single stack-machine instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Instruction {
@@ -57,6 +66,51 @@ pub enum Instruction {
     DefineComputedProperty,
     /// Duplicates the value at the top of the stack.
     Dup,
+    /// Duplicates the two values at the top of the stack, keeping their
+    /// order: `[a, b]` becomes `[a, b, a, b]`. Used by compound assignment and
+    /// update expressions, which read and write the same object and key.
+    Dup2,
+    /// Moves the top value beneath the `n` values below it: with `n = 2`,
+    /// `[a, b, c]` becomes `[c, a, b]`. The operand is the count of values
+    /// passed over and must not exceed the stack height minus one. Postfix
+    /// updates use it to leave the old value under the object and key.
+    MoveTop(u16),
+    /// Jumps when the top value is `null` or `undefined` without consuming
+    /// it. Optional chains and `??` use it.
+    JumpIfNullish(usize),
+    /// Removes a named property: pops the object and pushes the boolean
+    /// result of `delete`. The operand is the property name's constant-pool
+    /// index. Deleting from `null` or `undefined` is a runtime error.
+    DeleteProperty(u16),
+    /// Removes a computed property: pops the key, then the object, and pushes
+    /// the boolean result of `delete`.
+    DeleteComputedProperty,
+    /// Appends a value to the array beneath it: pops the value and leaves the
+    /// array on the stack. Used to build array literals that contain spread.
+    ArrayPush,
+    /// Appends every element of an iterable to the array beneath it: pops an
+    /// array or string and leaves the array on the stack. Any other value is
+    /// a runtime error.
+    ArrayExtend,
+    /// Starts an internal array/string or object-key iteration.
+    IteratorStart(IterationKind),
+    /// Pushes the next iteration value, or jumps when iteration is complete.
+    IteratorNext(usize),
+    /// Releases the active iterator during an abrupt loop exit.
+    IteratorEnd,
+    /// Copies the own enumerable properties of the popped value onto the
+    /// object beneath it, which stays on the stack. Object literal spread.
+    SpreadProperties,
+    /// Calls a function with `this` set to `undefined`, taking the arguments
+    /// from an array: pops the argument array, then the callee, and pushes
+    /// the result. Used when a call has a spread argument.
+    CallSpread,
+    /// Calls a method with arguments from an array: pops the argument array,
+    /// then the callee, then the receiver, and pushes the result.
+    CallMethodSpread,
+    /// Constructs an instance with arguments from an array: pops the argument
+    /// array, then the constructor, and pushes the new object.
+    NewSpread,
     /// Pushes the running function's `this` receiver.
     ///
     /// At the top level this is `undefined`. In a derived constructor it is
@@ -65,6 +119,20 @@ pub enum Instruction {
     /// Pushes the call argument at this position, or `undefined` when the
     /// caller passed fewer arguments.
     LoadArgument(u16),
+    /// Reads a binding captured by the running function.
+    LoadCapture {
+        /// Capture index.
+        index: u16,
+        /// Binding-name pool index used in diagnostics.
+        name: u16,
+    },
+    /// Stores the value on top of the stack into a captured binding.
+    StoreCapture {
+        /// Capture index.
+        index: u16,
+        /// Binding-name pool index used in diagnostics.
+        name: u16,
+    },
     /// Pushes a new function value made from the template at this index of
     /// [`Chunk::functions`](super::Chunk::functions).
     MakeFunction(u16),
@@ -77,6 +145,13 @@ pub enum Instruction {
     /// Calls a method: pops the arguments, then the callee, then the receiver
     /// that becomes `this`, and pushes the result.
     CallMethod(u16),
+    /// Calls a named method and retains the property name for diagnostics.
+    CallMethodNamed {
+        /// Number of arguments.
+        count: u16,
+        /// Constant-pool index of the property name.
+        name: u16,
+    },
     /// Constructs an instance: pops the arguments, then the constructor, and
     /// pushes the new object, or the object the constructor returned.
     ///
@@ -113,6 +188,26 @@ pub enum Instruction {
         /// Constant-pool index of the method name string.
         name: u16,
     },
+    /// Throws the value popped from the stack as an exception.
+    ///
+    /// The VM unwinds to the innermost active handler, which may belong to a
+    /// calling frame, and jumps to its target with the thrown value on the
+    /// stack. With no handler the script fails with a
+    /// [`JsErrorCategory::Thrown`](crate::JsErrorCategory::Thrown) error.
+    Throw,
+    /// Registers an exception handler that stays active until the matching
+    /// [`Instruction::ExitTry`].
+    ///
+    /// The operand is the instruction offset to run when a catchable error
+    /// is raised while the handler is active, from this frame or any callee.
+    /// The VM first restores the operand stack height and the lexical scope
+    /// depth recorded here, discards the frames of callees, and pushes the
+    /// thrown value, so the target starts with exactly one extra value. Both
+    /// `throw` and runtime or host errors take this path; limit errors do not.
+    EnterTry(usize),
+    /// Removes the innermost exception handler, which must belong to the
+    /// running frame. A handler that fires is removed automatically.
+    ExitTry,
     /// Enters a lexical environment with `slot_count` slots.
     EnterScope(u16),
     /// Leaves the current lexical environment.

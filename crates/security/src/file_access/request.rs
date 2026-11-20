@@ -68,6 +68,7 @@ impl FileAccessGrant {
     /// ends. Invalidated grants cannot be made active again; issue a new grant
     /// from the capability when replacing a session.
     pub fn revoke(&self) {
+        log::debug!("file access grant {} revoked", self.capability_id);
         self.session.revoke();
     }
 
@@ -110,6 +111,8 @@ impl FileAccessSession {
         if let Ok(mut state) = self.state.lock() {
             state.active = false;
             state.generation = state.generation.wrapping_add(1);
+        } else {
+            log::warn!("file access session lock poisoned; revoke skipped, access stays denied");
         }
     }
 

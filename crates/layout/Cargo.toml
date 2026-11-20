@@ -8,6 +8,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+unicode-segmentation = "1.13.3"
+log = { workspace = true }
 common = { workspace = true }
 css = { workspace = true }
 html = { workspace = true }

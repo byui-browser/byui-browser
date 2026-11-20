@@ -2,6 +2,45 @@ use url::Url;
 
 use crate::api::error::RequestError;
 
+/// Relationship between the request's origin and the origins in its redirect chain.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RedirectTaint {
+    /// Every relevant transition remains same-origin.
+    #[default]
+    SameOrigin,
+    /// The chain crosses origins while remaining within one schemeful site.
+    SameSite,
+    /// The chain crosses schemeful sites.
+    CrossSite,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SchemefulSite {
+    scheme: String,
+    registrable_domain: String,
+}
+
+impl SchemefulSite {
+    fn from_url(url: &Url) -> Option<Self> {
+        let host = url.host_str()?;
+        Some(Self {
+            scheme: url.scheme().to_ascii_lowercase(),
+            registrable_domain: registrable_domain(host),
+        })
+    }
+
+    fn from_origin(origin: &Origin) -> Option<Self> {
+        Some(Self {
+            scheme: origin.scheme.as_ref()?.clone(),
+            registrable_domain: registrable_domain(origin.host.as_ref()?),
+        })
+    }
+}
+
+fn registrable_domain(host: &str) -> String {
+    psl::domain_str(host).unwrap_or(host).to_ascii_lowercase()
+}
+
 /// Structured origin state for a client environment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Origin {
@@ -72,10 +111,37 @@ impl Origin {
         self.scheme.is_none()
     }
 
+    /// Returns the tuple-origin scheme, or `None` for an opaque origin.
+    pub(crate) fn scheme(&self) -> Option<&str> {
+        self.scheme.as_deref()
+    }
+
     /// Tests tuple-origin equality; opaque origins never match, including themselves.
     pub fn is_same_origin(&self, other: &Self) -> bool {
         !self.is_opaque() && !other.is_opaque() && self == other
     }
+
+    /// Tests schemeful-site equality using registrable domains.
+    pub(crate) fn is_same_site_url(&self, url: &Url) -> bool {
+        SchemefulSite::from_origin(self)
+            .zip(SchemefulSite::from_url(url))
+            .is_some_and(|(origin, target)| origin == target)
+    }
+}
+
+/// Tests whether two HTTP(S) URLs have the same tuple origin.
+pub(crate) fn urls_are_same_origin(first: &Url, second: &Url) -> bool {
+    Origin::from_url(first)
+        .ok()
+        .zip(Origin::from_url(second).ok())
+        .is_some_and(|(first, second)| first.is_same_origin(&second))
+}
+
+/// Tests whether two URLs belong to the same schemeful site.
+pub(crate) fn urls_are_same_site(first: &Url, second: &Url) -> bool {
+    SchemefulSite::from_url(first)
+        .zip(SchemefulSite::from_url(second))
+        .is_some_and(|(first, second)| first == second)
 }
 
 /// Top-level origin used to partition browser network state.
@@ -137,5 +203,14 @@ mod tests {
         assert!(!first.is_same_origin(&first));
         assert!(!first.is_same_origin(&second));
         assert!(!first.is_same_origin(&tuple));
+    }
+
+    #[test]
+    fn schemeful_sites_use_registrable_domains_and_ignore_ports() {
+        let origin = Origin::parse("https://app.example.co.uk:8443").unwrap();
+
+        assert!(origin.is_same_site_url(&Url::parse("https://api.example.co.uk/data").unwrap()));
+        assert!(!origin.is_same_site_url(&Url::parse("http://api.example.co.uk/data").unwrap()));
+        assert!(!origin.is_same_site_url(&Url::parse("https://example.com/data").unwrap()));
     }
 }

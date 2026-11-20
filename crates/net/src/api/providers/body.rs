@@ -68,20 +68,17 @@ impl SchemeBody {
     }
 
     /// Converts provider body data into the shared abort-aware engine body model.
-    pub(crate) fn into_body(self, signal: AbortSignal, force_null: bool) -> (Body, bool) {
+    pub(crate) fn into_body(self, signal: AbortSignal, force_null: bool) -> Body {
         if force_null {
-            return (Body::null(), true);
+            return Body::null();
         }
         match self {
-            Self::Null | Self::NullWithLength(_) => (Body::null(), true),
-            Self::Bytes(bytes) => (Body::once_with_signal(bytes, signal), false),
-            Self::StaticBytes(bytes) => (
-                Body::once_with_signal(Bytes::from_static(bytes), signal),
-                false,
-            ),
+            Self::Null | Self::NullWithLength(_) => Body::null(),
+            Self::Bytes(bytes) => Body::once_with_signal(bytes, signal),
+            Self::StaticBytes(bytes) => Body::once_static_with_signal(bytes, signal),
             Self::Stream(stream) => {
                 let stream = stream.map(|chunk| chunk.map(Bytes::from));
-                (Body::from_stream_with_signal(stream, signal), false)
+                Body::from_stream_with_signal(stream, signal)
             }
         }
     }

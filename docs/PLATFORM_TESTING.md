@@ -4,13 +4,15 @@ Run the shell on each native operating system after platform-specific changes:
 
 | Platform | Command | Verify |
 | --- | --- | --- |
-| macOS | `cargo run -p browser-macos` | Native traffic lights, toolbar inset, resize hover state, drag empty toolbar space, and zoom toggle |
+| macOS | `cargo run -p byui-browser` | Native traffic lights, toolbar inset, resize hover state, drag empty toolbar space, and zoom toggle |
 | Linux | `cargo run -p browser-linux` | Native titlebar, X11/Wayland startup, resize behavior, toolbar hit testing, and zoom toggle |
 | Windows | `cargo run -p byui-browser-windows` | Native titlebar, rounded normal frame, square maximized frame, resize behavior, toolbar hit testing, and zoom toggle |
 
-For every shell, confirm the welcome page renders, Reload responds, disabled
-Back and Forward do not drag or maximize the window, and the address field
+For every shell, confirm the welcome page renders, Reload responds, Back and
+Forward traverse successful session history without dragging or maximizing the window, and the address field
 shows the text cursor when hovered. Click the address field or press `Ctrl+L`
 to focus and select it, type replacement text, verify Backspace and Escape,
-and confirm Enter submits the built-in `byui://welcome` URL. Unsupported URLs
-must remain visible without claiming a successful navigation.
+and confirm Enter navigates to the built-in `byui://welcome` URL. Submit an
+HTTP or HTTPS URL and verify the loading indicator, successful page display,
+and built-in error page behavior for a failed request. The submitted address
+must remain visible while loading and after a failed navigation.

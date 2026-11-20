@@ -58,7 +58,10 @@ type ParseResult<T> = Result<T, ParseError>;
 /// literals allow a trailing comma. A `{` at the start of a statement opens a
 /// block, as in JavaScript, so wrap an object literal statement in
 /// parentheses: `({ a: 1 })`.
-/// Returns outside functions, constants without initializers, duplicate
+/// `throw` must have its operand on the same line. `try` needs a `catch`
+/// clause (with an optional identifier binding) or a `finally` block.
+/// `break` and `continue` must sit in a loop of the same function and
+/// take no label. Returns outside functions, constants without initializers, duplicate
 /// parameter names, and `let`/`const`/`function` declarations used directly as
 /// an `if`, `else`, or `while` body are rejected.
 ///
@@ -95,7 +98,7 @@ pub(crate) fn parse_program_with_line_terminators(
 pub fn parse(tokens: &[Token]) -> ParseResult<Expr> {
     with_engine_stack(|| {
         let mut parser = Parser::new(tokens, &[]);
-        let expression = parser.parse_expression(0)?;
+        let expression = parser.parse_sequence()?;
         if parser.peek().is_some() {
             return Err(parser.error("Unexpected token after expression", "expression"));
         }
@@ -117,6 +120,14 @@ struct Parser<'tokens> {
     position: usize,
     depth: usize,
     function_depth: usize,
+    /// For each `while` loop being parsed, the `function_depth` it sits at.
+    /// `break` and `continue` are valid only when the innermost loop belongs
+    /// to the function being parsed.
+    loops: Vec<usize>,
+    /// For each breakable non-loop statement being parsed, its function depth.
+    breakables: Vec<usize>,
+    /// Active labels as `(name, loop_target, function_depth)`.
+    labels: Vec<(String, bool, usize)>,
     /// Nonzero while parsing a class method body, where `super` is valid.
     method_depth: usize,
     line_terminators_before: &'tokens [bool],
@@ -129,6 +140,9 @@ impl<'tokens> Parser<'tokens> {
             position: 0,
             depth: 0,
             function_depth: 0,
+            loops: Vec::new(),
+            breakables: Vec::new(),
+            labels: Vec::new(),
             method_depth: 0,
             line_terminators_before,
         }
@@ -194,6 +208,7 @@ impl<'tokens> Parser<'tokens> {
         parse: impl FnOnce(&mut Self) -> ParseResult<T>,
     ) -> ParseResult<T> {
         if self.depth >= MAX_NESTING {
+            log::warn!("parser nesting limit of {MAX_NESTING} reached in {context}");
             return Err(self.error(NESTING_ERROR, context));
         }
         self.depth += 1;
@@ -217,9 +232,36 @@ impl<'tokens> Parser<'tokens> {
         })
     }
 
+    /// Parses a full expression, including the comma operator.
+    ///
+    /// Call arguments, array elements, object values, and declaration
+    /// initializers use [`Parser::parse_expression`] instead, because a comma
+    /// separates them.
+    fn parse_sequence(&mut self) -> ParseResult<Expr> {
+        self.parse_sequence_with_depth()
+            .map(|(expression, _)| expression)
+    }
+
+    /// Like [`Parser::parse_sequence`], also reporting the tree depth.
+    fn parse_sequence_with_depth(&mut self) -> ParseResult<(Expr, usize)> {
+        let (first, mut depth) = self.parse_expression_with_depth(0)?;
+        if self.peek() != Some(&Token::Comma) {
+            return Ok((first, depth));
+        }
+        let mut operands = vec![first];
+        while self.consume(&Token::Comma) {
+            let (operand, operand_depth) = self.parse_expression_with_depth(0)?;
+            depth = depth.max(operand_depth);
+            operands.push(operand);
+        }
+        let depth = self.node_depth(depth + 1, "comma expression")?;
+        Ok((Expr::Sequence(operands), depth))
+    }
+
     /// Validates the depth of a node about to be built from its children.
     fn node_depth(&self, depth: usize, context: &'static str) -> ParseResult<usize> {
         if depth > MAX_EXPRESSION_DEPTH {
+            log::warn!("expression depth limit of {MAX_EXPRESSION_DEPTH} reached in {context}");
             Err(self.error(NESTING_ERROR, context))
         } else {
             Ok(depth)
@@ -246,5 +288,27 @@ impl<'tokens> Parser<'tokens> {
             .get(self.position)
             .copied()
             .unwrap_or(false)
+    }
+
+    fn push_label(&mut self, name: String, loop_target: bool) -> ParseResult<()> {
+        if self
+            .labels
+            .iter()
+            .any(|(active, _, depth)| active == &name && *depth == self.function_depth)
+        {
+            return Err(self.error("Duplicate label", "labeled statement"));
+        }
+        self.labels.push((name, loop_target, self.function_depth));
+        Ok(())
+    }
+
+    fn pop_label(&mut self) {
+        self.labels.pop();
+    }
+
+    pub(super) fn labeled_target(&self, name: &str, require_loop: bool) -> bool {
+        self.labels.iter().rev().any(|(label, loop_target, depth)| {
+            label == name && *depth == self.function_depth && (!require_loop || *loop_target)
+        })
     }
 }

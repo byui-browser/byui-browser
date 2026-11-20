@@ -8,11 +8,19 @@
 //! The transport and its Reqwest header/status/stream types stay behind this
 //! response boundary. The `webapis` crate adapts these Rust values to
 //! JavaScript objects, promises, and streams; this crate owns no JS identity.
+//! Optional [`NetworkObserver`] implementations receive best-effort,
+//! non-blocking lifecycle diagnostics without affecting Fetch results. The
+//! Observer events cover request preparation, cache and preflight decisions,
+//! scheduler admission, transport, redirects, response finalization, and
+//! completion or failure; it does not expose bodies, credentials, or error
+//! strings.
 //!
 //! The engine coordinates process-local scheduling and a small in-memory cache.
 //! Durable storage, security policy, service workers, client context, and
-//! diagnostics belong to their browser services and enter through
-//! [`FetchServices`]. Renderer processes do not open sockets directly.
+//! diagnostics may be collected through [`NetworkObserver`], while browser
+//! policy and durable state enter through focused request, response, cookie,
+//! service-worker, and cache-partition capabilities. Renderer
+//! processes do not open sockets directly.
 //!
 //! The current transport executes HTTP(S) requests. Relative URLs require a
 //! [`FetchEnvironment`] with a base URL. Engine-owned `data:` and the exact
@@ -23,24 +31,23 @@
 //! observe request cancellation, and provider metadata is validated before
 //! public response exposure. Provider-backed local resources accept only `GET`
 //! and `HEAD`; other methods fail before provider lookup.
-//! This first engine slice supports basic same-origin responses, simple CORS
-//! checks, opaque no-CORS views, and forbidden response-header filtering.
+//! This engine slice supports basic same-origin responses, simple and
+//! preflighted CORS checks with a process-local permission cache, opaque
+//! no-CORS views, and forbidden response-header filtering.
 //! Requests requiring absent providers or algorithms fail with a typed
 //! [`RequestError::UnsupportedFeature`] before transport. HTTP redirects are
 //! handled by the controller according to [`RedirectMode`]. See the
 //! [engine contract](../docs/fetch-engine-contract.md) for the supported subset.
 
-// Crate-wide flags to ignore dead code warnings. Will be removed once implementation
-// is finished, but is required for now to prevent the integration tests from failing.
-#![allow(dead_code)]
 // Flag to forbid unsafe code. This is security-critical and permanant.
 #![forbid(unsafe_code)]
 
-// TODO(net): Add persistent cookie storage, strict CORS, and HTTP/3 transport.
+// TODO(net): Add persistent cookie storage, browser security integrations, and HTTP/3 transport.
 
 mod api;
 mod cache;
 mod engine;
+mod log_url;
 mod policy;
 mod scheduling;
 mod transport;
@@ -49,9 +56,10 @@ mod transport;
 mod tests;
 
 pub use api::{
-    body::{Blob, Body, FormData, FormDataEntry},
+    body::{Blob, Body, BodyStatus, FormData, FormDataEntry},
     cancellation::{AbortController, AbortSignal},
     config::Config,
+    diagnostics::{NetworkEvent, NetworkObserver, NetworkPhase},
     error::{ProviderErrorKind, RequestError},
     headers::{HeaderGuard, Headers},
     providers::{
@@ -61,10 +69,13 @@ pub use api::{
     request::{
         CacheMode, CredentialsMode, FetchContext, FetchEnvironment, InitiatorType,
         NetworkPartitionKey, Origin, RedirectMode, Referrer, ReferrerPolicy, Request,
-        RequestDestination, RequestMode, RequestPriority, ServiceWorkersMode,
+        RequestDestination, RequestDuplex, RequestMode, RequestPriority, ServiceWorkersMode,
     },
     response::{Response, ResponseType},
-    services::{FetchServices, ResponseInfo, ServiceWorkerDecision},
+    services::{
+        CachePartitionService, CookieService, RequestPolicyService, ResponseInfo,
+        ResponsePolicyService, ServiceWorkerDecision, ServiceWorkerService,
+    },
 };
 pub use engine::{RequestController, RequestControllerBuilder};
 pub use http::{HeaderName, HeaderValue, Method};

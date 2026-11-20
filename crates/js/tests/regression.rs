@@ -483,10 +483,10 @@ fn runtime_errors_describe_the_failure() {
             "const answer = 42; answer = 7",
             "Assignment to constant `answer`",
         ),
-        ("let a = 1; let a = 2;", "`a` has already been declared"),
-        ("let a = 1; var a;", "`a` has already been declared"),
-        ("let x = 1; x()", "`x` is not a function"),
-        ("'text'()", "expression is not a function"),
+        ("let a = 1; let a = 2;", "redeclaration of `a`"),
+        ("let a = 1; var a;", "redeclaration of `a`"),
+        ("let x = 1; x()", "`1` is not a function"),
+        ("'text'()", "`text` is not a function"),
     ] {
         assert_eq!(runtime_error(source).message, message, "{source}");
     }
@@ -602,23 +602,31 @@ fn realm_script_bindings_persist_between_scripts() {
 #[test]
 fn unsupported_syntax_is_rejected_at_parse_time() {
     for source in [
-        // Update and compound assignment.
-        "let i = 0; i++;",
-        "let i = 0; i += 1;",
-        // Unary plus and `typeof`.
-        "+'3'",
-        "typeof 1",
+        // Update and compound assignment need an assignable target.
+        "1++;",
+        "++(1 + 2);",
+        "1 += 1;",
+        "a + b = 1;",
+        // `delete` of a bare name, and `**` after a unary operator.
+        "let x = 1; delete x;",
+        "-1 ** 2",
+        // `??` cannot be mixed with `||` or `&&` without parentheses.
+        "1 ?? 2 || 3",
+        "1 || 2 ?? 3",
+        // Optional chains cannot be assigned to or constructed.
+        "let a = {}; a?.b = 1;",
+        "let a = {}; new a?.b();",
+        // Regular-expression literals and tagged templates.
+        "let r = /a/g;",
+        "/=/",
+        "let tag = 1; tag`text`",
         // Function expressions.
         "let f = function () {};",
-        // Template literals.
-        "`text`",
-        // `for` loops.
-        "for (let i = 0; i < 3; i = i + 1) {}",
+        // Unterminated template literals.
+        "`text",
+        "`${1`",
         // Multiple declarators.
         "let a = 1, b = 2;",
-        // Empty statements.
-        ";",
-        "1;;",
         // `return` outside a function.
         "return 1;",
         // `undefined` is a keyword here, so it cannot be a binding name.
@@ -630,17 +638,13 @@ fn unsupported_syntax_is_rejected_at_parse_time() {
     }
 }
 
-/// Some unsupported keywords and globals lex as plain identifiers, so they
-/// parse but fail at run time as undefined bindings.
+/// Undeclared globals lex as plain identifiers, so they parse but fail at run
+/// time as undefined bindings. (`break` and `continue` used to be among them;
+/// see `tests/exceptions.rs`.)
 #[test]
 fn unsupported_keywords_and_globals_fail_at_run_time() {
-    for (source, message) in [
-        ("while (true) { break; }", "`break` is not defined"),
-        ("NaN", "`NaN` is not defined"),
-        ("Infinity", "`Infinity` is not defined"),
-        ("this", "`this` is not defined"),
-        ("undeclared = 1", "`undeclared` is not defined"),
-    ] {
-        assert_eq!(runtime_error(source).message, message, "{source}");
-    }
+    assert_eq!(
+        runtime_error("undeclared = 1").message,
+        "`undeclared` is not defined"
+    );
 }

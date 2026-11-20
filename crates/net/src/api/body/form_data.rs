@@ -76,6 +76,7 @@ pub(super) fn serialize(form: FormData) -> (Vec<u8>, HeaderValue) {
     let mut bytes = Vec::new();
     for (name, value) in form.entries {
         bytes.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        let name = escape_quoted_parameter(&name);
         match value {
             FormDataEntry::Text(value) => bytes.extend_from_slice(
                 format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
@@ -83,12 +84,18 @@ pub(super) fn serialize(form: FormData) -> (Vec<u8>, HeaderValue) {
             ),
             FormDataEntry::File { blob, filename } => {
                 let filename = filename.unwrap_or_else(|| "blob".into());
+                let quoted_filename = escape_quoted_parameter(&filename);
                 bytes.extend_from_slice(
                     format!(
-                        "Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n"
+                        "Content-Disposition: form-data; name=\"{name}\"; filename=\"{quoted_filename}\""
                     )
                     .as_bytes(),
                 );
+                if !filename.is_ascii() {
+                    bytes.extend_from_slice(b"; filename*=UTF-8''");
+                    bytes.extend_from_slice(encode_rfc5987(&filename).as_bytes());
+                }
+                bytes.extend_from_slice(b"\r\n");
                 if let Some(media_type) = blob.media_type() {
                     bytes.extend_from_slice(b"Content-Type: ");
                     bytes.extend_from_slice(media_type.as_bytes());
@@ -137,19 +144,37 @@ fn multipart_boundary(content_type: &str) -> Option<&str> {
 
 /// Parses multipart parts into text entries or blob-backed file entries.
 fn parse_multipart(bytes: &[u8], boundary: &str) -> Result<FormData, RequestError> {
-    let boundary = format!("--{boundary}");
-    let body = std::str::from_utf8(bytes)
-        .map_err(|_| RequestError::BodyFormData("multipart body is not UTF-8".into()))?;
+    if boundary.is_empty() || boundary.bytes().any(|byte| byte <= b' ' || byte >= 0x7f) {
+        return Err(RequestError::BodyFormData(
+            "multipart boundary is invalid".into(),
+        ));
+    }
+    let delimiter = format!("--{boundary}").into_bytes();
+    let mut position = find_bytes(bytes, &delimiter, 0)
+        .ok_or_else(|| RequestError::BodyFormData("multipart boundary is missing".into()))?;
     let mut form = FormData::new();
-    for part in body.split(&boundary).skip(1) {
-        let part = part.trim_start_matches("\r\n");
-        if part.starts_with("--") {
+    loop {
+        position += delimiter.len();
+        if bytes.get(position..position + 2) == Some(b"--") {
             break;
         }
-        let (headers, value) = part.split_once("\r\n\r\n").ok_or_else(|| {
+        if bytes.get(position..position + 2) != Some(b"\r\n") {
+            return Err(RequestError::BodyFormData(
+                "multipart boundary has an invalid suffix".into(),
+            ));
+        }
+        position += 2;
+        let header_end = find_bytes(bytes, b"\r\n\r\n", position).ok_or_else(|| {
             RequestError::BodyFormData("multipart part is missing its header separator".into())
         })?;
-        let value = value.strip_suffix("\r\n").unwrap_or(value);
+        let headers = std::str::from_utf8(&bytes[position..header_end])
+            .map_err(|_| RequestError::BodyFormData("multipart headers are not UTF-8".into()))?;
+        let value_start = header_end + 4;
+        let next_boundary =
+            find_multipart_boundary(bytes, &delimiter, value_start).ok_or_else(|| {
+                RequestError::BodyFormData("multipart closing boundary is missing".into())
+            })?;
+        let value = &bytes[value_start..next_boundary];
         let disposition = headers
             .lines()
             .find(|line| {
@@ -159,7 +184,10 @@ fn parse_multipart(bytes: &[u8], boundary: &str) -> Result<FormData, RequestErro
             .ok_or_else(|| RequestError::BodyFormData("multipart part lacks disposition".into()))?;
         let name = disposition_parameter(disposition, "name")
             .ok_or_else(|| RequestError::BodyFormData("multipart part lacks name".into()))?;
-        if let Some(filename) = disposition_parameter(disposition, "filename") {
+        let filename = disposition_parameter(disposition, "filename*")
+            .and_then(|value| decode_rfc5987(&value))
+            .or_else(|| disposition_parameter(disposition, "filename"));
+        if let Some(filename) = filename {
             let media_type = headers.lines().find_map(|line| {
                 line.split_once(':').and_then(|(name, value)| {
                     name.trim()
@@ -168,24 +196,153 @@ fn parse_multipart(bytes: &[u8], boundary: &str) -> Result<FormData, RequestErro
                         .and_then(|value| HeaderValue::try_from(value).ok())
                 })
             });
-            form.append_file(
-                name,
-                Blob::new(value.as_bytes().to_vec(), media_type),
-                Some(filename),
-            );
+            form.append_file(name, Blob::new(value.to_vec(), media_type), Some(filename));
         } else {
-            form.append(name, value);
+            form.append(name, String::from_utf8_lossy(value));
         }
+        position = next_boundary + 2;
     }
     Ok(form)
 }
 
 /// Reads a named parameter from a multipart content-disposition header.
 fn disposition_parameter(disposition: &str, requested: &str) -> Option<String> {
-    disposition.split(';').skip(1).find_map(|parameter| {
-        let (name, value) = parameter.trim().split_once('=')?;
-        name.trim()
-            .eq_ignore_ascii_case(requested)
-            .then(|| value.trim().trim_matches('"').to_owned())
-    })
+    let bytes = disposition.as_bytes();
+    let mut position = disposition.find(';')? + 1;
+    while position < bytes.len() {
+        while bytes
+            .get(position)
+            .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b';')
+        {
+            position += 1;
+        }
+        let name_start = position;
+        while bytes
+            .get(position)
+            .is_some_and(|byte| *byte != b'=' && *byte != b';')
+        {
+            position += 1;
+        }
+        let name = disposition[name_start..position].trim();
+        if bytes.get(position) != Some(&b'=') {
+            position += usize::from(position < bytes.len());
+            continue;
+        }
+        position += 1;
+        while bytes.get(position).is_some_and(u8::is_ascii_whitespace) {
+            position += 1;
+        }
+        let value = if bytes.get(position) == Some(&b'"') {
+            position += 1;
+            let mut value_bytes = Vec::new();
+            while let Some(&byte) = bytes.get(position) {
+                position += 1;
+                match byte {
+                    b'"' => break,
+                    b'\\' => {
+                        if let Some(&escaped) = bytes.get(position) {
+                            value_bytes.push(escaped);
+                            position += 1;
+                        }
+                    }
+                    _ => value_bytes.push(byte),
+                }
+            }
+            String::from_utf8(value_bytes).ok()?
+        } else {
+            let value_start = position;
+            while bytes.get(position).is_some_and(|byte| *byte != b';') {
+                position += 1;
+            }
+            disposition[value_start..position].trim().to_owned()
+        };
+        if name.eq_ignore_ascii_case(requested) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Finds a byte substring beginning at `start`.
+fn find_bytes(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+    if needle.is_empty() || start > haystack.len() {
+        return None;
+    }
+    haystack[start..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|position| start + position)
+}
+
+/// Finds the CRLF that begins the next syntactically valid multipart delimiter.
+fn find_multipart_boundary(bytes: &[u8], delimiter: &[u8], start: usize) -> Option<usize> {
+    let mut marker = Vec::with_capacity(delimiter.len() + 2);
+    marker.extend_from_slice(b"\r\n");
+    marker.extend_from_slice(delimiter);
+    let mut search = start;
+    while let Some(position) = find_bytes(bytes, &marker, search) {
+        let suffix = position + marker.len();
+        if matches!(bytes.get(suffix..suffix + 2), Some(b"\r\n") | Some(b"--")) {
+            return Some(position);
+        }
+        search = position + 1;
+    }
+    None
+}
+
+/// Escapes a quoted multipart parameter without admitting header delimiters.
+fn escape_quoted_parameter(value: &str) -> String {
+    value
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+        .replace('"', "%22")
+}
+
+/// Encodes a UTF-8 RFC 5987 extended parameter value.
+fn encode_rfc5987(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    encoded
+}
+
+/// Decodes an RFC 5987 UTF-8 extended parameter value.
+fn decode_rfc5987(value: &str) -> Option<String> {
+    let (charset, remainder) = value.split_once('\'')?;
+    let (_, encoded) = remainder.split_once('\'')?;
+    if !charset.eq_ignore_ascii_case("utf-8") {
+        return None;
+    }
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut position = 0;
+    while position < bytes.len() {
+        if bytes[position] == b'%' {
+            let high = hex_value(*bytes.get(position + 1)?)?;
+            let low = hex_value(*bytes.get(position + 2)?)?;
+            decoded.push((high << 4) | low);
+            position += 3;
+        } else {
+            decoded.push(bytes[position]);
+            position += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }

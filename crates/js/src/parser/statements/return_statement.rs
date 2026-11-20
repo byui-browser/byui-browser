@@ -14,7 +14,7 @@ pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Statement> {
     {
         None
     } else {
-        Some(parser.parse_expression(0)?)
+        Some(parser.parse_sequence()?)
     };
     parser.terminator("return statement")?;
     Ok(Statement::Return(value))

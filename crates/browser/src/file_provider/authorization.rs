@@ -49,27 +49,42 @@ impl FileNavigationAuthorizations {
     }
 
     pub(crate) fn authorize(&self, request_id: u64) -> Result<(), FileNavigationError> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| FileNavigationError::Unavailable)?;
+        let mut pending = self.pending.lock().map_err(|_| {
+            log::debug!("file navigation {request_id} not authorized: state unavailable");
+            FileNavigationError::Unavailable
+        })?;
         if pending.len() == MAX_PENDING_FILE_NAVIGATIONS {
+            log::debug!(
+                "file navigation {request_id} not authorized: {MAX_PENDING_FILE_NAVIGATIONS} navigations already pending"
+            );
             return Err(FileNavigationError::PendingLimitReached {
                 limit: MAX_PENDING_FILE_NAVIGATIONS,
             });
         }
         pending.insert(request_id);
+        log::trace!("file navigation {request_id} authorized");
         Ok(())
     }
 
     pub(crate) fn consume(&self, request_id: u64) -> bool {
-        self.pending
+        let consumed = self
+            .pending
             .lock()
-            .is_ok_and(|mut pending| pending.remove(&request_id))
+            .is_ok_and(|mut pending| pending.remove(&request_id));
+        log::trace!(
+            "file navigation {request_id} authorization {}",
+            if consumed {
+                "consumed"
+            } else {
+                "not found (never granted, already used, or state unavailable)"
+            }
+        );
+        consumed
     }
 
     pub(super) fn clear(&self) {
         if let Ok(mut pending) = self.pending.lock() {
+            log::trace!("cleared {} pending file navigations", pending.len());
             pending.clear();
         }
     }

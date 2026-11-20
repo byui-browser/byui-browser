@@ -7,7 +7,7 @@ shell; the window, toolbar, and rendering code is shared in
 
 ## Run
 
-Requires Rust 1.85 or newer and a desktop session. From the repository root:
+Requires Rust 1.88 or newer and a desktop session. From the repository root:
 
 ```sh
 make run

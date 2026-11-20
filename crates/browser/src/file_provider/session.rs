@@ -160,8 +160,16 @@ impl FileAccessGrantSource {
             current.cancellation = FileAccessCancellation::new();
             current.generation = current.generation.wrapping_add(1);
             self.navigation_authorizations.clear();
+            log::debug!(
+                "file access grant replaced (generation {})",
+                current.generation
+            );
             self.record(FileAccessAuditEvent::Replaced);
             self.schedule_expiry(current.generation);
+        } else {
+            log::warn!(
+                "file access state lock poisoned; grant replace skipped, access stays denied"
+            );
         }
     }
 
@@ -174,7 +182,10 @@ impl FileAccessGrantSource {
             current.cancellation.cancel();
             current.grant = None;
             self.navigation_authorizations.clear();
+            log::debug!("file access grant revoked");
             self.record(FileAccessAuditEvent::Revoked);
+        } else {
+            log::warn!("file access state lock poisoned; revoke skipped, access stays denied");
         }
     }
 
@@ -186,6 +197,7 @@ impl FileAccessGrantSource {
         if let Ok(mut current) = self.state.write() {
             revoke_current(&mut current);
             self.navigation_authorizations.clear();
+            log::debug!("file access session shut down");
             self.record(FileAccessAuditEvent::Shutdown);
         }
     }
@@ -222,6 +234,8 @@ impl FileAccessGrantSource {
     fn record(&self, event: FileAccessAuditEvent) {
         if let Ok(mut events) = self.audit.lock() {
             events.push(event);
+        } else {
+            log::warn!("file access audit lock poisoned; audit event dropped");
         }
     }
 
@@ -264,12 +278,15 @@ fn expire_generation(
     if !expired {
         return;
     }
+    log::debug!("file access grant expired");
     if let Some(navigation_authorizations) = navigation_authorizations.upgrade() {
         navigation_authorizations.clear();
     }
     if let Some(audit) = audit.upgrade() {
         if let Ok(mut events) = audit.lock() {
             events.push(FileAccessAuditEvent::Expired);
+        } else {
+            log::warn!("file access audit lock poisoned; expiry audit event dropped");
         }
     }
 }

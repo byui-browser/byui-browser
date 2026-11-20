@@ -45,10 +45,32 @@ pub enum Token {
     Else,
     /// `while` keyword.
     While,
+    /// `do` keyword.
+    Do,
+    /// `for` keyword.
+    For,
     /// `function` keyword.
     Function,
     /// `return` keyword.
     Return,
+    /// `throw` keyword.
+    Throw,
+    /// `try` keyword.
+    Try,
+    /// `catch` keyword.
+    Catch,
+    /// `finally` keyword.
+    Finally,
+    /// `break` keyword.
+    Break,
+    /// `continue` keyword.
+    Continue,
+    /// `switch` keyword.
+    Switch,
+    /// `case` keyword.
+    Case,
+    /// `default` keyword.
+    Default,
     /// `class` keyword.
     Class,
     /// `extends` keyword.
@@ -127,6 +149,77 @@ pub enum Token {
     LeftBracket,
     /// `]` computed member access closer.
     RightBracket,
+    /// `typeof` keyword.
+    Typeof,
+    /// `void` keyword.
+    Void,
+    /// `delete` keyword.
+    Delete,
+    /// `in` keyword.
+    In,
+    /// `of` keyword.
+    Of,
+    /// `instanceof` keyword.
+    InstanceOf,
+    /// `?` conditional operator.
+    Question,
+    /// `?.` optional chaining operator. `?.` directly before a digit lexes
+    /// as `?` followed by a number, so `a?.5:1` stays a conditional.
+    QuestionDot,
+    /// `??` nullish coalescing operator.
+    NullishCoalesce,
+    /// `??=` nullish assignment operator.
+    NullishAssign,
+    /// `++` increment operator.
+    Increment,
+    /// `--` decrement operator.
+    Decrement,
+    /// `**` exponentiation operator.
+    StarStar,
+    /// `+=` compound assignment.
+    PlusAssign,
+    /// `-=` compound assignment.
+    MinusAssign,
+    /// `*=` compound assignment.
+    StarAssign,
+    /// `/=` compound assignment. Where an expression may start, the parser
+    /// reports it, like `/`, as an unsupported regular-expression literal.
+    SlashAssign,
+    /// `%=` compound assignment.
+    PercentAssign,
+    /// `**=` compound assignment.
+    StarStarAssign,
+    /// `<<=` compound assignment.
+    ShiftLeftAssign,
+    /// `>>=` compound assignment.
+    ShiftRightAssign,
+    /// `>>>=` compound assignment.
+    UnsignedShiftRightAssign,
+    /// `&=` compound assignment.
+    BitAndAssign,
+    /// `|=` compound assignment.
+    BitOrAssign,
+    /// `^=` compound assignment.
+    BitXorAssign,
+    /// `&&=` logical assignment.
+    AndAssign,
+    /// `||=` logical assignment.
+    OrAssign,
+    /// `...` spread operator.
+    Ellipsis,
+    /// Template literal with its decoded text and substitutions.
+    ///
+    /// `quasis` has one more entry than `expressions`. Each substitution is
+    /// the token stream between `${` and its matching `}`; the parser parses
+    /// it as an expression. A template that is never closed, or that has a
+    /// bad escape, is a [`Token::Invalid`] instead.
+    Template {
+        /// Decoded text before, between, and after the substitutions. Line
+        /// terminators are normalized to `\n`.
+        quasis: Vec<String>,
+        /// Tokens of each `${...}` substitution, without the delimiters.
+        expressions: Vec<Vec<Token>>,
+    },
     /// Unrecognized source character. Kept in the stream so callers can
     /// report unsupported syntax without the lexer silently dropping it.
     Unknown(char),
@@ -150,6 +243,15 @@ pub struct SpannedToken {
 /// Whitespace and line terminators follow the ECMAScript definitions, and
 /// `//` line comments and `/* */` block comments are skipped. An unterminated
 /// block comment produces [`Token::Invalid`].
+///
+/// Operators are scanned longest-match first, so `a+++b` is `a ++ + b` and
+/// `>>>=` is one token. `?.` is [`Token::QuestionDot`] unless a digit follows,
+/// which keeps `a?.5:1` a conditional.
+///
+/// A template literal is one [`Token::Template`]: its text uses the string
+/// escapes below, may span lines, and each `${...}` substitution is
+/// tokenized recursively (up to 32 levels deep) and kept inside the token. A
+/// template that is not closed produces [`Token::Invalid`].
 ///
 /// Strings may use single or double quotes. Supported escapes are `\n`, `\r`,
 /// `\t`, `\b`, `\f`, `\v`, `\0` (when not followed by a digit), `\xHH`,
@@ -192,8 +294,36 @@ pub fn tokenize(input: &str) -> Vec<Token> {
 ///
 /// Uses the same lexical rules and error tokens as [`tokenize`].
 pub fn tokenize_spanned(input: &str) -> Vec<SpannedToken> {
-    let mut tokens = Vec::new();
     let mut chars = input.char_indices().peekable();
+    let (tokens, _) = scan_tokens(input, &mut chars, 0, false);
+
+    log::debug!(
+        "tokenized {} bytes into {} tokens",
+        input.len(),
+        tokens.len()
+    );
+    if log::log_enabled!(log::Level::Trace) {
+        for entry in &tokens {
+            log::trace!("token {:?} at {}..{}", entry.token, entry.start, entry.end);
+        }
+    }
+    tokens
+}
+
+/// How deeply template literals may nest inside `${}` substitutions.
+const MAX_TEMPLATE_NESTING: usize = 32;
+
+/// Scans tokens until the end of input or, with `in_substitution`, until the
+/// `}` that closes a template substitution. Returns the tokens and whether
+/// that closing brace was found (always `false` outside a substitution).
+fn scan_tokens(
+    input: &str,
+    chars: &mut Chars<'_>,
+    nesting: usize,
+    in_substitution: bool,
+) -> (Vec<SpannedToken>, bool) {
+    let mut tokens = Vec::new();
+    let mut brace_depth = 0usize;
 
     while let Some((start, ch)) = chars.peek().copied() {
         if is_js_whitespace(ch) {
@@ -201,14 +331,19 @@ pub fn tokenize_spanned(input: &str) -> Vec<SpannedToken> {
             continue;
         }
 
+        if in_substitution && ch == '}' && brace_depth == 0 {
+            chars.next();
+            return (tokens, true);
+        }
+
         if ch == '/' {
             match chars.clone().nth(1).map(|(_, next)| next) {
                 Some('/') => {
-                    skip_line_comment(&mut chars);
+                    skip_line_comment(chars);
                     continue;
                 }
                 Some('*') => {
-                    if !skip_block_comment(&mut chars) {
+                    if !skip_block_comment(chars) {
                         tokens.push(SpannedToken {
                             token: Token::Invalid("unterminated block comment".into()),
                             start,
@@ -228,66 +363,199 @@ pub fn tokenize_spanned(input: &str) -> Vec<SpannedToken> {
                     .nth(1)
                     .is_some_and(|(_, next)| next.is_ascii_digit()))
         {
-            scan_number(input, &mut chars)
+            scan_number(input, chars)
         } else if ch == '\'' || ch == '"' {
-            scan_string(&mut chars, ch)
+            scan_string(chars, ch)
+        } else if ch == '`' {
+            scan_template(input, chars, nesting)
         } else if is_identifier_start(ch) || ch == '\\' {
-            scan_identifier(&mut chars)
+            scan_identifier(chars)
         } else {
             chars.next();
-            match ch {
-                '+' => Token::Plus,
-                '-' => Token::Subtract,
-                '*' => Token::Multiply,
-                '/' => Token::Divide,
-                '%' => Token::Remainder,
-                '=' if take_if(&mut chars, '>') => Token::Arrow,
-                '=' => match take_if(&mut chars, '=') {
-                    true if take_if(&mut chars, '=') => Token::StrictEqual,
-                    true => Token::EqualEqual,
-                    false => Token::Assign,
-                },
-                '!' => match take_if(&mut chars, '=') {
-                    true if take_if(&mut chars, '=') => Token::StrictBangEqual,
-                    true => Token::BangEqual,
-                    false => Token::Bang,
-                },
-                '<' if take_if(&mut chars, '<') => Token::ShiftLeft,
-                '<' if take_if(&mut chars, '=') => Token::LessEqual,
-                '<' => Token::LessThan,
-                '>' if take_if(&mut chars, '>') => {
-                    if take_if(&mut chars, '>') {
-                        Token::UnsignedShiftRight
-                    } else {
-                        Token::ShiftRight
-                    }
-                }
-                '>' if take_if(&mut chars, '=') => Token::GreaterEqual,
-                '>' => Token::GreaterThan,
-                '&' if take_if(&mut chars, '&') => Token::AndAnd,
-                '&' => Token::BitAnd,
-                '|' if take_if(&mut chars, '|') => Token::OrOr,
-                '|' => Token::BitOr,
-                '^' => Token::BitXor,
-                '~' => Token::BitNot,
-                ';' => Token::Semicolon,
-                '(' => Token::LeftParen,
-                ')' => Token::RightParen,
-                '{' => Token::LeftBrace,
-                '}' => Token::RightBrace,
-                ',' => Token::Comma,
-                ':' => Token::Colon,
-                '.' => Token::Dot,
-                '[' => Token::LeftBracket,
-                ']' => Token::RightBracket,
-                other => Token::Unknown(other),
-            }
+            scan_punctuator(chars, ch)
         };
+        match token {
+            Token::LeftBrace => brace_depth += 1,
+            Token::RightBrace => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
         let end = chars.peek().map_or(input.len(), |(index, _)| *index);
         tokens.push(SpannedToken { token, start, end });
     }
+    (tokens, false)
+}
 
-    tokens
+/// Scans an operator or delimiter whose first character `ch` was consumed,
+/// taking the longest match.
+fn scan_punctuator(chars: &mut Chars<'_>, ch: char) -> Token {
+    match ch {
+        '+' if take_if(chars, '+') => Token::Increment,
+        '+' if take_if(chars, '=') => Token::PlusAssign,
+        '+' => Token::Plus,
+        '-' if take_if(chars, '-') => Token::Decrement,
+        '-' if take_if(chars, '=') => Token::MinusAssign,
+        '-' => Token::Subtract,
+        '*' if take_if(chars, '*') => {
+            if take_if(chars, '=') {
+                Token::StarStarAssign
+            } else {
+                Token::StarStar
+            }
+        }
+        '*' if take_if(chars, '=') => Token::StarAssign,
+        '*' => Token::Multiply,
+        '/' if take_if(chars, '=') => Token::SlashAssign,
+        '/' => Token::Divide,
+        '%' if take_if(chars, '=') => Token::PercentAssign,
+        '%' => Token::Remainder,
+        '=' if take_if(chars, '>') => Token::Arrow,
+        '=' => match take_if(chars, '=') {
+            true if take_if(chars, '=') => Token::StrictEqual,
+            true => Token::EqualEqual,
+            false => Token::Assign,
+        },
+        '!' => match take_if(chars, '=') {
+            true if take_if(chars, '=') => Token::StrictBangEqual,
+            true => Token::BangEqual,
+            false => Token::Bang,
+        },
+        '<' if take_if(chars, '<') => {
+            if take_if(chars, '=') {
+                Token::ShiftLeftAssign
+            } else {
+                Token::ShiftLeft
+            }
+        }
+        '<' if take_if(chars, '=') => Token::LessEqual,
+        '<' => Token::LessThan,
+        '>' if take_if(chars, '>') => {
+            if take_if(chars, '>') {
+                if take_if(chars, '=') {
+                    Token::UnsignedShiftRightAssign
+                } else {
+                    Token::UnsignedShiftRight
+                }
+            } else if take_if(chars, '=') {
+                Token::ShiftRightAssign
+            } else {
+                Token::ShiftRight
+            }
+        }
+        '>' if take_if(chars, '=') => Token::GreaterEqual,
+        '>' => Token::GreaterThan,
+        '&' if take_if(chars, '&') => {
+            if take_if(chars, '=') {
+                Token::AndAssign
+            } else {
+                Token::AndAnd
+            }
+        }
+        '&' if take_if(chars, '=') => Token::BitAndAssign,
+        '&' => Token::BitAnd,
+        '|' if take_if(chars, '|') => {
+            if take_if(chars, '=') {
+                Token::OrAssign
+            } else {
+                Token::OrOr
+            }
+        }
+        '|' if take_if(chars, '=') => Token::BitOrAssign,
+        '|' => Token::BitOr,
+        '^' if take_if(chars, '=') => Token::BitXorAssign,
+        '^' => Token::BitXor,
+        '~' => Token::BitNot,
+        '?' if take_if(chars, '?') => {
+            if take_if(chars, '=') {
+                Token::NullishAssign
+            } else {
+                Token::NullishCoalesce
+            }
+        }
+        // `?.` followed by a digit is a conditional with a number, `a?.5:1`.
+        '?' if chars.peek().is_some_and(|(_, next)| *next == '.')
+            && !chars
+                .clone()
+                .nth(1)
+                .is_some_and(|(_, after)| after.is_ascii_digit()) =>
+        {
+            chars.next();
+            Token::QuestionDot
+        }
+        '?' => Token::Question,
+        ';' => Token::Semicolon,
+        '(' => Token::LeftParen,
+        ')' => Token::RightParen,
+        '{' => Token::LeftBrace,
+        '}' => Token::RightBrace,
+        ',' => Token::Comma,
+        ':' => Token::Colon,
+        '.' if chars.clone().next().is_some_and(|(_, next)| next == '.')
+            && chars.clone().nth(1).is_some_and(|(_, next)| next == '.') =>
+        {
+            chars.next();
+            chars.next();
+            Token::Ellipsis
+        }
+        '.' => Token::Dot,
+        '[' => Token::LeftBracket,
+        ']' => Token::RightBracket,
+        other => Token::Unknown(other),
+    }
+}
+
+/// Scans a template literal starting at its opening backtick.
+///
+/// Each `${` starts a substitution that is tokenized recursively up to its
+/// matching `}`. Escapes follow string literals, except that raw line breaks
+/// are allowed and are normalized to `\n`.
+fn scan_template(input: &str, chars: &mut Chars<'_>, nesting: usize) -> Token {
+    chars.next(); // opening backtick
+    if nesting >= MAX_TEMPLATE_NESTING {
+        return Token::Invalid("template literals are nested too deeply".into());
+    }
+    let mut quasis = Vec::new();
+    let mut expressions = Vec::new();
+    let mut current = String::new();
+    let mut error: Option<&'static str> = None;
+
+    loop {
+        let Some((_, ch)) = chars.next() else {
+            return Token::Invalid("unterminated template literal".into());
+        };
+        match ch {
+            '`' => {
+                quasis.push(current);
+                return match error {
+                    Some(message) => Token::Invalid(message.into()),
+                    None => Token::Template {
+                        quasis,
+                        expressions,
+                    },
+                };
+            }
+            '$' if take_if(chars, '{') => {
+                quasis.push(std::mem::take(&mut current));
+                let (inner, closed) = scan_tokens(input, chars, nesting + 1, true);
+                if !closed {
+                    return Token::Invalid("unterminated template literal".into());
+                }
+                expressions.push(inner.into_iter().map(|entry| entry.token).collect());
+            }
+            '\r' => {
+                take_if(chars, '\n');
+                current.push('\n');
+            }
+            '\\' => match decode_escape(chars) {
+                None => return Token::Invalid("unterminated template literal".into()),
+                Some(Ok(Some(decoded))) => current.push(decoded),
+                Some(Ok(None)) => {}
+                Some(Err(message)) => {
+                    error.get_or_insert(message);
+                }
+            },
+            other => current.push(other),
+        }
+    }
 }
 
 /// Returns whether `ch` is ECMAScript `WhiteSpace` or a `LineTerminator`.
@@ -390,29 +658,8 @@ fn scan_string(chars: &mut Chars<'_>, quote: char) -> Token {
             continue;
         }
 
-        let Some((_, escape)) = chars.next() else {
+        let Some(decoded) = decode_escape(chars) else {
             return Token::Invalid("unterminated string literal".into());
-        };
-        let decoded = match escape {
-            'n' => Ok(Some('\n')),
-            '\r' => {
-                take_if(chars, '\n');
-                Ok(None)
-            }
-            '\n' | '\u{2028}' | '\u{2029}' => Ok(None),
-            'r' => Ok(Some('\r')),
-            't' => Ok(Some('\t')),
-            'b' => Ok(Some('\u{0008}')),
-            'f' => Ok(Some('\u{000C}')),
-            'v' => Ok(Some('\u{000B}')),
-            '0' if !chars.peek().is_some_and(|(_, next)| next.is_ascii_digit()) => Ok(Some('\0')),
-            '0'..='9' => Err(UNSUPPORTED_ESCAPE),
-            'x' => read_hex_digits(chars, 2)
-                .and_then(char::from_u32)
-                .map(Some)
-                .ok_or(INVALID_ESCAPE),
-            'u' => read_unicode_escape(chars).map(Some),
-            other => Ok(Some(other)),
         };
         match decoded {
             Ok(Some(decoded)) => value.push(decoded),
@@ -426,6 +673,36 @@ fn scan_string(chars: &mut Chars<'_>, quote: char) -> Token {
     Token::Invalid("unterminated string literal".into())
 }
 
+/// Decodes one escape sequence whose backslash was already consumed.
+///
+/// Returns `None` at the end of input, `Ok(None)` for a line continuation
+/// that contributes no character, and `Err` for an unsupported or invalid
+/// escape.
+fn decode_escape(chars: &mut Chars<'_>) -> Option<Result<Option<char>, &'static str>> {
+    let (_, escape) = chars.next()?;
+    Some(match escape {
+        'n' => Ok(Some('\n')),
+        '\r' => {
+            take_if(chars, '\n');
+            Ok(None)
+        }
+        '\n' | '\u{2028}' | '\u{2029}' => Ok(None),
+        'r' => Ok(Some('\r')),
+        't' => Ok(Some('\t')),
+        'b' => Ok(Some('\u{0008}')),
+        'f' => Ok(Some('\u{000C}')),
+        'v' => Ok(Some('\u{000B}')),
+        '0' if !chars.peek().is_some_and(|(_, next)| next.is_ascii_digit()) => Ok(Some('\0')),
+        '0'..='9' => Err(UNSUPPORTED_ESCAPE),
+        'x' => read_hex_digits(chars, 2)
+            .and_then(char::from_u32)
+            .map(Some)
+            .ok_or(INVALID_ESCAPE),
+        'u' => read_unicode_escape(chars).map(Some),
+        other => Ok(Some(other)),
+    })
+}
+
 /// Decodes the body of a `\u` escape (the `u` already consumed), combining a
 /// high surrogate with an immediately following low-surrogate `\u` escape.
 fn read_unicode_escape(chars: &mut Chars<'_>) -> Result<char, &'static str> {
@@ -435,12 +712,13 @@ fn read_unicode_escape(chars: &mut Chars<'_>) -> Result<char, &'static str> {
     }
 
     let mut lookahead = chars.clone();
-    if take_if(&mut lookahead, '\\') && take_if(&mut lookahead, 'u') {
-        if let Some(low @ 0xDC00..=0xDFFF) = read_unicode_code_point(&mut lookahead) {
-            *chars = lookahead;
-            let combined = 0x10000 + ((code_unit - 0xD800) << 10) + (low - 0xDC00);
-            return char::from_u32(combined).ok_or(INVALID_ESCAPE);
-        }
+    if take_if(&mut lookahead, '\\')
+        && take_if(&mut lookahead, 'u')
+        && let Some(low @ 0xDC00..=0xDFFF) = read_unicode_code_point(&mut lookahead)
+    {
+        *chars = lookahead;
+        let combined = 0x10000 + ((code_unit - 0xD800) << 10) + (low - 0xDC00);
+        return char::from_u32(combined).ok_or(INVALID_ESCAPE);
     }
     Err(UNSUPPORTED_ESCAPE)
 }
@@ -550,8 +828,19 @@ fn keyword(name: &str) -> Option<Token> {
         "if" => Token::If,
         "else" => Token::Else,
         "while" => Token::While,
+        "do" => Token::Do,
+        "for" => Token::For,
         "function" => Token::Function,
         "return" => Token::Return,
+        "throw" => Token::Throw,
+        "try" => Token::Try,
+        "catch" => Token::Catch,
+        "finally" => Token::Finally,
+        "break" => Token::Break,
+        "continue" => Token::Continue,
+        "switch" => Token::Switch,
+        "case" => Token::Case,
+        "default" => Token::Default,
         "class" => Token::Class,
         "extends" => Token::Extends,
         "new" => Token::New,
@@ -561,6 +850,12 @@ fn keyword(name: &str) -> Option<Token> {
         "false" => Token::False,
         "null" => Token::Null,
         "undefined" => Token::Undefined,
+        "typeof" => Token::Typeof,
+        "void" => Token::Void,
+        "delete" => Token::Delete,
+        "in" => Token::In,
+        "of" => Token::Of,
+        "instanceof" => Token::InstanceOf,
         _ => return None,
     })
 }

@@ -3,29 +3,71 @@
 //! All coordinates are absolute CSS pixels with the origin at the top-left of
 //! the initial containing block (the viewport).
 
+use std::sync::Arc;
+
 use css::CssColor;
 use html::NodeID;
 
-use crate::{Edges, Rect};
+use crate::{BorderRadius, BoxShadow, Edges, ImageKey, Rect, ToggleControl};
 
 /// Paint-relevant computed values for a box or inline box fragment.
 ///
-/// Only colors are painted today; borders and other decorations are not
-/// supported yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Colors, borders, corner radii, outlines, text decorations, and outer box
+/// shadows are painted today. Inset shadows and full background layers are
+/// not supported yet.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoxStyle {
+    /// Used selection mode for expanding user-select:all across descendant runs.
+    pub user_select: String,
+    /// CSS cursor keyword used when the pointer hits this box. Image cursors use their fallback.
+    pub cursor: String,
+    /// Whether visibility suppresses this fragment. Collapse currently behaves as hidden.
+    pub hidden: bool,
     /// The background color, or `None` when it is transparent or unsupported.
     pub background_color: Option<CssColor>,
     /// The computed `color`, used for text.
     pub text_color: CssColor,
+    /// The computed `border-*-radius` values. The background is clipped to
+    /// the rounded border box; resolve them with [`BorderRadius::resolve`].
+    pub border_radius: BorderRadius,
+    /// Used border widths in CSS pixels, zero for hidden or absent borders.
+    pub border_width: Edges,
+    /// Per-side border colors, with currentcolor resolved.
+    pub border_color: crate::Sides<CssColor>,
+    /// Per-side CSS styles. Dashed, dotted, and double are painted;
+    /// relief styles currently use a solid fill. Border corners are square.
+    pub border_style: crate::Sides<String>,
+    /// The outline color. Outlines are outside the border and do not affect layout.
+    pub outline_color: CssColor,
+    /// Outline width in CSS pixels; zero when the outline is not visible.
+    pub outline_width: f32,
+    /// Distance between the border edge and outline in CSS pixels.
+    pub outline_offset: f32,
+    /// Outline pattern, such as `solid`, `dashed`, or `dotted`.
+    pub outline_style: String,
+    /// The computed `box-shadow` list, first (topmost) shadow first; empty
+    /// for `none`. Shadows follow the rounded border box.
+    pub box_shadow: Arc<[BoxShadow]>,
 }
 
 impl Default for BoxStyle {
     fn default() -> Self {
         Self {
+            user_select: "auto".into(),
+            cursor: "auto".into(),
+            hidden: false,
             background_color: None,
             text_color: css::user_agent_default_color("color")
                 .expect("user-agent stylesheet must define html color"),
+            border_radius: BorderRadius::default(),
+            border_width: Edges::default(),
+            border_color: crate::Sides::from_array([css::parse_color("black").unwrap(); 4]),
+            border_style: crate::Sides::from_array(std::array::from_fn(|_| "none".to_owned())),
+            outline_color: css::parse_color("black").unwrap(),
+            outline_width: 0.0,
+            outline_offset: 0.0,
+            outline_style: "none".to_owned(),
+            box_shadow: Arc::from(Vec::new()),
         }
     }
 }
@@ -44,6 +86,47 @@ pub enum BoxKind {
     /// An atomic inline-level box such as `display: inline-block`. It appears
     /// inside a [`LineBox`] as [`LineFragment::Atomic`].
     InlineBlock,
+    /// A replaced element such as `<img>` or inline `<svg>`. Its
+    /// [`LayoutBox::image`] is painted to fill its content box. It is a
+    /// [`LineFragment::Atomic`] when inline-level and a child box when
+    /// block-level.
+    Replaced,
+}
+
+/// How a box takes part in layout: its positioning scheme (CSS 2.2 §9.3).
+///
+/// Paint order depends on it: floats paint after in-flow block backgrounds,
+/// and positioned boxes paint after all in-flow content (CSS 2.2 Appendix E).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Placement {
+    /// Normal flow with `position: static`.
+    #[default]
+    InFlow,
+    /// A floated box (`float: left` or `right`), out of flow.
+    Float,
+    /// `position: relative`: laid out in flow, then shifted by its insets.
+    Relative,
+    /// `position: sticky`. Scroll-dependent sticking is not implemented, so
+    /// the box stays at its in-flow position.
+    Sticky,
+    /// `position: absolute`: out of flow, placed against the padding box of
+    /// the nearest positioned ancestor block box, or the viewport.
+    Absolute,
+    /// `position: fixed`: out of flow, placed against the viewport. The box
+    /// is laid out like an absolutely positioned child of the initial
+    /// containing block; keeping it in place while scrolling is up to the
+    /// embedder.
+    Fixed,
+}
+
+impl Placement {
+    /// Whether the box is positioned (`position` other than `static`).
+    pub fn is_positioned(self) -> bool {
+        matches!(
+            self,
+            Self::Relative | Self::Sticky | Self::Absolute | Self::Fixed
+        )
+    }
 }
 
 /// A box fragment: a block container laid out with the CSS box model.
@@ -59,27 +142,45 @@ pub struct LayoutBox {
     /// Used margin widths. Vertical margins are the box's own margins before
     /// collapsing.
     pub margin: Edges,
-    /// Used padding widths. Borders are not supported yet, so the border box
-    /// and the padding box coincide.
+    /// Used padding widths in CSS pixels.
     pub padding: Edges,
     /// Paint-relevant computed values.
     pub style: BoxStyle,
-    /// Block-level child boxes, in tree order. Empty when the box contains
-    /// inline content.
+    /// The box's positioning scheme.
+    pub placement: Placement,
+    /// Block-level child boxes, in tree order, followed by floats and
+    /// absolutely positioned boxes this box contains. A box with inline
+    /// content has only floats and absolutely positioned children.
     pub children: Vec<LayoutBox>,
     /// Line boxes when the box establishes an inline formatting context, in
     /// order from top to bottom.
     pub lines: Vec<LineBox>,
+    /// Whether to draw a drop-down arrow: a small down chevron, vertically
+    /// centered near the right of the padding box. Set for single-choice
+    /// `<select>` elements, whose layout keeps the arrow area free of text.
+    pub select_arrow: bool,
+    /// For [`BoxKind::Replaced`] boxes, the picture to draw in the content
+    /// box; `None` for every other kind.
+    pub image: Option<ImageKey>,
+    /// For [`BoxKind::Replaced`] boxes of checkbox and radio inputs, the
+    /// control to draw in the content box; `None` for every other box.
+    pub control: Option<ToggleControl>,
 }
 
 impl LayoutBox {
-    /// The content box: the border box minus the padding.
+    /// The content box: the border box minus borders and padding.
     pub fn content_rect(&self) -> Rect {
         Rect {
-            x: self.rect.x + self.padding.left,
-            y: self.rect.y + self.padding.top,
-            width: self.rect.width - self.padding.horizontal(),
-            height: self.rect.height - self.padding.vertical(),
+            x: self.rect.x + self.padding.left + self.style.border_width.left,
+            y: self.rect.y + self.padding.top + self.style.border_width.top,
+            width: (self.rect.width
+                - self.padding.horizontal()
+                - self.style.border_width.horizontal())
+            .max(0.0),
+            height: (self.rect.height
+                - self.padding.vertical()
+                - self.style.border_width.vertical())
+            .max(0.0),
         }
     }
 
@@ -116,6 +217,7 @@ impl LineBox {
                 LineFragment::Text(text) => {
                     text.rect = text.rect.translate(dx, dy);
                     text.baseline += dy;
+                    text.clip = text.clip.map(|clip| clip.translate(dx, dy));
                 }
                 LineFragment::Atomic(atomic) => atomic.translate(dx, dy),
             }
@@ -152,6 +254,15 @@ pub struct InlineBoxFragment {
 /// A run of text placed on a line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextFragment {
+    /// CSS cursor keyword inherited by this text.
+    pub cursor: String,
+    /// Selection behavior: auto/text allow ranges, none excludes text, all selects the element.
+    /// Containment selection is not implemented.
+    pub user_select: String,
+    /// CSS rendering hint. Kerning and shaping are not implemented.
+    pub text_rendering: String,
+    /// Whether inherited visibility suppresses painting and hit testing.
+    pub hidden: bool,
     /// The DOM text node the run comes from.
     pub node: NodeID,
     /// The text node's parent element, which is the hit-test target for the
@@ -166,8 +277,17 @@ pub struct TextFragment {
     pub text: String,
     /// The computed font size in CSS pixels.
     pub font_size: f32,
+    /// The face the run was measured with; paint it with the same face.
+    pub font: crate::FontId,
     /// The text color.
     pub color: CssColor,
+    /// Text decoration lines such as `underline`; empty for undecorated text.
+    pub text_decoration: Vec<String>,
+    /// A rectangle the glyphs must not paint outside, in the same absolute
+    /// coordinates as `rect`; `None` means unclipped. Set for text inside
+    /// form controls, which is clipped to the control's padding box. The
+    /// `overflow` property also clips text; other content is not clipped yet.
+    pub clip: Option<Rect>,
 }
 
 /// The complete layout output for one document and viewport.
@@ -190,21 +310,73 @@ pub enum PaintItem<'a> {
     InlineBox(&'a InlineBoxFragment),
     /// A text run.
     Text(&'a TextFragment),
+    /// The picture or form control of a [`BoxKind::Replaced`] box, drawn in
+    /// its content box after its background.
+    Image(&'a LayoutBox),
 }
 
 impl LayoutTree {
+    /// Returns the CSS cursor keyword at a document point in CSS pixels.
+    /// Visible text with an auto cursor uses the text cursor; empty space uses auto.
+    pub fn cursor_at(&self, x: f32, y: f32) -> &str {
+        for item in self.paint_order().into_iter().rev() {
+            let (rect, hidden, cursor) = match item {
+                PaintItem::Text(t) if t.clip.is_none_or(|clip| clip.contains(x, y)) => {
+                    if !t.hidden && t.rect.contains(x, y) {
+                        return if t.cursor == "auto" {
+                            "text"
+                        } else {
+                            &t.cursor
+                        };
+                    }
+                    continue;
+                }
+                PaintItem::Text(_) => continue,
+                PaintItem::InlineBox(b) => (b.rect, b.style.hidden, &b.style.cursor),
+                PaintItem::BoxDecorations(b) | PaintItem::Image(b) => {
+                    (b.rect, b.style.hidden, &b.style.cursor)
+                }
+            };
+            if !hidden && rect.contains(x, y) {
+                return cursor;
+            }
+        }
+        "auto"
+    }
+
     /// Lists everything to paint, back to front.
     ///
     /// Within the root stacking context this follows CSS 2.2 Appendix E: the
     /// canvas, then the backgrounds of all block-level boxes in
     /// tree order, then the inline content of every line box in tree order.
-    /// Atomic inlines are painted as if they created a stacking context, at
-    /// their place in the line. Positioned boxes, floats, and `z-index` are
-    /// not supported yet, so there are no other layers.
+    /// The picture of a block-level replaced box is painted at its place in
+    /// that last step, as CSS 2.2 Appendix E step 7 says.
+    /// Floats are painted atomically after the block backgrounds and before
+    /// inline content; positioned boxes are painted atomically, in tree order,
+    /// after everything else in their parent's stacking layer. Atomic inlines
+    /// are painted as if they created a stacking context, at their place in
+    /// the line. `z-index` is not supported, so positioned boxes never paint
+    /// below in-flow content.
     pub fn paint_order(&self) -> Vec<PaintItem<'_>> {
         let mut items = Vec::new();
         paint_atomically(&self.root, &mut items);
+        log::trace!("paint order: {} items", items.len());
         items
+    }
+
+    /// The height of the document's scrollable area, in CSS pixels.
+    ///
+    /// This is the larger of the viewport height and the lowest margin edge
+    /// of any box or line box, so a document shorter than the viewport has
+    /// nothing to scroll and a taller one scrolls until its last content,
+    /// including the root element's bottom margin, is visible. A viewport is
+    /// scrollable by `scroll_height() - root.rect.height` CSS pixels.
+    ///
+    /// Only vertical overflow is measured; horizontal scrolling is not
+    /// supported yet. Content of `overflow: hidden` boxes still counts, since
+    /// overflow clipping is not implemented.
+    pub fn scroll_height(&self) -> f32 {
+        lowest_edge(&self.root).max(self.root.rect.bottom())
     }
 
     /// Returns the element under a CSS-pixel point, or `None` when the point
@@ -216,35 +388,97 @@ impl LayoutTree {
     /// are transparent to hit testing. Content overflowing its parent is still
     /// hit, since overflow clipping is not implemented.
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeID> {
-        self.paint_order()
+        let hit = self
+            .paint_order()
             .into_iter()
             .rev()
             .find_map(|item| match item {
-                PaintItem::BoxDecorations(layout_box) => {
-                    layout_box.node.filter(|_| layout_box.rect.contains(x, y))
+                PaintItem::BoxDecorations(layout_box) => layout_box
+                    .node
+                    .filter(|_| !layout_box.style.hidden && layout_box.rect.contains(x, y)),
+                PaintItem::InlineBox(inline) => {
+                    (!inline.style.hidden && inline.rect.contains(x, y)).then_some(inline.node)
                 }
-                PaintItem::InlineBox(inline) => inline.rect.contains(x, y).then_some(inline.node),
-                PaintItem::Text(text) => text.element.filter(|_| text.rect.contains(x, y)),
-            })
+                PaintItem::Text(text) => text.element.filter(|_| {
+                    !text.hidden
+                        && text.rect.contains(x, y)
+                        && text.clip.is_none_or(|clip| clip.contains(x, y))
+                }),
+                PaintItem::Image(layout_box) => layout_box
+                    .node
+                    .filter(|_| !layout_box.style.hidden && layout_box.rect.contains(x, y)),
+            });
+        match hit {
+            Some(node) => log::trace!("hit test at ({x}, {y}): node {node:?}"),
+            None => log::trace!("hit test at ({x}, {y}): canvas (no node)"),
+        }
+        hit
     }
 }
 
+/// The lowest margin edge of `layout_box`, its line boxes, and their
+/// descendants, in absolute CSS pixels.
+fn lowest_edge(layout_box: &LayoutBox) -> f32 {
+    let own = layout_box.rect.bottom() + layout_box.margin.bottom.max(0.0);
+    let lines = layout_box.lines.iter().flat_map(|line| {
+        let atomics = line.fragments.iter().filter_map(|fragment| match fragment {
+            LineFragment::Atomic(atomic) => Some(lowest_edge(atomic)),
+            _ => None,
+        });
+        std::iter::once(line.rect.bottom()).chain(atomics)
+    });
+    let children = layout_box.children.iter().map(lowest_edge);
+    lines.chain(children).fold(own, f32::max)
+}
+
+/// Paints a box and its descendants as one layer: block backgrounds, then
+/// floats, then inline content, then positioned descendants.
 fn paint_atomically<'a>(layout_box: &'a LayoutBox, items: &mut Vec<PaintItem<'a>>) {
     items.push(PaintItem::BoxDecorations(layout_box));
+    let mut layers = Layers::default();
     for child in &layout_box.children {
-        push_block_decorations(child, items);
+        push_block_decorations(child, items, &mut layers);
+    }
+    for float in layers.floats {
+        paint_atomically(float, items);
     }
     push_inline_content(layout_box, items);
+    for positioned in layers.positioned {
+        paint_atomically(positioned, items);
+    }
 }
 
-fn push_block_decorations<'a>(layout_box: &'a LayoutBox, items: &mut Vec<PaintItem<'a>>) {
+/// Floats and positioned boxes found while painting in-flow blocks; each is
+/// painted later as a whole.
+#[derive(Default)]
+struct Layers<'a> {
+    floats: Vec<&'a LayoutBox>,
+    positioned: Vec<&'a LayoutBox>,
+}
+
+fn push_block_decorations<'a>(
+    layout_box: &'a LayoutBox,
+    items: &mut Vec<PaintItem<'a>>,
+    layers: &mut Layers<'a>,
+) {
+    if layout_box.placement.is_positioned() {
+        layers.positioned.push(layout_box);
+        return;
+    }
+    if layout_box.placement == Placement::Float {
+        layers.floats.push(layout_box);
+        return;
+    }
     items.push(PaintItem::BoxDecorations(layout_box));
     for child in &layout_box.children {
-        push_block_decorations(child, items);
+        push_block_decorations(child, items, layers);
     }
 }
 
 fn push_inline_content<'a>(layout_box: &'a LayoutBox, items: &mut Vec<PaintItem<'a>>) {
+    if layout_box.image.is_some() || layout_box.control.is_some() {
+        items.push(PaintItem::Image(layout_box));
+    }
     for line in &layout_box.lines {
         for fragment in &line.fragments {
             match fragment {
@@ -255,7 +489,9 @@ fn push_inline_content<'a>(layout_box: &'a LayoutBox, items: &mut Vec<PaintItem<
         }
     }
     for child in &layout_box.children {
-        push_inline_content(child, items);
+        if child.placement == Placement::InFlow {
+            push_inline_content(child, items);
+        }
     }
 }
 
@@ -275,8 +511,12 @@ mod tests {
             margin: Edges::default(),
             padding: Edges::default(),
             style: BoxStyle::default(),
+            placement: Placement::InFlow,
             children,
             lines: Vec::new(),
+            select_arrow: false,
+            image: None,
+            control: None,
         }
     }
 
@@ -316,13 +556,20 @@ mod tests {
             rect: rect(0.0, 0.0, 10.0),
             baseline: 8.0,
             fragments: vec![LineFragment::Text(TextFragment {
+                cursor: "auto".into(),
+                user_select: "auto".into(),
+                text_rendering: "auto".into(),
+                hidden: false,
                 node: NodeID::new(3),
                 element: Some(NodeID::new(1)),
                 rect: rect(0.0, 0.0, 10.0),
                 baseline: 8.0,
                 text: "a".into(),
                 font_size: 10.0,
+                font: crate::FontId::DEFAULT,
                 color: BoxStyle::default().text_color,
+                text_decoration: Vec::new(),
+                clip: None,
             })],
         });
         let sibling = block(Some(2), rect(0.0, 10.0, 10.0), Vec::new());
@@ -338,6 +585,7 @@ mod tests {
                 }
                 PaintItem::InlineBox(_) => "inline".to_owned(),
                 PaintItem::Text(text) => format!("text {}", text.text),
+                PaintItem::Image(_) => "image".to_owned(),
             })
             .collect::<Vec<_>>();
         assert_eq!(order, ["box None", "box Some(1)", "box Some(2)", "text a"]);

@@ -36,6 +36,8 @@ pub struct Chunk {
 pub enum CallableKind {
     /// A `function` declaration: callable, and constructible with `new`.
     Function,
+    /// An arrow function: callable but not constructible with `new`.
+    Arrow,
     /// A class method: callable with a receiver, never constructible.
     Method,
     /// A class constructor with no superclass. It must be run with `new`.
@@ -51,7 +53,7 @@ pub enum CallableKind {
 impl CallableKind {
     /// Whether `new` may run a function of this kind.
     pub fn is_constructor(self) -> bool {
-        !matches!(self, Self::Method)
+        !matches!(self, Self::Method | Self::Arrow)
     }
 
     /// Whether this kind is a class constructor.
@@ -73,9 +75,29 @@ pub struct FunctionTemplate {
     /// Number of declared parameters. Extra arguments are ignored and
     /// missing ones are `undefined`.
     pub param_count: u16,
+    /// Captured environments required by this function, in creation order.
+    pub captures: Vec<CaptureSource>,
     /// The function body, shared by every function value made from this
     /// template. Its [`Chunk::functions`] hold nested templates.
     pub chunk: Arc<Chunk>,
+}
+
+/// Describes where a closure obtains one of its captured bindings when it is
+/// created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureSource {
+    /// A binding in the currently running function's lexical scope chain.
+    Local {
+        /// Scope depth in the current frame.
+        depth: u16,
+        /// Slot within that scope.
+        slot: u16,
+    },
+    /// A binding already captured by the currently running function.
+    Capture {
+        /// Index of the binding in the current function's captures.
+        index: u16,
+    },
 }
 
 impl Chunk {
@@ -147,6 +169,8 @@ impl Chunk {
             Instruction::Jump(target) => format!("JUMP -> {target:04}"),
             Instruction::JumpIfFalse(target) => format!("JUMP_IF_FALSE -> {target:04}"),
             Instruction::JumpIfTrue(target) => format!("JUMP_IF_TRUE -> {target:04}"),
+            Instruction::JumpIfNullish(target) => format!("JUMP_IF_NULLISH -> {target:04}"),
+            Instruction::EnterTry(target) => format!("ENTER_TRY -> {target:04}"),
             Instruction::DeclareGlobal { slot, name, .. }
             | Instruction::DeclareLocal { slot, name, .. }
             | Instruction::InitializeGlobal { slot, name }
@@ -183,7 +207,12 @@ impl Chunk {
     pub fn emit_jump(&mut self, instruction: Instruction) -> Result<usize, &'static str> {
         if !matches!(
             instruction,
-            Instruction::Jump(_) | Instruction::JumpIfFalse(_) | Instruction::JumpIfTrue(_)
+            Instruction::Jump(_)
+                | Instruction::JumpIfFalse(_)
+                | Instruction::JumpIfTrue(_)
+                | Instruction::JumpIfNullish(_)
+                | Instruction::IteratorNext(_)
+                | Instruction::EnterTry(_)
         ) {
             return Err("instruction is not patchable");
         }
@@ -199,7 +228,10 @@ impl Chunk {
         match instruction {
             Instruction::Jump(target_slot)
             | Instruction::JumpIfFalse(target_slot)
-            | Instruction::JumpIfTrue(target_slot) => *target_slot = target,
+            | Instruction::JumpIfTrue(target_slot)
+            | Instruction::JumpIfNullish(target_slot)
+            | Instruction::IteratorNext(target_slot)
+            | Instruction::EnterTry(target_slot) => *target_slot = target,
             _ => return Err("instruction is not patchable"),
         }
         Ok(())

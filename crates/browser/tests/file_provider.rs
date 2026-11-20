@@ -699,7 +699,7 @@ fn file_navigation_requires_a_browser_issued_single_use_authorization() {
 
     let authorized = navigation(&file_access, url);
     let response = runtime
-        .block_on(controller.fetch(authorized.clone()))
+        .block_on(controller.fetch(authorized.try_clone().unwrap()))
         .unwrap();
     drop(response);
     assert!(matches!(

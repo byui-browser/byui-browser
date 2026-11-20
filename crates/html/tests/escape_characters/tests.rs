@@ -9,10 +9,10 @@ mod entity_table;
 /// element exists; callers that need optional lookup should use `query`.
 fn element_id(document: &HTMLDocument, name: &str) -> NodeID {
     document
-        .nodes
+        .get_nodes()
         .iter()
         .position(
-            |node| matches!(&node.kind, NodeKind::Element(element) if element.get_name() == name),
+            |node| matches!(node.get_kind(), NodeKind::Element(element) if element.get_name() == name),
         )
         .map(NodeID::new)
         .unwrap_or_else(|| panic!("missing <{name}> element"))
@@ -28,7 +28,7 @@ fn attribute_value<'a>(
     name: &str,
 ) -> Option<&'a str> {
     let id = element_id(document, element_name);
-    let NodeKind::Element(element) = &document.nodes[id.get()].kind else {
+    let NodeKind::Element(element) = document.get_nodes()[id.get()].get_kind() else {
         unreachable!("element lookup returns an element")
     };
     element
@@ -199,10 +199,9 @@ fn decoded_less_than_stays_a_text_node() {
     let id = element_id(&document, "p");
     assert_eq!(document.text_content(id), Some("<h1>hello</h1>".into()));
     assert!(
-        document
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.kind, NodeKind::Text(text) if text == "<h1>hello</h1>"))
+        document.get_nodes().iter().any(
+            |node| matches!(node.get_kind(), NodeKind::Text(text) if text == "<h1>hello</h1>")
+        )
     );
 }
 

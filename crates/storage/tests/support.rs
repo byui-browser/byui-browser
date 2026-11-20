@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::ipc::{StorageRequest, StorageResponse};
-use security::{Origin, StorageKey};
+use security::{Origin, RendererSecurityContext, StorageKey, StoragePermission};
 use storage::{PersistentOriginStorage, StorageLimits};
 
 /// The default origin used by Storage tests.
@@ -22,6 +22,14 @@ pub fn other_origin() -> Origin {
 /// Builds a storage key for an origin.
 pub fn storage_key_for(origin: Origin) -> StorageKey {
     StorageKey::new(origin)
+}
+
+/// Builds a renderer context that is allowed to use `storage_key`.
+///
+/// Call `trusted_storage_key()` on the returned context to obtain the key
+/// accepted by storage APIs; the context must outlive that key.
+pub fn context_for(storage_key: &StorageKey) -> RendererSecurityContext {
+    RendererSecurityContext::new(storage_key.get().clone(), StoragePermission::Allowed)
 }
 
 /// Creates a uniquely named temporary storage directory.

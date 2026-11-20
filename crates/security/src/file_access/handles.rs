@@ -44,16 +44,29 @@ impl TrustedDirectorySelection {
         directory: Dir,
     ) -> Result<Self, FileAccessError> {
         if !canonical_path.is_absolute() || canonical_path.as_os_str().is_empty() {
+            log::warn!(
+                "trusted directory rejected: {} is not an absolute path",
+                canonical_path.display()
+            );
             return Err(FileAccessError::InvalidPath);
         }
 
         let resolved_path = fs::canonicalize(&canonical_path).map_err(FileAccessError::from)?;
         if resolved_path != canonical_path {
+            log::warn!(
+                "trusted directory rejected: {} is not canonical",
+                canonical_path.display()
+            );
             return Err(FileAccessError::InvalidPath);
         }
         if !same_directory(&canonical_path, &directory)? {
+            log::warn!(
+                "trusted directory rejected: handle does not match {}",
+                canonical_path.display()
+            );
             return Err(FileAccessError::Denied);
         }
+        log::debug!("trusted directory selected: {}", canonical_path.display());
 
         Ok(Self {
             canonical_path,

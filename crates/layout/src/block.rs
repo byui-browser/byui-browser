@@ -5,9 +5,13 @@
 //! origin of the box being laid out; the parent translates them into place.
 
 use crate::box_tree::{BlockBox, BlockContents};
+use crate::control::SELECT_ARROW_ROOM;
 use crate::layout::Context;
-use crate::style::{ComputedStyle, Dimension};
-use crate::tree::{BoxKind, BoxStyle, LayoutBox};
+use std::sync::Arc;
+
+use crate::positioned::{FloatContext, FloatScope, PendingAbsolute, relative_offset};
+use crate::style::{BoxSizing, ComputedStyle, Dimension, Position};
+use crate::tree::{BoxKind, BoxStyle, LayoutBox, LineBox, LineFragment, Placement};
 use crate::{Edges, Rect};
 
 /// Adjoining vertical margins, collapsed as CSS 2.2 §8.3.1 describes: the
@@ -58,26 +62,52 @@ pub(crate) struct BlockResult {
     /// Whether the box's top and bottom margins are adjoining (an empty box
     /// that margins collapse through).
     pub collapses_through: bool,
+    /// The `position: relative` offset to add once the box is placed.
+    pub relative: (f32, f32),
+    /// Absolutely positioned descendants this box does not contain, relative
+    /// to its border-box origin.
+    pub absolutes: Vec<PendingAbsolute>,
 }
 
 impl Context<'_> {
     /// Lays out a block-level, non-replaced box in normal flow. Widths follow
     /// CSS 2.2 §10.3.3 for left-to-right text.
-    pub(crate) fn layout_block_level(&self, block: &BlockBox, cb: ContainingBlock) -> BlockResult {
+    ///
+    /// `floats` is the parent's float scope moved to where the box's top
+    /// margin edge is expected; `None` lays the box out without floats.
+    pub(crate) fn layout_block_level(
+        &self,
+        block: &BlockBox,
+        cb: ContainingBlock,
+        floats: Option<FloatScope<'_>>,
+    ) -> BlockResult {
         let style = &block.style;
         let basis = Some(cb.width);
-        let padding = style
-            .padding
-            .map(|value| value.resolve_or_zero(basis))
-            .horizontal();
+        let padding = style.outer_edges(basis).horizontal();
         let margin_left = style.margin.left.resolve(basis);
         let margin_right = style.margin.right.resolve(basis);
-        let (left, width, right) = match style.width.resolve(basis) {
+        let used_width = match &block.contents {
+            // A replaced box's width is never `auto` by now (CSS 2.2
+            // §10.3.4): it comes from its natural size or ratio.
+            BlockContents::Replaced(replaced) => {
+                Some(replaced.used_size(style, basis, cb.height).0)
+            }
+            _ => style
+                .content_width(basis)
+                .or_else(|| self.intrinsic_content_width(block, (cb.width - padding).max(0.0)))
+                .or(self.control_size(block, basis, cb.height).width),
+        };
+        let (mut left, mut width, mut right) = match used_width {
             None => {
                 // `auto` margins become 0 and the width fills the rest.
                 let left = margin_left.unwrap_or(0.0);
                 let right = margin_right.unwrap_or(0.0);
                 let width = (cb.width - left - right - padding).max(0.0);
+                log::trace!(
+                    "node {:?}: auto width resolved to {width} in containing block {}",
+                    block.node,
+                    cb.width
+                );
                 (left, width, cb.width - left - padding - width)
             }
             Some(width) => {
@@ -86,52 +116,137 @@ impl Context<'_> {
                 let remaining = cb.width - padding - width;
                 match (margin_left, margin_right) {
                     _ if fixed > cb.width => {
+                        log::trace!(
+                            "node {:?}: over-constrained width {width} in containing block {}; right margin absorbs the difference",
+                            block.node,
+                            cb.width
+                        );
                         // Over-constrained with `auto` margins treated as 0:
                         // the right margin absorbs the difference.
                         let left = margin_left.unwrap_or(0.0);
                         (left, width, remaining - left)
                     }
-                    (None, None) => (remaining / 2.0, width, remaining / 2.0),
+                    (None, None) => {
+                        log::trace!(
+                            "node {:?}: auto left and right margins centered at {}",
+                            block.node,
+                            remaining / 2.0
+                        );
+                        (remaining / 2.0, width, remaining / 2.0)
+                    }
                     (None, Some(right)) => (remaining - right, width, right),
                     (Some(left), _) => (left, width, remaining - left),
                 }
             }
         };
+        if let Some(min_width) = style.content_width_for(style.min_width, basis)
+            && width < min_width
+        {
+            width = min_width;
+            let remaining = cb.width - padding - width;
+            match (margin_left, margin_right) {
+                (None, None) if remaining >= 0.0 => {
+                    left = remaining / 2.0;
+                    right = remaining / 2.0;
+                }
+                (None, Some(right_margin)) => {
+                    left = remaining - right_margin;
+                    right = right_margin;
+                }
+                (Some(left_margin), _) => {
+                    left = left_margin;
+                    right = remaining - left_margin;
+                }
+                (None, None) => {
+                    left = 0.0;
+                    right = remaining;
+                }
+            }
+        }
         let kind = if block.node.is_some() {
             BoxKind::Block
         } else {
             BoxKind::AnonymousBlock
         };
-        self.layout_block_container(block, cb, kind, width, (left, right))
+        let floats = floats.map(|floats| floats.offset(left, 0.0));
+        self.layout_block_container(block, cb, kind, width, (left, right), floats)
     }
 
     /// Lays out an atomic inline-level block container (an inline-block):
     /// `auto` margins are zero and an `auto` width shrinks to fit
     /// (CSS 2.2 §10.3.9, §10.6.6).
     pub(crate) fn layout_inline_block(&self, block: &BlockBox, cb_width: f32) -> BlockResult {
+        self.layout_shrink_to_fit(block, cb_width, BoxKind::InlineBlock)
+    }
+
+    /// Lays out a box whose `auto` margins are zero and whose `auto` width
+    /// shrinks to fit, as inline-blocks and floats are (CSS 2.2 §10.3.5,
+    /// §10.3.9).
+    pub(crate) fn layout_shrink_to_fit(
+        &self,
+        block: &BlockBox,
+        cb_width: f32,
+        kind: BoxKind,
+    ) -> BlockResult {
         let style = &block.style;
         let basis = Some(cb_width);
-        let padding = style
-            .padding
-            .map(|value| value.resolve_or_zero(basis))
-            .horizontal();
+        let padding = style.outer_edges(basis).horizontal();
         let margin_left = style.margin.left.resolve_or_zero(basis);
         let margin_right = style.margin.right.resolve_or_zero(basis);
-        let width = style.width.resolve(basis).unwrap_or_else(|| {
+        let replaced_width = match &block.contents {
+            BlockContents::Replaced(replaced) => Some(replaced.used_size(style, basis, None).0),
+            _ => None,
+        };
+        let mut width = replaced_width
+            .or(style.content_width(basis))
+            .or_else(|| {
+                self.intrinsic_content_width(
+                    block,
+                    (cb_width - margin_left - margin_right - padding).max(0.0),
+                )
+            })
+            .or(self.control_size(block, basis, None).width)
+            .unwrap_or_else(|| {
             let (min_content, max_content) = self.intrinsic_content_sizes(block);
             let available = cb_width - margin_left - margin_right - padding;
-            max_content.min(available.max(min_content))
+            let width = max_content.min(available.max(min_content));
+            log::trace!(
+                "node {:?}: shrink-to-fit width {width} (min-content {min_content}, max-content {max_content}, available {available})",
+                block.node
+            );
+            width
         });
+        if let Some(min_width) = style.content_width_for(style.min_width, basis) {
+            width = width.max(min_width);
+        }
         self.layout_block_container(
             block,
             ContainingBlock {
                 width: cb_width,
                 height: None,
             },
-            BoxKind::InlineBlock,
+            kind,
             width,
             (margin_left, margin_right),
+            None,
         )
+    }
+
+    /// Lays out a block container whose used content width and horizontal
+    /// margins are already known, as for absolutely positioned boxes.
+    pub(crate) fn layout_block_container_at(
+        &self,
+        block: &BlockBox,
+        cb: ContainingBlock,
+        content_width: f32,
+        margins: (f32, f32),
+    ) -> BlockResult {
+        let kind = if block.node.is_some() {
+            BoxKind::Block
+        } else {
+            BoxKind::AnonymousBlock
+        };
+        self.layout_block_container(block, cb, kind, content_width, margins, None)
     }
 
     /// Lays out the initial containing block: a viewport-sized block
@@ -143,7 +258,9 @@ impl Context<'_> {
     ) -> LayoutBox {
         let mut children = Vec::new();
         let mut lines = Vec::new();
-        match &block.contents {
+        let mut float_context = FloatContext::default();
+        let mut floats = FloatScope::new(&mut float_context);
+        let absolutes = match &block.contents {
             BlockContents::Blocks(list) => {
                 self.layout_flow(
                     list,
@@ -151,12 +268,26 @@ impl Context<'_> {
                     Some(viewport.height),
                     FlowEdges::isolated(),
                     &mut children,
-                );
+                    &mut floats,
+                )
+                .absolutes
             }
             BlockContents::Inlines(items) => {
-                lines = self.layout_inline(items, &block.style, viewport.width);
+                let inline = self.layout_inline(items, &block.style, viewport.width, &mut floats);
+                lines = inline.lines;
+                children.extend(inline.floats);
+                inline.absolutes
             }
-        }
+            // The initial containing block is never generated by an element.
+            BlockContents::Replaced(_) => Vec::new(),
+        };
+        let viewport_rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: viewport.width,
+            height: viewport.height,
+        };
+        self.place_absolutes(absolutes, viewport_rect, true, &mut children);
         LayoutBox {
             kind: BoxKind::Viewport,
             node: None,
@@ -169,8 +300,12 @@ impl Context<'_> {
             margin: Edges::default(),
             padding: Edges::default(),
             style: box_style(&block.style),
+            placement: Placement::InFlow,
             children,
             lines,
+            select_arrow: false,
+            image: None,
+            control: None,
         }
     }
 
@@ -183,15 +318,26 @@ impl Context<'_> {
         kind: BoxKind,
         content_width: f32,
         (margin_left, margin_right): (f32, f32),
+        floats: Option<FloatScope<'_>>,
     ) -> BlockResult {
+        let kind = match block.contents {
+            BlockContents::Replaced(_) => BoxKind::Replaced,
+            _ => kind,
+        };
         let style = &block.style;
         let basis = Some(cb.width);
-        let padding = style.padding.map(|value| value.resolve_or_zero(basis));
+        let padding = style.outer_edges(basis);
         let margin_top = style.margin.top.resolve_or_zero(basis);
         let margin_bottom = style.margin.bottom.resolve_or_zero(basis);
         // Percentage heights resolve only against a definite containing block
         // height; otherwise they behave as `auto` (CSS 2.2 §10.5).
-        let specified_height = style.height.resolve(cb.height);
+        let control = self.control_size(block, basis, cb.height);
+        let specified_height = match &block.contents {
+            BlockContents::Replaced(replaced) => {
+                Some(replaced.used_size(style, basis, cb.height).1)
+            }
+            _ => style.content_height(basis, cb.height).or(control.height),
+        };
 
         let edges = FlowEdges {
             collapse_top: !block.establishes_bfc && padding.top == 0.0,
@@ -203,21 +349,118 @@ impl Context<'_> {
         };
         let mut children = Vec::new();
         let mut lines = Vec::new();
-        let flow = match &block.contents {
+        // A formatting context root keeps its floats to itself; any other
+        // block container shares its parent's, from its content-box origin.
+        let mut own_floats = FloatContext::default();
+        let scope = match floats {
+            Some(floats) if !block.establishes_bfc => floats,
+            _ => FloatScope::new(&mut own_floats),
+        };
+        let mut floats = scope.offset(padding.left, padding.top);
+        let mut flow = match &block.contents {
             BlockContents::Blocks(list) => {
-                self.layout_flow(list, content_width, specified_height, edges, &mut children)
+                if matches!(
+                    style.display,
+                    crate::style::Display::Box {
+                        inside: crate::style::DisplayInside::Flex
+                            | crate::style::DisplayInside::Table,
+                        ..
+                    }
+                ) {
+                    self.layout_flex(list, content_width, specified_height, style, &mut children)
+                } else {
+                    self.layout_flow(
+                        list,
+                        content_width,
+                        specified_height,
+                        edges,
+                        &mut children,
+                        &mut floats,
+                    )
+                }
             }
-            BlockContents::Inlines(items) => {
-                lines = self.layout_inline(items, style, content_width);
+            BlockContents::Inlines(items) if block.is_drop_down() => {
+                // One unbroken line beside the arrow; text that doesn't fit
+                // is clipped where the arrow area starts.
+                let text_width = (content_width - SELECT_ARROW_ROOM).max(0.0);
+                let (_, max_content) = self.inline_intrinsic_sizes(items, style);
+                let inline =
+                    self.layout_inline(items, style, text_width.max(max_content), &mut floats);
+                lines = inline.lines;
+                children.extend(inline.floats);
+                self.clip_lines(&mut lines, text_width, content_width);
                 FlowResult {
                     height: lines.last().map_or(0.0, |line| line.rect.bottom()),
                     margin_top: edges.own_top,
                     margin_bottom: edges.own_bottom,
                     has_content: !lines.is_empty(),
+                    absolutes: inline.absolutes,
                 }
             }
+            BlockContents::Inlines(items) => {
+                let inline = self.layout_inline(items, style, content_width, &mut floats);
+                lines = inline.lines;
+                children.extend(inline.floats);
+                if lines.is_empty() && block.centers_lines {
+                    // A single-line control with no text (an empty field or
+                    // `<input type=button>`) keeps one empty strut line, so
+                    // it is one line tall and has a baseline to align by.
+                    let metrics = self
+                        .fonts
+                        .font_vertical_metrics(style.font, style.font_size);
+                    lines.push(LineBox {
+                        rect: Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: content_width,
+                            height: metrics.ascent + metrics.descent + metrics.line_gap,
+                        },
+                        baseline: metrics.ascent + metrics.line_gap / 2.0,
+                        fragments: Vec::new(),
+                    });
+                }
+                let height = lines.last().map_or(0.0, |line| line.rect.bottom());
+                FlowResult {
+                    height,
+                    margin_top: edges.own_top,
+                    margin_bottom: edges.own_bottom,
+                    has_content: !lines.is_empty(),
+                    absolutes: inline.absolutes,
+                }
+            }
+            BlockContents::Replaced(_) => FlowResult {
+                height: 0.0,
+                margin_top: edges.own_top,
+                margin_bottom: edges.own_bottom,
+                has_content: true,
+                absolutes: Vec::new(),
+            },
         };
-        let content_height = specified_height.unwrap_or(flow.height);
+        // A formatting context root's `auto` height grows to contain its
+        // floats (CSS 2.2 §10.6.7).
+        if block.establishes_bfc
+            && let Some(bottom) = floats.bottom()
+        {
+            flow.height = flow.height.max(bottom);
+        }
+        let content_height = specified_height
+            .unwrap_or(flow.height.max(control.min_height))
+            .min(
+                style
+                    .content_height_for(style.max_height, basis, cb.height)
+                    .unwrap_or(f32::INFINITY),
+            )
+            .max(
+                style
+                    .content_height_for(style.min_height, basis, cb.height)
+                    .unwrap_or(0.0),
+            );
+        if specified_height.is_none() {
+            log::trace!(
+                "node {:?}: auto height resolved to {content_height}",
+                block.node
+            );
+        }
         let collapses_through = !block.establishes_bfc
             && !flow.has_content
             && padding.vertical() == 0.0
@@ -226,38 +469,132 @@ impl Context<'_> {
         for child in &mut children {
             child.translate(padding.left, padding.top);
         }
+        // Single-line controls center their text vertically (CSS Basic UI
+        // leaves this to the user agent; Chrome centers it). In a box shorter
+        // than its line the text overflows both edges equally and is clipped.
+        let line_offset = if block.centers_lines {
+            (content_height - flow.height) / 2.0
+        } else {
+            0.0
+        };
         for line in &mut lines {
-            line.translate(padding.left, padding.top);
+            line.translate(padding.left, padding.top + line_offset);
         }
+        // Text overflow is supported for left-to-right text runs. Atomic inline
+        // content and bidi marker placement are not yet truncated.
+        if style.clip_overflow && !block.clips_contents {
+            let clip = Rect {
+                x: padding.left,
+                y: padding.top,
+                width: content_width,
+                height: content_height,
+            };
+            for line in &mut lines {
+                for fragment in &mut line.fragments {
+                    if let LineFragment::Text(text) = fragment
+                        && style.ellipsis
+                        && text.rect.right() > clip.right()
+                    {
+                        let marker = self.fonts.font_text_width(text.font, "…", text.font_size);
+                        let available = (clip.right() - text.rect.x - marker).max(0.0);
+                        while !text.text.is_empty()
+                            && self
+                                .fonts
+                                .font_text_width(text.font, &text.text, text.font_size)
+                                > available
+                        {
+                            text.text.pop();
+                        }
+                        text.text.push('…');
+                        text.rect.width =
+                            self.fonts
+                                .font_text_width(text.font, &text.text, text.font_size);
+                    }
+                }
+            }
+            clip_text(&mut lines, clip);
+        }
+        if block.clips_contents {
+            // Control text is clipped to the padding box, inside the borders.
+            let border = style.borders.border_width;
+            let clip = Rect {
+                x: border.left,
+                y: border.top,
+                width: content_width + padding.horizontal() - border.horizontal(),
+                height: content_height + padding.vertical() - border.vertical(),
+            };
+            clip_text(&mut lines, clip);
+        }
+        let mut absolutes = flow.absolutes;
+        for absolute in &mut absolutes {
+            absolute.translate(padding.left, padding.top);
+        }
+        let border_box = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: content_width + padding.horizontal(),
+            height: content_height + padding.vertical(),
+        };
+        // A positioned box is the containing block of its absolutely
+        // positioned descendants: its padding box (CSS 2.2 §10.1).
+        if style.is_positioned() && !absolutes.is_empty() {
+            let b = style.borders.border_width;
+            let padding_box = Rect {
+                x: b.left,
+                y: b.top,
+                width: (border_box.width - b.horizontal()).max(0.0),
+                height: (border_box.height - b.vertical()).max(0.0),
+            };
+            absolutes = self.place_absolutes(absolutes, padding_box, false, &mut children);
+        }
+        log::trace!(
+            "laid out {kind:?} node {:?}: content {}x{}, margin top/bottom {margin_top}/{margin_bottom}, {} children, {} lines",
+            block.node,
+            content_width + padding.horizontal(),
+            content_height + padding.vertical(),
+            children.len(),
+            lines.len()
+        );
         BlockResult {
             fragment: LayoutBox {
                 kind,
                 node: block.node,
-                rect: Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    width: content_width + padding.horizontal(),
-                    height: content_height + padding.vertical(),
-                },
+                rect: border_box,
                 margin: Edges {
                     top: margin_top,
                     right: margin_right,
                     bottom: margin_bottom,
                     left: margin_left,
                 },
-                padding,
+                padding: style.padding.map(|v| v.resolve_or_zero(basis)),
                 style: box_style(style),
+                placement: placement(style),
                 children,
                 lines,
+                select_arrow: block.is_drop_down(),
+                image: match &block.contents {
+                    BlockContents::Replaced(replaced) => replaced.key.clone(),
+                    _ => None,
+                },
+                control: match &block.contents {
+                    BlockContents::Replaced(replaced) => replaced.control,
+                    _ => None,
+                },
             },
             margin_top: flow.margin_top,
             margin_bottom: flow.margin_bottom,
             collapses_through,
+            relative: relative_offset(style, cb),
+            absolutes,
         }
     }
 
     /// Stacks block-level children vertically, collapsing adjoining margins.
     /// Fragments are pushed relative to the parent's content-box origin.
+    ///
+    /// Floats are placed in `floats` and absolutely positioned children are
+    /// returned as pending, both at the position the next in-flow box would
+    /// take.
     fn layout_flow(
         &self,
         list: &[BlockBox],
@@ -265,6 +602,7 @@ impl Context<'_> {
         definite_height: Option<f32>,
         edges: FlowEdges,
         children: &mut Vec<LayoutBox>,
+        floats: &mut FloatScope<'_>,
     ) -> FlowResult {
         let cb = ContainingBlock {
             width: content_width,
@@ -274,13 +612,47 @@ impl Context<'_> {
         let mut pending = CollapsibleMargin::default();
         let mut cursor = 0.0_f32;
         let mut has_content = false;
+        let mut absolutes = Vec::new();
         for child in list {
-            let result = self.layout_block_level(child, cb);
-            let y = if !has_content && edges.collapse_top {
+            let still_collapsing_top = !has_content && edges.collapse_top;
+            if child.style.is_out_of_flow() {
+                let y = if still_collapsing_top {
+                    0.0
+                } else {
+                    cursor + pending.resolve()
+                };
+                if child.style.is_floated() {
+                    let (fragment, nested) = self.layout_float(child, content_width, floats, y);
+                    children.push(fragment);
+                    absolutes.extend(nested);
+                } else {
+                    absolutes.push(PendingAbsolute {
+                        block: child.clone(),
+                        x: 0.0,
+                        y,
+                    });
+                }
+                continue;
+            }
+            // Where the child's top border edge is expected, so floats can
+            // be found before its own margins finish collapsing.
+            let expected_y = if still_collapsing_top {
+                0.0
+            } else {
+                let mut margin = pending;
+                margin.adjoin(CollapsibleMargin::new(
+                    child.style.margin.top.resolve_or_zero(Some(content_width)),
+                ));
+                cursor + margin.resolve()
+            };
+            let result = self.layout_block_level(child, cb, Some(floats.reborrow(0.0, expected_y)));
+            let y = if still_collapsing_top {
+                log::trace!("child margin collapses with parent top margin");
                 // Still adjoining the parent's top margin: the child's margins
                 // collapse with it and the child sits at the content edge.
                 margin_top.adjoin(result.margin_top);
                 if result.collapses_through {
+                    log::trace!("empty child: margins collapse through it");
                     margin_top.adjoin(result.margin_bottom);
                 } else {
                     has_content = true;
@@ -291,6 +663,10 @@ impl Context<'_> {
             } else {
                 pending.adjoin(result.margin_top);
                 let y = cursor + pending.resolve();
+                log::trace!(
+                    "sibling margins collapsed to {} before child at y {y}",
+                    pending.resolve()
+                );
                 if result.collapses_through {
                     pending.adjoin(result.margin_bottom);
                 } else {
@@ -300,9 +676,10 @@ impl Context<'_> {
                 }
                 y
             };
-            let mut fragment = result.fragment;
-            fragment.translate(fragment.margin.left, y);
+            let margin_left = result.fragment.margin.left;
+            let (fragment, nested) = result.place(margin_left, y);
             children.push(fragment);
+            absolutes.extend(nested);
         }
         if edges.collapse_bottom {
             let mut margin_bottom = pending;
@@ -312,6 +689,7 @@ impl Context<'_> {
                 margin_top,
                 margin_bottom,
                 has_content,
+                absolutes,
             }
         } else {
             FlowResult {
@@ -319,21 +697,287 @@ impl Context<'_> {
                 margin_top,
                 margin_bottom: edges.own_bottom,
                 has_content,
+                absolutes,
             }
+        }
+    }
+
+    /// Lays out a single flex line in row or column direction. Wrapping,
+    /// shrink factors, alignment, and baseline alignment are not implemented.
+    ///
+    /// Absolutely positioned children are not flex items; their static
+    /// position is the container's content-box origin. `float` does not apply
+    /// to flex items, so floated children are laid out as ordinary items.
+    fn layout_flex(
+        &self,
+        list: &[BlockBox],
+        width: f32,
+        height: Option<f32>,
+        style: &ComputedStyle,
+        children: &mut Vec<LayoutBox>,
+    ) -> FlowResult {
+        let (absolute, items): (Vec<&BlockBox>, Vec<&BlockBox>) = list
+            .iter()
+            .partition(|item| item.style.is_absolutely_positioned());
+        let mut absolutes = absolute
+            .into_iter()
+            .map(|block| PendingAbsolute {
+                block: block.clone(),
+                x: 0.0,
+                y: 0.0,
+            })
+            .collect::<Vec<_>>();
+        let list = items;
+        if list.is_empty() {
+            return FlowResult {
+                height: 0.0,
+                margin_top: CollapsibleMargin::default(),
+                margin_bottom: CollapsibleMargin::default(),
+                has_content: false,
+                absolutes,
+            };
+        }
+        let column = style.flex_column;
+        let available = if column { height.unwrap_or(0.0) } else { width };
+        let gaps = style.gap * list.len().saturating_sub(1) as f32;
+        // Each item's main-axis padding: free space is what is left after
+        // the items' outer sizes, not just their content sizes.
+        let main_padding = |item: &BlockBox| {
+            let padding = item.style.outer_edges(Some(width));
+            if column {
+                padding.vertical()
+            } else {
+                padding.horizontal()
+            }
+        };
+        // The border-box height of an item laid out at its natural height,
+        // converted to a content-box height.
+        let natural_content_height = |item: &BlockBox| {
+            let border_box = self
+                .layout_block_level(
+                    item,
+                    ContainingBlock {
+                        width,
+                        height: None,
+                    },
+                    None,
+                )
+                .fragment
+                .rect
+                .height;
+            (border_box - main_padding(item)).max(0.0)
+        };
+        // Content-box sizes along the main axis. `flex-basis`, like the main
+        // size property, measures the box `box-sizing` selects.
+        let basis = list
+            .iter()
+            .map(|item| {
+                let basis_size = if column {
+                    item.style
+                        .content_height_for(item.style.flex_basis, Some(width), height)
+                } else {
+                    item.style
+                        .content_width_for(item.style.flex_basis, Some(width))
+                };
+                basis_size.unwrap_or_else(|| {
+                    if column {
+                        item.style
+                            .content_height(Some(width), height)
+                            .unwrap_or_else(|| natural_content_height(item))
+                    } else {
+                        item.style
+                            .content_width(Some(width))
+                            .unwrap_or_else(|| self.intrinsic_content_sizes(item).1)
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        // Content-box minimum main sizes that shrinking never goes below.
+        let minimums = list
+            .iter()
+            .map(|item| {
+                if column {
+                    if item.style.min_height_auto {
+                        natural_content_height(item)
+                    } else {
+                        item.style
+                            .content_height_for(item.style.min_height, Some(width), height)
+                            .unwrap_or(0.0)
+                    }
+                } else if item.style.min_width_auto {
+                    self.intrinsic_content_sizes(item).0
+                } else {
+                    item.style
+                        .content_width_for(item.style.min_width, Some(width))
+                        .unwrap_or(0.0)
+                }
+                .max(0.0)
+            })
+            .collect::<Vec<_>>();
+        let outer: f32 = list
+            .iter()
+            .zip(&basis)
+            .map(|(item, base)| base + main_padding(item))
+            .sum();
+        let grow: f32 = list.iter().map(|item| item.style.flex_grow).sum();
+        let free = available - gaps - outer;
+        let shrink: f32 = list
+            .iter()
+            .zip(&basis)
+            .map(|(item, base)| item.style.flex_shrink * base.max(0.0))
+            .sum();
+        let targets = list
+            .iter()
+            .zip(basis)
+            .zip(minimums)
+            .map(|((item, base), minimum)| {
+                if free >= 0.0 && grow > 0.0 {
+                    base + free * item.style.flex_grow / grow
+                } else if free < 0.0 && shrink > 0.0 {
+                    (base + free * item.style.flex_shrink * base.max(0.0) / shrink).max(minimum)
+                } else {
+                    base
+                }
+            })
+            .collect::<Vec<_>>();
+        let remaining = available
+            - gaps
+            - list
+                .iter()
+                .zip(&targets)
+                .map(|(item, target)| target + main_padding(item))
+                .sum::<f32>();
+        let count = list.len() as f32;
+        let (leading_space, extra_gap) = if remaining <= 0.0 {
+            (0.0, 0.0)
+        } else {
+            match style.flex_justify_content.as_str() {
+                "center" => (remaining / 2.0, 0.0),
+                "flex-end" | "end" => (remaining, 0.0),
+                "space-between" if count > 1.0 => (0.0, remaining / (count - 1.0)),
+                "space-around" => (remaining / (2.0 * count), remaining / count),
+                "space-evenly" => (remaining / (count + 1.0), remaining / (count + 1.0)),
+                _ => (0.0, 0.0),
+            }
+        };
+        let cross_available = if column {
+            Some(width)
+        } else {
+            style.content_height(Some(width), height)
+        };
+        let mut cursor = leading_space;
+        let mut cross = 0.0_f32;
+        for (index, (source, target)) in list.iter().zip(targets).enumerate() {
+            let item = source;
+            let distributed_gap = if index + 1 < list.len() {
+                extra_gap
+            } else {
+                0.0
+            };
+            let mut item = (*item).clone();
+            let mut computed = (*item.style).clone();
+            // `target` is a content size, whatever the item's `box-sizing`.
+            // Convert the cross size to a content size too before switching
+            // the item to `content-box`, so a border-box cross size keeps
+            // its padding inside it.
+            if computed.box_sizing == BoxSizing::BorderBox {
+                if column {
+                    if let Some(content) = computed.content_width(Some(width)) {
+                        computed.width = Dimension::Px(content);
+                    }
+                } else if let Some(content) = computed.content_height(Some(width), height) {
+                    computed.height = Dimension::Px(content);
+                }
+            }
+            computed.box_sizing = BoxSizing::ContentBox;
+            if column {
+                computed.height = Dimension::Px(target);
+            } else {
+                computed.width = Dimension::Px(target);
+            }
+            item.style = std::rc::Rc::new(computed);
+            let item_width = if column {
+                width
+            } else {
+                target + item.style.outer_edges(Some(width)).horizontal()
+            };
+            let result = self.layout_block_level(
+                &item,
+                ContainingBlock {
+                    width: item_width,
+                    height,
+                },
+                None,
+            );
+            let (margin, size) = (result.fragment.margin, result.fragment.rect);
+            let cross_free = cross_available
+                .map(|available| {
+                    (available - if column { size.width } else { size.height }).max(0.0)
+                })
+                .unwrap_or(0.0);
+            let cross_offset = match style.flex_align_items.as_str() {
+                "center" => cross_free / 2.0,
+                "flex-end" | "end" => cross_free,
+                _ => 0.0,
+            };
+            let (mut fragment, nested) = if column {
+                let placed = result.place(cross_offset, cursor + margin.top);
+                cursor += size.height + margin.vertical() + style.gap + distributed_gap;
+                cross = cross.max(size.width);
+                placed
+            } else {
+                let placed = result.place(cursor + margin.left, cross_offset);
+                cursor += size.width + margin.horizontal() + style.gap + distributed_gap;
+                cross = cross.max(size.height);
+                placed
+            };
+            if fragment.placement == Placement::Float {
+                fragment.placement = Placement::InFlow;
+            }
+            children.push(fragment);
+            absolutes.extend(nested);
+        }
+        FlowResult {
+            height: if column { cursor - style.gap } else { cross },
+            margin_top: CollapsibleMargin::default(),
+            margin_bottom: CollapsibleMargin::default(),
+            has_content: true,
+            absolutes,
         }
     }
 
     /// The min-content and max-content widths of a block container's content
     /// box (CSS Sizing 3 §5).
     pub(crate) fn intrinsic_content_sizes(&self, block: &BlockBox) -> (f32, f32) {
+        if let Some(width) = self.control_size(block, None, None).width {
+            return (width, width);
+        }
         match &block.contents {
             BlockContents::Blocks(list) => list
                 .iter()
+                .filter(|child| !child.style.is_absolutely_positioned())
                 .map(|child| self.intrinsic_outer_sizes(child))
                 .fold((0.0_f32, 0.0_f32), |(min, max), (child_min, child_max)| {
                     (min.max(child_min), max.max(child_max))
                 }),
             BlockContents::Inlines(items) => self.inline_intrinsic_sizes(items, &block.style),
+            BlockContents::Replaced(replaced) => {
+                // Percentages and `auto` resolve against an indefinite
+                // containing block when measuring intrinsic sizes.
+                let width = replaced.used_size(&block.style, None, None).0;
+                (width, width)
+            }
+        }
+    }
+
+    /// Resolves intrinsic width keywords for a non-replaced box.
+    fn intrinsic_content_width(&self, block: &BlockBox, available: f32) -> Option<f32> {
+        let (min_content, max_content) = self.intrinsic_content_sizes(block);
+        match block.style.width {
+            Dimension::MinContent => Some(min_content),
+            Dimension::MaxContent => Some(max_content),
+            Dimension::FitContent => Some(max_content.min(available.max(min_content))),
+            _ => None,
         }
     }
 
@@ -346,12 +990,16 @@ impl Context<'_> {
             Dimension::Px(px) => px,
             _ => 0.0,
         };
-        let outer = fixed(style.padding.left)
+        let outer = style.borders.border_width.horizontal()
+            + fixed(style.padding.left)
             + fixed(style.padding.right)
             + fixed(style.margin.left)
             + fixed(style.margin.right);
         let (min, max) = match style.width {
-            Dimension::Px(width) => (width, width),
+            Dimension::Px(_) => {
+                let width = style.content_width(None).unwrap_or(0.0);
+                (width, width)
+            }
             _ => self.intrinsic_content_sizes(block),
         };
         (min + outer, max + outer)
@@ -391,11 +1039,65 @@ struct FlowResult {
     /// Whether any in-flow child or line box keeps margins from collapsing
     /// through the container.
     has_content: bool,
+    /// Absolutely positioned boxes found in the content, relative to the
+    /// content-box origin.
+    absolutes: Vec<PendingAbsolute>,
+}
+
+/// The fragment placement for a box with `style`.
+fn placement(style: &ComputedStyle) -> Placement {
+    match style.position {
+        Position::Relative => Placement::Relative,
+        Position::Sticky => Placement::Sticky,
+        Position::Absolute => Placement::Absolute,
+        Position::Fixed => Placement::Fixed,
+        Position::Static if style.is_floated() => Placement::Float,
+        Position::Static => Placement::InFlow,
+    }
+}
+
+/// Clips every text run in `lines`, including those of nested inline
+/// boxes, to `clip`, intersecting with any clip a run already has.
+fn clip_text(lines: &mut [LineBox], clip: Rect) {
+    for line in lines {
+        for fragment in &mut line.fragments {
+            if let LineFragment::Text(text) = fragment {
+                text.clip = Some(match text.clip {
+                    Some(inner) => intersect(inner, clip),
+                    None => clip,
+                });
+            }
+        }
+    }
+}
+
+/// The overlap of two rectangles; empty (zero-sized) when they are apart.
+fn intersect(a: Rect, b: Rect) -> Rect {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    Rect {
+        x,
+        y,
+        width: (a.right().min(b.right()) - x).max(0.0),
+        height: (a.bottom().min(b.bottom()) - y).max(0.0),
+    }
 }
 
 pub(crate) fn box_style(style: &ComputedStyle) -> BoxStyle {
     BoxStyle {
+        hidden: style.hidden,
+        cursor: style.cursor.clone(),
+        user_select: style.user_select.clone(),
         background_color: style.background_color,
         text_color: style.color,
+        border_width: style.borders.border_width,
+        border_color: style.borders.border_color,
+        border_style: style.borders.border_style.clone(),
+        outline_color: style.outline_color,
+        outline_width: style.outline_width,
+        outline_offset: style.outline_offset,
+        outline_style: style.outline_style.clone(),
+        border_radius: style.border_radius,
+        box_shadow: Arc::clone(&style.box_shadow),
     }
 }

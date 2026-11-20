@@ -1,6 +1,7 @@
 //! Console-only refreshing through the shared networking API.
 
 use std::io::{self, Write};
+use std::time::Instant;
 
 use chrome::BrowserState;
 use net::{CacheMode, Config, Request, RequestController, SchemeProviders};
@@ -23,12 +24,14 @@ impl RefreshClient {
     /// Returns initialization failures so the shell can report them without
     /// panicking. Retain one client for the lifetime of the browser window.
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        log::debug!("initializing refresh client");
         let runtime = Runtime::new()?;
         let controller = RequestController::builder(Config::default())
             .with_scheme_providers(
                 SchemeProviders::new().with_page(crate::byui_provider::provider()),
             )
             .build()?;
+        log::trace!("refresh controller built");
         Ok(Self {
             runtime,
             controller,
@@ -37,42 +40,49 @@ impl RefreshClient {
 
     /// Copies the current URL and schedules a fresh fetch on a background task.
     ///
-    /// Prints the requested URL, status and body to stdout, or a failure to
-    /// stderr. Returns a task handle that may be dropped without cancelling the
-    /// fetch. With no current URL, prints a diagnostic and returns `None`.
+    /// Prints the requested URL, status and body to stdout, or logs a failure
+    /// as an error. Returns a task handle that may be dropped without cancelling
+    /// the fetch. With no current URL, logs a warning and returns `None`.
     /// The borrowed state is never mutated or retained by the task.
     pub fn refresh(&self, state: &BrowserState) -> Option<JoinHandle<()>> {
         let Some(url) = state.current_url().map(str::to_owned) else {
-            let _ = writeln!(io::stderr().lock(), "Refresh skipped: no current URL.");
+            log::warn!("refresh unavailable: no current URL");
             return None;
         };
+        log::info!("reload requested: {url}");
         let controller = self.controller.clone();
         Some(self.runtime.spawn(async move {
             match report(&controller, &url).await {
                 Ok(message) => {
                     let _ = writeln!(io::stdout().lock(), "{message}");
                 }
-                Err(message) => {
-                    let _ = writeln!(io::stderr().lock(), "{message}");
-                }
+                Err(message) => log::error!("{}", message),
             }
         }))
     }
 }
 
 async fn report(controller: &RequestController, url: &str) -> Result<String, String> {
+    let started = Instant::now();
+    log::trace!("refresh fetch {url} bypassing cache");
     let mut request = Request::get(url);
     request.set_cache_mode(CacheMode::Reload);
     let response = controller
         .fetch(request)
         .await
-        .map_err(|error| format!("Refresh failed for {url}: {error}"))?;
+        .map_err(|error| format!("refresh failed for {url}: {error}"))?;
     let status = response.status;
+    log::debug!("refresh {url} -> {status}");
     let body = response
         .body
         .text()
         .await
-        .map_err(|error| format!("Refresh failed for {url} (status {status}): {error}"))?;
+        .map_err(|error| format!("refresh failed for {url} (status {status}): {error}"))?;
+    log::debug!(
+        "refresh {url} body read: {} bytes in {} ms",
+        body.len(),
+        started.elapsed().as_millis()
+    );
     Ok(format!("Refresh {url}\nStatus: {status}\n{body}"))
 }
 
@@ -267,7 +277,7 @@ mod tests {
                 .runtime
                 .block_on(report(&client.controller, url))
                 .unwrap_err();
-            assert!(message.starts_with(&format!("Refresh failed for {url}:")));
+            assert!(message.starts_with(&format!("refresh failed for {url}:")));
             client
                 .runtime
                 .block_on(client.refresh(&state).unwrap())
@@ -298,7 +308,7 @@ mod tests {
             .runtime
             .block_on(report(&client.controller, &url))
             .unwrap_err();
-        assert!(message.starts_with(&format!("Refresh failed for {url} (status 200):")));
+        assert!(message.starts_with(&format!("refresh failed for {url} (status 200):")));
         server.join().unwrap();
     }
 }

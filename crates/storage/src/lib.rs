@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use security::StorageKey;
+use security::{StorageKey, TrustedStorageKey};
 
 const FILE_MAGIC: &[u8] = b"BYUI-LS\0";
 const FILE_VERSION: u8 = 1;
@@ -148,6 +148,10 @@ impl LocalStorage {
 }
 
 /// In-memory storage areas partitioned by [`StorageKey`].
+///
+/// Operations require a [`TrustedStorageKey`] minted by a
+/// [`security::RendererSecurityContext`]. This prevents callers at the
+/// renderer boundary from selecting an arbitrary origin.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct OriginStorage {
     areas: HashMap<StorageKey, LocalStorage>,
@@ -160,25 +164,54 @@ impl OriginStorage {
         Self::default()
     }
 
-    /// Returns the value for `key` in an origin area.
+    /// Returns the value for `key` in the authorized origin area.
     #[must_use]
-    pub fn get_item(&self, storage_key: &StorageKey, key: &str) -> Option<&str> {
+    pub fn get_item(&self, storage_key: &TrustedStorageKey<'_>, key: &str) -> Option<&str> {
+        self.get_item_for_key(storage_key.storage_key(), key)
+    }
+
+    /// Stores `value` under `key` in the authorized origin area.
+    pub fn set_item(&mut self, storage_key: &TrustedStorageKey<'_>, key: &str, value: &str) {
+        self.set_item_for_key(storage_key.storage_key(), key, value);
+    }
+
+    fn get_item_for_key(&self, storage_key: &StorageKey, key: &str) -> Option<&str> {
         self.areas
             .get(storage_key)
             .and_then(|area| area.get_item(key))
     }
 
-    /// Stores `value` under `key` in an origin area.
-    pub fn set_item(&mut self, storage_key: &StorageKey, key: &str, value: &str) {
+    fn set_item_for_key(&mut self, storage_key: &StorageKey, key: &str, value: &str) {
+        if !self.areas.contains_key(storage_key) {
+            log::debug!("storage area opened for {}", storage_label(storage_key));
+        }
+        log::trace!(
+            "set_item key {key:?} ({} bytes) in {}",
+            value.len(),
+            storage_label(storage_key)
+        );
         self.areas
             .entry(storage_key.clone())
             .or_default()
             .set_item(key, value);
     }
 
-    /// Removes and returns a value from an origin area.
-    pub fn remove_item(&mut self, storage_key: &StorageKey, key: &str) -> Option<String> {
+    /// Removes and returns a value from the authorized origin area.
+    pub fn remove_item(
+        &mut self,
+        storage_key: &TrustedStorageKey<'_>,
+        key: &str,
+    ) -> Option<String> {
+        self.remove_item_for_key(storage_key.storage_key(), key)
+    }
+
+    fn remove_item_for_key(&mut self, storage_key: &StorageKey, key: &str) -> Option<String> {
         let value = self.areas.get_mut(storage_key)?.remove_item(key);
+        log::trace!(
+            "remove_item key {key:?} in {} (present: {})",
+            storage_label(storage_key),
+            value.is_some()
+        );
         if self
             .areas
             .get(storage_key)
@@ -189,40 +222,65 @@ impl OriginStorage {
         value
     }
 
-    /// Returns the number of keys in an origin area.
+    /// Returns the number of keys in the authorized origin area.
     #[must_use]
-    pub fn len(&self, storage_key: &StorageKey) -> usize {
+    pub fn len(&self, storage_key: &TrustedStorageKey<'_>) -> usize {
+        self.len_for_key(storage_key.storage_key())
+    }
+
+    /// Removes every key in the authorized origin area.
+    pub fn clear(&mut self, storage_key: &TrustedStorageKey<'_>) {
+        self.clear_for_key(storage_key.storage_key());
+    }
+
+    fn len_for_key(&self, storage_key: &StorageKey) -> usize {
         self.areas.get(storage_key).map_or(0, LocalStorage::len)
     }
 
-    /// Removes every key in an origin area.
-    pub fn clear(&mut self, storage_key: &StorageKey) {
+    fn clear_for_key(&mut self, storage_key: &StorageKey) {
+        log::debug!("clearing storage area for {}", storage_label(storage_key));
         self.areas.remove(storage_key);
     }
 
-    /// Returns whether an origin area is empty.
+    /// Returns whether the authorized origin area is empty.
     #[must_use]
-    pub fn is_empty(&self, storage_key: &StorageKey) -> bool {
-        self.len(storage_key) == 0
+    pub fn is_empty(&self, storage_key: &TrustedStorageKey<'_>) -> bool {
+        self.len_for_key(storage_key.storage_key()) == 0
     }
 }
 
 /// Storage operations used by JavaScript bindings and browser processes.
+///
+/// The backend accepts only a [`TrustedStorageKey`], so a renderer cannot
+/// select a different origin by passing a raw [`StorageKey`].
 pub trait StorageBackend: fmt::Debug + Send {
-    /// Reads a value for an origin and key.
+    /// Reads a value for the authorized origin and item key.
     fn read_item(
         &mut self,
-        storage_key: &StorageKey,
+        storage_key: &TrustedStorageKey<'_>,
         key: &str,
     ) -> Result<Option<String>, StorageError>;
 
-    /// Writes a value for an origin and key.
+    /// Writes a value for the authorized origin and item key.
     fn write_item(
         &mut self,
-        storage_key: &StorageKey,
+        storage_key: &TrustedStorageKey<'_>,
         key: &str,
         value: &str,
     ) -> Result<(), StorageError>;
+
+    /// Returns the names of all keys in the authorized origin area.
+    fn keys(&mut self, storage_key: &TrustedStorageKey<'_>) -> Result<Vec<String>, StorageError>;
+
+    /// Removes one key from the authorized origin area atomically.
+    fn remove_item(
+        &mut self,
+        storage_key: &TrustedStorageKey<'_>,
+        key: &str,
+    ) -> Result<(), StorageError>;
+
+    /// Clears the authorized origin area atomically.
+    fn clear(&mut self, storage_key: &TrustedStorageKey<'_>) -> Result<(), StorageError>;
 }
 
 /// Shared storage handle for renderer bindings.
@@ -240,7 +298,7 @@ where
 impl StorageBackend for OriginStorage {
     fn read_item(
         &mut self,
-        storage_key: &StorageKey,
+        storage_key: &TrustedStorageKey<'_>,
         key: &str,
     ) -> Result<Option<String>, StorageError> {
         Ok(self.get_item(storage_key, key).map(str::to_owned))
@@ -248,11 +306,33 @@ impl StorageBackend for OriginStorage {
 
     fn write_item(
         &mut self,
-        storage_key: &StorageKey,
+        storage_key: &TrustedStorageKey<'_>,
         key: &str,
         value: &str,
     ) -> Result<(), StorageError> {
         self.set_item(storage_key, key, value);
+        Ok(())
+    }
+
+    fn keys(&mut self, storage_key: &TrustedStorageKey<'_>) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .areas
+            .get(storage_key.storage_key())
+            .map(|area| area.items.keys().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    fn remove_item(
+        &mut self,
+        storage_key: &TrustedStorageKey<'_>,
+        key: &str,
+    ) -> Result<(), StorageError> {
+        self.remove_item(storage_key, key);
+        Ok(())
+    }
+
+    fn clear(&mut self, storage_key: &TrustedStorageKey<'_>) -> Result<(), StorageError> {
+        self.clear(storage_key);
         Ok(())
     }
 }
@@ -285,7 +365,16 @@ impl PersistentOriginStorage {
         limits: StorageLimits,
     ) -> Result<Self, StorageError> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root)?;
+        if let Err(error) = fs::create_dir_all(&root) {
+            log::error!("could not open storage at {}: {error}", root.display());
+            return Err(error.into());
+        }
+        log::info!("storage opened at {}", root.display());
+        log::debug!(
+            "storage limits: {} bytes per item, {} bytes per origin",
+            limits.max_item_bytes,
+            limits.max_origin_bytes
+        );
 
         Ok(Self {
             root,
@@ -296,7 +385,7 @@ impl PersistentOriginStorage {
         })
     }
 
-    /// Reads a value, loading the origin's latest valid snapshot first.
+    /// Reads a value, loading the authorized origin's latest valid snapshot first.
     ///
     /// Matching snapshots are validated against `storage_key`. If the newest
     /// is corrupt, an older valid snapshot for the same key is used. If no
@@ -304,24 +393,46 @@ impl PersistentOriginStorage {
     /// [`StorageError::CorruptRecord`].
     pub fn read_item(
         &mut self,
-        storage_key: &StorageKey,
+        storage_key: &TrustedStorageKey<'_>,
         key: &str,
     ) -> Result<Option<String>, StorageError> {
+        let storage_key = storage_key.storage_key();
         self.ensure_loaded(storage_key)?;
-        Ok(self.memory.get_item(storage_key, key).map(str::to_owned))
+        let value = self
+            .memory
+            .get_item_for_key(storage_key, key)
+            .map(str::to_owned);
+        log::debug!(
+            "read key {key:?} from {} (found: {}, {} bytes)",
+            storage_label(storage_key),
+            value.is_some(),
+            value.as_ref().map_or(0, String::len)
+        );
+        Ok(value)
     }
 
-    /// Writes a value and publishes a complete new snapshot.
+    /// Writes a value and publishes a complete new snapshot for the authorized origin.
     pub fn write_item(
         &mut self,
-        storage_key: &StorageKey,
+        storage_key: &TrustedStorageKey<'_>,
         key: &str,
         value: &str,
     ) -> Result<(), StorageError> {
+        let storage_key = storage_key.storage_key();
         self.ensure_loaded(storage_key)?;
+        log::debug!(
+            "write key {key:?} ({} bytes) to {}",
+            value.len(),
+            storage_label(storage_key)
+        );
 
         let item_size = key.len().saturating_add(value.len());
         if item_size > self.limits.max_item_bytes {
+            log::warn!(
+                "storage quota exceeded for {}: item of {item_size} bytes exceeds {}",
+                storage_label(storage_key),
+                self.limits.max_item_bytes
+            );
             return Err(StorageError::QuotaExceeded {
                 limit_bytes: self.limits.max_item_bytes,
                 requested_bytes: item_size,
@@ -329,7 +440,7 @@ impl PersistentOriginStorage {
         }
 
         let previous = self.memory.areas.get(storage_key).cloned();
-        self.memory.set_item(storage_key, key, value);
+        self.memory.set_item_for_key(storage_key, key, value);
         let requested_bytes = self
             .memory
             .areas
@@ -338,6 +449,11 @@ impl PersistentOriginStorage {
             .size_bytes();
 
         if requested_bytes > self.limits.max_origin_bytes {
+            log::warn!(
+                "storage quota exceeded for {}: origin would use {requested_bytes} of {} bytes",
+                storage_label(storage_key),
+                self.limits.max_origin_bytes
+            );
             self.restore_area(storage_key, previous);
             return Err(StorageError::QuotaExceeded {
                 limit_bytes: self.limits.max_origin_bytes,
@@ -348,18 +464,19 @@ impl PersistentOriginStorage {
         self.publish_area(storage_key, previous)
     }
 
-    /// Removes `key` from the origin's persistent area.
+    /// Removes `key` from the authorized origin's persistent area.
     ///
     /// Returns the removed value, or `None` when the key was not present.
     /// The in-memory area is restored if publishing the updated snapshot fails.
     pub fn remove_item(
         &mut self,
-        storage_key: &StorageKey,
+        storage_key: &TrustedStorageKey<'_>,
         key: &str,
     ) -> Result<Option<String>, StorageError> {
+        let storage_key = storage_key.storage_key();
         self.ensure_loaded(storage_key)?;
         let previous = self.memory.areas.get(storage_key).cloned();
-        let Some(value) = self.memory.remove_item(storage_key, key) else {
+        let Some(value) = self.memory.remove_item_for_key(storage_key, key) else {
             return Ok(None);
         };
 
@@ -367,10 +484,11 @@ impl PersistentOriginStorage {
         Ok(Some(value))
     }
 
-    /// Removes every item from the origin's persistent area.
+    /// Removes every item from the authorized origin's persistent area.
     ///
     /// The in-memory area is restored if publishing the empty snapshot fails.
-    pub fn clear(&mut self, storage_key: &StorageKey) -> Result<(), StorageError> {
+    pub fn clear(&mut self, storage_key: &TrustedStorageKey<'_>) -> Result<(), StorageError> {
+        let storage_key = storage_key.storage_key();
         self.ensure_loaded(storage_key)?;
         let Some(previous) = self.memory.areas.get(storage_key).cloned() else {
             return Ok(());
@@ -379,7 +497,7 @@ impl PersistentOriginStorage {
             return Ok(());
         }
 
-        self.memory.clear(storage_key);
+        self.memory.clear_for_key(storage_key);
         self.publish_area(storage_key, Some(previous))
     }
 
@@ -397,6 +515,10 @@ impl PersistentOriginStorage {
         let record = match encode_area(storage_key, &area, self.limits) {
             Ok(record) => record,
             Err(error) => {
+                log::warn!(
+                    "could not encode storage for {}: {error}",
+                    storage_label(storage_key)
+                );
                 self.restore_area(storage_key, previous);
                 return Err(error);
             }
@@ -417,11 +539,25 @@ impl PersistentOriginStorage {
         let generation = match self.write_snapshot(storage_key, next_generation, &record) {
             Ok(generation) => generation,
             Err(error) => {
+                match std::error::Error::source(&error) {
+                    Some(source) => log::error!(
+                        "could not write storage snapshot for {}: {error} (cause: {source})",
+                        storage_label(storage_key)
+                    ),
+                    None => log::error!(
+                        "could not write storage snapshot for {}: {error}",
+                        storage_label(storage_key)
+                    ),
+                }
                 self.restore_area(storage_key, previous);
                 return Err(error);
             }
         };
 
+        log::debug!(
+            "storage snapshot generation {generation} written for {}",
+            storage_label(storage_key)
+        );
         self.generations.insert(storage_key.clone(), generation);
         self.remove_old_snapshots(storage_key, generation);
         Ok(())
@@ -432,31 +568,64 @@ impl PersistentOriginStorage {
             return Ok(());
         }
 
-        let snapshots = self.snapshots(storage_key)?;
+        log::debug!("loading storage area for {}", storage_label(storage_key));
+        let snapshots = self.snapshots(storage_key).inspect_err(|error| {
+            log::error!(
+                "could not list storage snapshots for {}: {error}",
+                storage_label(storage_key)
+            );
+        })?;
         let newest_generation = snapshots.first().map_or(0, |(generation, _)| *generation);
         let mut saw_corrupt = false;
 
         for (generation, path) in snapshots {
             match read_snapshot(&path, storage_key, self.limits) {
                 Ok(area) => {
+                    log::debug!(
+                        "loaded snapshot generation {generation} for {} ({} keys)",
+                        storage_label(storage_key),
+                        area.len()
+                    );
                     self.memory.areas.insert(storage_key.clone(), area);
                     self.generations
                         .insert(storage_key.clone(), newest_generation);
                     self.loaded.insert(storage_key.clone());
                     return Ok(());
                 }
-                Err(StorageError::CorruptRecord(_)) => saw_corrupt = true,
-                Err(error) => return Err(error),
+                Err(StorageError::CorruptRecord(reason)) => {
+                    log::warn!(
+                        "skipping corrupt snapshot {} for {}: {reason}",
+                        path.display(),
+                        storage_label(storage_key)
+                    );
+                    saw_corrupt = true;
+                }
+                Err(error) => {
+                    log::error!(
+                        "could not read snapshot {} for {}: {error}",
+                        path.display(),
+                        storage_label(storage_key)
+                    );
+                    return Err(error);
+                }
             }
             self.generations.insert(storage_key.clone(), generation);
         }
 
         if saw_corrupt {
+            log::error!(
+                "storage for {} is corrupt: no valid snapshot was found",
+                storage_label(storage_key)
+            );
             return Err(StorageError::CorruptRecord(
                 "no valid snapshot was found".into(),
             ));
         }
 
+        log::debug!(
+            "no snapshots found for {}; starting empty",
+            storage_label(storage_key)
+        );
         self.loaded.insert(storage_key.clone());
         self.generations.insert(storage_key.clone(), 0);
         Ok(())
@@ -521,23 +690,23 @@ impl PersistentOriginStorage {
             let result = file.write_all(record).and_then(|()| file.sync_all());
             drop(file);
             if let Err(error) = result {
-                let _ = fs::remove_file(&temporary_path);
+                remove_temporary_snapshot(&temporary_path);
                 return Err(error.into());
             }
 
             match fs::hard_link(&temporary_path, &path) {
                 Ok(()) => {
-                    let _ = fs::remove_file(&temporary_path);
+                    remove_temporary_snapshot(&temporary_path);
                     return Ok(generation);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let _ = fs::remove_file(&temporary_path);
+                    remove_temporary_snapshot(&temporary_path);
                     generation = generation.checked_add(1).ok_or_else(|| {
                         StorageError::CorruptRecord("snapshot generation overflow".into())
                     })?;
                 }
                 Err(error) => {
-                    let _ = fs::remove_file(&temporary_path);
+                    remove_temporary_snapshot(&temporary_path);
                     return Err(error.into());
                 }
             }
@@ -545,12 +714,23 @@ impl PersistentOriginStorage {
     }
 
     fn remove_old_snapshots(&self, storage_key: &StorageKey, newest: u64) {
-        if let Ok(snapshots) = self.snapshots(storage_key) {
-            for (generation, path) in snapshots {
-                if generation.saturating_add(1) < newest {
-                    let _ = fs::remove_file(path);
+        match self.snapshots(storage_key) {
+            Ok(snapshots) => {
+                for (generation, path) in snapshots {
+                    if generation.saturating_add(1) < newest
+                        && let Err(error) = fs::remove_file(&path)
+                    {
+                        log::warn!(
+                            "could not remove stale snapshot {}: {error}",
+                            path.display()
+                        );
+                    }
                 }
             }
+            Err(error) => log::debug!(
+                "could not list snapshots for {}; stale snapshots kept: {error}",
+                storage_label(storage_key)
+            ),
         }
     }
 
@@ -569,7 +749,7 @@ impl PersistentOriginStorage {
 impl StorageBackend for PersistentOriginStorage {
     fn read_item(
         &mut self,
-        storage_key: &StorageKey,
+        storage_key: &TrustedStorageKey<'_>,
         key: &str,
     ) -> Result<Option<String>, StorageError> {
         Self::read_item(self, storage_key, key)
@@ -577,12 +757,53 @@ impl StorageBackend for PersistentOriginStorage {
 
     fn write_item(
         &mut self,
-        storage_key: &StorageKey,
+        storage_key: &TrustedStorageKey<'_>,
         key: &str,
         value: &str,
     ) -> Result<(), StorageError> {
         Self::write_item(self, storage_key, key, value)
     }
+
+    fn keys(&mut self, storage_key: &TrustedStorageKey<'_>) -> Result<Vec<String>, StorageError> {
+        let storage_key = storage_key.storage_key();
+        self.ensure_loaded(storage_key)?;
+        Ok(self
+            .memory
+            .areas
+            .get(storage_key)
+            .map(|area| area.items.keys().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    fn remove_item(
+        &mut self,
+        storage_key: &TrustedStorageKey<'_>,
+        key: &str,
+    ) -> Result<(), StorageError> {
+        Self::remove_item(self, storage_key, key).map(drop)
+    }
+
+    fn clear(&mut self, storage_key: &TrustedStorageKey<'_>) -> Result<(), StorageError> {
+        Self::clear(self, storage_key)
+    }
+}
+
+/// Removes a temporary snapshot file, logging when cleanup fails.
+fn remove_temporary_snapshot(path: &Path) {
+    if let Err(error) = fs::remove_file(path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        log::warn!(
+            "could not remove temporary snapshot {}: {error}",
+            path.display()
+        );
+    }
+}
+
+/// Formats a storage key's origin as `scheme://host:port` for log messages.
+fn storage_label(storage_key: &StorageKey) -> String {
+    let origin = storage_key.get();
+    format!("{}://{}:{}", origin.scheme(), origin.host(), origin.port())
 }
 
 fn origin_file_prefix(storage_key: &StorageKey) -> String {
@@ -761,11 +982,15 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use security::{Origin, StorageKey};
+    use security::{Origin, RendererSecurityContext, StorageKey, StoragePermission};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn storage_key(scheme: &str, host: &str, port: u16) -> StorageKey {
         StorageKey::new(Origin::with_port(scheme, host, port))
+    }
+
+    fn context_for(storage_key: &StorageKey) -> RendererSecurityContext {
+        RendererSecurityContext::new(storage_key.get().clone(), StoragePermission::Allowed)
     }
 
     fn test_directory(name: &str) -> PathBuf {
@@ -815,6 +1040,10 @@ mod tests {
     fn origin_areas_do_not_share_values() {
         let first = storage_key("https", "example.com", 443);
         let second = storage_key("https", "other.example", 443);
+        let first_context = context_for(&first);
+        let second_context = context_for(&second);
+        let first = first_context.trusted_storage_key();
+        let second = second_context.trusted_storage_key();
         let mut storage = OriginStorage::new();
 
         storage.set_item(&first, "token", "first");
@@ -828,6 +1057,10 @@ mod tests {
     fn same_origin_keys_share_an_area() {
         let first = storage_key("https", "example.com", 443);
         let equivalent = storage_key("HTTPS", "EXAMPLE.COM", 443);
+        let first_context = context_for(&first);
+        let equivalent_context = context_for(&equivalent);
+        let first = first_context.trusted_storage_key();
+        let equivalent = equivalent_context.trusted_storage_key();
         let mut storage = OriginStorage::new();
 
         storage.set_item(&first, "theme", "dark");
@@ -840,6 +1073,10 @@ mod tests {
     fn clear_only_removes_the_selected_origin() {
         let first = storage_key("https", "example.com", 443);
         let second = storage_key("http", "example.com", 80);
+        let first_context = context_for(&first);
+        let second_context = context_for(&second);
+        let first = first_context.trusted_storage_key();
+        let second = second_context.trusted_storage_key();
         let mut storage = OriginStorage::new();
 
         storage.set_item(&first, "name", "first");
@@ -853,6 +1090,8 @@ mod tests {
     #[test]
     fn dropping_storage_discards_all_values() {
         let key = storage_key("https", "example.com", 443);
+        let context = context_for(&key);
+        let key = context.trusted_storage_key();
         {
             let mut storage = OriginStorage::new();
             storage.set_item(&key, "session", "temporary");
@@ -866,6 +1105,8 @@ mod tests {
     fn persistent_values_survive_reopen() {
         let path = test_directory("reopen");
         let key = storage_key("https", "example.com", 443);
+        let context = context_for(&key);
+        let key = context.trusted_storage_key();
 
         {
             let mut storage = PersistentOriginStorage::open(&path).unwrap();
@@ -884,6 +1125,8 @@ mod tests {
     fn persistent_storage_starts_empty_for_a_new_root() {
         let path = test_directory("missing");
         let key = storage_key("https", "example.com", 443);
+        let key_context = context_for(&key);
+        let key = key_context.trusted_storage_key();
         assert!(!path.exists());
 
         let mut storage = PersistentOriginStorage::open(&path).unwrap();
@@ -898,6 +1141,10 @@ mod tests {
         let path = test_directory("isolation");
         let first = storage_key("https", "example.com", 443);
         let second = storage_key("https", "other.example", 443);
+        let first_context = context_for(&first);
+        let second_context = context_for(&second);
+        let first = first_context.trusted_storage_key();
+        let second = second_context.trusted_storage_key();
         let mut storage = PersistentOriginStorage::open(&path).unwrap();
 
         storage.write_item(&first, "token", "first").unwrap();
@@ -922,6 +1169,12 @@ mod tests {
         let https = storage_key("https", "example.com", 443);
         let http = storage_key("http", "example.com", 80);
         let alternate_port = storage_key("https", "example.com", 8443);
+        let https_context = context_for(&https);
+        let http_context = context_for(&http);
+        let alternate_port_context = context_for(&alternate_port);
+        let https = https_context.trusted_storage_key();
+        let http = http_context.trusted_storage_key();
+        let alternate_port = alternate_port_context.trusted_storage_key();
         let mut storage = PersistentOriginStorage::open(&path).unwrap();
 
         storage.write_item(&https, "transport", "https").unwrap();
@@ -941,9 +1194,7 @@ mod tests {
             Some("http".into())
         );
         assert_eq!(
-            reopened
-                .read_item(&alternate_port, "transport")
-                .unwrap(),
+            reopened.read_item(&alternate_port, "transport").unwrap(),
             Some("alternate-port".into())
         );
         remove_test_directory(&path);
@@ -954,6 +1205,10 @@ mod tests {
         let path = test_directory("remove-clear");
         let first = storage_key("https", "example.com", 443);
         let second = storage_key("https", "other.example", 443);
+        let first_context = context_for(&first);
+        let second_context = context_for(&second);
+        let first = first_context.trusted_storage_key();
+        let second = second_context.trusted_storage_key();
         let mut storage = PersistentOriginStorage::open(&path).unwrap();
 
         storage.write_item(&first, "remove", "removed").unwrap();
@@ -980,6 +1235,8 @@ mod tests {
     fn persistent_files_do_not_use_raw_origin_text() {
         let path = test_directory("filenames");
         let key = storage_key("https", "example.com/path", 443);
+        let context = context_for(&key);
+        let key = context.trusted_storage_key();
         let mut storage = PersistentOriginStorage::open(&path).unwrap();
         storage.write_item(&key, "name", "value").unwrap();
 
@@ -1006,8 +1263,10 @@ mod tests {
     fn corrupt_snapshot_is_rejected() {
         let path = test_directory("corrupt");
         let key = storage_key("https", "example.com", 443);
+        let context = context_for(&key);
+        let key = context.trusted_storage_key();
         fs::create_dir_all(&path).unwrap();
-        let file_name = format!("{}1.storage", origin_file_prefix(&key));
+        let file_name = format!("{}1.storage", origin_file_prefix(key.storage_key()));
         fs::write(path.join(file_name), b"not a storage record").unwrap();
 
         let mut storage = PersistentOriginStorage::open(&path).unwrap();
@@ -1023,14 +1282,26 @@ mod tests {
         let path = test_directory("wrong-origin");
         let first = storage_key("https", "example.com", 443);
         let second = storage_key("https", "other.example", 443);
+        let first_context = context_for(&first);
+        let second_context = context_for(&second);
+        let first = first_context.trusted_storage_key();
+        let second = second_context.trusted_storage_key();
         let mut storage = PersistentOriginStorage::open(&path).unwrap();
-        storage.write_item(&second, "token", "other-origin-secret").unwrap();
+        storage
+            .write_item(&second, "token", "other-origin-secret")
+            .unwrap();
         drop(storage);
 
-        let second_snapshot =
-            fs::read(path.join(format!("{}1.storage", origin_file_prefix(&second)))).unwrap();
+        let second_snapshot = fs::read(path.join(format!(
+            "{}1.storage",
+            origin_file_prefix(second.storage_key())
+        )))
+        .unwrap();
         fs::write(
-            path.join(format!("{}1.storage", origin_file_prefix(&first))),
+            path.join(format!(
+                "{}1.storage",
+                origin_file_prefix(first.storage_key())
+            )),
             second_snapshot,
         )
         .unwrap();
@@ -1052,15 +1323,28 @@ mod tests {
         let path = test_directory("corrupt-newest");
         let first = storage_key("https", "example.com", 443);
         let second = storage_key("https", "other.example", 443);
+        let first_context = context_for(&first);
+        let second_context = context_for(&second);
+        let first = first_context.trusted_storage_key();
+        let second = second_context.trusted_storage_key();
         let mut storage = PersistentOriginStorage::open(&path).unwrap();
 
-        storage.write_item(&first, "token", "first-generation").unwrap();
-        storage.write_item(&first, "token", "corrupt-generation").unwrap();
-        storage.write_item(&second, "token", "other-origin").unwrap();
+        storage
+            .write_item(&first, "token", "first-generation")
+            .unwrap();
+        storage
+            .write_item(&first, "token", "corrupt-generation")
+            .unwrap();
+        storage
+            .write_item(&second, "token", "other-origin")
+            .unwrap();
         drop(storage);
 
         fs::write(
-            path.join(format!("{}2.storage", origin_file_prefix(&first))),
+            path.join(format!(
+                "{}2.storage",
+                origin_file_prefix(first.storage_key())
+            )),
             b"incomplete snapshot",
         )
         .unwrap();
@@ -1081,12 +1365,17 @@ mod tests {
     fn incomplete_temporary_snapshot_is_ignored() {
         let path = test_directory("incomplete-temporary");
         let key = storage_key("https", "example.com", 443);
+        let key_context = context_for(&key);
+        let key = key_context.trusted_storage_key();
         let mut storage = PersistentOriginStorage::open(&path).unwrap();
         storage.write_item(&key, "token", "complete").unwrap();
         drop(storage);
 
         fs::write(
-            path.join(format!("{}2.storage.tmp", origin_file_prefix(&key))),
+            path.join(format!(
+                "{}2.storage.tmp",
+                origin_file_prefix(key.storage_key())
+            )),
             b"incomplete snapshot",
         )
         .unwrap();
@@ -1111,6 +1400,8 @@ mod tests {
     fn quota_rejects_large_values() {
         let path = test_directory("quota");
         let key = storage_key("https", "example.com", 443);
+        let context = context_for(&key);
+        let key = context.trusted_storage_key();
         let limits = StorageLimits::new(4, 8);
         let mut storage = PersistentOriginStorage::open_with_limits(&path, limits).unwrap();
 

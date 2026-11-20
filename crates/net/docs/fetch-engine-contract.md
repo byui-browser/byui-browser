@@ -2,7 +2,8 @@
 
 `net` is the reusable Rust Fetch engine. It owns request preparation, response
 tainting and exposure, body transport, cancellation, process-local scheduling,
-and coordination of cache, credential, security, and transport services. It does
+and coordination of cache, credential, security, transport, and lifecycle
+diagnostic services. It does
 not create JavaScript objects or promises. `webapis` owns that conversion; its
 current binding returns a string and is not yet a complete Fetch binding.
 
@@ -10,6 +11,34 @@ current binding returns a string and is not yet a complete Fetch binding.
 headers pass Fetch filtering. Its abort-aware `Body` holds the scheduler permit
 until it is consumed or dropped. Body errors may occur after headers. Callers
 cannot obtain the transport response.
+
+Controllers may install a [`NetworkObserver`] with
+`RequestController::builder(...).with_network_observer(...)`. The observer is
+shared by controller clones, receives best-effort non-failing events, and must
+be quick, non-blocking, and panic-free. The feed reports request preparation,
+cache and preflight decisions, queue start and admission, transport start and
+response headers, redirects, response finalization, and completion or failure
+for the relevant execution paths. The abort phase is reserved in the public
+enum but is not currently emitted by the controller's cancellation branch.
+Events contain request IDs, active URLs, timestamps, status when known, cache
+provenance, and redirect counts, but never bodies, credentials, or error
+strings.
+
+`Body` owns one source and reports one lifecycle state for helper locking,
+direct streaming, transport handoff, completion, failure, and abort. Nullness
+is part of that model rather than a parallel response flag. `Body` has no
+implicit `Clone`: `Body::fork` duplicates unused buffered sources into
+independent views and tees an unused live stream. `Request::try_clone`
+duplicates buffered request bodies and rejects live streams; the controller
+transfers a live request stream to one transport attempt. Internal cache
+wrapping rejects a used or transferred source with `BodyAlreadyConsumed`.
+Declared length and media type survive live, cached, and provider-backed
+responses. `Response::try_clone` forks an unused
+live body through bounded one-chunk branches; a slow active branch applies
+backpressure, dropping a branch cancels it, and the shared scheduler permit is
+released only after the source completes or both branches are dropped. Cache
+capture is bounded by `Config::max_cache_body_size` and commits only at a clean
+end-of-stream.
 
 Error timing and retry behavior are part of this boundary:
 
@@ -25,7 +54,8 @@ Error timing and retry behavior are part of this boundary:
 The private `InternalResponse` retains the transport status and canonical
 reason phrase, every header (including `Set-Cookie` and obsolete `Set-Cookie2`), complete URL-list and
 redirect state for the supported exchange/redirect slice, origin and tainting state,
-null-body state, cache provenance, cookie-processing state, and the live body.
+cache provenance, cookie-processing state, and the live body, whose own state
+authoritatively represents nullness.
 Policy and cookie processing run on that representation. Exposure constructs
 an immutable header list and removes forbidden response headers, including the
 obsolete `Set-Cookie2` compatibility case. CORS views
@@ -55,7 +85,7 @@ mutation and guard-loosening attempts return stable typed errors.
 Caller request headers remain separate from the transport header channel.
 Generated body metadata, `Origin`, `Referer`, and cookies are added only while
 preparing the transport request. Internal response headers retain every field
-for `FetchServices`, while public basic responses remove cookie fields and CORS
+for response-policy and cookie capabilities, while public basic responses remove cookie fields and CORS
 responses expose only safelisted or valid explicitly exposed fields. The CORS
 wildcard exposes non-cookie fields only when credentials mode is not `Include`;
 malformed exposure metadata exposes no additional fields. Opaque,
@@ -93,17 +123,17 @@ work.
   byte and streaming bodies observe the same abort signal; aborting, failing,
   or discarding a body drops its provider stream. Providers must release their
   own handles, tasks, and other resources when those futures or streams drop.
-- `RequestController::builder` is the construction API. Its optional
-  `with_fetch_services` and `with_scheme_providers` setters compose browser
-  services and local-scheme capabilities. A controller without services is for
-  standalone requests without client context. A request carrying browser
-  client context requires browser-owned `FetchServices`; local schemes require
-  their matching provider. That interface supplies security decisions, credential
-  selection and storage, a service-worker network decision, a cache partition,
-  and a response-header observation hook. `Set-Cookie` reaches only that
-  trusted interface. Credential mode still decides whether the engine calls
-  its credential methods.
-- CORS preflight, integrity, navigation fetch, keepalive lifetime, nondefault
+- `RequestController::builder` is the construction API. Its focused policy,
+  cookie, service-worker, and cache-partition setters compose browser
+  capabilities; `with_scheme_providers` composes local-scheme capabilities. A
+  controller without request policy is for standalone requests without client
+  context. A request carrying browser client context requires a browser-owned
+  `RequestPolicyService`; the other focused traits supply response decisions,
+  credential selection and storage, a service-worker network decision, a cache
+  partition, and a response-header observation hook. `Set-Cookie` reaches only
+  the trusted cookie capability. Credential mode still decides whether the
+  engine invokes it.
+- Integrity, navigation fetch, keepalive lifetime, nondefault
   priority scheduling, and cache revalidation fail with `UnsupportedFeature`.
   Manual/error redirect modes are handled by the controller. A service-worker
   `Intercept` decision also
@@ -117,15 +147,21 @@ work.
 - `Default`, `NoStore`, `Reload`, `ForceCache`, and `OnlyIfCached` retain their
   documented process-local cache subset; `NoCache` fails until revalidation
   exists. Browser service providers choose the partition key. This cache is
-  neither durable nor a full Fetch HTTP cache.
-- Cache-only misses surface as Fetch network errors. Body stream transport
-  errors and aborts retain separate typed errors.
+  neither durable nor a full Fetch HTTP cache. Successful responses with a
+  positive `Cache-Control: max-age` are stored by method, normalized URL,
+  and partition; response `Vary` fields select among request-header variants,
+  and `Vary: *` responses are not stored. Cache hits still pass through the
+  normal response finalization and filtering path.
+- Cache-only misses and other pre-exposure failures can surface through
+  `RequestController::fetch_response` as Fetch network errors. Body stream
+  transport errors and aborts retain separate typed errors; `fetch` preserves
+  all typed Rust failures for callers that need diagnostics.
 
 `storage` owns durable cookie and cache data and network partition state.
 `security` owns cookie, CSP, mixed-content, CORP, MIME, authentication, and
 certificate decisions. Browser and service-worker crates own interception,
 navigation/client context, and lifecycle. Diagnostics and timing consumers
-own reporting. They supply decisions through `FetchServices`; none of their
+own reporting. They supply decisions through focused capability traits; none of their
 databases belong here. Complete interception, persistence, and diagnostics
 lifecycles remain work for their later plan steps.
 

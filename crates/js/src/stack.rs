@@ -49,7 +49,10 @@ pub(crate) fn with_engine_stack<T: Send>(task: impl FnOnce() -> T + Send) -> T {
             Ok(handle) => handle
                 .join()
                 .unwrap_or_else(|payload| std::panic::resume_unwind(payload)),
-            Err(_) => take_task()(),
+            Err(error) => {
+                log::warn!("could not spawn engine thread, running on the caller's stack: {error}");
+                take_task()()
+            }
         }
     })
 }

@@ -39,7 +39,7 @@ the archives to a GitHub Release:
 
 | Operating system | Package | Archive |
 | --- | --- | --- |
-| macOS (Apple Silicon) | `browser-macos` | `byui-browser-macos-aarch64.tar.gz` |
+| macOS (Apple Silicon) | `byui-browser` | `byui-browser-macos-aarch64.tar.gz` |
 | Linux (x86_64) | `browser-linux` | `byui-browser-linux-x86_64.tar.gz` |
 | Windows (x86_64) | `byui-browser-windows` | `byui-browser-windows-x86_64.zip` |
 

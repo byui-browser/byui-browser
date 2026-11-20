@@ -24,8 +24,8 @@ pub enum Expr {
     Identifier(String),
     /// Arrow function with positional parameters and an expression or block body.
     ///
-    /// The tree-walk evaluator supports arrows; the bytecode compiler currently
-    /// rejects them with an unsupported-construct error.
+    /// The bytecode VM supports expression and block bodies, lexical captures,
+    /// and lexical `this`.
     ArrowFunction {
         /// Owned parameter names in argument order.
         params: Vec<String>,
@@ -127,12 +127,114 @@ pub enum Expr {
     ///
     /// Properties are evaluated in source order, each key before its value.
     /// A repeated key keeps its first position and its last value. Shorthand
-    /// `{ a }` is parsed as `{ a: a }`. Methods, getters, setters, and spread
-    /// (`...`) are unsupported.
+    /// `{ a }` is parsed as `{ a: a }`. Spread (`...source`) is supported.
+    /// Methods, getters, and setters are unsupported.
     Object(Vec<ObjectProperty>),
     /// Array literal. `None` entries represent elisions and evaluate to
-    /// `undefined` when read by index.
+    /// `undefined` when read by index. An entry may be an [`Expr::Spread`],
+    /// which contributes each element of an array or each character of a
+    /// string.
     Array(Vec<Option<Expr>>),
+    /// `test ? consequent : alternate`. Only the selected branch is evaluated.
+    Conditional {
+        /// Owned condition, evaluated first and tested for truthiness.
+        test: Box<Expr>,
+        /// Evaluated only when the condition is truthy.
+        consequent: Box<Expr>,
+        /// Evaluated only when the condition is falsy.
+        alternate: Box<Expr>,
+    },
+    /// Comma expression `a, b, c`: evaluates every operand left to right and
+    /// yields the last one. Always has at least two operands.
+    Sequence(Vec<Expr>),
+    /// `++x`, `x++`, `--x`, or `x--` on an identifier or member expression.
+    ///
+    /// The old value is converted with `ToNumber` first. A prefix update
+    /// yields the new value and a postfix update yields the converted old
+    /// value.
+    Update {
+        /// Identifier or [`Expr::Member`] being updated; the parser rejects
+        /// every other target.
+        target: Box<Expr>,
+        /// Whether the value is incremented or decremented.
+        operator: UpdateOperator,
+        /// `true` for `++x`/`--x`, `false` for `x++`/`x--`.
+        prefix: bool,
+    },
+    /// Compound assignment such as `x += 1` or `object.count ||= 0`.
+    ///
+    /// The target's object and key are evaluated once. Logical forms
+    /// (`&&=`, `||=`, `??=`) skip both the right operand and the store when
+    /// the left value already decides the result.
+    CompoundAssign {
+        /// Identifier or [`Expr::Member`] being assigned; the parser rejects
+        /// every other target.
+        target: Box<Expr>,
+        /// Operation combining the old value with the right operand.
+        operator: AssignmentOperator,
+        /// Owned right operand.
+        value: Box<Expr>,
+    },
+    /// `delete object.name` or `delete object[key]`, yielding a boolean.
+    ///
+    /// Deleting a property of `null` or `undefined` is a runtime error. An
+    /// operand of any other shape is evaluated and the result is `true`.
+    /// `delete name` on a bare identifier and `delete` on an optional chain
+    /// are rejected while parsing.
+    Delete(Box<Expr>),
+    /// Template literal such as `` `a${b}c` ``.
+    ///
+    /// `quasis` always has exactly one more entry than `expressions`, and the
+    /// parts are joined in order. Tagged templates are unsupported.
+    Template {
+        /// Decoded literal text between substitutions.
+        quasis: Vec<String>,
+        /// Substitution expressions in source order.
+        expressions: Vec<Expr>,
+    },
+    /// `...value` inside an array literal or call or `new` arguments. (Object
+    /// literals use [`PropertyKey::Spread`].) Never appears elsewhere.
+    Spread(Box<Expr>),
+    /// The extent of an optional chain such as `a?.b.c(d)`.
+    ///
+    /// If any [`Expr::OptionalMember`] or [`Expr::OptionalCall`] inside finds
+    /// a `null` or `undefined` base, the rest of the chain is skipped and the
+    /// whole chain evaluates to `undefined`.
+    OptionalChain(Box<Expr>),
+    /// `object?.name` or `object?.[key]` inside an [`Expr::OptionalChain`].
+    OptionalMember {
+        /// Base expression; `null` or `undefined` short-circuits the chain.
+        object: Box<Expr>,
+        /// Property name, fixed or computed.
+        property: MemberProperty,
+    },
+    /// `callee?.(arguments)` inside an [`Expr::OptionalChain`]. A `null` or
+    /// `undefined` callee short-circuits the chain before any argument runs.
+    OptionalCall {
+        /// Expression producing the callee.
+        callee: Box<Expr>,
+        /// Owned arguments in evaluation order.
+        arguments: Vec<Expr>,
+    },
+}
+
+/// `++` or `--` in an [`Expr::Update`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateOperator {
+    /// `++`: adds one.
+    Increment,
+    /// `--`: subtracts one.
+    Decrement,
+}
+
+/// The operator of an [`Expr::CompoundAssign`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignmentOperator {
+    /// An eager binary operator: `+=`, `-=`, `*=`, `/=`, `%=`, `**=`, `<<=`,
+    /// `>>=`, `>>>=`, `&=`, `|=`, or `^=`.
+    Binary(BinaryOperator),
+    /// A short-circuiting operator: `&&=`, `||=`, or `??=`.
+    Logical(LogicalOperator),
 }
 
 /// Body of an arrow function.
@@ -162,6 +264,11 @@ pub enum PropertyKey {
     Named(String),
     /// `[expression]`: the key is converted to a string after evaluation.
     Computed(Box<Expr>),
+    /// `...value`: the entry has no key of its own; its value expression
+    /// supplies the source whose own enumerable properties are copied. `null`
+    /// and `undefined` sources are ignored, arrays and strings contribute
+    /// their indices, and other values contribute nothing.
+    Spread,
 }
 
 /// The property part of a member expression.
@@ -177,6 +284,8 @@ pub enum MemberProperty {
 /// An owned statement in the supported program grammar.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    /// An empty statement written as `;`.
+    Empty,
     /// Owned statements enclosed in braces, in source order.
     Block(Vec<Statement>),
     /// Expression executed for its effects and completion value.
@@ -206,6 +315,61 @@ pub enum Statement {
         /// Owned statement executed on each iteration.
         body: Box<Statement>,
     },
+    /// Loop that tests its condition after each iteration.
+    DoWhile {
+        /// Owned statement executed before the condition is tested.
+        body: Box<Statement>,
+        /// Owned expression tested after each iteration.
+        condition: Expr,
+    },
+    /// Loop with optional initialization, condition, and update clauses.
+    For {
+        /// Optional expression or variable declaration evaluated once before
+        /// the first condition check.
+        init: Option<Box<Statement>>,
+        /// Optional expression tested before each iteration; absent means true.
+        condition: Option<Expr>,
+        /// Optional expression evaluated after each body iteration.
+        update: Option<Expr>,
+        /// Owned statement executed on each iteration.
+        body: Box<Statement>,
+    },
+    /// Iterates over the values produced by an array or string expression.
+    ForOf {
+        /// Loop binding initialized for each value.
+        kind: VarKind,
+        /// Binding name.
+        name: String,
+        /// Iterable expression.
+        iterable: Expr,
+        /// Loop body.
+        body: Box<Statement>,
+    },
+    /// Iterates over the enumerable keys of an object or array expression.
+    ForIn {
+        /// Loop binding initialized for each key.
+        kind: VarKind,
+        /// Binding name.
+        name: String,
+        /// Target expression.
+        object: Expr,
+        /// Loop body.
+        body: Box<Statement>,
+    },
+    /// A `switch` statement with ordered case clauses.
+    Switch {
+        /// Value compared against case expressions.
+        discriminant: Expr,
+        /// Ordered cases; `None` is the default clause.
+        cases: Vec<SwitchCase>,
+    },
+    /// A labeled statement.
+    Labeled {
+        /// Label name.
+        label: String,
+        /// Labeled body.
+        body: Box<Statement>,
+    },
     /// Named function declaration with an owned body.
     FunctionDeclaration {
         /// Owned identifier spelling.
@@ -219,6 +383,46 @@ pub enum Statement {
     Return(Option<Expr>),
     /// Class declaration with an optional superclass.
     ClassDeclaration(Box<ClassDefinition>),
+    /// `throw expression;`: raises any value as an exception.
+    Throw(Expr),
+    /// `try { ... } catch (name) { ... } finally { ... }`.
+    ///
+    /// At least one of `handler` and `finalizer` is present. The completion
+    /// value is that of the `try` block, or of the `catch` block when it
+    /// ran; a `finally` block changes it only by completing abruptly.
+    Try {
+        /// Statements of the protected block.
+        block: Vec<Statement>,
+        /// The `catch` clause, if any.
+        handler: Option<CatchClause>,
+        /// Statements of the `finally` block, if any. They run on every
+        /// exit of the `try` and `catch` blocks, including `return`, `break`,
+        /// `continue`, and a thrown exception.
+        finalizer: Option<Vec<Statement>>,
+    },
+    /// `break;`: leaves the innermost enclosing loop.
+    Break(Option<String>),
+    /// `continue;`: starts the next iteration of the innermost enclosing loop.
+    Continue(Option<String>),
+}
+
+/// One `case` or `default` clause in a switch statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwitchCase {
+    /// Case expression, or `None` for the default clause.
+    pub test: Option<Expr>,
+    /// Statements executed after the clause is selected, including fallthrough.
+    pub consequent: Vec<Statement>,
+}
+
+/// The `catch` clause of a [`Statement::Try`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatchClause {
+    /// Name bound to the caught value, or `None` for `catch { ... }`.
+    /// Destructuring parameters are unsupported.
+    pub param: Option<String>,
+    /// Statements of the clause body, which has its own block scope.
+    pub body: Vec<Statement>,
 }
 
 /// The parsed body of a class declaration.
@@ -269,6 +473,13 @@ pub enum UnaryOperator {
     Not,
     /// `~x`
     BitwiseNot,
+    /// `+x`: converts the operand with `ToNumber`.
+    Plus,
+    /// `typeof x`: the operand's type name as a string. A bare identifier
+    /// that is not declared yields `"undefined"` instead of an error.
+    Typeof,
+    /// `void x`: evaluates the operand and yields `undefined`.
+    Void,
 }
 
 /// Arithmetic, bitwise, and comparison operations represented by the AST.
@@ -312,6 +523,15 @@ pub enum BinaryOperator {
     StrictEqual,
     /// `!==` operator.
     StrictNotEqual,
+    /// `**` operator; right associative.
+    Exponent,
+    /// `key in object`: whether the property exists on the object or its
+    /// prototype chain. The right operand must be an object, array, or
+    /// function.
+    In,
+    /// `value instanceof Constructor`: whether the constructor's `prototype`
+    /// is on the value's prototype chain.
+    InstanceOf,
 }
 
 /// Operations represented separately to preserve short-circuit structure.
@@ -321,4 +541,7 @@ pub enum LogicalOperator {
     And,
     /// `||`: evaluate the right operand only if the left is falsy.
     Or,
+    /// `??`: evaluate the right operand only if the left is `null` or
+    /// `undefined`.
+    Nullish,
 }

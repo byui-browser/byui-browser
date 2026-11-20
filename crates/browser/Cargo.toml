@@ -1,20 +1,17 @@
 [package]
 name = "browser"
-description = "Top-level browser binary that wires processes and crates together"
+description = "Page loading, navigation, and script hosting shared by the native shells"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "browser"
-path = "src/main.rs"
-
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
+log = { workspace = true }
 common = { workspace = true }
 html = { workspace = true }
 css = { workspace = true }
@@ -30,7 +27,6 @@ security = { workspace = true }
 chrome = { workspace = true }
 devtools = { workspace = true }
 futures-util = "0.3"
-rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
 
 [dev-dependencies]
 cap-std = "4"

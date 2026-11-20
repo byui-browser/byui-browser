@@ -7,40 +7,378 @@ use crate::Declaration;
 
 const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
 
+/// The `border-*-radius` longhands, in the order `border-radius` lists them.
+const CORNERS: [&str; 4] = ["top-left", "top-right", "bottom-right", "bottom-left"];
+
+/// CSS-wide keywords, which a shorthand copies to each longhand unchanged.
+const CSS_WIDE_KEYWORDS: [&str; 5] = ["inherit", "initial", "unset", "revert", "revert-layer"];
+
 /// Expands one declaration into the longhand declarations it sets.
 ///
-/// Only the box shorthands `margin` and `padding` are expanded today, using
-/// the one-to-four value rule. Other declarations are returned unchanged. An
-/// invalid `margin` or `padding` value expands to nothing, matching CSS's rule
-/// that invalid declarations are dropped. CSS-wide keywords such as `inherit`
-/// are copied to every longhand.
+/// The box shorthands `margin` and `padding` are expanded using the
+/// one-to-four value rule, as is `inset`, which sets the `top`, `right`,
+/// `bottom`, and `left` longhands (CSS Positioned Layout 3 §3.1). `border-radius` is expanded to the four
+/// `border-*-radius` longhands (CSS Backgrounds 3 §5.1): the values before an
+/// optional `/` are the horizontal radii and the values after it the vertical
+/// radii, each following the one-to-four value rule starting at the top-left
+/// corner. A longhand gets `"<horizontal> <vertical>"`, or just the
+/// horizontal radius when there is no `/`. Values are not validated here.
+///
+/// `animation` is expanded to the eight `animation-*` longhands, each a
+/// comma-separated list with one entry per animation (CSS Animations 1
+/// §3.10). The supported WebKit animation and flexbox aliases normalize to
+/// their standard property names; legacy box alignment values are translated
+/// to their modern flex equivalents.
+/// `background` currently expands only its color component; image and other
+/// layer components are ignored. Numeric `flex` forms and the common
+/// `-webkit-flex`, `-webkit-box-flex`, `-webkit-box-sizing`, and
+/// `-webkit-box-shadow` aliases map to the corresponding supported longhands.
+/// `outline` expands width, style, and color. `text-decoration` currently
+/// expands its line component; style, thickness, and explicit color are not
+/// interpreted.
+///
+/// Other declarations are returned unchanged. An invalid shorthand value
+/// expands to nothing, matching CSS's rule that invalid declarations are
+/// dropped. CSS-wide keywords such as `inherit` are copied to every longhand.
 pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
+    if let Some(property) = declaration.property.strip_prefix("-webkit-") {
+        let (property, value) = match property {
+            "box-align" => ("align-items", legacy_box_align(&declaration.value)),
+            "box-pack" => ("justify-content", legacy_box_pack(&declaration.value)),
+            "align-items" | "justify-content" | "animation" => {
+                (property, declaration.value.clone())
+            }
+            "box-shadow" => ("box-shadow", declaration.value.clone()),
+            "box-sizing" => ("box-sizing", declaration.value.clone()),
+            "box-flex" => ("flex-grow", declaration.value.clone()),
+            "flex" => return expand_flex(&declaration.value),
+            _ => return vec![declaration.clone()],
+        };
+        return expand(&Declaration {
+            property: property.to_owned(),
+            value,
+        });
+    }
+    if declaration.property == "background" {
+        return expand_background(&declaration.value);
+    }
+    if declaration.property == "outline" {
+        return expand_outline(&declaration.value);
+    }
+    if declaration.property == "text-decoration" {
+        return vec![Declaration {
+            property: "text-decoration-line".to_owned(),
+            value: declaration.value.clone(),
+        }];
+    }
+    if declaration.property == "flex" {
+        return expand_flex(&declaration.value);
+    }
+    if matches!(
+        declaration.property.as_str(),
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left"
+    ) {
+        return expand_border(declaration);
+    }
+    if matches!(
+        declaration.property.as_str(),
+        "border-color" | "border-width" | "border-style"
+    ) {
+        let parts = split_components(&declaration.value);
+        return one_to_four(&parts)
+            .map(|values| {
+                SIDES
+                    .iter()
+                    .zip(values)
+                    .map(|(side, value)| Declaration {
+                        property: format!("border-{side}-{}", &declaration.property[7..]),
+                        value: value.to_owned(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
     let prefix = match declaration.property.as_str() {
         "margin" => "margin",
         "padding" => "padding",
+        "inset" => "inset",
+        "border-radius" => return expand_border_radius(&declaration.value),
+        "animation" => {
+            return crate::animation::expand_shorthand(&declaration.value).unwrap_or_else(|| {
+                log::debug!(
+                    "dropping invalid animation shorthand value `{}`",
+                    declaration.value
+                );
+                Vec::new()
+            });
+        }
         _ => return vec![declaration.clone()],
     };
     let parts = split_components(&declaration.value);
-    let sides = match parts.as_slice() {
-        [all] => [*all, *all, *all, *all],
-        [vertical, horizontal] => [*vertical, *horizontal, *vertical, *horizontal],
-        [top, horizontal, bottom] => [*top, *horizontal, *bottom, *horizontal],
-        [top, right, bottom, left] => [*top, *right, *bottom, *left],
-        _ => return Vec::new(),
+    let Some(sides) = one_to_four(&parts) else {
+        log::debug!(
+            "dropping invalid {prefix} shorthand value `{}`",
+            declaration.value
+        );
+        return Vec::new();
     };
+    log::trace!("expanding {prefix} shorthand `{}`", declaration.value);
     SIDES
         .iter()
         .zip(sides)
         .map(|(side, value)| Declaration {
-            property: format!("{prefix}-{side}"),
+            // `inset` sets the bare side properties.
+            property: if prefix == "inset" {
+                (*side).to_owned()
+            } else {
+                format!("{prefix}-{side}")
+            },
             value: value.to_owned(),
         })
         .collect()
 }
 
+fn legacy_box_align(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "start" => "flex-start".to_owned(),
+        "end" => "flex-end".to_owned(),
+        "center" | "baseline" | "stretch" => value.trim().to_ascii_lowercase(),
+        _ => value.to_owned(),
+    }
+}
+
+fn legacy_box_pack(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "start" => "flex-start".to_owned(),
+        "end" => "flex-end".to_owned(),
+        "center" => "center".to_owned(),
+        "justify" => "space-between".to_owned(),
+        _ => value.to_owned(),
+    }
+}
+
+/// Expands the supported color-only portion of `background`. Image, repeat,
+/// position, and sizing components are ignored; the shorthand still resets
+/// the background color when it contains no supported color.
+fn expand_background(value: &str) -> Vec<Declaration> {
+    let color = if CSS_WIDE_KEYWORDS
+        .iter()
+        .any(|keyword| value.trim().eq_ignore_ascii_case(keyword))
+    {
+        value.trim()
+    } else {
+        split_components(value)
+            .into_iter()
+            .find(|part| crate::parse_color(part).is_some())
+            .unwrap_or("transparent")
+    };
+    vec![Declaration {
+        property: "background-color".to_owned(),
+        value: color.to_owned(),
+    }]
+}
+
+/// Expands the width, style, and color components of the outline shorthand.
+fn expand_outline(value: &str) -> Vec<Declaration> {
+    let trimmed = value.trim();
+    let mut components = ["medium", "none", "currentcolor"];
+    if CSS_WIDE_KEYWORDS
+        .iter()
+        .any(|keyword| trimmed.eq_ignore_ascii_case(keyword))
+    {
+        components = [trimmed; 3];
+    } else {
+        let mut seen = [false; 3];
+        for token in split_components(trimmed) {
+            let lower = token.to_ascii_lowercase();
+            let index = if matches!(
+                lower.as_str(),
+                "none" | "auto" | "solid" | "dashed" | "dotted" | "double"
+            ) {
+                1
+            } else if matches!(lower.as_str(), "thin" | "medium" | "thick")
+                || crate::values::parse_length(&lower).is_some_and(|length| length.value >= 0.0)
+            {
+                0
+            } else if lower == "currentcolor" || crate::parse_color(token).is_some() {
+                2
+            } else {
+                return Vec::new();
+            };
+            if seen[index] {
+                return Vec::new();
+            }
+            seen[index] = true;
+            components[index] = token;
+        }
+    }
+    ["outline-width", "outline-style", "outline-color"]
+        .into_iter()
+        .zip(components)
+        .map(|(property, value)| Declaration {
+            property: property.to_owned(),
+            value: value.to_owned(),
+        })
+        .collect()
+}
+
+/// Expands the numeric and keyword forms of the `flex` shorthand.
+fn expand_flex(value: &str) -> Vec<Declaration> {
+    if CSS_WIDE_KEYWORDS
+        .iter()
+        .any(|keyword| value.trim().eq_ignore_ascii_case(keyword))
+    {
+        return ["flex-grow", "flex-shrink", "flex-basis"]
+            .into_iter()
+            .map(|property| Declaration {
+                property: property.to_owned(),
+                value: value.trim().to_owned(),
+            })
+            .collect();
+    }
+    let parts = split_components(value);
+    let values = match parts.as_slice() {
+        ["none"] => ["0", "0", "auto"],
+        ["auto"] => ["1", "1", "auto"],
+        [grow] if grow.parse::<f32>().is_ok() => [*grow, "1", "0%"],
+        [grow, shrink] if grow.parse::<f32>().is_ok() && shrink.parse::<f32>().is_ok() => {
+            [*grow, *shrink, "0%"]
+        }
+        [grow, shrink, basis] if grow.parse::<f32>().is_ok() && shrink.parse::<f32>().is_ok() => {
+            [*grow, *shrink, *basis]
+        }
+        _ => return Vec::new(),
+    };
+    ["flex-grow", "flex-shrink", "flex-basis"]
+        .into_iter()
+        .zip(values)
+        .map(|(property, value)| Declaration {
+            property: property.to_owned(),
+            value: value.to_owned(),
+        })
+        .collect()
+}
+
+fn expand_border(declaration: &Declaration) -> Vec<Declaration> {
+    let value = declaration.value.trim();
+    let mut values = ["medium", "none", "currentcolor"];
+    if CSS_WIDE_KEYWORDS.contains(&value) {
+        values = [value; 3];
+    } else {
+        let mut seen = [false; 3];
+        for token in split_components(value) {
+            let lower = token.to_ascii_lowercase();
+            let index = if matches!(
+                lower.as_str(),
+                "none"
+                    | "hidden"
+                    | "solid"
+                    | "dashed"
+                    | "dotted"
+                    | "double"
+                    | "groove"
+                    | "ridge"
+                    | "inset"
+                    | "outset"
+            ) {
+                1
+            } else if matches!(lower.as_str(), "thin" | "medium" | "thick")
+                || crate::values::parse_length(&lower).is_some_and(|v| v.value >= 0.0)
+            {
+                0
+            } else if lower == "currentcolor" || crate::parse_color(token).is_some() {
+                2
+            } else {
+                return Vec::new();
+            };
+            if seen[index] {
+                return Vec::new();
+            }
+            seen[index] = true;
+            values[index] = token;
+        }
+        if !seen.iter().any(|v| *v) {
+            return Vec::new();
+        }
+    }
+    let side = &declaration.property[declaration.property.len().min(7)..];
+    let sides: &[&str] = if declaration.property == "border" {
+        &SIDES
+    } else {
+        std::slice::from_ref(&side)
+    };
+    sides
+        .iter()
+        .flat_map(|side| {
+            ["width", "style", "color"]
+                .iter()
+                .zip(values)
+                .map(move |(part, value)| Declaration {
+                    property: format!("border-{side}-{part}"),
+                    value: value.to_owned(),
+                })
+        })
+        .collect()
+}
+
+/// Applies the one-to-four value rule, returning values for top, right,
+/// bottom, and left (or top-left, top-right, bottom-right, and bottom-left).
+fn one_to_four<'a>(parts: &[&'a str]) -> Option<[&'a str; 4]> {
+    match *parts {
+        [all] => Some([all, all, all, all]),
+        [vertical, horizontal] => Some([vertical, horizontal, vertical, horizontal]),
+        [top, horizontal, bottom] => Some([top, horizontal, bottom, horizontal]),
+        [top, right, bottom, left] => Some([top, right, bottom, left]),
+        _ => None,
+    }
+}
+
+/// Expands `border-radius` to its four corner longhands.
+fn expand_border_radius(value: &str) -> Vec<Declaration> {
+    let longhands = |values: [String; 4]| {
+        CORNERS
+            .iter()
+            .zip(values)
+            .map(|(corner, value)| Declaration {
+                property: format!("border-{corner}-radius"),
+                value,
+            })
+            .collect()
+    };
+    let trimmed = value.trim();
+    if CSS_WIDE_KEYWORDS
+        .iter()
+        .any(|keyword| trimmed.eq_ignore_ascii_case(keyword))
+    {
+        return longhands([0; 4].map(|_| trimmed.to_owned()));
+    }
+    let (horizontal, vertical) = match trimmed.split_once('/') {
+        Some((horizontal, vertical)) => (horizontal, Some(vertical)),
+        None => (trimmed, None),
+    };
+    let horizontal = one_to_four(&split_components(horizontal));
+    let vertical = vertical.map(|vertical| one_to_four(&split_components(vertical)));
+    let values = match (horizontal, vertical) {
+        (Some(horizontal), None) => horizontal.map(str::to_owned),
+        (Some(horizontal), Some(Some(vertical))) => {
+            let mut values = [0; 4].map(|_| String::new());
+            for (index, value) in values.iter_mut().enumerate() {
+                *value = format!("{} {}", horizontal[index], vertical[index]);
+            }
+            values
+        }
+        _ => {
+            log::debug!("dropping invalid border-radius shorthand value `{value}`");
+            return Vec::new();
+        }
+    };
+    log::trace!("expanding border-radius shorthand `{value}`");
+    longhands(values)
+}
+
 /// Splits a value into whitespace-separated components, keeping parenthesized
 /// groups such as `calc(1px + 2px)` intact.
-fn split_components(value: &str) -> Vec<&str> {
+pub(crate) fn split_components(value: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0_usize;
     let mut start = None;
@@ -90,6 +428,15 @@ mod tests {
             ]
         );
         assert_eq!(expanded("padding", "1px 2px 3px 4px 5px"), []);
+        assert_eq!(
+            expanded("inset", "0 auto"),
+            [
+                ("top".into(), "0".into()),
+                ("right".into(), "auto".into()),
+                ("bottom".into(), "0".into()),
+                ("left".into(), "auto".into()),
+            ]
+        );
         assert_eq!(expanded("color", "red"), [("color".into(), "red".into())]);
     }
 
@@ -100,5 +447,125 @@ mod tests {
                 .iter()
                 .all(|(_, value)| value == "inherit")
         );
+        let radius = expanded("border-radius", "initial");
+        assert_eq!(radius.len(), 4);
+        assert!(radius.iter().all(|(_, value)| value == "initial"));
+    }
+
+    #[test]
+    fn border_radius_expands_to_corner_longhands() {
+        assert_eq!(
+            expanded("border-radius", "3px"),
+            [
+                ("border-top-left-radius".into(), "3px".into()),
+                ("border-top-right-radius".into(), "3px".into()),
+                ("border-bottom-right-radius".into(), "3px".into()),
+                ("border-bottom-left-radius".into(), "3px".into()),
+            ]
+        );
+        assert_eq!(
+            expanded("border-radius", "1px 2px 3px / 4px 5px"),
+            [
+                ("border-top-left-radius".into(), "1px 4px".into()),
+                ("border-top-right-radius".into(), "2px 5px".into()),
+                ("border-bottom-right-radius".into(), "3px 4px".into()),
+                ("border-bottom-left-radius".into(), "2px 5px".into()),
+            ]
+        );
+        assert_eq!(expanded("border-radius", "1px / "), []);
+        assert_eq!(expanded("border-radius", "1px 2px 3px 4px 5px"), []);
+    }
+
+    #[test]
+    fn webkit_flexbox_and_animation_aliases_normalize_to_standard_properties() {
+        assert_eq!(
+            expanded("-webkit-align-items", "center"),
+            [("align-items".into(), "center".into())]
+        );
+        assert_eq!(
+            expanded("-webkit-box-align", "start"),
+            [("align-items".into(), "flex-start".into())]
+        );
+        assert_eq!(
+            expanded("-webkit-box-pack", "justify"),
+            [("justify-content".into(), "space-between".into())]
+        );
+        assert_eq!(
+            expanded("-webkit-justify-content", "center"),
+            [("justify-content".into(), "center".into())]
+        );
+        let animation = expanded("-webkit-animation", "fade 1s linear");
+        assert_eq!(animation.len(), 8);
+        assert_eq!(animation[0], ("animation-name".into(), "fade".into()));
+    }
+
+    #[test]
+    fn supported_css_property_shorthands_expand_to_longhands() {
+        assert_eq!(
+            expanded("background", "url(image.png) center red"),
+            [("background-color".into(), "red".into())]
+        );
+        assert_eq!(
+            expanded("outline", "2px dashed blue"),
+            [
+                ("outline-width".into(), "2px".into()),
+                ("outline-style".into(), "dashed".into()),
+                ("outline-color".into(), "blue".into()),
+            ]
+        );
+        assert_eq!(
+            expanded("flex", "2"),
+            [
+                ("flex-grow".into(), "2".into()),
+                ("flex-shrink".into(), "1".into()),
+                ("flex-basis".into(), "0%".into()),
+            ]
+        );
+        assert_eq!(
+            expanded("text-decoration", "underline"),
+            [("text-decoration-line".into(), "underline".into())]
+        );
+        assert_eq!(
+            expanded("-webkit-box-flex", "2"),
+            [("flex-grow".into(), "2".into())]
+        );
+        assert_eq!(
+            expanded("-webkit-flex", "2"),
+            [
+                ("flex-grow".into(), "2".into()),
+                ("flex-shrink".into(), "1".into()),
+                ("flex-basis".into(), "0%".into()),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod border_tests {
+    use super::*;
+
+    fn expand_value(property: &str, value: &str) -> Vec<Declaration> {
+        expand(&Declaration {
+            property: property.into(),
+            value: value.into(),
+        })
+    }
+
+    #[test]
+    fn borders_expand_before_cascade_and_reset_omitted_components() {
+        let result = expand_value("border-left", "rgb(10, 20, 30) solid 2px");
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].property, "border-left-width");
+        assert_eq!(result[0].value, "2px");
+        assert_eq!(result[2].value, "rgb(10, 20, 30)");
+        let reset = expand_value("border", "solid");
+        assert_eq!(reset.len(), 12);
+        assert_eq!(reset[0].value, "medium");
+        assert_eq!(reset[2].value, "currentcolor");
+        assert!(expand_value("border", "solid dashed").is_empty());
+        assert!(expand_value("border", "-2px solid").is_empty());
+        assert!(expand_value("border", "2% solid").is_empty());
+        assert_eq!(expand_value("border", "inherit")[11].value, "inherit");
+        assert_eq!(expand_value("border-color", "red blue")[3].value, "blue");
     }
 }

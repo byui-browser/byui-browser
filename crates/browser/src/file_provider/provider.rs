@@ -95,25 +95,34 @@ impl FileProvider for BrowserFileProvider {
         let before_read_hook = self.before_read_hook.clone();
 
         Box::pin(async move {
-            let (grant, lease, session_cancellation) = grants
-                .snapshot()
-                .ok_or_else(|| provider_error(FileAccessError::Denied))?;
+            log::trace!("file open requested: {url}");
+            let (grant, lease, session_cancellation) = grants.snapshot().ok_or_else(|| {
+                log::warn!("file provider denied {url}: no active file access session");
+                provider_error(FileAccessError::Denied)
+            })?;
             if session_cancellation.is_cancelled() || !lease.is_current() {
+                log::debug!("file open aborted for {url}: session revoked");
                 return Err(RequestError::Aborted);
             }
             let context = request_context(request);
             if context.kind != FileRequestKind::Navigation
                 || !navigation_authorizations.consume(request.id())
             {
+                log::warn!("file provider denied {url}: not an authorized navigation");
                 return Err(provider_error(FileAccessError::Denied));
             }
             capability
                 .authorize_request(&context, &grant)
-                .map_err(provider_error)?;
-            let path = url
-                .to_file_path()
-                .map_err(|_| provider_error(FileAccessError::InvalidPath))?;
+                .map_err(|error| {
+                    log::warn!("file provider denied {url}: request not authorized");
+                    provider_error(error)
+                })?;
+            let path = url.to_file_path().map_err(|_| {
+                log::warn!("file provider rejected {url}: not a valid file path");
+                provider_error(FileAccessError::InvalidPath)
+            })?;
             if path.as_os_str().to_string_lossy().contains('\0') {
+                log::warn!("file provider rejected {url}: path contains a nul byte");
                 return Err(provider_error(FileAccessError::InvalidPath));
             }
             let permit = read_admission
@@ -131,6 +140,9 @@ impl FileProvider for BrowserFileProvider {
                 }
                 let opened = capability
                     .open_authorized_file(&context, &grant, &setup_lease, path)
+                    .inspect_err(|error| {
+                        log::debug!("file provider could not open file: {error}");
+                    })
                     .map_err(|error| {
                         if setup_lease.is_current() {
                             provider_error(error)
@@ -154,6 +166,7 @@ impl FileProvider for BrowserFileProvider {
                 || !lease.is_current()
                 || Instant::now() >= deadline
             {
+                log::debug!("file open for {url} aborted or timed out during setup");
                 return Err(if Instant::now() >= deadline {
                     provider_resource_exhausted_error()
                 } else {
@@ -161,14 +174,23 @@ impl FileProvider for BrowserFileProvider {
                 });
             }
             if length > limits.max_file_size {
+                log::warn!(
+                    "file provider denied {url}: {length} bytes exceeds the {} byte limit",
+                    limits.max_file_size
+                );
                 return Err(provider_resource_exhausted_error());
             }
             if !allows_content(content_policy, media_type.as_deref()) {
+                log::warn!(
+                    "file provider denied {url}: unsupported media type {:?}",
+                    media_type
+                );
                 return Err(provider_error(FileAccessError::UnsupportedFile));
             }
             let mut prefix = [0; 4];
             let prefix_length = opened.read_prefix(&mut prefix).map_err(provider_error)?;
             if is_native_executable_prefix(&prefix[..prefix_length]) {
+                log::warn!("file provider denied {url}: native executable");
                 return Err(provider_error(FileAccessError::UnsupportedFile));
             }
             let expected_length = length;
@@ -191,8 +213,13 @@ impl FileProvider for BrowserFileProvider {
             // revocation observed first aborts setup; a later revocation is
             // enforced by the body lease checks below.
             if !lease.is_current() {
+                log::debug!("file open aborted for {url}: session revoked");
                 return Err(RequestError::Aborted);
             }
+            log::debug!(
+                "file provider serving {url}: {expected_length} bytes{}",
+                if is_head { " (head)" } else { "" }
+            );
             Ok(SchemeResource {
                 url,
                 status: 200,

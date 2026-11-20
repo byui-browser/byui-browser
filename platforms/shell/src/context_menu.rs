@@ -1,26 +1,108 @@
-//! Shared page popup: disabled navigation, Reload, View Page Source, and Inspect.
+//! Shared popup menus for page and browser-chrome actions.
 
 use ab_glyph::FontVec;
-use tiny_skia::{Color, Paint, Pixmap, Rect, Transform};
+use tiny_skia::{PathBuilder, Pixmap, Rect, Transform};
 
-/// Independent actions offered by the page popup.
+use crate::toolbar;
+
+/// Paints a broad, softly fading menu shadow in logical pixels.
+///
+/// The same neutral shadow works over both light and dark content. Half-pixel
+/// layers approximate a blurred edge without a tight, dark outline.
+pub(crate) fn draw_menu_shadow(frame: &mut Pixmap, rect: Option<Rect>, radius: f32, scale: f32) {
+    let Some(rect) = rect else { return };
+    let transform = Transform::from_scale(scale, scale);
+    for layer in (1..=48).rev() {
+        let spread = layer as f32 * 0.5;
+        // Integrating these fading layers produces a smooth falloff, with
+        // a faint ambient shadow and only a slight downward offset.
+        let alpha = 0.004 * (-(spread * spread) / 128.0).exp();
+        if let Some(path) = toolbar::rounded_rect(
+            rect.x() - spread,
+            rect.y() - spread + 2.0,
+            rect.width() + 2.0 * spread,
+            rect.height() + 2.0 * spread,
+            radius + spread,
+        ) {
+            let color = tiny_skia::Color::from_rgba(0.0, 0.0, 0.0, alpha).unwrap();
+            toolbar::fill(frame, &path, color, transform);
+        }
+    }
+}
+
+/// Window-wide appearance choice, independent of the active tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    pub(crate) fn is_dark(self, system_dark: Option<bool>) -> bool {
+        match self {
+            Self::System => system_dark.unwrap_or(false),
+            Self::Light => false,
+            Self::Dark => true,
+        }
+    }
+}
+
+/// Independent actions offered by browser popup menus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuAction {
     Reload,
+    /// Removes the in-memory network cache used by future page loads.
+    ClearCache,
+    OpenAppearance,
+    SetAppearance(Appearance),
     PageSource,
     Inspect,
+    /// Opens the DevTools dock on its Compatibility tab.
+    Compatibility,
 }
 
 // Disabled rows deliberately have no executable action. Navigation wiring is
 // outside this feature even when BrowserState has previous/next entries.
-const MENU_ITEMS: [(&str, Option<MenuAction>); 5] = [
+type MenuItem = (&'static str, Option<MenuAction>);
+
+const PAGE_MENU_ITEMS: [MenuItem; 6] = [
     ("Back", None),
     ("Forward", None),
     ("Reload", Some(MenuAction::Reload)),
     ("View Page Source", Some(MenuAction::PageSource)),
     ("Inspect", Some(MenuAction::Inspect)),
+    ("Audit Compatibility", Some(MenuAction::Compatibility)),
 ];
 
+const OVERFLOW_MENU_ITEMS: [MenuItem; 2] = [
+    ("Clear cache", Some(MenuAction::ClearCache)),
+    ("Appearance…", Some(MenuAction::OpenAppearance)),
+];
+
+const APPEARANCE_ITEMS: [MenuItem; 3] = [
+    (
+        "System",
+        Some(MenuAction::SetAppearance(Appearance::System)),
+    ),
+    ("Light", Some(MenuAction::SetAppearance(Appearance::Light))),
+    ("Dark", Some(MenuAction::SetAppearance(Appearance::Dark))),
+];
+
+/// Index of the first item after the separator that splits navigation
+/// (Back, Forward, Reload) from developer tools (Source, Inspect, Audit).
+const SECOND_GROUP: usize = 3;
+/// Menu width in logical pixels.
+const WIDTH: f64 = 208.0;
+/// Inner padding around the item list in logical pixels.
+const PAD: f64 = 5.0;
+/// Item row height in logical pixels.
+const ROW: f64 = 24.0;
+/// Height of the separator gap between groups in logical pixels.
+const SEPARATOR: f64 = 9.0;
+/// Corner radius of the menu surface in logical pixels.
+const RADIUS: f32 = 8.0;
 /// Popup bounds in logical pixels, independent of display scaling.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ContextMenu {
@@ -28,19 +110,76 @@ pub(crate) struct ContextMenu {
     y: f64,
     width: f64,
     height: f64,
+    items: &'static [MenuItem],
+    second_group: Option<usize>,
+    checked: Option<MenuAction>,
 }
 
 impl ContextMenu {
-    /// Anchors a five-item popup at the pointer, clamped to the window.
+    /// Anchors the popup at the pointer, clamped to the window.
     pub(crate) fn new(x: f64, y: f64, width: f64, height: f64) -> Self {
-        let menu_width = 220.0_f64.min(width);
-        let menu_height = 168.0_f64.min(height);
+        Self::with_items(x, y, width, height, &PAGE_MENU_ITEMS, Some(SECOND_GROUP))
+    }
+
+    /// Places the browser overflow menu below the toolbar's trailing controls.
+    pub(crate) fn overflow(width: f64, height: f64) -> Self {
+        Self::with_items(
+            width - WIDTH - 8.0,
+            toolbar::PAGE_TOP,
+            width,
+            height,
+            &OVERFLOW_MENU_ITEMS,
+            None,
+        )
+    }
+
+    /// Replaces the overflow list with the appearance choices and a checkmark.
+    pub(crate) fn appearance(width: f64, height: f64, current: Appearance) -> Self {
+        let mut menu = Self::with_items(
+            width - WIDTH - 8.0,
+            toolbar::PAGE_TOP,
+            width,
+            height,
+            &APPEARANCE_ITEMS,
+            None,
+        );
+        menu.checked = Some(MenuAction::SetAppearance(current));
+        menu
+    }
+
+    fn with_items(
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        items: &'static [MenuItem],
+        second_group: Option<usize>,
+    ) -> Self {
+        let menu_width = WIDTH.min(width);
+        let menu_height = Self::height_for(items.len(), second_group).min(height);
         Self {
             x: x.clamp(0.0, width - menu_width),
             y: y.clamp(0.0, height - menu_height),
             width: menu_width,
             height: menu_height,
+            items,
+            second_group,
+            checked: None,
         }
+    }
+
+    /// Top of item `index` relative to the menu's top edge, in logical pixels.
+    fn row_top(self, index: usize) -> f64 {
+        let gap = if self.second_group.is_some_and(|group| index >= group) {
+            SEPARATOR
+        } else {
+            0.0
+        };
+        PAD + index as f64 * ROW + gap
+    }
+
+    fn height_for(items: usize, second_group: Option<usize>) -> f64 {
+        2.0 * PAD + items as f64 * ROW + second_group.map_or(0.0, |_| SEPARATOR)
     }
 
     /// Whether the pointer is inside the popup, including disabled rows/padding.
@@ -50,19 +189,31 @@ impl ContextMenu {
         })
     }
 
-    /// Returns enabled actions only; Back/Forward cannot be selected or hovered.
+    /// Returns enabled actions only; Back/Forward, padding, and the separator
+    /// cannot be selected or hovered.
     pub(crate) fn action_at(self, cursor: Option<(f64, f64)>) -> Option<MenuAction> {
         let (x, y) = cursor?;
-        if x < self.x + 4.0
-            || x >= self.x + self.width - 4.0
-            || y < self.y + 4.0
-            || y >= self.y + self.height - 4.0
-        {
+        if !self.contains(cursor) || x < self.x + PAD || x >= self.x + self.width - PAD {
             return None;
         }
-        let row_height = (self.height - 8.0) / MENU_ITEMS.len() as f64;
-        let index = ((y - self.y - 4.0) / row_height) as usize;
-        MENU_ITEMS.get(index).and_then(|(_, action)| *action)
+        let y = y - self.y;
+        self.items
+            .iter()
+            .enumerate()
+            .find(|(index, _)| {
+                let top = self.row_top(*index);
+                y >= top && y < top + ROW
+            })
+            .and_then(|(_, (_, action))| *action)
+    }
+
+    /// Center of item `index` in logical window coordinates, for tests.
+    #[cfg(test)]
+    pub(crate) fn item_center(self, index: usize) -> (f64, f64) {
+        (
+            self.x + self.width / 2.0,
+            self.y + self.row_top(index) + ROW / 2.0,
+        )
     }
 
     /// Composites the menu above a freshly restored window frame.
@@ -74,65 +225,96 @@ impl ContextMenu {
         hovered: Option<MenuAction>,
         font: Option<&FontVec>,
     ) {
-        let scale = scale as f32;
-        let rect = Rect::from_xywh(
-            self.x as f32 * scale,
-            self.y as f32 * scale,
-            self.width as f32 * scale,
-            self.height as f32 * scale,
-        )
-        .unwrap();
-        let mut paint = Paint::default();
-        paint.set_color_rgba8(120, 120, 130, 255);
-        frame.fill_rect(rect, &paint, Transform::identity(), None);
-        if let Some(inner) = Rect::from_xywh(
-            rect.x() + scale,
-            rect.y() + scale,
-            rect.width() - 2.0 * scale,
-            rect.height() - 2.0 * scale,
-        ) {
-            let shade = if dark { 45 } else { 250 };
-            paint.set_color_rgba8(shade, shade, shade, 255);
-            frame.fill_rect(inner, &paint, Transform::identity(), None);
+        let palette = toolbar::palette(dark);
+        let rgba = toolbar::rgba;
+        let s = scale as f32;
+        let transform = Transform::from_scale(s, s);
+        let (x, y, w, h) = (
+            self.x as f32,
+            self.y as f32,
+            self.width as f32,
+            self.height as f32,
+        );
+
+        draw_menu_shadow(frame, Rect::from_xywh(x, y, w, h), RADIUS, s);
+        let (surface, border, separator) = if dark {
+            (palette.panel, palette.panel_border, rgba(255, 255, 255, 22))
+        } else {
+            (
+                rgba(255, 255, 255, 255),
+                rgba(15, 23, 42, 34),
+                rgba(15, 23, 42, 22),
+            )
+        };
+        if let Some(path) = toolbar::rounded_rect(x, y, w, h, RADIUS) {
+            toolbar::fill(frame, &path, surface, transform);
         }
-        let row_height = (rect.height() - 8.0 * scale) / MENU_ITEMS.len() as f32;
-        for (index, (label, action)) in MENU_ITEMS.into_iter().enumerate() {
-            let top = rect.y() + 4.0 * scale + index as f32 * row_height;
-            let selected = action.is_some() && hovered == action;
-            if selected
-                && let Some(row) = Rect::from_xywh(
-                    rect.x() + 4.0 * scale,
-                    top,
-                    rect.width() - 8.0 * scale,
-                    row_height,
+        if let Some(path) = toolbar::rounded_rect(x + 0.5, y + 0.5, w - 1.0, h - 1.0, RADIUS - 0.5)
+        {
+            toolbar::stroke(frame, &path, border, 1.0, transform);
+        }
+        if let Some(second_group) = self.second_group {
+            let separator_y = y + (self.row_top(second_group) - SEPARATOR / 2.0) as f32;
+            if separator_y + 1.0 < y + h
+                && let Some(rect) = Rect::from_xywh(
+                    x + PAD as f32 + 8.0,
+                    separator_y.floor(),
+                    w - 2.0 * PAD as f32 - 16.0,
+                    1.0,
                 )
             {
-                paint.set_color_rgba8(40, 100, 210, 255);
-                frame.fill_rect(row, &paint, Transform::identity(), None);
+                toolbar::fill(frame, &PathBuilder::from_rect(rect), separator, transform);
             }
-            if let Some(font) = font {
-                let color = if action.is_none() {
-                    if dark {
-                        Color::from_rgba8(145, 145, 155, 255)
-                    } else {
-                        Color::from_rgba8(140, 140, 150, 255)
-                    }
-                } else if dark || selected {
-                    Color::WHITE
-                } else {
-                    Color::BLACK
-                };
-                crate::toolbar::draw_text(
-                    frame,
-                    font,
-                    13.0 * scale,
-                    rect.x() + 14.0 * scale,
-                    top + 21.0 * scale,
-                    rect.right() - 8.0 * scale,
-                    color,
-                    label,
-                );
+        }
+
+        for (index, (label, action)) in self.items.iter().copied().enumerate() {
+            let top = y + self.row_top(index) as f32;
+            if top + ROW as f32 > y + h {
+                break;
             }
+            let selected = action.is_some() && hovered == action;
+            if selected
+                && let Some(path) = toolbar::rounded_rect(
+                    x + PAD as f32,
+                    top,
+                    w - 2.0 * PAD as f32,
+                    ROW as f32,
+                    5.0,
+                )
+            {
+                toolbar::fill(frame, &path, palette.accent, transform);
+            }
+            let color = if selected {
+                palette.on_accent
+            } else if action.is_none() {
+                palette.icon_disabled
+            } else {
+                palette.text
+            };
+            if action.is_some() && action == self.checked {
+                let mark_x = x + w - 24.0;
+                let mark_y = top + ROW as f32 / 2.0;
+                let mut mark = PathBuilder::new();
+                mark.move_to(mark_x, mark_y);
+                mark.line_to(mark_x + 3.0, mark_y + 3.0);
+                mark.line_to(mark_x + 9.0, mark_y - 3.0);
+                if let Some(path) = mark.finish() {
+                    toolbar::stroke(frame, &path, color, 1.6, transform);
+                }
+            }
+            let Some(font) = font else {
+                continue;
+            };
+            toolbar::draw_text(
+                frame,
+                font,
+                13.0 * s,
+                (x + PAD as f32 + 10.0) * s,
+                (top + ROW as f32 / 2.0 + 4.5) * s,
+                (x + w - PAD as f32 - 8.0) * s,
+                color,
+                label,
+            );
         }
     }
 }
@@ -142,14 +324,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn five_rows_have_the_requested_order_and_disabled_rows_have_no_actions() {
+    fn rows_have_the_requested_order_and_disabled_rows_have_no_actions() {
         assert_eq!(
-            MENU_ITEMS.map(|(label, _)| label),
-            ["Back", "Forward", "Reload", "View Page Source", "Inspect"]
+            PAGE_MENU_ITEMS.map(|(label, _)| label),
+            [
+                "Back",
+                "Forward",
+                "Reload",
+                "View Page Source",
+                "Inspect",
+                "Audit Compatibility"
+            ]
         );
         let menu = ContextMenu::new(100.0, 100.0, 800.0, 600.0);
-        for (row, (_, expected)) in MENU_ITEMS.into_iter().enumerate() {
-            let cursor = Some((120.0, 120.0 + row as f64 * 32.0));
+        for (row, (_, expected)) in PAGE_MENU_ITEMS.into_iter().enumerate() {
+            let cursor = Some(menu.item_center(row));
             assert!(menu.contains(cursor));
             assert_eq!(menu.action_at(cursor), expected);
         }
@@ -157,29 +346,75 @@ mod tests {
     }
 
     #[test]
+    fn overflow_menu_exposes_clear_cache_below_all_browser_controls() {
+        for (width, height) in [(420.0, 280.0), (800.0, 600.0), (1728.0, 1117.0)] {
+            let menu = ContextMenu::overflow(width, height);
+            assert_eq!(
+                menu.action_at(Some(menu.item_center(0))),
+                Some(MenuAction::ClearCache)
+            );
+            assert!(menu.y >= toolbar::PAGE_TOP);
+            assert!(menu.x >= 0.0 && menu.x + menu.width <= width);
+            assert!(menu.y + menu.height <= height);
+            // The popup must not cover the toolbar button that opened it.
+            assert!(!menu.contains(Some((width - 30.0, crate::tab_strip::HEIGHT + 26.0))));
+        }
+    }
+
+    #[test]
+    fn appearance_is_in_overflow_and_marks_only_the_current_choice() {
+        let overflow = ContextMenu::overflow(420.0, 280.0);
+        assert_eq!(
+            overflow.action_at(Some(overflow.item_center(1))),
+            Some(MenuAction::OpenAppearance)
+        );
+        let mut frames = Vec::new();
+        for appearance in [Appearance::System, Appearance::Light, Appearance::Dark] {
+            let menu = ContextMenu::appearance(420.0, 280.0, appearance);
+            assert_eq!(menu.checked, Some(MenuAction::SetAppearance(appearance)));
+            assert!(menu.y + menu.height <= 280.0);
+            let mut frame = Pixmap::new(420, 280).unwrap();
+            menu.draw(&mut frame, 1.0, false, None, None);
+            assert!(!frames.iter().any(|previous| previous == &frame));
+            frames.push(frame);
+        }
+    }
+
+    #[test]
+    fn separator_and_padding_are_inert() {
+        let menu = ContextMenu::new(100.0, 100.0, 800.0, 600.0);
+        let (x, _) = menu.item_center(0);
+        let separator = menu.y + menu.row_top(SECOND_GROUP) - SEPARATOR / 2.0;
+        assert!(menu.contains(Some((x, separator))));
+        assert_eq!(menu.action_at(Some((x, separator))), None);
+        assert_eq!(
+            menu.action_at(Some((menu.x + 1.0, menu.item_center(2).1))),
+            None
+        );
+        assert_eq!(menu.action_at(Some((x, menu.y + 1.0))), None);
+    }
+
+    #[test]
     fn popup_stays_inside_window_and_hit_testing_matches_position() {
-        for (width, height) in [(800.0, 600.0), (100.0, 20.0)] {
+        for (width, height) in [(800.0, 600.0), (240.0, 160.0), (100.0, 20.0)] {
             for (x, y) in [(0.0, 0.0), (width - 1.0, height - 1.0)] {
                 let menu = ContextMenu::new(x, y, width, height);
                 assert!(menu.x >= 0.0 && menu.y >= 0.0);
                 assert!(menu.x + menu.width <= width);
                 assert!(menu.y + menu.height <= height);
+                assert_eq!(menu.action_at(Some((menu.x, menu.y))), None);
+                assert_eq!(menu.action_at(None), None);
+                if height < ContextMenu::height_for(PAGE_MENU_ITEMS.len(), Some(SECOND_GROUP)) {
+                    continue;
+                }
                 assert_eq!(
-                    menu.action_at(Some((
-                        menu.x + 5.0,
-                        menu.y + 4.0 + (menu.height - 8.0) * 0.5
-                    ))),
+                    menu.action_at(Some(menu.item_center(2))),
                     Some(MenuAction::Reload)
                 );
                 assert_eq!(
-                    menu.action_at(Some((
-                        menu.x + 5.0,
-                        menu.y + 4.0 + (menu.height - 8.0) * 0.7
-                    ))),
+                    menu.action_at(Some(menu.item_center(3))),
                     Some(MenuAction::PageSource)
                 );
-                assert_eq!(menu.action_at(Some((menu.x, menu.y))), None);
-                assert_eq!(menu.action_at(None), None);
             }
         }
     }
