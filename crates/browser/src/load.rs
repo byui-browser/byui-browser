@@ -687,12 +687,26 @@ pub fn security_context_for_url_with_policy(
         && !host.is_empty()
     {
         let origin = Origin::new(url.scheme(), host, url.port());
-        let storage_permission = match policy.decision(&origin, PermissionKind::Storage) {
-            Some(PermissionState::Denied) => StoragePermission::Denied,
-            Some(PermissionState::Granted) | None => StoragePermission::Allowed,
-        };
-        log::debug!("security context derived: origin {origin:?}, storage {storage_permission:?}");
-        return RendererSecurityContext::new(origin, storage_permission);
+        let permissions = [
+            PermissionKind::Storage,
+            PermissionKind::Cookies,
+            PermissionKind::Geolocation,
+        ]
+        .into_iter()
+        .map(|permission| {
+            let default = if permission == PermissionKind::Storage {
+                PermissionState::Granted
+            } else {
+                PermissionState::Denied
+            };
+            (
+                permission,
+                policy.decision(&origin, permission).unwrap_or(default),
+            )
+        })
+        .collect::<Vec<_>>();
+        log::debug!("security context derived: origin {origin:?}, permissions from policy");
+        return RendererSecurityContext::with_permissions(origin, permissions);
     }
     log::debug!("security context derived: opaque origin, storage denied");
     RendererSecurityContext::new(Origin::new("opaque", "", None), StoragePermission::Denied)
@@ -1212,6 +1226,19 @@ mod tests {
 
         assert!(!context.can_read_storage());
         assert!(!context.can_write_storage());
+    }
+
+    #[test]
+    fn policy_grants_reach_the_renderer_context_without_changing_defaults() {
+        let origin = Origin::new("https", "example.com", None);
+        let mut policy = PermissionPolicy::new();
+        policy.grant(origin, PermissionKind::Cookies);
+
+        let context = security_context_for_url_with_policy("https://example.com/page", &policy);
+
+        assert!(context.can_read_storage());
+        assert!(context.has_permission(PermissionKind::Cookies));
+        assert!(!context.has_permission(PermissionKind::Geolocation));
     }
 
     #[test]

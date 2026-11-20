@@ -10,9 +10,11 @@
 pub mod file_access;
 pub mod permissions;
 
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 use common::ipc::{StorageError as IpcStorageError, StorageRequest};
+
+use permissions::{PermissionKind, PermissionState};
 
 /// Formats an origin as `scheme://host:port` for log messages.
 fn origin_label(origin: &Origin) -> String {
@@ -280,6 +282,7 @@ pub struct RendererSecurityContext {
     origin: Origin,
     storage_key: StorageKey,
     storage_permission: StoragePermission,
+    permissions: HashMap<PermissionKind, PermissionState>,
 }
 
 impl RendererSecurityContext {
@@ -288,15 +291,49 @@ impl RendererSecurityContext {
     ///
     /// The storage key is derived from the same origin stored by this context.
     pub fn new(origin: Origin, storage_permission: StoragePermission) -> Self {
+        Self::with_permissions(
+            origin,
+            [
+                (
+                    PermissionKind::Storage,
+                    match storage_permission {
+                        StoragePermission::Allowed => PermissionState::Granted,
+                        StoragePermission::Denied => PermissionState::Denied,
+                    },
+                ),
+                (PermissionKind::Cookies, PermissionState::Denied),
+                (PermissionKind::Geolocation, PermissionState::Denied),
+            ],
+        )
+    }
+
+    /// Creates a renderer context with explicit decisions for browser
+    /// capabilities.
+    ///
+    /// Capabilities omitted from `permissions` are denied. The storage
+    /// decision is also exposed through the legacy [`StoragePermission`]
+    /// accessors and continues to control trusted storage-key authorization.
+    pub fn with_permissions(
+        origin: Origin,
+        permissions: impl IntoIterator<Item = (PermissionKind, PermissionState)>,
+    ) -> Self {
+        let permissions: HashMap<PermissionKind, PermissionState> =
+            permissions.into_iter().collect();
+        let storage_permission = match permissions.get(&PermissionKind::Storage) {
+            Some(PermissionState::Granted) => StoragePermission::Allowed,
+            Some(PermissionState::Denied) | None => StoragePermission::Denied,
+        };
         log::debug!(
-            "security context created for {} (storage {:?})",
+            "security context created for {} (storage {:?}, permissions {:?})",
             origin_label(&origin),
-            storage_permission
+            storage_permission,
+            permissions
         );
         Self {
             storage_key: StorageKey::new(origin.clone()),
             origin,
             storage_permission,
+            permissions,
         }
     }
 
@@ -393,6 +430,24 @@ impl RendererSecurityContext {
     /// Whether the renderer is allowed to write storage.
     pub fn can_write_storage(&self) -> bool {
         !self.origin.is_opaque() && self.storage_permission == StoragePermission::Allowed
+    }
+
+    /// Returns the decision for a browser capability in this renderer.
+    ///
+    /// Capabilities that were not granted when the context was created are
+    /// denied.
+    #[must_use]
+    pub fn permission_state(&self, permission: PermissionKind) -> PermissionState {
+        self.permissions
+            .get(&permission)
+            .copied()
+            .unwrap_or(PermissionState::Denied)
+    }
+
+    /// Returns whether this renderer may use `permission`.
+    #[must_use]
+    pub fn has_permission(&self, permission: PermissionKind) -> bool {
+        self.permission_state(permission) == PermissionState::Granted
     }
 }
 
@@ -533,6 +588,21 @@ mod tests {
             origin("https", "byui.edu", 443),
             origin("https", "example.com", 443)
         );
+    }
+
+    #[test]
+    fn renderer_context_defaults_omitted_permissions_to_denied() {
+        let context = RendererSecurityContext::with_permissions(
+            origin("https", "byui.edu", 443),
+            [(PermissionKind::Cookies, PermissionState::Granted)],
+        );
+
+        assert!(context.has_permission(PermissionKind::Cookies));
+        assert_eq!(
+            context.permission_state(PermissionKind::Geolocation),
+            PermissionState::Denied
+        );
+        assert!(!context.can_read_storage());
     }
 
     #[test]
