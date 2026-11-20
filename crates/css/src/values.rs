@@ -120,7 +120,11 @@ pub fn parse_number(input: &str) -> Option<f32> {
 /// value resolver and are not converted by this helper.
 pub fn parse_length(input: &str) -> Option<Length> {
     let input = input.trim();
-    if input.len() >= 6 && input[..5].eq_ignore_ascii_case("calc(") && input.ends_with(')') {
+    if input
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("calc("))
+        && input.ends_with(')')
+    {
         return None;
     }
     let (number, unit) = input.split_at(number_prefix_len(input));
@@ -338,7 +342,7 @@ pub fn resolve_length_function(input: &str) -> Option<String> {
 fn function_inner<'a>(input: &'a str, name: &str) -> Option<&'a str> {
     let prefix = format!("{name}(");
     if input.len() <= prefix.len()
-        || !input[..prefix.len()].eq_ignore_ascii_case(&prefix)
+        || !input.get(..prefix.len())?.eq_ignore_ascii_case(&prefix)
         || !input.ends_with(')')
     {
         return None;
