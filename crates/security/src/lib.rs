@@ -46,6 +46,15 @@ impl Origin {
         self.port
     }
 
+    /// Returns whether this is an opaque origin.
+    ///
+    /// Opaque origins do not receive origin-scoped web storage, even when a
+    /// caller supplies an otherwise allowing permission.
+    #[must_use]
+    pub fn is_opaque(&self) -> bool {
+        self.scheme == "opaque"
+    }
+
     /// Returns the origin serialization exposed to web content.
     ///
     /// Opaque origins serialize as `null`. Tuple origins omit the default port
@@ -239,9 +248,8 @@ impl<'context> AuthorizedStorageRequest<'context> {
 
 /// The renderer's permission to access browser storage.
 ///
-/// This initial policy is all-or-nothing: allowing storage permits both reads
-/// and writes. More granular permissions can be added when the storage policy
-/// is expanded.
+/// This initial policy is all-or-nothing for tuple origins: allowing storage
+/// permits both reads and writes. Opaque origins are always denied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoragePermission {
     /// The renderer may read and write storage.
@@ -379,12 +387,12 @@ impl RendererSecurityContext {
 
     /// Whether the renderer is allowed to read storage.
     pub fn can_read_storage(&self) -> bool {
-        self.storage_permission == StoragePermission::Allowed
+        !self.origin.is_opaque() && self.storage_permission == StoragePermission::Allowed
     }
 
     /// Whether the renderer is allowed to write storage.
     pub fn can_write_storage(&self) -> bool {
-        self.storage_permission == StoragePermission::Allowed
+        !self.origin.is_opaque() && self.storage_permission == StoragePermission::Allowed
     }
 }
 
@@ -546,6 +554,12 @@ mod tests {
     }
 
     #[test]
+    fn opaque_origins_are_identifiable() {
+        assert!(Origin::new("opaque", "", None).is_opaque());
+        assert!(!Origin::new("https", "example.com", None).is_opaque());
+    }
+
+    #[test]
     fn placeholder_origin_can_create_storage_key() {
         let origin = Origin::placeholder();
         let key = StorageKey::new(origin.clone());
@@ -601,6 +615,17 @@ mod tests {
         let context = RendererSecurityContext::new(
             origin("https", "byui.edu", 443),
             StoragePermission::Denied,
+        );
+
+        assert!(!context.can_read_storage());
+        assert!(!context.can_write_storage());
+    }
+
+    #[test]
+    fn opaque_renderer_cannot_read_or_write_storage_even_when_allowed() {
+        let context = RendererSecurityContext::new(
+            Origin::new("opaque", "", None),
+            StoragePermission::Allowed,
         );
 
         assert!(!context.can_read_storage());
