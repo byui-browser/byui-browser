@@ -494,14 +494,25 @@ impl RequestController {
     ) -> Result<(crate::Headers, crate::Headers), RequestError> {
         let mut headers = request.fetch_headers(url)?;
         match request.cache_mode() {
-            CacheMode::Reload => headers.append_internal_header(
-                http::header::CACHE_CONTROL,
-                http::HeaderValue::from_static("no-cache"),
-            )?,
-            CacheMode::NoCache => headers.append_internal_header(
-                http::header::CACHE_CONTROL,
-                http::HeaderValue::from_static("max-age=0"),
-            )?,
+            CacheMode::NoCache if !headers.has(http::header::CACHE_CONTROL.as_str()) => headers
+                .append_internal_header(
+                    http::header::CACHE_CONTROL,
+                    http::HeaderValue::from_static("max-age=0"),
+                )?,
+            CacheMode::NoStore | CacheMode::Reload => {
+                if !headers.has(http::header::PRAGMA.as_str()) {
+                    headers.append_internal_header(
+                        http::header::PRAGMA,
+                        http::HeaderValue::from_static("no-cache"),
+                    )?;
+                }
+                if !headers.has(http::header::CACHE_CONTROL.as_str()) {
+                    headers.append_internal_header(
+                        http::header::CACHE_CONTROL,
+                        http::HeaderValue::from_static("no-cache"),
+                    )?;
+                }
+            }
             _ => {}
         }
         let generated = if let Some(policy) = &self.inner.request_policy {

@@ -9,6 +9,7 @@ use std::sync::{
 use std::time::Duration;
 
 use common::{TestServer, collect_body, runtime};
+use http::{HeaderName, HeaderValue};
 use net::{
     CacheMode, CachePartitionService, Config, CookieService, FetchEnvironment, Request,
     RequestController, RequestError, RequestMode, RequestPolicyService, ResponseInfo,
@@ -324,6 +325,7 @@ fn reload_bypasses_cache_and_caches_the_refresh_when_consumed() {
         let hit = observed_hits.fetch_add(1, Ordering::SeqCst);
         if hit == 1 {
             assert!(request.contains("cache-control: no-cache"));
+            assert!(request.contains("pragma: no-cache"));
         }
         let body = if hit == 0 { "first" } else { "second" };
         format!("HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).into_bytes()
@@ -373,6 +375,142 @@ fn reload_bypasses_cache_and_caches_the_refresh_when_consumed() {
     assert!(cached.0);
     assert_eq!(cached.1, b"second");
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn caller_cache_directives_are_preserved_for_reload_and_no_cache() {
+    let server = TestServer::start(2, |request| {
+        if request.starts_with("GET /reload ") {
+            assert!(request.contains("cache-control: max-age=120"));
+            assert!(request.contains("pragma: client-cache-rule"));
+            assert!(!request.contains("cache-control: no-cache"));
+            assert!(!request.contains("pragma: no-cache"));
+        } else if request.starts_with("GET /no-cache ") {
+            assert!(request.contains("cache-control: max-age=120"));
+            assert!(!request.contains("cache-control: max-age=0"));
+        } else {
+            panic!("unexpected request: {request}");
+        }
+        b"HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+
+    runtime().block_on(async {
+        let mut reload = Request::get(format!("{}/reload", server.url()));
+        reload.set_cache_mode(CacheMode::Reload);
+        reload
+            .set_header(
+                HeaderName::from_static("cache-control"),
+                HeaderValue::from_static("max-age=120"),
+            )
+            .unwrap();
+        reload
+            .set_header(
+                HeaderName::from_static("pragma"),
+                HeaderValue::from_static("client-cache-rule"),
+            )
+            .unwrap();
+        assert_eq!(
+            collect_body(controller.fetch(reload).await.unwrap())
+                .await
+                .unwrap(),
+            b"ok"
+        );
+
+        let mut no_cache = Request::get(format!("{}/no-cache", server.url()));
+        no_cache.set_cache_mode(CacheMode::NoCache);
+        no_cache
+            .set_header(
+                HeaderName::from_static("cache-control"),
+                HeaderValue::from_static("max-age=120"),
+            )
+            .unwrap();
+        assert_eq!(
+            collect_body(controller.fetch(no_cache).await.unwrap())
+                .await
+                .unwrap(),
+            b"ok"
+        );
+    });
+
+    server.join();
+}
+
+#[test]
+fn no_store_sends_cache_bypass_directives_when_the_caller_omits_them() {
+    let server = TestServer::start(1, |request| {
+        assert!(request.contains("pragma: no-cache"));
+        assert!(request.contains("cache-control: no-cache"));
+        b"HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+
+    runtime().block_on(async {
+        let mut request = Request::get(server.url());
+        request.set_cache_mode(CacheMode::NoStore);
+        assert_eq!(
+            collect_body(controller.fetch(request).await.unwrap())
+                .await
+                .unwrap(),
+            b"ok"
+        );
+    });
+
+    server.join();
+}
+
+#[test]
+fn default_request_with_a_caller_validator_bypasses_and_preserves_the_cache() {
+    let server = TestServer::start(2, |request| {
+        if request.contains("if-none-match: \"caller\"") {
+            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 9\r\nConnection: close\r\n\r\nvalidated".to_vec()
+        } else {
+            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
+        }
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+    let url = server.url().to_owned();
+
+    runtime().block_on(async {
+        let request = Request::get(&url);
+        assert_eq!(
+            collect_body(
+                controller
+                    .fetch(request.try_clone().unwrap())
+                    .await
+                    .unwrap()
+            )
+            .await
+            .unwrap(),
+            b"cached"
+        );
+        wait_for_cached(&controller, &request).await;
+
+        let mut conditional = request;
+        conditional
+            .set_header(
+                HeaderName::from_static("if-none-match"),
+                HeaderValue::from_static("\"caller\""),
+            )
+            .unwrap();
+        assert_eq!(
+            collect_body(controller.fetch(conditional).await.unwrap())
+                .await
+                .unwrap(),
+            b"validated"
+        );
+
+        let cached = wait_for_cached(&controller, &Request::get(&url)).await;
+        assert_eq!(collect_body(cached).await.unwrap(), b"cached");
+    });
+
+    server.join();
 }
 
 #[test]

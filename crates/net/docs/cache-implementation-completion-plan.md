@@ -106,11 +106,10 @@ remain incorrect:
 
 - `Default` does not implement stale-while-revalidate and always waits for a
   stale response's network update.
-- `Reload` adds `Cache-Control: no-cache` but omits `Pragma: no-cache` and does
-  not fully honor the standard's caller-header conditions.
-- `NoStore`/`Reload` do not cover all standard request-directive interactions.
-- A request with caller-supplied validators does not force default mode to
-  `no-store`.
+- `Reload` and `NoStore` add `Pragma: no-cache` and `Cache-Control: no-cache`
+  only when the caller did not already provide each field. `NoCache` likewise
+  preserves a caller-provided `Cache-Control` field, and default requests with
+  caller-supplied validators use `no-store` behavior.
 - Cached redirects are not stored or followed for `OnlyIfCached`.
 - The Rust error boundary should be aligned with the JavaScript-facing
   `TypeError` required when `only-if-cached` is used outside same-origin mode.
@@ -168,7 +167,6 @@ Add focused unit and integration coverage for:
 Add focused coverage for:
 
 - stale-while-revalidate behavior;
-- `Pragma`, caller-supplied cache directives, and caller-supplied validators;
 - validation failure, missing validators, changed validators, concurrent
   revalidation, and `Set-Cookie` during `304`;
 - generated-header-aware `Vary` matching;

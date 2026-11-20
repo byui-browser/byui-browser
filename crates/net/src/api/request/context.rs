@@ -87,12 +87,20 @@ pub enum CacheMode {
     /// Use the normal HTTP cache algorithm.
     Default,
     /// Skip the cache and do not store the response.
+    ///
+    /// Network attempts add `Pragma: no-cache` and `Cache-Control: no-cache`
+    /// when the caller did not already provide those fields.
     NoStore,
-    /// Skip an existing cached response, send `Cache-Control: no-cache`, and
-    /// permit the new response to be cached.
+    /// Skip an existing cached response, send reload directives when absent,
+    /// and permit the new response to be cached.
+    ///
+    /// Network attempts add `Pragma: no-cache` and `Cache-Control: no-cache`
+    /// only when the caller did not already provide the respective field.
     Reload,
-    /// Revalidate a cached response before using it, sending
-    /// `Cache-Control: max-age=0` on the network request.
+    /// Revalidate a cached response before using it.
+    ///
+    /// Network attempts add `Cache-Control: max-age=0` only when the caller
+    /// did not already provide a `Cache-Control` field.
     NoCache,
     /// Use a cached response when available, even if stale.
     ForceCache,
