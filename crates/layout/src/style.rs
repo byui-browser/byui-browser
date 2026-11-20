@@ -102,7 +102,8 @@ fn parse_corner_radius(
 }
 
 impl Display {
-    const INLINE: Self = Self::Box {
+    /// `display: inline`: a non-replaced inline box.
+    pub(crate) const INLINE: Self = Self::Box {
         outside: DisplayOutside::Inline,
         inside: DisplayInside::Flow,
     };
@@ -461,8 +462,27 @@ pub(crate) struct ComputedStyle {
     pub hidden: bool,
     /// End ellipsis for overflowing LTR text runs; atomic content and bidi placement are unsupported.
     pub ellipsis: bool,
-    /// Clip text for non-visible overflow; images and box decorations are not clipped yet.
+    /// Whether text runs are clipped (and ellipsized) at the content edge:
+    /// the used `overflow-x` is not `visible`.
     pub clip_overflow: bool,
+    /// Whether the used `overflow-x` clips descendants at the padding box.
+    /// `hidden`, `clip`, `scroll`, and `auto` all clip; scrolling inside a
+    /// box is not supported, so `scroll` and `auto` behave like `hidden`.
+    pub clip_x: bool,
+    /// Whether the used `overflow-y` clips descendants at the padding box.
+    pub clip_y: bool,
+    /// The computed `opacity`, from 0 (invisible) to 1 (opaque). Inline
+    /// boxes fold it into their colors instead; see [`StyleMap`].
+    ///
+    /// [`StyleMap`]: crate::box_tree::StyleMap
+    pub opacity: f32,
+    /// The computed `z-index`; `None` for `auto`.
+    pub z_index: Option<i32>,
+    /// Whether the element is a flex item, for which `z-index` applies
+    /// without positioning. Set by the style map, which knows the parent.
+    pub flex_item: bool,
+    /// The computed `transform` and `transform-origin`; `None` for `none`.
+    pub transform: Option<crate::Transform>,
     pub nowrap: bool,
     /// Normal, break-all, keep-all, or the legacy break-word mode.
     pub word_break: String,
@@ -505,6 +525,9 @@ pub(crate) struct ComputedStyle {
     /// The face [`crate::FontMetrics::select_font`] chose for the three
     /// properties above. Set by the style map, which knows the fonts.
     pub font: crate::FontId,
+    /// Whether `font` must be emboldened and slanted to match `font_weight`
+    /// and `font_italic`, from [`crate::FontMetrics::font_synthesis`].
+    pub font_synthesis: (bool, bool),
     pub color: CssColor,
     pub text_transform: TextTransform,
     /// Lines painted over this element's text by `text-decoration`.
@@ -574,6 +597,34 @@ impl ComputedStyle {
     pub(crate) fn is_positioned(&self) -> bool {
         self.position != Position::Static
     }
+}
+
+/// The used overflow clipping per axis for computed `overflow-x` and
+/// `overflow-y` values (CSS Overflow 3 §3): `visible` beside a scrolling
+/// value computes to `auto`, so if either axis is `hidden`, `scroll`, or
+/// `auto`, both clip; otherwise only `clip` axes clip.
+fn used_overflow(x: Option<&str>, y: Option<&str>) -> (bool, bool) {
+    let classify = |value: Option<&str>| match value.map(str::to_ascii_lowercase).as_deref() {
+        Some("hidden" | "scroll" | "auto" | "overlay") => 2,
+        Some("clip") => 1,
+        _ => 0,
+    };
+    let (x, y) = (classify(x), classify(y));
+    if x == 2 || y == 2 {
+        (true, true)
+    } else {
+        (x == 1, y == 1)
+    }
+}
+
+/// Parses an `opacity` value: a number or percentage, clamped to 0..=1.
+fn parse_opacity(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let opacity = match css::values::parse_percentage(value) {
+        Some(percent) => percent / 100.0,
+        None => value.parse::<f32>().ok()?,
+    };
+    opacity.is_finite().then(|| opacity.clamp(0.0, 1.0))
 }
 
 /// Parses a `content` value into the text a generated box holds.
@@ -664,6 +715,12 @@ impl ComputedStyle {
             hidden: false,
             ellipsis: false,
             clip_overflow: false,
+            clip_x: false,
+            clip_y: false,
+            opacity: 1.0,
+            z_index: None,
+            flex_item: false,
+            transform: None,
             nowrap: parent.is_some_and(|p| p.nowrap),
             word_break: parent.map_or_else(|| "normal".into(), |p| p.word_break.clone()),
             cursor: parent.map_or_else(|| "auto".into(), |p| p.cursor.clone()),
@@ -684,6 +741,7 @@ impl ComputedStyle {
             font_weight: parent.map_or(400, |parent| parent.font_weight),
             font_italic: parent.is_some_and(|parent| parent.font_italic),
             font: parent.map_or(crate::FontId::DEFAULT, |parent| parent.font),
+            font_synthesis: parent.map_or((false, false), |parent| parent.font_synthesis),
             color: parent.map_or_else(
                 || {
                     css::user_agent_default_color("color")
@@ -781,13 +839,22 @@ impl ComputedStyle {
             v.eq_ignore_ascii_case("hidden") || v.eq_ignore_ascii_case("collapse")
         });
         style.ellipsis = get("text-overflow").is_some_and(|v| v.eq_ignore_ascii_case("ellipsis"));
-        style.clip_overflow = get("overflow-x")
-            .or_else(|| get("overflow"))
-            .is_some_and(|v| {
-                ["hidden", "clip", "scroll", "auto"]
-                    .iter()
-                    .any(|k| v.eq_ignore_ascii_case(k))
-            });
+        (style.clip_x, style.clip_y) = used_overflow(get("overflow-x"), get("overflow-y"));
+        style.clip_overflow = style.clip_x;
+        if let Some(value) = get("opacity") {
+            match parse_opacity(value) {
+                Some(opacity) => style.opacity = opacity,
+                None if is_css_wide_keyword(value) => {}
+                None => log::debug!("ignoring invalid opacity value {value:?}; using 1"),
+            }
+        }
+        if let Some(value) = get("z-index") {
+            match value.parse::<i32>() {
+                Ok(z) => style.z_index = Some(z),
+                Err(_) if value.eq_ignore_ascii_case("auto") || is_css_wide_keyword(value) => {}
+                Err(_) => log::debug!("ignoring invalid z-index value {value:?}; using auto"),
+            }
+        }
         style.nowrap = get("white-space").is_some_and(|v| v.eq_ignore_ascii_case("nowrap"));
         if let Some(value) = get("font-size") {
             match css::values::compute_font_size(value, root_font_size, root_font_size) {
@@ -986,6 +1053,31 @@ impl ComputedStyle {
             Some(parsed)
         };
         style.flex_basis = dimension("flex-basis", true, false).unwrap_or(Dimension::Auto);
+        if let Some(value) = get("transform") {
+            match crate::transform::parse_transform(value, &context) {
+                Some(functions) if functions.is_empty() => {}
+                Some(functions) => {
+                    let origin = get("transform-origin")
+                        .and_then(|origin| {
+                            let parsed =
+                                crate::transform::parse_transform_origin(origin, &context);
+                            if parsed.is_none() && !is_css_wide_keyword(origin) {
+                                log::debug!(
+                                    "ignoring invalid transform-origin value {origin:?}; using center"
+                                );
+                            }
+                            parsed
+                        })
+                        .unwrap_or((LengthPercentage::Percent(50.0), LengthPercentage::Percent(50.0)));
+                    style.transform = Some(crate::Transform {
+                        functions: functions.into(),
+                        origin,
+                    });
+                }
+                None if is_css_wide_keyword(value) => {}
+                None => log::debug!("ignoring invalid transform value {value:?}; using none"),
+            }
+        }
         let side = |prefix: &str, allow_auto: bool, allow_negative: bool| {
             Sides::from_array(["top", "right", "bottom", "left"].map(|side| {
                 dimension(&format!("{prefix}-{side}"), allow_auto, allow_negative)
@@ -1061,9 +1153,22 @@ impl ComputedStyle {
             }
         }));
         style.borders.border_color = Sides::from_array(sides.map(|side| {
-            get(&format!("border-{side}-color"))
-                .and_then(css::parse_color)
-                .unwrap_or(style.color)
+            let property = format!("border-{side}-color");
+            match get(&property) {
+                None => style.color,
+                Some(value) if value.eq_ignore_ascii_case("transparent") => CssColor {
+                    a: 0,
+                    ..style.color
+                },
+                Some(value) => css::parse_color(value).unwrap_or_else(|| {
+                    if !is_no_color_keyword(value) {
+                        log::debug!(
+                            "ignoring invalid {property} value {value:?}; using currentcolor"
+                        );
+                    }
+                    style.color
+                }),
+            }
         }));
         style.outline_style = get("outline-style").unwrap_or("none").to_ascii_lowercase();
         style.outline_width = match get("outline-width").unwrap_or("medium") {

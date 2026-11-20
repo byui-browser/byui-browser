@@ -341,7 +341,7 @@ fn partial_css_support_reports_the_actual_value_gaps_with_locations() {
     let report = audit(
         "",
         &[
-            ".a { visibility:collapse; text-overflow:'..'; min-width:min-content; overflow:hidden }
+            ".a { visibility:collapse; text-overflow:'..'; min-width:min-content; overflow:auto }
 .b { text-overflow:clip ellipsis; min-height:max-content }",
         ],
         &[],
@@ -351,7 +351,7 @@ fn partial_css_support_reports_the_actual_value_gaps_with_locations() {
         "visibility: collapse",
         "text-overflow strings / two-value syntax",
         "Intrinsic minimum sizes",
-        "Overflow clipping limitations",
+        "Overflow scrolling limitations",
     ] {
         let finding = report
             .in_area(Area::CssValue)
@@ -372,7 +372,7 @@ fn ordinary_css_values_do_not_trigger_partial_support_warnings() {
     let report = audit(
         "",
         &[
-            ".a { visibility:visible; min-width:20px; min-height:30%; text-overflow:clip; animation:none; overflow:visible }",
+            ".a { visibility:visible; min-width:20px; min-height:30%; text-overflow:clip; animation:none; overflow:hidden }",
         ],
         &[],
         None,
@@ -383,7 +383,7 @@ fn ordinary_css_values_do_not_trigger_partial_support_warnings() {
         "Intrinsic minimum sizes",
         "text-overflow: ellipsis limitations",
         "Animation timeline limitations",
-        "Overflow clipping limitations",
+        "Overflow scrolling limitations",
     ] {
         assert!(!has(&report, Area::CssValue, feature), "{feature}");
     }
@@ -405,6 +405,38 @@ fn new_css_layout_and_paint_properties_are_not_flagged_as_missing() {
         "outline-offset",
         "max-block-size",
         "text-rendering",
+    ] {
+        assert!(
+            !has(&report, Area::CssProperty, property),
+            "{property}: {:?}",
+            report.findings
+        );
+    }
+}
+
+#[test]
+fn visual_paint_properties_are_not_flagged_as_missing() {
+    let report = audit(
+        "",
+        &[
+            ".a {opacity:0.5;border-color:red;font:bold 12px serif;overflow:hidden;z-index:2;\
+             font-weight:bold;-ms-transform:rotate(45deg);-webkit-transform:rotate(45deg);\
+             font-style:italic;transform:rotate(45deg)}",
+        ],
+        &[],
+        None,
+    );
+    for property in [
+        "opacity",
+        "border-color",
+        "font",
+        "overflow",
+        "z-index",
+        "font-weight",
+        "-ms-transform",
+        "-webkit-transform",
+        "font-style",
+        "transform",
     ] {
         assert!(
             !has(&report, Area::CssProperty, property),

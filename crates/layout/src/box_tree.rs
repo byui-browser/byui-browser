@@ -152,6 +152,114 @@ fn parent_text_align(
     crate::style::TextAlign::Start
 }
 
+/// Fades `color` by `alpha` (0 to 1).
+fn fade(color: css::CssColor, alpha: f32) -> css::CssColor {
+    css::CssColor {
+        a: (f32::from(color.a) * alpha).round() as u8,
+        ..color
+    }
+}
+
+/// Applies the opacity an element inherits from enclosing inline boxes,
+/// `inherited`, and returns the alpha its own inline-level children inherit.
+///
+/// Non-replaced inline boxes are not painted as groups. Instead their
+/// opacity, times that of enclosing inline boxes, multiplies the alpha of
+/// their own colors and of every descendant inline box and text run; this
+/// matches group opacity wherever the faded content does not overlap. Other
+/// boxes inside an inline box (inline blocks, images) multiply their own
+/// group opacity instead.
+fn apply_inline_alpha(style: &mut ComputedStyle, inherited: f32) -> f32 {
+    if style.display != Display::INLINE {
+        style.opacity *= inherited;
+        return 1.0;
+    }
+    let alpha = style.opacity * inherited;
+    style.opacity = 1.0;
+    if alpha < 1.0 {
+        style.color = fade(style.color, alpha);
+        style.background_color = style.background_color.map(|color| fade(color, alpha));
+        style.outline_color = fade(style.outline_color, alpha);
+        style.borders.border_color = style.borders.border_color.map(|color| fade(color, alpha));
+        style.box_shadow = style
+            .box_shadow
+            .iter()
+            .map(|shadow| crate::BoxShadow {
+                color: fade(shadow.color, alpha),
+                ..*shadow
+            })
+            .collect();
+    }
+    alpha
+}
+
+/// Applies the style adjustments that depend on an element's place in the
+/// tree, walking from `root` in tree order:
+///
+/// - inline opacity folding ([`apply_inline_alpha`]);
+/// - whether each element is a flex or grid item, for `z-index`;
+/// - `overflow` propagation: the root element's, or if that is `visible`,
+///   `body`'s, applies to the viewport (CSS Overflow 3 §3.3), so that
+///   element itself does not clip. Viewport clipping needs no work since
+///   the frame is the viewport, and scrolling it is the embedder's job.
+///
+/// Returns the inline alpha each element's children inherit, keyed by DOM
+/// index, for generated content.
+fn apply_tree_context(
+    document: &HTMLDocument,
+    root: Option<NodeID>,
+    styles: &mut [Option<Rc<ComputedStyle>>],
+) -> HashMap<usize, f32> {
+    let mut child_alpha = HashMap::new();
+    let Some(root) = root else {
+        return child_alpha;
+    };
+    let is_element = |node: NodeID, name: &str| {
+        matches!(
+            document.get_node(node).map(|node| node.get_kind()),
+            Some(NodeKind::Element(element)) if element.get_name() == name
+        )
+    };
+    let mut root_clips = false;
+    if let Some(Some(style)) = styles.get_mut(root.get()) {
+        root_clips = style.clip_x || style.clip_y;
+        let style = Rc::make_mut(style);
+        (style.clip_x, style.clip_y, style.clip_overflow) = (false, false, false);
+    }
+    // (node, alpha inherited from inline ancestors, parent is a flex/grid container)
+    let mut stack = vec![(root, 1.0_f32, false)];
+    while let Some((node, inherited, flex_parent)) = stack.pop() {
+        let mut passed = (inherited, flex_parent);
+        if let Some(Some(style)) = styles.get_mut(node.get()) {
+            let style = Rc::make_mut(style);
+            let alpha = apply_inline_alpha(style, inherited);
+            style.flex_item = flex_parent;
+            if !root_clips
+                && is_element(node, "body")
+                && document.get_node(node).and_then(|body| body.get_parent()) == Some(root)
+            {
+                (style.clip_x, style.clip_y, style.clip_overflow) = (false, false, false);
+            }
+            passed = match style.display {
+                // Children of `display: contents` are boxed as the parent's.
+                Display::Contents => (inherited, flex_parent),
+                Display::Box { inside, .. } => (
+                    alpha,
+                    matches!(inside, DisplayInside::Flex | DisplayInside::Grid),
+                ),
+                Display::None => (alpha, false),
+            };
+            child_alpha.insert(node.get(), passed.0);
+        }
+        if let Some(element) = document.get_node(node) {
+            for child in element.get_children().iter().rev() {
+                stack.push((*child, passed.0, passed.1));
+            }
+        }
+    }
+    child_alpha
+}
+
 impl StyleMap {
     /// Resolves every element's computed style. The root element's display is
     /// blockified (CSS Display 3 §2.8).
@@ -172,7 +280,7 @@ impl StyleMap {
                 )
             })
             .unwrap_or(css::values::MEDIUM_FONT_SIZE);
-        let resolved: Vec<Option<Rc<ComputedStyle>>> = (0..document.get_nodes_count())
+        let mut resolved: Vec<Option<Rc<ComputedStyle>>> = (0..document.get_nodes_count())
             .map(|index| {
                 let node = NodeID::new(index);
                 let declarations = styles.declarations_for(node)?;
@@ -188,9 +296,12 @@ impl StyleMap {
                 }
                 style.font =
                     fonts.select_font(&style.font_families, style.font_weight, style.font_italic);
+                style.font_synthesis =
+                    fonts.font_synthesis(style.font, style.font_weight, style.font_italic);
                 Some(Rc::new(style))
             })
             .collect();
+        let group_alpha = apply_tree_context(document, root, &mut resolved);
         let mut pseudo = HashMap::new();
         for (index, owner) in resolved.iter().enumerate() {
             let Some(owner) = owner else { continue };
@@ -199,11 +310,24 @@ impl StyleMap {
                 else {
                     continue;
                 };
-                let style = ComputedStyle::from_declarations(
+                let mut style = ComputedStyle::from_declarations(
                     declarations,
                     root_font_size,
                     viewport,
                     || owner.text_align,
+                );
+                style.font =
+                    fonts.select_font(&style.font_families, style.font_weight, style.font_italic);
+                style.font_synthesis =
+                    fonts.font_synthesis(style.font, style.font_weight, style.font_italic);
+                let inherited = group_alpha.get(&index).copied().unwrap_or(1.0);
+                apply_inline_alpha(&mut style, inherited);
+                style.flex_item = matches!(
+                    owner.display,
+                    Display::Box {
+                        inside: DisplayInside::Flex | DisplayInside::Grid,
+                        ..
+                    }
                 );
                 pseudo.insert((index, which), Rc::new(style));
             }

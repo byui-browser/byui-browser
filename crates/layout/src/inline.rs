@@ -851,10 +851,18 @@ impl Context<'_> {
     }
 
     fn placeholder(&self, info: &InlineBoxInfo<'_>) -> InlineBoxFragment {
+        let mut style = crate::block::box_style(info.style);
+        // Transforms, stacking, and clipping do not apply to non-replaced
+        // inline boxes, and their opacity is folded into their colors.
+        style.transform = None;
+        style.z_index = None;
+        style.opacity = 1.0;
+        style.clip_x = false;
+        style.clip_y = false;
         InlineBoxFragment {
             node: info.node,
             rect: Rect::default(),
-            style: crate::block::box_style(info.style),
+            style,
         }
     }
 
@@ -894,6 +902,8 @@ impl Context<'_> {
             font_size: source.style.font_size,
             font: source.style.font,
             color: source.style.color,
+            synthetic_bold: source.style.font_synthesis.0,
+            synthetic_italic: source.style.font_synthesis.1,
             text_decoration: source.style.text_decoration.clone(),
             clip: None,
         }));

@@ -1216,6 +1216,10 @@ fn property_has_effect(property: &str, values: &[String]) -> bool {
             "#t{padding-inline-end:20px}",
             "#t{padding-right:20px}",
         )),
+        "border-color" => Some(differs(
+            "#t{border:4px solid;border-color:#ff0000}",
+            "#t{border:4px solid}",
+        )),
         "outline-offset" => Some(differs(
             "#t{outline:2px solid red;outline-offset:5px}",
             "#t{outline:2px solid red;outline-offset:0}",
@@ -1345,13 +1349,14 @@ fn audit_partial_support(declarations: &[Decl], report: &mut AuditReport) {
                 "Animation timeline limitations",
                 "Animations use the document timeline origin. Starting an animation after first style and resuming paused animations do not maintain an element-specific playback position; animation events are not implemented.",
             )),
-            "overflow" | "overflow-x"
-                if ["hidden", "clip", "scroll", "auto"]
-                    .contains(&value.trim_end_matches("!important").trim()) =>
+            "overflow" | "overflow-x" | "overflow-y"
+                if ["scroll", "auto"]
+                    .iter()
+                    .any(|keyword| value.trim_end_matches("!important").contains(keyword)) =>
             {
                 Some((
-                    "Overflow clipping limitations",
-                    "Overflow clips text only; images, atomic inline content, and box decorations are not clipped. Scroll and auto do not create element scroll containers.",
+                    "Overflow scrolling limitations",
+                    "Scroll and auto clip overflowing content like hidden, but they do not create element scroll containers or scrollbars.",
                 ))
             }
             "min-width" | "min-height" | "max-block-size"
