@@ -51,9 +51,10 @@ impl RequestController {
             );
             return Err(RequestError::NetworkError);
         }
-        let response = loop {
-            let transport_headers = self.validate_http_hop(&mut request, &url).await?;
-            let revalidation = match self.lookup_http_cache(&request, &url)? {
+        let (response, request_headers) = loop {
+            let mut transport_headers = self.validate_http_hop(&mut request, &url).await?;
+            self.select_cookies(&request, &url, &mut transport_headers)?;
+            let revalidation = match self.lookup_http_cache(&request, &url, &transport_headers)? {
                 CacheDecision::Hit(response) => return Ok(response),
                 CacheDecision::Miss(revalidation) => revalidation,
             };
@@ -62,11 +63,11 @@ impl RequestController {
                 .body()
                 .as_ref()
                 .is_some_and(|body| !body.is_replayable());
-            let candidate = self
-                .submit_http_hop(&mut request, &url, transport_headers, revalidation)
+            let (candidate, request_headers) = self
+                .submit_http_hop(&mut request, &url, &mut transport_headers, revalidation)
                 .await?;
             match self.process_http_result(&mut request, &url, candidate, had_nonreplayable_body)? {
-                HopResult::Complete(response) => break response,
+                HopResult::Complete(response) => break (response, request_headers),
                 HopResult::Follow(next_url) => {
                     url = next_url;
                     continue;
@@ -75,7 +76,7 @@ impl RequestController {
             }
         };
 
-        self.finalize_and_cache_http_response(&request, url, response)
+        self.finalize_and_cache_http_response(&request, &request_headers, url, response)
     }
 
     /// Looks up the current hop and selects an optional validator for transport.
@@ -83,6 +84,7 @@ impl RequestController {
         &self,
         request: &Request,
         url: &reqwest::Url,
+        request_headers: &crate::Headers,
     ) -> Result<CacheDecision, RequestError> {
         if !request.is_cacheable_method() {
             return Ok(CacheDecision::Miss(None));
@@ -98,14 +100,23 @@ impl RequestController {
         let mut revalidation = None;
         let cached = match request.cache_mode() {
             CacheMode::NoCache => {
-                revalidation = self.inner.cache.lookup_for_revalidation(request, url);
+                revalidation = self.inner.cache.lookup_for_revalidation_with_headers(
+                    request,
+                    url,
+                    request_headers,
+                );
                 None
             }
-            CacheMode::ForceCache | CacheMode::OnlyIfCached => {
-                self.inner.cache.lookup_matching(request, url)
-            }
+            CacheMode::ForceCache | CacheMode::OnlyIfCached => self
+                .inner
+                .cache
+                .lookup_matching_with_headers(request, url, request_headers),
             _ => match cache_lookup
-                .then(|| self.inner.cache.lookup(request, url))
+                .then(|| {
+                    self.inner
+                        .cache
+                        .lookup_with_headers(request, url, request_headers)
+                })
                 .flatten()
             {
                 Some(CacheLookup::Fresh(response)) => Some(response),
@@ -203,13 +214,13 @@ impl RequestController {
         &self,
         request: &mut Request,
         url: &reqwest::Url,
-        mut transport_headers: crate::Headers,
+        transport_headers: &mut crate::Headers,
         revalidation: Option<(StoredResponse, CacheValidator)>,
-    ) -> Result<InternalResponse, RequestError> {
+    ) -> Result<(InternalResponse, crate::Headers), RequestError> {
         if let Some((_, validator)) = &revalidation {
-            validator.apply(&mut transport_headers)?;
+            validator.apply(transport_headers)?;
         }
-        let validated = self.finish_http_hop(request, url, transport_headers)?;
+        let validated = self.finish_http_hop(request, url, transport_headers.clone())?;
         let mut response = self
             .inner
             .scheduler
@@ -228,10 +239,12 @@ impl RequestController {
         }
         if response.status == http::StatusCode::NOT_MODIFIED
             && revalidation.is_some()
-            && let Some(cached) =
-                self.inner
-                    .cache
-                    .merge_not_modified(request, url, &response.headers)
+            && let Some(cached) = self.inner.cache.merge_not_modified_with_headers(
+                request,
+                url,
+                transport_headers,
+                &response.headers,
+            )
         {
             let validation_cookie_headers: Vec<http::HeaderValue> = response
                 .headers
@@ -241,9 +254,9 @@ impl RequestController {
                 .collect();
             let mut merged = self.response_from_stored(request, cached);
             merged.validation_cookie_headers = Some(validation_cookie_headers.into_boxed_slice());
-            return Ok(merged);
+            return Ok((merged, transport_headers.clone()));
         }
-        Ok(response)
+        Ok((response, transport_headers.clone()))
     }
 
     /// Processes a response as terminal, manual redirect, or followed redirect.
@@ -353,6 +366,7 @@ impl RequestController {
     fn finalize_and_cache_http_response(
         &self,
         request: &Request,
+        request_headers: &crate::Headers,
         url: reqwest::Url,
         mut response: InternalResponse,
     ) -> Result<Response, RequestError> {
@@ -371,9 +385,10 @@ impl RequestController {
                     "storing null-body response in cache: {}",
                     crate::log_url::loggable(url.as_str())
                 );
-                self.inner.cache.insert(
+                self.inner.cache.insert_with_headers(
                     request,
                     &url,
+                    request_headers,
                     StoredResponse {
                         status: response.status,
                         headers: response.headers.clone(),
@@ -387,6 +402,7 @@ impl RequestController {
                     response,
                     self.inner.cache.clone(),
                     request.for_cache(),
+                    request_headers.clone(),
                     url,
                     self.inner.max_cache_body_size,
                 )?;
@@ -400,8 +416,8 @@ impl RequestController {
     /// Initial browser authorization has already run during preparation. For
     /// followed redirects this method performs the per-hop authorization
     /// before deriving any target-dependent headers or starting preflight.
-    /// Cookie selection intentionally remains after cache lookup so cache hits
-    /// do not consult browser cookie storage.
+    /// Cookie selection follows this step so cache matching can use the
+    /// complete outgoing header set.
     async fn validate_http_hop(
         &self,
         request: &mut Request,
@@ -426,14 +442,13 @@ impl RequestController {
         Ok(headers)
     }
 
-    /// Completes a cache-miss hop with credentials and transport ownership.
+    /// Transfers a cache-miss hop's already selected transport inputs.
     fn finish_http_hop(
         &self,
         request: &mut Request,
         url: &reqwest::Url,
-        mut transport_headers: crate::Headers,
+        transport_headers: crate::Headers,
     ) -> Result<ValidatedHop, RequestError> {
-        self.select_cookies(request, url, &mut transport_headers)?;
         Ok(ValidatedHop::new(
             request.for_transport()?,
             transport_headers,

@@ -85,8 +85,13 @@ impl ResponseCache {
         }
     }
 
-    /// Looks up a matching cached representation and reports its freshness.
-    pub(crate) fn lookup(&self, request: &Request, url: &Url) -> Option<CacheLookup> {
+    /// Looks up a matching representation using the complete outgoing headers.
+    pub(crate) fn lookup_with_headers(
+        &self,
+        request: &Request,
+        url: &Url,
+        request_headers: &crate::Headers,
+    ) -> Option<CacheLookup> {
         let key = cache_key(request, url);
         let now = self.clock.now();
         let mut entries = self.entries.write().expect("cache lock poisoned");
@@ -103,7 +108,7 @@ impl ResponseCache {
             entry
                 .vary_headers
                 .iter()
-                .all(|(name, original_value)| request.headers().get(name) == *original_value)
+                .all(|(name, original_value)| request_headers.get(name) == *original_value)
         }) else {
             log::trace!("cache miss: no matching Vary response");
             return None;
@@ -119,13 +124,18 @@ impl ResponseCache {
         }
     }
 
-    /// Returns a matching stored representation without applying freshness policy.
+    /// Returns a matching stored representation using the complete outgoing headers.
     ///
-    /// `force-cache` and `only-if-cached` select a matching entry even when
-    /// its response directives would otherwise require revalidation. Normal
-    /// cache lookup must continue to use [`Self::lookup`] so it can enforce
-    /// freshness and validator rules.
-    pub(crate) fn lookup_matching(&self, request: &Request, url: &Url) -> Option<StoredResponse> {
+    /// `force-cache` and `only-if-cached` select an entry even when its
+    /// response directives otherwise require revalidation. Normal cache lookup
+    /// must continue to use [`Self::lookup_with_headers`] to enforce freshness
+    /// and validator rules.
+    pub(crate) fn lookup_matching_with_headers(
+        &self,
+        request: &Request,
+        url: &Url,
+        request_headers: &crate::Headers,
+    ) -> Option<StoredResponse> {
         let key = cache_key(request, url);
         let mut entries = self.entries.write().expect("cache lock poisoned");
         let access = entries.next_access();
@@ -133,19 +143,20 @@ impl ResponseCache {
             entry
                 .vary_headers
                 .iter()
-                .all(|(name, original_value)| request.headers().get(name) == *original_value)
+                .all(|(name, original_value)| request_headers.get(name) == *original_value)
         })?;
         cached.last_access = access;
         Some(cached.as_response())
     }
 
-    /// Returns a matching representation and its validator, regardless of freshness.
+    /// Returns a matching representation and validator using complete outgoing headers.
     ///
     /// This is used for `no-cache`, which must revalidate even a fresh entry.
-    pub(crate) fn lookup_for_revalidation(
+    pub(crate) fn lookup_for_revalidation_with_headers(
         &self,
         request: &Request,
         url: &Url,
+        request_headers: &crate::Headers,
     ) -> Option<(StoredResponse, CacheValidator)> {
         let key = cache_key(request, url);
         let mut entries = self.entries.write().expect("cache lock poisoned");
@@ -154,7 +165,7 @@ impl ResponseCache {
             entry
                 .vary_headers
                 .iter()
-                .all(|(name, original_value)| request.headers().get(name) == *original_value)
+                .all(|(name, original_value)| request_headers.get(name) == *original_value)
         })?;
         cached.last_access = access;
         cached
@@ -165,12 +176,12 @@ impl ResponseCache {
 
     /// Merges a 304 response into its matching stored representation.
     ///
-    /// The stored status and body remain authoritative; 304 metadata replaces
-    /// corresponding representation metadata and establishes new freshness.
-    pub(crate) fn merge_not_modified(
+    /// Merges a 304 response using the headers that were sent for validation.
+    pub(crate) fn merge_not_modified_with_headers(
         &self,
         request: &Request,
         url: &Url,
+        request_headers: &crate::Headers,
         headers: &reqwest::header::HeaderMap,
     ) -> Option<StoredResponse> {
         let key = cache_key(request, url);
@@ -183,7 +194,7 @@ impl ResponseCache {
                 entry
                     .vary_headers
                     .iter()
-                    .all(|(name, original_value)| request.headers().get(name) == *original_value)
+                    .all(|(name, original_value)| request_headers.get(name) == *original_value)
             })?;
             let mut merged_headers = variants[cached_index].response.headers.clone();
             for (name, value) in headers {
@@ -193,7 +204,7 @@ impl ResponseCache {
             }
             let freshness = FreshnessMetadata::from_headers(&merged_headers, now)?;
             let mut cached = variants.remove(cached_index);
-            let response = cached.merge_not_modified(request, headers, freshness, access);
+            let response = cached.merge_not_modified(request_headers, headers, freshness, access);
             let vary_names = cached.vary_names();
             let cached_vary_headers = &cached.vary_headers;
             let mut removed_body_size = 0_usize;
@@ -212,8 +223,14 @@ impl ResponseCache {
         Some(response)
     }
 
-    /// Stores a successful response when its headers provide a positive TTL.
-    pub(crate) fn insert(&self, request: &Request, url: &Url, response: StoredResponse) {
+    /// Stores a response with the complete headers sent for its request.
+    pub(crate) fn insert_with_headers(
+        &self,
+        request: &Request,
+        url: &Url,
+        request_headers: &crate::Headers,
+        response: StoredResponse,
+    ) {
         if !request.is_cacheable_method() || has_authorization(request) {
             log::trace!(
                 "cache store skipped for {}: method or authorization is not cacheable",
@@ -266,7 +283,8 @@ impl ResponseCache {
         let mut entries = self.entries.write().expect("cache lock poisoned");
         entries.prune_stale(now);
         let access = entries.next_access();
-        let cached_response = CachedResponse::from_response(request, response, freshness, access);
+        let cached_response =
+            CachedResponse::from_response(request_headers, response, freshness, access);
         let new_vary_names = cached_response.vary_names();
         let replaced_body_size = entries.body_size_for(&key);
         let existing = entries.entries.remove(&key).unwrap_or_default();

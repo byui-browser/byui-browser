@@ -6,8 +6,6 @@ use reqwest::{
     header::{ETAG, HeaderMap, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED},
 };
 
-use crate::api::request::Request;
-
 use super::freshness::FreshnessMetadata;
 
 /// Complete buffered response retained for cache policy and later filtering.
@@ -62,12 +60,12 @@ impl CacheValidator {
 impl CachedResponse {
     /// Moves a response into the cache with parsed freshness metadata.
     pub(super) fn from_response(
-        request: &Request,
+        request_headers: &crate::Headers,
         response: StoredResponse,
         freshness: FreshnessMetadata,
         last_access: u64,
     ) -> Self {
-        let vary_headers = capture_vary_headers(request, &response.headers);
+        let vary_headers = capture_vary_headers(request_headers, &response.headers);
         Self {
             validator: response_validator(&response.headers),
             response,
@@ -99,7 +97,7 @@ impl CachedResponse {
     /// Merges successful revalidation metadata while retaining the representation body.
     pub(super) fn merge_not_modified(
         &mut self,
-        request: &Request,
+        request_headers: &crate::Headers,
         headers: &HeaderMap,
         freshness: FreshnessMetadata,
         access: u64,
@@ -115,7 +113,7 @@ impl CachedResponse {
             }
         }
         self.validator = response_validator(&self.response.headers);
-        self.vary_headers = capture_vary_headers(request, &self.response.headers);
+        self.vary_headers = capture_vary_headers(request_headers, &self.response.headers);
         self.freshness = freshness;
         self.last_access = access;
         self.as_response()
@@ -148,13 +146,13 @@ pub(super) fn vary_header_names(headers: &HeaderMap) -> Vec<String> {
 
 /// Captures the original request values for headers listed in `Vary`.
 fn capture_vary_headers(
-    request: &Request,
+    request_headers: &crate::Headers,
     response_headers: &HeaderMap,
 ) -> Vec<(String, Option<String>)> {
     vary_header_names(response_headers)
         .into_iter()
         .map(|name| {
-            let value = request.headers().get(&name);
+            let value = request_headers.get(&name);
             (name, value)
         })
         .collect()

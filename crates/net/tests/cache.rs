@@ -85,6 +85,124 @@ struct RecordingCookieCacheServices {
     stored: Arc<Mutex<Vec<String>>>,
 }
 
+struct EffectiveVaryServices;
+
+impl RequestPolicyService for EffectiveVaryServices {
+    fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
+        Ok(())
+    }
+
+    fn generated_request_headers(
+        &self,
+        request: &Request,
+        _target: &net::Url,
+    ) -> Result<net::Headers, RequestError> {
+        let mut headers = net::Headers::generated_request_headers();
+        headers
+            .set_str(
+                "sec-fetch-site",
+                &request.headers().get("x-cache-variant").unwrap(),
+            )
+            .unwrap();
+        Ok(headers)
+    }
+}
+
+impl ResponsePolicyService for EffectiveVaryServices {
+    fn check_response(&self, _request: &Request, _info: &ResponseInfo) -> Result<(), RequestError> {
+        Ok(())
+    }
+}
+
+impl CookieService for EffectiveVaryServices {
+    fn cookie_header(&self, request: &Request) -> Result<Option<String>, RequestError> {
+        Ok(Some(format!(
+            "session={}",
+            request.headers().get("x-cache-variant").unwrap()
+        )))
+    }
+
+    fn store_set_cookie(
+        &self,
+        _request: &Request,
+        _values: &[net::HeaderValue],
+    ) -> Result<(), RequestError> {
+        Ok(())
+    }
+}
+
+impl ServiceWorkerService for EffectiveVaryServices {
+    fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
+        Ok(ServiceWorkerDecision::Network)
+    }
+}
+
+impl CachePartitionService for EffectiveVaryServices {
+    fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
+        Ok("effective-vary-test".into())
+    }
+}
+
+#[test]
+fn vary_matches_generated_and_cookie_headers_from_the_outgoing_request() {
+    let server = TestServer::start(4, |request| {
+        let vary = if request.starts_with("GET /generated ") {
+            "Sec-Fetch-Site"
+        } else if request.starts_with("GET /cookie ") {
+            "Cookie"
+        } else {
+            panic!("unexpected request: {request}");
+        };
+        format!(
+            "HTTP/1.1 204 No Content\r\nCache-Control: max-age=60\r\nVary: {vary}\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    });
+    let controller = RequestController::builder(Config::default())
+        .with_browser_capabilities(Arc::new(EffectiveVaryServices))
+        .build()
+        .unwrap();
+
+    runtime().block_on(async {
+        for path in ["generated", "cookie"] {
+            for variant in ["one", "two"] {
+                let mut request = Request::get(format!("{}/{path}", server.url()));
+                request.set_credentials_mode(net::CredentialsMode::Include);
+                request.set_environment(
+                    FetchEnvironment::from_url(reqwest::Url::parse(request.url()).unwrap())
+                        .unwrap(),
+                );
+                request
+                    .set_header(
+                        HeaderName::from_static("x-cache-variant"),
+                        HeaderValue::from_static(variant),
+                    )
+                    .unwrap();
+                let response = controller.fetch(request).await.unwrap();
+                assert!(
+                    !response.from_cache,
+                    "{path} variant {variant} reused another variant"
+                );
+            }
+        }
+
+        let mut repeated = Request::get(format!("{}/generated", server.url()));
+        repeated.set_credentials_mode(net::CredentialsMode::Include);
+        repeated.set_environment(
+            FetchEnvironment::from_url(reqwest::Url::parse(repeated.url()).unwrap()).unwrap(),
+        );
+        repeated
+            .set_header(
+                HeaderName::from_static("x-cache-variant"),
+                HeaderValue::from_static("two"),
+            )
+            .unwrap();
+        assert!(controller.fetch(repeated).await.unwrap().from_cache);
+    });
+
+    server.join();
+}
+
 impl RequestPolicyService for RecordingCookieCacheServices {
     fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
         Ok(())

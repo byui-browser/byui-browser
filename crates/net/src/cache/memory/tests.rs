@@ -36,7 +36,7 @@ fn vary_header_matches_original_request() {
         cookie_headers_processed: false,
     };
 
-    cache.insert(&english, &url, response);
+    cache.insert_with_headers(&english, &url, english.headers(), response);
 
     // Same language should produce a cache hit.
     assert!(fresh_response(&cache, &english, &url).is_some());
@@ -68,7 +68,7 @@ fn vary_star_responses_are_not_cached() {
         cookie_headers_processed: false,
     };
 
-    cache.insert(&request, &url, response);
+    cache.insert_with_headers(&request, &url, request.headers(), response);
 
     // Vary: * responses must not be stored.
     assert!(fresh_response(&cache, &request, &url).is_none());
@@ -111,9 +111,10 @@ fn freshness_uses_age_and_resident_time() {
     headers.insert(DATE, "Sun, 06 Nov 1994 08:49:37 GMT".parse().unwrap());
     headers.insert(AGE, "30".parse().unwrap());
 
-    cache.insert(
+    cache.insert_with_headers(
         &request,
         &url,
+        request.headers(),
         StoredResponse {
             status: StatusCode::OK,
             headers,
@@ -124,13 +125,13 @@ fn freshness_uses_age_and_resident_time() {
     );
     clock.advance(Duration::from_secs(29));
     assert!(matches!(
-        cache.lookup(&request, &url),
+        cache.lookup_with_headers(&request, &url, request.headers()),
         Some(CacheLookup::Fresh(_))
     ));
 
     clock.advance(Duration::from_secs(1));
     assert!(matches!(
-        cache.lookup(&request, &url),
+        cache.lookup_with_headers(&request, &url, request.headers()),
         Some(CacheLookup::Stale { .. })
     ));
 }
@@ -149,9 +150,10 @@ fn expires_is_used_when_max_age_is_absent() {
     headers.insert(DATE, "Sun, 06 Nov 1994 08:49:37 GMT".parse().unwrap());
     headers.insert(EXPIRES, "Sun, 06 Nov 1994 08:50:37 GMT".parse().unwrap());
 
-    cache.insert(
+    cache.insert_with_headers(
         &request,
         &url,
+        request.headers(),
         StoredResponse {
             status: StatusCode::OK,
             headers,
@@ -162,12 +164,12 @@ fn expires_is_used_when_max_age_is_absent() {
     );
     clock.advance(Duration::from_secs(59));
     assert!(matches!(
-        cache.lookup(&request, &url),
+        cache.lookup_with_headers(&request, &url, request.headers()),
         Some(CacheLookup::Fresh(_))
     ));
     clock.advance(Duration::from_secs(1));
     assert!(matches!(
-        cache.lookup(&request, &url),
+        cache.lookup_with_headers(&request, &url, request.headers()),
         Some(CacheLookup::Stale { .. })
     ));
 }
@@ -189,9 +191,10 @@ fn last_modified_supplies_conservative_heuristic_freshness() {
         "Sun, 06 Nov 1994 08:39:37 GMT".parse().unwrap(),
     );
 
-    cache.insert(
+    cache.insert_with_headers(
         &request,
         &url,
+        request.headers(),
         StoredResponse {
             status: StatusCode::OK,
             headers,
@@ -203,12 +206,12 @@ fn last_modified_supplies_conservative_heuristic_freshness() {
 
     clock.advance(Duration::from_secs(59));
     assert!(matches!(
-        cache.lookup(&request, &url),
+        cache.lookup_with_headers(&request, &url, request.headers()),
         Some(CacheLookup::Fresh(_))
     ));
     clock.advance(Duration::from_secs(1));
     assert!(matches!(
-        cache.lookup(&request, &url),
+        cache.lookup_with_headers(&request, &url, request.headers()),
         Some(CacheLookup::Stale { .. })
     ));
 }
@@ -239,9 +242,10 @@ fn no_cache_and_must_revalidate_entries_require_revalidation_when_stale() {
 
     let mut no_cache_headers = HeaderMap::new();
     no_cache_headers.insert(CACHE_CONTROL, "no-cache, max-age=60".parse().unwrap());
-    cache.insert(
+    cache.insert_with_headers(
         &request,
         &url,
+        request.headers(),
         StoredResponse {
             status: StatusCode::OK,
             headers: no_cache_headers,
@@ -251,15 +255,16 @@ fn no_cache_and_must_revalidate_entries_require_revalidation_when_stale() {
         },
     );
     assert!(matches!(
-        cache.lookup(&request, &url),
+        cache.lookup_with_headers(&request, &url, request.headers()),
         Some(CacheLookup::Stale { .. })
     ));
 
     let mut must_revalidate_headers = HeaderMap::new();
     must_revalidate_headers.insert(CACHE_CONTROL, "max-age=0, must-revalidate".parse().unwrap());
-    cache.insert(
+    cache.insert_with_headers(
         &request,
         &url,
+        request.headers(),
         StoredResponse {
             status: StatusCode::OK,
             headers: must_revalidate_headers,
@@ -269,7 +274,7 @@ fn no_cache_and_must_revalidate_entries_require_revalidation_when_stale() {
         },
     );
     assert!(matches!(
-        cache.lookup(&request, &url),
+        cache.lookup_with_headers(&request, &url, request.headers()),
         Some(CacheLookup::Stale { .. })
     ));
 }
@@ -287,9 +292,10 @@ fn matching_lookup_returns_entries_that_normally_require_revalidation() {
     ] {
         let mut headers = HeaderMap::new();
         headers.insert(CACHE_CONTROL, directives.parse().unwrap());
-        cache.insert(
+        cache.insert_with_headers(
             &request,
             &url,
+            request.headers(),
             StoredResponse {
                 status: StatusCode::OK,
                 headers,
@@ -300,11 +306,15 @@ fn matching_lookup_returns_entries_that_normally_require_revalidation() {
         );
 
         assert!(matches!(
-            cache.lookup(&request, &url),
+            cache.lookup_with_headers(&request, &url, request.headers()),
             Some(CacheLookup::Stale { .. })
         ));
         assert_eq!(
-            cache.lookup_matching(&request, &url).unwrap().body.as_ref(),
+            cache
+                .lookup_matching_with_headers(&request, &url, request.headers())
+                .unwrap()
+                .body
+                .as_ref(),
             body
         );
     }
@@ -323,9 +333,10 @@ fn revalidation_sends_all_validators_and_merges_304_metadata() {
         LAST_MODIFIED,
         "Sun, 06 Nov 1994 08:49:37 GMT".parse().unwrap(),
     );
-    cache.insert(
+    cache.insert_with_headers(
         &request,
         &url,
+        request.headers(),
         StoredResponse {
             status: StatusCode::OK,
             headers,
@@ -335,7 +346,9 @@ fn revalidation_sends_all_validators_and_merges_304_metadata() {
         },
     );
 
-    let (_, validator) = cache.lookup_for_revalidation(&request, &url).unwrap();
+    let (_, validator) = cache
+        .lookup_for_revalidation_with_headers(&request, &url, request.headers())
+        .unwrap();
     let mut conditional_headers = crate::Headers::new();
     validator.apply(&mut conditional_headers).unwrap();
     assert_eq!(
@@ -359,13 +372,15 @@ fn revalidation_sends_all_validators_and_merges_304_metadata() {
     not_modified.insert("x-revalidated", "yes".parse().unwrap());
     not_modified.insert("set-cookie", "session=updated".parse().unwrap());
     let merged = cache
-        .merge_not_modified(&request, &url, &not_modified)
+        .merge_not_modified_with_headers(&request, &url, request.headers(), &not_modified)
         .unwrap();
     assert_eq!(merged.status, StatusCode::OK);
     assert_eq!(merged.body, Bytes::from_static(b"cached"));
     assert_eq!(merged.headers.get("x-revalidated").unwrap(), "yes");
     assert!(merged.headers.get("set-cookie").is_none());
-    let (_, refreshed_validator) = cache.lookup_for_revalidation(&request, &url).unwrap();
+    let (_, refreshed_validator) = cache
+        .lookup_for_revalidation_with_headers(&request, &url, request.headers())
+        .unwrap();
     let mut refreshed_headers = crate::Headers::new();
     refreshed_validator.apply(&mut refreshed_headers).unwrap();
     assert_eq!(
@@ -373,7 +388,7 @@ fn revalidation_sends_all_validators_and_merges_304_metadata() {
         "\"second\""
     );
     assert!(matches!(
-        cache.lookup(&request, &url),
+        cache.lookup_with_headers(&request, &url, request.headers()),
         Some(CacheLookup::Fresh(_))
     ));
 }
@@ -397,9 +412,10 @@ fn revalidation_updates_vary_snapshot_when_304_changes_vary_fields() {
     headers.insert(CACHE_CONTROL, "max-age=0".parse().unwrap());
     headers.insert(ETAG, "\"first\"".parse().unwrap());
     headers.insert("vary", "Accept-Language".parse().unwrap());
-    cache.insert(
+    cache.insert_with_headers(
         &original,
         &url,
+        original.headers(),
         StoredResponse {
             status: StatusCode::OK,
             headers,
@@ -413,7 +429,7 @@ fn revalidation_updates_vary_snapshot_when_304_changes_vary_fields() {
     not_modified.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
     not_modified.insert("vary", "User-Agent".parse().unwrap());
     cache
-        .merge_not_modified(&original, &url, &not_modified)
+        .merge_not_modified_with_headers(&original, &url, original.headers(), &not_modified)
         .unwrap();
 
     let mut same_agent = Request::get(url.as_str());
@@ -427,7 +443,7 @@ fn revalidation_updates_vary_snapshot_when_304_changes_vary_fields() {
         )
         .unwrap();
     assert!(matches!(
-        cache.lookup(&same_agent, &url),
+        cache.lookup_with_headers(&same_agent, &url, same_agent.headers()),
         Some(CacheLookup::Fresh(_))
     ));
 
@@ -438,7 +454,11 @@ fn revalidation_updates_vary_snapshot_when_304_changes_vary_fields() {
             "second-agent".parse().unwrap(),
         )
         .unwrap();
-    assert!(cache.lookup(&different_agent, &url).is_none());
+    assert!(
+        cache
+            .lookup_with_headers(&different_agent, &url, different_agent.headers())
+            .is_none()
+    );
 }
 
 #[test]
@@ -478,7 +498,7 @@ fn cache_does_not_store_non_success_responses() {
     };
 
     let url = Url::parse(request.url()).unwrap();
-    cache.insert(&request, &url, response);
+    cache.insert_with_headers(&request, &url, request.headers(), response);
 
     assert!(fresh_response(&cache, &request, &url).is_none());
 }
@@ -549,7 +569,7 @@ fn expired_entries_are_not_returned() {
         body: Bytes::from_static(b"stale"),
         cookie_headers_processed: false,
     };
-    let cached = CachedResponse::from_response(&request, response, expired_freshness(), 0);
+    let cached = CachedResponse::from_response(request.headers(), response, expired_freshness(), 0);
 
     cache.entries.write().unwrap().entries.insert(
         cache_key(&request, &Url::parse(request.url()).unwrap()),
@@ -557,7 +577,11 @@ fn expired_entries_are_not_returned() {
     );
 
     assert!(matches!(
-        cache.lookup(&request, &Url::parse(request.url()).unwrap()),
+        cache.lookup_with_headers(
+            &request,
+            &Url::parse(request.url()).unwrap(),
+            request.headers(),
+        ),
         Some(CacheLookup::Stale { .. })
     ));
 }
@@ -573,7 +597,7 @@ fn expired_entries_are_not_returned2() {
         body: Bytes::from_static(b"stale"),
         cookie_headers_processed: false,
     };
-    let cached = CachedResponse::from_response(&request, response, expired_freshness(), 0);
+    let cached = CachedResponse::from_response(request.headers(), response, expired_freshness(), 0);
 
     cache.entries.write().unwrap().entries.insert(
         cache_key(&request, &Url::parse(request.url()).unwrap()),
@@ -581,7 +605,11 @@ fn expired_entries_are_not_returned2() {
     );
 
     assert!(matches!(
-        cache.lookup(&request, &Url::parse(request.url()).unwrap()),
+        cache.lookup_with_headers(
+            &request,
+            &Url::parse(request.url()).unwrap(),
+            request.headers(),
+        ),
         Some(CacheLookup::Stale { .. })
     ));
 }
@@ -624,8 +652,8 @@ fn multiple_vary_variants_are_cached() {
     };
 
     // Store both responses under the same URL.
-    cache.insert(&english, &url, english_response.clone());
-    cache.insert(&spanish, &url, spanish_response);
+    cache.insert_with_headers(&english, &url, english.headers(), english_response.clone());
+    cache.insert_with_headers(&spanish, &url, spanish.headers(), spanish_response);
 
     // Each language should retrieve its own response.
     assert_eq!(
@@ -649,7 +677,7 @@ fn multiple_vary_variants_are_cached() {
         ..english_response.clone()
     };
 
-    cache.insert(&english, &url, updated_english_response);
+    cache.insert_with_headers(&english, &url, english.headers(), updated_english_response);
 
     // English should return the updated response.
     assert_eq!(
@@ -706,7 +734,7 @@ fn changing_vary_rules_removes_old_variants() {
         cookie_headers_processed: false,
     };
 
-    cache.insert(&request, &url, language_response.clone());
+    cache.insert_with_headers(&request, &url, request.headers(), language_response.clone());
 
     let mut encoding_headers = HeaderMap::new();
     encoding_headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
@@ -718,7 +746,7 @@ fn changing_vary_rules_removes_old_variants() {
         ..language_response.clone()
     };
 
-    cache.insert(&request, &url, encoding_response);
+    cache.insert_with_headers(&request, &url, request.headers(), encoding_response);
 
     // The cache should contain only the new Vary rule.
     let key = cache_key(&request, &url);
@@ -738,9 +766,10 @@ fn cache_hits_share_immutable_body_bytes() {
     let mut headers = HeaderMap::new();
     headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
 
-    cache.insert(
+    cache.insert_with_headers(
         &request,
         &url,
+        request.headers(),
         StoredResponse {
             status: StatusCode::OK,
             headers,
@@ -788,14 +817,25 @@ fn cache_evicts_the_least_recently_used_primary_entry() {
     let second_request = Request::get(second.as_str());
     let third_request = Request::get(third.as_str());
 
-    cache.insert(&first_request, &first, cached_response(&first, b"first"));
-    cache.insert(
+    cache.insert_with_headers(
+        &first_request,
+        &first,
+        first_request.headers(),
+        cached_response(&first, b"first"),
+    );
+    cache.insert_with_headers(
         &second_request,
         &second,
+        second_request.headers(),
         cached_response(&second, b"second"),
     );
     assert!(fresh_response(&cache, &first_request, &first).is_some());
-    cache.insert(&third_request, &third, cached_response(&third, b"third"));
+    cache.insert_with_headers(
+        &third_request,
+        &third,
+        third_request.headers(),
+        cached_response(&third, b"third"),
+    );
 
     assert!(fresh_response(&cache, &first_request, &first).is_some());
     assert!(fresh_response(&cache, &second_request, &second).is_none());
@@ -811,8 +851,18 @@ fn cache_evicts_across_partitions_to_stay_within_the_body_budget() {
     let mut second = first.try_clone().unwrap();
     second.set_cache_partition("two".into());
 
-    cache.insert(&first, &url, cached_response(&url, b"first"));
-    cache.insert(&second, &url, cached_response(&url, b"second"));
+    cache.insert_with_headers(
+        &first,
+        &url,
+        first.headers(),
+        cached_response(&url, b"first"),
+    );
+    cache.insert_with_headers(
+        &second,
+        &url,
+        second.headers(),
+        cached_response(&url, b"second"),
+    );
 
     assert!(fresh_response(&cache, &first, &url).is_none());
     assert!(fresh_response(&cache, &second, &url).is_some());
@@ -828,9 +878,10 @@ fn insertion_removes_expired_entries_before_admitting_new_data() {
     let fresh_request = Request::get(fresh_url.as_str());
     let expired_key = cache_key(&expired_request, &expired_url);
 
-    cache.insert(
+    cache.insert_with_headers(
         &expired_request,
         &expired_url,
+        expired_request.headers(),
         cached_response(&expired_url, b"expired"),
     );
     cache
@@ -842,9 +893,10 @@ fn insertion_removes_expired_entries_before_admitting_new_data() {
         .unwrap()[0]
         .freshness = expired_freshness();
 
-    cache.insert(
+    cache.insert_with_headers(
         &fresh_request,
         &fresh_url,
+        fresh_request.headers(),
         cached_response(&fresh_url, b"fresh"),
     );
 
@@ -863,7 +915,12 @@ fn authorized_requests_are_never_stored() {
         .set_header(AUTHORIZATION, "Bearer do-not-store".parse().unwrap())
         .unwrap();
 
-    cache.insert(&request, &url, cached_response(&url, b"private"));
+    cache.insert_with_headers(
+        &request,
+        &url,
+        request.headers(),
+        cached_response(&url, b"private"),
+    );
 
     assert!(fresh_response(&cache, &request, &url).is_none());
 }
@@ -881,9 +938,24 @@ fn invalidation_removes_every_variant_in_its_partition_only() {
     let mut mutate = first.try_clone().unwrap();
     mutate.set_method("PATCH").unwrap();
 
-    cache.insert(&first, &url, cached_response(&url, b"first"));
-    cache.insert(&second, &url, cached_response(&url, b"second"));
-    cache.insert(&first, &other_url, cached_response(&other_url, b"other"));
+    cache.insert_with_headers(
+        &first,
+        &url,
+        first.headers(),
+        cached_response(&url, b"first"),
+    );
+    cache.insert_with_headers(
+        &second,
+        &url,
+        second.headers(),
+        cached_response(&url, b"second"),
+    );
+    cache.insert_with_headers(
+        &first,
+        &other_url,
+        first.headers(),
+        cached_response(&other_url, b"other"),
+    );
 
     cache.invalidate(&mutate, &url);
 
@@ -914,7 +986,7 @@ fn cached_response(url: &Url, body: &'static [u8]) -> StoredResponse {
 }
 
 fn fresh_response(cache: &ResponseCache, request: &Request, url: &Url) -> Option<StoredResponse> {
-    match cache.lookup(request, url) {
+    match cache.lookup_with_headers(request, url, request.headers()) {
         Some(CacheLookup::Fresh(response)) => Some(response),
         Some(CacheLookup::Stale { .. }) | None => None,
     }

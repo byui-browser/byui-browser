@@ -14,6 +14,8 @@ struct CacheCapture {
     cache: ResponseCache,
     /// Original request used to compute the cache key.
     request: Request,
+    /// Complete headers sent for the original request, retained for `Vary`.
+    request_headers: crate::Headers,
     /// Parsed request URL used to compute the cache key.
     request_url: reqwest::Url,
     /// Response metadata retained while the body is consumed.
@@ -37,6 +39,7 @@ pub(crate) fn with_cache_capture(
     mut response: InternalResponse,
     cache: ResponseCache,
     request: Request,
+    request_headers: crate::Headers,
     request_url: reqwest::Url,
     max_body_size: usize,
 ) -> Result<InternalResponse, RequestError> {
@@ -47,6 +50,7 @@ pub(crate) fn with_cache_capture(
     let capture = CacheCapture {
         cache,
         request,
+        request_headers,
         request_url,
         status,
         headers,
@@ -94,9 +98,10 @@ async fn capture_body_to_cache(mut body: Body, capture: CacheCapture) {
         collected.len(),
         capture.url
     );
-    capture.cache.insert(
+    capture.cache.insert_with_headers(
         &capture.request,
         &capture.request_url,
+        &capture.request_headers,
         StoredResponse {
             status: capture.status,
             headers: capture.headers,
@@ -148,12 +153,17 @@ mod tests {
                 response,
                 cache.clone(),
                 request.try_clone().unwrap(),
+                request.headers().clone(),
                 url.clone(),
                 1024
             ),
             Err(RequestError::BodyNotCloneable)
         ));
-        assert!(cache.lookup(&request, &url).is_none());
+        assert!(
+            cache
+                .lookup_with_headers(&request, &url, request.headers())
+                .is_none()
+        );
     }
 
     #[test]
@@ -182,19 +192,27 @@ mod tests {
                 response,
                 cache.clone(),
                 request.try_clone().unwrap(),
+                request.headers().clone(),
                 url.clone(),
                 1024,
             )
             .unwrap();
             drop(response);
             for _ in 0..4_096 {
-                if cache.lookup(&request, &url).is_some() {
+                if cache
+                    .lookup_with_headers(&request, &url, request.headers())
+                    .is_some()
+                {
                     return;
                 }
                 tokio::task::yield_now().await;
             }
         });
-        assert!(cache.lookup(&request, &url).is_some());
+        assert!(
+            cache
+                .lookup_with_headers(&request, &url, request.headers())
+                .is_some()
+        );
     }
 
     #[test]
@@ -223,6 +241,7 @@ mod tests {
                 response,
                 cache.clone(),
                 request.try_clone().unwrap(),
+                request.headers().clone(),
                 url.clone(),
                 3,
             )
@@ -234,7 +253,11 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         });
-        assert!(cache.lookup(&request, &url).is_none());
+        assert!(
+            cache
+                .lookup_with_headers(&request, &url, request.headers())
+                .is_none()
+        );
     }
 
     #[test]
@@ -265,6 +288,7 @@ mod tests {
                 response,
                 cache.clone(),
                 request.try_clone().unwrap(),
+                request.headers().clone(),
                 url.clone(),
                 1024,
             )
@@ -274,7 +298,11 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         });
-        assert!(cache.lookup(&request, &url).is_none());
+        assert!(
+            cache
+                .lookup_with_headers(&request, &url, request.headers())
+                .is_none()
+        );
     }
 
     #[test]
@@ -304,6 +332,7 @@ mod tests {
                 response,
                 cache.clone(),
                 request.try_clone().unwrap(),
+                request.headers().clone(),
                 url.clone(),
                 1024,
             )
@@ -314,6 +343,10 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         });
-        assert!(cache.lookup(&request, &url).is_none());
+        assert!(
+            cache
+                .lookup_with_headers(&request, &url, request.headers())
+                .is_none()
+        );
     }
 }

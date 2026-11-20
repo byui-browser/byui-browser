@@ -11,6 +11,8 @@ a partial Fetch HTTP-cache implementation. It currently provides:
 - least-recently-used eviction and stale-entry pruning;
 - multiple `Vary` request-header variants, including `Vary: *` rejection and
   variant replacement when the `Vary` field set changes;
+- `Vary` matching against the complete outgoing header set, including
+  Fetch-generated, policy-generated, body-metadata, and cookie fields;
 - explicit freshness based on `Date`, `Expires`, `Age`, and supported
   `Cache-Control` directives, plus conservative `Last-Modified` heuristic
   freshness when explicit metadata is absent;
@@ -47,9 +49,6 @@ Remaining work:
 - Make the cache partition mandatory for browser-context requests. The current
   standalone fallback can create an unpartitioned cache rather than selecting
   `no-store` when no browser HTTP cache is available.
-- Match `Vary` against the complete outgoing request, including generated
-  headers such as `Origin`, `Referer`, user-agent/Fetch Metadata fields, body
-  metadata, and cookies, not only caller-visible headers.
 - Revisit the extra cache-key dimensions. They conservatively reduce reuse but
   do not model HTTP cache matching directly.
 - Support cacheable response statuses and cached redirects according to HTTP
