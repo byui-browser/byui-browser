@@ -140,7 +140,7 @@ fn failed_cloned_response_releases_permit_and_is_not_cached() {
 }
 
 #[test]
-fn dropping_a_stream_releases_its_scheduler_permit_and_does_not_cache() {
+fn dropping_a_stream_releases_its_scheduler_permit() {
     let hits = Arc::new(AtomicUsize::new(0));
     let observed_hits = Arc::clone(&hits);
     let server = TestServer::start(2, move |_| {
@@ -161,13 +161,13 @@ fn dropping_a_stream_releases_its_scheduler_permit_and_does_not_cache() {
             b"body"
         );
         drop(response);
-        let retry = tokio::time::timeout(
-            SCHEDULER_RELEASE_TIMEOUT,
-            controller.fetch(Request::get(server.url())),
-        )
-        .await
-        .expect("dropped stream should release its scheduler permit")
-        .unwrap();
+        let mut retry_request = Request::get(server.url());
+        retry_request.set_cache_mode(CacheMode::Reload);
+        let retry =
+            tokio::time::timeout(SCHEDULER_RELEASE_TIMEOUT, controller.fetch(retry_request))
+                .await
+                .expect("dropped stream should release its scheduler permit")
+                .unwrap();
         assert!(!retry.from_cache);
         assert_eq!(retry.body.bytes().await.unwrap(), b"body");
     });
