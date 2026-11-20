@@ -684,6 +684,7 @@ pub fn security_context_for_url_with_policy(
     if let Ok(url) = Url::parse(url)
         && matches!(url.scheme(), "http" | "https" | "byui")
         && let Some(host) = url.host_str()
+        && !host.is_empty()
     {
         let origin = Origin::new(url.scheme(), host, url.port());
         let storage_permission = match policy.decision(&origin, PermissionKind::Storage) {
@@ -1173,10 +1174,16 @@ mod tests {
 
     #[test]
     fn unsupported_origins_are_isolated_without_storage() {
-        for url in ["", "not a url", "file:///etc/passwd", "data:text/html,hi"] {
+        for url in [
+            "",
+            "not a url",
+            "file:///etc/passwd",
+            "data:text/html,hi",
+            "https:///",
+        ] {
             let context = security_context_for_url(url);
             assert!(!context.can_read_storage() && !context.can_write_storage());
-            assert_eq!(context.origin().scheme(), "opaque");
+            assert!(context.origin().is_opaque());
         }
     }
 
