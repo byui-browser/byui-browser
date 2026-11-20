@@ -106,8 +106,11 @@ impl CachedResponse {
     ) -> StoredResponse {
         for (name, value) in headers {
             // A 304 has no representation body, so its content length cannot
-            // describe the retained body.
-            if name != http::header::CONTENT_LENGTH {
+            // describe the retained body. `Set-Cookie` is a response-side
+            // effect rather than representation metadata; it is handled by
+            // the validating response path and must not be replayed by later
+            // cache hits.
+            if name != http::header::CONTENT_LENGTH && name != http::header::SET_COOKIE {
                 self.response.headers.insert(name.clone(), value.clone());
             }
         }

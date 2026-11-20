@@ -64,14 +64,16 @@ date supplies a conservative one-tenth apparent-age heuristic.
 
 Basic validator-aware revalidation now retains and sends both `ETag` and
 `Last-Modified` when available. A `304` refreshes the stored `Vary` request
-snapshot and removes variants made obsolete by a changed `Vary` field set.
+snapshot, updates retained validators, removes variants made obsolete by a
+changed `Vary` field set, and sends validation-response `Set-Cookie` fields to
+browser storage without retaining them for later cache hits. A validation
+response without a stored validator replaces the representation normally, and
+an unsuccessful validation response leaves the existing representation intact.
 Remaining work is to:
 
 1. apply the complete HTTP freshening rules when merging `304` headers;
-2. process `Set-Cookie` and other response-side effects from the validation
-   response; and
-3. cover validation failure, missing validators, changed validators, and
-   concurrent revalidation.
+2. process non-cookie response-side effects from the validation response; and
+3. cover transport-level validation failure and concurrent revalidation.
 
 `CacheMode::NoCache` now uses this path, but its request-header interaction is
 not yet fully Fetch-compatible.

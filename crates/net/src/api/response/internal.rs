@@ -24,6 +24,12 @@ pub(crate) struct InternalResponse {
     pub(crate) body: Body,
     pub(crate) from_cache: bool,
     pub(crate) cookie_headers_processed: bool,
+    /// Cookie fields received with a validating `304` response.
+    ///
+    /// They are not representation metadata and therefore are not retained in
+    /// the cache entry. They must still reach browser cookie storage after the
+    /// merged response has passed response policy checks.
+    pub(crate) validation_cookie_headers: Option<Box<[reqwest::header::HeaderValue]>>,
 }
 
 impl InternalResponse {
@@ -54,6 +60,7 @@ impl InternalResponse {
             body,
             from_cache,
             cookie_headers_processed,
+            validation_cookie_headers: None,
         }
     }
 

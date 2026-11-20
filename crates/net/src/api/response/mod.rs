@@ -93,6 +93,7 @@ mod tests {
             body: Body::once(b"body".to_vec()),
             from_cache: false,
             cookie_headers_processed: true,
+            validation_cookie_headers: None,
         };
         assert!(internal.headers.contains_key("set-cookie"));
         let exposed = internal.expose();
@@ -129,6 +130,7 @@ mod tests {
                 },
                 from_cache: response_type == ResponseType::Opaque,
                 cookie_headers_processed: false,
+                validation_cookie_headers: None,
             };
             let mut exposed = internal.expose();
             if matches!(

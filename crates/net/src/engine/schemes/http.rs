@@ -233,7 +233,15 @@ impl RequestController {
                     .cache
                     .merge_not_modified(request, url, &response.headers)
         {
-            return Ok(self.response_from_stored(request, cached));
+            let validation_cookie_headers: Vec<http::HeaderValue> = response
+                .headers
+                .get_all(http::header::SET_COOKIE)
+                .iter()
+                .cloned()
+                .collect();
+            let mut merged = self.response_from_stored(request, cached);
+            merged.validation_cookie_headers = Some(validation_cookie_headers.into_boxed_slice());
+            return Ok(merged);
         }
         Ok(response)
     }

@@ -85,18 +85,23 @@ impl RequestController {
         url: &reqwest::Url,
         response: &mut InternalResponse,
     ) -> Result<(), RequestError> {
-        if response.cookie_headers_processed || !request.credentials_allowed(url) {
+        if !request.credentials_allowed(url) {
             return Ok(());
         }
         if let Some(cookies) = &self.inner.cookies {
-            let values: Vec<http::HeaderValue> = response
-                .headers
-                .get_all(http::header::SET_COOKIE)
-                .iter()
-                .cloned()
-                .collect();
-            cookies.store_set_cookie(request, &values)?;
-            response.cookie_headers_processed = true;
+            if !response.cookie_headers_processed {
+                let values: Vec<http::HeaderValue> = response
+                    .headers
+                    .get_all(http::header::SET_COOKIE)
+                    .iter()
+                    .cloned()
+                    .collect();
+                cookies.store_set_cookie(request, &values)?;
+                response.cookie_headers_processed = true;
+            }
+            if let Some(values) = response.validation_cookie_headers.take() {
+                cookies.store_set_cookie(request, &values)?;
+            }
         }
         Ok(())
     }

@@ -67,6 +67,7 @@ impl InternalResponse {
             body,
             from_cache: false,
             cookie_headers_processed: false,
+            validation_cookie_headers: None,
         })
     }
 }

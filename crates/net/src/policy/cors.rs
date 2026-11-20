@@ -116,6 +116,7 @@ mod tests {
             body: Body::once(Vec::new()),
             from_cache: false,
             cookie_headers_processed: false,
+            validation_cookie_headers: None,
         }
     }
 

@@ -3,7 +3,7 @@
 mod common;
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -78,6 +78,53 @@ impl ServiceWorkerService for SameOriginCacheServices {
 impl CachePartitionService for SameOriginCacheServices {
     fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
         Ok("same-origin-cache-test".into())
+    }
+}
+
+struct RecordingCookieCacheServices {
+    stored: Arc<Mutex<Vec<String>>>,
+}
+
+impl RequestPolicyService for RecordingCookieCacheServices {
+    fn check_request(&self, _request: &Request) -> Result<(), RequestError> {
+        Ok(())
+    }
+}
+
+impl ResponsePolicyService for RecordingCookieCacheServices {
+    fn check_response(&self, _request: &Request, _info: &ResponseInfo) -> Result<(), RequestError> {
+        Ok(())
+    }
+}
+
+impl CookieService for RecordingCookieCacheServices {
+    fn cookie_header(&self, _request: &Request) -> Result<Option<String>, RequestError> {
+        Ok(None)
+    }
+
+    fn store_set_cookie(
+        &self,
+        _request: &Request,
+        values: &[net::HeaderValue],
+    ) -> Result<(), RequestError> {
+        self.stored.lock().unwrap().extend(
+            values
+                .iter()
+                .map(|value| value.to_str().unwrap().to_owned()),
+        );
+        Ok(())
+    }
+}
+
+impl ServiceWorkerService for RecordingCookieCacheServices {
+    fn service_worker(&self, _request: &Request) -> Result<ServiceWorkerDecision, RequestError> {
+        Ok(ServiceWorkerDecision::Network)
+    }
+}
+
+impl CachePartitionService for RecordingCookieCacheServices {
+    fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
+        Ok("recording-cookie-cache-test".into())
     }
 }
 
@@ -176,6 +223,136 @@ fn no_cache_revalidates_with_all_validators_and_reuses_the_merged_representation
     assert_eq!(revalidated.2, b"cached");
     assert!(cached.0);
     assert_eq!(cached.1, b"cached");
+}
+
+#[test]
+fn revalidation_processes_304_cookies_once_without_caching_them() {
+    let server = TestServer::start(2, |request| {
+        if request
+            .to_ascii_lowercase()
+            .contains("if-none-match: \"version-1\"")
+        {
+            b"HTTP/1.1 304 Not Modified\r\nCache-Control: max-age=60\r\nETag: \"version-2\"\r\nSet-Cookie: refreshed=two\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        } else {
+            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nETag: \"version-1\"\r\nSet-Cookie: initial=one\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
+        }
+    });
+    let stored = Arc::new(Mutex::new(Vec::new()));
+    let controller = RequestController::builder(Config::default())
+        .with_browser_capabilities(Arc::new(RecordingCookieCacheServices {
+            stored: Arc::clone(&stored),
+        }))
+        .build()
+        .unwrap();
+
+    runtime().block_on(async {
+        let mut request = Request::get(server.url());
+        request.set_environment(
+            FetchEnvironment::from_url(reqwest::Url::parse(request.url()).unwrap()).unwrap(),
+        );
+        let first = controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(collect_body(first).await.unwrap(), b"cached");
+        wait_for_cached(&controller, &request).await;
+
+        let mut revalidate = request.try_clone().unwrap();
+        revalidate.set_cache_mode(CacheMode::NoCache);
+        let revalidated = controller.fetch(revalidate).await.unwrap();
+        assert!(revalidated.from_cache);
+        assert_eq!(collect_body(revalidated).await.unwrap(), b"cached");
+
+        let cached = controller.fetch(request).await.unwrap();
+        assert!(cached.from_cache);
+        assert_eq!(collect_body(cached).await.unwrap(), b"cached");
+    });
+
+    server.join();
+    assert_eq!(
+        stored.lock().unwrap().as_slice(),
+        ["initial=one", "refreshed=two"]
+    );
+}
+
+#[test]
+fn no_cache_without_a_validator_replaces_the_cached_representation() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let observed_hits = Arc::clone(&hits);
+    let server = TestServer::start(2, move |request| {
+        assert!(!request.to_ascii_lowercase().contains("if-none-match:"));
+        if observed_hits.fetch_add(1, Ordering::SeqCst) == 0 {
+            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfirst".to_vec()
+        } else {
+            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecond".to_vec()
+        }
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+
+    runtime().block_on(async {
+        let request = Request::get(server.url());
+        let first = controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(collect_body(first).await.unwrap(), b"first");
+        wait_for_cached(&controller, &request).await;
+
+        let mut revalidate = request.try_clone().unwrap();
+        revalidate.set_cache_mode(CacheMode::NoCache);
+        let replacement = controller.fetch(revalidate).await.unwrap();
+        assert!(!replacement.from_cache);
+        assert_eq!(collect_body(replacement).await.unwrap(), b"second");
+
+        let cached = wait_for_cached(&controller, &request).await;
+        assert_eq!(collect_body(cached).await.unwrap(), b"second");
+    });
+
+    server.join();
+}
+
+#[test]
+fn failed_revalidation_keeps_the_existing_representation() {
+    let server = TestServer::start(2, |request| {
+        if request
+            .to_ascii_lowercase()
+            .contains("if-none-match: \"version-1\"")
+        {
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfail".to_vec()
+        } else {
+            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=0\r\nETag: \"version-1\"\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
+        }
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+
+    runtime().block_on(async {
+        let request = Request::get(server.url());
+        let first = controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(collect_body(first).await.unwrap(), b"cached");
+        wait_for_cached(&controller, &request).await;
+
+        let failure = controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
+        assert!(!failure.from_cache);
+        assert_eq!(collect_body(failure).await.unwrap(), b"fail");
+
+        let mut cached_request = request;
+        cached_request.set_cache_mode(CacheMode::ForceCache);
+        let cached = controller.fetch(cached_request).await.unwrap();
+        assert!(cached.from_cache);
+        assert_eq!(collect_body(cached).await.unwrap(), b"cached");
+    });
+
+    server.join();
 }
 
 #[test]

@@ -357,12 +357,21 @@ fn revalidation_sends_all_validators_and_merges_304_metadata() {
     not_modified.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
     not_modified.insert(ETAG, "\"second\"".parse().unwrap());
     not_modified.insert("x-revalidated", "yes".parse().unwrap());
+    not_modified.insert("set-cookie", "session=updated".parse().unwrap());
     let merged = cache
         .merge_not_modified(&request, &url, &not_modified)
         .unwrap();
     assert_eq!(merged.status, StatusCode::OK);
     assert_eq!(merged.body, Bytes::from_static(b"cached"));
     assert_eq!(merged.headers.get("x-revalidated").unwrap(), "yes");
+    assert!(merged.headers.get("set-cookie").is_none());
+    let (_, refreshed_validator) = cache.lookup_for_revalidation(&request, &url).unwrap();
+    let mut refreshed_headers = crate::Headers::new();
+    refreshed_validator.apply(&mut refreshed_headers).unwrap();
+    assert_eq!(
+        refreshed_headers.to_reqwest().get("if-none-match").unwrap(),
+        "\"second\""
+    );
     assert!(matches!(
         cache.lookup(&request, &url),
         Some(CacheLookup::Fresh(_))
