@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use html::{Attribute, Namespace, NodeID};
+use html::{Attribute, Namespace, NodeID, NodeKind};
 use js::{JsError, JsResult, Object, ScriptEvaluator, Value};
 
 use crate::document::{Document, script_element_object};
@@ -207,6 +207,72 @@ fn define_element_properties(object: &Object, element: &Element, document: &Arc<
         Namespace::Svg | Namespace::MathMl => element.local_name.clone(),
     };
     object.set_read_only("tagName", Value::String(tag_name));
+    let offset_parent_document = document.clone();
+    object.define_accessor(
+        "offsetParent",
+        Arc::new(move || {
+            let parent = {
+                let document = offset_parent_document.lock().unwrap();
+                let Some(source) = document.html_document() else {
+                    return Ok(Value::Null);
+                };
+                let styles = document.computed_styles();
+                if styles.value_for(node, "position") == Some("fixed") {
+                    return Ok(Value::Null);
+                }
+                let mut current = source.get_node(node).and_then(|entry| entry.get_parent());
+                let mut found = None;
+                while let Some(id) = current {
+                    let Some(entry) = source.get_node(id) else {
+                        break;
+                    };
+                    if let NodeKind::Element(data) = entry.get_kind() {
+                        let positioned = styles
+                            .value_for(id, "position")
+                            .is_some_and(|value| !value.eq_ignore_ascii_case("static"));
+                        if positioned {
+                            found = Some(id);
+                            break;
+                        }
+                        if data.get_name() == "body" {
+                            found = Some(id);
+                            break;
+                        }
+                    }
+                    current = entry.get_parent();
+                }
+                found
+            };
+            match parent {
+                Some(parent) => wrap_element(&offset_parent_document, parent),
+                None => Ok(Value::Null),
+            }
+        }),
+        None,
+    );
+    let naturally_focusable = matches!(
+        element.local_name.as_str(),
+        "button" | "input" | "select" | "textarea" | "a"
+    );
+    let tab_document = document.clone();
+    object.define_accessor(
+        "tabIndex",
+        Arc::new(move || {
+            let value = tab_document
+                .lock()
+                .unwrap()
+                .element_snapshot(node)
+                .and_then(|element| element.get_attribute("tabindex").map(str::to_owned));
+            let index = value
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or({
+                    // The supported DOM subset treats common interactive controls as focusable.
+                    if naturally_focusable { 0 } else { -1 }
+                });
+            Ok(Value::Number(index as f64))
+        }),
+        None,
+    );
 
     let attributes_document = document.clone();
     let attributes_owner = object.clone();
@@ -237,7 +303,11 @@ fn define_element_properties(object: &Object, element: &Element, document: &Arc<
         })),
     );
 
-    for (property, height) in [("clientWidth", false), ("clientHeight", true)] {
+    for (property, height) in [
+        ("clientWidth", false),
+        ("clientHeight", true),
+        ("offsetWidth", false),
+    ] {
         let client_document = document.clone();
         object.define_accessor(
             property,
@@ -311,6 +381,28 @@ fn define_tree_methods(object: &Object, node: NodeID, document: &Arc<Mutex<Docum
             let (inputs, inserted) = node_inputs(arguments);
             mutate_tree(&before_document, &inserted, &[], |document| {
                 document.before(node, &inputs)
+            })?;
+            Ok(Value::Undefined)
+        }),
+    );
+
+    let after_document = document.clone();
+    object.set_method(
+        "after",
+        Arc::new(move |arguments| {
+            let (inputs, inserted) = node_inputs(arguments);
+            {
+                let document = after_document.lock().unwrap();
+                let Some(source) = document.html_document() else {
+                    return Ok(Value::Undefined);
+                };
+                let Some(_parent) = source.get_node(node).and_then(|entry| entry.get_parent())
+                else {
+                    return Ok(Value::Undefined);
+                };
+            }
+            mutate_tree(&after_document, &inserted, &[], |document| {
+                document.after(node, &inputs)
             })?;
             Ok(Value::Undefined)
         }),

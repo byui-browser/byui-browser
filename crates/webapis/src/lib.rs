@@ -17,6 +17,7 @@ mod dom_exception;
 mod element;
 mod event;
 mod fetch;
+mod headers;
 pub mod local_storage;
 mod location;
 mod node;

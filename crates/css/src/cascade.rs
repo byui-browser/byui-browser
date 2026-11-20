@@ -521,7 +521,7 @@ fn media_feature_applies(token: &str, context: StyleContext) -> bool {
 /// the computed font size in CSS pixels.
 fn compute(
     parent: Option<&[Declaration]>,
-    cascaded: HashMap<&str, (CascadePriority, &str)>,
+    mut cascaded: HashMap<&str, (CascadePriority, &str)>,
     initial_color: &str,
     root_font_size: f32,
     context: StyleContext,
@@ -535,6 +535,38 @@ fn compute(
                 .map(|declaration| declaration.value.as_str())
         })
     };
+    // Logical and physical aliases compete using the original cascade priority.
+    // Writing modes map axes here; vertical text layout remains unsupported.
+    let axis_value = |name: &str, initial: &str| match cascaded.get(name).map(|(_, v)| v.trim()) {
+        Some("inherit" | "unset") | None => parent_value(name).unwrap_or(initial).to_owned(),
+        Some("initial" | "revert" | "revert-layer") => initial.to_owned(),
+        Some(value) => value.to_ascii_lowercase(),
+    };
+    let rtl = axis_value("direction", "ltr") == "rtl";
+    let vertical = axis_value("writing-mode", "horizontal-tb").starts_with("vertical")
+        || axis_value("writing-mode", "horizontal-tb").starts_with("sideways");
+    let inline_end = match (vertical, rtl) {
+        (false, false) => "padding-right",
+        (false, true) => "padding-left",
+        (true, false) => "padding-bottom",
+        (true, true) => "padding-top",
+    };
+    for (logical, physical) in [
+        ("padding-inline-end", inline_end),
+        (
+            "max-block-size",
+            if vertical { "max-width" } else { "max-height" },
+        ),
+        ("-webkit-user-select", "user-select"),
+    ] {
+        if let Some(candidate) = cascaded.remove(logical)
+            && cascaded
+                .get(physical)
+                .is_none_or(|existing| candidate.0 >= existing.0)
+        {
+            cascaded.insert(physical, candidate);
+        }
+    }
     let mut properties = BTreeMap::<String, String>::new();
     if let Some(parent) = parent {
         for declaration in parent {
@@ -786,5 +818,12 @@ pub(crate) fn is_inherited_property(property: &str) -> bool {
             | "text-align"
             | "text-transform"
             | "visibility"
+            | "white-space"
+            | "word-break"
+            | "direction"
+            | "writing-mode"
+            | "cursor"
+            | "text-rendering"
+            | "user-select"
     )
 }

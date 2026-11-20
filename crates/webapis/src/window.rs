@@ -921,6 +921,7 @@ fn register_window_object(
     };
     let self_window = window.clone();
     let navigator = Object::new();
+    navigator.set_read_only("userAgent", Value::String("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) byui-browser/0.1".into()));
     let navigator_for_window = navigator.clone();
     let history = Object::new();
     let location = Object::new();
@@ -961,6 +962,167 @@ fn register_window_object(
     // registration replaces this with the document's singleton Selection.
     window.set_method("getSelection", Arc::new(|_| Ok(Value::Null)));
     window.set("customElements", Value::Object(custom_elements.clone()));
+    let url_constructor = Function::from_host_constructor(
+        "URL",
+        Arc::new(|_| Err(JsError::runtime("URL constructor requires 'new'"))),
+        Arc::new(|arguments| {
+            let input = arguments
+                .first()
+                .map(Value::to_string)
+                .ok_or_else(|| JsError::runtime("URL requires an input"))?;
+            let parsed = match arguments.get(1) {
+                Some(base) => Url::parse(&base.to_string()).and_then(|base| base.join(&input)),
+                None => Url::parse(&input),
+            }
+            .map_err(|error| JsError::runtime(format!("Invalid URL: {error}")))?;
+            let object = Object::new();
+            object.set_read_only("href", Value::String(parsed.as_str().into()));
+            object.set_read_only(
+                "origin",
+                Value::String(parsed.origin().ascii_serialization()),
+            );
+            object.set_read_only("protocol", Value::String(format!("{}:", parsed.scheme())));
+            let host = parsed.host_str().unwrap_or_default();
+            let host = parsed
+                .port()
+                .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
+            object.set_read_only("host", Value::String(host));
+            object.set_read_only("pathname", Value::String(parsed.path().into()));
+            object.set_read_only(
+                "search",
+                Value::String(parsed.query().map_or(String::new(), |q| format!("?{q}"))),
+            );
+            object.set_read_only(
+                "hash",
+                Value::String(parsed.fragment().map_or(String::new(), |f| format!("#{f}"))),
+            );
+            Ok(Value::Object(object))
+        }),
+    );
+    window.set_read_only("URL", Value::Function(url_constructor.clone()));
+    realm.register_global_value("URL", Value::Function(url_constructor))?;
+    let params_constructor = Function::from_host_constructor(
+        "URLSearchParams",
+        Arc::new(|_| {
+            Err(JsError::runtime(
+                "URLSearchParams constructor requires 'new'",
+            ))
+        }),
+        Arc::new(|arguments| {
+            let query = arguments.first().map(Value::to_string).unwrap_or_default();
+            let query = query.strip_prefix('?').unwrap_or(&query);
+            let entries = Arc::new(Mutex::new(
+                query
+                    .split('&')
+                    .filter(|part| !part.is_empty())
+                    .map(|part| {
+                        let (name, value) = part.split_once('=').unwrap_or((part, ""));
+                        (decode_form_component(name), decode_form_component(value))
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+            let object = Object::new();
+            let entries_for_get = entries.clone();
+            object.set_method(
+                "get",
+                Arc::new(move |args| {
+                    let name = args.first().map(Value::to_string).unwrap_or_default();
+                    Ok(entries_for_get
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(key, _)| *key == name)
+                        .map_or(Value::Null, |(_, value)| Value::String(value.clone())))
+                }),
+            );
+            let entries_for_has = entries.clone();
+            object.set_method(
+                "has",
+                Arc::new(move |args| {
+                    let name = args.first().map(Value::to_string).unwrap_or_default();
+                    Ok(Value::Boolean(
+                        entries_for_has
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|(key, _)| *key == name),
+                    ))
+                }),
+            );
+            let entries_for_append = entries.clone();
+            object.set_method(
+                "append",
+                Arc::new(move |args| {
+                    if args.len() < 2 {
+                        return Err(JsError::runtime("append requires a name and value"));
+                    }
+                    entries_for_append
+                        .lock()
+                        .unwrap()
+                        .push((args[0].to_string(), args[1].to_string()));
+                    Ok(Value::Undefined)
+                }),
+            );
+            let entries_for_set = entries.clone();
+            object.set_method(
+                "set",
+                Arc::new(move |args| {
+                    if args.len() < 2 {
+                        return Err(JsError::runtime("set requires a name and value"));
+                    }
+                    let name = args[0].to_string();
+                    let value = args[1].to_string();
+                    let mut entries = entries_for_set.lock().unwrap();
+                    let first = entries.iter().position(|(key, _)| *key == name);
+                    entries.retain(|(key, _)| *key != name);
+                    let length = entries.len();
+                    entries.insert(first.unwrap_or(length).min(length), (name, value));
+                    Ok(Value::Undefined)
+                }),
+            );
+            let entries_for_delete = entries.clone();
+            object.set_method(
+                "delete",
+                Arc::new(move |args| {
+                    let name = args.first().map(Value::to_string).unwrap_or_default();
+                    entries_for_delete
+                        .lock()
+                        .unwrap()
+                        .retain(|(key, _)| *key != name);
+                    Ok(Value::Undefined)
+                }),
+            );
+            object.set_method(
+                "toString",
+                Arc::new(move |_| {
+                    let query = entries
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(key, value)| {
+                            format!(
+                                "{}={}",
+                                encode_form_component(key),
+                                encode_form_component(value)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("&");
+                    Ok(Value::String(query))
+                }),
+            );
+            Ok(Value::Object(object))
+        }),
+    );
+    window.set_read_only(
+        "URLSearchParams",
+        Value::Function(params_constructor.clone()),
+    );
+    realm.register_global_value("URLSearchParams", Value::Function(params_constructor))?;
+    crate::headers::register(realm, &window)?;
+    if let Some(console) = realm.registered_global_value("console") {
+        window.set_read_only("console", console);
+    }
     // HTML's structured cloning API deep-copies primitives, plain objects,
     // and arrays, preserving cycles and repeated references. This runtime
     // does not represent the standard's built-in serializable types (such as
@@ -2431,6 +2593,44 @@ fn register_window_object(
             .expect("cancelAnimationFrame should be installed on Window"),
     )?;
     Ok(window)
+}
+
+fn decode_form_component(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'+' {
+            output.push(b' ');
+            index += 1;
+        } else if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(value) = u8::from_str_radix(&input[index + 1..index + 3], 16) {
+                output.push(value);
+                index += 3;
+            } else {
+                output.push(bytes[index]);
+                index += 1;
+            }
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn encode_form_component(input: &str) -> String {
+    let mut output = String::new();
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'*' | b'-' | b'.' | b'_') {
+            output.push(char::from(byte));
+        } else if byte == b' ' {
+            output.push('+');
+        } else {
+            output.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    output
 }
 
 /// Runs callbacks whose `setInterval()` deadlines have elapsed.

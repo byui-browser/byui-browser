@@ -443,7 +443,18 @@ impl Context<'_> {
         {
             flow.height = flow.height.max(bottom);
         }
-        let content_height = specified_height.unwrap_or(flow.height.max(control.min_height));
+        let content_height = specified_height
+            .unwrap_or(flow.height.max(control.min_height))
+            .min(
+                style
+                    .content_height_for(style.max_height, basis, cb.height)
+                    .unwrap_or(f32::INFINITY),
+            )
+            .max(
+                style
+                    .content_height_for(style.min_height, basis, cb.height)
+                    .unwrap_or(0.0),
+            );
         if specified_height.is_none() {
             log::trace!(
                 "node {:?}: auto height resolved to {content_height}",
@@ -468,6 +479,40 @@ impl Context<'_> {
         };
         for line in &mut lines {
             line.translate(padding.left, padding.top + line_offset);
+        }
+        // Text overflow is supported for left-to-right text runs. Atomic inline
+        // content and bidi marker placement are not yet truncated.
+        if style.clip_overflow && !block.clips_contents {
+            let clip = Rect {
+                x: padding.left,
+                y: padding.top,
+                width: content_width,
+                height: content_height,
+            };
+            for line in &mut lines {
+                for fragment in &mut line.fragments {
+                    if let LineFragment::Text(text) = fragment
+                        && style.ellipsis
+                        && text.rect.right() > clip.right()
+                    {
+                        let marker = self.fonts.font_text_width(text.font, "…", text.font_size);
+                        let available = (clip.right() - text.rect.x - marker).max(0.0);
+                        while !text.text.is_empty()
+                            && self
+                                .fonts
+                                .font_text_width(text.font, &text.text, text.font_size)
+                                > available
+                        {
+                            text.text.pop();
+                        }
+                        text.text.push('…');
+                        text.rect.width =
+                            self.fonts
+                                .font_text_width(text.font, &text.text, text.font_size);
+                    }
+                }
+            }
+            clip_text(&mut lines, clip);
         }
         if block.clips_contents {
             // Control text is clipped to the padding box, inside the borders.
@@ -1040,6 +1085,9 @@ fn intersect(a: Rect, b: Rect) -> Rect {
 
 pub(crate) fn box_style(style: &ComputedStyle) -> BoxStyle {
     BoxStyle {
+        hidden: style.hidden,
+        cursor: style.cursor.clone(),
+        user_select: style.user_select.clone(),
         background_color: style.background_color,
         text_color: style.color,
         border_width: style.borders.border_width,

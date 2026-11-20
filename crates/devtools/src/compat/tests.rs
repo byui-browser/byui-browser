@@ -300,3 +300,136 @@ fn previews_window_long_minified_lines_around_the_column() {
     let tabbed = SourcePreview::new("t.js", "\tvar a;", 1, Some(2)).unwrap();
     assert_eq!(tabbed.focus(), " var a;");
 }
+
+#[test]
+fn supported_css_properties_are_not_reported_as_missing() {
+    let report = audit(
+        "<div>example</div>",
+        &[
+            "div { animation: grow 1s linear; min-height:40px; min-width:100px; text-overflow:ellipsis; visibility:hidden } @keyframes grow { from { height:10px } to { height:40px } }",
+        ],
+        &[],
+        None,
+    );
+    for property in [
+        "animation",
+        "min-height",
+        "min-width",
+        "text-overflow",
+        "visibility",
+    ] {
+        assert!(
+            !has(&report, Area::CssProperty, property),
+            "{property}: {:?}",
+            report.findings
+        );
+    }
+    assert!(has(
+        &report,
+        Area::CssValue,
+        "text-overflow: ellipsis limitations"
+    ));
+    assert!(has(
+        &report,
+        Area::CssValue,
+        "Animation timeline limitations"
+    ));
+}
+
+#[test]
+fn partial_css_support_reports_the_actual_value_gaps_with_locations() {
+    let report = audit(
+        "",
+        &[
+            ".a { visibility:collapse; text-overflow:'..'; min-width:min-content; overflow:hidden }
+.b { text-overflow:clip ellipsis; min-height:max-content }",
+        ],
+        &[],
+        None,
+    );
+    for feature in [
+        "visibility: collapse",
+        "text-overflow strings / two-value syntax",
+        "Intrinsic minimum sizes",
+        "Overflow clipping limitations",
+    ] {
+        let finding = report
+            .in_area(Area::CssValue)
+            .find(|f| f.feature == feature)
+            .unwrap_or_else(|| panic!("missing {feature}"));
+        assert_eq!(finding.evidence, Evidence::Documented);
+        assert!(finding.location.is_some());
+    }
+    let intrinsic = report
+        .in_area(Area::CssValue)
+        .find(|f| f.feature == "Intrinsic minimum sizes")
+        .unwrap();
+    assert_eq!(intrinsic.occurrences, 2);
+}
+
+#[test]
+fn ordinary_css_values_do_not_trigger_partial_support_warnings() {
+    let report = audit(
+        "",
+        &[
+            ".a { visibility:visible; min-width:20px; min-height:30%; text-overflow:clip; animation:none; overflow:visible }",
+        ],
+        &[],
+        None,
+    );
+    for feature in [
+        "visibility: collapse",
+        "text-overflow strings / two-value syntax",
+        "Intrinsic minimum sizes",
+        "text-overflow: ellipsis limitations",
+        "Animation timeline limitations",
+        "Overflow clipping limitations",
+    ] {
+        assert!(!has(&report, Area::CssValue, feature), "{feature}");
+    }
+}
+
+#[test]
+fn new_css_layout_and_paint_properties_are_not_flagged_as_missing() {
+    let report = audit(
+        "",
+        &[
+            ".a {word-break:break-all;padding-inline-end:20px;outline-offset:5px;max-block-size:30px;text-rendering:optimizeSpeed}",
+        ],
+        &[],
+        None,
+    );
+    for property in [
+        "word-break",
+        "padding-inline-end",
+        "outline-offset",
+        "max-block-size",
+        "text-rendering",
+    ] {
+        assert!(
+            !has(&report, Area::CssProperty, property),
+            "{property}: {:?}",
+            report.findings
+        );
+    }
+}
+
+#[test]
+fn interaction_and_text_quality_limitations_are_reported_precisely() {
+    let report = audit(
+        "",
+        &[
+            ".a {cursor:url(cursor.png), pointer;user-select:contain;text-rendering:optimizeLegibility;word-break:auto-phrase}",
+        ],
+        &[],
+        None,
+    );
+    for feature in [
+        "Image cursors",
+        "user-select: contain",
+        "Text rendering quality limitations",
+        "Advanced word breaking",
+    ] {
+        assert!(has(&report, Area::CssValue, feature), "{feature}");
+    }
+}

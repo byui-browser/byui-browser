@@ -1,5 +1,5 @@
 //! Numeric global functions: `parseInt`, `parseFloat`, `isNaN`, and
-//! `isFinite`, plus `encodeURIComponent` (ECMAScript §19.2).
+//! `isFinite`, URI helpers, and legacy escape helpers (ECMAScript §19.2).
 //!
 //! Arguments are converted the way the specification requires: the parsing
 //! functions apply `ToString` (after `ToPrimitive`) and the predicates apply
@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use super::Function;
 use super::conversions::{to_int32, to_number, to_primitive};
-use crate::Value;
 use crate::lexer::is_js_whitespace;
+use crate::{JsError, Value};
 
 /// The global function names this module provides.
 const NAMES: &[&str] = &[
@@ -26,9 +26,13 @@ const NAMES: &[&str] = &[
     "isNaN",
     "isFinite",
     "encodeURIComponent",
+    "encodeURI",
+    "decodeURI",
+    "escape",
+    "unescape",
 ];
 
-/// Installs numeric globals and `encodeURIComponent`.
+/// Installs numeric globals and URI helpers.
 pub(super) fn install(state: &super::GlobalState) {
     for name in NAMES {
         if let Some(function) = value(name) {
@@ -64,9 +68,94 @@ pub(super) fn value(name: &str) -> Option<Value> {
             "encodeURIComponent",
             Arc::new(|args| Ok(Value::String(encode_uri_component(&argument_string(args))))),
         ),
+        "encodeURI" => Function::from_host(
+            "encodeURI",
+            Arc::new(|args| Ok(Value::String(encode_uri(&argument_string(args))))),
+        ),
+        "decodeURI" => Function::from_host(
+            "decodeURI",
+            Arc::new(|args| {
+                let input = argument_string(args);
+                super::errors::decode_uri(&input)
+                    .map(Value::String)
+                    .map_err(|_| {
+                        JsError::thrown(super::errors::new_error("URIError", "URI malformed"))
+                    })
+            }),
+        ),
+        "escape" => Function::from_host(
+            "escape",
+            Arc::new(|args| Ok(Value::String(legacy_escape(&argument_string(args))))),
+        ),
+        "unescape" => Function::from_host(
+            "unescape",
+            Arc::new(|args| Ok(Value::String(legacy_unescape(&argument_string(args))))),
+        ),
         _ => return None,
     };
     Some(Value::Function(function))
+}
+
+fn encode_uri(input: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut output = String::new();
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || b";/?:@&=+$,#-_.!~*'()".contains(&byte) {
+            output.push(char::from(byte));
+        } else {
+            output.push('%');
+            output.push(char::from(HEX[usize::from(byte >> 4)]));
+            output.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+    }
+    output
+}
+
+fn legacy_escape(input: &str) -> String {
+    let mut output = String::new();
+    for unit in input.encode_utf16() {
+        if unit <= 0x7f
+            && (char::from(unit as u8).is_ascii_alphanumeric()
+                || b"@*_+-./".contains(&(unit as u8)))
+        {
+            output.push(char::from(unit as u8));
+        } else if unit < 0x100 {
+            output.push_str(&format!("%{unit:02X}"));
+        } else {
+            output.push_str(&format!("%u{unit:04X}"));
+        }
+    }
+    output
+}
+
+fn legacy_unescape(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::<u16>::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes
+            .get(index..index + 2)
+            .is_some_and(|pair| pair == b"%u" || pair == b"%U")
+            && index + 6 <= bytes.len()
+            && let Ok(unit) = u16::from_str_radix(&input[index + 2..index + 6], 16)
+        {
+            output.push(unit);
+            index += 6;
+            continue;
+        }
+        if bytes[index] == b'%'
+            && index + 3 <= bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&input[index + 1..index + 3], 16)
+        {
+            output.push(u16::from(byte));
+            index += 3;
+            continue;
+        }
+        let ch = input[index..].chars().next().unwrap();
+        output.extend(ch.encode_utf16(&mut [0; 2]).iter().copied());
+        index += ch.len_utf8();
+    }
+    String::from_utf16_lossy(&output)
 }
 
 /// Encodes a URI component as uppercase hexadecimal escapes of UTF-8 bytes.

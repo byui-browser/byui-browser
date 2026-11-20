@@ -86,7 +86,11 @@ pub fn register_console(realm: &mut Realm, console: Arc<dyn ConsoleSink>) -> JsR
         "error",
         Arc::new(move |arguments| emit(error_console.as_ref(), emit_error, arguments)),
     );
-    realm.register_global_value("console", Value::Object(object))
+    let value = Value::Object(object);
+    if let Some(Value::Object(window)) = realm.registered_global_value("window") {
+        window.set_read_only("console", value.clone());
+    }
+    realm.register_global_value("console", value)
 }
 
 #[cfg(test)]

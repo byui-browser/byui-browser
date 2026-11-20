@@ -458,6 +458,18 @@ impl BoxSizing {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ComputedStyle {
     pub display: Display,
+    pub hidden: bool,
+    /// End ellipsis for overflowing LTR text runs; atomic content and bidi placement are unsupported.
+    pub ellipsis: bool,
+    /// Clip text for non-visible overflow; images and box decorations are not clipped yet.
+    pub clip_overflow: bool,
+    pub nowrap: bool,
+    /// Normal, break-all, keep-all, or the legacy break-word mode.
+    pub word_break: String,
+    pub cursor: String,
+    pub user_select: String,
+    /// Rendering hint: optimizeSpeed snaps glyph origins; other modes retain precision.
+    pub text_rendering: String,
     pub margin: Sides<Dimension>,
     pub padding: Sides<Dimension>,
     /// `width`, measuring the box chosen by `box_sizing`; read the content
@@ -470,7 +482,7 @@ pub(crate) struct ComputedStyle {
     pub box_sizing: BoxSizing,
     /// `min-width`; ordinary blocks, replaced elements, and flex items honor it.
     pub min_width: Dimension,
-    /// `min-height`; replaced elements and flex items honor it so far.
+    /// `min-height`; blocks, replaced elements, and flex items honor it.
     pub min_height: Dimension,
     /// Whether `min-width` was left at the flex item's automatic minimum.
     pub min_width_auto: bool,
@@ -479,7 +491,7 @@ pub(crate) struct ComputedStyle {
     /// `max-width`, with `none` stored as [`Dimension::Auto`]; only replaced
     /// elements honor it so far.
     pub max_width: Dimension,
-    /// `max-height`, as for `max_width`.
+    /// `max-height`, with `none` stored as Auto; blocks and replaced elements honor it.
     pub max_height: Dimension,
     pub font_size: f32,
     pub line_height: LineHeight,
@@ -649,6 +661,14 @@ impl ComputedStyle {
             width: Dimension::Auto,
             height: Dimension::Auto,
             box_sizing: BoxSizing::ContentBox,
+            hidden: false,
+            ellipsis: false,
+            clip_overflow: false,
+            nowrap: parent.is_some_and(|p| p.nowrap),
+            word_break: parent.map_or_else(|| "normal".into(), |p| p.word_break.clone()),
+            cursor: parent.map_or_else(|| "auto".into(), |p| p.cursor.clone()),
+            user_select: parent.map_or_else(|| "auto".into(), |p| p.user_select.clone()),
+            text_rendering: parent.map_or_else(|| "auto".into(), |p| p.text_rendering.clone()),
             min_width: Dimension::Px(0.0),
             min_height: Dimension::Px(0.0),
             min_width_auto: true,
@@ -718,6 +738,38 @@ impl ComputedStyle {
         };
         let mut style = Self::anonymous(None);
         style.content = get("content").and_then(parse_content);
+        if let Some(value) = get("word-break")
+            .filter(|v| ["normal", "break-all", "keep-all", "break-word"].contains(v))
+        {
+            style.word_break = value.to_owned();
+        }
+        if let Some(value) = get("cursor") {
+            // Image cursors use their required keyword fallback.
+            style.cursor = value
+                .rsplit(',')
+                .next()
+                .unwrap_or("auto")
+                .trim()
+                .to_ascii_lowercase();
+        }
+        if let Some(value) =
+            get("user-select").filter(|v| ["auto", "none", "text", "all"].contains(v))
+        {
+            style.user_select = value.to_owned();
+        }
+        if let Some(value) = get("text-rendering").filter(|v| {
+            [
+                "auto",
+                "optimizespeed",
+                "optimizelegibility",
+                "geometricprecision",
+            ]
+            .iter()
+            .any(|k| v.eq_ignore_ascii_case(k))
+        }) {
+            style.text_rendering = value.to_ascii_lowercase();
+        }
+
         style.display = match get("display") {
             Some(value) => Display::parse(value).unwrap_or_else(|| {
                 log::debug!("ignoring invalid display value {value:?}; using inline");
@@ -725,6 +777,18 @@ impl ComputedStyle {
             }),
             None => Display::INLINE,
         };
+        style.hidden = get("visibility").is_some_and(|v| {
+            v.eq_ignore_ascii_case("hidden") || v.eq_ignore_ascii_case("collapse")
+        });
+        style.ellipsis = get("text-overflow").is_some_and(|v| v.eq_ignore_ascii_case("ellipsis"));
+        style.clip_overflow = get("overflow-x")
+            .or_else(|| get("overflow"))
+            .is_some_and(|v| {
+                ["hidden", "clip", "scroll", "auto"]
+                    .iter()
+                    .any(|k| v.eq_ignore_ascii_case(k))
+            });
+        style.nowrap = get("white-space").is_some_and(|v| v.eq_ignore_ascii_case("nowrap"));
         if let Some(value) = get("font-size") {
             match css::values::compute_font_size(value, root_font_size, root_font_size) {
                 Some(size) => style.font_size = size,

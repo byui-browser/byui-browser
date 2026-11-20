@@ -43,6 +43,9 @@ pub enum DisplayItem {
     },
     /// Draws a run of text.
     Text {
+        /// Snap each glyph origin to device pixels for the optimizeSpeed rendering hint.
+        /// Other hints retain fractional glyph positions; shaping is not implemented.
+        snap_glyphs: bool,
         /// Left edge of the first glyph's advance.
         x: f32,
         /// The alphabetic baseline the glyphs sit on.

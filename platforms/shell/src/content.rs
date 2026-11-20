@@ -12,6 +12,7 @@ use html::{NodeID, NodeKind};
 use layout::{FontMetrics, ImageKey, LayoutTree, Size, layout_document_with_images};
 use render::{Compositor, FontCollection, Frame, ImageStore, OutlineFont};
 use tiny_skia::Pixmap;
+use unicode_segmentation::UnicodeSegmentation;
 use webapis::{AlertSink, ConsoleSink, LocationNavigate, ViewportSize};
 
 pub(crate) struct DevtoolsConsole(pub(crate) Arc<Mutex<devtools::Console>>);
@@ -313,6 +314,9 @@ pub(crate) fn css_viewport(width: u32, height: u32, scale_factor: f64) -> (u32, 
     )
 }
 
+/// Anchor and focus points in document CSS pixels.
+pub(crate) type Selection = ((f32, f32), (f32, f32));
+
 /// A page parsed, styled, and laid out for one CSS-pixel viewport.
 ///
 /// The window keeps this between frames so scrolling only repaints; it is
@@ -325,6 +329,7 @@ pub(crate) struct PageLayout {
     /// The viewport width and height in CSS pixels.
     css_size: (u32, u32),
     tree: LayoutTree,
+    selection: std::cell::Cell<Option<Selection>>,
     /// Elements that can take focus from a click, in document order.
     focusable: Vec<NodeID>,
     /// Decoded `<img>` files and inline `<svg>` documents the tree's
@@ -480,6 +485,7 @@ impl PageLayout {
             document,
             stylesheets,
             state,
+            selection: std::cell::Cell::new(None),
             running_animations,
             timeline,
         }
@@ -581,6 +587,22 @@ impl PageLayout {
         dark: bool,
     ) -> std::collections::HashMap<*const layout::TextFragment, Vec<paint::PaintBox>> {
         let mut result: std::collections::HashMap<_, Vec<_>> = std::collections::HashMap::new();
+        for (fragment, range) in self.selection_ranges() {
+            if let Some(rect) = text_range_rect(fragment, range, &self.fonts) {
+                result
+                    .entry(fragment as *const layout::TextFragment)
+                    .or_default()
+                    .push(paint::PaintBox {
+                        rect,
+                        background: Some(paint::Color {
+                            r: 120,
+                            g: 175,
+                            b: 255,
+                            a: 180,
+                        }),
+                    });
+            }
+        }
         let Some(find) = find else {
             return result;
         };
@@ -616,6 +638,162 @@ impl PageLayout {
     /// same page, because both parse `page.html` the same way.
     pub(crate) fn hit_test(&self, x: f32, y: f32, scroll_y: f32) -> Option<NodeID> {
         self.tree.hit_test(x, y + scroll_y)
+    }
+
+    /// Returns the CSS cursor at a document point.
+    pub(crate) fn cursor_at(&self, x: f32, y: f32) -> &str {
+        self.tree.cursor_at(x, y)
+    }
+
+    /// Sets a drag range in document CSS pixels; reflow currently keeps geometric endpoints.
+    pub(crate) fn set_selection(&self, range: Option<Selection>) {
+        self.selection.set(range);
+    }
+
+    /// Text ranges selected by the current drag. Hidden and user-select:none runs
+    /// are excluded. user-select:all expands to runs of the hit element.
+    fn selection_ranges(&self) -> Vec<(&layout::TextFragment, std::ops::Range<usize>)> {
+        let Some((anchor, focus)) = self.selection.get() else {
+            return Vec::new();
+        };
+        let fragments: Vec<_> = self
+            .find_fragments()
+            .into_iter()
+            .map(|(t, _, _)| t)
+            .filter(|t| !t.hidden && t.user_select != "none")
+            .collect();
+        let endpoint = |(x, y): (f32, f32)| {
+            if let Some(last) = fragments.last()
+                && y >= last.rect.bottom()
+            {
+                return Some((fragments.len() - 1, last.text.len()));
+            }
+            fragments
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    let distance = |t: &layout::TextFragment| {
+                        let dy = (t.rect.y - y).max(0.0).max(y - t.rect.bottom());
+                        let dx = (t.rect.x - x).max(0.0).max(x - t.rect.right());
+                        dy * 10000.0 + dx
+                    };
+                    distance(a).total_cmp(&distance(b))
+                })
+                .map(|(index, t)| {
+                    if y >= t.rect.bottom() {
+                        return (index, t.text.len());
+                    }
+                    if y < t.rect.y {
+                        return (index, 0);
+                    }
+                    let mut byte = t.text.len();
+                    for (offset, grapheme) in t.text.grapheme_indices(true) {
+                        let width =
+                            self.fonts
+                                .font_text_width(t.font, &t.text[..offset], t.font_size);
+                        if x < t.rect.x
+                            + width
+                            + self.fonts.font_text_width(t.font, grapheme, t.font_size) / 2.0
+                        {
+                            byte = offset;
+                            break;
+                        }
+                    }
+                    (index, byte)
+                })
+        };
+        let (Some(mut a), Some(mut b)) = (endpoint(anchor), endpoint(focus)) else {
+            return Vec::new();
+        };
+        // A click in a none region must not select adjacent selectable text.
+        if !fragments
+            .iter()
+            .any(|t| t.rect.contains(anchor.0, anchor.1))
+        {
+            return Vec::new();
+        }
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        let group = |t: &layout::TextFragment| {
+            let mut node = t.element;
+            let mut root = node;
+            while let Some(id) = node {
+                let mode = self
+                    .tree
+                    .paint_order()
+                    .into_iter()
+                    .find_map(|item| match item {
+                        layout::PaintItem::BoxDecorations(b) if b.node == Some(id) => {
+                            Some(b.style.user_select.as_str())
+                        }
+                        layout::PaintItem::InlineBox(b) if b.node == id => {
+                            Some(b.style.user_select.as_str())
+                        }
+                        _ => None,
+                    });
+                if mode != Some("all") {
+                    break;
+                }
+                root = Some(id);
+                node = self.document.get_node(id).and_then(|n| n.get_parent());
+            }
+            root
+        };
+        let all_elements: Vec<_> = [a.0, b.0]
+            .into_iter()
+            .filter_map(|index| {
+                let t = fragments[index];
+                (t.user_select == "all").then(|| group(t))
+            })
+            .collect();
+        fragments
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, t)| {
+                let all = t.user_select == "all" && all_elements.contains(&group(t));
+                if !all && (index < a.0 || index > b.0) {
+                    return None;
+                }
+                let start = if all || index != a.0 { 0 } else { a.1 };
+                let end = if all || index != b.0 {
+                    t.text.len()
+                } else {
+                    b.1
+                };
+                (end > start).then_some((t, start..end))
+            })
+            .collect()
+    }
+
+    /// Copies selected ranges in layout order, joining inline fragments on the same line.
+    pub(crate) fn selected_text(&self) -> String {
+        let mut result = String::new();
+        let mut previous_y = None;
+        for (t, range) in self.selection_ranges() {
+            if previous_y.is_some_and(|y: f32| (y - t.rect.y).abs() > 1.0) && !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(&t.text[range]);
+            previous_y = Some(t.rect.y);
+        }
+        result
+    }
+
+    /// Endpoints for Select All, excluding hidden and unselectable text.
+    pub(crate) fn select_all_range(&self) -> Option<Selection> {
+        let runs: Vec<_> = self
+            .find_fragments()
+            .into_iter()
+            .map(|(t, _, _)| t)
+            .filter(|t| !t.hidden && t.user_select != "none")
+            .collect();
+        let first = runs.first()?;
+        let last = runs.last()?;
+        Some((
+            (first.rect.x, first.rect.y + first.rect.height / 2.0),
+            (last.rect.right(), last.rect.y + last.rect.height / 2.0),
+        ))
     }
 
     pub(crate) fn is_focusable(&self, node: NodeID) -> bool {
@@ -2485,5 +2663,70 @@ mod tests {
         );
         // `.on { display: none }` removed the only box from the live layout.
         assert_eq!(changed.hit_test(10.0, 12.0, 0.0), None);
+    }
+    fn interaction_page(css: &str) -> PageLayout {
+        PageLayout::new(&Page {
+            url: "https://selection.test/".into(),
+            html: "<html><body><div id='a'>select me <span>child</span></div><div id='b'>exclude</div></body></html>".into(),
+            stylesheets: vec![format!("body {{margin:0}} {css}")],
+            scripts: Vec::new(), resources: Default::default(),
+        }, 300, 200)
+    }
+
+    #[test]
+    fn page_selection_highlights_copies_and_respects_both_user_select_names() {
+        for property in ["user-select", "-webkit-user-select"] {
+            let layout = interaction_page(&format!("#b {{{property}:none}}"));
+            let runs = layout.find_fragments();
+            let first = runs[0].0;
+            let last = runs.last().unwrap().0;
+            layout.set_selection(Some((
+                (first.rect.x, first.rect.y + 1.0),
+                (last.rect.right(), last.rect.y + 1.0),
+            )));
+            assert!(layout.selected_text().contains("select me"));
+            assert!(layout.selected_text().contains("child"));
+            assert!(!layout.selected_text().contains("exclude"));
+            assert!(!layout.text_backgrounds(None, false).is_empty());
+            layout.set_selection(Some((
+                (last.rect.x + 1.0, last.rect.y + 1.0),
+                (last.rect.right(), last.rect.y + 1.0),
+            )));
+            assert!(layout.selected_text().is_empty());
+        }
+    }
+
+    #[test]
+    fn select_all_expands_a_click_to_descendant_text() {
+        let layout = interaction_page("#a {user-select:all}");
+        let first = layout.find_fragments()[0].0;
+        let point = (first.rect.x + 1.0, first.rect.y + 1.0);
+        layout.set_selection(Some((point, point)));
+        assert!(layout.selected_text().contains("select me"));
+        assert!(layout.selected_text().contains("child"));
+        assert!(!layout.selected_text().contains("exclude"));
+    }
+
+    #[test]
+    fn css_cursor_inherits_and_hidden_text_does_not_override_it() {
+        let layout = interaction_page(
+            "#a {cursor:crosshair} span {cursor:pointer} #b {visibility:hidden;cursor:wait}",
+        );
+        let runs = layout.find_fragments();
+        let first = runs[0].0;
+        assert_eq!(
+            layout.cursor_at(first.rect.x + 1.0, first.rect.y + 1.0),
+            "crosshair"
+        );
+        let child = runs.iter().find(|(t, _, _)| t.text == "child").unwrap().0;
+        assert_eq!(
+            layout.cursor_at(child.rect.x + 1.0, child.rect.y + 1.0),
+            "pointer"
+        );
+        let hidden = runs.last().unwrap().0;
+        assert_ne!(
+            layout.cursor_at(hidden.rect.x + 1.0, hidden.rect.y + 1.0),
+            "wait"
+        );
     }
 }

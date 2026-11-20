@@ -18,6 +18,7 @@
 use std::ops::Range;
 
 use html::NodeID;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::Rect;
 use crate::block::{BlockResult, ContainingBlock};
@@ -359,17 +360,21 @@ impl Context<'_> {
                         after_space = false;
                         continue;
                     }
-                    if *white_space == WhiteSpace::Pre {
+                    if *white_space == WhiteSpace::Pre || style.nowrap {
                         // One unbreakable run with its spaces kept.
                         if !text.is_empty() {
+                            let text = if style.nowrap {
+                                text.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
+                            } else {
+                                text.clone()
+                            };
+                            let width =
+                                self.fonts
+                                    .font_text_width(style.font, &text, style.font_size);
                             prepared.pieces.push(Piece::Word {
                                 source,
-                                text: text.clone(),
-                                width: self.fonts.font_text_width(
-                                    style.font,
-                                    text,
-                                    style.font_size,
-                                ),
+                                text,
+                                width,
                             });
                             after_space = false;
                         }
@@ -397,10 +402,48 @@ impl Context<'_> {
                                 after_space = true;
                             }
                         } else {
+                            let break_all = style.word_break == "break-all"
+                                || (style.word_break == "break-word"
+                                    && cb_width.is_some_and(|width| {
+                                        self.fonts.font_text_width(style.font, run, style.font_size)
+                                            > width
+                                    }));
+                            let mut start = 0;
+                            for (offset, grapheme) in run.grapheme_indices(true) {
+                                let character = grapheme.chars().next().expect("nonempty grapheme");
+                                // Basic CJK opportunities. Full Unicode line breaking and
+                                // dictionary-based Southeast Asian breaking are not implemented.
+                                let cjk = matches!(character as u32, 0x2e80..=0x9fff | 0xac00..=0xd7af | 0xf900..=0xfaff);
+                                if offset > start
+                                    && (break_all || (style.word_break != "keep-all" && cjk))
+                                {
+                                    let part = &run[start..offset];
+                                    prepared.pieces.push(Piece::Word {
+                                        source,
+                                        text: part.to_owned(),
+                                        width: self.fonts.font_text_width(
+                                            style.font,
+                                            part,
+                                            style.font_size,
+                                        ),
+                                    });
+                                    prepared.pieces.push(Piece::Space {
+                                        source,
+                                        width: 0.0,
+                                        text: None,
+                                    });
+                                    start = offset;
+                                }
+                            }
+                            let part = &run[start..];
                             prepared.pieces.push(Piece::Word {
                                 source,
-                                text: run.to_owned(),
-                                width: self.fonts.font_text_width(style.font, run, style.font_size),
+                                text: part.to_owned(),
+                                width: self.fonts.font_text_width(
+                                    style.font,
+                                    part,
+                                    style.font_size,
+                                ),
                             });
                             after_space = false;
                         }
@@ -553,7 +596,9 @@ impl Context<'_> {
                     (width + info.padding_end + info.margin_end, spaces)
                 }
                 Piece::Word { width: word, .. } => (width + word, spaces),
-                Piece::Space { width: space, .. } => (width + space, spaces + 1),
+                Piece::Space { width: space, .. } => {
+                    (width + space, spaces + u32::from(*space > 0.0))
+                }
                 Piece::Atomic(atomic_index) => {
                     (width + prepared.atomics[*atomic_index].width, spaces)
                 }
@@ -832,6 +877,10 @@ impl Context<'_> {
             return;
         }
         fragments.push(LineFragment::Text(TextFragment {
+            cursor: source.style.cursor.clone(),
+            user_select: source.style.user_select.clone(),
+            text_rendering: source.style.text_rendering.clone(),
+            hidden: source.style.hidden,
             node: source.node,
             element: source.element,
             rect: Rect {

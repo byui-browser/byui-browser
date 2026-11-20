@@ -643,6 +643,7 @@ impl Compositor {
                     text,
                     color,
                     clip,
+                    snap_glyphs,
                 } => {
                     let clip = clip.map(|clip| {
                         let edge = |value: f32, limit: u32| {
@@ -670,6 +671,7 @@ impl Compositor {
                             text,
                             rgba,
                             clip,
+                            *snap_glyphs,
                         ),
                         None => self.draw_text(
                             &mut frame,
@@ -813,6 +815,7 @@ impl Compositor {
         text: &str,
         rgba: [u8; 4],
         clip: Option<PixelBounds>,
+        snap_glyphs: bool,
     ) {
         use ab_glyph::{Font, ScaleFont};
         if font_size <= 0.0 {
@@ -827,8 +830,10 @@ impl Compositor {
         let mut caret = x;
         for character in text.chars() {
             let id = scaled.glyph_id(character);
-            let glyph =
-                id.with_scale_and_position(scaled.scale(), ab_glyph::point(caret, baseline));
+            let glyph = id.with_scale_and_position(
+                scaled.scale(),
+                ab_glyph::point(if snap_glyphs { caret.round() } else { caret }, baseline),
+            );
             caret += scaled.h_advance(id);
             let Some(outline) = font.font().outline_glyph(glyph) else {
                 log::trace!("no outline for {character:?}; nothing drawn");
@@ -993,6 +998,7 @@ mod tests {
         };
         let list = paint::DisplayList {
             items: vec![paint::DisplayItem::Text {
+                snap_glyphs: false,
                 x: 4.0,
                 baseline: 20.0,
                 font_size: 16.0,
@@ -1328,6 +1334,7 @@ mod image_tests {
                     },
                 },
                 paint::DisplayItem::Text {
+                    snap_glyphs: false,
                     x: 1.2,
                     baseline: 9.4,
                     font_size: 10.0,
@@ -1370,6 +1377,7 @@ mod image_tests {
                     },
                 },
                 paint::DisplayItem::Text {
+                    snap_glyphs: false,
                     x: 0.0,
                     baseline: 12.0,
                     font_size: 12.0,
