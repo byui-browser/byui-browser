@@ -141,7 +141,7 @@ impl HTMLDocument {
         find_in_tree(self, self.root, id_value)
     }
 
-    /// Returns a live `DOMTokenList` for an element's `class` attribute.
+    /// Returns a live [`ClassList`] for an element's `class` attribute.
     ///
     /// The handle mutates the associated element through its `add`, `remove`,
     /// `toggle`, `replace`, and `value` operations. The document is borrowed

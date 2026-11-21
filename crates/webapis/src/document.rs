@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use css::{ComputedStyles, parse_stylesheet, style_document};
-use html::{DOMTokenList, HTMLDocument, NodeID, NodeKind};
+use html::{ClassList, HTMLDocument, NodeID, NodeKind};
 use js::{JsError, JsResult, Object, Realm, Value};
 
 use crate::custom_elements::CustomElementRegistry;
@@ -895,7 +895,7 @@ impl Document {
     /// Implements the DOM `Element.classList` getter for an element in this
     /// document. The returned live token list mutates the element's `class`
     /// attribute through the DOM Standard operations.
-    pub fn class_list(&mut self, element: NodeID) -> JsResult<DOMTokenList<'_>> {
+    pub fn class_list(&mut self, element: NodeID) -> JsResult<ClassList<'_>> {
         self.source_document
             .get_or_insert_with(HTMLDocument::new)
             .class_list(element)
