@@ -256,7 +256,7 @@ fn class_list_mutations_update_the_element_attribute() {
         assert_eq!(class_list.toggle("active", None), Ok(true));
         assert_eq!(class_list.toggle("active", Some(false)), Ok(false));
         assert_eq!(class_list.replace("card", "panel"), Ok(true));
-        class_list.set_value("panel  wide wide").unwrap();
+        class_list.set_value("panel  wide wide");
     }
 
     let NodeKind::Element(element) = document.get_node(html::NodeID::new(1)).unwrap().get_kind()
@@ -280,11 +280,10 @@ fn class_list_validates_all_tokens_before_mutating() {
 
     assert_eq!(
         class_list.add(&["valid", "has space"]),
-        Err(html::DomError::InvalidToken)
+        Err(html::DomError::InvalidClass)
     );
     assert_eq!(class_list.value(), "card");
     assert_eq!(class_list.remove(&[""]), Err(html::DomError::Syntax));
-    assert_eq!(class_list.supports("card"), Err(html::DomError::Type));
 }
 
 #[test]

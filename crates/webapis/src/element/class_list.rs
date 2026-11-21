@@ -1,6 +1,6 @@
 //! `Element.classList` on script element wrappers.
 //!
-//! The getter returns a `DOMTokenList`-like host object whose state lives in
+//! The getter returns a class-list host object whose state lives in
 //! the element's `class` attribute: every read (`length`, `value`, indexed
 //! tokens, `item`, `contains`) consults the document, and every mutation
 //! (`add`, `remove`, `toggle`, `replace`, the `value` setter) writes through
@@ -58,17 +58,20 @@ struct ClassList {
 impl ClassList {
     /// Returns the current tokens, in order, without duplicates.
     fn tokens(&self) -> JsResult<Vec<String>> {
+        if self.attribute().is_none() {
+            return Ok(Vec::new());
+        }
         Ok(self
             .document
             .lock()
             .unwrap()
             .class_list(self.node)?
-            .tokens())
+            .get_classes())
     }
 
     /// Returns the raw `class` attribute value, or `""` when absent.
     fn value(&self) -> JsResult<String> {
-        Ok(self.document.lock().unwrap().class_list(self.node)?.value())
+        Ok(self.attribute().unwrap_or_default())
     }
 
     /// Returns the raw `class` attribute value, or `None` when absent.
@@ -85,7 +88,8 @@ impl ClassList {
     /// `class` attribute changed.
     fn mutate<T>(
         &self,
-        operation: impl FnOnce(&mut html::DOMTokenList<'_>) -> Result<T, html::DomError>,
+        preserve_missing_attribute: bool,
+        operation: impl FnOnce(&mut html::ClassList<'_>) -> Result<T, html::DomError>,
     ) -> JsResult<T> {
         let old_value = self.attribute();
         let result = {
@@ -93,7 +97,14 @@ impl ClassList {
             let mut list = document.class_list(self.node)?;
             operation(&mut list).map_err(dom_exception)?
         };
-        let new_value = self.attribute();
+        let mut new_value = self.attribute();
+        if preserve_missing_attribute && old_value.is_none() && new_value.as_deref() == Some("") {
+            self.document
+                .lock()
+                .unwrap()
+                .remove_attribute(self.node, "class")?;
+            new_value = self.attribute();
+        }
         if old_value != new_value
             && let Some(owner) = self.owner.upgrade()
         {
@@ -111,7 +122,10 @@ impl ClassList {
 
     /// Implements the `value` setter: replaces the raw attribute value.
     fn set_value(&self, value: &str) -> JsResult<()> {
-        self.mutate(|list| list.set_value(value))
+        self.mutate(false, |list| {
+            list.set_value(value);
+            Ok(())
+        })
     }
 }
 
@@ -186,7 +200,7 @@ fn token_list_object(list: &ClassList) -> Object {
         Arc::new(move |arguments| {
             let tokens = string_arguments(arguments);
             let tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
-            add_list.mutate(|list| list.add(&tokens))?;
+            add_list.mutate(false, |list| list.add(&tokens))?;
             Ok(Value::Undefined)
         }),
     );
@@ -197,7 +211,7 @@ fn token_list_object(list: &ClassList) -> Object {
         Arc::new(move |arguments| {
             let tokens = string_arguments(arguments);
             let tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
-            remove_list.mutate(|list| list.remove(&tokens))?;
+            remove_list.mutate(true, |list| list.remove(&tokens))?;
             Ok(Value::Undefined)
         }),
     );
@@ -211,7 +225,7 @@ fn token_list_object(list: &ClassList) -> Object {
                 None | Some(Value::Undefined) => None,
                 Some(value) => Some(truthy(value)),
             };
-            let present = toggle_list.mutate(|list| list.toggle(&token, force))?;
+            let present = toggle_list.mutate(true, |list| list.toggle(&token, force))?;
             Ok(Value::Boolean(present))
         }),
     );
@@ -229,7 +243,7 @@ fn token_list_object(list: &ClassList) -> Object {
             }
             let token = string_argument(arguments, 0);
             let new_token = string_argument(arguments, 1);
-            let replaced = replace_list.mutate(|list| list.replace(&token, &new_token))?;
+            let replaced = replace_list.mutate(true, |list| list.replace(&token, &new_token))?;
             Ok(Value::Boolean(replaced))
         }),
     );
@@ -261,7 +275,7 @@ fn token_list_object(list: &ClassList) -> Object {
 fn dom_exception(error: html::DomError) -> JsError {
     let (detail, code) = match error {
         html::DomError::Syntax => ("the token must not be empty", Some(12)),
-        html::DomError::InvalidToken | html::DomError::InvalidCharacter => {
+        html::DomError::InvalidClass | html::DomError::InvalidCharacter => {
             ("the token must not contain ASCII whitespace", Some(5))
         }
         html::DomError::Type => ("the operation is not supported", None),

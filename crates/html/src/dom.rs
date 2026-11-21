@@ -11,12 +11,11 @@ pub mod element_data;
 pub mod attribute;
 pub mod namespace;
 
+pub mod class_list;
 pub mod dom_error;
-pub mod dom_token_list;
 
-pub use dom_token_list::DOMTokenList;
 pub use {
-    attribute::Attribute, doctype::Doctype, dom_error::DomError, element_data::ElementData,
-    html_document::HTMLDocument, namespace::Namespace, node::Node, node_id::NodeID,
-    node_kind::NodeKind,
+    attribute::Attribute, class_list::ClassList, doctype::Doctype, dom_error::DomError,
+    element_data::ElementData, html_document::HTMLDocument, namespace::Namespace, node::Node,
+    node_id::NodeID, node_kind::NodeKind,
 };
