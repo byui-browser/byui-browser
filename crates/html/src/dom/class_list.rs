@@ -13,7 +13,11 @@ pub struct ClassList<'attribute> {
 
 impl<'attribute> ClassList<'attribute> {
     pub(crate) fn new(class_attribute: &'attribute mut Attribute) -> Self {
-        Self { class_attribute, stored_classes_string: String::from(""), stored_classes: Vec::new() }
+        Self {
+            class_attribute,
+            stored_classes_string: String::new(),
+            stored_classes: Vec::new(),
+        }
     }
 
     /// Updates stored classes to match class attribute.
@@ -23,6 +27,12 @@ impl<'attribute> ClassList<'attribute> {
             self.stored_classes_string = classes_string.clone();
             self.stored_classes = parse_classes(classes_string);
         }
+    }
+
+    /// Returns a snapshot of the classes in document order.
+    pub fn get_classes(&mut self) -> Vec<String> {
+        self.sync_classes();
+        self.stored_classes.clone()
     }
 
     /// Returns the number of classes.
@@ -40,7 +50,17 @@ impl<'attribute> ClassList<'attribute> {
     /// Returns whether `class` is present.
     pub fn contains(&mut self, class: &str) -> bool {
         self.sync_classes();
-        self.stored_classes.contains(&String::from(class))
+        self.stored_classes.iter().any(|current| current == class)
+    }
+
+    /// Returns the serialized `class` attribute value.
+    pub fn value(&self) -> String {
+        self.class_attribute.get_value().clone()
+    }
+
+    /// Sets the raw `class` attribute value to `value`.
+    pub fn set_value(&mut self, value: &str) {
+        self.class_attribute.set_value(value.to_owned());
     }
 
     /// Adds each class that is not already present.
@@ -48,8 +68,8 @@ impl<'attribute> ClassList<'attribute> {
         validate_classes(classes)?;
         self.sync_classes();
 
-        // Creates updated list of classes.
         let mut current = self.stored_classes.clone();
+        let original_len = current.len();
         for class in classes {
             if !current.iter().any(|existing| existing.as_str() == *class) {
                 log::trace!("classList add {class:?} on node");
@@ -57,8 +77,9 @@ impl<'attribute> ClassList<'attribute> {
             }
         }
 
-        // Sets updated list of classes.
-        self.write_classes(current);
+        if current.len() != original_len {
+            self.write_classes(current);
+        }
         Ok(())
     }
 
@@ -67,9 +88,9 @@ impl<'attribute> ClassList<'attribute> {
         validate_classes(classes)?;
         self.sync_classes();
 
-        // Creates updated list of classes.
-        let current = self.stored_classes.clone()
-            .into_iter()
+        let current = self
+            .stored_classes
+            .iter()
             .filter(|current| {
                 let removed = classes.contains(&current.as_str());
                 if removed {
@@ -77,10 +98,12 @@ impl<'attribute> ClassList<'attribute> {
                 }
                 !removed
             })
-            .collect();
+            .cloned()
+            .collect::<Vec<_>>();
 
-        // Sets updated list of classes.
-        self.write_classes(current);
+        if current.len() != self.stored_classes.len() {
+            self.write_classes(current);
+        }
         Ok(())
     }
 
@@ -89,7 +112,7 @@ impl<'attribute> ClassList<'attribute> {
         validate_classes(&[class])?;
         self.sync_classes();
 
-        let present = self.contains(class);
+        let present = self.stored_classes.iter().any(|current| current == class);
         let should_have = force.unwrap_or(!present);
         if should_have && !present {
             self.add(&[class])?;
@@ -104,10 +127,14 @@ impl<'attribute> ClassList<'attribute> {
         validate_classes(&[class, new_class])?;
         self.sync_classes();
 
-        let mut current = self.stored_classes.clone();
-        let Some(index) = current.iter().position(|current| current == class) else {
+        let Some(index) = self
+            .stored_classes
+            .iter()
+            .position(|current| current == class)
+        else {
             return Ok(false);
         };
+        let mut current = self.stored_classes.clone();
         log::trace!("classList replace {class:?} with {new_class:?} on node");
         current.remove(index);
         if !current.iter().any(|current| current.as_str() == new_class) {
@@ -119,7 +146,10 @@ impl<'attribute> ClassList<'attribute> {
 
     /// Sets class attribute's value with class vector as string.
     fn write_classes(&mut self, classes: Vec<String>) {
-        self.class_attribute.set_value(String::from(&classes.join(" ")));
+        let value = classes.join(" ");
+        self.class_attribute.set_value(value.clone());
+        self.stored_classes_string = value;
+        self.stored_classes = classes;
     }
 }
 
