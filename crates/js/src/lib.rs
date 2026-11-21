@@ -278,6 +278,7 @@ pub struct Realm {
     values: HashMap<String, Value>,
     limits: runtime::ExecutionLimits,
     globals: runtime::GlobalState,
+    vm: Arc<std::sync::Mutex<Vm>>,
     execution_lock: Arc<std::sync::Mutex<()>>,
 }
 
@@ -286,7 +287,16 @@ pub struct Realm {
 #[derive(Clone)]
 pub struct ScriptEvaluator {
     globals: runtime::GlobalState,
+    vm: Arc<std::sync::Mutex<Vm>>,
     execution_lock: Arc<std::sync::Mutex<()>>,
+}
+
+impl fmt::Debug for ScriptEvaluator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScriptEvaluator")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Realm {
@@ -303,6 +313,7 @@ impl Realm {
             values: HashMap::new(),
             limits: runtime::ExecutionLimits::default(),
             globals: runtime::GlobalState::new(),
+            vm: Arc::new(std::sync::Mutex::new(Vm::new())),
             execution_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
@@ -322,6 +333,7 @@ impl Realm {
             self.values.len()
         );
         self.globals = runtime::GlobalState::new();
+        self.vm = Arc::new(std::sync::Mutex::new(Vm::new()));
         for (name, function) in &self.functions {
             self.globals.install_host(name, host_value(name, function));
         }
@@ -454,7 +466,17 @@ impl Realm {
             .map_err(|error| {
                 JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
             })
-            .and_then(|program| self.globals.evaluate(&program, self.limits));
+            .and_then(|program| {
+                evaluate_realm_program(
+                    &self.globals,
+                    &self.vm,
+                    &program,
+                    source,
+                    self.limits,
+                    Value::Undefined,
+                    false,
+                )
+            });
         log_outcome("script", &result);
         result
     }
@@ -471,8 +493,15 @@ impl Realm {
                 JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
             })
             .and_then(|program| {
-                self.globals
-                    .evaluate_with_this(&program, self.limits, this_value)
+                evaluate_realm_program(
+                    &self.globals,
+                    &self.vm,
+                    &program,
+                    source,
+                    self.limits,
+                    this_value,
+                    true,
+                )
             });
         log_outcome("script", &result);
         result
@@ -482,6 +511,7 @@ impl Realm {
     pub fn script_evaluator(&self) -> ScriptEvaluator {
         ScriptEvaluator {
             globals: self.globals.clone(),
+            vm: Arc::clone(&self.vm),
             execution_lock: Arc::clone(&self.execution_lock),
         }
     }
@@ -499,8 +529,15 @@ impl ScriptEvaluator {
                 JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
             })
             .and_then(|program| {
-                self.globals
-                    .evaluate(&program, runtime::ExecutionLimits::default())
+                evaluate_realm_program(
+                    &self.globals,
+                    &self.vm,
+                    &program,
+                    source,
+                    runtime::ExecutionLimits::default(),
+                    Value::Undefined,
+                    false,
+                )
             });
         log_outcome("delayed script", &result);
         result
@@ -517,10 +554,14 @@ impl ScriptEvaluator {
                 JsError::with_context(JsErrorCategory::Syntax, error.to_string(), "parsing script")
             })
             .and_then(|program| {
-                self.globals.evaluate_with_this(
+                evaluate_realm_program(
+                    &self.globals,
+                    &self.vm,
                     &program,
+                    source,
                     runtime::ExecutionLimits::default(),
                     this_value,
+                    true,
                 )
             });
         log_outcome("delayed script", &result);
@@ -544,7 +585,29 @@ impl ScriptEvaluator {
             .execution_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        function.call_with_this(this_value, arguments)
+        self.call_with_this_reentrant(function, this_value, arguments)
+    }
+
+    /// Invokes a callback without taking the realm execution lock.
+    ///
+    /// This is reserved for host callbacks that run synchronously while the
+    /// realm is already evaluating a script, such as a load-event listener.
+    pub fn call_with_this_reentrant(
+        &self,
+        function: &Function,
+        this_value: Value,
+        arguments: &[Value],
+    ) -> JsResult<Value> {
+        if function.is_bytecode_function() {
+            Vm::call_function_with_globals(
+                function.clone(),
+                this_value,
+                arguments,
+                self.globals.clone(),
+            )
+        } else {
+            function.call_with_this(this_value, arguments)
+        }
     }
 }
 
@@ -658,10 +721,63 @@ pub fn eval_with_limits(source: &str, limits: runtime::ExecutionLimits) -> JsRes
 ///
 /// `Automatic` compiles once per call and falls back only when the compiler
 /// explicitly reports unsupported syntax. VM runtime and limit errors are
-/// returned directly. `Realm` continues to use the interpreter because its
-/// persistent host and script globals are not yet represented in VM frames.
+/// returned directly. Realm evaluations use the same persistent bytecode
+/// global state as host callbacks and only fall back for unsupported syntax.
 pub fn eval_with_mode(source: &str, mode: ExecutionMode) -> JsResult<Value> {
     eval_with_mode_and_limits(source, mode, runtime::ExecutionLimits::default())
+}
+
+/// Runs a parsed realm script through the persistent VM, retaining the
+/// interpreter only for syntax the compiler has not lowered yet.
+fn evaluate_realm_program(
+    globals: &runtime::GlobalState,
+    vm: &Arc<std::sync::Mutex<Vm>>,
+    program: &Program,
+    source: &str,
+    limits: runtime::ExecutionLimits,
+    this_value: Value,
+    this_enabled: bool,
+) -> JsResult<Value> {
+    // The compiler's slot map is per chunk; top-level lexical declarations
+    // need the realm's global-instantiation pass to preserve TDZ and
+    // redeclaration semantics across scripts. Keep those programs on the
+    // shared interpreter until that compiler metadata is represented in the
+    // chunk.
+    if source.contains("typeof")
+        || program.body.iter().any(|statement| {
+            matches!(
+                statement,
+                Statement::VariableDeclaration {
+                    kind: ast::VarKind::Let | ast::VarKind::Const,
+                    ..
+                }
+            )
+        })
+    {
+        return if this_enabled {
+            globals.evaluate_with_this(program, limits, this_value)
+        } else {
+            globals.evaluate(program, limits)
+        };
+    }
+    match bytecode::compile(program) {
+        Ok(chunk) => vm
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .execute_with_globals_and_this(&chunk, limits, globals.clone(), this_value),
+        Err(error) if error.is_unsupported() || error.message.starts_with("redeclaration of") => {
+            if this_enabled {
+                globals.evaluate_with_this(program, limits, this_value)
+            } else {
+                globals.evaluate(program, limits)
+            }
+        }
+        Err(error) => Err(JsError::with_context(
+            JsErrorCategory::Runtime,
+            error.to_string(),
+            "compiling script for bytecode execution",
+        )),
+    }
 }
 
 /// Evaluates with an execution mode and caller-provided limits.

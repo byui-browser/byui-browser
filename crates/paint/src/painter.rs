@@ -37,11 +37,19 @@ pub const CANVAS_COLOR: Color = Color {
 /// opaque border of one color around an opaque background is painted as a
 /// rounded ring (a rounded fill in the border color under the rounded
 /// padding-box background); any other rounded border keeps square strips.
-/// Outlines and border images are not supported.
+/// Outlines use square strips with outline-offset; border images are not supported.
+///
+/// Boxes with an opacity below 1 or a transform are wrapped in
+/// [`DisplayItem::BeginLayer`] and [`DisplayItem::EndLayer`], and `overflow`
+/// clipping produces [`DisplayItem::Clip`] items, both following
+/// [`LayoutTree::paint_order`]. Text whose face lacks the wanted weight or
+/// slant is marked for synthetic bold or italic.
 ///
 /// Replaced boxes (`<img>`, inline `<svg>`) produce a [`DisplayItem::Image`]
 /// covering their content box, after their background. Their pictures are
-/// not clipped to `border-radius`.
+/// not clipped to `border-radius`. Checkbox and radio inputs instead draw
+/// their control in the content box with [`DisplayItem::FillRoundedRect`]
+/// and, for a check mark, [`DisplayItem::StrokeLine`]; see [`crate::ACCENT`].
 pub fn paint_document(tree: &LayoutTree) -> DisplayList {
     paint(tree, 0.0, false, |_| Vec::new())
 }
@@ -85,14 +93,54 @@ fn paint(
 ) -> DisplayList {
     log::trace!("building display list (scroll_y {scroll_y}, cull {cull})");
     let viewport = tree.root.rect;
-    // Whether a content rect in document coordinates is (partly) on screen.
-    let visible = |rect: &layout::Rect| {
-        !cull || (rect.bottom() - scroll_y > viewport.y && rect.y - scroll_y < viewport.bottom())
-    };
+    // How many enclosing layers are transformed. Their content may be drawn
+    // far from where it was laid out, so it is never culled.
+    let mut transformed = 0_usize;
+    let mut transformed_layers = Vec::new();
     let scrolled = |rect: layout::Rect| rect.translate(0.0, -scroll_y);
     let mut items = Vec::new();
     for item in tree.paint_order() {
+        // Whether a content rect in document coordinates is (partly) on screen.
+        let visible = |rect: &layout::Rect| {
+            !cull
+                || transformed > 0
+                || (rect.bottom() - scroll_y > viewport.y && rect.y - scroll_y < viewport.bottom())
+        };
+        if match item {
+            PaintItem::BoxDecorations(b) | PaintItem::Image(b) => {
+                b.style.hidden && b.kind != BoxKind::Viewport
+            }
+            PaintItem::InlineBox(b) => b.style.hidden,
+            PaintItem::Text(t) => t.hidden,
+            PaintItem::Clip(_) | PaintItem::BeginLayer(_) | PaintItem::EndLayer(_) => false,
+        } {
+            continue;
+        }
         match item {
+            PaintItem::Clip(rect) => items.push(DisplayItem::Clip {
+                rect: rect.map(scrolled),
+            }),
+            PaintItem::BeginLayer(layer) => {
+                // Content is drawn scrolled, so the matrix is conjugated by
+                // the scroll: move content back, transform, scroll again.
+                let transform = layer.transform_matrix().map(|matrix| {
+                    layout::Affine::translate(0.0, -scroll_y)
+                        .then_after(matrix)
+                        .then_after(layout::Affine::translate(0.0, scroll_y))
+                });
+                transformed += usize::from(transform.is_some());
+                transformed_layers.push(transform.is_some());
+                items.push(DisplayItem::BeginLayer {
+                    opacity: layer.style.opacity,
+                    transform,
+                });
+            }
+            PaintItem::EndLayer(_) => {
+                if transformed_layers.pop() == Some(true) {
+                    transformed -= 1;
+                }
+                items.push(DisplayItem::EndLayer);
+            }
             PaintItem::BoxDecorations(layout_box) => match layout_box.kind {
                 // The canvas is infinite, so it is never rounded.
                 BoxKind::Viewport => items.push(DisplayItem::FillRect {
@@ -110,6 +158,21 @@ fn paint(
                     }
                     if visible(&layout_box.rect) {
                         items.extend(decorations(scrolled(layout_box.rect), &layout_box.style));
+                    }
+                    if layout_box.select_arrow && visible(&layout_box.rect) {
+                        // The arrow sits inside the borders, against the
+                        // padding box's right edge.
+                        let border = layout_box.style.border_width;
+                        let padding_box = layout::Rect {
+                            x: layout_box.rect.x + border.left,
+                            y: layout_box.rect.y + border.top,
+                            width: (layout_box.rect.width - border.horizontal()).max(0.0),
+                            height: (layout_box.rect.height - border.vertical()).max(0.0),
+                        };
+                        items.extend(select_arrow(
+                            scrolled(padding_box),
+                            layout_box.style.text_color.into(),
+                        ));
                     }
                 }
             },
@@ -136,14 +199,36 @@ fn paint(
                 }
                 if !text.text.trim().is_empty() && visible(&text.rect) {
                     items.push(DisplayItem::Text {
-                        x: text.rect.x,
+                        snap_glyphs: text.text_rendering == "optimizespeed",
+                        x: if text.text_rendering == "optimizespeed" {
+                            text.rect.x.round()
+                        } else {
+                            text.rect.x
+                        },
                         baseline: text.baseline - scroll_y,
                         font_size: text.font_size,
                         font: text.font,
                         text: text.text.clone(),
                         color: text.color.into(),
+                        synthetic_bold: text.synthetic_bold,
+                        synthetic_italic: text.synthetic_italic,
                         clip: text.clip.map(scrolled),
                     });
+                    if text.clip.is_none() {
+                        for decoration in &text.text_decoration {
+                            let y = match decoration.as_str() {
+                                "overline" => text.baseline - text.font_size * 0.8 - scroll_y,
+                                "line-through" => text.baseline - text.font_size * 0.3 - scroll_y,
+                                _ => text.baseline + text.font_size * 0.08 - scroll_y,
+                            };
+                            items.push(DisplayItem::StrokeLine {
+                                from: (text.rect.x, y),
+                                to: (text.rect.right(), y),
+                                width: 1.0,
+                                color: text.color.into(),
+                            });
+                        }
+                    }
                 }
             }
             PaintItem::Image(layout_box) => {
@@ -157,6 +242,13 @@ fn paint(
                         rect: scrolled(rect),
                         image: image.clone(),
                     });
+                }
+                if let Some(control) = layout_box.control
+                    && rect.width > 0.0
+                    && rect.height > 0.0
+                    && visible(&rect)
+                {
+                    items.extend(crate::control::control_items(scrolled(rect), control));
                 }
             }
         }
@@ -217,8 +309,8 @@ fn shadows(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<Shadow> {
             let shape = layout::Rect {
                 x: rect.x + shadow.offset_x - spread,
                 y: rect.y + shadow.offset_y - spread,
-                width: rect.width + 2.0 * spread,
-                height: rect.height + 2.0 * spread,
+                width: (rect.width + 2.0 * spread).max(0.0),
+                height: (rect.height + 2.0 * spread).max(0.0),
             };
             if shape.width <= 0.0 || shape.height <= 0.0 {
                 return None;
@@ -252,14 +344,39 @@ fn shadows(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<Shadow> {
 /// order: a rounded ring when [`rounded_ring`] applies, otherwise the
 /// background followed by square border strips.
 fn decorations(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<DisplayItem> {
-    if let Some(ring) = rounded_ring(rect, style) {
-        return ring;
+    let mut items = if let Some(ring) = rounded_ring(rect, style) {
+        ring
+    } else {
+        let mut items = Vec::new();
+        if let Some(color) = style.background_color {
+            items.push(background(rect, style, color.into()));
+        }
+        items.extend(borders(rect, style));
+        items
+    };
+    if style.outline_width > 0.0 && style.outline_style != "none" {
+        let spread = style.outline_width + style.outline_offset;
+        let outline_rect = layout::Rect {
+            x: rect.x - spread,
+            y: rect.y - spread,
+            width: (rect.width + 2.0 * spread).max(0.0),
+            height: (rect.height + 2.0 * spread).max(0.0),
+        };
+        let outline = layout::BoxStyle {
+            border_width: layout::Edges {
+                top: style.outline_width,
+                right: style.outline_width,
+                bottom: style.outline_width,
+                left: style.outline_width,
+            },
+            border_color: layout::Sides::from_array([style.outline_color; 4]),
+            border_style: layout::Sides::from_array(std::array::from_fn(|_| {
+                style.outline_style.clone()
+            })),
+            ..Default::default()
+        };
+        items.extend(borders(outline_rect, &outline));
     }
-    let mut items = Vec::new();
-    if let Some(color) = style.background_color {
-        items.push(background(rect, style, color.into()));
-    }
-    items.extend(borders(rect, style));
     items
 }
 
@@ -459,6 +576,33 @@ fn borders(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<DisplayItem> {
         }
     }
     items
+}
+
+/// Width of a drop-down arrow chevron, in CSS pixels.
+const ARROW_WIDTH: f32 = 10.0;
+/// Rows (one CSS pixel each) in a drop-down arrow chevron.
+const ARROW_ROWS: usize = 5;
+/// Gap between the chevron and the right of the padding box, in CSS pixels.
+const ARROW_INSET: f32 = 6.0;
+
+/// A down chevron for a `<select>` whose padding box is `rect`, vertically
+/// centered, drawn as a pair of 2px strokes per row converging to the point.
+fn select_arrow(rect: layout::Rect, color: Color) -> Vec<DisplayItem> {
+    let left = rect.right() - ARROW_INSET - ARROW_WIDTH;
+    let top = rect.y + (rect.height - ARROW_ROWS as f32) / 2.0;
+    (0..ARROW_ROWS)
+        .flat_map(|row| {
+            let y = top + row as f32;
+            let inset = row as f32;
+            [left + inset, left + ARROW_WIDTH - 2.0 - inset].map(|x| layout::Rect {
+                x,
+                y,
+                width: 2.0,
+                height: 1.0,
+            })
+        })
+        .map(|rect| DisplayItem::FillRect { rect, color })
+        .collect()
 }
 
 /// The background fill for a box's border box `rect`, rounded by its
@@ -710,6 +854,57 @@ mod tests {
     }
 
     #[test]
+    fn a_drop_down_select_paints_its_arrow_before_its_text() {
+        let list = paint(
+            "<body><select><option>One</option></select></body>",
+            "body { margin: 0 } select { padding: 0; margin: 0; font-size: 16px }",
+        );
+        let arrow: Vec<_> = list
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::FillRect { rect, .. } if rect.height == 1.0 => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(arrow.len(), 2 * ARROW_ROWS);
+        // "One" (24px) plus 20px of arrow room; one 19.2px line. The arrow
+        // sits inside the select's 2px user-agent border, so the padding box
+        // runs from 2px to 46px.
+        let border = 2.0;
+        let right = arrow.iter().map(|rect| rect.right()).fold(0.0, f32::max);
+        let left = arrow.iter().map(|rect| rect.x).fold(f32::MAX, f32::min);
+        assert_eq!(right, border + 44.0 - ARROW_INSET);
+        assert_eq!(left, border + 44.0 - ARROW_INSET - ARROW_WIDTH);
+        assert!((arrow[0].y - (border + (19.2 - 5.0) / 2.0)).abs() < 1e-4);
+        assert!(matches!(
+            list.items.last(),
+            Some(DisplayItem::Text { text, .. }) if text == "One"
+        ));
+    }
+
+    /// Guards the merge with borders (#426): the arrow stays inside a thick
+    /// author border instead of painting over it.
+    #[test]
+    fn a_drop_down_arrow_stays_inside_thick_borders() {
+        let list = paint(
+            "<body><select><option>One</option></select></body>",
+            "body { margin: 0 } select { padding: 0; margin: 0; font-size: 16px; \
+             border: 8px solid black }",
+        );
+        let right = list
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::FillRect { rect, .. } if rect.height == 1.0 => Some(rect.right()),
+                _ => None,
+            })
+            .fold(0.0, f32::max);
+        // Border box: 8 + 44 + 8; the padding box ends at 52.
+        assert_eq!(right, 52.0 - ARROW_INSET);
+    }
+
+    #[test]
     fn the_canvas_is_painted_first_with_the_default_canvas_color() {
         let list = paint("<body>Hello</body>", "");
         assert_eq!(
@@ -741,6 +936,10 @@ mod tests {
                 DisplayItem::Text { text, baseline, .. } => format!("text {text} {baseline:.1}"),
                 DisplayItem::Image { .. } => "image".to_owned(),
                 DisplayItem::BoxShadow { .. } => "shadow".to_owned(),
+                DisplayItem::StrokeLine { .. } => "line".to_owned(),
+                DisplayItem::Clip { .. } => "clip".to_owned(),
+                DisplayItem::BeginLayer { .. } => "layer".to_owned(),
+                DisplayItem::EndLayer => "end layer".to_owned(),
             })
             .collect::<Vec<_>>();
         // Canvas, then both block backgrounds, then the text of both blocks

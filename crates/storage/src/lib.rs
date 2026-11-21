@@ -338,6 +338,12 @@ impl StorageBackend for OriginStorage {
 }
 
 /// File-backed storage with one snapshot sequence per origin.
+///
+/// Each origin's complete snapshot is published as a new generation. Older
+/// generations are retained so a corrupt or incomplete newest snapshot can
+/// fall back to the last valid data for that same origin.
+/// A synchronized temporary file is atomically linked to its final snapshot
+/// name only after the record is complete.
 #[derive(Debug)]
 pub struct PersistentOriginStorage {
     root: PathBuf,
@@ -380,6 +386,11 @@ impl PersistentOriginStorage {
     }
 
     /// Reads a value, loading the authorized origin's latest valid snapshot first.
+    ///
+    /// Matching snapshots are validated against `storage_key`. If the newest
+    /// is corrupt, an older valid snapshot for the same key is used. If no
+    /// matching snapshot can be validated, returns
+    /// [`StorageError::CorruptRecord`].
     pub fn read_item(
         &mut self,
         storage_key: &TrustedStorageKey<'_>,
@@ -430,14 +441,14 @@ impl PersistentOriginStorage {
 
         let previous = self.memory.areas.get(storage_key).cloned();
         self.memory.set_item_for_key(storage_key, key, value);
-        let area = self
+        let requested_bytes = self
             .memory
             .areas
             .get(storage_key)
-            .expect("set_item creates the origin area");
+            .expect("set_item creates the origin area")
+            .size_bytes();
 
-        if area.size_bytes() > self.limits.max_origin_bytes {
-            let requested_bytes = area.size_bytes();
+        if requested_bytes > self.limits.max_origin_bytes {
             log::warn!(
                 "storage quota exceeded for {}: origin would use {requested_bytes} of {} bytes",
                 storage_label(storage_key),
@@ -450,7 +461,58 @@ impl PersistentOriginStorage {
             });
         }
 
-        let record = match encode_area(storage_key, area, self.limits) {
+        self.publish_area(storage_key, previous)
+    }
+
+    /// Removes `key` from the authorized origin's persistent area.
+    ///
+    /// Returns the removed value, or `None` when the key was not present.
+    /// The in-memory area is restored if publishing the updated snapshot fails.
+    pub fn remove_item(
+        &mut self,
+        storage_key: &TrustedStorageKey<'_>,
+        key: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let storage_key = storage_key.storage_key();
+        self.ensure_loaded(storage_key)?;
+        let previous = self.memory.areas.get(storage_key).cloned();
+        let Some(value) = self.memory.remove_item_for_key(storage_key, key) else {
+            return Ok(None);
+        };
+
+        self.publish_area(storage_key, previous)?;
+        Ok(Some(value))
+    }
+
+    /// Removes every item from the authorized origin's persistent area.
+    ///
+    /// The in-memory area is restored if publishing the empty snapshot fails.
+    pub fn clear(&mut self, storage_key: &TrustedStorageKey<'_>) -> Result<(), StorageError> {
+        let storage_key = storage_key.storage_key();
+        self.ensure_loaded(storage_key)?;
+        let Some(previous) = self.memory.areas.get(storage_key).cloned() else {
+            return Ok(());
+        };
+        if previous.is_empty() {
+            return Ok(());
+        }
+
+        self.memory.clear_for_key(storage_key);
+        self.publish_area(storage_key, Some(previous))
+    }
+
+    fn publish_area(
+        &mut self,
+        storage_key: &StorageKey,
+        previous: Option<LocalStorage>,
+    ) -> Result<(), StorageError> {
+        let area = self
+            .memory
+            .areas
+            .get(storage_key)
+            .cloned()
+            .unwrap_or_default();
+        let record = match encode_area(storage_key, &area, self.limits) {
             Ok(record) => record,
             Err(error) => {
                 log::warn!(
@@ -462,13 +524,18 @@ impl PersistentOriginStorage {
             }
         };
 
-        let next_generation = self
+        let Some(next_generation) = self
             .generations
             .get(storage_key)
             .copied()
             .unwrap_or_default()
             .checked_add(1)
-            .ok_or_else(|| StorageError::CorruptRecord("snapshot generation overflow".into()))?;
+        else {
+            self.restore_area(storage_key, previous);
+            return Err(StorageError::CorruptRecord(
+                "snapshot generation overflow".into(),
+            ));
+        };
         let generation = match self.write_snapshot(storage_key, next_generation, &record) {
             Ok(generation) => generation,
             Err(error) => {
@@ -603,7 +670,11 @@ impl PersistentOriginStorage {
 
         loop {
             let path = self.root.join(format!("{prefix}{generation}.storage"));
-            let file = OpenOptions::new().write(true).create_new(true).open(&path);
+            let temporary_path = self.root.join(format!("{prefix}{generation}.storage.tmp"));
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary_path);
 
             let mut file = match file {
                 Ok(file) => file,
@@ -617,16 +688,28 @@ impl PersistentOriginStorage {
             };
 
             let result = file.write_all(record).and_then(|()| file.sync_all());
-            if result.is_err()
-                && let Err(error) = fs::remove_file(&path)
-            {
-                log::warn!(
-                    "could not remove partial snapshot {}: {error}",
-                    path.display()
-                );
+            drop(file);
+            if let Err(error) = result {
+                remove_temporary_snapshot(&temporary_path);
+                return Err(error.into());
             }
-            result?;
-            return Ok(generation);
+
+            match fs::hard_link(&temporary_path, &path) {
+                Ok(()) => {
+                    remove_temporary_snapshot(&temporary_path);
+                    return Ok(generation);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    remove_temporary_snapshot(&temporary_path);
+                    generation = generation.checked_add(1).ok_or_else(|| {
+                        StorageError::CorruptRecord("snapshot generation overflow".into())
+                    })?;
+                }
+                Err(error) => {
+                    remove_temporary_snapshot(&temporary_path);
+                    return Err(error.into());
+                }
+            }
         }
     }
 
@@ -660,23 +743,6 @@ impl PersistentOriginStorage {
                 self.memory.areas.remove(storage_key);
             }
         }
-    }
-
-    fn persist_current_area(&mut self, storage_key: &StorageKey) -> Result<(), StorageError> {
-        let empty = LocalStorage::new();
-        let area = self.memory.areas.get(storage_key).unwrap_or(&empty);
-        let record = encode_area(storage_key, area, self.limits)?;
-        let next_generation = self
-            .generations
-            .get(storage_key)
-            .copied()
-            .unwrap_or_default()
-            .checked_add(1)
-            .ok_or_else(|| StorageError::CorruptRecord("snapshot generation overflow".into()))?;
-        let generation = self.write_snapshot(storage_key, next_generation, &record)?;
-        self.generations.insert(storage_key.clone(), generation);
-        self.remove_old_snapshots(storage_key, generation);
-        Ok(())
     }
 }
 
@@ -714,32 +780,23 @@ impl StorageBackend for PersistentOriginStorage {
         storage_key: &TrustedStorageKey<'_>,
         key: &str,
     ) -> Result<(), StorageError> {
-        let storage_key = storage_key.storage_key();
-        self.ensure_loaded(storage_key)?;
-        let previous = self.memory.areas.get(storage_key).cloned();
-        if self.memory.remove_item_for_key(storage_key, key).is_none() {
-            return Ok(());
-        }
-        if let Err(error) = self.persist_current_area(storage_key) {
-            self.restore_area(storage_key, previous);
-            return Err(error);
-        }
-        Ok(())
+        Self::remove_item(self, storage_key, key).map(drop)
     }
 
     fn clear(&mut self, storage_key: &TrustedStorageKey<'_>) -> Result<(), StorageError> {
-        let storage_key = storage_key.storage_key();
-        self.ensure_loaded(storage_key)?;
-        let previous = self.memory.areas.get(storage_key).cloned();
-        if previous.as_ref().is_none_or(LocalStorage::is_empty) {
-            return Ok(());
-        }
-        self.memory.clear_for_key(storage_key);
-        if let Err(error) = self.persist_current_area(storage_key) {
-            self.restore_area(storage_key, previous);
-            return Err(error);
-        }
-        Ok(())
+        Self::clear(self, storage_key)
+    }
+}
+
+/// Removes a temporary snapshot file, logging when cleanup fails.
+fn remove_temporary_snapshot(path: &Path) {
+    if let Err(error) = fs::remove_file(path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        log::warn!(
+            "could not remove temporary snapshot {}: {error}",
+            path.display()
+        );
     }
 }
 
@@ -1065,6 +1122,21 @@ mod tests {
     }
 
     #[test]
+    fn persistent_storage_starts_empty_for_a_new_root() {
+        let path = test_directory("missing");
+        let key = storage_key("https", "example.com", 443);
+        let key_context = context_for(&key);
+        let key = key_context.trusted_storage_key();
+        assert!(!path.exists());
+
+        let mut storage = PersistentOriginStorage::open(&path).unwrap();
+
+        assert!(path.is_dir());
+        assert_eq!(storage.read_item(&key, "missing").unwrap(), None);
+        remove_test_directory(&path);
+    }
+
+    #[test]
     fn persistent_storage_keeps_origins_separate() {
         let path = test_directory("isolation");
         let first = storage_key("https", "example.com", 443);
@@ -1088,6 +1160,74 @@ mod tests {
             reopened.read_item(&second, "token").unwrap(),
             Some("second".into())
         );
+        remove_test_directory(&path);
+    }
+
+    #[test]
+    fn persistent_storage_keeps_schemes_and_ports_separate_after_reopen() {
+        let path = test_directory("scheme-port-isolation");
+        let https = storage_key("https", "example.com", 443);
+        let http = storage_key("http", "example.com", 80);
+        let alternate_port = storage_key("https", "example.com", 8443);
+        let https_context = context_for(&https);
+        let http_context = context_for(&http);
+        let alternate_port_context = context_for(&alternate_port);
+        let https = https_context.trusted_storage_key();
+        let http = http_context.trusted_storage_key();
+        let alternate_port = alternate_port_context.trusted_storage_key();
+        let mut storage = PersistentOriginStorage::open(&path).unwrap();
+
+        storage.write_item(&https, "transport", "https").unwrap();
+        storage.write_item(&http, "transport", "http").unwrap();
+        storage
+            .write_item(&alternate_port, "transport", "alternate-port")
+            .unwrap();
+        drop(storage);
+
+        let mut reopened = PersistentOriginStorage::open(&path).unwrap();
+        assert_eq!(
+            reopened.read_item(&https, "transport").unwrap(),
+            Some("https".into())
+        );
+        assert_eq!(
+            reopened.read_item(&http, "transport").unwrap(),
+            Some("http".into())
+        );
+        assert_eq!(
+            reopened.read_item(&alternate_port, "transport").unwrap(),
+            Some("alternate-port".into())
+        );
+        remove_test_directory(&path);
+    }
+
+    #[test]
+    fn persistent_remove_and_clear_survive_reopen_without_affecting_other_origins() {
+        let path = test_directory("remove-clear");
+        let first = storage_key("https", "example.com", 443);
+        let second = storage_key("https", "other.example", 443);
+        let first_context = context_for(&first);
+        let second_context = context_for(&second);
+        let first = first_context.trusted_storage_key();
+        let second = second_context.trusted_storage_key();
+        let mut storage = PersistentOriginStorage::open(&path).unwrap();
+
+        storage.write_item(&first, "remove", "removed").unwrap();
+        storage.write_item(&first, "keep", "kept").unwrap();
+        storage.write_item(&second, "clear", "cleared").unwrap();
+        assert_eq!(
+            storage.remove_item(&first, "remove").unwrap(),
+            Some("removed".into())
+        );
+        storage.clear(&second).unwrap();
+        drop(storage);
+
+        let mut reopened = PersistentOriginStorage::open(&path).unwrap();
+        assert_eq!(reopened.read_item(&first, "remove").unwrap(), None);
+        assert_eq!(
+            reopened.read_item(&first, "keep").unwrap(),
+            Some("kept".into())
+        );
+        assert_eq!(reopened.read_item(&second, "clear").unwrap(), None);
         remove_test_directory(&path);
     }
 
@@ -1134,6 +1274,125 @@ mod tests {
             storage.read_item(&key, "name"),
             Err(StorageError::CorruptRecord(_))
         ));
+        remove_test_directory(&path);
+    }
+
+    #[test]
+    fn snapshot_for_another_origin_is_rejected() {
+        let path = test_directory("wrong-origin");
+        let first = storage_key("https", "example.com", 443);
+        let second = storage_key("https", "other.example", 443);
+        let first_context = context_for(&first);
+        let second_context = context_for(&second);
+        let first = first_context.trusted_storage_key();
+        let second = second_context.trusted_storage_key();
+        let mut storage = PersistentOriginStorage::open(&path).unwrap();
+        storage
+            .write_item(&second, "token", "other-origin-secret")
+            .unwrap();
+        drop(storage);
+
+        let second_snapshot = fs::read(path.join(format!(
+            "{}1.storage",
+            origin_file_prefix(second.storage_key())
+        )))
+        .unwrap();
+        fs::write(
+            path.join(format!(
+                "{}1.storage",
+                origin_file_prefix(first.storage_key())
+            )),
+            second_snapshot,
+        )
+        .unwrap();
+
+        let mut reopened = PersistentOriginStorage::open(&path).unwrap();
+        assert!(matches!(
+            reopened.read_item(&first, "token"),
+            Err(StorageError::CorruptRecord(_))
+        ));
+        assert_eq!(
+            reopened.read_item(&second, "token").unwrap(),
+            Some("other-origin-secret".into())
+        );
+        remove_test_directory(&path);
+    }
+
+    #[test]
+    fn corrupt_newest_snapshot_falls_back_without_cross_origin_leakage() {
+        let path = test_directory("corrupt-newest");
+        let first = storage_key("https", "example.com", 443);
+        let second = storage_key("https", "other.example", 443);
+        let first_context = context_for(&first);
+        let second_context = context_for(&second);
+        let first = first_context.trusted_storage_key();
+        let second = second_context.trusted_storage_key();
+        let mut storage = PersistentOriginStorage::open(&path).unwrap();
+
+        storage
+            .write_item(&first, "token", "first-generation")
+            .unwrap();
+        storage
+            .write_item(&first, "token", "corrupt-generation")
+            .unwrap();
+        storage
+            .write_item(&second, "token", "other-origin")
+            .unwrap();
+        drop(storage);
+
+        fs::write(
+            path.join(format!(
+                "{}2.storage",
+                origin_file_prefix(first.storage_key())
+            )),
+            b"incomplete snapshot",
+        )
+        .unwrap();
+
+        let mut reopened = PersistentOriginStorage::open(&path).unwrap();
+        assert_eq!(
+            reopened.read_item(&first, "token").unwrap(),
+            Some("first-generation".into())
+        );
+        assert_eq!(
+            reopened.read_item(&second, "token").unwrap(),
+            Some("other-origin".into())
+        );
+        remove_test_directory(&path);
+    }
+
+    #[test]
+    fn incomplete_temporary_snapshot_is_ignored() {
+        let path = test_directory("incomplete-temporary");
+        let key = storage_key("https", "example.com", 443);
+        let key_context = context_for(&key);
+        let key = key_context.trusted_storage_key();
+        let mut storage = PersistentOriginStorage::open(&path).unwrap();
+        storage.write_item(&key, "token", "complete").unwrap();
+        drop(storage);
+
+        fs::write(
+            path.join(format!(
+                "{}2.storage.tmp",
+                origin_file_prefix(key.storage_key())
+            )),
+            b"incomplete snapshot",
+        )
+        .unwrap();
+
+        let mut reopened = PersistentOriginStorage::open(&path).unwrap();
+        assert_eq!(
+            reopened.read_item(&key, "token").unwrap(),
+            Some("complete".into())
+        );
+        reopened.write_item(&key, "token", "recovered").unwrap();
+        drop(reopened);
+
+        let mut reloaded = PersistentOriginStorage::open(&path).unwrap();
+        assert_eq!(
+            reloaded.read_item(&key, "token").unwrap(),
+            Some("recovered".into())
+        );
         remove_test_directory(&path);
     }
 

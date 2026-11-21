@@ -79,6 +79,9 @@ fn main() {
         let inner_y = 24.0 + inset * 6.0;
         let label_width = label.len() as f32 * 6.0;
         items.push(DisplayItem::Text {
+            snap_glyphs: false,
+            synthetic_bold: false,
+            synthetic_italic: false,
             x: (inner_x + (group_width - 12.0 * inset - label_width) / 2.0).max(0.0),
             baseline: inner_y + (group_height - 12.0 * inset - 7.0) / 2.0 + 7.0,
             font_size: 10.0,

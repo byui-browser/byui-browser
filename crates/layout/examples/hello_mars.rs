@@ -34,6 +34,9 @@ fn main() {
     }];
     add_border(&mut items, box_rect, border, border_color);
     items.push(DisplayItem::Text {
+        snap_glyphs: false,
+        synthetic_bold: false,
+        synthetic_italic: false,
         x: box_rect.x + 89.0,
         baseline: box_rect.y + 49.0 + 7.0,
         font_size: 10.0,

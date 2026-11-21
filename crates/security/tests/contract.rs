@@ -4,6 +4,10 @@
 
 use security::{Cookie, CookieJar, Origin, same_origin};
 
+mod support;
+
+use support::primary_origin;
+
 #[test]
 #[ignore = "TODO(security): origin parsing not implemented"]
 fn parses_origin_with_default_port() {
@@ -23,15 +27,15 @@ fn path_does_not_affect_origin() {
 
 #[test]
 fn secure_cookie_is_not_sent_over_http() {
-    let https = Origin::with_port("https", "example.test", 443);
-    let http = Origin::with_port("http", "example.test", 80);
+    let https = primary_origin();
+    let http = Origin::with_port("http", https.host(), 80);
     let mut jar = CookieJar::new();
     jar.store(
         &https,
         Cookie {
             name: "session".into(),
             value: "abc".into(),
-            domain: "example.test".into(),
+            domain: https.host().into(),
             secure: true,
         },
     );

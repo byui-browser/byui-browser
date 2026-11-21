@@ -11,8 +11,8 @@ use crate::crypto::register_crypto;
 use crate::custom_elements::CustomElementRegistry;
 use crate::event::{
     EventTarget, EventTargetRef, add_event_listener_to_target, dispatch_event_target,
-    dispatch_event_target_with_target, event_constructor, event_object,
-    hashchange_event_constructor, remove_event_listener_from_target,
+    dispatch_event_target_preserving_target, dispatch_event_target_with_target, event_constructor,
+    event_object, hashchange_event_constructor, remove_event_listener_from_target,
 };
 use js::{Function, JsError, JsResult, Object, Realm, Value};
 use net::Url;
@@ -55,6 +55,97 @@ struct WindowPopstateState {
 struct WindowHashchangeState {
     /// The current `window.onhashchange` event handler, if any.
     handler: Option<Function>,
+}
+
+/// Per-Window state for the `keydown` event handler attribute.
+#[derive(Default)]
+struct WindowKeydownState {
+    /// The current `window.onkeydown` event handler, if any.
+    handler: Option<Function>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn keyboard_event(
+    key: &str,
+    code: &str,
+    location: u32,
+    ctrl_key: bool,
+    shift_key: bool,
+    alt_key: bool,
+    meta_key: bool,
+    repeat: bool,
+) -> Object {
+    let event = event_object("keydown".into(), true, true);
+    event.set("key", Value::String(key.into()));
+    event.set("code", Value::String(code.into()));
+    event.set("location", Value::Number(location as f64));
+    event.set("ctrlKey", Value::Boolean(ctrl_key));
+    event.set("shiftKey", Value::Boolean(shift_key));
+    event.set("altKey", Value::Boolean(alt_key));
+    event.set("metaKey", Value::Boolean(meta_key));
+    event.set("repeat", Value::Boolean(repeat));
+    event.set("isComposing", Value::Boolean(false));
+    event.set("view", Value::Null);
+    event.set("detail", Value::Number(0.0));
+    event.set("which", Value::Number(0.0));
+    event.set("keyCode", Value::Number(0.0));
+    event.set("charCode", Value::Number(0.0));
+    event.set_method(
+        "getModifierState",
+        Arc::new(move |arguments| {
+            let modifier = arguments.first().map_or_else(String::new, Value::to_string);
+            let active = match modifier.as_str() {
+                "Control" => ctrl_key,
+                "Shift" => shift_key,
+                "Alt" => alt_key,
+                "Meta" => meta_key,
+                _ => false,
+            };
+            Ok(Value::Boolean(active))
+        }),
+    );
+    event
+}
+
+/// Implements the callable subset of the UI Events `KeyboardEvent` constructor.
+fn keyboard_event_constructor(arguments: &[Value]) -> JsResult<Value> {
+    let event_type = arguments.first().map_or_else(String::new, Value::to_string);
+    let options = match arguments.get(1) {
+        Some(Value::Object(options) | Value::Array(options)) => Some(options),
+        _ => None,
+    };
+    let string = |name: &str| {
+        options
+            .and_then(|options| options.get(name))
+            .map_or_else(String::new, |value| value.to_string())
+    };
+    let number = |name: &str| {
+        options
+            .and_then(|options| options.get(name))
+            .and_then(|value| match value {
+                Value::Number(value) => Some(value as u32),
+                _ => None,
+            })
+            .unwrap_or(0)
+    };
+    let boolean = |name: &str| {
+        options
+            .and_then(|options| options.get(name))
+            .is_some_and(|value| matches!(value, Value::Boolean(true)))
+    };
+    let event = keyboard_event(
+        &string("key"),
+        &string("code"),
+        number("location"),
+        boolean("ctrlKey"),
+        boolean("shiftKey"),
+        boolean("altKey"),
+        boolean("metaKey"),
+        boolean("repeat"),
+    );
+    event.set("type", Value::String(event_type));
+    event.set("isComposing", Value::Boolean(boolean("isComposing")));
+    Ok(Value::Object(event))
 }
 
 /// Per-Window state for the `scroll` event handler attribute.
@@ -584,10 +675,27 @@ fn invoke_message(window: &Object, event_target: &EventTargetRef, data: Value, o
     {
         event.set("currentTarget", Value::Object(window.clone()));
         event.set("eventPhase", Value::Number(2.0));
-        if let Err(error) = callback.call_with_this(
-            Value::Object(window.clone()),
-            &[Value::Object(event.clone())],
-        ) {
+        let evaluator = event_target
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .evaluator
+            .clone();
+        let result = evaluator.map_or_else(
+            || {
+                callback.call_with_this(
+                    Value::Object(window.clone()),
+                    &[Value::Object(event.clone())],
+                )
+            },
+            |evaluator| {
+                evaluator.call_with_this_reentrant(
+                    &callback,
+                    Value::Object(window.clone()),
+                    &[Value::Object(event.clone())],
+                )
+            },
+        );
+        if let Err(error) = result {
             log::warn!("message event handler threw: {error}");
         }
     }
@@ -737,7 +845,7 @@ fn media_query_list(query: &str, state: MediaState) -> Object {
     list
 }
 
-fn dispatch_media_query_change(list: &Object, matches: bool) {
+fn dispatch_media_query_change(list: &Object, matches: bool, evaluator: &js::ScriptEvaluator) {
     let media = list.get("media").unwrap_or(Value::String(String::new()));
     let event = Object::new();
     event.set("type", Value::String("change".into()));
@@ -760,11 +868,17 @@ fn dispatch_media_query_change(list: &Object, matches: bool) {
     }
     for callback in callbacks {
         let result = match callback {
-            Value::Function(callback) => callback.call(&[Value::Object(event.clone())]),
+            Value::Function(callback) => evaluator.call_with_this_reentrant(
+                &callback,
+                Value::Object(list.clone()),
+                &[Value::Object(event.clone())],
+            ),
             Value::Object(callback) => match callback.get("handleEvent") {
-                Some(Value::Function(handle_event)) => {
-                    handle_event.call(&[Value::Object(event.clone())])
-                }
+                Some(Value::Function(handle_event)) => evaluator.call_with_this_reentrant(
+                    &handle_event,
+                    Value::Object(callback.clone()),
+                    &[Value::Object(event.clone())],
+                ),
                 _ => Ok(Value::Undefined),
             },
             _ => Ok(Value::Undefined),
@@ -775,7 +889,7 @@ fn dispatch_media_query_change(list: &Object, matches: bool) {
     }
 }
 
-fn update_media_query_lists(window: &Object, state: MediaState) {
+fn update_media_query_lists(window: &Object, state: MediaState, evaluator: &js::ScriptEvaluator) {
     let Some(Value::Object(lists)) = window.get("__mediaQueryLists") else {
         return;
     };
@@ -790,7 +904,7 @@ fn update_media_query_lists(window: &Object, state: MediaState) {
         let old_matches = matches!(list.get("matches"), Some(Value::Boolean(true)));
         if matches != old_matches {
             list.update_read_only("matches", Value::Boolean(matches));
-            dispatch_media_query_change(&list, matches);
+            dispatch_media_query_change(&list, matches, evaluator);
         }
     }
 }
@@ -807,13 +921,15 @@ fn register_window_object(
     };
     let self_window = window.clone();
     let navigator = Object::new();
+    navigator.set_read_only("userAgent", Value::String("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) byui-browser/0.1".into()));
     let navigator_for_window = navigator.clone();
     let history = Object::new();
     let location = Object::new();
     let session = Arc::new(Mutex::new(SessionHistory::new(initial_url)?));
+    let evaluator = realm.script_evaluator();
     let custom_elements = match realm.registered_global_value("customElements") {
         Some(Value::Object(registry)) => registry,
-        _ => CustomElementRegistry::new().object(),
+        _ => CustomElementRegistry::new_with_evaluator(Some(evaluator.clone())).object(),
     };
     let timers = Arc::new(Mutex::new(WindowTimers::new()));
     let microtasks = Arc::new(Mutex::new(MicrotaskQueue::new()));
@@ -827,7 +943,10 @@ fn register_window_object(
     let click_state = Arc::new(Mutex::new(WindowClickState::default()));
     let performance = Object::new();
     let performance_clock = Arc::new(PerformanceClock::new());
-    let evaluator = realm.script_evaluator();
+    event_target
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .evaluator = Some(evaluator.clone());
     let timer_this = Value::Object(window.clone());
     let nesting_context = Arc::new(AtomicU32::new(0));
 
@@ -843,6 +962,167 @@ fn register_window_object(
     // registration replaces this with the document's singleton Selection.
     window.set_method("getSelection", Arc::new(|_| Ok(Value::Null)));
     window.set("customElements", Value::Object(custom_elements.clone()));
+    let url_constructor = Function::from_host_constructor(
+        "URL",
+        Arc::new(|_| Err(JsError::runtime("URL constructor requires 'new'"))),
+        Arc::new(|arguments| {
+            let input = arguments
+                .first()
+                .map(Value::to_string)
+                .ok_or_else(|| JsError::runtime("URL requires an input"))?;
+            let parsed = match arguments.get(1) {
+                Some(base) => Url::parse(&base.to_string()).and_then(|base| base.join(&input)),
+                None => Url::parse(&input),
+            }
+            .map_err(|error| JsError::runtime(format!("Invalid URL: {error}")))?;
+            let object = Object::new();
+            object.set_read_only("href", Value::String(parsed.as_str().into()));
+            object.set_read_only(
+                "origin",
+                Value::String(parsed.origin().ascii_serialization()),
+            );
+            object.set_read_only("protocol", Value::String(format!("{}:", parsed.scheme())));
+            let host = parsed.host_str().unwrap_or_default();
+            let host = parsed
+                .port()
+                .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
+            object.set_read_only("host", Value::String(host));
+            object.set_read_only("pathname", Value::String(parsed.path().into()));
+            object.set_read_only(
+                "search",
+                Value::String(parsed.query().map_or(String::new(), |q| format!("?{q}"))),
+            );
+            object.set_read_only(
+                "hash",
+                Value::String(parsed.fragment().map_or(String::new(), |f| format!("#{f}"))),
+            );
+            Ok(Value::Object(object))
+        }),
+    );
+    window.set_read_only("URL", Value::Function(url_constructor.clone()));
+    realm.register_global_value("URL", Value::Function(url_constructor))?;
+    let params_constructor = Function::from_host_constructor(
+        "URLSearchParams",
+        Arc::new(|_| {
+            Err(JsError::runtime(
+                "URLSearchParams constructor requires 'new'",
+            ))
+        }),
+        Arc::new(|arguments| {
+            let query = arguments.first().map(Value::to_string).unwrap_or_default();
+            let query = query.strip_prefix('?').unwrap_or(&query);
+            let entries = Arc::new(Mutex::new(
+                query
+                    .split('&')
+                    .filter(|part| !part.is_empty())
+                    .map(|part| {
+                        let (name, value) = part.split_once('=').unwrap_or((part, ""));
+                        (decode_form_component(name), decode_form_component(value))
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+            let object = Object::new();
+            let entries_for_get = entries.clone();
+            object.set_method(
+                "get",
+                Arc::new(move |args| {
+                    let name = args.first().map(Value::to_string).unwrap_or_default();
+                    Ok(entries_for_get
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(key, _)| *key == name)
+                        .map_or(Value::Null, |(_, value)| Value::String(value.clone())))
+                }),
+            );
+            let entries_for_has = entries.clone();
+            object.set_method(
+                "has",
+                Arc::new(move |args| {
+                    let name = args.first().map(Value::to_string).unwrap_or_default();
+                    Ok(Value::Boolean(
+                        entries_for_has
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|(key, _)| *key == name),
+                    ))
+                }),
+            );
+            let entries_for_append = entries.clone();
+            object.set_method(
+                "append",
+                Arc::new(move |args| {
+                    if args.len() < 2 {
+                        return Err(JsError::runtime("append requires a name and value"));
+                    }
+                    entries_for_append
+                        .lock()
+                        .unwrap()
+                        .push((args[0].to_string(), args[1].to_string()));
+                    Ok(Value::Undefined)
+                }),
+            );
+            let entries_for_set = entries.clone();
+            object.set_method(
+                "set",
+                Arc::new(move |args| {
+                    if args.len() < 2 {
+                        return Err(JsError::runtime("set requires a name and value"));
+                    }
+                    let name = args[0].to_string();
+                    let value = args[1].to_string();
+                    let mut entries = entries_for_set.lock().unwrap();
+                    let first = entries.iter().position(|(key, _)| *key == name);
+                    entries.retain(|(key, _)| *key != name);
+                    let length = entries.len();
+                    entries.insert(first.unwrap_or(length).min(length), (name, value));
+                    Ok(Value::Undefined)
+                }),
+            );
+            let entries_for_delete = entries.clone();
+            object.set_method(
+                "delete",
+                Arc::new(move |args| {
+                    let name = args.first().map(Value::to_string).unwrap_or_default();
+                    entries_for_delete
+                        .lock()
+                        .unwrap()
+                        .retain(|(key, _)| *key != name);
+                    Ok(Value::Undefined)
+                }),
+            );
+            object.set_method(
+                "toString",
+                Arc::new(move |_| {
+                    let query = entries
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(key, value)| {
+                            format!(
+                                "{}={}",
+                                encode_form_component(key),
+                                encode_form_component(value)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("&");
+                    Ok(Value::String(query))
+                }),
+            );
+            Ok(Value::Object(object))
+        }),
+    );
+    window.set_read_only(
+        "URLSearchParams",
+        Value::Function(params_constructor.clone()),
+    );
+    realm.register_global_value("URLSearchParams", Value::Function(params_constructor))?;
+    crate::headers::register(realm, &window)?;
+    if let Some(console) = realm.registered_global_value("console") {
+        window.set_read_only("console", console);
+    }
     // HTML's structured cloning API deep-copies primitives, plain objects,
     // and arrays, preserving cycles and repeated references. This runtime
     // does not represent the standard's built-in serializable types (such as
@@ -896,6 +1176,7 @@ fn register_window_object(
     let onload_listener = {
         let window = window.clone();
         let load_state = Arc::clone(&load_state);
+        let evaluator = evaluator.clone();
         Function::from_host(
             "onload",
             Arc::new(move |arguments| {
@@ -905,9 +1186,11 @@ fn register_window_object(
                     .onload
                     .clone();
                 match handler {
-                    Some(handler) => {
-                        handler.call_with_this(Value::Object(window.clone()), arguments)
-                    }
+                    Some(handler) => evaluator.call_with_this_reentrant(
+                        &handler,
+                        Value::Object(window.clone()),
+                        arguments,
+                    ),
                     None => Ok(Value::Undefined),
                 }
             }),
@@ -965,6 +1248,7 @@ fn register_window_object(
     let onpopstate_listener = {
         let window = window.clone();
         let popstate_state = Arc::clone(&popstate_state);
+        let evaluator = evaluator.clone();
         Function::from_host(
             "onpopstate",
             Arc::new(move |arguments| {
@@ -974,9 +1258,11 @@ fn register_window_object(
                     .handler
                     .clone();
                 match handler {
-                    Some(handler) => {
-                        handler.call_with_this(Value::Object(window.clone()), arguments)
-                    }
+                    Some(handler) => evaluator.call_with_this_reentrant(
+                        &handler,
+                        Value::Object(window.clone()),
+                        arguments,
+                    ),
                     None => Ok(Value::Undefined),
                 }
             }),
@@ -1037,6 +1323,7 @@ fn register_window_object(
     let onhashchange_listener = {
         let window = window.clone();
         let hashchange_state = Arc::clone(&hashchange_state);
+        let evaluator = evaluator.clone();
         Function::from_host(
             "onhashchange",
             Arc::new(move |arguments| {
@@ -1046,9 +1333,11 @@ fn register_window_object(
                     .handler
                     .clone();
                 match handler {
-                    Some(handler) => {
-                        handler.call_with_this(Value::Object(window.clone()), arguments)
-                    }
+                    Some(handler) => evaluator.call_with_this_reentrant(
+                        &handler,
+                        Value::Object(window.clone()),
+                        arguments,
+                    ),
                     None => Ok(Value::Undefined),
                 }
             }),
@@ -1102,12 +1391,94 @@ fn register_window_object(
             Ok(())
         })),
     );
+    // `window.onkeydown` is an event handler IDL attribute. Keep its handler
+    // in private state and expose one stable listener on Window.
+    let keydown_state = Arc::new(Mutex::new(WindowKeydownState::default()));
+    let onkeydown_listener = {
+        let window = window.clone();
+        let keydown_state = Arc::clone(&keydown_state);
+        let evaluator = evaluator.clone();
+        Function::from_host(
+            "onkeydown",
+            Arc::new(move |arguments| {
+                let handler = keydown_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .handler
+                    .clone();
+                if let Some(handler) = handler {
+                    let result = evaluator.call_with_this_reentrant(
+                        &handler,
+                        Value::Object(window.clone()),
+                        arguments,
+                    )?;
+                    if matches!(result, Value::Boolean(false))
+                        && let Some(Value::Object(event)) = arguments.first()
+                        && let Some(Value::Function(prevent_default)) = event.get("preventDefault")
+                    {
+                        prevent_default.call(&[])?;
+                    }
+                }
+                Ok(Value::Undefined)
+            }),
+        )
+    };
+    let keydown_state_for_get = Arc::clone(&keydown_state);
+    let keydown_state_for_set = Arc::clone(&keydown_state);
+    let onkeydown_event_target = event_target.clone();
+    window.define_accessor(
+        "onkeydown",
+        Arc::new(move || {
+            let state = keydown_state_for_get
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(state.handler.clone().map_or(Value::Null, Value::Function))
+        }),
+        Some(Arc::new(move |value| {
+            let handler = match value {
+                Value::Null | Value::Undefined => None,
+                Value::Function(handler) => Some(handler),
+                _ => return Err(type_error("window.onkeydown must be a function or null")),
+            };
+            let had_handler = {
+                let mut state = keydown_state_for_set
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let had_handler = state.handler.is_some();
+                state.handler = handler.clone();
+                had_handler
+            };
+            let listener_arguments = [
+                Value::String("keydown".into()),
+                Value::Function(onkeydown_listener.clone()),
+            ];
+            match (had_handler, handler.is_some()) {
+                (false, true) => {
+                    add_event_listener_to_target(
+                        &onkeydown_event_target,
+                        &listener_arguments,
+                        "window",
+                    )?;
+                }
+                (true, false) => {
+                    remove_event_listener_from_target(
+                        &onkeydown_event_target,
+                        &listener_arguments,
+                    )?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })),
+    );
+
     // CSSOM View's `window.onscroll` is an event handler IDL attribute. Keep
     // one stable listener so it participates in registration order with
     // `addEventListener("scroll", ...)` listeners.
     let onscroll_listener = {
         let window = window.clone();
         let scroll_state = Arc::clone(&scroll_state);
+        let evaluator = evaluator.clone();
         Function::from_host(
             "onscroll",
             Arc::new(move |arguments| {
@@ -1117,9 +1488,11 @@ fn register_window_object(
                     .handler
                     .clone();
                 match handler {
-                    Some(handler) => {
-                        handler.call_with_this(Value::Object(window.clone()), arguments)
-                    }
+                    Some(handler) => evaluator.call_with_this_reentrant(
+                        &handler,
+                        Value::Object(window.clone()),
+                        arguments,
+                    ),
                     None => Ok(Value::Undefined),
                 }
             }),
@@ -1170,12 +1543,14 @@ fn register_window_object(
             Ok(())
         })),
     );
+
     // `window.onresize` is an event handler IDL attribute. Keep its handler
     // in private state and expose one stable event listener so it participates
     // in Window listener ordering.
     let resize_state_for_get = Arc::clone(&resize_state);
     let resize_state_for_set = Arc::clone(&resize_state);
     let resize_window = window.clone();
+    let resize_evaluator = evaluator.clone();
     let onresize_listener = Function::from_host(
         "onresize",
         Arc::new(move |arguments| {
@@ -1185,9 +1560,11 @@ fn register_window_object(
                 .handler
                 .clone();
             match handler {
-                Some(handler) => {
-                    handler.call_with_this(Value::Object(resize_window.clone()), arguments)
-                }
+                Some(handler) => resize_evaluator.call_with_this_reentrant(
+                    &handler,
+                    Value::Object(resize_window.clone()),
+                    arguments,
+                ),
                 None => Ok(Value::Undefined),
             }
         }),
@@ -1241,6 +1618,7 @@ fn register_window_object(
     let onclick_listener = {
         let window = window.clone();
         let click_state = Arc::clone(&click_state);
+        let evaluator = evaluator.clone();
         Function::from_host(
             "onclick",
             Arc::new(move |arguments| {
@@ -1250,9 +1628,11 @@ fn register_window_object(
                     .handler
                     .clone();
                 match handler {
-                    Some(handler) => {
-                        handler.call_with_this(Value::Object(window.clone()), arguments)
-                    }
+                    Some(handler) => evaluator.call_with_this_reentrant(
+                        &handler,
+                        Value::Object(window.clone()),
+                        arguments,
+                    ),
                     None => Ok(Value::Undefined),
                 }
             }),
@@ -1473,6 +1853,7 @@ fn register_window_object(
         }),
     );
     let update_media_window = window.clone();
+    let evaluator_for_media = evaluator.clone();
     window.set_method(
         "__updateMediaQueries",
         Arc::new(move |arguments| {
@@ -1499,6 +1880,7 @@ fn register_window_object(
                         .map(|(width, height)| ViewportSize { width, height }),
                     ratio,
                 ),
+                &evaluator_for_media,
             );
             Ok(Value::Undefined)
         }),
@@ -1638,7 +2020,11 @@ fn register_window_object(
                 let Some(callback) = callback else {
                     continue;
                 };
-                if let Err(error) = callback.call(&[Value::Number(timestamp)]) {
+                if let Err(error) = evaluator_for_animation.call_with_this_reentrant(
+                    &callback,
+                    Value::Undefined,
+                    &[Value::Number(timestamp)],
+                ) {
                     log::warn!("requestAnimationFrame callback threw: {error}");
                 }
                 fired += 1;
@@ -1724,7 +2110,76 @@ fn register_window_object(
             dispatch_event_target(&dispatch_window_event_target, &dispatch_window, arguments)
         }),
     );
+    let create_keydown_event = window.clone();
+    window.set_method(
+        "__createKeydownEvent",
+        Arc::new(move |arguments| {
+            let string = |index: usize| {
+                arguments.get(index).and_then(|value| match value {
+                    Value::String(value) => Some(value.as_str()),
+                    _ => None,
+                })
+            };
+            let number = |index: usize| {
+                arguments.get(index).and_then(|value| match value {
+                    Value::Number(value) => Some(*value as u32),
+                    _ => None,
+                })
+            };
+            let boolean = |index: usize| {
+                arguments
+                    .get(index)
+                    .is_some_and(|value| matches!(value, Value::Boolean(true)))
+            };
+            let event = keyboard_event(
+                string(0).unwrap_or_default(),
+                string(1).unwrap_or_default(),
+                number(2).unwrap_or(0),
+                boolean(3),
+                boolean(4),
+                boolean(5),
+                boolean(6),
+                boolean(7),
+            );
+            Ok(Value::Object(event))
+        }),
+    );
+    let dispatch_keydown_event_target = event_target.clone();
+    let dispatch_keydown_window = window.clone();
+    window.set_method(
+        "__dispatchKeydownAtWindow",
+        Arc::new(move |arguments| {
+            dispatch_event_target_preserving_target(
+                &dispatch_keydown_event_target,
+                &dispatch_keydown_window,
+                arguments,
+            )
+        }),
+    );
+    let dispatch_keydown_creator = create_keydown_event.clone();
+    let dispatch_keydown_event_target = event_target.clone();
+    let dispatch_keydown_window = window.clone();
+    window.set_method(
+        "__dispatchKeydown",
+        Arc::new(move |arguments| {
+            let Some(Value::Function(create)) =
+                dispatch_keydown_creator.get("__createKeydownEvent")
+            else {
+                return Err(JsError::runtime(
+                    "window keydown event constructor is not installed",
+                ));
+            };
+            let event = create.call(arguments)?;
+            dispatch_event_target(
+                &dispatch_keydown_event_target,
+                &dispatch_keydown_window,
+                &[event],
+            )
+        }),
+    );
     window.set_method("HashChangeEvent", Arc::new(hashchange_event_constructor));
+    window.set_method("KeyboardEvent", Arc::new(keyboard_event_constructor));
+    realm.register_global_function("KeyboardEvent", Arc::new(keyboard_event_constructor))?;
 
     let report_window_event_target = event_target.clone();
     let report_window = window.clone();
@@ -2140,6 +2595,44 @@ fn register_window_object(
     Ok(window)
 }
 
+fn decode_form_component(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'+' {
+            output.push(b' ');
+            index += 1;
+        } else if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(value) = u8::from_str_radix(&input[index + 1..index + 3], 16) {
+                output.push(value);
+                index += 3;
+            } else {
+                output.push(bytes[index]);
+                index += 1;
+            }
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn encode_form_component(input: &str) -> String {
+    let mut output = String::new();
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'*' | b'-' | b'.' | b'_') {
+            output.push(char::from(byte));
+        } else if byte == b' ' {
+            output.push('+');
+        } else {
+            output.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    output
+}
+
 /// Runs callbacks whose `setInterval()` deadlines have elapsed.
 ///
 /// Browser integrations call this from the owning page/event-loop thread.
@@ -2171,6 +2664,45 @@ pub fn dispatch_window_load(window: &Object) -> JsResult<()> {
     };
     dispatch.call(&[])?;
     run_window_microtasks(window).map(|_| ())
+}
+
+/// Dispatches a trusted native `keydown` event on a Window.
+///
+/// `key` and `code` use the UI Events names. `location` is the standard
+/// keyboard location value: 0 for standard keys, 1 for the left side, 2 for
+/// the right side, and 3 for the numeric keypad.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_window_keydown(
+    window: &Object,
+    key: &str,
+    code: &str,
+    location: u32,
+    ctrl_key: bool,
+    shift_key: bool,
+    alt_key: bool,
+    meta_key: bool,
+    repeat: bool,
+) -> JsResult<bool> {
+    let Some(Value::Function(dispatch)) = window.get("__dispatchKeydown") else {
+        return Err(JsError::runtime(
+            "window keydown dispatcher is not installed",
+        ));
+    };
+    match dispatch.call(&[
+        Value::String(key.into()),
+        Value::String(code.into()),
+        Value::Number(location as f64),
+        Value::Boolean(ctrl_key),
+        Value::Boolean(shift_key),
+        Value::Boolean(alt_key),
+        Value::Boolean(meta_key),
+        Value::Boolean(repeat),
+    ])? {
+        Value::Boolean(allowed) => Ok(allowed),
+        _ => Err(JsError::runtime(
+            "window keydown dispatcher returned a non-boolean",
+        )),
+    }
 }
 
 /// Dispatches a `resize` event on a Window after its viewport dimensions have

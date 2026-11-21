@@ -233,6 +233,47 @@ impl Document {
         Ok(())
     }
 
+    /// Implements `ChildNode.after(...nodes)` for `node`.
+    ///
+    /// Inserts nodes immediately after `node` in argument order. Detached
+    /// nodes are a no-op; existing nodes are moved according to the DOM's
+    /// viable-next-sibling rule.
+    pub fn after(&mut self, node: NodeID, nodes: &[NodeInput]) -> Result<(), DomException> {
+        let Some(source) = &self.source_document else {
+            return Ok(());
+        };
+        let Some(parent) = source.get_node(node).and_then(|data| data.get_parent()) else {
+            return Ok(());
+        };
+        let (ids, has_text) = split_inputs(nodes);
+        let siblings = source.get_node(parent).unwrap().get_children().clone();
+        let position = siblings
+            .iter()
+            .position(|sibling| *sibling == node)
+            .ok_or(DomException::NotFoundError)?;
+        let viable_next = siblings[position + 1..]
+            .iter()
+            .find(|sibling| !ids.contains(sibling))
+            .copied();
+        self.ensure_pre_insert_validity(parent, &ids, has_text, &[])?;
+        let inserted = self.materialize(nodes);
+        let source = self.source_document.as_mut().unwrap();
+        for id in &inserted {
+            source.remove(*id);
+        }
+        let mut children = source.get_node(parent).unwrap().get_children().clone();
+        let index = viable_next
+            .and_then(|next| children.iter().position(|sibling| *sibling == next))
+            .unwrap_or(children.len());
+        for (offset, id) in inserted.iter().enumerate() {
+            children.insert(index + offset, *id);
+            source.get_mut_node(*id).unwrap().set_parent(Some(parent));
+        }
+        source.get_mut_node(parent).unwrap().set_children(children);
+        self.elements = collect_elements(source);
+        Ok(())
+    }
+
     /// Implements `ParentNode.append(...nodes)` for `parent`.
     ///
     /// Appends `nodes` after `parent`'s existing children, in argument order.

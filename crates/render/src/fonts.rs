@@ -201,8 +201,10 @@ struct WebFace {
 /// in order (names compared ignoring ASCII case; generic families such as
 /// `serif` match only faces declared with that name), faces with the wanted
 /// style are preferred, then the face whose weight range is nearest using
-/// the §5.2 weight rules. Limitations: there are no system fonts besides the
-/// default, no synthetic bold or italic, and no per-character fallback, so
+/// the §5.2 weight rules. When the chosen face is lighter or more upright
+/// than wanted, text is drawn with synthetic bold or italic (see
+/// [`layout::FontMetrics::font_synthesis`]). Limitations: there are no system
+/// fonts besides the default and no per-character fallback, so
 /// characters missing from a web font draw its missing-glyph shape;
 /// `unicode-range` is ignored.
 #[derive(Debug, Clone, Default)]
@@ -335,6 +337,19 @@ impl layout::FontMetrics for FontCollection {
             }
         }
         layout::FontId::DEFAULT
+    }
+
+    /// The default font is taken to be upright and regular. A web face is
+    /// emboldened when 600 or more is wanted and its weight range ends
+    /// below 600, and slanted when italic is wanted and it is upright.
+    fn font_synthesis(&self, font: layout::FontId, weight: u16, italic: bool) -> (bool, bool) {
+        let face = (font.0 as usize)
+            .checked_sub(1)
+            .and_then(|index| self.faces.get(index));
+        match face {
+            Some(face) => (weight >= 600 && face.weight.1 < 600, italic && !face.italic),
+            None => (weight >= 600, italic),
+        }
     }
 
     fn font_advance(&self, font: layout::FontId, character: char, font_size: f32) -> f32 {

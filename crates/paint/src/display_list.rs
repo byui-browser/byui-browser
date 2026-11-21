@@ -1,6 +1,6 @@
 //! Display-list commands.
 
-use crate::{Color, CornerRadii, FontId, ImageKey, PaintBox, Rect};
+use crate::{Affine, Color, CornerRadii, FontId, ImageKey, PaintBox, Rect};
 
 /// One ordered drawing command. Coordinates are CSS pixels.
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +43,9 @@ pub enum DisplayItem {
     },
     /// Draws a run of text.
     Text {
+        /// Snap each glyph origin to device pixels for the optimizeSpeed rendering hint.
+        /// Other hints retain fractional glyph positions; shaping is not implemented.
+        snap_glyphs: bool,
         /// Left edge of the first glyph's advance.
         x: f32,
         /// The alphabetic baseline the glyphs sit on.
@@ -57,10 +60,30 @@ pub enum DisplayItem {
         text: String,
         /// Text color.
         color: Color,
+        /// Embolden the glyphs: the run wants a bold weight (600 or more)
+        /// but its face is not bold. Advances are unchanged.
+        synthetic_bold: bool,
+        /// Slant the glyphs: the run wants italic or oblique but its face
+        /// is upright.
+        synthetic_italic: bool,
         /// A rectangle the glyphs must not paint outside; `None` means
         /// unclipped. Set for text inside form controls
         /// ([`layout::TextFragment::clip`]).
         clip: Option<Rect>,
+    },
+    /// Strokes a straight line segment with round caps.
+    ///
+    /// Painted for the check mark of checked checkboxes.
+    StrokeLine {
+        /// Start point `(x, y)`.
+        from: (f32, f32),
+        /// End point `(x, y)`.
+        to: (f32, f32),
+        /// Stroke width; the line covers points within `width / 2` of the
+        /// segment.
+        width: f32,
+        /// Stroke color.
+        color: Color,
     },
     /// Draws a picture (a decoded bitmap or an SVG document) stretched to
     /// fill `rect`.
@@ -74,6 +97,32 @@ pub enum DisplayItem {
         /// Which picture to draw.
         image: ImageKey,
     },
+    /// Clips the items that follow, up to the next `Clip` or the end of the
+    /// current layer, to `rect`; `None` removes the clip.
+    ///
+    /// Painted for `overflow` other than `visible`. The rectangle is in the
+    /// current layer's coordinates. A layer starts unclipped; the clip in
+    /// effect before [`DisplayItem::BeginLayer`] returns after the matching
+    /// [`DisplayItem::EndLayer`] and clips the finished layer as it is drawn.
+    Clip {
+        /// The clip rectangle, or `None` for no clip.
+        rect: Option<Rect>,
+    },
+    /// Starts a group: the items up to the matching [`DisplayItem::EndLayer`]
+    /// are drawn onto a transparent surface, which is then mapped through
+    /// `transform` and blended over what is below at `opacity`.
+    ///
+    /// Painted for boxes with an `opacity` below 1 or a `transform`. Groups
+    /// nest.
+    BeginLayer {
+        /// Group opacity, from 0 to 1.
+        opacity: f32,
+        /// Maps the group's content (CSS pixels) to where it is drawn;
+        /// `None` draws it in place.
+        transform: Option<Affine>,
+    },
+    /// Ends the group the matching [`DisplayItem::BeginLayer`] started.
+    EndLayer,
 }
 
 /// An ordered list of paint commands, drawn back to front.

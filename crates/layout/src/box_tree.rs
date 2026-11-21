@@ -9,7 +9,7 @@ use css::PseudoElement;
 
 use html::{HTMLDocument, NodeID, NodeKind};
 
-use crate::control::FormControl;
+use crate::control::{CHECKBOX_RADIO_SIZE, ControlKind, FormControl, ToggleControl};
 use crate::replaced::{
     ImageKey, ImageMetrics, NaturalSize, ReplacedBox, parse_dimension_attribute, view_box_ratio,
 };
@@ -152,6 +152,114 @@ fn parent_text_align(
     crate::style::TextAlign::Start
 }
 
+/// Fades `color` by `alpha` (0 to 1).
+fn fade(color: css::CssColor, alpha: f32) -> css::CssColor {
+    css::CssColor {
+        a: (f32::from(color.a) * alpha).round() as u8,
+        ..color
+    }
+}
+
+/// Applies the opacity an element inherits from enclosing inline boxes,
+/// `inherited`, and returns the alpha its own inline-level children inherit.
+///
+/// Non-replaced inline boxes are not painted as groups. Instead their
+/// opacity, times that of enclosing inline boxes, multiplies the alpha of
+/// their own colors and of every descendant inline box and text run; this
+/// matches group opacity wherever the faded content does not overlap. Other
+/// boxes inside an inline box (inline blocks, images) multiply their own
+/// group opacity instead.
+fn apply_inline_alpha(style: &mut ComputedStyle, inherited: f32) -> f32 {
+    if style.display != Display::INLINE {
+        style.opacity *= inherited;
+        return 1.0;
+    }
+    let alpha = style.opacity * inherited;
+    style.opacity = 1.0;
+    if alpha < 1.0 {
+        style.color = fade(style.color, alpha);
+        style.background_color = style.background_color.map(|color| fade(color, alpha));
+        style.outline_color = fade(style.outline_color, alpha);
+        style.borders.border_color = style.borders.border_color.map(|color| fade(color, alpha));
+        style.box_shadow = style
+            .box_shadow
+            .iter()
+            .map(|shadow| crate::BoxShadow {
+                color: fade(shadow.color, alpha),
+                ..*shadow
+            })
+            .collect();
+    }
+    alpha
+}
+
+/// Applies the style adjustments that depend on an element's place in the
+/// tree, walking from `root` in tree order:
+///
+/// - inline opacity folding ([`apply_inline_alpha`]);
+/// - whether each element is a flex or grid item, for `z-index`;
+/// - `overflow` propagation: the root element's, or if that is `visible`,
+///   `body`'s, applies to the viewport (CSS Overflow 3 §3.3), so that
+///   element itself does not clip. Viewport clipping needs no work since
+///   the frame is the viewport, and scrolling it is the embedder's job.
+///
+/// Returns the inline alpha each element's children inherit, keyed by DOM
+/// index, for generated content.
+fn apply_tree_context(
+    document: &HTMLDocument,
+    root: Option<NodeID>,
+    styles: &mut [Option<Rc<ComputedStyle>>],
+) -> HashMap<usize, f32> {
+    let mut child_alpha = HashMap::new();
+    let Some(root) = root else {
+        return child_alpha;
+    };
+    let is_element = |node: NodeID, name: &str| {
+        matches!(
+            document.get_node(node).map(|node| node.get_kind()),
+            Some(NodeKind::Element(element)) if element.get_name() == name
+        )
+    };
+    let mut root_clips = false;
+    if let Some(Some(style)) = styles.get_mut(root.get()) {
+        root_clips = style.clip_x || style.clip_y;
+        let style = Rc::make_mut(style);
+        (style.clip_x, style.clip_y, style.clip_overflow) = (false, false, false);
+    }
+    // (node, alpha inherited from inline ancestors, parent is a flex/grid container)
+    let mut stack = vec![(root, 1.0_f32, false)];
+    while let Some((node, inherited, flex_parent)) = stack.pop() {
+        let mut passed = (inherited, flex_parent);
+        if let Some(Some(style)) = styles.get_mut(node.get()) {
+            let style = Rc::make_mut(style);
+            let alpha = apply_inline_alpha(style, inherited);
+            style.flex_item = flex_parent;
+            if !root_clips
+                && is_element(node, "body")
+                && document.get_node(node).and_then(|body| body.get_parent()) == Some(root)
+            {
+                (style.clip_x, style.clip_y, style.clip_overflow) = (false, false, false);
+            }
+            passed = match style.display {
+                // Children of `display: contents` are boxed as the parent's.
+                Display::Contents => (inherited, flex_parent),
+                Display::Box { inside, .. } => (
+                    alpha,
+                    matches!(inside, DisplayInside::Flex | DisplayInside::Grid),
+                ),
+                Display::None => (alpha, false),
+            };
+            child_alpha.insert(node.get(), passed.0);
+        }
+        if let Some(element) = document.get_node(node) {
+            for child in element.get_children().iter().rev() {
+                stack.push((*child, passed.0, passed.1));
+            }
+        }
+    }
+    child_alpha
+}
+
 impl StyleMap {
     /// Resolves every element's computed style. The root element's display is
     /// blockified (CSS Display 3 §2.8).
@@ -172,7 +280,7 @@ impl StyleMap {
                 )
             })
             .unwrap_or(css::values::MEDIUM_FONT_SIZE);
-        let resolved: Vec<Option<Rc<ComputedStyle>>> = (0..document.get_nodes_count())
+        let mut resolved: Vec<Option<Rc<ComputedStyle>>> = (0..document.get_nodes_count())
             .map(|index| {
                 let node = NodeID::new(index);
                 let declarations = styles.declarations_for(node)?;
@@ -188,9 +296,12 @@ impl StyleMap {
                 }
                 style.font =
                     fonts.select_font(&style.font_families, style.font_weight, style.font_italic);
+                style.font_synthesis =
+                    fonts.font_synthesis(style.font, style.font_weight, style.font_italic);
                 Some(Rc::new(style))
             })
             .collect();
+        let group_alpha = apply_tree_context(document, root, &mut resolved);
         let mut pseudo = HashMap::new();
         for (index, owner) in resolved.iter().enumerate() {
             let Some(owner) = owner else { continue };
@@ -199,11 +310,24 @@ impl StyleMap {
                 else {
                     continue;
                 };
-                let style = ComputedStyle::from_declarations(
+                let mut style = ComputedStyle::from_declarations(
                     declarations,
                     root_font_size,
                     viewport,
                     || owner.text_align,
+                );
+                style.font =
+                    fonts.select_font(&style.font_families, style.font_weight, style.font_italic);
+                style.font_synthesis =
+                    fonts.font_synthesis(style.font, style.font_weight, style.font_italic);
+                let inherited = group_alpha.get(&index).copied().unwrap_or(1.0);
+                apply_inline_alpha(&mut style, inherited);
+                style.flex_item = matches!(
+                    owner.display,
+                    Display::Box {
+                        inside: DisplayInside::Flex | DisplayInside::Grid,
+                        ..
+                    }
                 );
                 pseudo.insert((index, which), Rc::new(style));
             }
@@ -360,14 +484,40 @@ impl Builder<'_> {
             style.display,
             is_root || flow_root
         );
+        let control = self.form_control_sizing(node);
+        let contents = match &control {
+            // A drop-down shows only its selected option's text, as one
+            // synthetic run; its options and groups generate no boxes, and
+            // it never shows `::before` / `::after` content.
+            Some(FormControl::Select {
+                drop_down: Some(text),
+                ..
+            }) => BlockContents::Inlines(
+                (!text.is_empty())
+                    .then(|| {
+                        BuildStats::bump(&self.stats.text_runs);
+                        let style = self.styles.for_text_parent(Some(node));
+                        InlineItem::Text {
+                            node,
+                            element: Some(node),
+                            text: style.text_transform.apply(text),
+                            style,
+                            white_space: WhiteSpace::Collapse,
+                        }
+                    })
+                    .into_iter()
+                    .collect(),
+            ),
+            _ => self.container_contents(Some(node), children, style),
+        };
         BlockBox {
             node: Some(node),
-            contents: self.container_contents(Some(node), children, style),
+            contents,
             style: Rc::clone(style),
             // Floats and absolutely positioned boxes establish a new block
             // formatting context (CSS 2.2 §9.4.1).
             establishes_bfc: is_root || flow_root || style.is_out_of_flow(),
-            control: self.form_control_sizing(node),
+            control,
             clips_contents: false,
             centers_lines: false,
         }
@@ -685,8 +835,9 @@ impl Builder<'_> {
 }
 
 impl Builder<'_> {
-    /// The box for a replaced element (`<img>`, or an `<svg>` element that is
-    /// not inside another SVG element), or `None` for other elements.
+    /// The box for a replaced element (`<img>`, an `<svg>` element that is
+    /// not inside another SVG element, or a checkbox or radio `<input>`, which
+    /// is sized like a 13x13 image), or `None` for other elements.
     ///
     /// A broken `<img>` (no `src`, or one the embedder has no image for) with
     /// a non-empty `alt` and no `width`/`height` is shown as its `alt` text
@@ -706,7 +857,27 @@ impl Builder<'_> {
                 .map(|attribute| attribute.get_value().as_str())
         };
         let hint = |name: &str| attribute(name).map_or(Dimension::Auto, parse_dimension_attribute);
+        let mut control = None;
         let (key, natural) = match (element.get_name().as_str(), element.get_namespace()) {
+            ("input", html::Namespace::Html) => {
+                let kind = match attribute("type") {
+                    Some(kind) if kind.eq_ignore_ascii_case("checkbox") => ControlKind::Checkbox,
+                    Some(kind) if kind.eq_ignore_ascii_case("radio") => ControlKind::Radio,
+                    _ => return None,
+                };
+                control = Some(ToggleControl {
+                    kind,
+                    checked: attribute("checked").is_some(),
+                    disabled: attribute("disabled").is_some(),
+                });
+                (
+                    None,
+                    NaturalSize::from_size(crate::Size {
+                        width: CHECKBOX_RADIO_SIZE,
+                        height: CHECKBOX_RADIO_SIZE,
+                    }),
+                )
+            }
             ("img", html::Namespace::Html) => {
                 let src = attribute("src").map(str::trim).unwrap_or_default();
                 let key = ImageKey::Src(src.to_owned());
@@ -739,7 +910,7 @@ impl Builder<'_> {
                         }
                     }
                 };
-                (key, natural)
+                (Some(key), natural)
             }
             ("svg", html::Namespace::Svg) => {
                 let nested = self
@@ -771,7 +942,7 @@ impl Builder<'_> {
                         _ => None,
                     }),
                 };
-                (ImageKey::InlineSvg(node), natural)
+                (Some(ImageKey::InlineSvg(node)), natural)
             }
             _ => return None,
         };
@@ -788,9 +959,20 @@ impl Builder<'_> {
             centers_lines: false,
             contents: BlockContents::Replaced(ReplacedBox {
                 key,
+                control,
                 natural,
-                width_hint: hint("width"),
-                height_hint: hint("height"),
+                // The `width` and `height` attributes do not apply to
+                // checkbox and radio inputs.
+                width_hint: if control.is_some() {
+                    Dimension::Auto
+                } else {
+                    hint("width")
+                },
+                height_hint: if control.is_some() {
+                    Dimension::Auto
+                } else {
+                    hint("height")
+                },
             }),
             control: None,
         };
@@ -808,9 +990,15 @@ impl Builder<'_> {
     /// - `<textarea>` shows its child text, or its `placeholder` when it has
     ///   no text, as `white-space: pre-wrap` ([`WhiteSpace::PreWrap`]): line
     ///   breaks and spaces are kept and long lines wrap.
+    /// - `<input type=submit|reset|button>` shows its `value` (even when
+    ///   empty), or else "Submit", "Reset", or nothing, on one line. The
+    ///   defaults are not localized.
     ///
-    /// Other input types (buttons, checkboxes, dates, …) return `None` and
-    /// keep their empty inline-block box. Values changed at runtime, the
+    /// Single-line text drops CR and LF and shows tabs as one space. An
+    /// empty single-line control is still one line tall.
+    ///
+    /// Other input types (`image`, `file`, checkboxes, dates, …) return
+    /// `None` and keep their empty inline-block box. Values changed at runtime, the
     /// caret, and selection are not supported.
     fn form_control(
         &self,
@@ -844,17 +1032,17 @@ impl Builder<'_> {
         let block = match element.get_name().as_str() {
             "input" => {
                 let kind = attribute("type").unwrap_or_default().to_ascii_lowercase();
-                if !is_text_like_input_type(&kind) {
+                let button_label = button_input_default_label(&kind);
+                if button_label.is_none() && !is_text_like_input_type(&kind) {
                     return None;
                 }
-                let value: String = attribute("value")
-                    .unwrap_or_default()
-                    .chars()
-                    .filter(|character| !matches!(character, '\n' | '\r'))
-                    // Tab stops are not supported: a tab shows as one space.
-                    .map(|character| if character == '\t' { ' ' } else { character })
-                    .collect();
-                let (text, text_style) = if value.is_empty() {
+                let value = single_line_text(attribute("value").unwrap_or_default());
+                let (text, text_style) = if let Some(default_label) = button_label {
+                    // The label is the value, even when empty.
+                    let label =
+                        attribute("value").map_or_else(|| default_label.to_owned(), |_| value);
+                    (label, Rc::clone(style))
+                } else if value.is_empty() {
                     placeholder(true)
                 } else if kind == "password" {
                     ("\u{2022}".repeat(value.chars().count()), Rc::clone(style))
@@ -925,7 +1113,8 @@ impl Builder<'_> {
     /// line with its spaces preserved (as [`WhiteSpace::Pre`]),
     /// centered vertically in the content box, and clipped to the padding
     /// box. Horizontal placement follows the control's `text-align`. Empty
-    /// `text` gives a box with no lines. `text-transform` is applied here.
+    /// `text` gives a box whose only line is an empty strut, so it is still
+    /// one line tall. `text-transform` is applied here.
     ///
     /// Wrap the result with [`level_for`] (or `InlineItem::Atomic`) to place
     /// it.
@@ -963,6 +1152,28 @@ pub(crate) const PLACEHOLDER_COLOR: css::CssColor = css::CssColor {
     b: 0x75,
     a: 255,
 };
+
+/// `text` for one line of a control: CR and LF are dropped, and each tab
+/// shows as one space because tab stops are not supported.
+fn single_line_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| !matches!(character, '\n' | '\r'))
+        .map(|character| if character == '\t' { ' ' } else { character })
+        .collect()
+}
+
+/// The label an `<input>` button with the lowercased `type` value `kind`
+/// shows when it has no `value` attribute: "Submit" for `submit`, "Reset"
+/// for `reset`, and no text for `button`. `None` for other types. The
+/// labels are not localized; `type=image` is not a labelled button here.
+fn button_input_default_label(kind: &str) -> Option<&'static str> {
+    match kind {
+        "submit" => Some("Submit"),
+        "reset" => Some("Reset"),
+        "button" => Some(""),
+        _ => None,
+    }
+}
 
 /// Whether an `<input>` with the lowercased `type` value `kind` is a text
 /// field. Missing, empty, and unknown types are `text` per HTML.

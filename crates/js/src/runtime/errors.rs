@@ -224,6 +224,31 @@ pub(crate) fn decode_uri_component(input: &str) -> Result<String, &'static str> 
     Ok(output)
 }
 
+pub(super) fn decode_uri(input: &str) -> Result<String, &'static str> {
+    const RESERVED: &str = ";/?:@&=+$,#";
+    let bytes = input.as_bytes();
+    let mut output = String::new();
+    let mut index = 0;
+    let mut chunk_start = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&input[index + 1..index + 3], 16)
+            && byte.is_ascii()
+            && RESERVED.contains(char::from(byte))
+        {
+            output.push_str(&decode_uri_component(&input[chunk_start..index])?);
+            output.push_str(&input[index..index + 3]);
+            index += 3;
+            chunk_start = index;
+            continue;
+        }
+        index += 1;
+    }
+    output.push_str(&decode_uri_component(&input[chunk_start..])?);
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::decode_uri_component;

@@ -200,3 +200,30 @@ fn denied_context_cannot_write_storage() {
         Ok(Value::String("original".into()))
     );
 }
+
+#[test]
+fn opaque_origin_cannot_access_storage_even_when_allowed() {
+    let storage = shared_storage(OriginStorage::new());
+    let mut opaque = realm(
+        storage,
+        RendererSecurityContext::new(Origin::new("opaque", "", None), StoragePermission::Allowed),
+    );
+
+    assert_eq!(
+        get_item(&mut opaque, "secret").unwrap_err().to_string(),
+        "Uncaught SecurityError: localStorage read access denied"
+    );
+    assert_eq!(
+        opaque
+            .call_global(
+                "localStorage.setItem",
+                &[
+                    Value::String("secret".into()),
+                    Value::String("value".into())
+                ],
+            )
+            .unwrap_err()
+            .to_string(),
+        "Uncaught SecurityError: localStorage write access denied"
+    );
+}

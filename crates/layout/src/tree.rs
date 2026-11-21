@@ -3,19 +3,27 @@
 //! All coordinates are absolute CSS pixels with the origin at the top-left of
 //! the initial containing block (the viewport).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use css::CssColor;
 use html::NodeID;
 
-use crate::{BorderRadius, BoxShadow, Edges, ImageKey, Rect};
+use crate::{BorderRadius, BoxShadow, Edges, ImageKey, Rect, ToggleControl};
 
 /// Paint-relevant computed values for a box or inline box fragment.
 ///
-/// Colors, borders, corner radii, and outer box shadows are painted today;
-/// Inset shadows, and other decorations are not supported yet.
+/// Colors, borders, corner radii, outlines, text decorations, outer box
+/// shadows, opacity, transforms, and overflow clipping are painted today.
+/// Inset shadows and full background layers are not supported yet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoxStyle {
+    /// Used selection mode for expanding user-select:all across descendant runs.
+    pub user_select: String,
+    /// CSS cursor keyword used when the pointer hits this box. Image cursors use their fallback.
+    pub cursor: String,
+    /// Whether visibility suppresses this fragment. Collapse currently behaves as hidden.
+    pub hidden: bool,
     /// The background color, or `None` when it is transparent or unsupported.
     pub background_color: Option<CssColor>,
     /// The computed `color`, used for text.
@@ -30,14 +38,42 @@ pub struct BoxStyle {
     /// Per-side CSS styles. Dashed, dotted, and double are painted;
     /// relief styles currently use a solid fill. Border corners are square.
     pub border_style: crate::Sides<String>,
+    /// The outline color. Outlines are outside the border and do not affect layout.
+    pub outline_color: CssColor,
+    /// Outline width in CSS pixels; zero when the outline is not visible.
+    pub outline_width: f32,
+    /// Distance between the border edge and outline in CSS pixels.
+    pub outline_offset: f32,
+    /// Outline pattern, such as `solid`, `dashed`, or `dotted`.
+    pub outline_style: String,
     /// The computed `box-shadow` list, first (topmost) shadow first; empty
     /// for `none`. Shadows follow the rounded border box.
     pub box_shadow: Arc<[BoxShadow]>,
+    /// The computed `opacity`, from 0 to 1. A box with an opacity below 1 is
+    /// painted as a group: its content is drawn, then blended at this
+    /// opacity. Always 1 on inline box fragments, whose opacity layout folds
+    /// into their colors and their text's colors.
+    pub opacity: f32,
+    /// The `transform` and `transform-origin`; `None` for `none` and on
+    /// inline box fragments, which transforms do not apply to. Resolve it
+    /// with [`LayoutBox::transform_matrix`].
+    pub transform: Option<crate::Transform>,
+    /// The `z-index` when it applies (positioned boxes and flex items) and
+    /// is not `auto`. Such a box creates a stacking context.
+    pub z_index: Option<i32>,
+    /// Whether descendants are clipped horizontally at the padding box
+    /// (`overflow-x` other than `visible`). Scrolling is not supported.
+    pub clip_x: bool,
+    /// Whether descendants are clipped vertically at the padding box.
+    pub clip_y: bool,
 }
 
 impl Default for BoxStyle {
     fn default() -> Self {
         Self {
+            user_select: "auto".into(),
+            cursor: "auto".into(),
+            hidden: false,
             background_color: None,
             text_color: css::user_agent_default_color("color")
                 .expect("user-agent stylesheet must define html color"),
@@ -45,7 +81,16 @@ impl Default for BoxStyle {
             border_width: Edges::default(),
             border_color: crate::Sides::from_array([css::parse_color("black").unwrap(); 4]),
             border_style: crate::Sides::from_array(std::array::from_fn(|_| "none".to_owned())),
+            outline_color: css::parse_color("black").unwrap(),
+            outline_width: 0.0,
+            outline_offset: 0.0,
+            outline_style: "none".to_owned(),
             box_shadow: Arc::from(Vec::new()),
+            opacity: 1.0,
+            transform: None,
+            z_index: None,
+            clip_x: false,
+            clip_y: false,
         }
     }
 }
@@ -133,12 +178,81 @@ pub struct LayoutBox {
     /// Line boxes when the box establishes an inline formatting context, in
     /// order from top to bottom.
     pub lines: Vec<LineBox>,
+    /// Whether to draw a drop-down arrow: a small down chevron, vertically
+    /// centered near the right of the padding box. Set for single-choice
+    /// `<select>` elements, whose layout keeps the arrow area free of text.
+    pub select_arrow: bool,
     /// For [`BoxKind::Replaced`] boxes, the picture to draw in the content
     /// box; `None` for every other kind.
     pub image: Option<ImageKey>,
+    /// For [`BoxKind::Replaced`] boxes of checkbox and radio inputs, the
+    /// control to draw in the content box; `None` for every other box.
+    pub control: Option<ToggleControl>,
 }
 
 impl LayoutBox {
+    /// The matrix [`BoxStyle::transform`] resolves to for this box's border
+    /// box, mapping its content to where it is drawn; `None` without a
+    /// transform.
+    pub fn transform_matrix(&self) -> Option<crate::Affine> {
+        self.style
+            .transform
+            .as_ref()
+            .map(|transform| transform.matrix(self.rect))
+    }
+
+    /// Whether the box is painted as a group that is blended or transformed
+    /// as a whole: its opacity is below 1 or it has a transform. Such boxes
+    /// appear between [`PaintItem::BeginLayer`] and [`PaintItem::EndLayer`].
+    pub fn is_layer(&self) -> bool {
+        self.kind != BoxKind::Viewport
+            && (self.style.opacity < 1.0 || self.style.transform.is_some())
+    }
+
+    /// Whether the box creates a stacking context (CSS 2.2 §9.9.1, CSS
+    /// Positioned Layout 3 §6): it is a layer, has a `z-index` that applies,
+    /// or is `fixed` or `sticky`. The viewport is the root stacking context.
+    pub fn creates_stacking_context(&self) -> bool {
+        self.kind == BoxKind::Viewport
+            || self.is_layer()
+            || self.style.z_index.is_some()
+            || matches!(self.placement, Placement::Fixed | Placement::Sticky)
+    }
+
+    /// The rectangle `overflow` clips this box's descendants to: the
+    /// padding box, unbounded along an axis that does not clip. `None` when
+    /// neither axis clips.
+    pub fn overflow_clip(&self) -> Option<Rect> {
+        const UNBOUNDED: f32 = 1.0e9;
+        let style = &self.style;
+        if !style.clip_x && !style.clip_y {
+            return None;
+        }
+        let border = style.border_width;
+        let padding_box = Rect {
+            x: self.rect.x + border.left,
+            y: self.rect.y + border.top,
+            width: (self.rect.width - border.horizontal()).max(0.0),
+            height: (self.rect.height - border.vertical()).max(0.0),
+        };
+        let (x, width) = if style.clip_x {
+            (padding_box.x, padding_box.width)
+        } else {
+            (-UNBOUNDED, 2.0 * UNBOUNDED)
+        };
+        let (y, height) = if style.clip_y {
+            (padding_box.y, padding_box.height)
+        } else {
+            (-UNBOUNDED, 2.0 * UNBOUNDED)
+        };
+        Some(Rect {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
     /// The content box: the border box minus borders and padding.
     pub fn content_rect(&self) -> Rect {
         Rect {
@@ -225,6 +339,15 @@ pub struct InlineBoxFragment {
 /// A run of text placed on a line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextFragment {
+    /// CSS cursor keyword inherited by this text.
+    pub cursor: String,
+    /// Selection behavior: auto/text allow ranges, none excludes text, all selects the element.
+    /// Containment selection is not implemented.
+    pub user_select: String,
+    /// CSS rendering hint. Kerning and shaping are not implemented.
+    pub text_rendering: String,
+    /// Whether inherited visibility suppresses painting and hit testing.
+    pub hidden: bool,
     /// The DOM text node the run comes from.
     pub node: NodeID,
     /// The text node's parent element, which is the hit-test target for the
@@ -243,10 +366,19 @@ pub struct TextFragment {
     pub font: crate::FontId,
     /// The text color.
     pub color: CssColor,
+    /// Whether the run wants a bold weight its face lacks, so the renderer
+    /// emboldens the glyphs; see [`crate::FontMetrics::font_synthesis`].
+    pub synthetic_bold: bool,
+    /// Whether the run wants an italic or oblique style its face lacks, so
+    /// the renderer slants the glyphs.
+    pub synthetic_italic: bool,
+    /// Text decoration lines such as `underline`; empty for undecorated text.
+    pub text_decoration: Vec<String>,
     /// A rectangle the glyphs must not paint outside, in the same absolute
     /// coordinates as `rect`; `None` means unclipped. Set for text inside
     /// form controls, which is clipped to the control's padding box. The
-    /// `overflow` property does not clip other content yet.
+    /// `overflow` property also clips text runs this way; other content is
+    /// clipped with [`PaintItem::Clip`].
     pub clip: Option<Rect>,
 }
 
@@ -270,30 +402,132 @@ pub enum PaintItem<'a> {
     InlineBox(&'a InlineBoxFragment),
     /// A text run.
     Text(&'a TextFragment),
-    /// The picture of a [`BoxKind::Replaced`] box, drawn in its content box
-    /// after its background.
+    /// The picture or form control of a [`BoxKind::Replaced`] box, drawn in
+    /// its content box after its background.
     Image(&'a LayoutBox),
+    /// Clips the items that follow, up to the next `Clip` or the end of the
+    /// current layer, to a rectangle in the current layer's coordinates;
+    /// `None` removes the clip. Each layer starts unclipped, and the clip in
+    /// effect before [`PaintItem::BeginLayer`] is in effect again after the
+    /// matching [`PaintItem::EndLayer`] and also clips the finished layer.
+    Clip(Option<Rect>),
+    /// Starts a group for a box where [`LayoutBox::is_layer`] holds. The
+    /// items up to the matching [`PaintItem::EndLayer`] are drawn onto a
+    /// transparent surface, which is then mapped through the box's
+    /// [`LayoutBox::transform_matrix`] and blended at its opacity. Layers
+    /// nest.
+    BeginLayer(&'a LayoutBox),
+    /// Ends the group the matching [`PaintItem::BeginLayer`] started.
+    EndLayer(&'a LayoutBox),
 }
 
 impl LayoutTree {
+    /// Returns the CSS cursor keyword at a document point in CSS pixels.
+    /// Visible text with an auto cursor uses the text cursor; empty space uses auto.
+    /// Transforms and overflow clipping are honored as in [`Self::hit_test`].
+    pub fn cursor_at(&self, x: f32, y: f32) -> &str {
+        for (item, (x, y)) in self.hit_candidates(x, y).into_iter().rev() {
+            let (rect, hidden, cursor) = match item {
+                PaintItem::Text(t) if t.clip.is_none_or(|clip| clip.contains(x, y)) => {
+                    if !t.hidden && t.rect.contains(x, y) {
+                        return if t.cursor == "auto" {
+                            "text"
+                        } else {
+                            &t.cursor
+                        };
+                    }
+                    continue;
+                }
+                PaintItem::InlineBox(b) => (b.rect, b.style.hidden, &b.style.cursor),
+                PaintItem::BoxDecorations(b) | PaintItem::Image(b) => {
+                    (b.rect, b.style.hidden, &b.style.cursor)
+                }
+                _ => continue,
+            };
+            if !hidden && rect.contains(x, y) {
+                return cursor;
+            }
+        }
+        "auto"
+    }
+
     /// Lists everything to paint, back to front.
     ///
-    /// Within the root stacking context this follows CSS 2.2 Appendix E: the
-    /// canvas, then the backgrounds of all block-level boxes in
-    /// tree order, then the inline content of every line box in tree order.
-    /// The picture of a block-level replaced box is painted at its place in
-    /// that last step, as CSS 2.2 Appendix E step 7 says.
-    /// Floats are painted atomically after the block backgrounds and before
-    /// inline content; positioned boxes are painted atomically, in tree order,
-    /// after everything else in their parent's stacking layer. Atomic inlines
-    /// are painted as if they created a stacking context, at their place in
-    /// the line. `z-index` is not supported, so positioned boxes never paint
-    /// below in-flow content.
+    /// Each stacking context paints in the order CSS 2.2 Appendix E gives:
+    /// its root's background and borders, then descendant stacking contexts
+    /// with a negative `z-index`, the backgrounds of in-flow block-level
+    /// boxes in tree order, floats, inline content (line by line), and
+    /// finally positioned boxes and stacking contexts with `z-index: auto`
+    /// or 0 followed by those with a positive `z-index`, ordered by
+    /// `z-index` and then tree order. Stacking contexts
+    /// ([`LayoutBox::creates_stacking_context`]) are painted whole.
+    /// Positioned boxes without a `z-index`, floats, and atomic inlines are
+    /// painted as if they created one, except that their positioned
+    /// descendants and stacking contexts join the enclosing stacking
+    /// context. The picture of a replaced box is painted at its place in the
+    /// inline content step.
+    ///
+    /// Boxes with an opacity below 1 or a transform are wrapped in
+    /// [`PaintItem::BeginLayer`] and [`PaintItem::EndLayer`]. `overflow`
+    /// clipping is expressed with [`PaintItem::Clip`]: it applies to a box's
+    /// descendants but not to its own background and borders, and not to
+    /// absolutely positioned descendants whose containing block is outside
+    /// the clipping box, nor to `fixed` ones.
+    ///
+    /// Limitation: the relative tree order of a box's line content and its
+    /// out-of-flow children is approximated as lines first.
     pub fn paint_order(&self) -> Vec<PaintItem<'_>> {
-        let mut items = Vec::new();
-        paint_atomically(&self.root, &mut items);
+        let mut order = HashMap::new();
+        number_boxes(&self.root, &mut order);
+        let painter = Painter { order };
+        let mut steps = Vec::new();
+        painter.stacking_context(&self.root, None, &mut steps);
+        let items = flatten(steps);
         log::trace!("paint order: {} items", items.len());
         items
+    }
+
+    /// The leaf items of [`Self::paint_order`] that the point `(x, y)`
+    /// (document CSS pixels) is not clipped away from, in paint order, each
+    /// with the point mapped into the item's coordinates through the
+    /// inverse of every enclosing transform.
+    fn hit_candidates(&self, x: f32, y: f32) -> Vec<(PaintItem<'_>, (f32, f32))> {
+        /// Per layer: the point in its coordinates (`None` when a singular
+        /// transform makes the layer invisible) and the current clip.
+        type Frame = (Option<(f32, f32)>, Option<Rect>);
+        let mut frames: Vec<Frame> = vec![(Some((x, y)), None)];
+        let mut candidates = Vec::new();
+        for item in self.paint_order() {
+            let (point, clip) = *frames.last().expect("the root frame is never popped");
+            let visible = point.filter(|&(px, py)| clip.is_none_or(|clip| clip.contains(px, py)));
+            match item {
+                PaintItem::Clip(rect) => {
+                    if let Some(frame) = frames.last_mut() {
+                        frame.1 = rect;
+                    }
+                }
+                PaintItem::BeginLayer(layer) => {
+                    let inner = match layer.transform_matrix() {
+                        Some(matrix) => visible.and_then(|(px, py)| {
+                            matrix.inverse().map(|inverse| inverse.apply(px, py))
+                        }),
+                        None => visible,
+                    };
+                    frames.push((inner, None));
+                }
+                PaintItem::EndLayer(_) => {
+                    if frames.len() > 1 {
+                        frames.pop();
+                    }
+                }
+                _ => {
+                    if let Some(point) = visible {
+                        candidates.push((item, point));
+                    }
+                }
+            }
+        }
+        candidates
     }
 
     /// The height of the document's scrollable area, in CSS pixels.
@@ -305,8 +539,8 @@ impl LayoutTree {
     /// scrollable by `scroll_height() - root.rect.height` CSS pixels.
     ///
     /// Only vertical overflow is measured; horizontal scrolling is not
-    /// supported yet. Content of `overflow: hidden` boxes still counts, since
-    /// overflow clipping is not implemented.
+    /// supported yet. Content clipped by a box with `overflow-y` other than
+    /// `visible` does not count; transforms are ignored.
     pub fn scroll_height(&self) -> f32 {
         lowest_edge(&self.root).max(self.root.rect.bottom())
     }
@@ -317,23 +551,31 @@ impl LayoutTree {
     /// The topmost painted item wins, so this matches what is drawn: text hits
     /// its parent element, inline box fragments hit their element, and block
     /// boxes hit their element anywhere in their border box. Anonymous boxes
-    /// are transparent to hit testing. Content overflowing its parent is still
-    /// hit, since overflow clipping is not implemented.
+    /// are transparent to hit testing. Points outside an `overflow` clip
+    /// miss the clipped content, and transformed boxes are hit where they
+    /// are drawn. Boxes with `opacity: 0` are still hit, as in CSS.
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeID> {
-        let hit = self
-            .paint_order()
-            .into_iter()
-            .rev()
-            .find_map(|item| match item {
-                PaintItem::BoxDecorations(layout_box) => {
-                    layout_box.node.filter(|_| layout_box.rect.contains(x, y))
-                }
-                PaintItem::InlineBox(inline) => inline.rect.contains(x, y).then_some(inline.node),
-                PaintItem::Text(text) => text.element.filter(|_| text.rect.contains(x, y)),
-                PaintItem::Image(layout_box) => {
-                    layout_box.node.filter(|_| layout_box.rect.contains(x, y))
-                }
-            });
+        let hit =
+            self.hit_candidates(x, y)
+                .into_iter()
+                .rev()
+                .find_map(|(item, (x, y))| match item {
+                    PaintItem::BoxDecorations(layout_box) => layout_box
+                        .node
+                        .filter(|_| !layout_box.style.hidden && layout_box.rect.contains(x, y)),
+                    PaintItem::InlineBox(inline) => {
+                        (!inline.style.hidden && inline.rect.contains(x, y)).then_some(inline.node)
+                    }
+                    PaintItem::Text(text) => text.element.filter(|_| {
+                        !text.hidden
+                            && text.rect.contains(x, y)
+                            && text.clip.is_none_or(|clip| clip.contains(x, y))
+                    }),
+                    PaintItem::Image(layout_box) => layout_box
+                        .node
+                        .filter(|_| !layout_box.style.hidden && layout_box.rect.contains(x, y)),
+                    PaintItem::Clip(_) | PaintItem::BeginLayer(_) | PaintItem::EndLayer(_) => None,
+                });
         match hit {
             Some(node) => log::trace!("hit test at ({x}, {y}): node {node:?}"),
             None => log::trace!("hit test at ({x}, {y}): canvas (no node)"),
@@ -346,6 +588,9 @@ impl LayoutTree {
 /// descendants, in absolute CSS pixels.
 fn lowest_edge(layout_box: &LayoutBox) -> f32 {
     let own = layout_box.rect.bottom() + layout_box.margin.bottom.max(0.0);
+    if layout_box.kind != BoxKind::Viewport && layout_box.style.clip_y {
+        return own;
+    }
     let lines = layout_box.lines.iter().flat_map(|line| {
         let atomics = line.fragments.iter().filter_map(|fragment| match fragment {
             LineFragment::Atomic(atomic) => Some(lowest_edge(atomic)),
@@ -357,68 +602,307 @@ fn lowest_edge(layout_box: &LayoutBox) -> f32 {
     lines.chain(children).fold(own, f32::max)
 }
 
-/// Paints a box and its descendants as one layer: block backgrounds, then
-/// floats, then inline content, then positioned descendants.
-fn paint_atomically<'a>(layout_box: &'a LayoutBox, items: &mut Vec<PaintItem<'a>>) {
-    items.push(PaintItem::BoxDecorations(layout_box));
-    let mut layers = Layers::default();
-    for child in &layout_box.children {
-        push_block_decorations(child, items, &mut layers);
-    }
-    for float in layers.floats {
-        paint_atomically(float, items);
-    }
-    push_inline_content(layout_box, items);
-    for positioned in layers.positioned {
-        paint_atomically(positioned, items);
-    }
-}
-
-/// Floats and positioned boxes found while painting in-flow blocks; each is
-/// painted later as a whole.
-#[derive(Default)]
-struct Layers<'a> {
-    floats: Vec<&'a LayoutBox>,
-    positioned: Vec<&'a LayoutBox>,
-}
-
-fn push_block_decorations<'a>(
-    layout_box: &'a LayoutBox,
-    items: &mut Vec<PaintItem<'a>>,
-    layers: &mut Layers<'a>,
-) {
-    if layout_box.placement.is_positioned() {
-        layers.positioned.push(layout_box);
-        return;
-    }
-    if layout_box.placement == Placement::Float {
-        layers.floats.push(layout_box);
-        return;
-    }
-    items.push(PaintItem::BoxDecorations(layout_box));
-    for child in &layout_box.children {
-        push_block_decorations(child, items, layers);
-    }
-}
-
-fn push_inline_content<'a>(layout_box: &'a LayoutBox, items: &mut Vec<PaintItem<'a>>) {
-    if layout_box.image.is_some() {
-        items.push(PaintItem::Image(layout_box));
-    }
+/// Numbers every box in tree order (lines before out-of-flow children),
+/// keyed by address, to sort stacking context entries.
+fn number_boxes(layout_box: &LayoutBox, order: &mut HashMap<*const LayoutBox, usize>) {
+    order.insert(std::ptr::from_ref(layout_box), order.len());
     for line in &layout_box.lines {
         for fragment in &line.fragments {
-            match fragment {
-                LineFragment::InlineBox(inline) => items.push(PaintItem::InlineBox(inline)),
-                LineFragment::Text(text) => items.push(PaintItem::Text(text)),
-                LineFragment::Atomic(atomic) => paint_atomically(atomic, items),
+            if let LineFragment::Atomic(atomic) = fragment {
+                number_boxes(atomic, order);
             }
         }
     }
     for child in &layout_box.children {
-        if child.placement == Placement::InFlow {
-            push_inline_content(child, items);
+        number_boxes(child, order);
+    }
+}
+
+/// One paint step with the clip it is drawn under, in the coordinates of
+/// the enclosing layer.
+type Step<'a> = (PaintItem<'a>, Option<Rect>);
+
+/// A positioned box or stacking context waiting to be painted in its
+/// stacking context's z-ordered steps.
+struct Entry<'a> {
+    z: i32,
+    order: usize,
+    steps: Vec<Step<'a>>,
+}
+
+/// The `overflow` clips in effect for a box's descendants, by how they are
+/// positioned: in-flow, floated, and relatively positioned boxes use
+/// `flow`; absolutely positioned ones are clipped only by boxes that
+/// contain their containing block, `absolute`; fixed ones by `fixed`.
+#[derive(Clone, Copy, Default)]
+struct Clips {
+    flow: Option<Rect>,
+    absolute: Option<Rect>,
+    fixed: Option<Rect>,
+}
+
+impl Clips {
+    /// The clip a child placed by `placement` is drawn under.
+    fn for_box(self, placement: Placement) -> Option<Rect> {
+        match placement {
+            Placement::Absolute => self.absolute,
+            Placement::Fixed => self.fixed,
+            _ => self.flow,
         }
     }
+
+    /// The clips for the descendants of `layout_box`, a box whose parent's
+    /// descendants use `self`.
+    fn inside(self, layout_box: &LayoutBox) -> Self {
+        let own = self.for_box(layout_box.placement);
+        let flow = match (own, layout_box.overflow_clip()) {
+            (Some(outer), Some(inner)) => Some(intersect(outer, inner)),
+            (outer, inner) => inner.or(outer),
+        };
+        let contains_absolute = layout_box.placement.is_positioned()
+            || layout_box.style.transform.is_some()
+            || layout_box.kind == BoxKind::Viewport;
+        Self {
+            flow,
+            absolute: if contains_absolute {
+                flow
+            } else {
+                self.absolute
+            },
+            fixed: if layout_box.style.transform.is_some() {
+                flow
+            } else {
+                self.fixed
+            },
+        }
+    }
+}
+
+/// The overlap of two rectangles; empty (zero-sized) when they are apart.
+fn intersect(a: Rect, b: Rect) -> Rect {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    Rect {
+        x,
+        y,
+        width: (a.right().min(b.right()) - x).max(0.0),
+        height: (a.bottom().min(b.bottom()) - y).max(0.0),
+    }
+}
+
+/// Builds the steps of [`LayoutTree::paint_order`].
+struct Painter {
+    order: HashMap<*const LayoutBox, usize>,
+}
+
+impl Painter {
+    fn order(&self, layout_box: &LayoutBox) -> usize {
+        self.order
+            .get(&std::ptr::from_ref(layout_box))
+            .copied()
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Paints a stacking context rooted at `root`, drawn under `clip`.
+    fn stacking_context<'a>(
+        &self,
+        root: &'a LayoutBox,
+        clip: Option<Rect>,
+        out: &mut Vec<Step<'a>>,
+    ) {
+        let layer = root.is_layer();
+        // A layer's content is drawn in its own, initially unclipped space.
+        let base = if layer { None } else { clip };
+        if layer {
+            out.push((PaintItem::BeginLayer(root), clip));
+        }
+        out.push((PaintItem::BoxDecorations(root), base));
+        // Descendants are clipped by the root's own overflow too. The root
+        // contains its absolutely positioned descendants (approximated for
+        // non-positioned roots, which only an opacity makes stacking
+        // contexts); fixed ones escape every clip but a transformed root's.
+        let flow = match (base, root.overflow_clip()) {
+            (Some(outer), Some(inner)) => Some(intersect(outer, inner)),
+            (outer, inner) => inner.or(outer),
+        };
+        let inside = Clips {
+            flow,
+            absolute: flow,
+            fixed: if root.style.transform.is_some() {
+                flow
+            } else {
+                None
+            },
+        };
+        let mut entries = Vec::new();
+        let mut body = Vec::new();
+        self.contents(root, base, inside, &mut body, &mut entries);
+        entries.sort_by_key(|entry| (entry.z, entry.order));
+        let split = entries.partition_point(|entry| entry.z < 0);
+        let mut entries = entries.into_iter();
+        for entry in entries.by_ref().take(split) {
+            out.extend(entry.steps);
+        }
+        out.extend(body);
+        for entry in entries {
+            out.extend(entry.steps);
+        }
+        if layer {
+            out.push((PaintItem::EndLayer(root), clip));
+        }
+    }
+
+    /// Paints `layout_box`'s descendants: in-flow block backgrounds, then
+    /// floats, then inline content. `own` is the clip the box itself is
+    /// drawn under and `inside` the clips of its descendants. Positioned
+    /// boxes and stacking contexts are added to `entries` instead.
+    fn contents<'a>(
+        &self,
+        layout_box: &'a LayoutBox,
+        own: Option<Rect>,
+        inside: Clips,
+        out: &mut Vec<Step<'a>>,
+        entries: &mut Vec<Entry<'a>>,
+    ) {
+        let mut floats = Vec::new();
+        for child in &layout_box.children {
+            self.block_backgrounds(child, inside, out, &mut floats, entries);
+        }
+        for (float, clips) in floats {
+            self.pseudo_stacking_context(float, clips, out, entries);
+        }
+        self.inline_content(layout_box, own, inside, out, entries);
+    }
+
+    /// Defers `layout_box` to its stacking context's entries if it is
+    /// positioned or creates a stacking context; returns whether it did.
+    fn defer<'a>(
+        &self,
+        layout_box: &'a LayoutBox,
+        clips: Clips,
+        entries: &mut Vec<Entry<'a>>,
+    ) -> bool {
+        let mut steps = Vec::new();
+        if layout_box.creates_stacking_context() {
+            self.stacking_context(layout_box, clips.for_box(layout_box.placement), &mut steps);
+        } else if layout_box.placement.is_positioned() {
+            self.pseudo_stacking_context(layout_box, clips, &mut steps, entries);
+        } else {
+            return false;
+        }
+        entries.push(Entry {
+            z: layout_box.style.z_index.unwrap_or(0),
+            order: self.order(layout_box),
+            steps,
+        });
+        true
+    }
+
+    /// The block background pass over an in-flow child and its in-flow
+    /// descendants, collecting floats for later.
+    fn block_backgrounds<'a>(
+        &self,
+        layout_box: &'a LayoutBox,
+        clips: Clips,
+        out: &mut Vec<Step<'a>>,
+        floats: &mut Vec<(&'a LayoutBox, Clips)>,
+        entries: &mut Vec<Entry<'a>>,
+    ) {
+        if self.defer(layout_box, clips, entries) {
+            return;
+        }
+        if layout_box.placement == Placement::Float {
+            floats.push((layout_box, clips));
+            return;
+        }
+        out.push((
+            PaintItem::BoxDecorations(layout_box),
+            clips.for_box(layout_box.placement),
+        ));
+        let inside = clips.inside(layout_box);
+        for child in &layout_box.children {
+            self.block_backgrounds(child, inside, out, floats, entries);
+        }
+    }
+
+    /// Paints a float, atomic inline, or positioned box without a
+    /// `z-index` as if it created a stacking context, leaving its
+    /// positioned descendants and stacking contexts to `entries`.
+    fn pseudo_stacking_context<'a>(
+        &self,
+        layout_box: &'a LayoutBox,
+        clips: Clips,
+        out: &mut Vec<Step<'a>>,
+        entries: &mut Vec<Entry<'a>>,
+    ) {
+        let own = clips.for_box(layout_box.placement);
+        out.push((PaintItem::BoxDecorations(layout_box), own));
+        self.contents(layout_box, own, clips.inside(layout_box), out, entries);
+    }
+
+    /// The inline content pass: `layout_box`'s picture, its lines, and the
+    /// inline content of its in-flow block descendants.
+    fn inline_content<'a>(
+        &self,
+        layout_box: &'a LayoutBox,
+        own: Option<Rect>,
+        inside: Clips,
+        out: &mut Vec<Step<'a>>,
+        entries: &mut Vec<Entry<'a>>,
+    ) {
+        if layout_box.image.is_some() || layout_box.control.is_some() {
+            out.push((PaintItem::Image(layout_box), own));
+        }
+        for line in &layout_box.lines {
+            for fragment in &line.fragments {
+                match fragment {
+                    LineFragment::InlineBox(inline) => {
+                        out.push((PaintItem::InlineBox(inline), inside.flow));
+                    }
+                    LineFragment::Text(text) => out.push((PaintItem::Text(text), inside.flow)),
+                    LineFragment::Atomic(atomic) => {
+                        if !self.defer(atomic, inside, entries) {
+                            self.pseudo_stacking_context(atomic, inside, out, entries);
+                        }
+                    }
+                }
+            }
+        }
+        for child in &layout_box.children {
+            if child.placement == Placement::InFlow && !child.creates_stacking_context() {
+                let own = inside.for_box(child.placement);
+                self.inline_content(child, own, inside.inside(child), out, entries);
+            }
+        }
+    }
+}
+
+/// Turns clip-annotated steps into paint items, emitting
+/// [`PaintItem::Clip`] whenever the clip changes within a layer.
+fn flatten(steps: Vec<Step<'_>>) -> Vec<PaintItem<'_>> {
+    let mut items = Vec::with_capacity(steps.len());
+    let mut current = None;
+    let mut saved = Vec::new();
+    for (item, clip) in steps {
+        match item {
+            PaintItem::EndLayer(_) => {
+                items.push(item);
+                current = saved.pop().unwrap_or(None);
+            }
+            _ => {
+                if clip != current {
+                    items.push(PaintItem::Clip(clip));
+                    current = clip;
+                }
+                items.push(item);
+                if let PaintItem::BeginLayer(_) = item {
+                    saved.push(current);
+                    current = None;
+                }
+            }
+        }
+    }
+    items
 }
 
 #[cfg(test)]
@@ -440,7 +924,9 @@ mod tests {
             placement: Placement::InFlow,
             children,
             lines: Vec::new(),
+            select_arrow: false,
             image: None,
+            control: None,
         }
     }
 
@@ -480,6 +966,10 @@ mod tests {
             rect: rect(0.0, 0.0, 10.0),
             baseline: 8.0,
             fragments: vec![LineFragment::Text(TextFragment {
+                cursor: "auto".into(),
+                user_select: "auto".into(),
+                text_rendering: "auto".into(),
+                hidden: false,
                 node: NodeID::new(3),
                 element: Some(NodeID::new(1)),
                 rect: rect(0.0, 0.0, 10.0),
@@ -488,6 +978,9 @@ mod tests {
                 font_size: 10.0,
                 font: crate::FontId::DEFAULT,
                 color: BoxStyle::default().text_color,
+                synthetic_bold: false,
+                synthetic_italic: false,
+                text_decoration: Vec::new(),
                 clip: None,
             })],
         });
@@ -505,6 +998,9 @@ mod tests {
                 PaintItem::InlineBox(_) => "inline".to_owned(),
                 PaintItem::Text(text) => format!("text {}", text.text),
                 PaintItem::Image(_) => "image".to_owned(),
+                PaintItem::Clip(_) | PaintItem::BeginLayer(_) | PaintItem::EndLayer(_) => {
+                    "marker".into()
+                }
             })
             .collect::<Vec<_>>();
         assert_eq!(order, ["box None", "box Some(1)", "box Some(2)", "text a"]);

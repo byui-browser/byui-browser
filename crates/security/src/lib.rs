@@ -10,9 +10,11 @@
 pub mod file_access;
 pub mod permissions;
 
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 use common::ipc::{StorageError as IpcStorageError, StorageRequest};
+
+use permissions::{PermissionKind, PermissionState};
 
 /// Formats an origin as `scheme://host:port` for log messages.
 fn origin_label(origin: &Origin) -> String {
@@ -44,6 +46,15 @@ impl Origin {
     /// Returns the effective port.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Returns whether this is an opaque origin.
+    ///
+    /// Opaque origins do not receive origin-scoped web storage, even when a
+    /// caller supplies an otherwise allowing permission.
+    #[must_use]
+    pub fn is_opaque(&self) -> bool {
+        self.scheme == "opaque"
     }
 
     /// Returns the origin serialization exposed to web content.
@@ -239,9 +250,8 @@ impl<'context> AuthorizedStorageRequest<'context> {
 
 /// The renderer's permission to access browser storage.
 ///
-/// This initial policy is all-or-nothing: allowing storage permits both reads
-/// and writes. More granular permissions can be added when the storage policy
-/// is expanded.
+/// This initial policy is all-or-nothing for tuple origins: allowing storage
+/// permits both reads and writes. Opaque origins are always denied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoragePermission {
     /// The renderer may read and write storage.
@@ -272,6 +282,7 @@ pub struct RendererSecurityContext {
     origin: Origin,
     storage_key: StorageKey,
     storage_permission: StoragePermission,
+    permissions: HashMap<PermissionKind, PermissionState>,
 }
 
 impl RendererSecurityContext {
@@ -280,15 +291,49 @@ impl RendererSecurityContext {
     ///
     /// The storage key is derived from the same origin stored by this context.
     pub fn new(origin: Origin, storage_permission: StoragePermission) -> Self {
+        Self::with_permissions(
+            origin,
+            [
+                (
+                    PermissionKind::Storage,
+                    match storage_permission {
+                        StoragePermission::Allowed => PermissionState::Granted,
+                        StoragePermission::Denied => PermissionState::Denied,
+                    },
+                ),
+                (PermissionKind::Cookies, PermissionState::Denied),
+                (PermissionKind::Geolocation, PermissionState::Denied),
+            ],
+        )
+    }
+
+    /// Creates a renderer context with explicit decisions for browser
+    /// capabilities.
+    ///
+    /// Capabilities omitted from `permissions` are denied. The storage
+    /// decision is also exposed through the legacy [`StoragePermission`]
+    /// accessors and continues to control trusted storage-key authorization.
+    pub fn with_permissions(
+        origin: Origin,
+        permissions: impl IntoIterator<Item = (PermissionKind, PermissionState)>,
+    ) -> Self {
+        let permissions: HashMap<PermissionKind, PermissionState> =
+            permissions.into_iter().collect();
+        let storage_permission = match permissions.get(&PermissionKind::Storage) {
+            Some(PermissionState::Granted) => StoragePermission::Allowed,
+            Some(PermissionState::Denied) | None => StoragePermission::Denied,
+        };
         log::debug!(
-            "security context created for {} (storage {:?})",
+            "security context created for {} (storage {:?}, permissions {:?})",
             origin_label(&origin),
-            storage_permission
+            storage_permission,
+            permissions
         );
         Self {
             storage_key: StorageKey::new(origin.clone()),
             origin,
             storage_permission,
+            permissions,
         }
     }
 
@@ -379,12 +424,30 @@ impl RendererSecurityContext {
 
     /// Whether the renderer is allowed to read storage.
     pub fn can_read_storage(&self) -> bool {
-        self.storage_permission == StoragePermission::Allowed
+        !self.origin.is_opaque() && self.storage_permission == StoragePermission::Allowed
     }
 
     /// Whether the renderer is allowed to write storage.
     pub fn can_write_storage(&self) -> bool {
-        self.storage_permission == StoragePermission::Allowed
+        !self.origin.is_opaque() && self.storage_permission == StoragePermission::Allowed
+    }
+
+    /// Returns the decision for a browser capability in this renderer.
+    ///
+    /// Capabilities that were not granted when the context was created are
+    /// denied.
+    #[must_use]
+    pub fn permission_state(&self, permission: PermissionKind) -> PermissionState {
+        self.permissions
+            .get(&permission)
+            .copied()
+            .unwrap_or(PermissionState::Denied)
+    }
+
+    /// Returns whether this renderer may use `permission`.
+    #[must_use]
+    pub fn has_permission(&self, permission: PermissionKind) -> bool {
+        self.permission_state(permission) == PermissionState::Granted
     }
 }
 
@@ -528,6 +591,21 @@ mod tests {
     }
 
     #[test]
+    fn renderer_context_defaults_omitted_permissions_to_denied() {
+        let context = RendererSecurityContext::with_permissions(
+            origin("https", "byui.edu", 443),
+            [(PermissionKind::Cookies, PermissionState::Granted)],
+        );
+
+        assert!(context.has_permission(PermissionKind::Cookies));
+        assert_eq!(
+            context.permission_state(PermissionKind::Geolocation),
+            PermissionState::Denied
+        );
+        assert!(!context.can_read_storage());
+    }
+
+    #[test]
     fn default_ports_are_scheme_specific() {
         assert_eq!(Origin::new("http", "example.com", None).port(), 80);
         assert_eq!(Origin::new("https", "example.com", None).port(), 443);
@@ -543,6 +621,12 @@ mod tests {
             Origin::new("HTTPS", "EXAMPLE.COM", None),
             Origin::new("https", "example.com", Some(443))
         );
+    }
+
+    #[test]
+    fn opaque_origins_are_identifiable() {
+        assert!(Origin::new("opaque", "", None).is_opaque());
+        assert!(!Origin::new("https", "example.com", None).is_opaque());
     }
 
     #[test]
@@ -601,6 +685,17 @@ mod tests {
         let context = RendererSecurityContext::new(
             origin("https", "byui.edu", 443),
             StoragePermission::Denied,
+        );
+
+        assert!(!context.can_read_storage());
+        assert!(!context.can_write_storage());
+    }
+
+    #[test]
+    fn opaque_renderer_cannot_read_or_write_storage_even_when_allowed() {
+        let context = RendererSecurityContext::new(
+            Origin::new("opaque", "", None),
+            StoragePermission::Allowed,
         );
 
         assert!(!context.can_read_storage());

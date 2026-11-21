@@ -109,6 +109,34 @@ fn inherited_properties_reach_descendants() {
 }
 
 #[test]
+fn unicode_values_do_not_interrupt_style_computation() {
+    let document = parse_raw_html(
+        "<div style='font-size: 20px'><p id='target'>Hello</p></div><p id='other'>World</p>".into(),
+    );
+    let sheet = parse_stylesheet(
+        "#target { font-family: 日本語; font-size: ééé; color: green; } #other { font-size: 24px; }",
+    );
+    let styles = style_document(&document, &[sheet]);
+
+    assert_eq!(
+        value(&styles, &document, "target", "font-family").as_deref(),
+        Some("日本語")
+    );
+    assert_eq!(
+        value(&styles, &document, "target", "font-size").as_deref(),
+        Some("20px")
+    );
+    assert_eq!(
+        value(&styles, &document, "target", "color").as_deref(),
+        Some("green")
+    );
+    assert_eq!(
+        value(&styles, &document, "other", "font-size").as_deref(),
+        Some("24px")
+    );
+}
+
+#[test]
 fn resolves_css_wide_keywords() {
     let document = parse_raw_html(
         "<div id='parent' style='color: red; margin-left: 5px'><p id='child' style='color: initial; margin-left: inherit'>Hello</p></div>".into()

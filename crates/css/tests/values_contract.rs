@@ -64,6 +64,31 @@ fn handles_length_case_whitespace_and_unitless_zero() {
 }
 
 #[test]
+fn rejects_unicode_lengths_without_panicking() {
+    for input in ["ééé", "☃☃", "💙💙", "1234épx", "1px💙", "  ééé  "] {
+        assert_eq!(parse_length(input), None, "{input}");
+    }
+}
+
+#[test]
+fn rejects_unicode_length_functions_without_panicking() {
+    for input in [
+        "ééé",
+        "aééx",
+        "abcdeéx",
+        "☃☃",
+        "💙💙",
+        "min💙(1px, 2px)",
+        "calc(1234épx + 1px)",
+        "min(1px, 1234épx)",
+        "max(1234épx, 2px)",
+        "clamp(1px, 1234épx, 3px)",
+    ] {
+        assert_eq!(css::values::resolve_length_function(input), None, "{input}");
+    }
+}
+
+#[test]
 fn converts_absolute_and_relative_lengths_to_pixels() {
     let context = LengthContext {
         font_size: 20.0,

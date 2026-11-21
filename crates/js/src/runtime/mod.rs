@@ -213,8 +213,11 @@ pub(crate) fn with_host_this<T>(this: Value, body: impl FnOnce() -> T) -> T {
     })
 }
 
-/// The `this` value for the host function currently running on this thread.
-pub(crate) fn host_this() -> Value {
+/// Returns an owned handle to the JavaScript receiver of the native callback
+/// currently running on this thread. Native prototype methods can use this to
+/// validate their receiver and operate on different instances. Outside a native
+/// call this is undefined; nested calls restore the previous receiver.
+pub fn host_this() -> Value {
     HOST_THIS.with(|slot| slot.borrow().clone())
 }
 
@@ -404,7 +407,7 @@ impl Function {
     /// Wraps a Rust callback as a callable and constructible JavaScript
     /// function. The constructor callback receives the arguments passed to
     /// `new` and must return the constructed value.
-    pub(crate) fn from_host_constructor(
+    pub fn from_host_constructor(
         name: impl Into<String>,
         function: HostFunction,
         constructor: HostFunction,
@@ -541,6 +544,21 @@ impl Function {
     /// own properties.
     pub fn set_own_property(&self, key: &str, value: Value) -> bool {
         self.set_own(key, value)
+    }
+
+    /// Defines a read-only own property on a host or bytecode function.
+    ///
+    /// The function retains the supplied value; cloning a value handle preserves
+    /// its identity. Returns false for tree-walk functions, which have no own
+    /// property table. Script assignment cannot replace the property.
+    pub fn set_read_only_property(&self, key: &str, value: Value) -> bool {
+        match &*self.0 {
+            FunctionKind::Bytecode { properties, .. } | FunctionKind::Host { properties, .. } => {
+                properties.set_read_only(key, value);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Returns whether this function was compiled for the bytecode VM.
@@ -719,22 +737,54 @@ impl GlobalState {
         let lexical = child_scope(&object);
         let state = Self { object, lexical };
         builtins::install(&state);
+        global_functions::install(&state);
         state
     }
 
     /// Binds a host-provided global, replacing any binding in the object
     /// layer. A script `let`/`const` of the same name still shadows it.
     pub(crate) fn install_host(&self, name: &str, value: Value) {
-        self.object.lock_scope().bindings.insert(
-            name.to_owned(),
-            Binding {
-                value: Some(value),
-                mutable: true,
-                lexical: false,
-                host: true,
-                setter: None,
-            },
-        );
+        let global_this = {
+            let mut scope = self.object.lock_scope();
+            scope.bindings.insert(
+                name.to_owned(),
+                Binding {
+                    value: Some(value.clone()),
+                    mutable: true,
+                    lexical: false,
+                    host: true,
+                    setter: None,
+                },
+            );
+            (name != "globalThis")
+                .then(|| {
+                    scope
+                        .bindings
+                        .get("globalThis")
+                        .and_then(|binding| binding.value.clone())
+                })
+                .flatten()
+        };
+        if let Some(Value::Object(global)) = global_this {
+            let _ = global.set_property(name.to_owned(), value);
+        }
+    }
+
+    pub(crate) fn install_global_this(&self) {
+        let global = Object::new();
+        let values = self
+            .object
+            .lock_scope()
+            .bindings
+            .iter()
+            .filter_map(|(name, binding)| binding.value.clone().map(|value| (name.clone(), value)))
+            .collect::<Vec<_>>();
+        for (name, value) in values {
+            let _ = global.set_property(name, value);
+        }
+        let value = Value::Object(global.clone());
+        let _ = global.set_property("globalThis", value.clone());
+        self.install_host("globalThis", value);
     }
 
     /// Sets the host hook that handles assignment to a registered global.
@@ -749,6 +799,102 @@ impl GlobalState {
         }
         binding.setter = Some(setter);
         Ok(())
+    }
+
+    /// Declares a global binding emitted by the bytecode compiler.
+    pub(crate) fn bytecode_declare(&self, name: &str, kind: VarKind) -> JsResult<()> {
+        match kind {
+            VarKind::Var => {
+                if self.lexical.lock_scope().bindings.contains_key(name) {
+                    return Err(already_declared(name));
+                }
+                declare_var(&self.object, name)
+            }
+            VarKind::Let | VarKind::Const => {
+                let lexical = self.lexical.lock_scope();
+                let object = self.object.lock_scope();
+                if lexical.bindings.contains_key(name)
+                    || object
+                        .bindings
+                        .get(name)
+                        .is_some_and(|binding| !binding.host)
+                {
+                    return Err(already_declared(name));
+                }
+                drop(object);
+                drop(lexical);
+                declare_lexical(&self.lexical, name, kind == VarKind::Let, None)
+            }
+        }
+    }
+
+    /// Reads a global binding for bytecode, including host-provided globals.
+    pub(crate) fn bytecode_load(&self, name: &str) -> JsResult<Value> {
+        if self.lexical.lock_scope().bindings.contains_key(name) {
+            read(&self.lexical, name)
+        } else {
+            read(&self.object, name)
+        }
+    }
+
+    /// Returns whether a global binding exists, including an uninitialized
+    /// lexical binding in its temporal dead zone.
+    pub(crate) fn bytecode_has(&self, name: &str) -> bool {
+        self.lexical.lock_scope().bindings.contains_key(name)
+            || self.object.lock_scope().bindings.contains_key(name)
+    }
+
+    /// Initializes a global binding for bytecode.
+    pub(crate) fn bytecode_initialize(&self, name: &str, value: Value) -> JsResult<()> {
+        if self.lexical.lock_scope().bindings.contains_key(name) {
+            initialize(&self.lexical, name, value);
+            Ok(())
+        } else if self.object.lock_scope().bindings.contains_key(name) {
+            initialize(&self.object, name, value);
+            Ok(())
+        } else {
+            Err(JsError::runtime(format!(
+                "global binding `{name}` is unavailable"
+            )))
+        }
+    }
+
+    /// Assigns a global binding for bytecode, honoring host setters.
+    pub(crate) fn bytecode_store(&self, name: &str, value: Value) -> JsResult<Value> {
+        if is_declared(&self.lexical, name) {
+            assign(&self.lexical, name, value.clone())?;
+        } else {
+            assign(&self.object, name, value.clone())?;
+        }
+        Ok(value)
+    }
+
+    /// Returns the registered host-global name referring to `value`.
+    pub(crate) fn host_global_name(&self, value: &Value) -> Option<String> {
+        self.object
+            .lock_scope()
+            .bindings
+            .iter()
+            .find(|(_, binding)| binding.host && binding.value.as_ref() == Some(value))
+            .map(|(name, _)| name.clone())
+    }
+
+    /// Finds a global name currently referring to `value`, for call errors.
+    pub(crate) fn bytecode_name_for_value(&self, value: &Value) -> Option<String> {
+        let lexical = self.lexical.lock_scope();
+        if let Some((name, _)) = lexical
+            .bindings
+            .iter()
+            .find(|(_, binding)| binding.value.as_ref() == Some(value))
+        {
+            return Some(name.clone());
+        }
+        let object = self.object.lock_scope();
+        object
+            .bindings
+            .iter()
+            .find(|(_, binding)| binding.value.as_ref() == Some(value))
+            .map(|(name, _)| name.clone())
     }
 
     /// Evaluates `program` against the persistent globals.

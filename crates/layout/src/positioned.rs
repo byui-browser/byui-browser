@@ -12,7 +12,14 @@
 //! (or the initial containing block). `position: fixed` boxes always reach
 //! the initial containing block.
 //!
-//! Limitations: `clear` is not supported; in-flow block formatting context
+//! `clear` moves a block-level box's border edge (or a float's margin edge)
+//! below the earlier floats it clears in the same formatting context
+//! (CSS 2.2 §9.5.2). The cleared box's top margin then does not collapse with
+//! the margins before it.
+//!
+//! Limitations: clearance is not computed for inline content (such as
+//! `<br clear>`); a cleared first child whose top margin would collapse
+//! through its parent ignores that margin when testing for clearance; in-flow block formatting context
 //! roots (such as `display: flow-root`) do not avoid floats; a floated box's
 //! y position is estimated before its parent's margins finish collapsing;
 //! relatively positioned inline boxes move with their text but do not become
@@ -23,7 +30,7 @@ use crate::Rect;
 use crate::block::{BlockResult, ContainingBlock};
 use crate::box_tree::BlockBox;
 use crate::layout::Context;
-use crate::style::{BoxSizing, ComputedStyle, Dimension, Float, Position};
+use crate::style::{BoxSizing, Clear, ComputedStyle, Dimension, Float, Position};
 use crate::tree::{BoxKind, LayoutBox};
 
 /// Tolerance for floating-point error when testing whether a float fits.
@@ -83,6 +90,16 @@ impl FloatContext {
             .map(|float| float.rect.bottom())
             .filter(|bottom| *bottom > y)
             .min_by(f32::total_cmp)
+    }
+
+    /// The lowest margin edge among the floats `clear` clears, or `None`
+    /// when there are none.
+    fn clear_bottom(&self, clear: Clear) -> Option<f32> {
+        self.floats
+            .iter()
+            .filter(|float| clear.clears(float.left))
+            .map(|float| float.rect.bottom())
+            .max_by(f32::total_cmp)
     }
 
     /// The lowest float margin edge, or `None` without floats.
@@ -201,6 +218,14 @@ impl<'f> FloatScope<'f> {
         self.context.bottom().map(|bottom| bottom - self.y)
     }
 
+    /// The lowest margin edge, relative to this scope, of the floats that
+    /// `clear` clears, if any.
+    pub(crate) fn clear_bottom(&self, clear: Clear) -> Option<f32> {
+        self.context
+            .clear_bottom(clear)
+            .map(|bottom| bottom - self.y)
+    }
+
     fn place(
         &mut self,
         left: bool,
@@ -298,6 +323,10 @@ impl Context<'_> {
             margin.horizontal() + fragment.rect.width,
             margin.vertical() + fragment.rect.height,
         );
+        // A cleared float's top margin edge goes below the floats it clears.
+        let min_y = floats
+            .clear_bottom(block.style.clear)
+            .map_or(min_y, |bottom| min_y.max(bottom));
         let (x, y) = floats.place(
             block.style.float == Float::Left,
             size,

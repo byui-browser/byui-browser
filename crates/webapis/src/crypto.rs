@@ -62,6 +62,26 @@ fn random_uuid(arguments: &[Value]) -> JsResult<Value> {
     Ok(Value::String(uuid))
 }
 
+fn random_bytes_api(arguments: &[Value]) -> JsResult<Value> {
+    let Some(Value::Number(length)) = arguments.first() else {
+        return Err(JsError::runtime(
+            "crypto.randomBytes() requires a byte length",
+        ));
+    };
+    if !length.is_finite() || *length < 0.0 || *length > 1_000_000.0 || length.fract() != 0.0 {
+        return Err(JsError::runtime(
+            "crypto.randomBytes() byte length is invalid",
+        ));
+    }
+    let bytes = random_bytes(*length as usize)?;
+    let array = Object::new();
+    for (index, byte) in bytes.iter().enumerate() {
+        array.set(index.to_string(), Value::Number(f64::from(*byte)));
+    }
+    array.set("length", Value::Number(bytes.len() as f64));
+    Ok(Value::Array(array))
+}
+
 /// Registers the stable `window.crypto` object and its global alias.
 ///
 /// `getRandomValues()` uses the operating system's cryptographically secure
@@ -78,6 +98,7 @@ pub fn register_crypto(realm: &mut Realm, window: &Object) -> JsResult<()> {
     crypto.set_method("getRandomValues", get_random_values);
     let random_uuid: HostFunction = Arc::new(random_uuid);
     crypto.set_method("randomUUID", random_uuid);
+    crypto.set_method("randomBytes", Arc::new(random_bytes_api));
     window.set_read_only("crypto", Value::Object(crypto.clone()));
     realm.register_global_value("crypto", Value::Object(crypto))?;
     Ok(())

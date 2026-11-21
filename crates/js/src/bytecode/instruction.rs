@@ -145,6 +145,13 @@ pub enum Instruction {
     /// Calls a method: pops the arguments, then the callee, then the receiver
     /// that becomes `this`, and pushes the result.
     CallMethod(u16),
+    /// Calls a named method and retains the property name for diagnostics.
+    CallMethodNamed {
+        /// Number of arguments.
+        count: u16,
+        /// Constant-pool index of the property name.
+        name: u16,
+    },
     /// Constructs an instance: pops the arguments, then the constructor, and
     /// pushes the new object, or the object the constructor returned.
     ///
