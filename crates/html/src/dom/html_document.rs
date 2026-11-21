@@ -1,5 +1,5 @@
 use super::{
-    attribute::Attribute, doctype::Doctype, dom_error::DomError, dom_token_list::DOMTokenList,
+    attribute::Attribute, doctype::Doctype, dom_error::DomError, class_list::ClassList,
     element_data::ElementData, namespace::Namespace, node::Node, node_id::NodeID,
     node_kind::NodeKind,
 };
@@ -147,18 +147,36 @@ impl HTMLDocument {
     /// `toggle`, `replace`, and `value` operations. The document is borrowed
     /// mutably for the lifetime of the handle, matching the exclusive access
     /// required for DOM mutations in this Rust model.
-    pub fn class_list(&mut self, element: NodeID) -> Result<DOMTokenList<'_>, DomError> {
-        if !matches!(
-            self.get_node(element).map(|node| node.get_kind()),
-            Some(NodeKind::Element(_))
-        ) {
-            log::debug!(
-                "class_list failed: node {} is not an element",
-                element.get()
-            );
-            return Err(DomError::NotFound);
+    pub fn class_list(&mut self, node_id: NodeID) -> Result<ClassList<'_>, DomError> {
+        // Gets node.
+        let Some(node) = self.get_mut_node(node_id) else {
+            return Err(DomError::NotFound)
+        };
+
+        // Gets element data of node.
+        let element = match node.get_mut_kind() {
+            NodeKind::Element(element) => element,
+            _ => {
+                log::debug!(
+                    "class_list failed: node {} is not an element",
+                    node_id.get()
+                );
+                return Err(DomError::NotFound)
+            },
+        };
+
+        // Creates class attribute if there is not one.
+        if !element.has_attribute(String::from("class")) {
+            element.set_attribute(Attribute::new(String::from("class"), String::new()))
         }
-        Ok(DOMTokenList::new(self, element))
+
+        // Gets class attribute of node.
+        let Some(class_attribute) = element.get_mut_attribute(String::from("class")) else {
+            return Err(DomError::NotFound)
+        };
+
+        // Returns class list.
+        return Ok(ClassList::new(class_attribute))
     }
 
     /// Creates a detached HTML element using the DOM `createElement` rules.

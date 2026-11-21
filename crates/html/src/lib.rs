@@ -10,7 +10,7 @@ mod parser;
 mod selector;
 
 pub use dom::{
-    Attribute, DOMTokenList, Doctype, DomError, ElementData, HTMLDocument, Namespace, Node, NodeID,
+    Attribute, ClassList, Doctype, DomError, ElementData, HTMLDocument, Namespace, Node, NodeID,
     NodeKind,
 };
 pub use parser::parse_raw_html;
