@@ -25,7 +25,7 @@ impl Attribute {
     pub const fn get_value(&self) -> &String {
         &self.value
     }
-    
+
     /// Sets attribute value.
     pub fn set_value(&mut self, value: String) {
         self.value = value;

@@ -72,7 +72,9 @@ impl ElementData {
 
     /// Checks if element has attribute with name.
     pub fn has_attribute(&self, name: String) -> bool {
-        self.attributes.iter().any(|attribute_ref| attribute_ref.get_name() == &name)
+        self.attributes
+            .iter()
+            .any(|attribute_ref| attribute_ref.get_name() == &name)
     }
 
     /// Updates or adds element attribute.
