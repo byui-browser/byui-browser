@@ -2,9 +2,9 @@ use js::{JsError, Realm, Value};
 use security::{Origin, RendererSecurityContext, StoragePermission};
 use std::{thread, time::Duration};
 use webapis::{
-    Document, dispatch_window_keydown, dispatch_window_scroll, register_document, register_window,
-    register_window_with_security_context, register_window_with_url,
-    register_window_with_url_and_device_pixel_ratio, report_window_error,
+    Document, dispatch_window_keydown, dispatch_window_keyup, dispatch_window_scroll,
+    register_document, register_window, register_window_with_security_context,
+    register_window_with_url, register_window_with_url_and_device_pixel_ratio, report_window_error,
     run_window_hashchange_events, run_window_messages,
 };
 
@@ -63,6 +63,74 @@ fn window_onkeydown_receives_bubbling_events_from_the_focused_element() {
         .unwrap();
     assert_eq!(
         dispatch_window_keydown(
+            &window, "Enter", "Enter", 0, false, false, false, false, false
+        ),
+        Ok(true)
+    );
+    assert_eq!(
+        realm.evaluate_script(
+            "order.length === 3 && order[0] === 'target' && order[1] === 'document' &&
+             order[2] === 'window'",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_onkeyup_receives_keyboard_event_metadata_and_can_cancel() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    realm
+        .evaluate_script(
+            "var seen = null; function handler(event) { seen = [
+             this === window, event.type, event.key, event.code, event.location,
+             event.ctrlKey, event.shiftKey, event.altKey, event.metaKey,
+             event.repeat, event.bubbles, event.cancelable]; return false; }
+             window.onkeyup = handler;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        dispatch_window_keyup(&window, "A", "KeyA", 0, true, false, true, false, true),
+        Ok(false)
+    );
+    assert_eq!(
+        realm.evaluate_script(
+            "seen.length === 12 && seen[0] && seen[1] === 'keyup' && seen[2] === 'A' &&
+             seen[3] === 'KeyA' && seen[4] === 0 && seen[5] && !seen[6] && seen[7] &&
+             !seen[8] && seen[9] && seen[10] && seen[11]",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_onkeyup_receives_bubbling_events_from_the_focused_element() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    register_document(
+        &mut realm,
+        Document::from_html_document(&html::parse_raw_html(
+            "<button id='target'></button>".to_owned(),
+        )),
+    )
+    .unwrap();
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    realm
+        .evaluate_script(
+            "var order = []; var target = document.getElementById('target');
+             target.addEventListener('keyup', () => order.push('target'));
+             document.addEventListener('keyup', () => order.push('document'));
+             window.onkeyup = () => order.push('window'); target.focus();",
+        )
+        .unwrap();
+    assert_eq!(
+        dispatch_window_keyup(
             &window, "Enter", "Enter", 0, false, false, false, false, false
         ),
         Ok(true)

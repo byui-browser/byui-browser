@@ -439,6 +439,61 @@ pub(crate) fn register_shared_document(
             }
         }),
     );
+    // A trusted keyup follows the same focused-element -> document -> Window
+    // path as keydown. The event dispatch is routed through the Node/Event
+    // implementation so node listeners observe the event before window.
+    let keyup_document = Arc::clone(&shared_document);
+    let keyup_window = window_object.clone();
+    window_object.set_method(
+        "__dispatchKeyup",
+        Arc::new(move |arguments| {
+            let Some(Value::Function(create)) = keyup_window.get("__createKeyupEvent") else {
+                return Err(JsError::runtime(
+                    "window keyup event constructor is not installed",
+                ));
+            };
+            let event = create.call(arguments)?;
+            let focused = {
+                let document = keyup_document.lock().unwrap();
+                document
+                    .focused_element()
+                    .filter(|node| document.is_connected(*node))
+            };
+            let Some(node) = focused else {
+                let Some(Value::Function(dispatch)) = keyup_window.get("__dispatchKeyupAtWindow")
+                else {
+                    return Err(JsError::runtime("window keyup dispatcher is not installed"));
+                };
+                return dispatch.call(&[event]);
+            };
+            let Value::Object(target) = wrap_element(&keyup_document, node)? else {
+                return Err(JsError::runtime("focused keyup target is not an element"));
+            };
+            let snapshot = keyup_document.lock().unwrap().clone();
+            let result =
+                dispatch_event_at(&snapshot, Some(node), &target, std::slice::from_ref(&event))?;
+            let Value::Object(event_object) = &event else {
+                return Err(JsError::runtime("keyup event is not an object"));
+            };
+            if matches!(
+                event_object.get("__stopPropagation"),
+                Some(Value::Boolean(true))
+            ) {
+                return Ok(result);
+            }
+            let Some(Value::Function(dispatch)) = keyup_window.get("__dispatchKeyupAtWindow")
+            else {
+                return Err(JsError::runtime("window keyup dispatcher is not installed"));
+            };
+            let window_result = dispatch.call(&[event])?;
+            match (result, window_result) {
+                (Value::Boolean(false), _) | (_, Value::Boolean(false)) => {
+                    Ok(Value::Boolean(false))
+                }
+                _ => Ok(Value::Boolean(true)),
+            }
+        }),
+    );
     let computed_style_document = shared_document.clone();
     window_object.set_method(
         "getComputedStyle",
