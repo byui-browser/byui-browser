@@ -639,6 +639,121 @@ fn revalidation_updates_vary_snapshot_when_304_changes_vary_fields() {
 }
 
 #[test]
+fn revalidation_replaces_all_instances_of_each_304_header_field() {
+    let cache = ResponseCache::default();
+    let url = Url::parse("https://example.test/revalidate-fields").unwrap();
+    let request = Request::get(url.as_str());
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, "max-age=0".parse().unwrap());
+    headers.insert(ETAG, "\"first\"".parse().unwrap());
+    headers.append("x-metadata", "stale".parse().unwrap());
+    headers.append("x-metadata", "older".parse().unwrap());
+    cache.insert_with_headers(
+        &request,
+        &url,
+        request.headers(),
+        StoredResponse {
+            status: StatusCode::OK,
+            headers,
+            url: url.to_string(),
+            body: Bytes::from_static(b"cached"),
+            cookie_headers_processed: false,
+        },
+    );
+
+    let (stored, _) = cache
+        .lookup_for_revalidation_with_headers(&request, &url, request.headers())
+        .unwrap();
+    let mut not_modified = HeaderMap::new();
+    not_modified.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+    not_modified.append("x-metadata", "newest".parse().unwrap());
+    not_modified.append("x-metadata", "also-new".parse().unwrap());
+    let merged = cache
+        .merge_not_modified_with_headers(&request, &url, request.headers(), &stored, &not_modified)
+        .unwrap();
+
+    let values: Vec<_> = merged.headers.get_all("x-metadata").iter().collect();
+    assert_eq!(values, ["newest", "also-new"]);
+}
+
+#[test]
+fn revalidation_with_vary_star_serves_once_and_removes_all_variants() {
+    let cache = ResponseCache::default();
+    let url = Url::parse("https://example.test/revalidate-vary-star").unwrap();
+    let request = Request::get(url.as_str());
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, "max-age=0".parse().unwrap());
+    headers.insert(ETAG, "\"first\"".parse().unwrap());
+    cache.insert_with_headers(
+        &request,
+        &url,
+        request.headers(),
+        StoredResponse {
+            status: StatusCode::OK,
+            headers,
+            url: url.to_string(),
+            body: Bytes::from_static(b"cached"),
+            cookie_headers_processed: false,
+        },
+    );
+
+    let (stored, _) = cache
+        .lookup_for_revalidation_with_headers(&request, &url, request.headers())
+        .unwrap();
+    let mut not_modified = HeaderMap::new();
+    not_modified.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+    not_modified.insert("vary", "*".parse().unwrap());
+    let merged = cache
+        .merge_not_modified_with_headers(&request, &url, request.headers(), &stored, &not_modified)
+        .unwrap();
+
+    assert_eq!(merged.body, Bytes::from_static(b"cached"));
+    assert!(
+        cache
+            .lookup_matching_with_headers(&request, &url, request.headers())
+            .is_none()
+    );
+}
+
+#[test]
+fn revalidation_with_no_store_serves_once_and_removes_the_validated_variant() {
+    let cache = ResponseCache::default();
+    let url = Url::parse("https://example.test/revalidate-no-store").unwrap();
+    let request = Request::get(url.as_str());
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, "max-age=0".parse().unwrap());
+    headers.insert(ETAG, "\"first\"".parse().unwrap());
+    cache.insert_with_headers(
+        &request,
+        &url,
+        request.headers(),
+        StoredResponse {
+            status: StatusCode::OK,
+            headers,
+            url: url.to_string(),
+            body: Bytes::from_static(b"cached"),
+            cookie_headers_processed: false,
+        },
+    );
+
+    let (stored, _) = cache
+        .lookup_for_revalidation_with_headers(&request, &url, request.headers())
+        .unwrap();
+    let mut not_modified = HeaderMap::new();
+    not_modified.insert(CACHE_CONTROL, "no-store".parse().unwrap());
+    let merged = cache
+        .merge_not_modified_with_headers(&request, &url, request.headers(), &stored, &not_modified)
+        .unwrap();
+
+    assert_eq!(merged.body, Bytes::from_static(b"cached"));
+    assert!(
+        cache
+            .lookup_matching_with_headers(&request, &url, request.headers())
+            .is_none()
+    );
+}
+
+#[test]
 fn malformed_expiry_and_negative_age_do_not_extend_freshness() {
     let now = CacheTime {
         wall: Duration::from_secs(1_000),

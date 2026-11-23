@@ -18,8 +18,8 @@ a partial Fetch HTTP-cache implementation. It currently provides:
   `Last-Modified` heuristic freshness when explicit metadata is absent;
 - `stale-while-revalidate` with one detached refresh per matching variant and
   `stale-if-error` fallback for transport and 5xx failures;
-- validator retention, conditional requests, basic `304 Not Modified`
-  merging, and unsafe-request invalidation;
+- validator retention, conditional requests, `304 Not Modified` freshening and
+  validation-response side effects, and unsafe-request invalidation;
 - independent public body readers sharing immutable cached body bytes; and
 - response filtering and provider authorization on cache hits.
 
@@ -65,19 +65,20 @@ date supplies a conservative one-tenth apparent-age heuristic.
 
 ### 3. Finish conditional revalidation
 
-Basic validator-aware revalidation now retains and sends both `ETag` and
-`Last-Modified` when available. A `304` refreshes the stored `Vary` request
-snapshot, updates retained validators, removes variants made obsolete by a
-changed `Vary` field set, and sends validation-response `Set-Cookie` fields to
-browser storage without retaining them for later cache hits. A validation
-response without a stored validator replaces the representation normally, and
-an unsuccessful validation response leaves the existing representation intact.
-A late `304` cannot freshen a representation that a concurrent revalidation
-has already replaced; that caller uses the newer cached representation.
-Remaining work is to:
-
-1. apply the complete HTTP freshening rules when merging `304` headers;
-2. process non-cookie response-side effects from the validation response; and
+Validator-aware revalidation retains and sends both `ETag` and `Last-Modified`
+when available. A `304` replaces every stored instance of its supplied
+representation fields, removes stale `1xx` warning fields, preserves retained
+body metadata, refreshes freshness and validator state, and updates the stored
+`Vary` request snapshot. Changed `Vary` field sets remove obsolete variants;
+`Vary: *` and `no-store` serve the validated representation to the current
+caller but remove it from reusable storage. Validation-response `Set-Cookie`
+fields reach browser storage without being retained for later cache hits, and
+approved validation headers reach the browser response-policy hook for other
+browser-owned side effects. A validation response without a stored validator
+replaces the representation normally, and an unsuccessful validation response
+leaves the existing representation intact. A late `304` cannot freshen a
+representation that a concurrent revalidation has already replaced; that
+caller uses the newer cached representation.
 
 `CacheMode::NoCache` now uses this path, but its request-header interaction is
 not yet fully Fetch-compatible.

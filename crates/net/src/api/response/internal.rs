@@ -30,6 +30,12 @@ pub(crate) struct InternalResponse {
     /// the cache entry. They must still reach browser cookie storage after the
     /// merged response has passed response policy checks.
     pub(crate) validation_cookie_headers: Option<Box<[reqwest::header::HeaderValue]>>,
+    /// Raw headers received with a validating `304` response.
+    ///
+    /// These are not representation metadata. They are retained only until
+    /// the merged representation has passed response policy so browser-owned
+    /// validation side effects can observe the validation response once.
+    pub(crate) validation_headers: Option<Box<reqwest::header::HeaderMap>>,
 }
 
 impl InternalResponse {
@@ -61,6 +67,7 @@ impl InternalResponse {
             from_cache,
             cookie_headers_processed,
             validation_cookie_headers: None,
+            validation_headers: None,
         }
     }
 

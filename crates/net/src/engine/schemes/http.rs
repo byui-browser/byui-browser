@@ -34,7 +34,7 @@ enum CacheDecision {
 /// Result of processing one HTTP transport response.
 enum HopResult {
     /// The response completes the fetch.
-    Complete(InternalResponse),
+    Complete(Box<InternalResponse>),
     /// Redirect processing prepared another request URL.
     Follow(reqwest::Url),
     /// A manual redirect can be exposed immediately.
@@ -74,7 +74,7 @@ impl RequestController {
                         )? {
                             HopResult::Complete(response) => {
                                 return self
-                                    .finalize_cached_http_response(&request, &url, response);
+                                    .finalize_cached_http_response(&request, &url, *response);
                             }
                             HopResult::Follow(next_url) => {
                                 url = next_url;
@@ -126,7 +126,7 @@ impl RequestController {
                 &request_headers,
                 had_nonreplayable_body,
             )? {
-                HopResult::Complete(response) => break (response, request_headers),
+                HopResult::Complete(response) => break (*response, request_headers),
                 HopResult::Follow(next_url) => {
                     url = next_url;
                     continue;
@@ -379,6 +379,7 @@ impl RequestController {
                 .collect();
             let mut merged = self.response_from_stored(request, cached);
             merged.validation_cookie_headers = Some(validation_cookie_headers.into_boxed_slice());
+            merged.validation_headers = Some(Box::new(response.headers.clone()));
             return Ok((merged, transport_headers.clone()));
         }
         if response.status == http::StatusCode::NOT_MODIFIED
@@ -400,6 +401,7 @@ impl RequestController {
                 .collect();
             let mut cached = self.response_from_stored(request, cached);
             cached.validation_cookie_headers = Some(validation_cookie_headers.into_boxed_slice());
+            cached.validation_headers = Some(Box::new(response.headers.clone()));
             return Ok((cached, transport_headers.clone()));
         }
         Ok((response, transport_headers.clone()))
@@ -416,10 +418,10 @@ impl RequestController {
     ) -> Result<HopResult, RequestError> {
         let status = response.status.as_u16();
         if !is_redirect_status(response.status) {
-            return Ok(HopResult::Complete(response));
+            return Ok(HopResult::Complete(Box::new(response)));
         }
         let Some(location) = response.headers.get(http::header::LOCATION) else {
-            return Ok(HopResult::Complete(response));
+            return Ok(HopResult::Complete(Box::new(response)));
         };
         if request.redirect_mode() == crate::RedirectMode::Manual {
             response.redirect_count = request.redirect_count() + 1;

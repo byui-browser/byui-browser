@@ -108,14 +108,12 @@ impl CachedResponse {
             .collect()
     }
 
-    /// Merges successful revalidation metadata while retaining the representation body.
-    pub(super) fn merge_not_modified(
+    /// Applies `304` header updates while retaining the representation body.
+    pub(super) fn merge_not_modified_headers(
         &mut self,
         request_headers: &crate::Headers,
         headers: &HeaderMap,
-        freshness: FreshnessMetadata,
-        access: u64,
-    ) -> StoredResponse {
+    ) {
         // RFC 9111 requires removal of stale warning fields after successful
         // validation. Warnings in the 1xx range describe a stale response and
         // must not survive a `304` refresh.
@@ -137,18 +135,33 @@ impl CachedResponse {
         for warning in retained_warnings {
             self.response.headers.append(http::header::WARNING, warning);
         }
-        for (name, value) in headers {
+        let mut replaced_names = std::collections::HashSet::new();
+        for (name, _) in headers {
             // A 304 has no representation body, so its content length cannot
             // describe the retained body. `Set-Cookie` is a response-side
             // effect rather than representation metadata; it is handled by
             // the validating response path and must not be replayed by later
             // cache hits.
             if name != http::header::CONTENT_LENGTH && name != http::header::SET_COOKIE {
-                self.response.headers.insert(name.clone(), value.clone());
+                replaced_names.insert(name.clone());
+            }
+        }
+        for name in replaced_names {
+            self.response.headers.remove(&name);
+            for value in headers.get_all(&name) {
+                self.response.headers.append(name.clone(), value.clone());
             }
         }
         self.validator = response_validator(&self.response.headers);
         self.vary_headers = capture_vary_headers(request_headers, &self.response.headers);
+    }
+
+    /// Records cache metadata after successful `304` header freshening.
+    pub(super) fn refresh_not_modified(
+        &mut self,
+        freshness: FreshnessMetadata,
+        access: u64,
+    ) -> StoredResponse {
         self.freshness = freshness;
         self.last_access = access;
         self.as_response()

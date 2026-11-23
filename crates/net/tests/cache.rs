@@ -83,6 +83,7 @@ impl CachePartitionService for SameOriginCacheServices {
 
 struct RecordingCookieCacheServices {
     stored: Arc<Mutex<Vec<String>>>,
+    validation_effects: Arc<Mutex<Vec<String>>>,
 }
 
 struct EffectiveVaryServices;
@@ -212,6 +213,12 @@ impl RequestPolicyService for RecordingCookieCacheServices {
 impl ResponsePolicyService for RecordingCookieCacheServices {
     fn check_response(&self, _request: &Request, _info: &ResponseInfo) -> Result<(), RequestError> {
         Ok(())
+    }
+
+    fn validation_response_headers(&self, _request: &Request, headers: net::Headers) {
+        if let Some(effect) = headers.get("x-validation-effect") {
+            self.validation_effects.lock().unwrap().push(effect);
+        }
     }
 }
 
@@ -350,21 +357,24 @@ fn revalidation_processes_304_cookies_once_without_caching_them() {
             .to_ascii_lowercase()
             .contains("if-none-match: \"version-1\"")
         {
-            b"HTTP/1.1 304 Not Modified\r\nCache-Control: max-age=60\r\nETag: \"version-2\"\r\nSet-Cookie: refreshed=two\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            b"HTTP/1.1 304 Not Modified\r\nCache-Control: max-age=60\r\nETag: \"version-2\"\r\nSet-Cookie: refreshed=two\r\nX-Validation-Effect: revalidated\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
         } else {
             b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nETag: \"version-1\"\r\nSet-Cookie: initial=one\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
         }
     });
     let stored = Arc::new(Mutex::new(Vec::new()));
+    let validation_effects = Arc::new(Mutex::new(Vec::new()));
     let controller = RequestController::builder(Config::default())
         .with_browser_capabilities(Arc::new(RecordingCookieCacheServices {
             stored: Arc::clone(&stored),
+            validation_effects: Arc::clone(&validation_effects),
         }))
         .build()
         .unwrap();
 
     runtime().block_on(async {
         let mut request = Request::get(server.url());
+        request.set_mode(RequestMode::SameOrigin).unwrap();
         request.set_environment(
             FetchEnvironment::from_url(reqwest::Url::parse(request.url()).unwrap()).unwrap(),
         );
@@ -373,7 +383,21 @@ fn revalidation_processes_304_cookies_once_without_caching_them() {
             .await
             .unwrap();
         assert_eq!(collect_body(first).await.unwrap(), b"cached");
-        wait_for_cached(&controller, &request).await;
+        let cached = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut probe = request.try_clone().unwrap();
+                probe.set_cache_mode(CacheMode::OnlyIfCached);
+                match controller.fetch(probe).await {
+                    Ok(response) if response.from_cache => break response,
+                    Err(RequestError::NetworkError) => tokio::task::yield_now().await,
+                    Ok(_) => panic!("only-if-cached response must come from the cache"),
+                    Err(error) => panic!("cache probe failed unexpectedly: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("initial body capture should finish within five seconds");
+        drop(cached);
 
         let mut revalidate = request.try_clone().unwrap();
         revalidate.set_cache_mode(CacheMode::NoCache);
@@ -390,6 +414,10 @@ fn revalidation_processes_304_cookies_once_without_caching_them() {
     assert_eq!(
         stored.lock().unwrap().as_slice(),
         ["initial=one", "refreshed=two"]
+    );
+    assert_eq!(
+        validation_effects.lock().unwrap().as_slice(),
+        ["revalidated"]
     );
 }
 
@@ -424,8 +452,19 @@ fn no_cache_without_a_validator_replaces_the_cached_representation() {
         assert!(!replacement.from_cache);
         assert_eq!(collect_body(replacement).await.unwrap(), b"second");
 
-        let cached = wait_for_cached(&controller, &request).await;
-        assert_eq!(collect_body(cached).await.unwrap(), b"second");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut probe = request.try_clone().unwrap();
+                probe.set_cache_mode(CacheMode::ForceCache);
+                let cached = controller.fetch(probe).await.unwrap();
+                if cached.from_cache && collect_body(cached).await.unwrap() == b"second" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement body capture should finish within five seconds");
     });
 
     server.join();

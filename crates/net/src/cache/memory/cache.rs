@@ -267,28 +267,40 @@ impl ResponseCache {
                     .all(|(name, original_value)| request_headers.get(name) == *original_value)
                     && entry.matches_revalidation(validated_response)
             })?;
-            let mut merged_headers = variants[cached_index].response.headers.clone();
-            for (name, value) in headers {
-                if name != http::header::CONTENT_LENGTH {
-                    merged_headers.insert(name.clone(), value.clone());
-                }
-            }
-            let freshness = FreshnessMetadata::from_headers(&merged_headers, now)?;
             let mut cached = variants.remove(cached_index);
-            let response = cached.merge_not_modified(request_headers, headers, freshness, access);
-            let vary_names = cached.vary_names();
-            let cached_vary_headers = &cached.vary_headers;
-            let mut removed_body_size = 0_usize;
-            variants.retain(|entry| {
-                let retain =
-                    entry.vary_names() == vary_names && entry.vary_headers != *cached_vary_headers;
-                if !retain {
-                    removed_body_size = removed_body_size.saturating_add(entry.body_size());
-                }
-                retain
-            });
-            variants.push(cached);
-            (response, removed_body_size)
+            cached.merge_not_modified_headers(request_headers, headers);
+            let can_store = !vary_header_names(&cached.response.headers)
+                .iter()
+                .any(|name| name == "*");
+            let freshness = FreshnessMetadata::from_headers(&cached.response.headers, now);
+            if !can_store {
+                let response = cached.as_response();
+                let mut removed_body_size = cached.body_size();
+                removed_body_size = removed_body_size.saturating_add(
+                    variants
+                        .drain(..)
+                        .map(|entry| entry.body_size())
+                        .sum::<usize>(),
+                );
+                (response, removed_body_size)
+            } else if let Some(freshness) = freshness {
+                let response = cached.refresh_not_modified(freshness, access);
+                let vary_names = cached.vary_names();
+                let cached_vary_headers = &cached.vary_headers;
+                let mut removed_body_size = 0_usize;
+                variants.retain(|entry| {
+                    let retain = entry.vary_names() == vary_names
+                        && entry.vary_headers != *cached_vary_headers;
+                    if !retain {
+                        removed_body_size = removed_body_size.saturating_add(entry.body_size());
+                    }
+                    retain
+                });
+                variants.push(cached);
+                (response, removed_body_size)
+            } else {
+                (cached.as_response(), cached.body_size())
+            }
         };
         entries.total_body_size = entries.total_body_size.saturating_sub(removed_body_size);
         Some(response)
