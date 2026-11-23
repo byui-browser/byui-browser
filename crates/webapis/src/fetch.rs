@@ -137,6 +137,11 @@ fn apply_init(request: &mut Request, init: Option<&Value>) -> JsResult<()> {
             "only-if-cached" => CacheMode::OnlyIfCached,
             _ => CacheMode::Default,
         });
+        if cache == "only-if-cached" && request.mode() != RequestMode::SameOrigin {
+            return Err(JsError::new(
+                "TypeError: only-if-cached requires same-origin mode",
+            ));
+        }
     }
     if let Some(Value::String(redirect)) = init.get("redirect") {
         request.set_redirect_mode(match redirect.as_str() {
@@ -312,6 +317,23 @@ mod tests {
         assert_eq!(request.method().as_str(), "POST");
         assert_eq!(request.headers().get("x-test").as_deref(), Some("yes"));
         assert_eq!(request.body().unwrap().length(), Some(7));
+    }
+
+    #[test]
+    fn only_if_cached_requires_same_origin_during_request_construction() {
+        let mut request = Request::get("https://example.test/");
+        let init = Object::new();
+        init.set("cache", Value::String("only-if-cached".into()));
+
+        let error = apply_init(&mut request, Some(&Value::Object(init))).unwrap_err();
+
+        assert!(error.to_string().contains("TypeError"));
+
+        let mut request = Request::get("https://example.test/");
+        let init = Object::new();
+        init.set("mode", Value::String("same-origin".into()));
+        init.set("cache", Value::String("only-if-cached".into()));
+        apply_init(&mut request, Some(&Value::Object(init))).unwrap();
     }
 
     #[test]

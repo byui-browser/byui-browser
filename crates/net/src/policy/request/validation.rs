@@ -1,6 +1,6 @@
 use crate::api::{
     error::RequestError,
-    request::{CacheMode, CredentialsMode, Request, RequestPriority},
+    request::{CredentialsMode, Request, RequestPriority},
 };
 
 use super::FetchScheme;
@@ -47,9 +47,6 @@ impl RequestPolicy {
         }
         if request.integrity().is_some() {
             return Err(RequestError::UnsupportedFeature("subresource integrity"));
-        }
-        if request.cache_mode() == CacheMode::NoCache {
-            return Err(RequestError::UnsupportedFeature("HTTP cache revalidation"));
         }
         if request.priority() != RequestPriority::Auto {
             return Err(RequestError::UnsupportedFeature("priority scheduling"));

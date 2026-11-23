@@ -19,6 +19,16 @@ pub struct Config {
     pub max_keepalive_body_size: u64,
     /// Maximum response-body size, in bytes, captured by the process-local cache.
     pub max_cache_body_size: usize,
+    /// Maximum number of primary entries retained by the process-local response cache.
+    ///
+    /// A primary entry may contain multiple `Vary` variants. Zero disables
+    /// response-cache storage while preserving normal network behavior.
+    pub max_cache_entries: usize,
+    /// Maximum total response-body bytes retained by the process-local cache.
+    ///
+    /// Zero disables response-cache storage. The limit applies across every
+    /// partition and `Vary` variant held by this controller.
+    pub max_cache_total_body_size: usize,
     /// Maximum lifetime accepted from `Access-Control-Max-Age`.
     pub max_preflight_cache_age: Duration,
 }
@@ -33,6 +43,8 @@ impl Default for Config {
             max_in_flight: 32,
             max_keepalive_body_size: 65_536,
             max_cache_body_size: 8 * 1024 * 1024,
+            max_cache_entries: 256,
+            max_cache_total_body_size: 64 * 1024 * 1024,
             max_preflight_cache_age: Duration::from_secs(2 * 60 * 60),
         }
     }

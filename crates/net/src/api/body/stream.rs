@@ -113,7 +113,7 @@ impl Drop for TeeBranch {
 
 impl Body {
     /// Tees an unused body, retaining one branch and returning the other.
-    pub(super) fn tee(&mut self) -> Result<Self, RequestError> {
+    pub(crate) fn tee(&mut self) -> Result<Self, RequestError> {
         let mut state = self
             .state
             .lock()

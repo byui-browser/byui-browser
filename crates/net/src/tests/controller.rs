@@ -5,11 +5,12 @@ use std::{
     net::TcpListener,
     sync::{Arc, Mutex, mpsc},
     thread,
+    time::Duration,
 };
 
 use crate::{
-    AbortController, Body, CacheMode, Config, NetworkEvent, NetworkObserver, NetworkPhase, Request,
-    RequestController, RequestError, ResponseType,
+    AbortController, Body, CacheMode, CachePartitionService, Config, NetworkEvent, NetworkObserver,
+    NetworkPhase, Request, RequestController, RequestError, ResponseType,
 };
 use futures_util::StreamExt;
 use reqwest::{
@@ -19,6 +20,14 @@ use reqwest::{
 
 #[derive(Default)]
 struct EventLog(Mutex<Vec<NetworkEvent>>);
+
+struct TestCachePartition;
+
+impl CachePartitionService for TestCachePartition {
+    fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
+        Ok("controller-cache-test".into())
+    }
+}
 
 impl NetworkObserver for EventLog {
     fn observe(&self, event: NetworkEvent) {
@@ -221,6 +230,7 @@ fn observer_receives_network_lifecycle_events() {
     });
     let events = Arc::new(EventLog::default());
     let client = RequestController::builder(Config::default())
+        .with_cache_partition_service(Arc::new(TestCachePartition))
         .with_network_observer(events.clone())
         .build()
         .expect("controller should initialize");
@@ -323,10 +333,10 @@ fn fetch_returns_headers_before_body_and_forwards_body_bytes() {
 }
 
 #[test]
-/// Verifies a response enters cache only after body completion.
-fn fetch_is_cached_only_after_body_completion() {
-    // The first response is streamed and fully consumed. The following
-    // streaming request should then use the completed response from cache.
+/// Verifies a completed background capture can satisfy the next request.
+fn completed_background_capture_is_cached() {
+    // The first response is streamed and fully consumed. Let its bounded
+    // background capture reach completion before the following request.
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
     let address = format!(
         "http://{}",
@@ -351,6 +361,7 @@ fn fetch_is_cached_only_after_body_completion() {
 
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
     let client = RequestController::builder(Config::default())
+        .with_cache_partition_service(Arc::new(TestCachePartition))
         .build()
         .expect("controller should initialize");
     let (first, second) = runtime.block_on(async {
@@ -362,11 +373,25 @@ fn fetch_is_cached_only_after_body_completion() {
         while let Some(chunk) = first.body.next().await {
             first_body.extend_from_slice(&chunk.expect("first body chunk should be valid"));
         }
-
-        let second = client
-            .fetch(Request::get(&address))
-            .await
-            .expect("cached streaming request should succeed");
+        let second = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut probe = Request::get(&address);
+                probe.set_cache_mode(CacheMode::ForceCache);
+                match client.fetch(probe).await {
+                    Ok(response) if response.from_cache => break response,
+                    Ok(response) => {
+                        let _ = response.body.bytes().await;
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(RequestError::NetworkError | RequestError::Transport(_)) => {
+                        tokio::time::sleep(Duration::from_millis(1)).await
+                    }
+                    Err(error) => panic!("cache probe failed unexpectedly: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("background body capture should finish within five seconds");
         (first_body, second)
     });
 

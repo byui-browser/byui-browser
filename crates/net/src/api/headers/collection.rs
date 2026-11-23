@@ -278,6 +278,22 @@ impl Headers {
         Ok(())
     }
 
+    /// Appends an engine-managed header while retaining the current guard.
+    ///
+    /// This preserves caller-provided values when Fetch requires an additional
+    /// directive in the same HTTP field.
+    pub(crate) fn append_internal_header(
+        &mut self,
+        name: HeaderName,
+        value: HeaderValue,
+    ) -> Result<(), RequestError> {
+        if self.guard == HeaderGuard::Immutable {
+            return Err(RequestError::ImmutableHeaders);
+        }
+        self.store.append(name, normalize_value(value));
+        Ok(())
+    }
+
     /// Merges browser-generated fields while retaining Fetch ownership of
     /// request metadata and preflight fields.
     pub(crate) fn merge_generated_request_headers(
