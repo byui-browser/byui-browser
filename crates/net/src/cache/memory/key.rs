@@ -1,9 +1,6 @@
 //! Cache request identity and partitioning.
 
-use reqwest::{
-    Url,
-    header::{AUTHORIZATION, PROXY_AUTHORIZATION},
-};
+use reqwest::Url;
 
 use crate::api::request::{CredentialsMode, RedirectTaint, Request, RequestMode};
 
@@ -41,7 +38,17 @@ enum CachePartition {
 }
 
 /// Creates the cache key used to distinguish method and URL combinations.
+#[cfg(test)]
 pub(crate) fn cache_key(request: &Request, url: &Url) -> CacheKey {
+    cache_key_with_headers(request, url, request.headers())
+}
+
+/// Creates a cache key from the effective headers sent on the HTTP hop.
+pub(crate) fn cache_key_with_headers(
+    request: &Request,
+    url: &Url,
+    request_headers: &crate::Headers,
+) -> CacheKey {
     let credentials_allowed = request.credentials_allowed(url);
     let url = normalized_url(url);
     CacheKey {
@@ -55,7 +62,7 @@ pub(crate) fn cache_key(request: &Request, url: &Url) -> CacheKey {
         credentials_allowed,
         request_mode: request.mode(),
         redirect_taint: request.redirect_taint(),
-        has_authorization: has_authorization(request),
+        has_authorization: has_authorization(request_headers),
     }
 }
 
@@ -89,7 +96,7 @@ fn normalized_url(url: &Url) -> String {
 }
 
 /// Reports whether a request carries an authorization-bearing header.
-pub(super) fn has_authorization(request: &Request) -> bool {
-    request.headers().has(AUTHORIZATION.as_str())
-        || request.headers().has(PROXY_AUTHORIZATION.as_str())
+pub(super) fn has_authorization(request_headers: &crate::Headers) -> bool {
+    request_headers.has(http::header::AUTHORIZATION.as_str())
+        || request_headers.has(http::header::PROXY_AUTHORIZATION.as_str())
 }

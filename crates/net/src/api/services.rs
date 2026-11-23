@@ -113,6 +113,7 @@ pub trait CachePartitionService: Send + Sync {
     /// Returns an owned process-local cache partition key for this request.
     ///
     /// The key is not durable storage identity and is not shared outside this
-    /// controller.
+    /// controller. Return an empty key when no HTTP cache partition is
+    /// available; the engine will use `no-store` behavior for that request.
     fn cache_partition(&self, request: &Request) -> Result<String, RequestError>;
 }

@@ -75,6 +75,123 @@ fn vary_star_responses_are_not_cached() {
 }
 
 #[test]
+fn effective_authorization_headers_prevent_storage() {
+    let cache = ResponseCache::default();
+    let url = Url::parse("https://example.test/private").unwrap();
+    let request = Request::get(url.as_str());
+    let mut request_headers = crate::Headers::generated_request_headers();
+    request_headers
+        .set_str("authorization", "Bearer generated")
+        .unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+
+    cache.insert_with_headers(
+        &request,
+        &url,
+        &request_headers,
+        StoredResponse {
+            status: StatusCode::OK,
+            headers,
+            url: url.to_string(),
+            body: Bytes::from_static(b"private"),
+            cookie_headers_processed: false,
+        },
+    );
+
+    assert!(
+        cache
+            .lookup_with_headers(&request, &url, &request_headers)
+            .is_none()
+    );
+}
+
+#[test]
+fn request_no_store_prevents_storage() {
+    let cache = ResponseCache::default();
+    let url = Url::parse("https://example.test/no-store-request").unwrap();
+    let request = Request::get(url.as_str());
+    let mut request_headers = crate::Headers::generated_request_headers();
+    request_headers
+        .set_str("cache-control", "no-store")
+        .unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+
+    cache.insert_with_headers(
+        &request,
+        &url,
+        &request_headers,
+        StoredResponse {
+            status: StatusCode::OK,
+            headers,
+            url: url.to_string(),
+            body: Bytes::from_static(b"not stored"),
+            cookie_headers_processed: false,
+        },
+    );
+
+    assert!(
+        cache
+            .lookup_with_headers(&request, &url, &request_headers)
+            .is_none()
+    );
+}
+
+#[test]
+fn partial_responses_are_not_stored_without_range_support() {
+    let cache = ResponseCache::default();
+    let url = Url::parse("https://example.test/range").unwrap();
+    let request = Request::get(url.as_str());
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+    headers.insert("content-range", "bytes 0-3/10".parse().unwrap());
+
+    cache.insert_with_headers(
+        &request,
+        &url,
+        request.headers(),
+        StoredResponse {
+            status: StatusCode::PARTIAL_CONTENT,
+            headers,
+            url: url.to_string(),
+            body: Bytes::from_static(b"part"),
+            cookie_headers_processed: false,
+        },
+    );
+
+    assert!(fresh_response(&cache, &request, &url).is_none());
+}
+
+#[test]
+fn cache_hits_generate_current_age() {
+    let clock = Arc::new(TestClock::new(Duration::from_secs(1_000)));
+    let cache = ResponseCache::with_clock(4, 64, clock.clone());
+    let url = Url::parse("https://example.test/aged").unwrap();
+    let request = Request::get(url.as_str());
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, "max-age=60".parse().unwrap());
+    headers.insert(AGE, "2".parse().unwrap());
+    cache.insert_with_headers(
+        &request,
+        &url,
+        request.headers(),
+        StoredResponse {
+            status: StatusCode::OK,
+            headers,
+            url: url.to_string(),
+            body: Bytes::from_static(b"aged"),
+            cookie_headers_processed: false,
+        },
+    );
+
+    clock.advance(Duration::from_secs(5));
+    let response = fresh_response(&cache, &request, &url).unwrap();
+
+    assert_eq!(response.headers.get(AGE).unwrap(), "7");
+}
+
+#[test]
 /// Verifies non-cacheable directives prevent insertion.
 fn cache_control_rejects_non_cacheable_directives() {
     for value in ["no-store", "public, no-cache, max-age=60"] {

@@ -18,6 +18,21 @@ use net::{
 
 struct SameOriginCacheServices;
 
+struct StandaloneCachePartition;
+
+impl CachePartitionService for StandaloneCachePartition {
+    fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
+        Ok("standalone-cache-test".into())
+    }
+}
+
+fn cache_controller() -> RequestController {
+    RequestController::builder(Config::default())
+        .with_cache_partition_service(Arc::new(StandaloneCachePartition))
+        .build()
+        .unwrap()
+}
+
 /// Waits for detached body capture by retrying a cache-preferred probe.
 async fn wait_for_cached(controller: &RequestController, request: &Request) -> net::Response {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -258,9 +273,7 @@ fn empty_stream_body_can_be_consumed_and_cached() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 204 No Content\r\nCache-Control: max-age=60\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     let (first, second) = runtime().block_on(async {
         let first = controller.fetch(Request::get(server.url())).await.unwrap();
@@ -285,9 +298,7 @@ fn fully_consumed_stream_is_cached() {
         observed_hits.fetch_add(1, Ordering::SeqCst);
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     runtime().block_on(async {
         let response = controller.fetch(Request::get(server.url())).await.unwrap();
@@ -315,9 +326,7 @@ fn no_cache_revalidates_with_all_validators_and_reuses_the_merged_representation
             b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nETag: \"version-1\"\r\nLast-Modified: Sun, 06 Nov 1994 08:49:37 GMT\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
         }
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     let (revalidated, cached) = runtime().block_on(async {
         let request = Request::get(server.url());
@@ -433,9 +442,7 @@ fn no_cache_without_a_validator_replaces_the_cached_representation() {
             b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecond".to_vec()
         }
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     runtime().block_on(async {
         let request = Request::get(server.url());
@@ -482,9 +489,7 @@ fn failed_revalidation_keeps_the_existing_representation() {
             b"HTTP/1.1 204 No Content\r\nCache-Control: max-age=0\r\nETag: \"version-1\"\r\nConnection: close\r\n\r\n".to_vec()
         }
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     runtime().block_on(async {
         let request = Request::get(server.url());
@@ -525,9 +530,7 @@ fn transport_failed_revalidation_keeps_the_existing_representation() {
             b"HTTP/1.1 204 No Content\r\nCache-Control: max-age=0\r\nETag: \"version-1\"\r\nConnection: close\r\n\r\n".to_vec()
         }
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     runtime().block_on(async {
         let request = Request::get(server.url());
@@ -569,9 +572,7 @@ fn stale_while_revalidate_serves_stale_and_refreshes_once_in_the_background() {
             b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh".to_vec()
         }
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     runtime().block_on(async {
         let request = Request::get(server.url());
@@ -619,9 +620,7 @@ fn stale_if_error_returns_a_cached_representation_for_server_failures() {
             b"HTTP/1.1 200 OK\r\nCache-Control: max-age=0, stale-if-error=60\r\nETag: \"stale\"\r\nContent-Length: 5\r\nConnection: close\r\n\r\nstale".to_vec()
         }
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     runtime().block_on(async {
         let request = Request::get(server.url());
@@ -675,9 +674,7 @@ fn no_store_responses_are_not_cached() {
         observed_hits.fetch_add(1, Ordering::SeqCst);
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh".to_vec()
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     runtime().block_on(async {
         let mut request = Request::get(server.url());
@@ -702,9 +699,7 @@ fn force_cache_serves_a_permitted_stale_representation_without_network_io() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=0\r\nContent-Length: 5\r\nConnection: close\r\n\r\nstale".to_vec()
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     let cached = runtime().block_on(async {
         let request = Request::get(server.url());
@@ -792,9 +787,7 @@ fn reload_bypasses_cache_and_caches_the_refresh_when_consumed() {
         let body = if hit == 0 { "first" } else { "second" };
         format!("HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).into_bytes()
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     let (first, refreshed, cached) = runtime().block_on(async {
         let request = Request::get(server.url());
@@ -860,9 +853,7 @@ fn cache_mode_directives_preserve_caller_headers() {
         }
         b"HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     runtime().block_on(async {
         let mut reload = Request::get(format!("{}/reload", server.url()));
@@ -933,9 +924,7 @@ fn no_store_sends_cache_bypass_directives_when_the_caller_omits_them() {
         assert!(request.contains("cache-control: no-cache"));
         b"HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     runtime().block_on(async {
         let mut request = Request::get(server.url());
@@ -960,9 +949,7 @@ fn default_request_with_a_caller_validator_bypasses_and_preserves_the_cache() {
             b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
         }
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
     let url = server.url().to_owned();
 
     runtime().block_on(async {
@@ -1002,6 +989,68 @@ fn default_request_with_a_caller_validator_bypasses_and_preserves_the_cache() {
 }
 
 #[test]
+fn caller_no_cache_directive_revalidates_a_fresh_entry() {
+    let server = TestServer::start(2, |request| {
+        if request.contains("if-none-match: \"cached\"") {
+            b"HTTP/1.1 304 Not Modified\r\nCache-Control: max-age=60\r\nConnection: close\r\n\r\n"
+                .to_vec()
+        } else {
+            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nETag: \"cached\"\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
+        }
+    });
+    let controller = cache_controller();
+    let url = server.url().to_owned();
+
+    runtime().block_on(async {
+        let first = Request::get(&url);
+        assert_eq!(
+            collect_body(controller.fetch(first.try_clone().unwrap()).await.unwrap())
+                .await
+                .unwrap(),
+            b"cached"
+        );
+        drop(wait_for_cached(&controller, &first).await);
+
+        let mut revalidate = Request::get(&url);
+        revalidate
+            .set_header(
+                HeaderName::from_static("cache-control"),
+                HeaderValue::from_static("no-cache"),
+            )
+            .unwrap();
+        let response = controller.fetch(revalidate).await.unwrap();
+        assert!(response.from_cache);
+        assert_eq!(collect_body(response).await.unwrap(), b"cached");
+    });
+
+    server.join();
+}
+
+#[test]
+fn missing_cache_partition_uses_no_store_behavior() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let observed_hits = Arc::clone(&hits);
+    let server = TestServer::start(2, move |_| {
+        observed_hits.fetch_add(1, Ordering::SeqCst);
+        b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 7\r\nConnection: close\r\n\r\nnetwork".to_vec()
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+
+    runtime().block_on(async {
+        for _ in 0..2 {
+            let response = controller.fetch(Request::get(server.url())).await.unwrap();
+            assert!(!response.from_cache);
+            assert_eq!(collect_body(response).await.unwrap(), b"network");
+        }
+    });
+
+    server.join();
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
 fn unsafe_redirect_invalidates_its_same_origin_location_target() {
     let target_hits = Arc::new(AtomicUsize::new(0));
     let observed_target_hits = Arc::clone(&target_hits);
@@ -1019,9 +1068,7 @@ fn unsafe_redirect_invalidates_its_same_origin_location_target() {
             panic!("unexpected request: {request}");
         }
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
     let target = format!("{}/target", server.url());
     let mutation = format!("{}/mutate", server.url());
 
@@ -1042,10 +1089,10 @@ fn unsafe_redirect_invalidates_its_same_origin_location_target() {
 }
 
 #[test]
-fn unsafe_response_invalidates_its_request_target_even_after_a_server_error() {
+fn unsuccessful_unsafe_response_preserves_its_request_target() {
     let hits = Arc::new(AtomicUsize::new(0));
     let observed_hits = Arc::clone(&hits);
-    let server = TestServer::start(3, move |request| {
+    let server = TestServer::start(2, move |request| {
         if request.starts_with("POST /resource ") {
             b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 .to_vec()
@@ -1060,9 +1107,7 @@ fn unsafe_response_invalidates_its_request_target_even_after_a_server_error() {
             panic!("unexpected request: {request}");
         }
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
     let resource = format!("{}/resource", server.url());
 
     runtime().block_on(async {
@@ -1076,9 +1121,9 @@ fn unsafe_response_invalidates_its_request_target_even_after_a_server_error() {
             .unwrap();
         assert_eq!(mutation.status, 500);
 
-        let refreshed = controller.fetch(Request::get(&resource)).await.unwrap();
-        assert!(!refreshed.from_cache);
-        assert_eq!(collect_body(refreshed).await.unwrap(), b"new");
+        let cached = controller.fetch(Request::get(&resource)).await.unwrap();
+        assert!(cached.from_cache);
+        assert_eq!(collect_body(cached).await.unwrap(), b"old");
     });
 
     server.join();
@@ -1096,9 +1141,7 @@ fn unsuccessful_unsafe_response_does_not_invalidate_its_location_target() {
             panic!("unexpected request: {request}");
         }
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
     let target = format!("{}/target", server.url());
     let mutation = format!("{}/mutate", server.url());
 
@@ -1132,9 +1175,7 @@ fn unsafe_response_cannot_invalidate_a_cross_origin_location_target() {
         assert!(request.starts_with("POST /mutate "));
         format!("HTTP/1.1 201 Created\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     runtime().block_on(async {
         let initial = controller
@@ -1201,9 +1242,7 @@ fn no_store_requests_are_not_cached() {
         observed_hits.fetch_add(1, Ordering::SeqCst);
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfresh".to_vec()
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     runtime().block_on(async {
         let mut request = Request::get(server.url());
@@ -1227,9 +1266,7 @@ fn clear_cache_forces_a_new_network_request() {
         observed_hits.fetch_add(1, Ordering::SeqCst);
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_vec()
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     runtime().block_on(async {
         let request = Request::get(server.url());
@@ -1260,9 +1297,7 @@ fn reload_bypasses_cached_response_and_caches_the_refresh() {
         let body = if hit == 0 { "first" } else { "second" };
         format!("HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).into_bytes()
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     let response = runtime().block_on(async {
         let request = Request::get(server.url());
@@ -1399,9 +1434,7 @@ fn only_if_cached_requires_same_origin_mode_without_network_access() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
 
     runtime().block_on(async {
         let request = Request::get(server.url());
@@ -1427,9 +1460,7 @@ fn cloned_controllers_share_the_response_cache() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\nshared".to_vec()
     });
-    let controller = RequestController::builder(Config::default())
-        .build()
-        .unwrap();
+    let controller = cache_controller();
     let clone = controller.clone();
 
     let (first, second) = runtime().block_on(async {

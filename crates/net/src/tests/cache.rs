@@ -10,8 +10,16 @@ use std::{
     thread,
 };
 
-use crate::{CacheMode, Config, Request, RequestController, RequestError};
+use crate::{CacheMode, CachePartitionService, Config, Request, RequestController, RequestError};
 use reqwest::StatusCode;
+
+struct TestCachePartition;
+
+impl CachePartitionService for TestCachePartition {
+    fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
+        Ok("crate-cache-test".into())
+    }
+}
 
 #[test]
 /// Verifies a fresh cached GET avoids a second server request.
@@ -21,6 +29,7 @@ fn cache_serves_a_fresh_get_without_a_second_network_request() {
     let (address, request_count, server) = start_cached_server();
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
     let client = RequestController::builder(Config::default())
+        .with_cache_partition_service(Arc::new(TestCachePartition))
         .build()
         .expect("controller should initialize");
 

@@ -152,8 +152,9 @@ impl RequestController {
             });
         }
         self.observe(request, NetworkPhase::CacheLookup, url, None, false);
+        let cache_mode = effective_cache_mode(request, request_headers);
         let cache_lookup = matches!(
-            request.cache_mode(),
+            cache_mode,
             CacheMode::Default
                 | CacheMode::OnlyIfCached
                 | CacheMode::ForceCache
@@ -161,7 +162,7 @@ impl RequestController {
         );
         let mut revalidation = None;
         let mut stale_if_error = None;
-        let cached = match request.cache_mode() {
+        let cached = match cache_mode {
             CacheMode::NoCache => {
                 revalidation = self.inner.cache.lookup_for_revalidation_with_headers(
                     request,
@@ -231,7 +232,7 @@ impl RequestController {
                 crate::log_url::loggable(url.as_str())
             );
         }
-        if request.cache_mode() == CacheMode::OnlyIfCached {
+        if cache_mode == CacheMode::OnlyIfCached {
             log::debug!(
                 "only-if-cached request has no cache entry: {}",
                 crate::log_url::loggable(url.as_str())
@@ -526,7 +527,7 @@ impl RequestController {
     ) {
         if response.from_cache
             || !request.is_cacheable_method()
-            || request.cache_mode() == CacheMode::NoStore
+            || request_forbids_storage(request, request_headers)
         {
             return;
         }
@@ -561,7 +562,7 @@ impl RequestController {
             Some(response.status.as_u16()),
             response.from_cache,
         );
-        if request.is_cacheable_method() && request.cache_mode() != CacheMode::NoStore {
+        if request.is_cacheable_method() && !request_forbids_storage(request, request_headers) {
             if response.body.is_null() {
                 log::trace!(
                     "storing null-body response in cache: {}",
@@ -650,10 +651,10 @@ impl RequestController {
         url: &reqwest::Url,
         response: &InternalResponse,
     ) {
-        self.inner.cache.invalidate(request, url);
         if !response.status.is_success() && !response.status.is_redirection() {
             return;
         }
+        self.inner.cache.invalidate(request, url);
         let Some(location) = response.headers.get(http::header::LOCATION) else {
             return;
         };
@@ -734,4 +735,48 @@ impl RequestController {
 /// Reports whether a response status triggers Fetch redirect processing.
 fn is_redirect_status(status: http::StatusCode) -> bool {
     matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
+/// Applies caller cache-control directives to default Fetch cache behavior.
+fn effective_cache_mode(request: &Request, request_headers: &crate::Headers) -> CacheMode {
+    if request.cache_mode() != CacheMode::Default {
+        return request.cache_mode();
+    }
+    if has_cache_control_directive(request_headers, "no-store") {
+        CacheMode::NoStore
+    } else if has_cache_control_directive(request_headers, "no-cache")
+        || (!request_headers.has(http::header::CACHE_CONTROL.as_str())
+            && request_headers
+                .get(http::header::PRAGMA.as_str())
+                .is_some_and(|value| {
+                    value
+                        .split(',')
+                        .any(|token| token.trim().eq_ignore_ascii_case("no-cache"))
+                }))
+    {
+        CacheMode::NoCache
+    } else {
+        CacheMode::Default
+    }
+}
+
+/// Reports whether this request forbids retaining its network response.
+fn request_forbids_storage(request: &Request, request_headers: &crate::Headers) -> bool {
+    request.cache_mode() == CacheMode::NoStore
+        || has_cache_control_directive(request_headers, "no-store")
+}
+
+/// Finds one case-insensitive directive in the combined request field value.
+fn has_cache_control_directive(headers: &crate::Headers, expected: &str) -> bool {
+    headers
+        .get(http::header::CACHE_CONTROL.as_str())
+        .is_some_and(|value| {
+            value.split(',').any(|directive| {
+                directive
+                    .trim()
+                    .split_once('=')
+                    .map_or(directive.trim(), |(name, _)| name.trim())
+                    .eq_ignore_ascii_case(expected)
+            })
+        })
 }

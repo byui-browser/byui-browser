@@ -151,7 +151,7 @@ impl FreshnessMetadata {
         self.allows_stale_while_revalidate(now) || self.allows_stale_if_error(now)
     }
 
-    fn current_age(&self, now: CacheTime) -> Duration {
+    pub(super) fn current_age(&self, now: CacheTime) -> Duration {
         let apparent_age = self
             .date
             .map(|date| self.response_time.wall.saturating_sub(date))

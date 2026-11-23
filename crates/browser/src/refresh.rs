@@ -89,12 +89,32 @@ async fn report(controller: &RequestController, url: &str) -> Result<String, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use net::{CachePartitionService, RequestError};
     use std::{
         io::Read,
         net::TcpListener,
+        sync::Arc,
         thread,
         time::{Duration, Instant},
     };
+
+    struct TestCachePartition;
+
+    impl CachePartitionService for TestCachePartition {
+        fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
+            Ok("refresh-cache-test".into())
+        }
+    }
+
+    fn cache_enabled_client() -> RefreshClient {
+        RefreshClient {
+            runtime: Runtime::new().unwrap(),
+            controller: RequestController::builder(Config::default())
+                .with_cache_partition_service(Arc::new(TestCachePartition))
+                .build()
+                .unwrap(),
+        }
+    }
 
     // Bounded local fixture: failures time out instead of hanging the test run.
     fn server(responses: Vec<String>) -> (String, thread::JoinHandle<Vec<String>>) {
@@ -213,7 +233,7 @@ mod tests {
     #[test]
     fn refresh_bypasses_a_populated_http_cache() {
         let (url, server) = server(vec![response("200 OK", "old"), response("200 OK", "new")]);
-        let client = RefreshClient::new().unwrap();
+        let client = cache_enabled_client();
         client.runtime.block_on(async {
             let first = client.controller.fetch(Request::get(&url)).await.unwrap();
             assert_eq!(first.body.text().await.unwrap(), "old");

@@ -7,6 +7,8 @@ a partial Fetch HTTP-cache implementation. It currently provides:
 
 - structured cache identity for partition, method, normalized URL, credential
   eligibility, request mode, redirect taint, and authorization presence;
+- fail-closed effective-header authorization admission and browser partition
+  selection derived from the request's network partition key;
 - bounded storage with primary-entry and aggregate-body-byte limits;
 - least-recently-used eviction and stale-entry pruning;
 - multiple `Vary` request-header variants, including `Vary: *` rejection and
@@ -16,6 +18,7 @@ a partial Fetch HTTP-cache implementation. It currently provides:
 - explicit freshness based on `Date`, `Expires`, `Age`, and supported
   `Cache-Control` directives, including stale extensions, plus conservative
   `Last-Modified` heuristic freshness when explicit metadata is absent;
+- regenerated `Age` metadata whenever a stored response is reused;
 - `stale-while-revalidate` with one detached refresh per matching variant and
   `stale-if-error` fallback for transport and 5xx failures;
 - validator retention, conditional requests, `304 Not Modified` freshening and
@@ -48,16 +51,14 @@ from storage.
 
 Remaining work:
 
-- Make the cache partition mandatory for browser-context requests. The current
-  standalone fallback can create an unpartitioned cache rather than selecting
-  `no-store` when no browser HTTP cache is available.
 - Revisit the extra cache-key dimensions. They conservatively reduce reuse but
   do not model HTTP cache matching directly.
 - Extend the current status-admission subset and cached-redirect behavior to
-  the complete HTTP caching rules. The cache now admits default-cacheable
-  response statuses plus other responses with explicit cache metadata, and
-  follows stored redirects for cache hits (including `OnlyIfCached`), but the
-  status policy remains intentionally incomplete.
+  the complete HTTP caching rules. The cache now admits supported
+  default-cacheable response statuses plus other responses with explicit
+  cache metadata, rejects `206 Partial Content` until range-aware completeness
+  tracking exists, and follows stored redirects for cache hits (including
+  `OnlyIfCached`), but the status policy remains intentionally incomplete.
 
 Freshness uses explicit `Cache-Control`, `Date`, `Expires`, and `Age` metadata
 where available. If no explicit lifetime is present, a valid `Last-Modified`
@@ -92,12 +93,12 @@ the active cache partition, including method and `Vary` variants. A successful
 fragments are ignored, while unrelated URLs, origins, and partitions remain
 untouched.
 
-Focused integration coverage verifies that request-target invalidation also
-occurs after a server error, successful 2xx and 3xx responses invalidate only
-same-origin `Location` targets, and unsuccessful responses leave their
-`Location` target intact. Unit coverage preserves partition and `Vary`-variant
-isolation. Remaining work is an audit against the complete HTTP invalidation
-rules before introducing a durable backend.
+Focused integration coverage verifies that successful 2xx and 3xx unsafe
+responses invalidate the request target and only same-origin `Location`
+targets, while unsuccessful responses preserve both targets. Unit coverage
+preserves partition and `Vary`-variant isolation. Remaining work is an audit
+against the complete HTTP invalidation rules before introducing a durable
+backend.
 
 ### 5. Finish all Fetch cache modes
 
@@ -116,14 +117,16 @@ The current implementation has all six modes represented. `Reload` and
 `NoStore` add `Pragma: no-cache` and `Cache-Control: no-cache` only when the
 caller did not already provide each respective field; `NoCache` likewise
 preserves a caller-provided `Cache-Control` field. Default requests with
-caller-supplied validators use `no-store` behavior. These are Fetch's
-request-header preparation rules, rather than known deviations.
+caller-supplied validators use `no-store` behavior. Caller-supplied request
+`no-cache` triggers validation in default mode, and request `no-store` bypasses
+lookup and storage. These are Fetch and HTTP cache-control rules rather than
+known deviations.
 
 Cached redirects are stored and followed for `OnlyIfCached` when redirect mode
 is `Follow`. `OnlyIfCached` outside same-origin mode currently returns the
-Rust `NetworkError` before network I/O. When a JavaScript `fetch` binding is
-introduced, it must reject that invalid option combination with the
-JavaScript-facing `TypeError` required during Request construction.
+Rust `NetworkError` before network I/O. The JavaScript `fetch` binding rejects
+that invalid option combination with the `TypeError` required during request
+construction.
 
 ### 6. Revisit body-capture semantics
 
@@ -190,7 +193,9 @@ Add focused coverage for:
   concurrent replacement, and `Set-Cookie` during `304`;
 - generated-header-aware `Vary` matching;
 - cacheable non-2xx responses and cached redirects; and
-- missing browser cache partitions and the resulting `no-store` behavior.
+- missing browser cache partitions and the resulting `no-store` behavior;
+- effective generated authorization, request cache directives, generated
+  `Age`, and partial-response rejection.
 
 Run the focused `net` tests together with formatting and clippy before the
 cache work is considered complete.

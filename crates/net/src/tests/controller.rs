@@ -9,8 +9,8 @@ use std::{
 };
 
 use crate::{
-    AbortController, Body, CacheMode, Config, NetworkEvent, NetworkObserver, NetworkPhase, Request,
-    RequestController, RequestError, ResponseType,
+    AbortController, Body, CacheMode, CachePartitionService, Config, NetworkEvent, NetworkObserver,
+    NetworkPhase, Request, RequestController, RequestError, ResponseType,
 };
 use futures_util::StreamExt;
 use reqwest::{
@@ -20,6 +20,14 @@ use reqwest::{
 
 #[derive(Default)]
 struct EventLog(Mutex<Vec<NetworkEvent>>);
+
+struct TestCachePartition;
+
+impl CachePartitionService for TestCachePartition {
+    fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
+        Ok("controller-cache-test".into())
+    }
+}
 
 impl NetworkObserver for EventLog {
     fn observe(&self, event: NetworkEvent) {
@@ -222,6 +230,7 @@ fn observer_receives_network_lifecycle_events() {
     });
     let events = Arc::new(EventLog::default());
     let client = RequestController::builder(Config::default())
+        .with_cache_partition_service(Arc::new(TestCachePartition))
         .with_network_observer(events.clone())
         .build()
         .expect("controller should initialize");
@@ -352,6 +361,7 @@ fn completed_background_capture_is_cached() {
 
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime should initialize");
     let client = RequestController::builder(Config::default())
+        .with_cache_partition_service(Arc::new(TestCachePartition))
         .build()
         .expect("controller should initialize");
     let (first, second) = runtime.block_on(async {

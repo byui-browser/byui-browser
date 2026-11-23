@@ -3,10 +3,10 @@
 use bytes::Bytes;
 use reqwest::{
     StatusCode,
-    header::{ETAG, HeaderMap, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED},
+    header::{AGE, ETAG, HeaderMap, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED},
 };
 
-use super::freshness::FreshnessMetadata;
+use super::freshness::{CacheTime, FreshnessMetadata};
 
 /// Complete buffered response retained for cache policy and later filtering.
 #[derive(Clone, Debug)]
@@ -83,6 +83,17 @@ impl CachedResponse {
         self.response.clone()
     }
 
+    /// Reconstructs a response and sets `Age` to its age at reuse time.
+    pub(crate) fn as_response_at(&self, now: CacheTime) -> StoredResponse {
+        let mut response = self.as_response();
+        let age = self.freshness.current_age(now).as_secs().to_string();
+        response.headers.insert(
+            AGE,
+            HeaderValue::from_str(&age).expect("a decimal age is a valid header value"),
+        );
+        response
+    }
+
     /// Reports whether this entry is still the representation that a
     /// conditional request validated.
     ///
@@ -91,7 +102,7 @@ impl CachedResponse {
     /// that newer representation.
     pub(super) fn matches_revalidation(&self, response: &StoredResponse) -> bool {
         self.response.status == response.status
-            && self.response.headers == response.headers
+            && headers_match_ignoring_age(&self.response.headers, &response.headers)
             && self.response.url == response.url
             && self.response.body == response.body
             && self.response.cookie_headers_processed == response.cookie_headers_processed
@@ -166,6 +177,15 @@ impl CachedResponse {
         self.last_access = access;
         self.as_response()
     }
+}
+
+/// Compares stored representation metadata while ignoring generated cache age.
+fn headers_match_ignoring_age(first: &HeaderMap, second: &HeaderMap) -> bool {
+    let mut first = first.clone();
+    let mut second = second.clone();
+    first.remove(AGE);
+    second.remove(AGE);
+    first == second
 }
 
 fn response_validator(headers: &HeaderMap) -> Option<CacheValidator> {

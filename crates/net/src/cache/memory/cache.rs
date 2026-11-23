@@ -17,7 +17,7 @@ use crate::api::request::Request;
 use super::{
     entry::{CacheValidator, CachedResponse, StoredResponse, vary_header_names},
     freshness::{CacheClock, FreshnessMetadata, SystemCacheClock},
-    key::{cache_key, has_authorization, invalidation_key},
+    key::{cache_key_with_headers, has_authorization, invalidation_key},
     storage::{CacheEntries, CacheLimits},
 };
 
@@ -124,7 +124,7 @@ impl ResponseCache {
         url: &Url,
         request_headers: &crate::Headers,
     ) -> Option<CacheLookup> {
-        let key = cache_key(request, url);
+        let key = cache_key_with_headers(request, url, request_headers);
         let now = self.clock.now();
         let mut entries = self.entries.write().expect("cache lock poisoned");
         let access = entries.next_access();
@@ -147,10 +147,10 @@ impl ResponseCache {
         };
         cached.last_access = access;
         if cached.freshness.is_fresh(now) {
-            Some(CacheLookup::Fresh(cached.as_response()))
+            Some(CacheLookup::Fresh(cached.as_response_at(now)))
         } else {
             Some(CacheLookup::Stale {
-                response: cached.as_response(),
+                response: cached.as_response_at(now),
                 validator: cached.validator.clone(),
                 stale_while_revalidate: cached.freshness.allows_stale_while_revalidate(now),
                 stale_if_error: cached.freshness.allows_stale_if_error(now),
@@ -168,7 +168,7 @@ impl ResponseCache {
         url: &Url,
         request_headers: &crate::Headers,
     ) -> Option<RevalidationLease> {
-        let cache = cache_key(request, url);
+        let cache = cache_key_with_headers(request, url, request_headers);
         let entries = self.entries.read().expect("cache lock poisoned");
         let entry = entries.entries.get(&cache)?.iter().find(|entry| {
             entry
@@ -205,7 +205,8 @@ impl ResponseCache {
         url: &Url,
         request_headers: &crate::Headers,
     ) -> Option<StoredResponse> {
-        let key = cache_key(request, url);
+        let key = cache_key_with_headers(request, url, request_headers);
+        let now = self.clock.now();
         let mut entries = self.entries.write().expect("cache lock poisoned");
         let access = entries.next_access();
         let cached = entries.entries.get_mut(&key)?.iter_mut().find(|entry| {
@@ -215,7 +216,7 @@ impl ResponseCache {
                 .all(|(name, original_value)| request_headers.get(name) == *original_value)
         })?;
         cached.last_access = access;
-        Some(cached.as_response())
+        Some(cached.as_response_at(now))
     }
 
     /// Returns a matching representation and validator using complete outgoing headers.
@@ -227,7 +228,7 @@ impl ResponseCache {
         url: &Url,
         request_headers: &crate::Headers,
     ) -> Option<(StoredResponse, CacheValidator)> {
-        let key = cache_key(request, url);
+        let key = cache_key_with_headers(request, url, request_headers);
         let mut entries = self.entries.write().expect("cache lock poisoned");
         let access = entries.next_access();
         let cached = entries.entries.get_mut(&key)?.iter_mut().find(|entry| {
@@ -254,7 +255,7 @@ impl ResponseCache {
         validated_response: &StoredResponse,
         headers: &reqwest::header::HeaderMap,
     ) -> Option<StoredResponse> {
-        let key = cache_key(request, url);
+        let key = cache_key_with_headers(request, url, request_headers);
         let now = self.clock.now();
         let mut entries = self.entries.write().expect("cache lock poisoned");
         let access = entries.next_access();
@@ -274,7 +275,7 @@ impl ResponseCache {
                 .any(|name| name == "*");
             let freshness = FreshnessMetadata::from_headers(&cached.response.headers, now);
             if !can_store {
-                let response = cached.as_response();
+                let response = cached.as_response_at(now);
                 let mut removed_body_size = cached.body_size();
                 removed_body_size = removed_body_size.saturating_add(
                     variants
@@ -284,7 +285,8 @@ impl ResponseCache {
                 );
                 (response, removed_body_size)
             } else if let Some(freshness) = freshness {
-                let response = cached.refresh_not_modified(freshness, access);
+                cached.refresh_not_modified(freshness, access);
+                let response = cached.as_response_at(now);
                 let vary_names = cached.vary_names();
                 let cached_vary_headers = &cached.vary_headers;
                 let mut removed_body_size = 0_usize;
@@ -299,7 +301,7 @@ impl ResponseCache {
                 variants.push(cached);
                 (response, removed_body_size)
             } else {
-                (cached.as_response(), cached.body_size())
+                (cached.as_response_at(now), cached.body_size())
             }
         };
         entries.total_body_size = entries.total_body_size.saturating_sub(removed_body_size);
@@ -314,9 +316,22 @@ impl ResponseCache {
         request_headers: &crate::Headers,
         response: StoredResponse,
     ) {
-        if !request.is_cacheable_method() || has_authorization(request) {
+        if !request.is_cacheable_method()
+            || has_authorization(request_headers)
+            || request_headers
+                .get(CACHE_CONTROL.as_str())
+                .is_some_and(|value| {
+                    value.split(',').any(|directive| {
+                        directive
+                            .trim()
+                            .split_once('=')
+                            .map_or(directive.trim(), |(name, _)| name.trim())
+                            .eq_ignore_ascii_case("no-store")
+                    })
+                })
+        {
             log::trace!(
-                "cache store skipped for {}: method or authorization is not cacheable",
+                "cache store skipped for {}: request policy is not cacheable",
                 crate::log_url::loggable(url.as_str())
             );
             return;
@@ -354,7 +369,7 @@ impl ResponseCache {
             response.body.len(),
             freshness.lifetime.as_secs()
         );
-        let key = cache_key(request, url);
+        let key = cache_key_with_headers(request, url, request_headers);
         let body_size = response.body.len();
         if self.limits.max_entries == 0
             || self.limits.max_body_size == 0
@@ -434,9 +449,15 @@ impl ResponseCache {
 /// responses, including temporary redirects, require explicit freshness or
 /// cache-control metadata before this bounded private cache retains them.
 fn is_cacheable_response_status(status: http::StatusCode, headers: &HeaderMap) -> bool {
+    // Partial responses require range-aware completeness tracking and must not
+    // be reused as complete representations. Reject them until that support
+    // exists, even when they carry explicit freshness metadata.
+    if status == http::StatusCode::PARTIAL_CONTENT {
+        return false;
+    }
     matches!(
         status.as_u16(),
-        200 | 203 | 204 | 206 | 300 | 301 | 308 | 404 | 405 | 410 | 414 | 501
+        200 | 203 | 204 | 300 | 301 | 308 | 404 | 405 | 410 | 414 | 501
     ) || headers.contains_key(CACHE_CONTROL)
         || headers.contains_key(EXPIRES)
 }
