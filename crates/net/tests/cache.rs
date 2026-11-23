@@ -1042,6 +1042,121 @@ fn unsafe_redirect_invalidates_its_same_origin_location_target() {
 }
 
 #[test]
+fn unsafe_response_invalidates_its_request_target_even_after_a_server_error() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let observed_hits = Arc::clone(&hits);
+    let server = TestServer::start(3, move |request| {
+        if request.starts_with("POST /resource ") {
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec()
+        } else if request.starts_with("GET /resource ") {
+            let body = if observed_hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                "old"
+            } else {
+                "new"
+            };
+            format!("HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
+        } else {
+            panic!("unexpected request: {request}");
+        }
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+    let resource = format!("{}/resource", server.url());
+
+    runtime().block_on(async {
+        let initial = controller.fetch(Request::get(&resource)).await.unwrap();
+        assert_eq!(collect_body(initial).await.unwrap(), b"old");
+        wait_for_cached(&controller, &Request::get(&resource)).await;
+
+        let mutation = controller
+            .fetch(Request::new(&resource, "POST").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(mutation.status, 500);
+
+        let refreshed = controller.fetch(Request::get(&resource)).await.unwrap();
+        assert!(!refreshed.from_cache);
+        assert_eq!(collect_body(refreshed).await.unwrap(), b"new");
+    });
+
+    server.join();
+}
+
+#[test]
+fn unsuccessful_unsafe_response_does_not_invalidate_its_location_target() {
+    let server = TestServer::start(2, |request| {
+        if request.starts_with("POST /mutate ") {
+            b"HTTP/1.1 404 Not Found\r\nLocation: /target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec()
+        } else if request.starts_with("GET /target ") {
+            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
+        } else {
+            panic!("unexpected request: {request}");
+        }
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+    let target = format!("{}/target", server.url());
+    let mutation = format!("{}/mutate", server.url());
+
+    runtime().block_on(async {
+        let initial = controller.fetch(Request::get(&target)).await.unwrap();
+        assert_eq!(collect_body(initial).await.unwrap(), b"cached");
+        wait_for_cached(&controller, &Request::get(&target)).await;
+
+        let response = controller
+            .fetch(Request::new(&mutation, "POST").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status, 404);
+
+        let cached = wait_for_cached(&controller, &Request::get(&target)).await;
+        assert_eq!(collect_body(cached).await.unwrap(), b"cached");
+    });
+
+    server.join();
+}
+
+#[test]
+fn unsafe_response_cannot_invalidate_a_cross_origin_location_target() {
+    let target_server = TestServer::start(1, |request| {
+        assert!(request.starts_with("GET /target "));
+        b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
+    });
+    let cross_origin_target = format!("{}/target", target_server.url());
+    let location = cross_origin_target.clone();
+    let mutation_server = TestServer::start(1, move |request| {
+        assert!(request.starts_with("POST /mutate "));
+        format!("HTTP/1.1 201 Created\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
+    });
+    let controller = RequestController::builder(Config::default())
+        .build()
+        .unwrap();
+
+    runtime().block_on(async {
+        let initial = controller
+            .fetch(Request::get(&cross_origin_target))
+            .await
+            .unwrap();
+        assert_eq!(collect_body(initial).await.unwrap(), b"cached");
+        wait_for_cached(&controller, &Request::get(&cross_origin_target)).await;
+
+        let mutation = Request::new(format!("{}/mutate", mutation_server.url()), "POST").unwrap();
+        let response = controller.fetch(mutation).await.unwrap();
+        assert_eq!(response.status, 201);
+
+        let cached = wait_for_cached(&controller, &Request::get(&cross_origin_target)).await;
+        assert_eq!(collect_body(cached).await.unwrap(), b"cached");
+    });
+
+    target_server.join();
+    mutation_server.join();
+}
+
+#[test]
 fn only_if_cached_returns_a_cache_hit() {
     let server = TestServer::start(1, |_| {
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nX-Cache-Test: yes\r\nConnection: close\r\n\r\ncached".to_vec()

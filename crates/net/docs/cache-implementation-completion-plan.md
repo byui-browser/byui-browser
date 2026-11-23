@@ -92,9 +92,12 @@ the active cache partition, including method and `Vary` variants. A successful
 fragments are ignored, while unrelated URLs, origins, and partitions remain
 untouched.
 
-Remaining work is to validate this behavior against the complete HTTP
-invalidation rules, including status classes, redirect targets, and cache
-partition boundaries.
+Focused integration coverage verifies that request-target invalidation also
+occurs after a server error, successful 2xx and 3xx responses invalidate only
+same-origin `Location` targets, and unsuccessful responses leave their
+`Location` target intact. Unit coverage preserves partition and `Vary`-variant
+isolation. Remaining work is an audit against the complete HTTP invalidation
+rules before introducing a durable backend.
 
 ### 5. Finish all Fetch cache modes
 

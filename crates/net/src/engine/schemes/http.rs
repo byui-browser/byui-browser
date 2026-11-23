@@ -651,7 +651,7 @@ impl RequestController {
         response: &InternalResponse,
     ) {
         self.inner.cache.invalidate(request, url);
-        if !(200..400).contains(&response.status.as_u16()) {
+        if !response.status.is_success() && !response.status.is_redirection() {
             return;
         }
         let Some(location) = response.headers.get(http::header::LOCATION) else {
