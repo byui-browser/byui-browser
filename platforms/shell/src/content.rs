@@ -910,6 +910,17 @@ enum PageCommand {
         repeat: bool,
         response: mpsc::Sender<bool>,
     },
+    Keyup {
+        key: String,
+        code: String,
+        location: u32,
+        ctrl_key: bool,
+        shift_key: bool,
+        alt_key: bool,
+        meta_key: bool,
+        repeat: bool,
+        response: mpsc::Sender<bool>,
+    },
     WatchDom(DomChanged),
     Snapshot(mpsc::Sender<String>),
     /// Answers once every earlier command has been handled.
@@ -1079,6 +1090,43 @@ impl PageEvents {
             .is_err()
         {
             log::warn!("page session is not running; dropped keydown");
+            return true;
+        }
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap_or(true)
+    }
+
+    /// Dispatches a trusted native `keyup` event to the current page.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn keyup(
+        &self,
+        key: String,
+        code: String,
+        location: u32,
+        ctrl_key: bool,
+        shift_key: bool,
+        alt_key: bool,
+        meta_key: bool,
+        repeat: bool,
+    ) -> bool {
+        let (response, receiver) = mpsc::channel();
+        if self
+            .commands
+            .send(PageCommand::Keyup {
+                key,
+                code,
+                location,
+                ctrl_key,
+                shift_key,
+                alt_key,
+                meta_key,
+                repeat,
+                response,
+            })
+            .is_err()
+        {
+            log::warn!("page session is not running; dropped keyup");
             return true;
         }
         receiver
@@ -1272,6 +1320,38 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
                     Ok(allowed) => allowed,
                     Err(error) => {
                         log::warn!("page keydown failed: {error}");
+                        true
+                    }
+                };
+                let _ = response.send(allowed);
+                report_dom_change(session, &mut shown, watcher.as_ref());
+            }
+            PageCommand::Keyup {
+                key,
+                code,
+                location,
+                ctrl_key,
+                shift_key,
+                alt_key,
+                meta_key,
+                repeat,
+                response,
+            } => {
+                let Some(session) = &session else {
+                    let _ = response.send(true);
+                    continue;
+                };
+                let (result, event) =
+                    TimelineEvent::measure(EventCategory::Script, "Keyup listeners", || {
+                        session.dispatch_keyup(
+                            &key, &code, location, ctrl_key, shift_key, alt_key, meta_key, repeat,
+                        )
+                    });
+                record(&performance, event);
+                let allowed = match result {
+                    Ok(allowed) => allowed,
+                    Err(error) => {
+                        log::warn!("page keyup failed: {error}");
                         true
                     }
                 };

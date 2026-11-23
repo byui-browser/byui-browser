@@ -64,8 +64,16 @@ struct WindowKeydownState {
     handler: Option<Function>,
 }
 
+/// Per-Window state for the `keyup` event handler attribute.
+#[derive(Default)]
+struct WindowKeyupState {
+    /// The current `window.onkeyup` event handler, if any.
+    handler: Option<Function>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn keyboard_event(
+    event_type: &str,
     key: &str,
     code: &str,
     location: u32,
@@ -75,7 +83,7 @@ fn keyboard_event(
     meta_key: bool,
     repeat: bool,
 ) -> Object {
-    let event = event_object("keydown".into(), true, true);
+    let event = event_object(event_type.into(), true, true);
     event.set("key", Value::String(key.into()));
     event.set("code", Value::String(code.into()));
     event.set("location", Value::Number(location as f64));
@@ -134,6 +142,7 @@ fn keyboard_event_constructor(arguments: &[Value]) -> JsResult<Value> {
             .is_some_and(|value| matches!(value, Value::Boolean(true)))
     };
     let event = keyboard_event(
+        &event_type,
         &string("key"),
         &string("code"),
         number("location"),
@@ -1472,6 +1481,84 @@ fn register_window_object(
         })),
     );
 
+    // `window.onkeyup` is an event handler IDL attribute. Keep its handler
+    // in private state and expose one stable listener on Window.
+    let keyup_state = Arc::new(Mutex::new(WindowKeyupState::default()));
+    let onkeyup_listener = {
+        let window = window.clone();
+        let keyup_state = Arc::clone(&keyup_state);
+        let evaluator = evaluator.clone();
+        Function::from_host(
+            "onkeyup",
+            Arc::new(move |arguments| {
+                let handler = keyup_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .handler
+                    .clone();
+                if let Some(handler) = handler {
+                    let result = evaluator.call_with_this_reentrant(
+                        &handler,
+                        Value::Object(window.clone()),
+                        arguments,
+                    )?;
+                    if matches!(result, Value::Boolean(false))
+                        && let Some(Value::Object(event)) = arguments.first()
+                        && let Some(Value::Function(prevent_default)) = event.get("preventDefault")
+                    {
+                        prevent_default.call(&[])?;
+                    }
+                }
+                Ok(Value::Undefined)
+            }),
+        )
+    };
+    let keyup_state_for_get = Arc::clone(&keyup_state);
+    let keyup_state_for_set = Arc::clone(&keyup_state);
+    let onkeyup_event_target = event_target.clone();
+    window.define_accessor(
+        "onkeyup",
+        Arc::new(move || {
+            let state = keyup_state_for_get
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(state.handler.clone().map_or(Value::Null, Value::Function))
+        }),
+        Some(Arc::new(move |value| {
+            let handler = match value {
+                Value::Null | Value::Undefined => None,
+                Value::Function(handler) => Some(handler),
+                _ => return Err(type_error("window.onkeyup must be a function or null")),
+            };
+            let had_handler = {
+                let mut state = keyup_state_for_set
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let had_handler = state.handler.is_some();
+                state.handler = handler.clone();
+                had_handler
+            };
+            let listener_arguments = [
+                Value::String("keyup".into()),
+                Value::Function(onkeyup_listener.clone()),
+            ];
+            match (had_handler, handler.is_some()) {
+                (false, true) => {
+                    add_event_listener_to_target(
+                        &onkeyup_event_target,
+                        &listener_arguments,
+                        "window",
+                    )?;
+                }
+                (true, false) => {
+                    remove_event_listener_from_target(&onkeyup_event_target, &listener_arguments)?;
+                }
+                _ => {}
+            }
+            Ok(())
+        })),
+    );
+
     // CSSOM View's `window.onscroll` is an event handler IDL attribute. Keep
     // one stable listener so it participates in registration order with
     // `addEventListener("scroll", ...)` listeners.
@@ -2132,6 +2219,42 @@ fn register_window_object(
                     .is_some_and(|value| matches!(value, Value::Boolean(true)))
             };
             let event = keyboard_event(
+                "keydown",
+                string(0).unwrap_or_default(),
+                string(1).unwrap_or_default(),
+                number(2).unwrap_or(0),
+                boolean(3),
+                boolean(4),
+                boolean(5),
+                boolean(6),
+                boolean(7),
+            );
+            Ok(Value::Object(event))
+        }),
+    );
+    let create_keyup_event = window.clone();
+    window.set_method(
+        "__createKeyupEvent",
+        Arc::new(move |arguments| {
+            let string = |index: usize| {
+                arguments.get(index).and_then(|value| match value {
+                    Value::String(value) => Some(value.as_str()),
+                    _ => None,
+                })
+            };
+            let number = |index: usize| {
+                arguments.get(index).and_then(|value| match value {
+                    Value::Number(value) => Some(*value as u32),
+                    _ => None,
+                })
+            };
+            let boolean = |index: usize| {
+                arguments
+                    .get(index)
+                    .is_some_and(|value| matches!(value, Value::Boolean(true)))
+            };
+            let event = keyboard_event(
+                "keyup",
                 string(0).unwrap_or_default(),
                 string(1).unwrap_or_default(),
                 number(2).unwrap_or(0),
@@ -2156,6 +2279,18 @@ fn register_window_object(
             )
         }),
     );
+    let dispatch_keyup_event_target = event_target.clone();
+    let dispatch_keyup_window = window.clone();
+    window.set_method(
+        "__dispatchKeyupAtWindow",
+        Arc::new(move |arguments| {
+            dispatch_event_target_preserving_target(
+                &dispatch_keyup_event_target,
+                &dispatch_keyup_window,
+                arguments,
+            )
+        }),
+    );
     let dispatch_keydown_creator = create_keydown_event.clone();
     let dispatch_keydown_event_target = event_target.clone();
     let dispatch_keydown_window = window.clone();
@@ -2173,6 +2308,26 @@ fn register_window_object(
             dispatch_event_target(
                 &dispatch_keydown_event_target,
                 &dispatch_keydown_window,
+                &[event],
+            )
+        }),
+    );
+    let dispatch_keyup_creator = create_keyup_event.clone();
+    let dispatch_keyup_event_target = event_target.clone();
+    let dispatch_keyup_window = window.clone();
+    window.set_method(
+        "__dispatchKeyup",
+        Arc::new(move |arguments| {
+            let Some(Value::Function(create)) = dispatch_keyup_creator.get("__createKeyupEvent")
+            else {
+                return Err(JsError::runtime(
+                    "window keyup event constructor is not installed",
+                ));
+            };
+            let event = create.call(arguments)?;
+            dispatch_event_target(
+                &dispatch_keyup_event_target,
+                &dispatch_keyup_window,
                 &[event],
             )
         }),
@@ -2701,6 +2856,42 @@ pub fn dispatch_window_keydown(
         Value::Boolean(allowed) => Ok(allowed),
         _ => Err(JsError::runtime(
             "window keydown dispatcher returned a non-boolean",
+        )),
+    }
+}
+
+/// Dispatches a trusted native `keyup` event on a Window.
+///
+/// The event bubbles from the focused element through the document to the
+/// Window and is cancelable, matching the UI Events `keyup` definition.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_window_keyup(
+    window: &Object,
+    key: &str,
+    code: &str,
+    location: u32,
+    ctrl_key: bool,
+    shift_key: bool,
+    alt_key: bool,
+    meta_key: bool,
+    repeat: bool,
+) -> JsResult<bool> {
+    let Some(Value::Function(dispatch)) = window.get("__dispatchKeyup") else {
+        return Err(JsError::runtime("window keyup dispatcher is not installed"));
+    };
+    match dispatch.call(&[
+        Value::String(key.into()),
+        Value::String(code.into()),
+        Value::Number(location as f64),
+        Value::Boolean(ctrl_key),
+        Value::Boolean(shift_key),
+        Value::Boolean(alt_key),
+        Value::Boolean(meta_key),
+        Value::Boolean(repeat),
+    ])? {
+        Value::Boolean(allowed) => Ok(allowed),
+        _ => Err(JsError::runtime(
+            "window keyup dispatcher returned a non-boolean",
         )),
     }
 }

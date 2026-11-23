@@ -3222,6 +3222,24 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 log::trace!("key event: {:?}", event.state);
+                if event.state == ElementState::Released {
+                    let modifiers = self.modifiers;
+                    let page_has_focus = !self.tab.chrome.address_focused
+                        && !self.tab.find.as_ref().is_some_and(|find| find.focused)
+                        && self.tab.page_source.is_none();
+                    if page_has_focus {
+                        self.tab.page_events.keyup(
+                            Self::page_key_name(&event.logical_key.as_ref()),
+                            Self::page_key_code(&event),
+                            0,
+                            modifiers.control_key(),
+                            modifiers.shift_key(),
+                            modifiers.alt_key(),
+                            modifiers.super_key(),
+                            event.repeat,
+                        );
+                    }
+                }
                 if event.state == ElementState::Pressed {
                     let modifiers = self.modifiers;
                     let page_has_focus = !self.tab.chrome.address_focused
