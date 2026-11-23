@@ -441,6 +441,12 @@ fn property(document: &SharedDocument, id: NodeID, name: &str) -> JsResult<Value
         let parent = node.get_parent();
         let siblings = parent.map(|parent| source.get_nodes()[parent.get()].get_children());
         let position = siblings.and_then(|siblings| siblings.iter().position(|child| *child == id));
+        // `parentNode` is the DOM Standard's live parent relationship. It is
+        // intentionally resolved from the arena on every read so that the
+        // same wrapper observes moves and removals performed through any DOM
+        // mutation method. Unlike `parentElement`, it also returns a
+        // Document parent for the document element and applies to text,
+        // comment, and doctype nodes.
         let relation = match name {
             "parentNode" => parent,
             "parentElement" => parent.filter(|parent| {
