@@ -50,4 +50,39 @@ mod tests {
             Value::Boolean(true)
         );
     }
+
+    #[test]
+    fn parent_node_is_live_for_all_supported_child_node_kinds() {
+        let mut realm = realm_with("<!doctype html><div id='p'>text<!--comment--></div>");
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var p = document.getElementById('p'); \
+                 var text = p.firstChild; var comment = text.nextSibling; \
+                 var doctype = document.firstChild; \
+                 doctype.parentNode === document && text.parentNode === p && \
+                 comment.parentNode === p && document.parentNode === null && \
+                 p.removeChild(comment) === comment && comment.parentNode === null && \
+                 p.appendChild(comment) === comment && comment.parentNode === p"
+            ),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn parent_node_is_null_for_new_document_roots_and_is_read_only() {
+        let mut realm = realm_with("<div></div>");
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var created = new Document(); \
+                 var child = created.createElement('section'); \
+                 created.appendChild(child); \
+                 var before = child.parentNode === created && created.parentNode === null; \
+                 child.parentNode = null; \
+                 before && child.parentNode === created"
+            ),
+            Value::Boolean(true)
+        );
+    }
 }
