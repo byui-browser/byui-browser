@@ -8,8 +8,8 @@ null-body rules. The detailed audit below records the wider unfinished Fetch
 algorithms; see `fetch-engine-contract.md` for the current supported subset and
 capability errors.
 
-Status: audit of the implementation as of 2026-11-12, including the current
-`crates/net` implementation, browser composition, and the Feature 4.4 plan
+Status: audit of the implementation as of 2026-11-23, including the current
+`crates/net` implementation, browser composition, and the HTTP-cache plan
 updates. Body ownership and streaming claims below describe the current
 compiled implementation.
 
@@ -38,7 +38,7 @@ cancellation branch does not emit that phase.
 | Credentials and cookies     | `CookieService` exposes selection/storage hooks, but the current browser capability selects no cookies and stores none; matching, persistence, and policy remain provider work                                                               | Critical     |
 | CORS and response tainting  | Simple and preflighted CORS checks, URL-list-derived redirect taint, a partitioned preflight cache, and filtered views exist on every HTTP redirect hop; browser-generated headers participate in the same per-hop preflight decision, while browser policy values remain partial | High         |
 | Redirects                   | Controller follows validated HTTP(S) redirects with per-hop policy, credentials, origin/referrer transitions, cache lookup, and `follow`, `error`, and `manual` modes; broader browser subsystems remain partial                                  | Medium       |
-| HTTP cache                  | Process-local bounded cache with network-key-derived partitions, `Vary` variants, validators, revalidation, stale extensions, and invalidation; persistence and complete HTTP admission/freshness policy remain absent                       | High         |
+| HTTP cache                  | Process-local bounded cache with network-key-derived partitions, `Vary` variants, validators, revalidation, stale extensions, cache modes, and invalidation; durable persistence and complete shared HTTP admission/freshness policy remain absent | High |
 | Fetch policy integrations   | Browser-context requests require `RequestPolicyService`; CSP, mixed content, CORP, SRI, and worker interception remain provider/later-step work                                                                                                         | Critical     |
 | Cancellation and lifecycle  | Basic abort signal and broad best-effort lifecycle observer events work, but Fetch controller state, abort reasons, body timing, and abort-event reporting are absent                                                               | Medium       |
 | Fetch API surface           | Rust `Request`, filtered `Response`, guarded `Headers`, shared `Body`, response cloning, and body helpers exist; complete JavaScript bindings remain                                                                                             | High         |
@@ -169,7 +169,7 @@ browser integrations rather than CORS gaps.
 
 Every followed hop now repeats request authorization, simple CORS response validation, browser response approval, credential-gated cookie lookup/storage, and cache matching using the current method and URL. Network redirects disable further service-worker interception, redirect-tainted requests serialize their origin as `null`, redirect responses can update the referrer policy, and manual redirects pass through common approval before exposure. Malformed, credential-bearing, and non-HTTP(S) targets fail closed with `RedirectFailure`.
 
-**Required work:** integrate future same-site cookie, full HTTP-cache, mixed-content, and other browser-security facilities through the existing per-hop boundary as those facilities are implemented. These are subsystem gaps rather than missing redirect-loop dispatch.
+**Required work:** integrate future same-site cookie, shared/durable HTTP-cache, mixed-content, and other browser-security facilities through the existing per-hop boundary as those facilities are implemented. These are subsystem gaps rather than missing redirect-loop dispatch.
 
 ### 7. HTTP cache and cache modes
 
@@ -303,7 +303,7 @@ currently composed `byui:` and `file:` providers, while retaining the generic
 1. Expand `data:`, `byui:`, `file:`, and `about:blank` edge-case and provider-isolation coverage.
 2. Implement credentials/cookie policy and strict same-origin/CORS/no-CORS response filtering across HTTP and local schemes.
 3. Complete per-hop redirect CORS/security and credential policy.
-4. Replace the TTL map with a partitioned HTTP cache or integrate an existing standards-aware cache.
+4. Complete durable partitioning and shared-cache policy if a standards-aware cache is added or a cache backend is adopted.
 5. Complete JavaScript body conversion semantics on top of the explicit Rust fork/tee API.
 6. Resume browser-owned `blob:` lifecycle integration when its registry owner is scheduled.
 7. Add integrity, keepalive, service-worker, CSP/mixed-content, MIME/CORP, and timing hooks as the surrounding browser subsystems become available.

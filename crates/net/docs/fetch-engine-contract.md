@@ -144,7 +144,7 @@ work.
   error mode fails before public headers. Per-hop policy checks remain
   incomplete. Fetch errors currently return a `RequestError`, not a
   `ResponseType::Error` value.
-- All six cache modes retain their documented process-local subset. `NoCache`
+- All six cache modes retain their documented process-local implementation. `NoCache`
   revalidates a matching entry with its stored validators; `ForceCache` and
   same-origin `OnlyIfCached` use any matching stored entry, including one that
   otherwise requires revalidation, while `OnlyIfCached` never starts network
