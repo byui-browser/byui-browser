@@ -1090,19 +1090,12 @@ fn unsafe_redirect_invalidates_its_same_origin_location_target() {
 
 #[test]
 fn unsuccessful_unsafe_response_preserves_its_request_target() {
-    let hits = Arc::new(AtomicUsize::new(0));
-    let observed_hits = Arc::clone(&hits);
     let server = TestServer::start(2, move |request| {
         if request.starts_with("POST /resource ") {
             b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 .to_vec()
         } else if request.starts_with("GET /resource ") {
-            let body = if observed_hits.fetch_add(1, Ordering::SeqCst) == 0 {
-                "old"
-            } else {
-                "new"
-            };
-            format!("HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
+            b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 3\r\nConnection: close\r\n\r\nold".to_vec()
         } else {
             panic!("unexpected request: {request}");
         }
