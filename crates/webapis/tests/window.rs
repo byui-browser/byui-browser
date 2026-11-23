@@ -2,10 +2,163 @@ use js::{JsError, Realm, Value};
 use security::{Origin, RendererSecurityContext, StoragePermission};
 use std::{thread, time::Duration};
 use webapis::{
-    Document, register_document, register_window, register_window_with_security_context,
+    Document, dispatch_window_keydown, dispatch_window_keyup, dispatch_window_scroll,
+    register_document, register_window, register_window_with_security_context,
     register_window_with_url, register_window_with_url_and_device_pixel_ratio, report_window_error,
     run_window_hashchange_events, run_window_messages,
 };
+
+#[test]
+fn window_onkeydown_receives_keyboard_event_metadata_and_can_cancel() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    realm
+        .evaluate_script(
+            "var seen = null; function handler(event) { seen = [
+             this === window, event.type, event.key, event.code, event.location,
+             event.ctrlKey, event.shiftKey, event.altKey, event.metaKey,
+             event.repeat, event.bubbles, event.cancelable]; return false; }
+             window.onkeydown = handler;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        dispatch_window_keydown(&window, "A", "KeyA", 0, true, false, true, false, true),
+        Ok(false)
+    );
+    assert_eq!(
+        realm.evaluate_script(
+            "seen.length === 12 && seen[0] && seen[1] === 'keydown' && seen[2] === 'A' &&
+             seen[3] === 'KeyA' && seen[4] === 0 && seen[5] && !seen[6] && seen[7] &&
+             !seen[8] && seen[9] && seen[10] && seen[11]"
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_onkeydown_receives_bubbling_events_from_the_focused_element() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    register_document(
+        &mut realm,
+        Document::from_html_document(&html::parse_raw_html(
+            "<button id='target'></button>".to_owned(),
+        )),
+    )
+    .unwrap();
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    realm
+        .evaluate_script(
+            "var order = []; var target = document.getElementById('target');
+             target.addEventListener('keydown', () => order.push('target'));
+             document.addEventListener('keydown', () => order.push('document'));
+             window.onkeydown = () => order.push('window'); target.focus();",
+        )
+        .unwrap();
+    assert_eq!(
+        dispatch_window_keydown(
+            &window, "Enter", "Enter", 0, false, false, false, false, false
+        ),
+        Ok(true)
+    );
+    assert_eq!(
+        realm.evaluate_script(
+            "order.length === 3 && order[0] === 'target' && order[1] === 'document' &&
+             order[2] === 'window'",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_onkeyup_receives_keyboard_event_metadata_and_can_cancel() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    realm
+        .evaluate_script(
+            "var seen = null; function handler(event) { seen = [
+             this === window, event.type, event.key, event.code, event.location,
+             event.ctrlKey, event.shiftKey, event.altKey, event.metaKey,
+             event.repeat, event.bubbles, event.cancelable]; return false; }
+             window.onkeyup = handler;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        dispatch_window_keyup(&window, "A", "KeyA", 0, true, false, true, false, true),
+        Ok(false)
+    );
+    assert_eq!(
+        realm.evaluate_script(
+            "seen.length === 12 && seen[0] && seen[1] === 'keyup' && seen[2] === 'A' &&
+             seen[3] === 'KeyA' && seen[4] === 0 && seen[5] && !seen[6] && seen[7] &&
+             !seen[8] && seen[9] && seen[10] && seen[11]",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn window_onkeyup_receives_bubbling_events_from_the_focused_element() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    register_document(
+        &mut realm,
+        Document::from_html_document(&html::parse_raw_html(
+            "<button id='target'></button>".to_owned(),
+        )),
+    )
+    .unwrap();
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+    realm
+        .evaluate_script(
+            "var order = []; var target = document.getElementById('target');
+             target.addEventListener('keyup', () => order.push('target'));
+             document.addEventListener('keyup', () => order.push('document'));
+             window.onkeyup = () => order.push('window'); target.focus();",
+        )
+        .unwrap();
+    assert_eq!(
+        dispatch_window_keyup(
+            &window, "Enter", "Enter", 0, false, false, false, false, false
+        ),
+        Ok(true)
+    );
+    assert_eq!(
+        realm.evaluate_script(
+            "order.length === 3 && order[0] === 'target' && order[1] === 'document' &&
+             order[2] === 'window'",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
+fn keyboard_event_constructor_exposes_ui_events_defaults_and_modifier_state() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    assert_eq!(
+        realm.evaluate_script(
+            "var event = KeyboardEvent('keydown', {key: 'A', code: 'KeyA',
+             ctrlKey: true, repeat: true});
+             event.type === 'keydown' && event.key === 'A' && event.code === 'KeyA' &&
+             event.ctrlKey && event.repeat && event.getModifierState('Control') &&
+             !event.getModifierState('Shift') && event.location === 0 && event.detail === 0"
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
 
 #[test]
 fn window_onerror_receives_legacy_error_arguments_and_can_cancel_reporting() {
@@ -154,6 +307,48 @@ fn onmessage_can_be_removed_and_runs_with_event_listeners() {
 }
 
 #[test]
+fn onscroll_is_an_event_handler_attribute_with_window_scroll_metadata() {
+    let mut realm = Realm::new();
+    let window = register_window_with_url(&mut realm, "https://example.test/page").unwrap();
+
+    realm
+        .evaluate_script(
+            "var order = []; var seen = null; \
+             window.addEventListener('scroll', (event) => { \
+                 order.push('listener'); seen = [event.type, event.target, event.currentTarget, \
+                     event.bubbles, event.cancelable]; }); \
+             function rememberScroll(event) { order.push('handler'); \
+                 if (this !== window || event !== event) throw 'bad receiver'; } \
+             window.onscroll = rememberScroll;",
+        )
+        .unwrap();
+
+    dispatch_window_scroll(&window).unwrap();
+    assert_eq!(
+        realm.evaluate_script(
+            "order.length === 2 && order[0] === 'listener' && order[1] === 'handler' && \
+             seen[0] === 'scroll' && seen[1] === window && seen[2] === window && \
+             !seen[3] && !seen[4] && window.onscroll !== null",
+        ),
+        Ok(Value::Boolean(true))
+    );
+
+    realm
+        .evaluate_script(
+            "window.onscroll = null; window.addEventListener('scroll', () => order.push('second'))",
+        )
+        .unwrap();
+    dispatch_window_scroll(&window).unwrap();
+    assert_eq!(
+        realm.evaluate_script(
+            "order.length === 4 && order[2] === 'listener' && order[3] === 'second' && \
+             window.onscroll === null",
+        ),
+        Ok(Value::Boolean(true))
+    );
+}
+
+#[test]
 fn message_dispatch_honors_once_and_stop_immediate_propagation() {
     let mut realm = Realm::new();
     let window = register_window_with_url(&mut realm, "https://example.test/page").unwrap();
@@ -264,6 +459,50 @@ fn window_add_event_listener_dispatches_and_removes_callbacks() {
         ),
         Ok(Value::String("ready:true".into()))
     );
+}
+
+#[test]
+fn window_onclick_is_an_event_handler_attribute() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+
+    assert_eq!(
+        realm.evaluate_script("window.onclick === null"),
+        Ok(Value::Boolean(true))
+    );
+    realm
+        .evaluate_script(
+            "var order = []; var seen = {}; \
+             function listener() { order.push('listener'); } \
+             function handler(event) { order.push('handler'); \
+               seen.thisValue = this; seen.type = event.type; \
+               seen.target = event.target; seen.currentTarget = event.currentTarget; \
+               seen.bubbles = event.bubbles; seen.cancelable = event.cancelable; } \
+             window.addEventListener('click', listener); window.onclick = handler; \
+             window.onclick === handler && window.dispatchEvent({type: 'click', bubbles: true, cancelable: true})",
+        )
+        .unwrap();
+
+    assert_eq!(
+        realm.evaluate_script(
+            "order.length === 2 && order[0] === 'listener' && order[1] === 'handler' && \
+             seen.thisValue === window && seen.type === 'click' && \
+             seen.target === window && seen.currentTarget === window && \
+             seen.bubbles && seen.cancelable",
+        ),
+        Ok(Value::Boolean(true))
+    );
+
+    realm
+        .evaluate_script(
+            "window.onclick = null; window.dispatchEvent({type: 'click'}); window.onclick === null",
+        )
+        .unwrap();
+    assert_eq!(
+        realm.evaluate_script("order.length === 3 && order[2] === 'listener'"),
+        Ok(Value::Boolean(true))
+    );
+    assert!(realm.evaluate_script("window.onclick = 1").is_err());
 }
 
 #[test]
@@ -929,6 +1168,45 @@ fn inner_height_is_replaceable_like_the_cssom_view_attribute() {
     assert_eq!(
         realm.evaluate_script("window.innerHeight = 42; window.innerHeight"),
         Ok(Value::Number(42.0))
+    );
+}
+
+#[test]
+fn window_onresize_dispatches_after_viewport_changes() {
+    let mut realm = Realm::new();
+    register_window(&mut realm).unwrap();
+    let Some(Value::Object(window)) = realm.registered_global_value("window") else {
+        panic!("window global should be registered");
+    };
+
+    realm
+        .evaluate_script(
+            "var order = []; var seen = null; \
+             window.addEventListener('resize', () => order.push('listener')); \
+             function resizeHandler(event) { order.push('handler'); seen = { \
+               thisValue: this, type: event.type, target: event.target, \
+               currentTarget: event.currentTarget, bubbles: event.bubbles, \
+               cancelable: event.cancelable }; } \
+             window.onresize = resizeHandler; \
+             window.onresize === window.onresize",
+        )
+        .unwrap();
+
+    webapis::dispatch_window_resize(&window).unwrap();
+    assert_eq!(
+        realm.evaluate_script(
+            "order.length === 2 && order[0] === 'listener' && order[1] === 'handler' && \
+             seen.thisValue === window && seen.type === 'resize' && seen.target === window && \
+             seen.currentTarget === window && !seen.bubbles && !seen.cancelable",
+        ),
+        Ok(Value::Boolean(true))
+    );
+
+    realm.evaluate_script("window.onresize = null").unwrap();
+    webapis::dispatch_window_resize(&window).unwrap();
+    assert_eq!(
+        realm.evaluate_script("order.length === 3"),
+        Ok(Value::Boolean(true))
     );
 }
 

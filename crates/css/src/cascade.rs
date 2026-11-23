@@ -155,7 +155,7 @@ fn style_document_with_stats_context(
 ) -> (ComputedStyles, CascadeStats) {
     log::debug!(
         "styling document: {} nodes, {} author stylesheets",
-        dom.nodes.len(),
+        dom.get_nodes().len(),
         stylesheets.len()
     );
     if log::log_enabled!(log::Level::Debug) {
@@ -203,7 +203,7 @@ fn style_document_with_stats_context(
     let mut root_font_size = None;
     let mut candidates = Vec::new();
     let initial_color = initial_color_value();
-    for (node_index, node) in dom.nodes.iter().enumerate() {
+    for (node_index, node) in dom.get_nodes().iter().enumerate() {
         let NodeKind::Element(element) = node.get_kind() else {
             continue;
         };
@@ -511,6 +511,111 @@ fn media_feature_applies(token: &str, context: StyleContext) -> bool {
     }
 }
 
+/// Every physical property a logical property or alias can map to, so mapped names
+/// can borrow `'static` strings in the cascade map.
+const PHYSICAL_PROPERTIES: &[&str] = &[
+    "margin-top",
+    "margin-right",
+    "margin-bottom",
+    "margin-left",
+    "padding-top",
+    "padding-right",
+    "padding-bottom",
+    "padding-left",
+    "border-top-color",
+    "border-right-color",
+    "border-bottom-color",
+    "border-left-color",
+    "border-top-style",
+    "border-right-style",
+    "border-bottom-style",
+    "border-left-style",
+    "border-top-width",
+    "border-right-width",
+    "border-bottom-width",
+    "border-left-width",
+    "width",
+    "height",
+    "min-width",
+    "min-height",
+    "max-width",
+    "max-height",
+    "user-select",
+];
+
+/// The physical property a logical property (CSS Logical Properties 1)
+/// stands for under `writing_mode` and `direction: rtl`, or `None` when
+/// `property` is not a supported logical property.
+///
+/// Supported: `{margin,padding}-{block,inline}-{start,end}`,
+/// `border-{block,inline}-{start,end}-{color,style,width}`, and
+/// `{,min-,max-}{inline,block}-size`. The cascade maps axes this way, but
+/// layout itself only lays text out horizontally.
+fn logical_to_physical(property: &str, writing_mode: &str, rtl: bool) -> Option<String> {
+    let vertical = writing_mode.starts_with("vertical") || writing_mode.starts_with("sideways");
+    if let Some(prefix) = property
+        .strip_suffix("inline-size")
+        .or_else(|| property.strip_suffix("block-size"))
+    {
+        if !matches!(prefix, "" | "min-" | "max-") {
+            return None;
+        }
+        let inline = property.ends_with("inline-size");
+        let dimension = if inline != vertical {
+            "width"
+        } else {
+            "height"
+        };
+        return Some(format!("{prefix}{dimension}"));
+    }
+    let (head, rest) = ["margin-", "padding-", "border-"]
+        .into_iter()
+        .find_map(|head| property.strip_prefix(head).map(|rest| (head, rest)))?;
+    let (axis, rest) = rest.split_once('-')?;
+    let (edge, tail) = match rest.split_once('-') {
+        Some((edge, tail)) => (edge, Some(tail)),
+        None => (rest, None),
+    };
+    let start = match edge {
+        "start" => true,
+        "end" => false,
+        _ => return None,
+    };
+    match (head, tail) {
+        ("border-", Some("color" | "style" | "width")) | ("margin-" | "padding-", None) => {}
+        _ => return None,
+    }
+    let side = match (axis, vertical) {
+        ("block", false) => ["top", "bottom"][usize::from(!start)],
+        ("block", true) => {
+            // `vertical-lr` and `sideways-lr` stack lines left to right.
+            let left_first = writing_mode.ends_with("-lr");
+            if start == left_first { "left" } else { "right" }
+        }
+        ("inline", false) => {
+            if start != rtl {
+                "left"
+            } else {
+                "right"
+            }
+        }
+        ("inline", true) => {
+            // `sideways-lr` runs text bottom to top.
+            let top_first = writing_mode != "sideways-lr";
+            if (start != rtl) == top_first {
+                "top"
+            } else {
+                "bottom"
+            }
+        }
+        _ => return None,
+    };
+    Some(match tail {
+        Some(tail) => format!("{head}{side}-{tail}"),
+        None => format!("{head}{side}"),
+    })
+}
+
 /// Resolves one element's or pseudo-element's cascaded values against its
 /// parent's computed declarations.
 ///
@@ -521,7 +626,7 @@ fn media_feature_applies(token: &str, context: StyleContext) -> bool {
 /// the computed font size in CSS pixels.
 fn compute(
     parent: Option<&[Declaration]>,
-    cascaded: HashMap<&str, (CascadePriority, &str)>,
+    mut cascaded: HashMap<&str, (CascadePriority, &str)>,
     initial_color: &str,
     root_font_size: f32,
     context: StyleContext,
@@ -535,10 +640,45 @@ fn compute(
                 .map(|declaration| declaration.value.as_str())
         })
     };
+    // Logical and physical aliases compete using the original cascade priority.
+    // Writing modes map axes here; vertical text layout remains unsupported.
+    let axis_value = |name: &str, initial: &str| match cascaded.get(name).map(|(_, v)| v.trim()) {
+        Some("inherit" | "unset") | None => parent_value(name).unwrap_or(initial).to_owned(),
+        Some("initial" | "revert" | "revert-layer") => initial.to_owned(),
+        Some(value) => value.to_ascii_lowercase(),
+    };
+    let rtl = axis_value("direction", "ltr") == "rtl";
+    let writing_mode = axis_value("writing-mode", "horizontal-tb");
+    let mut mapped = Vec::new();
+    for logical in cascaded.keys() {
+        if let Some(physical) = logical_to_physical(logical, &writing_mode, rtl) {
+            mapped.push((*logical, physical));
+        } else if *logical == "-webkit-user-select" {
+            mapped.push((*logical, "user-select".to_owned()));
+        }
+    }
+    // Apply in a fixed order so equal priorities resolve deterministically.
+    mapped.sort_unstable();
+    for (logical, physical) in mapped {
+        let Some(physical) = PHYSICAL_PROPERTIES.iter().copied().find(|n| *n == physical) else {
+            continue;
+        };
+        let Some(candidate) = cascaded.remove(logical) else {
+            continue;
+        };
+        if cascaded
+            .get(physical)
+            .is_none_or(|existing| candidate.0 >= existing.0)
+        {
+            cascaded.insert(physical, candidate);
+        }
+    }
     let mut properties = BTreeMap::<String, String>::new();
     if let Some(parent) = parent {
         for declaration in parent {
-            if is_inherited_property(&declaration.property) {
+            if is_inherited_property(&declaration.property)
+                || declaration.property.starts_with("--")
+            {
                 properties.insert(declaration.property.clone(), declaration.value.clone());
             }
         }
@@ -574,6 +714,8 @@ fn compute(
         }
     }
 
+    resolve_computed_values(&mut properties);
+
     let parent_font_size = parent_value("font-size")
         .and_then(|value| {
             values::compute_font_size_with_context(
@@ -602,6 +744,15 @@ fn compute(
             parent_font_size
         });
     properties.insert("font-size".to_owned(), values::format_px(font_size));
+    if let Some(percent) = properties
+        .get("line-height")
+        .and_then(|value| values::parse_percentage(value))
+    {
+        properties.insert(
+            "line-height".to_owned(),
+            values::format_px(font_size * percent / 100.0),
+        );
+    }
     (
         properties
             .into_iter()
@@ -609,6 +760,113 @@ fn compute(
             .collect(),
         font_size,
     )
+}
+
+fn resolve_computed_values(properties: &mut BTreeMap<String, String>) {
+    let variables: BTreeMap<String, String> = properties
+        .iter()
+        .filter(|(property, _)| property.starts_with("--"))
+        .map(|(property, value)| (property.clone(), value.clone()))
+        .collect();
+    let property_names: Vec<String> = properties.keys().cloned().collect();
+
+    for property in property_names {
+        let Some(value) = properties.get(&property).cloned() else {
+            continue;
+        };
+        let Some(mut value) = substitute_variables(&value, &variables, &mut Vec::new()) else {
+            properties.remove(&property);
+            continue;
+        };
+        if !property.starts_with("--")
+            && let Some(resolved) = values::resolve_length_function(&value)
+        {
+            value = resolved;
+        }
+        properties.insert(property, value);
+    }
+}
+
+fn substitute_variables(
+    value: &str,
+    variables: &BTreeMap<String, String>,
+    stack: &mut Vec<String>,
+) -> Option<String> {
+    let mut result = String::new();
+    let mut index = 0;
+
+    while index < value.len() {
+        if !value[index..].to_ascii_lowercase().starts_with("var(") {
+            let character = value[index..].chars().next()?;
+            result.push(character);
+            index += character.len_utf8();
+            continue;
+        }
+
+        let end = matching_function_end(value, index)?;
+        let arguments = split_function_arguments(&value[index + 4..end - 1]);
+        let name = arguments.first()?.trim();
+        if !name.starts_with("--") {
+            return None;
+        }
+
+        let replacement = variables
+            .get(name)
+            .cloned()
+            .or_else(|| arguments.get(1).map(|fallback| fallback.to_string()))?;
+        if stack.iter().any(|item| item == name) {
+            return None;
+        }
+
+        stack.push(name.to_owned());
+        let resolved = substitute_variables(&replacement, variables, stack)?;
+        stack.pop();
+        result.push_str(&resolved);
+        index = end;
+    }
+
+    Some(result)
+}
+
+fn matching_function_end(value: &str, start: usize) -> Option<usize> {
+    let open = value[start..].find('(')? + start;
+    let mut depth: usize = 0;
+
+    for (offset, character) in value[open..].char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn split_function_arguments(input: &str) -> Vec<&str> {
+    let mut arguments = Vec::new();
+    let mut depth: usize = 0;
+    let mut start = 0;
+
+    for (index, character) in input.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                arguments.push(input[start..index].trim());
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    arguments.push(input[start..].trim());
+    arguments
 }
 
 /// Records `declaration` for its property if it beats the current winner.
@@ -666,5 +924,106 @@ pub(crate) fn is_inherited_property(property: &str) -> bool {
             | "text-align"
             | "text-transform"
             | "visibility"
+            | "white-space"
+            | "word-break"
+            | "direction"
+            | "writing-mode"
+            | "cursor"
+            | "text-rendering"
+            | "user-select"
     )
+}
+
+#[cfg(test)]
+mod logical_tests {
+    use super::logical_to_physical;
+
+    fn map(property: &str, writing_mode: &str, rtl: bool) -> Option<String> {
+        logical_to_physical(property, writing_mode, rtl)
+    }
+
+    #[test]
+    fn horizontal_logical_properties_map_by_direction() {
+        let h = "horizontal-tb";
+        assert_eq!(
+            map("margin-block-start", h, false).as_deref(),
+            Some("margin-top")
+        );
+        assert_eq!(
+            map("margin-block-end", h, true).as_deref(),
+            Some("margin-bottom")
+        );
+        assert_eq!(
+            map("padding-inline-start", h, false).as_deref(),
+            Some("padding-left")
+        );
+        assert_eq!(
+            map("padding-inline-start", h, true).as_deref(),
+            Some("padding-right")
+        );
+        assert_eq!(
+            map("padding-inline-end", h, true).as_deref(),
+            Some("padding-left")
+        );
+        assert_eq!(map("inline-size", h, false).as_deref(), Some("width"));
+        assert_eq!(map("block-size", h, false).as_deref(), Some("height"));
+        assert_eq!(
+            map("min-inline-size", h, false).as_deref(),
+            Some("min-width")
+        );
+        assert_eq!(
+            map("max-block-size", h, false).as_deref(),
+            Some("max-height")
+        );
+        assert_eq!(
+            map("border-inline-start-color", h, true).as_deref(),
+            Some("border-right-color")
+        );
+    }
+
+    #[test]
+    fn vertical_writing_modes_swap_axes() {
+        assert_eq!(
+            map("inline-size", "vertical-rl", false).as_deref(),
+            Some("height")
+        );
+        assert_eq!(
+            map("max-block-size", "vertical-lr", false).as_deref(),
+            Some("max-width")
+        );
+        assert_eq!(
+            map("margin-block-start", "vertical-rl", false).as_deref(),
+            Some("margin-right")
+        );
+        assert_eq!(
+            map("margin-block-start", "vertical-lr", false).as_deref(),
+            Some("margin-left")
+        );
+        assert_eq!(
+            map("padding-inline-start", "vertical-rl", false).as_deref(),
+            Some("padding-top")
+        );
+        assert_eq!(
+            map("padding-inline-start", "vertical-rl", true).as_deref(),
+            Some("padding-bottom")
+        );
+        assert_eq!(
+            map("padding-inline-start", "sideways-lr", false).as_deref(),
+            Some("padding-bottom")
+        );
+    }
+
+    #[test]
+    fn non_logical_properties_are_left_alone() {
+        for property in [
+            "margin-top",
+            "margin-block",
+            "padding-inline-middle",
+            "border-block-start",
+            "size",
+            "foo-inline-size",
+        ] {
+            assert_eq!(map(property, "horizontal-tb", false), None, "{property}");
+        }
+    }
 }

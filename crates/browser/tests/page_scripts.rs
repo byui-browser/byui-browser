@@ -127,6 +127,39 @@ fn policy_context_controls_runtime_local_storage() {
 }
 
 #[test]
+fn runtime_policy_is_shared_by_cloned_handles_and_can_be_revoked() {
+    let runtime = BrowserRuntime::in_memory();
+    let cloned_runtime = runtime.clone();
+    let example = Origin::new("https", "example.com", None);
+    cloned_runtime.deny_permission(example.clone(), PermissionKind::Storage);
+
+    let denied = runtime.security_context_for_url("https://example.com/page");
+    assert!(!denied.can_read_storage());
+    assert!(!denied.can_write_storage());
+
+    runtime.revoke_permission(&example, PermissionKind::Storage);
+
+    let restored = runtime.security_context_for_url("https://example.com/other");
+    assert!(restored.can_read_storage());
+    assert!(restored.can_write_storage());
+}
+
+#[test]
+fn runtime_policy_is_scoped_by_origin() {
+    let runtime = BrowserRuntime::in_memory();
+    runtime.deny_permission(
+        Origin::new("https", "example.com", None),
+        PermissionKind::Storage,
+    );
+
+    let denied = runtime.security_context_for_url("https://example.com/");
+    let allowed = runtime.security_context_for_url("https://other.example/");
+
+    assert!(!denied.can_read_storage());
+    assert!(allowed.can_read_storage());
+}
+
+#[test]
 fn page_script_runs_queued_microtasks_before_the_next_script() {
     let controller = Arc::new(
         net::RequestController::builder(net::Config::default())
@@ -369,6 +402,66 @@ fn window_location_shares_the_window_with_viewport_and_device_scale() {
 }
 
 #[test]
+fn viewport_resize_updates_inner_dimensions_and_dispatches_onresize() {
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+    let mut session = BrowserRuntime::in_memory()
+        .open_page_with_viewport(
+            &browser::Page {
+                url: "https://example.com/resize".into(),
+                html: String::new(),
+                stylesheets: Vec::new(),
+                scripts: vec![
+                    "var resizeCalls = 0; var resizeSeen = null; \
+                     function resizeHandler(event) { resizeCalls++; resizeSeen = \
+                     [this === window, event.type, event.target === window, \
+                      event.currentTarget === window, event.bubbles, event.cancelable, \
+                      window.innerWidth, window.innerHeight]; } \
+                     window.onresize = resizeHandler"
+                        .into(),
+                ],
+                resources: Default::default(),
+            },
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            security_context(),
+            1.0,
+            webapis::ViewportSize {
+                width: 800,
+                height: 600,
+            },
+        )
+        .expect("page script should evaluate");
+
+    session.set_viewport(webapis::ViewportSize {
+        width: 1024,
+        height: 768,
+    });
+    assert_eq!(
+        session.evaluate_script(
+            "resizeCalls === 1 && resizeSeen[0] && resizeSeen[1] === 'resize' && \
+             resizeSeen[2] && resizeSeen[3] && !resizeSeen[4] && !resizeSeen[5] && \
+             resizeSeen[6] === 1024 && resizeSeen[7] === 768 && \
+             window.innerWidth === 1024 && window.innerHeight === 768",
+        ),
+        Ok(js::Value::Boolean(true))
+    );
+
+    session.set_viewport(webapis::ViewportSize {
+        width: 1024,
+        height: 768,
+    });
+    assert_eq!(
+        session.evaluate_script("resizeCalls === 1"),
+        Ok(js::Value::Boolean(true))
+    );
+}
+
+#[test]
 fn document_click_listener_runs_after_the_page_loads() {
     let console = Arc::new(TestConsole::default());
     let alert = Arc::new(TestAlert::default());
@@ -435,7 +528,7 @@ fn linked_script_finds_page_elements_and_handles_their_clicks() {
     let document = html::parse_raw_html(page.html.clone());
     let button = document.get_element_by_id("btn").expect("#btn");
     let main = document
-        .node(button)
+        .get_node(button)
         .and_then(|node| node.get_parent())
         .expect("main");
     session

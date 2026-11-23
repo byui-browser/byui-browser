@@ -64,6 +64,31 @@ fn handles_length_case_whitespace_and_unitless_zero() {
 }
 
 #[test]
+fn rejects_unicode_lengths_without_panicking() {
+    for input in ["ééé", "☃☃", "💙💙", "1234épx", "1px💙", "  ééé  "] {
+        assert_eq!(parse_length(input), None, "{input}");
+    }
+}
+
+#[test]
+fn rejects_unicode_length_functions_without_panicking() {
+    for input in [
+        "ééé",
+        "aééx",
+        "abcdeéx",
+        "☃☃",
+        "💙💙",
+        "min💙(1px, 2px)",
+        "calc(1234épx + 1px)",
+        "min(1px, 1234épx)",
+        "max(1234épx, 2px)",
+        "clamp(1px, 1234épx, 3px)",
+    ] {
+        assert_eq!(css::values::resolve_length_function(input), None, "{input}");
+    }
+}
+
+#[test]
 fn converts_absolute_and_relative_lengths_to_pixels() {
     let context = LengthContext {
         font_size: 20.0,
@@ -209,4 +234,28 @@ fn rejects_unsupported_or_invalid_colors() {
     assert_eq!(parse_color("rgb(256, 0, 0)"), None);
     assert_eq!(parse_color("rgb(1, 2)"), None);
     assert_eq!(parse_color("not-a-color"), None);
+}
+
+#[test]
+fn resolves_css_length_functions() {
+    assert_eq!(
+        css::values::resolve_length_function("calc(20px + 30px)").as_deref(),
+        Some("50px")
+    );
+    assert_eq!(
+        css::values::resolve_length_function("calc(50px - 20px)").as_deref(),
+        Some("30px")
+    );
+    assert_eq!(
+        css::values::resolve_length_function("min(50px, 80px)").as_deref(),
+        Some("50px")
+    );
+    assert_eq!(
+        css::values::resolve_length_function("max(50px, 80px)").as_deref(),
+        Some("80px")
+    );
+    assert_eq!(
+        css::values::resolve_length_function("clamp(10px, 50px, 90px)").as_deref(),
+        Some("50px")
+    );
 }

@@ -1,13 +1,9 @@
-use super::element_data::ElementData;
+use super::{doctype::Doctype, element_data::ElementData};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeKind {
     Document,
-    Doctype {
-        name: Option<String>,
-        public_id: Option<String>,
-        system_id: Option<String>,
-    },
+    Doctype(Doctype),
     Element(ElementData),
     Text(String),
     Comment(String),

@@ -1,12 +1,13 @@
 use super::{
-    dom_error::DomError, dom_token_list::DOMTokenList, element_data::ElementData,
-    namespace::Namespace, node::Node, node_id::NodeID, node_kind::NodeKind,
+    attribute::Attribute, class_list::ClassList, doctype::Doctype, dom_error::DomError,
+    element_data::ElementData, namespace::Namespace, node::Node, node_id::NodeID,
+    node_kind::NodeKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HTMLDocument {
-    pub nodes: Vec<Node>,
-    pub root: NodeID,
+    nodes: Vec<Node>,
+    root: NodeID,
 }
 
 impl Default for HTMLDocument {
@@ -16,6 +17,7 @@ impl Default for HTMLDocument {
 }
 
 impl HTMLDocument {
+    /// Constructs HTMLDocument.
     pub fn new() -> Self {
         let mut document = Self {
             nodes: Vec::new(),
@@ -26,6 +28,39 @@ impl HTMLDocument {
         document
     }
 
+    /// Returns the document's root node ID.
+    pub fn get_root(&self) -> &NodeID {
+        &self.root
+    }
+
+    /// Returns all nodes in arena order.
+    pub fn get_nodes(&self) -> &Vec<Node> {
+        &self.nodes
+    }
+
+    /// Gets nodes list length.
+    pub fn get_nodes_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Gets a node from its ID.
+    ///
+    /// Returns None if not found.
+    pub fn get_node(&self, id: NodeID) -> Option<&Node> {
+        self.nodes.get(id.get())
+    }
+
+    /// Gets a mutable node from its ID.
+    ///
+    /// The returned node remains owned by this document. Mutating its parent
+    /// or child links directly can violate DOM invariants; callers should
+    /// prefer [`Self::append_child`] and [`Self::remove`] for tree changes.
+    /// Returns `None` if the ID is not present.
+    pub fn get_mut_node(&mut self, id: NodeID) -> Option<&mut Node> {
+        self.nodes.get_mut(id.get())
+    }
+
+    /// Adds new orphan node to HTMLDocument and returns its id.
     pub fn push_node(&mut self, kind: NodeKind) -> NodeID {
         let id = NodeID::new(self.nodes.len());
         let node = Node::new(None, Vec::new(), kind);
@@ -33,15 +68,25 @@ impl HTMLDocument {
         id
     }
 
+    /// Parents 'child' node to 'parent'.
     pub fn append_child(&mut self, parent: NodeID, child: NodeID) {
-        if let Some(node) = self.node_mut(child) {
-            node.set_parent(Some(parent));
+        // Removes child from previous parent.
+        if let Some(prev_parent) = self.get_node(child).and_then(Node::get_parent)
+            && let Some(prev_parent_node) = self.get_mut_node(prev_parent)
+        {
+            prev_parent_node.remove_child(child);
         }
-        if let Some(node) = self.node_mut(parent) {
-            let mut children = node.get_children().clone();
-            children.push(child);
-            node.set_children(children);
+
+        // Adds child to new parent.
+        if let Some(parent_node) = self.get_mut_node(parent) {
+            parent_node.add_child(child);
         }
+
+        // Sets new parent of child.
+        if let Some(child_node) = self.get_mut_node(child) {
+            child_node.set_parent(Some(parent));
+        }
+
         log::trace!("append node {} to parent {}", child.get(), parent.get());
     }
 
@@ -51,54 +96,87 @@ impl HTMLDocument {
     /// their existing stable IDs. Removing a detached node, the document root,
     /// or an invalid node ID has no effect.
     pub fn remove(&mut self, node: NodeID) {
-        let Some(parent) = self.node(node).and_then(Node::get_parent) else {
+        // Gets parent, returns otherwise.
+        let Some(parent) = self.get_node(node).and_then(Node::get_parent) else {
             return;
         };
 
-        if let Some(children) = self
-            .nodes
-            .get_mut(parent.get())
-            .map(|node| node.get_children().to_vec())
-        {
-            let children = children
-                .into_iter()
-                .filter(|child| *child != node)
-                .collect();
-            if let Some(parent_node) = self.node_mut(parent) {
-                parent_node.set_children(children);
-            }
+        // Removes node from parent.
+        if let Some(parent_node) = self.get_mut_node(parent) {
+            parent_node.remove_child(node);
         }
+
+        // Sets to be removed node's parent to None.
         if let Some(removed) = self.nodes.get_mut(node.get()) {
             removed.set_parent(None);
         }
     }
 
-    pub fn node(&self, id: NodeID) -> Option<&Node> {
-        self.nodes.get(id.get())
+    /// Gets the first element with the given HTML id (#id).
+    pub fn get_element_by_id(&self, id_value: &str) -> Option<NodeID> {
+        // Recursively searches from element by id through DOM tree.
+        fn find_in_tree(document: &HTMLDocument, parent: NodeID, id_value: &str) -> Option<NodeID> {
+            let children = document.get_node(parent)?.get_children().clone();
+
+            for child in children {
+                let node = document.get_node(child)?;
+                if let NodeKind::Element(element) = node.get_kind()
+                    && element.get_attributes().iter().any(|attribute| {
+                        attribute.get_name() == "id" && attribute.get_value() == id_value
+                    })
+                {
+                    return Some(child);
+                }
+
+                if let Some(found) = find_in_tree(document, child, id_value) {
+                    return Some(found);
+                }
+            }
+
+            None
+        }
+
+        // The DOM algorithm searches descendants in tree order. The document
+        // node itself is not an element and therefore is never a candidate.
+        find_in_tree(self, self.root, id_value)
     }
 
-    /// Returns a live `DOMTokenList` for an element's `class` attribute.
+    /// Returns a live [`ClassList`] for an element's `class` attribute.
     ///
     /// The handle mutates the associated element through its `add`, `remove`,
     /// `toggle`, `replace`, and `value` operations. The document is borrowed
     /// mutably for the lifetime of the handle, matching the exclusive access
     /// required for DOM mutations in this Rust model.
-    pub fn class_list(&mut self, element: NodeID) -> Result<DOMTokenList<'_>, DomError> {
-        if !matches!(
-            self.node(element).map(|node| node.get_kind()),
-            Some(NodeKind::Element(_))
-        ) {
-            log::debug!(
-                "class_list failed: node {} is not an element",
-                element.get()
-            );
+    pub fn class_list(&mut self, node_id: NodeID) -> Result<ClassList<'_>, DomError> {
+        // Gets node.
+        let Some(node) = self.get_mut_node(node_id) else {
             return Err(DomError::NotFound);
-        }
-        Ok(DOMTokenList::new(self, element))
-    }
+        };
 
-    pub(crate) fn node_mut(&mut self, id: NodeID) -> Option<&mut Node> {
-        self.nodes.get_mut(id.get())
+        // Gets element data of node.
+        let element = match node.get_mut_kind() {
+            NodeKind::Element(element) => element,
+            _ => {
+                log::debug!(
+                    "class_list failed: node {} is not an element",
+                    node_id.get()
+                );
+                return Err(DomError::NotFound);
+            }
+        };
+
+        // Creates class attribute if there is not one.
+        if !element.has_attribute(String::from("class")) {
+            element.set_attribute(Attribute::new(String::from("class"), String::new()))
+        }
+
+        // Gets class attribute of node.
+        let Some(class_attribute) = element.get_mut_attribute(String::from("class")) else {
+            return Err(DomError::NotFound);
+        };
+
+        // Returns class list.
+        Ok(ClassList::new(class_attribute))
     }
 
     /// Creates a detached HTML element using the DOM `createElement` rules.
@@ -106,7 +184,7 @@ impl HTMLDocument {
     /// ASCII uppercase characters are lowercased because this arena represents
     /// an HTML document. The returned node has no parent, no attributes, and
     /// the HTML namespace. Invalid names return [`DomError::InvalidCharacter`].
-    /// The node is owned by this arena; use the returned index with [`Self::node`].
+    /// The node is owned by this arena; use the returned ID with [`Self::get_node`].
     /// XML documents and custom-element creation options are not supported.
     pub fn create_element(&mut self, local_name: &str) -> Result<NodeID, DomError> {
         if !is_valid_element_local_name(local_name) {
@@ -133,6 +211,7 @@ impl HTMLDocument {
         qualified_name: &str,
         value: &str,
     ) -> Result<(), DomError> {
+        // Check whether the attribute name is valid.
         if !is_valid_attribute_local_name(qualified_name) {
             log::debug!(
                 "set_attribute on node {} rejected invalid attribute name {qualified_name:?}",
@@ -141,22 +220,25 @@ impl HTMLDocument {
             return Err(DomError::InvalidCharacter);
         }
 
-        let node = self.node(element).ok_or(DomError::NotFound)?;
-        let mut element_data = match node.get_kind() {
-            NodeKind::Element(element_data) => element_data.clone(),
-            _ => return Err(DomError::NotFound),
-        };
+        if let Some(node) = self.get_mut_node(element) {
+            let node_kind = node.get_mut_kind();
+            let element_data = match node_kind {
+                NodeKind::Element(element_data) => element_data,
+                _ => return Err(DomError::NotFound),
+            };
 
-        let name = match element_data.get_namespace() {
-            Namespace::Html => qualified_name.to_ascii_lowercase(),
-            Namespace::Svg | Namespace::MathMl => qualified_name.to_owned(),
-        };
+            // Normalize the name according to the element's namespace.
+            let name = match element_data.get_namespace() {
+                Namespace::Html => qualified_name.to_ascii_lowercase(),
+                Namespace::Svg | Namespace::MathMl => qualified_name.to_owned(),
+            };
 
-        log::trace!("set attribute {name:?} on node {}", element.get());
-        element_data.set_attribute(super::attribute::Attribute::new(name, value.to_owned()));
-        self.node_mut(element)
-            .expect("element was validated above")
-            .set_kind(NodeKind::Element(element_data));
+            // Set and log the attribute.
+            log::trace!("set attribute {name:?} on node {}", element.get());
+            element_data.set_attribute(Attribute::new(name, String::from(value)));
+        } else {
+            return Err(DomError::NotFound);
+        }
 
         Ok(())
     }
@@ -182,7 +264,7 @@ impl HTMLDocument {
             return Err(DomError::InvalidCharacter);
         }
 
-        let node = self.node(element).ok_or(DomError::NotFound)?;
+        let node = self.get_node(element).ok_or(DomError::NotFound)?;
         let mut element_data = match node.get_kind() {
             NodeKind::Element(element_data) => element_data.clone(),
             _ => return Err(DomError::NotFound),
@@ -196,7 +278,7 @@ impl HTMLDocument {
         }
         log::trace!("remove attribute {name:?} on node {}", element.get());
         element_data.remove_attribute(name);
-        self.node_mut(element)
+        self.get_mut_node(element)
             .expect("element was validated above")
             .set_kind(NodeKind::Element(element_data));
         Ok(true)
@@ -210,19 +292,23 @@ impl HTMLDocument {
     /// also return `None`. This is a read-only snapshot and does not mutate the
     /// document.
     pub fn text_content(&self, id: NodeID) -> Option<String> {
+        // Recursively collect text from a node's descendants.
         fn descendant_text(document: &HTMLDocument, id: NodeID, output: &mut String) {
-            let Some(node) = document.node(id) else {
+            let Some(node) = document.get_node(id) else {
                 return;
             };
-            if let NodeKind::Text(text) = node.get_kind() {
-                output.push_str(text);
-            }
-            for child in node.get_children() {
-                descendant_text(document, *child, output);
+            match node.get_kind() {
+                NodeKind::Element(_) => {
+                    for child in node.get_children() {
+                        descendant_text(document, *child, output);
+                    }
+                }
+                NodeKind::Text(text) => output.push_str(text),
+                _ => {}
             }
         }
 
-        let node = self.node(id)?;
+        let node = self.get_node(id)?;
         match node.get_kind() {
             NodeKind::Element(_) => {
                 let mut output = String::new();
@@ -232,8 +318,7 @@ impl HTMLDocument {
                 Some(output)
             }
             NodeKind::Text(text) | NodeKind::Comment(text) => Some(text.clone()),
-            NodeKind::Document | NodeKind::Doctype { .. } => None,
-            NodeKind::None => None,
+            _ => None,
         }
     }
 
@@ -247,7 +332,7 @@ impl HTMLDocument {
     /// are not implemented.
     pub fn inner_html(&self) -> String {
         let mut output = String::new();
-        if let Some(root) = self.node(self.root) {
+        if let Some(root) = self.get_node(self.root) {
             for child in root.get_children() {
                 self.serialize_node(*child, &mut output, false);
             }
@@ -262,14 +347,14 @@ impl HTMLDocument {
     /// node itself is included. Names are written as the parser stored them,
     /// which is ASCII lowercase, also for SVG content.
     pub fn outer_html(&self, id: NodeID) -> Option<String> {
-        self.node(id)?;
+        self.get_node(id)?;
         let mut output = String::new();
         self.serialize_node(id, &mut output, false);
         Some(output)
     }
 
     fn serialize_node(&self, id: NodeID, output: &mut String, raw_text: bool) {
-        let Some(node) = self.node(id) else {
+        let Some(node) = self.get_node(id) else {
             return;
         };
         match node.get_kind() {
@@ -278,55 +363,11 @@ impl HTMLDocument {
                     self.serialize_node(*child, output, false);
                 }
             }
-            NodeKind::Doctype {
-                name,
-                public_id,
-                system_id,
-            } => {
-                output.push_str("<!DOCTYPE");
-                if let Some(name) = name {
-                    output.push(' ');
-                    output.push_str(name);
-                }
-                if let Some(public_id) = public_id {
-                    output.push_str(" PUBLIC \"");
-                    output.push_str(&escape_attribute(public_id));
-                    output.push('"');
-                    if let Some(system_id) = system_id {
-                        output.push_str(" \"");
-                        output.push_str(&escape_attribute(system_id));
-                        output.push('"');
-                    }
-                } else if let Some(system_id) = system_id {
-                    output.push_str(" SYSTEM \"");
-                    output.push_str(&escape_attribute(system_id));
-                    output.push('"');
-                }
-                output.push('>');
+            NodeKind::Doctype(doctype) => {
+                self.serialize_doctype(output, doctype);
             }
             NodeKind::Element(element) => {
-                output.push('<');
-                output.push_str(element.get_name());
-                for attribute in element.get_attributes() {
-                    output.push(' ');
-                    output.push_str(attribute.get_name());
-                    output.push_str("=\"");
-                    output.push_str(&escape_attribute(attribute.get_value()));
-                    output.push('"');
-                }
-                output.push('>');
-                let is_void = *element.get_namespace() == Namespace::Html
-                    && is_void_html_element(element.get_name());
-                if !is_void {
-                    let child_raw_text = *element.get_namespace() == Namespace::Html
-                        && matches!(element.get_name().as_str(), "script" | "style");
-                    for child in node.get_children() {
-                        self.serialize_node(*child, output, child_raw_text);
-                    }
-                    output.push_str("</");
-                    output.push_str(element.get_name());
-                    output.push('>');
-                }
+                self.serialize_element(output, element, node);
             }
             NodeKind::Text(text) => {
                 if raw_text {
@@ -341,6 +382,56 @@ impl HTMLDocument {
                 output.push_str("-->");
             }
             NodeKind::None => {}
+        }
+    }
+
+    /// Serializes a doctype and appends it to the output string.
+    fn serialize_doctype(&self, output: &mut String, doctype: &Doctype) {
+        output.push_str("<!DOCTYPE");
+        if let Some(name) = doctype.get_name() {
+            output.push(' ');
+            output.push_str(name);
+        }
+        if let Some(public_id) = doctype.get_public_id() {
+            output.push_str(" PUBLIC \"");
+            output.push_str(&escape_attribute(public_id));
+            output.push('"');
+            if let Some(system_id) = doctype.get_system_id() {
+                output.push_str(" \"");
+                output.push_str(&escape_attribute(system_id));
+                output.push('"');
+            }
+        } else if let Some(system_id) = doctype.get_system_id() {
+            output.push_str(" SYSTEM \"");
+            output.push_str(&escape_attribute(system_id));
+            output.push('"');
+        }
+        output.push('>');
+    }
+
+    /// Serializes element data and appends it to the output string.
+    fn serialize_element(&self, output: &mut String, element: &ElementData, node: &Node) {
+        output.push('<');
+        output.push_str(element.get_name());
+        for attribute in element.get_attributes() {
+            output.push(' ');
+            output.push_str(attribute.get_name());
+            output.push_str("=\"");
+            output.push_str(&escape_attribute(attribute.get_value()));
+            output.push('"');
+        }
+        output.push('>');
+        let is_void =
+            *element.get_namespace() == Namespace::Html && is_void_html_element(element.get_name());
+        if !is_void {
+            let child_raw_text = *element.get_namespace() == Namespace::Html
+                && matches!(element.get_name().as_str(), "script" | "style");
+            for child in node.get_children() {
+                self.serialize_node(*child, output, child_raw_text);
+            }
+            output.push_str("</");
+            output.push_str(element.get_name());
+            output.push('>');
         }
     }
 
@@ -361,33 +452,6 @@ impl HTMLDocument {
                     .then(|| self.text_content(NodeID::new(index)).unwrap_or_default())
             })
             .collect()
-    }
-
-    pub fn get_element_by_id(&self, value: &str) -> Option<NodeID> {
-        fn find_in_tree(document: &HTMLDocument, parent: NodeID, value: &str) -> Option<NodeID> {
-            let children = document.node(parent)?.get_children().clone();
-
-            for child in children {
-                let node = document.node(child)?;
-                if let NodeKind::Element(element) = node.get_kind()
-                    && element.get_attributes().iter().any(|attribute| {
-                        attribute.get_name() == "id" && attribute.get_value() == value
-                    })
-                {
-                    return Some(child);
-                }
-
-                if let Some(found) = find_in_tree(document, child, value) {
-                    return Some(found);
-                }
-            }
-
-            None
-        }
-
-        // The DOM algorithm searches descendants in tree order. The document
-        // node itself is not an element and therefore is never a candidate.
-        find_in_tree(self, self.root, value)
     }
 }
 

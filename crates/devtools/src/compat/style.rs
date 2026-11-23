@@ -23,6 +23,8 @@ const CONTEXTS: &[&str] = &[
     "#t{position:relative}",
     "#t{width:60px;height:30px;padding:7px;overflow:hidden;white-space:nowrap}",
     "#t{display:list-item}",
+    "#t{display:inline}",
+    "#t{border:4px solid transparent}",
 ];
 
 /// Values tried in the plain context when the page's own values show no
@@ -138,7 +140,6 @@ const UNOBSERVABLE: &[&str] = &[
     "-webkit-tap-highlight-color",
     "-webkit-font-smoothing",
     "-moz-osx-font-smoothing",
-    "text-rendering",
     "image-rendering",
     "speak",
     "print-color-adjust",
@@ -1100,6 +1101,7 @@ pub(crate) fn audit<E: PageScriptEngine>(
     let (declarations, at_rules, selectors) = collect(page, map, report);
     audit_properties(auditor, &declarations, report);
     audit_values(auditor, &declarations, report);
+    audit_partial_support(&declarations, report);
     audit_at_rules(auditor, &at_rules, report);
     audit_selectors(auditor, &selectors, report);
 }
@@ -1203,13 +1205,84 @@ fn audit_properties<E: PageScriptEngine>(
 /// Whether setting `property` to any of the page's `values` or a generic
 /// candidate changes the fixture's rendering in any context.
 fn property_has_effect(property: &str, values: &[String]) -> bool {
+    // These properties need constraints, overflowing text, or keyframes to
+    // demonstrate support. Generic values alone produce false negatives.
+    let targeted = match property {
+        "word-break" => Some(differs(
+            "#c{width:16px;word-break:break-all}",
+            "#c{width:16px;word-break:normal}",
+        )),
+        "padding-inline-end" => Some(same(
+            "#t{padding-inline-end:20px}",
+            "#t{padding-right:20px}",
+        )),
+        "border-left-color" => Some(differs(
+            "#t{border:4px solid;border-left-color:#ff0000}",
+            "#t{border:4px solid}",
+        )),
+        "clear" => Some(differs(
+            "#c{float:left;width:50px;height:40px}#d{clear:left}",
+            "#c{float:left;width:50px;height:40px}",
+        )),
+        "border-color" => Some(differs(
+            "#t{border:4px solid;border-color:#ff0000}",
+            "#t{border:4px solid}",
+        )),
+        "outline-offset" => Some(differs(
+            "#t{outline:2px solid red;outline-offset:5px}",
+            "#t{outline:2px solid red;outline-offset:0}",
+        )),
+        "max-block-size" => Some(same(
+            "#t{height:100px;max-block-size:30px}",
+            "#t{height:30px}",
+        )),
+        "text-rendering" => Some(fixture("#c{text-rendering:optimizeSpeed}", |page| {
+            page.list.items.iter().any(|item| {
+                matches!(
+                    item,
+                    paint::DisplayItem::Text {
+                        snap_glyphs: true,
+                        ..
+                    }
+                )
+            })
+        })),
+
+        "animation" => Some(same(
+            "@keyframes probe{from{height:40px}to{height:40px}}#t{animation:probe 1s linear infinite}",
+            "#t{height:40px}",
+        )),
+        "min-height" => Some(same("#t{height:10px;min-height:100px}", "#t{height:100px}")),
+        "min-width" => Some(same("#t{width:10px;min-width:100px}", "#t{width:100px}")),
+        "visibility" => Some(fixture(
+            "#t{visibility:hidden}#s{visibility:visible}",
+            |page| {
+                page.fill_color("t").is_none()
+                    && page.paints_text("inline span")
+                    && !page.paints_text("child one")
+            },
+        )),
+        "text-overflow" => Some(fixture(
+            "#c{width:40px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}",
+            |page| {
+                page.list.items.iter().any(|item| {
+                    matches!(item,
+                paint::DisplayItem::Text { text, clip: Some(_), .. } if text.ends_with('…'))
+                })
+            },
+        )),
+        _ => None,
+    };
+    if let Some(outcome) = targeted {
+        return outcome == Outcome::Works;
+    }
     let try_values = |context: &str, values: Vec<&str>| {
         let Some(base) = render_fixture(context) else {
             return false;
         };
         values.into_iter().any(|value| {
             render_fixture(&format!("{context}#t{{{property}:{value}}}"))
-                .is_none_or(|probe| probe.list != base.list)
+                .is_some_and(|probe| probe.list != base.list)
         })
     };
     let own = || values.iter().map(String::as_str);
@@ -1225,6 +1298,105 @@ fn property_has_effect(property: &str, values: &[String]) -> bool {
             own().chain(CONTEXT_CANDIDATES.iter().copied()).collect(),
         )
     })
+}
+
+/// Report known partial behavior separately from a property's basic probe.
+/// A successful basic render is not a claim of full CSS conformance.
+fn audit_partial_support(declarations: &[Decl], report: &mut AuditReport) {
+    let mut usage = Usage::default();
+    for declaration in declarations {
+        let value = declaration.value.trim().to_ascii_lowercase();
+        let gap = match declaration.property.as_str() {
+            "cursor" if calls(&value, "url") => Some((
+                "Image cursors",
+                "Custom cursor images and hotspots are not implemented; the native cursor uses the keyword fallback.",
+            )),
+            "user-select" | "-webkit-user-select"
+                if value.trim_end_matches("!important").trim() == "contain" =>
+            {
+                Some((
+                    "user-select: contain",
+                    "Containment selection is not implemented. None, text, auto, and all are supported for mouse selection.",
+                ))
+            }
+            "text-rendering"
+                if value.contains("optimizelegibility") || value.contains("geometricprecision") =>
+            {
+                Some((
+                    "Text rendering quality limitations",
+                    "Rendering retains fractional glyph positions, but kerning, ligatures, and complex-script shaping are not implemented. optimizeSpeed snaps glyph origins to device pixels.",
+                ))
+            }
+            "word-break" if value.contains("auto-phrase") || value.contains("manual") => Some((
+                "Advanced word breaking",
+                "Phrase-aware and manual word breaking are not implemented. Normal and keep-all use basic CJK opportunities; dictionary-based line breaking is not implemented.",
+            )),
+
+            "visibility" if value.trim_end_matches("!important").trim() == "collapse" => Some((
+                "visibility: collapse",
+                "Collapse currently behaves as hidden; table rows and columns retain their layout space.",
+            )),
+            "text-overflow"
+                if value.contains(['\'', '"'])
+                    || value
+                        .split_whitespace()
+                        .filter(|v| *v != "!important")
+                        .count()
+                        > 1 =>
+            {
+                Some((
+                    "text-overflow strings / two-value syntax",
+                    "Custom overflow markers and two-value text-overflow syntax are not implemented.",
+                ))
+            }
+            "text-overflow" if value.trim_end_matches("!important").trim() == "ellipsis" => Some((
+                "text-overflow: ellipsis limitations",
+                "Ellipsis truncates individual left-to-right text runs in a direct inline formatting context. Mixed block/inline containers, atomic inline content, and bidirectional marker placement are not implemented.",
+            )),
+            "animation" | "animation-name" if value != "none" => Some((
+                "Animation timeline limitations",
+                "Animations use the document timeline origin. Starting an animation after first style and resuming paused animations do not maintain an element-specific playback position; animation events are not implemented.",
+            )),
+            "overflow" | "overflow-x" | "overflow-y"
+                if ["scroll", "auto"]
+                    .iter()
+                    .any(|keyword| value.trim_end_matches("!important").contains(keyword)) =>
+            {
+                Some((
+                    "Overflow scrolling limitations",
+                    "Scroll and auto clip overflowing content like hidden, but they do not create element scroll containers or scrollbars.",
+                ))
+            }
+            "min-width" | "min-height" | "max-block-size"
+                if ["min-content", "max-content", "fit-content"]
+                    .iter()
+                    .any(|keyword| value.contains(keyword)) =>
+            {
+                Some((
+                    "Intrinsic minimum sizes",
+                    "Intrinsic sizing keywords in min-width apply to blocks, inline-blocks, and floats but not flex items; they are not implemented for min-height or max-block-size.",
+                ))
+            }
+            _ => None,
+        };
+        if let Some((feature, detail)) = gap {
+            usage
+                .add(feature, || declaration.location.clone())
+                .remember(detail, 1);
+        }
+    }
+    for (feature, used) in usage.iter() {
+        report.features_checked += 1;
+        report.findings.push(
+            Finding::new(
+                Area::CssValue,
+                feature,
+                &used.values[0],
+                Evidence::Documented,
+            )
+            .at(used),
+        );
+    }
 }
 
 fn audit_values<E: PageScriptEngine>(
@@ -1438,6 +1610,21 @@ mod tests {
             .find(|probe| probe.names.contains(&"keyframes"))
             .expect("@keyframes probe");
         assert!(matches!((probe.check)(), Outcome::Works));
+    }
+
+    #[test]
+    fn reported_css_value_gaps_match_the_rendered_behavior() {
+        for name in [
+            "currentcolor",
+            "display: table / table-cell",
+            "Intrinsic sizes (min-content, max-content, fit-content)",
+        ] {
+            let feature = VALUE_FEATURES
+                .iter()
+                .find(|feature| feature.name == name)
+                .unwrap_or_else(|| panic!("missing value probe {name}"));
+            assert_eq!((feature.check)(), Outcome::Works, "{name}");
+        }
     }
 
     #[test]

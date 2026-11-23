@@ -2,12 +2,13 @@
 //!
 //! [`css::style_document`] produces cascaded, inherited declarations as text.
 //! This module parses `display`, box dimensions and edges, `box-sizing`, text
-//! colors, `text-align`, `border-*-radius`, `box-shadow`, `position`, `float`,
-//! the inset properties (`top`, `right`, `bottom`, `left`), and the flex subset
-//! (`flex-direction`, `flex-grow`, `flex-shrink`, `flex-basis`, and `gap`). Other
-//! properties use their initial values. A missing or unparsable value falls back to the initial
-//! value. Lengths are resolved to CSS pixels here; percentages are kept
-//! because they resolve against the containing block during layout.
+//! colors, `text-align`, `line-height`, `border-*-radius`, `box-shadow`,
+//! `position`, `float`, the inset properties (`top`, `right`, `bottom`,
+//! `left`), and the flex subset (`flex-direction`, `flex-grow`, `flex-shrink`,
+//! `flex-basis`, and `gap`). Other properties use their initial values. A
+//! missing or unparsable value falls back to the initial value. Lengths are
+//! resolved to CSS pixels here; percentages are kept because they resolve
+//! against the containing block during layout.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -101,7 +102,8 @@ fn parse_corner_radius(
 }
 
 impl Display {
-    const INLINE: Self = Self::Box {
+    /// `display: inline`: a non-replaced inline box.
+    pub(crate) const INLINE: Self = Self::Box {
         outside: DisplayOutside::Inline,
         inside: DisplayInside::Flow,
     };
@@ -241,12 +243,50 @@ impl Float {
     }
 }
 
-/// A `<length-percentage>` or `auto`, with lengths resolved to CSS pixels.
+/// The computed `clear` value (CSS 2.2 §9.5.2): which earlier floats in
+/// the same block formatting context a block-level box or float must be
+/// placed below. As with [`Float`], text is left-to-right, so
+/// `inline-start` is `left` and `inline-end` is `right`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Clear {
+    #[default]
+    None,
+    Left,
+    Right,
+    Both,
+}
+
+impl Clear {
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "left" | "inline-start" => Some(Self::Left),
+            "right" | "inline-end" => Some(Self::Right),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    /// Whether this value clears floats on the left (`left`) or right side.
+    pub(crate) fn clears(self, left: bool) -> bool {
+        match self {
+            Self::None => false,
+            Self::Left => left,
+            Self::Right => !left,
+            Self::Both => true,
+        }
+    }
+}
+
+/// A sizing value with lengths resolved to CSS pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Dimension {
     Auto,
     Px(f32),
     Percent(f32),
+    MinContent,
+    MaxContent,
+    FitContent,
 }
 
 impl Dimension {
@@ -257,6 +297,7 @@ impl Dimension {
             Self::Auto => None,
             Self::Px(px) => Some(px),
             Self::Percent(percent) => basis.map(|basis| basis * percent / 100.0),
+            Self::MinContent | Self::MaxContent | Self::FitContent => None,
         }
     }
 
@@ -284,6 +325,41 @@ pub(crate) enum TextTransform {
     Lowercase,
     /// The first letter of each word is upper-cased.
     Capitalize,
+}
+
+/// Computed `line-height`; unitless values remain multipliers so descendants
+/// apply them to their own font size, while lengths and percentages inherit as lengths.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum LineHeight {
+    Normal,
+    Number(f32),
+    Length(f32),
+}
+
+impl LineHeight {
+    fn parse(value: &str, context: &LengthContext, font_size: f32) -> Option<Self> {
+        let value = value.trim().to_ascii_lowercase();
+        if value == "normal" {
+            return Some(Self::Normal);
+        }
+        if let Ok(number) = value.parse::<f32>() {
+            return (number.is_finite() && number >= 0.0).then_some(Self::Number(number));
+        }
+        if let Some(percent) = parse_percentage(&value) {
+            let px = font_size * percent / 100.0;
+            return (px.is_finite() && px >= 0.0).then_some(Self::Length(px));
+        }
+        let px = parse_length(&value)?.to_px(context);
+        (px.is_finite() && px >= 0.0).then_some(Self::Length(px))
+    }
+
+    pub(crate) fn used(self, font_size: f32, normal: f32) -> f32 {
+        match self {
+            Self::Normal => normal,
+            Self::Number(n) => font_size * n,
+            Self::Length(px) => px,
+        }
+    }
 }
 
 impl TextTransform {
@@ -418,29 +494,65 @@ impl BoxSizing {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ComputedStyle {
     pub display: Display,
+    pub hidden: bool,
+    /// End ellipsis for overflowing LTR text runs; atomic content and bidi placement are unsupported.
+    pub ellipsis: bool,
+    /// Whether text runs are clipped (and ellipsized) at the content edge:
+    /// the used `overflow-x` is not `visible`.
+    pub clip_overflow: bool,
+    /// Whether the used `overflow-x` clips descendants at the padding box.
+    /// `hidden`, `clip`, `scroll`, and `auto` all clip; scrolling inside a
+    /// box is not supported, so `scroll` and `auto` behave like `hidden`.
+    pub clip_x: bool,
+    /// Whether the used `overflow-y` clips descendants at the padding box.
+    pub clip_y: bool,
+    /// The computed `opacity`, from 0 (invisible) to 1 (opaque). Inline
+    /// boxes fold it into their colors instead; see [`StyleMap`].
+    ///
+    /// [`StyleMap`]: crate::box_tree::StyleMap
+    pub opacity: f32,
+    /// The computed `z-index`; `None` for `auto`.
+    pub z_index: Option<i32>,
+    /// Whether the element is a flex item, for which `z-index` applies
+    /// without positioning. Set by the style map, which knows the parent.
+    pub flex_item: bool,
+    /// The computed `transform` and `transform-origin`; `None` for `none`.
+    pub transform: Option<crate::Transform>,
+    pub nowrap: bool,
+    /// Normal, break-all, keep-all, or the legacy break-word mode.
+    pub word_break: String,
+    pub cursor: String,
+    pub user_select: String,
+    /// Rendering hint: optimizeSpeed snaps glyph origins; other modes retain precision.
+    pub text_rendering: String,
     pub margin: Sides<Dimension>,
     pub padding: Sides<Dimension>,
     /// `width`, measuring the box chosen by `box_sizing`; read the content
-    /// width through [`ComputedStyle::content_width`].
+    /// width through [`ComputedStyle::content_width`]. Non-replaced boxes
+    /// support the `min-content`, `max-content`, and `fit-content` keywords.
     pub width: Dimension,
     /// `height`, as for `width`; see [`ComputedStyle::content_height`].
     pub height: Dimension,
     /// Which box `width`, `height`, and their limits measure.
     pub box_sizing: BoxSizing,
-    /// `min-width`; replaced elements and flex items honor it so far.
+    /// `min-width`; ordinary blocks, replaced elements, and flex items honor it.
     pub min_width: Dimension,
-    /// `min-height`; replaced elements and flex items honor it so far.
+    /// `min-height`; blocks, replaced elements, and flex items honor it.
     pub min_height: Dimension,
     /// Whether `min-width` was left at the flex item's automatic minimum.
     pub min_width_auto: bool,
     /// Whether `min-height` was left at the flex item's automatic minimum.
     pub min_height_auto: bool,
-    /// `max-width`, with `none` stored as [`Dimension::Auto`]; only replaced
-    /// elements honor it so far.
+    /// `max-width`, with `none` stored as [`Dimension::Auto`]. Blocks in
+    /// normal flow, inline-blocks, floats, and replaced elements honor it;
+    /// flex items do not yet. Like `min-width`, it accepts the
+    /// `min-content`, `max-content`, and `fit-content` keywords on
+    /// non-replaced boxes.
     pub max_width: Dimension,
-    /// `max-height`, as for `max_width`.
+    /// `max-height`, with `none` stored as Auto; blocks and replaced elements honor it.
     pub max_height: Dimension,
     pub font_size: f32,
+    pub line_height: LineHeight,
     /// The computed `font-family` list, unquoted, in order of preference.
     /// Empty means the user agent's default font.
     pub font_families: Rc<[String]>,
@@ -451,15 +563,35 @@ pub(crate) struct ComputedStyle {
     /// The face [`crate::FontMetrics::select_font`] chose for the three
     /// properties above. Set by the style map, which knows the fonts.
     pub font: crate::FontId,
+    /// Whether `font` must be emboldened and slanted to match `font_weight`
+    /// and `font_italic`, from [`crate::FontMetrics::font_synthesis`].
+    pub font_synthesis: (bool, bool),
     pub color: CssColor,
     pub text_transform: TextTransform,
+    /// Lines painted over this element's text by `text-decoration`.
+    pub text_decoration: Vec<String>,
+    /// Approximate baseline shift for inline boxes using `vertical-align`.
+    pub vertical_align_offset: f32,
     pub text_align: TextAlign,
     pub background_color: Option<CssColor>,
     pub borders: crate::BoxStyle,
+    /// Outline color; `currentcolor` resolves to the computed text color.
+    pub outline_color: CssColor,
+    /// Outline width in CSS pixels; CSS's `medium` is represented as 3px.
+    pub outline_width: f32,
+    /// Outline offset in CSS pixels; negative values draw inside the border edge.
+    pub outline_offset: f32,
+    /// Outline line pattern; `none` suppresses painting.
+    pub outline_style: String,
     pub border_radius: BorderRadius,
     /// The computed `box-shadow` list, first (topmost) shadow first.
     pub box_shadow: Arc<[BoxShadow]>,
     pub flex_column: bool,
+    /// Cross-axis placement for flex items; partial support includes start,
+    /// center, and end alignment when the container has a definite cross size.
+    pub flex_align_items: String,
+    /// Main-axis distribution for flex items when free space remains.
+    pub flex_justify_content: String,
     pub flex_grow: f32,
     /// Flex base size before free-space distribution; `auto` uses the
     /// corresponding main-size property or the item's intrinsic size.
@@ -474,6 +606,8 @@ pub(crate) struct ComputedStyle {
     /// The computed `float`; always [`Float::None`] for absolutely
     /// positioned boxes (CSS 2.2 §9.7).
     pub float: Float,
+    /// `clear`; honored by in-flow block-level boxes and floats.
+    pub clear: Clear,
     /// The `top`, `right`, `bottom`, and `left` insets; `auto` by default.
     pub inset: Sides<Dimension>,
     /// Whether the specified `display` was inline-level before floating or
@@ -503,6 +637,34 @@ impl ComputedStyle {
     pub(crate) fn is_positioned(&self) -> bool {
         self.position != Position::Static
     }
+}
+
+/// The used overflow clipping per axis for computed `overflow-x` and
+/// `overflow-y` values (CSS Overflow 3 §3): `visible` beside a scrolling
+/// value computes to `auto`, so if either axis is `hidden`, `scroll`, or
+/// `auto`, both clip; otherwise only `clip` axes clip.
+fn used_overflow(x: Option<&str>, y: Option<&str>) -> (bool, bool) {
+    let classify = |value: Option<&str>| match value.map(str::to_ascii_lowercase).as_deref() {
+        Some("hidden" | "scroll" | "auto" | "overlay") => 2,
+        Some("clip") => 1,
+        _ => 0,
+    };
+    let (x, y) = (classify(x), classify(y));
+    if x == 2 || y == 2 {
+        (true, true)
+    } else {
+        (x == 1, y == 1)
+    }
+}
+
+/// Parses an `opacity` value: a number or percentage, clamped to 0..=1.
+fn parse_opacity(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let opacity = match css::values::parse_percentage(value) {
+        Some(percent) => percent / 100.0,
+        None => value.parse::<f32>().ok()?,
+    };
+    opacity.is_finite().then(|| opacity.clamp(0.0, 1.0))
 }
 
 /// Parses a `content` value into the text a generated box holds.
@@ -590,6 +752,20 @@ impl ComputedStyle {
             width: Dimension::Auto,
             height: Dimension::Auto,
             box_sizing: BoxSizing::ContentBox,
+            hidden: false,
+            ellipsis: false,
+            clip_overflow: false,
+            clip_x: false,
+            clip_y: false,
+            opacity: 1.0,
+            z_index: None,
+            flex_item: false,
+            transform: None,
+            nowrap: parent.is_some_and(|p| p.nowrap),
+            word_break: parent.map_or_else(|| "normal".into(), |p| p.word_break.clone()),
+            cursor: parent.map_or_else(|| "auto".into(), |p| p.cursor.clone()),
+            user_select: parent.map_or_else(|| "auto".into(), |p| p.user_select.clone()),
+            text_rendering: parent.map_or_else(|| "auto".into(), |p| p.text_rendering.clone()),
             min_width: Dimension::Px(0.0),
             min_height: Dimension::Px(0.0),
             min_width_auto: true,
@@ -597,6 +773,7 @@ impl ComputedStyle {
             max_width: Dimension::Auto,
             max_height: Dimension::Auto,
             font_size: parent.map_or(css::values::MEDIUM_FONT_SIZE, |parent| parent.font_size),
+            line_height: parent.map_or(LineHeight::Normal, |parent| parent.line_height),
             font_families: parent.map_or_else(
                 || Rc::from(Vec::new()),
                 |parent| Rc::clone(&parent.font_families),
@@ -604,6 +781,7 @@ impl ComputedStyle {
             font_weight: parent.map_or(400, |parent| parent.font_weight),
             font_italic: parent.is_some_and(|parent| parent.font_italic),
             font: parent.map_or(crate::FontId::DEFAULT, |parent| parent.font),
+            font_synthesis: parent.map_or((false, false), |parent| parent.font_synthesis),
             color: parent.map_or_else(
                 || {
                     css::user_agent_default_color("color")
@@ -612,19 +790,29 @@ impl ComputedStyle {
                 |parent| parent.color,
             ),
             text_transform: parent.map_or(TextTransform::None, |parent| parent.text_transform),
+            text_decoration: parent.map_or_else(Vec::new, |parent| parent.text_decoration.clone()),
+            vertical_align_offset: 0.0,
             text_align: parent.map_or(TextAlign::Start, |parent| parent.text_align),
             background_color: None,
             content: None,
             borders: crate::BoxStyle::default(),
+            outline_color: css::user_agent_default_color("color")
+                .expect("user-agent stylesheet must define html color"),
+            outline_width: 3.0,
+            outline_offset: 0.0,
+            outline_style: "none".to_owned(),
             border_radius: BorderRadius::default(),
             box_shadow: Arc::from(Vec::new()),
             flex_column: false,
+            flex_align_items: "stretch".to_owned(),
+            flex_justify_content: "flex-start".to_owned(),
             flex_grow: 0.0,
             flex_basis: Dimension::Auto,
             flex_shrink: 1.0,
             gap: 0.0,
             position: Position::Static,
             float: Float::None,
+            clear: Clear::None,
             inset: Sides::from_array([Dimension::Auto; 4]),
             blockified_from_inline: false,
         }
@@ -649,6 +837,38 @@ impl ComputedStyle {
         };
         let mut style = Self::anonymous(None);
         style.content = get("content").and_then(parse_content);
+        if let Some(value) = get("word-break")
+            .filter(|v| ["normal", "break-all", "keep-all", "break-word"].contains(v))
+        {
+            style.word_break = value.to_owned();
+        }
+        if let Some(value) = get("cursor") {
+            // Image cursors use their required keyword fallback.
+            style.cursor = value
+                .rsplit(',')
+                .next()
+                .unwrap_or("auto")
+                .trim()
+                .to_ascii_lowercase();
+        }
+        if let Some(value) =
+            get("user-select").filter(|v| ["auto", "none", "text", "all"].contains(v))
+        {
+            style.user_select = value.to_owned();
+        }
+        if let Some(value) = get("text-rendering").filter(|v| {
+            [
+                "auto",
+                "optimizespeed",
+                "optimizelegibility",
+                "geometricprecision",
+            ]
+            .iter()
+            .any(|k| v.eq_ignore_ascii_case(k))
+        }) {
+            style.text_rendering = value.to_ascii_lowercase();
+        }
+
         style.display = match get("display") {
             Some(value) => Display::parse(value).unwrap_or_else(|| {
                 log::debug!("ignoring invalid display value {value:?}; using inline");
@@ -656,6 +876,27 @@ impl ComputedStyle {
             }),
             None => Display::INLINE,
         };
+        style.hidden = get("visibility").is_some_and(|v| {
+            v.eq_ignore_ascii_case("hidden") || v.eq_ignore_ascii_case("collapse")
+        });
+        style.ellipsis = get("text-overflow").is_some_and(|v| v.eq_ignore_ascii_case("ellipsis"));
+        (style.clip_x, style.clip_y) = used_overflow(get("overflow-x"), get("overflow-y"));
+        style.clip_overflow = style.clip_x;
+        if let Some(value) = get("opacity") {
+            match parse_opacity(value) {
+                Some(opacity) => style.opacity = opacity,
+                None if is_css_wide_keyword(value) => {}
+                None => log::debug!("ignoring invalid opacity value {value:?}; using 1"),
+            }
+        }
+        if let Some(value) = get("z-index") {
+            match value.parse::<i32>() {
+                Ok(z) => style.z_index = Some(z),
+                Err(_) if value.eq_ignore_ascii_case("auto") || is_css_wide_keyword(value) => {}
+                Err(_) => log::debug!("ignoring invalid z-index value {value:?}; using auto"),
+            }
+        }
+        style.nowrap = get("white-space").is_some_and(|v| v.eq_ignore_ascii_case("nowrap"));
         if let Some(value) = get("font-size") {
             match css::values::compute_font_size(value, root_font_size, root_font_size) {
                 Some(size) => style.font_size = size,
@@ -664,6 +905,20 @@ impl ComputedStyle {
                     style.font_size
                 ),
             }
+        }
+        if let Some(value) = get("line-height")
+            && let Some(line_height) = LineHeight::parse(
+                value,
+                &LengthContext {
+                    font_size: style.font_size,
+                    root_font_size,
+                    viewport_width: viewport.width,
+                    viewport_height: viewport.height,
+                },
+                style.font_size,
+            )
+        {
+            style.line_height = line_height;
         }
         if let Some(value) = get("font-family") {
             style.font_families = css::parse_font_family_list(value).into();
@@ -696,6 +951,13 @@ impl ComputedStyle {
                 None => log::debug!("ignoring unsupported text-transform value {value:?}"),
             }
         }
+        if let Some(value) = get("text-decoration-line") {
+            style.text_decoration = value
+                .split_ascii_whitespace()
+                .filter(|line| matches!(*line, "underline" | "overline" | "line-through"))
+                .map(str::to_owned)
+                .collect();
+        }
         style.text_align = TextAlign::compute(get("text-align"), parent_text_align);
         if let Some(value) = get("position") {
             match Position::parse(value) {
@@ -709,6 +971,13 @@ impl ComputedStyle {
                 Some(float) => style.float = float,
                 None if is_css_wide_keyword(value) => {}
                 None => log::debug!("ignoring invalid float value {value:?}; using none"),
+            }
+        }
+        if let Some(value) = get("clear") {
+            match Clear::parse(value) {
+                Some(clear) => style.clear = clear,
+                None if is_css_wide_keyword(value) => {}
+                None => log::debug!("ignoring invalid clear value {value:?}; using none"),
             }
         }
         // CSS 2.2 §9.7: absolute positioning wins over floating, and both
@@ -727,13 +996,42 @@ impl ComputedStyle {
             };
         }
         if let Some(value) = get("background-color") {
-            style.background_color = css::parse_color(value);
+            style.background_color = if value.eq_ignore_ascii_case("currentcolor") {
+                Some(style.color)
+            } else {
+                css::parse_color(value)
+            };
             if style.background_color.is_none() && !is_no_color_keyword(value) {
                 log::debug!("ignoring invalid background-color value {value:?}; using transparent");
             }
         }
         style.flex_column =
             get("flex-direction").is_some_and(|value| value.eq_ignore_ascii_case("column"));
+        style.flex_align_items = get("align-items")
+            .filter(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "stretch" | "flex-start" | "start" | "center" | "flex-end" | "end" | "baseline"
+                )
+            })
+            .unwrap_or("stretch")
+            .to_ascii_lowercase();
+        style.flex_justify_content = get("justify-content")
+            .filter(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "flex-start"
+                        | "start"
+                        | "center"
+                        | "flex-end"
+                        | "end"
+                        | "space-between"
+                        | "space-around"
+                        | "space-evenly"
+                )
+            })
+            .unwrap_or("flex-start")
+            .to_ascii_lowercase();
         style.flex_grow = get("flex-grow")
             .and_then(|value| value.parse::<f32>().ok())
             .filter(|value| value.is_finite() && *value >= 0.0)
@@ -749,8 +1047,32 @@ impl ComputedStyle {
             viewport_width: viewport.width,
             viewport_height: viewport.height,
         };
+        style.vertical_align_offset =
+            get("vertical-align").map_or(0.0, |value| match value.to_ascii_lowercase().as_str() {
+                "baseline" | "initial" | "inherit" | "unset" => 0.0,
+                "middle" => -style.font_size * 0.25,
+                "sub" => style.font_size * 0.2,
+                "super" => -style.font_size * 0.4,
+                "text-top" | "top" => -style.font_size * 0.8,
+                "text-bottom" | "bottom" => style.font_size * 0.2,
+                _ => parse_length(value)
+                    .map(|length| length.to_px(&context))
+                    .or_else(|| {
+                        parse_percentage(value).map(|percent| style.font_size * percent / 100.0)
+                    })
+                    .filter(|offset| offset.is_finite())
+                    .unwrap_or(0.0),
+            });
         let dimension = |property: &str, allow_auto: bool, allow_negative: bool| {
             let value = get(property)?;
+            if matches!(property, "width" | "min-width" | "max-width") {
+                match value.to_ascii_lowercase().as_str() {
+                    "min-content" => return Some(Dimension::MinContent),
+                    "max-content" => return Some(Dimension::MaxContent),
+                    "fit-content" => return Some(Dimension::FitContent),
+                    _ => {}
+                }
+            }
             if value.eq_ignore_ascii_case("auto") {
                 if !allow_auto {
                     log::debug!("ignoring invalid {property} value {value:?}; using 0");
@@ -779,6 +1101,31 @@ impl ComputedStyle {
             Some(parsed)
         };
         style.flex_basis = dimension("flex-basis", true, false).unwrap_or(Dimension::Auto);
+        if let Some(value) = get("transform") {
+            match crate::transform::parse_transform(value, &context) {
+                Some(functions) if functions.is_empty() => {}
+                Some(functions) => {
+                    let origin = get("transform-origin")
+                        .and_then(|origin| {
+                            let parsed =
+                                crate::transform::parse_transform_origin(origin, &context);
+                            if parsed.is_none() && !is_css_wide_keyword(origin) {
+                                log::debug!(
+                                    "ignoring invalid transform-origin value {origin:?}; using center"
+                                );
+                            }
+                            parsed
+                        })
+                        .unwrap_or((LengthPercentage::Percent(50.0), LengthPercentage::Percent(50.0)));
+                    style.transform = Some(crate::Transform {
+                        functions: functions.into(),
+                        origin,
+                    });
+                }
+                None if is_css_wide_keyword(value) => {}
+                None => log::debug!("ignoring invalid transform value {value:?}; using none"),
+            }
+        }
         let side = |prefix: &str, allow_auto: bool, allow_negative: bool| {
             Sides::from_array(["top", "right", "bottom", "left"].map(|side| {
                 dimension(&format!("{prefix}-{side}"), allow_auto, allow_negative)
@@ -854,10 +1201,46 @@ impl ComputedStyle {
             }
         }));
         style.borders.border_color = Sides::from_array(sides.map(|side| {
-            get(&format!("border-{side}-color"))
-                .and_then(css::parse_color)
-                .unwrap_or(style.color)
+            let property = format!("border-{side}-color");
+            match get(&property) {
+                None => style.color,
+                Some(value) if value.eq_ignore_ascii_case("transparent") => CssColor {
+                    a: 0,
+                    ..style.color
+                },
+                Some(value) => css::parse_color(value).unwrap_or_else(|| {
+                    if !is_no_color_keyword(value) {
+                        log::debug!(
+                            "ignoring invalid {property} value {value:?}; using currentcolor"
+                        );
+                    }
+                    style.color
+                }),
+            }
         }));
+        style.outline_style = get("outline-style").unwrap_or("none").to_ascii_lowercase();
+        style.outline_width = match get("outline-width").unwrap_or("medium") {
+            "thin" => 1.0,
+            "thick" => 5.0,
+            "medium" => 3.0,
+            value => parse_length(value)
+                .map(|length| length.to_px(&context))
+                .filter(|width| width.is_finite() && *width >= 0.0)
+                .unwrap_or(3.0),
+        };
+        style.outline_color = get("outline-color")
+            .and_then(|value| {
+                value
+                    .eq_ignore_ascii_case("currentcolor")
+                    .then_some(style.color)
+                    .or_else(|| css::parse_color(value))
+            })
+            .unwrap_or(style.color);
+        style.outline_offset = get("outline-offset")
+            .and_then(parse_length)
+            .map(|length| length.to_px(&context))
+            .filter(|offset| offset.is_finite())
+            .unwrap_or(0.0);
         style.gap = get("gap")
             .and_then(|value| parse_length(value).map(|length| length.to_px(&context)))
             .filter(|value| value.is_finite() && *value >= 0.0)

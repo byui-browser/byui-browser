@@ -216,6 +216,46 @@ pub(crate) enum UserEvent {
     },
 }
 
+/// Maps CSS keyword fallbacks to the native cursor.
+fn css_cursor_icon(keyword: &str) -> CursorIcon {
+    match keyword {
+        "pointer" => CursorIcon::Pointer,
+        "text" => CursorIcon::Text,
+        "vertical-text" => CursorIcon::VerticalText,
+        "crosshair" => CursorIcon::Crosshair,
+        "help" => CursorIcon::Help,
+        "wait" => CursorIcon::Wait,
+        "progress" => CursorIcon::Progress,
+        "move" => CursorIcon::Move,
+        "grab" => CursorIcon::Grab,
+        "grabbing" => CursorIcon::Grabbing,
+        "not-allowed" => CursorIcon::NotAllowed,
+        "no-drop" => CursorIcon::NoDrop,
+        "copy" => CursorIcon::Copy,
+        "alias" => CursorIcon::Alias,
+        "context-menu" => CursorIcon::ContextMenu,
+        "cell" => CursorIcon::Cell,
+        "all-scroll" => CursorIcon::AllScroll,
+        "zoom-in" => CursorIcon::ZoomIn,
+        "zoom-out" => CursorIcon::ZoomOut,
+        "e-resize" => CursorIcon::EResize,
+        "w-resize" => CursorIcon::WResize,
+        "n-resize" => CursorIcon::NResize,
+        "s-resize" => CursorIcon::SResize,
+        "ne-resize" => CursorIcon::NeResize,
+        "nw-resize" => CursorIcon::NwResize,
+        "se-resize" => CursorIcon::SeResize,
+        "sw-resize" => CursorIcon::SwResize,
+        "ew-resize" => CursorIcon::EwResize,
+        "ns-resize" => CursorIcon::NsResize,
+        "nesw-resize" => CursorIcon::NeswResize,
+        "nwse-resize" => CursorIcon::NwseResize,
+        "col-resize" => CursorIcon::ColResize,
+        "row-resize" => CursorIcon::RowResize,
+        _ => CursorIcon::Default,
+    }
+}
+
 impl App {
     fn new(platform: Platform) -> Self {
         let root = browser::application_data_directory()
@@ -895,7 +935,7 @@ impl App {
         let mut script_index = 0;
         let nodes = (0..)
             .map(html::NodeID::new)
-            .map_while(|id| document.node(id).map(|node| (id, node)));
+            .map_while(|id| document.get_node(id).map(|node| (id, node)));
         for (_id, node) in nodes {
             let html::NodeKind::Element(element) = node.get_kind() else {
                 continue;
@@ -998,6 +1038,7 @@ impl App {
         self.tab.loaded_page = Some(page);
         self.tab.animation_clock = None;
         self.tab.next_animation_frame = None;
+        self.tab.selection = None;
         self.tab.selector_state = css::SelectorState::default();
         self.refresh_devtools_document();
         if let Ok(mut console) = self.tab.console.lock() {
@@ -1317,6 +1358,28 @@ impl App {
         }
     }
 
+    /// Converts winit's logical key into the UI Events `KeyboardEvent.key`
+    /// value used by page scripts.
+    fn page_key_name(key: &Key<&str>) -> String {
+        match key {
+            Key::Character(value) => (*value).to_owned(),
+            Key::Named(value) => format!("{value:?}"),
+            Key::Dead(value) => value.map_or_else(|| "Dead".into(), |value| value.to_string()),
+            Key::Unidentified(_) => "Unidentified".into(),
+        }
+    }
+
+    /// Converts winit's physical key debug name into the UI Events `code`
+    /// value. The enum's code variants intentionally use the same names.
+    fn page_key_code(event: &KeyEvent) -> String {
+        let value = format!("{:?}", event.physical_key);
+        value
+            .strip_prefix("Code(")
+            .and_then(|value| value.strip_suffix(')'))
+            .unwrap_or(&value)
+            .to_owned()
+    }
+
     /// Applies browser shortcuts and address-field editing for a pressed key.
     fn key_down(&mut self, key: Key<&str>) {
         let modifiers = self.modifiers;
@@ -1365,6 +1428,35 @@ impl App {
                         arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text))
                     {
                         log::warn!("failed to copy the address: {error}");
+                    }
+                    return;
+                }
+                "a" if !self.tab.chrome.address_focused => {
+                    self.tab.selection = self
+                        .tab
+                        .page_layout
+                        .as_ref()
+                        .and_then(|layout| layout.select_all_range());
+                    if let Some(layout) = &self.tab.page_layout {
+                        layout.set_selection(self.tab.selection);
+                    }
+                    self.tab.page = None;
+                    self.frame_key = None;
+                    self.redraw();
+                    return;
+                }
+                "c" if !self.tab.chrome.address_focused => {
+                    let text = self
+                        .tab
+                        .page_layout
+                        .as_ref()
+                        .map(|layout| layout.selected_text())
+                        .unwrap_or_default();
+                    if !text.is_empty()
+                        && let Err(error) = arboard::Clipboard::new()
+                            .and_then(|mut clipboard| clipboard.set_text(text))
+                    {
+                        log::warn!("failed to copy page selection: {error}");
                     }
                     return;
                 }
@@ -1597,6 +1689,19 @@ impl App {
             .to_logical::<f64>(window.scale_factor())
             .width;
         self.set_hovered(toolbar::hit_test(x, y, width));
+        if self.page_press
+            && let Some(point) = self.page_point(x, y)
+            && let Some((anchor, _)) = self.tab.selection
+        {
+            self.tab.selection = Some((anchor, point));
+            if let Some(layout) = &self.tab.page_layout {
+                layout.set_selection(self.tab.selection);
+            }
+            self.tab.page = None;
+            self.frame_key = None;
+            self.redraw();
+        }
+        self.update_page_cursor();
     }
 
     fn dismiss_context_menu(&mut self) {
@@ -2336,6 +2441,11 @@ impl App {
                         self.activate(control);
                     }
                 } else if page_press
+                    && self
+                        .tab
+                        .page_layout
+                        .as_ref()
+                        .is_none_or(|layout| layout.selected_text().is_empty())
                     && let Some((x, y)) = self.cursor
                     && self.pointer_is_on_page(x, y)
                 {
@@ -2413,6 +2523,7 @@ impl App {
     }
 
     fn paint(&mut self) {
+        self.update_page_cursor();
         self.sync_platform_window();
         if self.window.is_none() || self.surface.is_none() {
             return;
@@ -2511,6 +2622,7 @@ impl App {
                 // A resize or reload can leave less to scroll than before.
                 self.tab.scroll_y = self.tab.scroll_y.clamp(0.0, layout.max_scroll());
                 self.tab.page_events.set_scroll_y(self.tab.scroll_y);
+                layout.set_selection(self.tab.selection);
                 let (page, paint) = TimelineEvent::measure(EventCategory::Paint, "Paint", || {
                     crate::content::render_page_with_find(
                         layout,
@@ -2709,6 +2821,19 @@ impl App {
             return;
         }
         self.set_hovered(toolbar::hit_test(x, y, width));
+        if self.page_press
+            && let Some(point) = self.page_point(x, y)
+            && let Some((anchor, _)) = self.tab.selection
+        {
+            self.tab.selection = Some((anchor, point));
+            if let Some(layout) = &self.tab.page_layout {
+                layout.set_selection(self.tab.selection);
+            }
+            self.tab.page = None;
+            self.frame_key = None;
+            self.redraw();
+        }
+        self.update_page_cursor();
     }
 
     /// Sets the page's `:hover` element to the one under the pointer and
@@ -2781,6 +2906,13 @@ impl App {
             .is_some_and(|(x, y)| self.pointer_is_on_page(x, y))
         {
             self.page_press = true;
+            self.tab.selection = self
+                .cursor
+                .and_then(|(x, y)| self.page_point(x, y))
+                .map(|p| (p, p));
+            if let Some(layout) = &self.tab.page_layout {
+                layout.set_selection(self.tab.selection);
+            }
             let target = self.cursor.and_then(|(x, y)| self.page_node_at(x, y));
             self.tab.selector_state.active = target;
             self.tab.selector_state.focused = target.filter(|node| {
@@ -2803,6 +2935,53 @@ impl App {
         self.tab.page_layout_stale = true;
         self.frame_key = None;
         self.redraw();
+    }
+
+    /// Converts a window point to document CSS pixels, including zoom and scroll.
+    fn page_point(&self, x: f64, y: f64) -> Option<(f32, f32)> {
+        if !self.pointer_is_on_page(x, y) {
+            return None;
+        }
+        let window = self.window.as_ref()?;
+        let size = window.inner_size();
+        let scale = window.scale_factor();
+        let card =
+            toolbar::page_rect_with_find(size.width, size.height, scale, self.tab.find.is_some())?;
+        let page_scale = scale * self.tab.page_zoom;
+        Some((
+            ((x * scale - card.x as f64) / page_scale) as f32,
+            ((y * scale - card.y as f64) / page_scale) as f32 + self.tab.scroll_y,
+        ))
+    }
+
+    fn update_page_cursor(&self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let overlay = self.context_menu.is_some()
+            || self.tab.page_source.is_some()
+            || self
+                .tab
+                .elements
+                .as_ref()
+                .is_some_and(|panel| panel.contains(self.cursor));
+        let keyword = self
+            .cursor
+            .filter(|_| !overlay)
+            .and_then(|(x, y)| self.page_point(x, y))
+            .and_then(|(x, y)| {
+                self.tab
+                    .page_layout
+                    .as_ref()
+                    .map(|layout| layout.cursor_at(x, y))
+            })
+            .unwrap_or(if self.tab.chrome.hovered == Some(Control::Address) {
+                "text"
+            } else {
+                "default"
+            });
+        window.set_cursor_visible(keyword != "none");
+        window.set_cursor(css_cursor_icon(keyword));
     }
 
     /// Returns the page node under a logical-pixel window point, matching the
@@ -3043,6 +3222,44 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 log::trace!("key event: {:?}", event.state);
+                if event.state == ElementState::Released {
+                    let modifiers = self.modifiers;
+                    let page_has_focus = !self.tab.chrome.address_focused
+                        && !self.tab.find.as_ref().is_some_and(|find| find.focused)
+                        && self.tab.page_source.is_none();
+                    if page_has_focus {
+                        self.tab.page_events.keyup(
+                            Self::page_key_name(&event.logical_key.as_ref()),
+                            Self::page_key_code(&event),
+                            0,
+                            modifiers.control_key(),
+                            modifiers.shift_key(),
+                            modifiers.alt_key(),
+                            modifiers.super_key(),
+                            event.repeat,
+                        );
+                    }
+                }
+                if event.state == ElementState::Pressed {
+                    let modifiers = self.modifiers;
+                    let page_has_focus = !self.tab.chrome.address_focused
+                        && !self.tab.find.as_ref().is_some_and(|find| find.focused)
+                        && self.tab.page_source.is_none();
+                    if page_has_focus
+                        && !self.tab.page_events.keydown(
+                            Self::page_key_name(&event.logical_key.as_ref()),
+                            Self::page_key_code(&event),
+                            0,
+                            modifiers.control_key(),
+                            modifiers.shift_key(),
+                            modifiers.alt_key(),
+                            modifiers.super_key(),
+                            event.repeat,
+                        )
+                    {
+                        return;
+                    }
+                }
                 if event.state == ElementState::Pressed
                     && (self.site_info_escape(&event.logical_key)
                         || self.tab_shortcut(&event.logical_key))

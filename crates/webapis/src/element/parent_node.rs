@@ -1,39 +1,4 @@
-//! `Node.parentNode` on script element wrappers.
-//!
-//! The getter is live. An element parent is that element's shared wrapper.
-//! A document parent is the registered `document` object, which is how a
-//! node created by the HTML parser reports its parent. A disconnected node
-//! returns `null`. Assignment is ignored.
-//!
-//! Limitation: when the document has not been registered with a realm, a
-//! document parent reads as `null` because there is no script object for it.
-
-use std::sync::{Arc, Mutex};
-
-use js::{Object, Value};
-
-use crate::document::Document;
-use crate::element::Element;
-
-use super::node_view::{parent_id, wrap_any_node};
-
-/// Installs `Node.parentNode` on the wrapper `object` for `element`.
-pub(super) fn install(object: &Object, element: &Element, document: &Arc<Mutex<Document>>) {
-    let node = element.node;
-    let document = Arc::clone(document);
-    object.define_accessor(
-        "parentNode",
-        Arc::new(move || {
-            let parent = parent_id(&document.lock().unwrap(), node);
-            match parent {
-                Some(parent) => wrap_any_node(&document, parent),
-                None => Ok(Value::Null),
-            }
-        }),
-        None,
-    );
-}
-
+//! Regression coverage for shared Node behavior on Element wrappers.
 #[cfg(test)]
 mod tests {
     use html::parse_raw_html;
@@ -81,6 +46,41 @@ mod tests {
                  document.getElementById('p').append(child); \
                  child.parentNode = null; \
                  child.parentNode === document.getElementById('p')"
+            ),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn parent_node_is_live_for_all_supported_child_node_kinds() {
+        let mut realm = realm_with("<!doctype html><div id='p'>text<!--comment--></div>");
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var p = document.getElementById('p'); \
+                 var text = p.firstChild; var comment = text.nextSibling; \
+                 var doctype = document.firstChild; \
+                 doctype.parentNode === document && text.parentNode === p && \
+                 comment.parentNode === p && document.parentNode === null && \
+                 p.removeChild(comment) === comment && comment.parentNode === null && \
+                 p.appendChild(comment) === comment && comment.parentNode === p"
+            ),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn parent_node_is_null_for_new_document_roots_and_is_read_only() {
+        let mut realm = realm_with("<div></div>");
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var created = new Document(); \
+                 var child = created.createElement('section'); \
+                 created.appendChild(child); \
+                 var before = child.parentNode === created && created.parentNode === null; \
+                 child.parentNode = null; \
+                 before && child.parentNode === created"
             ),
             Value::Boolean(true)
         );

@@ -6,15 +6,16 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
 use js::{JsResult, Realm, Value};
 use net::{Request, RequestController, SchemeProviders};
 use security::{
-    RendererSecurityContext,
+    Origin, RendererSecurityContext,
     file_access::{FileAccessCapability, FileAccessError, TrustedDirectorySelection},
+    permissions::{PermissionKind, PermissionPolicy},
 };
 use storage::{
     OriginStorage, PersistentOriginStorage, SharedStorage, StorageError, shared_storage,
@@ -22,9 +23,10 @@ use storage::{
 use webapis::local_storage::register_local_storage_with_url;
 use webapis::session_storage::register_session_storage;
 use webapis::{
-    AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, register_alert,
-    register_console, register_fetch_with_url, register_location_with_navigation, register_print,
-    register_shared_document_with_location, register_window_with_security_context,
+    AlertSink, ConsoleSink, Document, LocationNavigate, ViewportSize, dispatch_window_keydown,
+    dispatch_window_keyup, register_alert, register_console, register_fetch_with_url,
+    register_location_with_navigation, register_print, register_shared_document_with_location,
+    register_window_with_security_context,
     register_window_with_url_device_pixel_ratio_and_viewport, report_window_error,
 };
 
@@ -457,6 +459,7 @@ fn home_directory() -> io::Result<PathBuf> {
 #[derive(Debug, Clone)]
 pub struct BrowserRuntime {
     storage: SharedStorage,
+    permission_policy: Arc<RwLock<PermissionPolicy>>,
 }
 
 impl BrowserRuntime {
@@ -476,6 +479,7 @@ impl BrowserRuntime {
         log::info!("runtime opened: data directory {}", root.display());
         Ok(Self {
             storage: shared_storage(storage),
+            permission_policy: Arc::new(RwLock::new(PermissionPolicy::new())),
         })
     }
 
@@ -485,7 +489,48 @@ impl BrowserRuntime {
         log::debug!("runtime opened with in-memory storage");
         Self {
             storage: shared_storage(OriginStorage::new()),
+            permission_policy: Arc::new(RwLock::new(PermissionPolicy::new())),
         }
+    }
+
+    /// Grants `permission` to `origin` for the lifetime of this browser
+    /// runtime and all of its cloned renderer handles.
+    pub fn grant_permission(&self, origin: Origin, permission: PermissionKind) {
+        self.permission_policy
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .grant(origin, permission);
+    }
+
+    /// Explicitly denies `permission` for `origin` for the lifetime of this
+    /// browser runtime and all of its cloned renderer handles.
+    pub fn deny_permission(&self, origin: Origin, permission: PermissionKind) {
+        self.permission_policy
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .deny(origin, permission);
+    }
+
+    /// Removes the recorded decision for `origin` and `permission`.
+    pub fn revoke_permission(&self, origin: &Origin, permission: PermissionKind) {
+        self.permission_policy
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .revoke(origin, permission);
+    }
+
+    /// Creates a renderer security context using this runtime's shared
+    /// permission policy.
+    ///
+    /// Same-document URL changes do not call this method; a new document
+    /// navigation should call it with the final document URL.
+    #[must_use]
+    pub fn security_context_for_url(&self, url: &str) -> RendererSecurityContext {
+        let policy = self
+            .permission_policy
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        security_context_for_url_with_policy(url, &policy)
     }
 
     /// Parses a page, installs its Web APIs, and evaluates its scripts.
@@ -848,8 +893,12 @@ impl PageSession {
     /// non-replaceable read-only host attributes.
     pub fn set_scroll_y(&mut self, scroll_y: f64) {
         let value = Value::Number(scroll_y.max(0.0));
+        let changed = self.window.get("scrollY") != Some(value.clone());
         self.window.update_read_only("scrollY", value.clone());
         self.window.update_read_only("pageYOffset", value);
+        if changed && let Err(error) = webapis::dispatch_window_scroll(&self.window) {
+            log::warn!("could not dispatch window scroll event: {error}");
+        }
     }
 
     /// Updates the viewport dimensions exposed to this live page session.
@@ -858,6 +907,16 @@ impl PageSession {
     /// `window.innerHeight`, and their global aliases synchronized with the
     /// current viewport.
     pub fn set_viewport(&mut self, viewport: ViewportSize) {
+        let old_width = match self.window.get("innerWidth") {
+            Some(Value::Number(width)) => width,
+            _ => 0.0,
+        };
+        let old_height = match self.window.get("innerHeight") {
+            Some(Value::Number(height)) => height,
+            _ => 0.0,
+        };
+        let dimensions_changed =
+            old_width != viewport.width as f64 || old_height != viewport.height as f64;
         let width = Value::Number(viewport.width as f64);
         let height = Value::Number(viewport.height as f64);
         self.window.set("innerWidth", width.clone());
@@ -874,6 +933,13 @@ impl PageSession {
                 Value::Number(viewport.height as f64),
                 Value::Number(ratio),
             ]);
+        }
+        if dimensions_changed && let Err(error) = webapis::dispatch_window_resize(&self.window) {
+            log::warn!("could not dispatch window resize event: {error}");
+        } else if dimensions_changed
+            && let Err(error) = webapis::run_window_microtasks(&self.window)
+        {
+            log::warn!("could not run resize microtasks: {error}");
         }
     }
 
@@ -930,6 +996,70 @@ impl PageSession {
         webapis::run_window_microtasks(&self.window)?;
         webapis::run_window_hashchange_events(&self.window)?;
         result
+    }
+
+    /// Fires a trusted native `keydown` event on this page's Window.
+    ///
+    /// The returned value is `false` when a handler called `preventDefault()`
+    /// or returned `false`; otherwise it is `true`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_keydown(
+        &self,
+        key: &str,
+        code: &str,
+        location: u32,
+        ctrl_key: bool,
+        shift_key: bool,
+        alt_key: bool,
+        meta_key: bool,
+        repeat: bool,
+    ) -> JsResult<bool> {
+        let allowed = dispatch_window_keydown(
+            &self.window,
+            key,
+            code,
+            location,
+            ctrl_key,
+            shift_key,
+            alt_key,
+            meta_key,
+            repeat,
+        )?;
+        webapis::run_window_microtasks(&self.window)?;
+        webapis::run_window_hashchange_events(&self.window)?;
+        Ok(allowed)
+    }
+
+    /// Fires a trusted native `keyup` event on this page's Window.
+    ///
+    /// The returned value is `false` when a handler called `preventDefault()`
+    /// or returned `false`; otherwise it is `true`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_keyup(
+        &self,
+        key: &str,
+        code: &str,
+        location: u32,
+        ctrl_key: bool,
+        shift_key: bool,
+        alt_key: bool,
+        meta_key: bool,
+        repeat: bool,
+    ) -> JsResult<bool> {
+        let allowed = dispatch_window_keyup(
+            &self.window,
+            key,
+            code,
+            location,
+            ctrl_key,
+            shift_key,
+            alt_key,
+            meta_key,
+            repeat,
+        )?;
+        webapis::run_window_microtasks(&self.window)?;
+        webapis::run_window_hashchange_events(&self.window)?;
+        Ok(allowed)
     }
 
     /// Runs this page's elapsed `window.setInterval()` callbacks.
@@ -1112,11 +1242,27 @@ mod tests {
                 .evaluate_script("window.scrollY === 0 && window.pageYOffset === 0"),
             Ok(Value::Boolean(true))
         );
+        session
+            .realm
+            .evaluate_script(
+                "var scrollEvents = 0; var scrollMetadata = null; \
+                 window.onscroll = (event) => { scrollEvents++; scrollMetadata = [event.type, \
+                 event.target, event.currentTarget, event.bubbles, event.cancelable]; }",
+            )
+            .unwrap();
         session.set_scroll_y(123.5);
         assert_eq!(
-            session
-                .realm
-                .evaluate_script("window.scrollY === 123.5 && window.pageYOffset === 123.5"),
+            session.realm.evaluate_script(
+                "window.scrollY === 123.5 && window.pageYOffset === 123.5 && \
+                     scrollEvents === 1 && scrollMetadata[0] === 'scroll' && \
+                     scrollMetadata[1] === window && scrollMetadata[2] === window && \
+                     !scrollMetadata[3] && !scrollMetadata[4]",
+            ),
+            Ok(Value::Boolean(true))
+        );
+        session.set_scroll_y(123.5);
+        assert_eq!(
+            session.realm.evaluate_script("scrollEvents === 1"),
             Ok(Value::Boolean(true))
         );
         assert_eq!(

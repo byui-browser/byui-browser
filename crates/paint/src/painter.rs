@@ -29,11 +29,27 @@ pub const CANVAS_COLOR: Color = Color {
 /// clipped out beneath the box, so they show through a translucent
 /// background, and inset shadows are not painted yet. An inline box split across
 /// lines rounds every fragment's corners, as if each fragment were a whole
-/// box. Borders, outlines, and other decorations are not supported yet.
+/// box.
+///
+/// Borders are painted after the background as one strip per visible side.
+/// `inset` and `groove` darken the top and left sides, `outset` and `ridge`
+/// the bottom and right ones. With a non-zero `border-radius`, a solid,
+/// opaque border of one color around an opaque background is painted as a
+/// rounded ring (a rounded fill in the border color under the rounded
+/// padding-box background); any other rounded border keeps square strips.
+/// Outlines use square strips with outline-offset; border images are not supported.
+///
+/// Boxes with an opacity below 1 or a transform are wrapped in
+/// [`DisplayItem::BeginLayer`] and [`DisplayItem::EndLayer`], and `overflow`
+/// clipping produces [`DisplayItem::Clip`] items, both following
+/// [`LayoutTree::paint_order`]. Text whose face lacks the wanted weight or
+/// slant is marked for synthetic bold or italic.
 ///
 /// Replaced boxes (`<img>`, inline `<svg>`) produce a [`DisplayItem::Image`]
 /// covering their content box, after their background. Their pictures are
-/// not clipped to `border-radius`.
+/// not clipped to `border-radius`. Checkbox and radio inputs instead draw
+/// their control in the content box with [`DisplayItem::FillRoundedRect`]
+/// and, for a check mark, [`DisplayItem::StrokeLine`]; see [`crate::ACCENT`].
 pub fn paint_document(tree: &LayoutTree) -> DisplayList {
     paint(tree, 0.0, false, |_| Vec::new())
 }
@@ -77,14 +93,54 @@ fn paint(
 ) -> DisplayList {
     log::trace!("building display list (scroll_y {scroll_y}, cull {cull})");
     let viewport = tree.root.rect;
-    // Whether a content rect in document coordinates is (partly) on screen.
-    let visible = |rect: &layout::Rect| {
-        !cull || (rect.bottom() - scroll_y > viewport.y && rect.y - scroll_y < viewport.bottom())
-    };
+    // How many enclosing layers are transformed. Their content may be drawn
+    // far from where it was laid out, so it is never culled.
+    let mut transformed = 0_usize;
+    let mut transformed_layers = Vec::new();
     let scrolled = |rect: layout::Rect| rect.translate(0.0, -scroll_y);
     let mut items = Vec::new();
     for item in tree.paint_order() {
+        // Whether a content rect in document coordinates is (partly) on screen.
+        let visible = |rect: &layout::Rect| {
+            !cull
+                || transformed > 0
+                || (rect.bottom() - scroll_y > viewport.y && rect.y - scroll_y < viewport.bottom())
+        };
+        if match item {
+            PaintItem::BoxDecorations(b) | PaintItem::Image(b) => {
+                b.style.hidden && b.kind != BoxKind::Viewport
+            }
+            PaintItem::InlineBox(b) => b.style.hidden,
+            PaintItem::Text(t) => t.hidden,
+            PaintItem::Clip(_) | PaintItem::BeginLayer(_) | PaintItem::EndLayer(_) => false,
+        } {
+            continue;
+        }
         match item {
+            PaintItem::Clip(rect) => items.push(DisplayItem::Clip {
+                rect: rect.map(scrolled),
+            }),
+            PaintItem::BeginLayer(layer) => {
+                // Content is drawn scrolled, so the matrix is conjugated by
+                // the scroll: move content back, transform, scroll again.
+                let transform = layer.transform_matrix().map(|matrix| {
+                    layout::Affine::translate(0.0, -scroll_y)
+                        .then_after(matrix)
+                        .then_after(layout::Affine::translate(0.0, scroll_y))
+                });
+                transformed += usize::from(transform.is_some());
+                transformed_layers.push(transform.is_some());
+                items.push(DisplayItem::BeginLayer {
+                    opacity: layer.style.opacity,
+                    transform,
+                });
+            }
+            PaintItem::EndLayer(_) => {
+                if transformed_layers.pop() == Some(true) {
+                    transformed -= 1;
+                }
+                items.push(DisplayItem::EndLayer);
+            }
             PaintItem::BoxDecorations(layout_box) => match layout_box.kind {
                 // The canvas is infinite, so it is never rounded.
                 BoxKind::Viewport => items.push(DisplayItem::FillRect {
@@ -100,17 +156,23 @@ fn paint(
                             items.push(shadow.item(scroll_y));
                         }
                     }
-                    if let Some(color) = layout_box.style.background_color
-                        && visible(&layout_box.rect)
-                    {
-                        items.push(background(
-                            scrolled(layout_box.rect),
-                            &layout_box.style,
-                            color.into(),
-                        ));
-                    }
                     if visible(&layout_box.rect) {
-                        items.extend(borders(scrolled(layout_box.rect), &layout_box.style));
+                        items.extend(decorations(scrolled(layout_box.rect), &layout_box.style));
+                    }
+                    if layout_box.select_arrow && visible(&layout_box.rect) {
+                        // The arrow sits inside the borders, against the
+                        // padding box's right edge.
+                        let border = layout_box.style.border_width;
+                        let padding_box = layout::Rect {
+                            x: layout_box.rect.x + border.left,
+                            y: layout_box.rect.y + border.top,
+                            width: (layout_box.rect.width - border.horizontal()).max(0.0),
+                            height: (layout_box.rect.height - border.vertical()).max(0.0),
+                        };
+                        items.extend(select_arrow(
+                            scrolled(padding_box),
+                            layout_box.style.text_color.into(),
+                        ));
                     }
                 }
             },
@@ -120,17 +182,8 @@ fn paint(
                         items.push(shadow.item(scroll_y));
                     }
                 }
-                if let Some(color) = inline.style.background_color
-                    && visible(&inline.rect)
-                {
-                    items.push(background(
-                        scrolled(inline.rect),
-                        &inline.style,
-                        color.into(),
-                    ));
-                }
                 if visible(&inline.rect) {
-                    items.extend(borders(scrolled(inline.rect), &inline.style));
+                    items.extend(decorations(scrolled(inline.rect), &inline.style));
                 }
             }
             PaintItem::Text(text) => {
@@ -146,13 +199,36 @@ fn paint(
                 }
                 if !text.text.trim().is_empty() && visible(&text.rect) {
                     items.push(DisplayItem::Text {
-                        x: text.rect.x,
+                        snap_glyphs: text.text_rendering == "optimizespeed",
+                        x: if text.text_rendering == "optimizespeed" {
+                            text.rect.x.round()
+                        } else {
+                            text.rect.x
+                        },
                         baseline: text.baseline - scroll_y,
                         font_size: text.font_size,
                         font: text.font,
                         text: text.text.clone(),
                         color: text.color.into(),
+                        synthetic_bold: text.synthetic_bold,
+                        synthetic_italic: text.synthetic_italic,
+                        clip: text.clip.map(scrolled),
                     });
+                    if text.clip.is_none() {
+                        for decoration in &text.text_decoration {
+                            let y = match decoration.as_str() {
+                                "overline" => text.baseline - text.font_size * 0.8 - scroll_y,
+                                "line-through" => text.baseline - text.font_size * 0.3 - scroll_y,
+                                _ => text.baseline + text.font_size * 0.08 - scroll_y,
+                            };
+                            items.push(DisplayItem::StrokeLine {
+                                from: (text.rect.x, y),
+                                to: (text.rect.right(), y),
+                                width: 1.0,
+                                color: text.color.into(),
+                            });
+                        }
+                    }
                 }
             }
             PaintItem::Image(layout_box) => {
@@ -166,6 +242,13 @@ fn paint(
                         rect: scrolled(rect),
                         image: image.clone(),
                     });
+                }
+                if let Some(control) = layout_box.control
+                    && rect.width > 0.0
+                    && rect.height > 0.0
+                    && visible(&rect)
+                {
+                    items.extend(crate::control::control_items(scrolled(rect), control));
                 }
             }
         }
@@ -226,8 +309,8 @@ fn shadows(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<Shadow> {
             let shape = layout::Rect {
                 x: rect.x + shadow.offset_x - spread,
                 y: rect.y + shadow.offset_y - spread,
-                width: rect.width + 2.0 * spread,
-                height: rect.height + 2.0 * spread,
+                width: (rect.width + 2.0 * spread).max(0.0),
+                height: (rect.height + 2.0 * spread).max(0.0),
             };
             if shape.width <= 0.0 || shape.height <= 0.0 {
                 return None;
@@ -257,11 +340,147 @@ fn shadows(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<Shadow> {
         .collect()
 }
 
+/// The background and borders of a box with border box `rect`, in paint
+/// order: a rounded ring when [`rounded_ring`] applies, otherwise the
+/// background followed by square border strips.
+fn decorations(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<DisplayItem> {
+    let mut items = if let Some(ring) = rounded_ring(rect, style) {
+        ring
+    } else {
+        let mut items = Vec::new();
+        if let Some(color) = style.background_color {
+            items.push(background(rect, style, color.into()));
+        }
+        items.extend(borders(rect, style));
+        items
+    };
+    if style.outline_width > 0.0 && style.outline_style != "none" {
+        let spread = style.outline_width + style.outline_offset;
+        let outline_rect = layout::Rect {
+            x: rect.x - spread,
+            y: rect.y - spread,
+            width: (rect.width + 2.0 * spread).max(0.0),
+            height: (rect.height + 2.0 * spread).max(0.0),
+        };
+        let outline = layout::BoxStyle {
+            border_width: layout::Edges {
+                top: style.outline_width,
+                right: style.outline_width,
+                bottom: style.outline_width,
+                left: style.outline_width,
+            },
+            border_color: layout::Sides::from_array([style.outline_color; 4]),
+            border_style: layout::Sides::from_array(std::array::from_fn(|_| {
+                style.outline_style.clone()
+            })),
+            ..Default::default()
+        };
+        items.extend(borders(outline_rect, &outline));
+    }
+    items
+}
+
+/// A rounded border drawn as a ring: the rounded border box filled with the
+/// border color, then the rounded padding box filled with the background.
+///
+/// Only applies when the box has a non-zero `border-radius`, an opaque
+/// background, and the same opaque `solid` border on every side; other
+/// rounded borders return `None` and keep square strips.
+fn rounded_ring(rect: layout::Rect, style: &layout::BoxStyle) -> Option<Vec<DisplayItem>> {
+    let radii = style.border_radius.resolve(rect);
+    let background = style.background_color.filter(|color| color.a == 255)?;
+    let border = style.border_width;
+    let color = style.border_color.top;
+    let uniform = [
+        (border.top, &style.border_style.top, style.border_color.top),
+        (
+            border.right,
+            &style.border_style.right,
+            style.border_color.right,
+        ),
+        (
+            border.bottom,
+            &style.border_style.bottom,
+            style.border_color.bottom,
+        ),
+        (
+            border.left,
+            &style.border_style.left,
+            style.border_color.left,
+        ),
+    ]
+    .iter()
+    .all(|(width, line, side_color)| *width > 0.0 && *line == "solid" && *side_color == color);
+    if radii.is_zero() || !uniform || color.a != 255 {
+        return None;
+    }
+    let inner = layout::Rect {
+        x: rect.x + border.left,
+        y: rect.y + border.top,
+        width: (rect.width - border.horizontal()).max(0.0),
+        height: (rect.height - border.vertical()).max(0.0),
+    };
+    let shrink =
+        |radius: layout::CornerRadius<f32>, horizontal: f32, vertical: f32| layout::CornerRadius {
+            horizontal: (radius.horizontal - horizontal).max(0.0),
+            vertical: (radius.vertical - vertical).max(0.0),
+        };
+    let inner_radii = layout::Corners {
+        top_left: shrink(radii.top_left, border.left, border.top),
+        top_right: shrink(radii.top_right, border.right, border.top),
+        bottom_right: shrink(radii.bottom_right, border.right, border.bottom),
+        bottom_left: shrink(radii.bottom_left, border.left, border.bottom),
+    };
+    let fill = background.into();
+    Some(vec![
+        DisplayItem::FillRoundedRect {
+            rect,
+            radii,
+            color: color.into(),
+        },
+        if inner_radii.is_zero() {
+            DisplayItem::FillRect {
+                rect: inner,
+                color: fill,
+            }
+        } else {
+            DisplayItem::FillRoundedRect {
+                rect: inner,
+                radii: inner_radii,
+                color: fill,
+            }
+        },
+    ])
+}
+
+/// Whether a side in border style `line` is drawn in the darker shade:
+/// the top and left (`top_left`) sides of `inset` and `groove` borders, and
+/// the bottom and right sides of `outset` and `ridge` ones.
+fn shaded(line: &str, top_left: bool) -> bool {
+    match line {
+        "inset" | "groove" => top_left,
+        "outset" | "ridge" => !top_left,
+        _ => false,
+    }
+}
+
+/// The darker shade used for the shadowed sides of `inset`, `outset`,
+/// `groove`, and `ridge` borders: each channel at two thirds.
+fn darken(color: Color) -> Color {
+    let channel = |value: u8| (u16::from(value) * 2 / 3) as u8;
+    Color {
+        r: channel(color.r),
+        g: channel(color.g),
+        b: channel(color.b),
+        a: color.a,
+    }
+}
+
 // Square border strips. Patterns are anchored to the outer edge of each side.
 fn borders(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<DisplayItem> {
     let w = style.border_width;
     let mut items = Vec::new();
-    for (r, color, line, horizontal) in [
+    for (index, (r, color, line, horizontal)) in [
         (
             layout::Rect {
                 height: w.top.min(rect.height),
@@ -300,18 +519,21 @@ fn borders(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<DisplayItem> {
             &style.border_style.left,
             false,
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let color = if shaded(line, index == 0 || index == 3) {
+            darken(color.into())
+        } else {
+            color.into()
+        };
         let thickness = if horizontal { r.height } else { r.width };
         let length = if horizontal { r.width } else { r.height };
         if thickness <= 0.0 || length <= 0.0 {
             continue;
         }
-        let mut fill = |rect| {
-            items.push(DisplayItem::FillRect {
-                rect,
-                color: color.into(),
-            })
-        };
+        let mut fill = |rect| items.push(DisplayItem::FillRect { rect, color });
         if line == "dashed" || line == "dotted" {
             let dash = thickness * if line == "dashed" { 3.0 } else { 1.0 };
             let mut offset = 0.0;
@@ -354,6 +576,33 @@ fn borders(rect: layout::Rect, style: &layout::BoxStyle) -> Vec<DisplayItem> {
         }
     }
     items
+}
+
+/// Width of a drop-down arrow chevron, in CSS pixels.
+const ARROW_WIDTH: f32 = 10.0;
+/// Rows (one CSS pixel each) in a drop-down arrow chevron.
+const ARROW_ROWS: usize = 5;
+/// Gap between the chevron and the right of the padding box, in CSS pixels.
+const ARROW_INSET: f32 = 6.0;
+
+/// A down chevron for a `<select>` whose padding box is `rect`, vertically
+/// centered, drawn as a pair of 2px strokes per row converging to the point.
+fn select_arrow(rect: layout::Rect, color: Color) -> Vec<DisplayItem> {
+    let left = rect.right() - ARROW_INSET - ARROW_WIDTH;
+    let top = rect.y + (rect.height - ARROW_ROWS as f32) / 2.0;
+    (0..ARROW_ROWS)
+        .flat_map(|row| {
+            let y = top + row as f32;
+            let inset = row as f32;
+            [left + inset, left + ARROW_WIDTH - 2.0 - inset].map(|x| layout::Rect {
+                x,
+                y,
+                width: 2.0,
+                height: 1.0,
+            })
+        })
+        .map(|rect| DisplayItem::FillRect { rect, color })
+        .collect()
 }
 
 /// The background fill for a box's border box `rect`, rounded by its
@@ -407,7 +656,8 @@ mod tests {
     fn patterned_and_partial_borders_paint_supported_geometry() {
         for (line, expected) in [
             ("solid", 4),
-            ("inset", 4),
+            // The top and left sides of an inset border are darker.
+            ("inset", 2),
             ("double", 8),
             ("dashed", 8),
             ("dotted", 24),
@@ -426,6 +676,112 @@ mod tests {
             "div { border: 4px solid red; border-style: none }",
         );
         assert!(!list.items.iter().any(|item| matches!(item, DisplayItem::FillRect { color, .. } if *color == Color::from(css::parse_color("red").unwrap()))));
+    }
+
+    #[test]
+    fn relief_borders_darken_their_shadowed_sides() {
+        let red = Color::from(css::parse_color("rgb(240, 0, 0)").unwrap());
+        let dark = darken(red);
+        for (line, top_left_dark) in [
+            ("inset", true),
+            ("groove", true),
+            ("outset", false),
+            ("ridge", false),
+        ] {
+            let list = paint(
+                "<div></div>",
+                &format!(
+                    "body {{ margin: 0 }} div {{ width: 30px; height: 30px; border: 3px {line} rgb(240, 0, 0) }}"
+                ),
+            );
+            let strips: Vec<_> = list
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    DisplayItem::FillRect { rect, color } if *color == red || *color == dark => {
+                        Some((*rect, *color))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(strips.len(), 4, "{line}");
+            // Top, right, bottom, left.
+            let expected = if top_left_dark {
+                [dark, red, red, dark]
+            } else {
+                [red, dark, dark, red]
+            };
+            assert_eq!(
+                strips.iter().map(|(_, color)| *color).collect::<Vec<_>>(),
+                expected,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_solid_rounded_border_around_an_opaque_background_is_a_ring() {
+        let list = paint(
+            "<body><div></div></body>",
+            "body { margin: 0 } div { width: 30px; height: 20px; \
+             border: 3px solid blue; border-radius: 8px; background-color: white }",
+        );
+        let blue = Color::from(css::parse_color("blue").unwrap());
+        let white = Color::from(css::parse_color("white").unwrap());
+        let rounded: Vec<_> = list
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::FillRoundedRect { rect, radii, color } => {
+                    Some((*rect, *radii, *color))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rounded.len(), 2);
+        let (outer, outer_radii, outer_color) = rounded[0];
+        assert_eq!(outer_color, blue);
+        assert_eq!((outer.width, outer.height), (36.0, 26.0));
+        assert_eq!(outer_radii.top_left.horizontal, 8.0);
+        let (inner, inner_radii, inner_color) = rounded[1];
+        assert_eq!(inner_color, white);
+        assert_eq!(
+            (inner.x, inner.y, inner.width, inner.height),
+            (3.0, 3.0, 30.0, 20.0)
+        );
+        assert_eq!(inner_radii.top_left.horizontal, 5.0);
+        // No square strips on top of the ring.
+        assert!(
+            !list
+                .items
+                .iter()
+                .any(|item| matches!(item, DisplayItem::FillRect { color, .. } if *color == blue))
+        );
+        // A dashed or translucent-background border keeps square strips.
+        let list = paint(
+            "<body><div></div></body>",
+            "body { margin: 0 } div { width: 30px; height: 20px; border: 3px solid blue; \
+             border-radius: 8px }",
+        );
+        assert!(
+            list.items
+                .iter()
+                .any(|item| matches!(item, DisplayItem::FillRect { color, .. } if *color == blue))
+        );
+    }
+
+    #[test]
+    fn iframes_draw_no_border_and_controls_use_a_grey_one() {
+        let list = paint("<body><iframe></iframe></body>", "body { margin: 0 }");
+        // Only the canvas.
+        assert_eq!(list.items.len(), 1);
+        let grey = Color::from(css::parse_color("#767676").unwrap());
+        let list = paint("<body><input></body>", "body { margin: 0 }");
+        assert!(
+            list.items
+                .iter()
+                .any(|item| matches!(item, DisplayItem::FillRect { color, .. } if *color == grey))
+        );
     }
 
     #[test]
@@ -498,6 +854,57 @@ mod tests {
     }
 
     #[test]
+    fn a_drop_down_select_paints_its_arrow_before_its_text() {
+        let list = paint(
+            "<body><select><option>One</option></select></body>",
+            "body { margin: 0 } select { padding: 0; margin: 0; font-size: 16px }",
+        );
+        let arrow: Vec<_> = list
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::FillRect { rect, .. } if rect.height == 1.0 => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(arrow.len(), 2 * ARROW_ROWS);
+        // "One" (24px) plus 20px of arrow room; one 19.2px line. The arrow
+        // sits inside the select's 2px user-agent border, so the padding box
+        // runs from 2px to 46px.
+        let border = 2.0;
+        let right = arrow.iter().map(|rect| rect.right()).fold(0.0, f32::max);
+        let left = arrow.iter().map(|rect| rect.x).fold(f32::MAX, f32::min);
+        assert_eq!(right, border + 44.0 - ARROW_INSET);
+        assert_eq!(left, border + 44.0 - ARROW_INSET - ARROW_WIDTH);
+        assert!((arrow[0].y - (border + (19.2 - 5.0) / 2.0)).abs() < 1e-4);
+        assert!(matches!(
+            list.items.last(),
+            Some(DisplayItem::Text { text, .. }) if text == "One"
+        ));
+    }
+
+    /// Guards the merge with borders (#426): the arrow stays inside a thick
+    /// author border instead of painting over it.
+    #[test]
+    fn a_drop_down_arrow_stays_inside_thick_borders() {
+        let list = paint(
+            "<body><select><option>One</option></select></body>",
+            "body { margin: 0 } select { padding: 0; margin: 0; font-size: 16px; \
+             border: 8px solid black }",
+        );
+        let right = list
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::FillRect { rect, .. } if rect.height == 1.0 => Some(rect.right()),
+                _ => None,
+            })
+            .fold(0.0, f32::max);
+        // Border box: 8 + 44 + 8; the padding box ends at 52.
+        assert_eq!(right, 52.0 - ARROW_INSET);
+    }
+
+    #[test]
     fn the_canvas_is_painted_first_with_the_default_canvas_color() {
         let list = paint("<body>Hello</body>", "");
         assert_eq!(
@@ -529,6 +936,10 @@ mod tests {
                 DisplayItem::Text { text, baseline, .. } => format!("text {text} {baseline:.1}"),
                 DisplayItem::Image { .. } => "image".to_owned(),
                 DisplayItem::BoxShadow { .. } => "shadow".to_owned(),
+                DisplayItem::StrokeLine { .. } => "line".to_owned(),
+                DisplayItem::Clip { .. } => "clip".to_owned(),
+                DisplayItem::BeginLayer { .. } => "layer".to_owned(),
+                DisplayItem::EndLayer => "end layer".to_owned(),
             })
             .collect::<Vec<_>>();
         // Canvas, then both block backgrounds, then the text of both blocks
@@ -543,6 +954,26 @@ mod tests {
                 "text World 33.6"
             ]
         );
+    }
+
+    #[test]
+    fn input_values_are_painted_clipped_to_the_control() {
+        let list = paint(
+            "<body><input style='width: 40px; padding: 0 2px; font-size: 16px' value='much too long'></body>",
+            "body { margin: 0 }",
+        );
+        let (text, clip) = list
+            .items
+            .iter()
+            .find_map(|item| match item {
+                DisplayItem::Text { text, clip, .. } => Some((text.as_str(), *clip)),
+                _ => None,
+            })
+            .expect("the value is painted");
+        assert_eq!(text, "much too long");
+        // The padding box: inside the input's 2px user-agent border.
+        let clip = clip.expect("control text is clipped");
+        assert_eq!((clip.x, clip.width), (2.0, 44.0));
     }
 
     #[test]

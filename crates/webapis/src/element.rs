@@ -2,11 +2,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use html::{Attribute, Namespace, NodeID};
-use js::{JsError, JsResult, Object, Value};
+use html::{Attribute, Namespace, NodeID, NodeKind};
+use js::{JsError, JsResult, Object, ScriptEvaluator, Value};
 
 use crate::document::{Document, script_element_object};
-use crate::event::{add_event_listener_at, dispatch_event_at, remove_event_listener_at};
 use crate::node_tree::NodeInput;
 
 // One submodule per Element API; each installs its members on the wrapper.
@@ -15,17 +14,22 @@ mod children;
 mod class_list;
 mod class_name;
 mod closest;
+#[cfg(test)]
 mod compare_document_position;
+#[cfg(test)]
 mod contains;
 mod dataset;
+#[cfg(test)]
 mod first_child;
 mod focus;
 mod get_elements_by_class_name;
 pub(crate) mod get_elements_by_tag_name;
 mod has_attribute;
+#[cfg(test)]
 mod node_type;
-mod node_view;
+#[cfg(test)]
 mod parent_element;
+#[cfg(test)]
 mod parent_node;
 mod query_selector;
 
@@ -141,36 +145,19 @@ pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -
                 .unwrap()
                 .element_snapshot(node)
                 .and_then(|element| element.get_attribute(qualified_name).map(str::to_owned));
+            let evaluator = set_attribute_document
+                .lock()
+                .unwrap()
+                .event_evaluator
+                .clone();
             invoke_attribute_changed_callback(
                 &set_attribute_target,
                 qualified_name,
                 old_value,
                 new_value,
+                evaluator.as_ref(),
             );
             Ok(Value::Undefined)
-        }),
-    );
-    let append_document = document.clone();
-    object.set_method(
-        "appendChild",
-        Arc::new(move |arguments| {
-            let ([Value::Object(child)] | [Value::Array(child)]) = arguments else {
-                return Err(JsError::new("Element.appendChild() expects an element"));
-            };
-            let Some(Value::Number(child_id)) = child.get("__nodeId") else {
-                return Err(JsError::new("Element.appendChild() expects an element"));
-            };
-            let child_id = html::NodeID::new(child_id as usize);
-            let was_connected = append_document.lock().unwrap().is_connected(child_id);
-            if was_connected {
-                invoke_lifecycle_callback(child, "disconnectedCallback");
-            }
-            append_document
-                .lock()
-                .unwrap()
-                .append_child_to(node, child_id)?;
-            invoke_lifecycle_callback(child, "connectedCallback");
-            Ok(Value::Object(child.clone()))
         }),
     );
     let remove_document = document.clone();
@@ -179,39 +166,16 @@ pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -
         "remove",
         Arc::new(move |_| {
             let was_connected = remove_document.lock().unwrap().is_connected(node);
+            let evaluator = remove_document.lock().unwrap().event_evaluator.clone();
             remove_document.lock().unwrap().remove(node);
             if was_connected {
-                invoke_lifecycle_callback(&remove_target, "disconnectedCallback");
+                invoke_lifecycle_callback(
+                    &remove_target,
+                    "disconnectedCallback",
+                    evaluator.as_ref(),
+                );
             }
             Ok(Value::Undefined)
-        }),
-    );
-    let add_document = document.clone();
-    let add_node = element.node;
-    object.set_method(
-        "addEventListener",
-        Arc::new(move |arguments| {
-            let document = add_document.lock().unwrap();
-            add_event_listener_at(&document, Some(add_node), arguments)
-        }),
-    );
-    let remove_document = document.clone();
-    let remove_node = element.node;
-    object.set_method(
-        "removeEventListener",
-        Arc::new(move |arguments| {
-            let document = remove_document.lock().unwrap();
-            remove_event_listener_at(&document, Some(remove_node), arguments)
-        }),
-    );
-    let dispatch_document = document.clone();
-    let dispatch_node = element.node;
-    let dispatch_target = object.clone();
-    object.set_method(
-        "dispatchEvent",
-        Arc::new(move |arguments| {
-            let document = dispatch_document.lock().unwrap();
-            dispatch_event_at(&document, Some(dispatch_node), &dispatch_target, arguments)
         }),
     );
     define_element_properties(&object, &element, &document);
@@ -221,18 +185,13 @@ pub(crate) fn element_object(element: Element, document: Arc<Mutex<Document>>) -
     class_list::install(&object, &element, &document);
     class_name::install(&object, &element, &document);
     closest::install(&object, &element, &document);
-    compare_document_position::install(&object, &element, &document);
-    contains::install(&object, &element, &document);
     dataset::install(&object, &element, &document);
-    first_child::install(&object, &element, &document);
     focus::install(&object, &element, &document);
     get_elements_by_class_name::install(&object, &element, &document);
     get_elements_by_tag_name::install(&object, &element, &document);
     has_attribute::install(&object, &element, &document);
-    node_type::install(&object, &element, &document);
-    parent_element::install(&object, &element, &document);
-    parent_node::install(&object, &element, &document);
     query_selector::install(&object, &element, &document);
+    crate::node::install(&object, node, &document);
     object
 }
 
@@ -248,6 +207,72 @@ fn define_element_properties(object: &Object, element: &Element, document: &Arc<
         Namespace::Svg | Namespace::MathMl => element.local_name.clone(),
     };
     object.set_read_only("tagName", Value::String(tag_name));
+    let offset_parent_document = document.clone();
+    object.define_accessor(
+        "offsetParent",
+        Arc::new(move || {
+            let parent = {
+                let document = offset_parent_document.lock().unwrap();
+                let Some(source) = document.html_document() else {
+                    return Ok(Value::Null);
+                };
+                let styles = document.computed_styles();
+                if styles.value_for(node, "position") == Some("fixed") {
+                    return Ok(Value::Null);
+                }
+                let mut current = source.get_node(node).and_then(|entry| entry.get_parent());
+                let mut found = None;
+                while let Some(id) = current {
+                    let Some(entry) = source.get_node(id) else {
+                        break;
+                    };
+                    if let NodeKind::Element(data) = entry.get_kind() {
+                        let positioned = styles
+                            .value_for(id, "position")
+                            .is_some_and(|value| !value.eq_ignore_ascii_case("static"));
+                        if positioned {
+                            found = Some(id);
+                            break;
+                        }
+                        if data.get_name() == "body" {
+                            found = Some(id);
+                            break;
+                        }
+                    }
+                    current = entry.get_parent();
+                }
+                found
+            };
+            match parent {
+                Some(parent) => wrap_element(&offset_parent_document, parent),
+                None => Ok(Value::Null),
+            }
+        }),
+        None,
+    );
+    let naturally_focusable = matches!(
+        element.local_name.as_str(),
+        "button" | "input" | "select" | "textarea" | "a"
+    );
+    let tab_document = document.clone();
+    object.define_accessor(
+        "tabIndex",
+        Arc::new(move || {
+            let value = tab_document
+                .lock()
+                .unwrap()
+                .element_snapshot(node)
+                .and_then(|element| element.get_attribute("tabindex").map(str::to_owned));
+            let index = value
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or({
+                    // The supported DOM subset treats common interactive controls as focusable.
+                    if naturally_focusable { 0 } else { -1 }
+                });
+            Ok(Value::Number(index as f64))
+        }),
+        None,
+    );
 
     let attributes_document = document.clone();
     let attributes_owner = object.clone();
@@ -278,7 +303,11 @@ fn define_element_properties(object: &Object, element: &Element, document: &Arc<
         })),
     );
 
-    for (property, height) in [("clientWidth", false), ("clientHeight", true)] {
+    for (property, height) in [
+        ("clientWidth", false),
+        ("clientHeight", true),
+        ("offsetWidth", false),
+    ] {
         let client_document = document.clone();
         object.define_accessor(
             property,
@@ -289,16 +318,6 @@ fn define_element_properties(object: &Object, element: &Element, document: &Arc<
             None,
         );
     }
-
-    let owner_document = document.clone();
-    object.define_accessor(
-        "ownerDocument",
-        Arc::new(move || {
-            let bindings = owner_document.lock().unwrap().script_bindings();
-            Ok(bindings.map_or(Value::Null, |bindings| Value::Object(bindings.document)))
-        }),
-        None,
-    );
 
     let query_document = document.clone();
     object.set_method(
@@ -328,57 +347,6 @@ fn define_element_properties(object: &Object, element: &Element, document: &Arc<
 
 /// Defines `removeChild`, `replaceChild`, `replaceChildren`, and `before`.
 fn define_tree_methods(object: &Object, node: NodeID, document: &Arc<Mutex<Document>>) {
-    let remove_child_document = document.clone();
-    object.set_method(
-        "removeChild",
-        Arc::new(move |arguments| {
-            let Some((child, child_object)) = arguments.first().and_then(node_argument) else {
-                return Err(JsError::new(
-                    "TypeError: Element.removeChild() expects a Node",
-                ));
-            };
-            mutate_tree(
-                &remove_child_document,
-                &[],
-                std::slice::from_ref(&child_object),
-                |document| document.remove_child(node, child).map(|_| ()),
-            )?;
-            Ok(Value::Object(child_object))
-        }),
-    );
-
-    let replace_child_document = document.clone();
-    object.set_method(
-        "replaceChild",
-        Arc::new(move |arguments| {
-            let (Some((new_node, new_object)), Some((child, child_object))) = (
-                arguments.first().and_then(node_argument),
-                arguments.get(1).and_then(node_argument),
-            ) else {
-                return Err(JsError::new(
-                    "TypeError: Element.replaceChild() expects two Nodes",
-                ));
-            };
-            if new_node == child {
-                // Replacing a child with itself changes nothing, so no
-                // lifecycle callbacks run.
-                replace_child_document
-                    .lock()
-                    .unwrap()
-                    .replace_child(node, new_node, child)
-                    .map_err(|error| JsError::new(error.to_string()))?;
-                return Ok(Value::Object(child_object));
-            }
-            mutate_tree(
-                &replace_child_document,
-                &[new_object],
-                std::slice::from_ref(&child_object),
-                |document| document.replace_child(node, new_node, child).map(|_| ()),
-            )?;
-            Ok(Value::Object(child_object))
-        }),
-    );
-
     let replace_children_document = document.clone();
     object.set_method(
         "replaceChildren",
@@ -388,7 +356,7 @@ fn define_tree_methods(object: &Object, node: NodeID, document: &Arc<Mutex<Docum
                 let document = replace_children_document.lock().unwrap();
                 let children = document
                     .html_document()
-                    .and_then(|source| source.node(node))
+                    .and_then(|source| source.get_node(node))
                     .map(|data| data.get_children().clone())
                     .unwrap_or_default();
                 children
@@ -413,6 +381,28 @@ fn define_tree_methods(object: &Object, node: NodeID, document: &Arc<Mutex<Docum
             let (inputs, inserted) = node_inputs(arguments);
             mutate_tree(&before_document, &inserted, &[], |document| {
                 document.before(node, &inputs)
+            })?;
+            Ok(Value::Undefined)
+        }),
+    );
+
+    let after_document = document.clone();
+    object.set_method(
+        "after",
+        Arc::new(move |arguments| {
+            let (inputs, inserted) = node_inputs(arguments);
+            {
+                let document = after_document.lock().unwrap();
+                let Some(source) = document.html_document() else {
+                    return Ok(Value::Undefined);
+                };
+                let Some(_parent) = source.get_node(node).and_then(|entry| entry.get_parent())
+                else {
+                    return Ok(Value::Undefined);
+                };
+            }
+            mutate_tree(&after_document, &inserted, &[], |document| {
+                document.after(node, &inputs)
             })?;
             Ok(Value::Undefined)
         }),
@@ -545,18 +535,19 @@ fn mutate_tree(
             .map(|((object, _), was)| (was, connected(&document, object)))
             .collect::<Vec<_>>()
     };
+    let evaluator = document.lock().unwrap().event_evaluator.clone();
     for ((object, is_inserted), (was_connected, is_connected)) in
         tracked.into_iter().zip(connections)
     {
         if is_inserted {
             if was_connected {
-                invoke_lifecycle_callback(object, "disconnectedCallback");
+                invoke_lifecycle_callback(object, "disconnectedCallback", evaluator.as_ref());
             }
             if is_connected {
-                invoke_lifecycle_callback(object, "connectedCallback");
+                invoke_lifecycle_callback(object, "connectedCallback", evaluator.as_ref());
             }
         } else if was_connected && !is_connected {
-            invoke_lifecycle_callback(object, "disconnectedCallback");
+            invoke_lifecycle_callback(object, "disconnectedCallback", evaluator.as_ref());
         }
     }
     Ok(())
@@ -587,9 +578,18 @@ pub(super) fn thrown_exception(name: &str, message: &str) -> JsError {
     JsError::thrown(Value::Object(exception))
 }
 
-pub(crate) fn invoke_lifecycle_callback(element: &Object, name: &str) {
+pub(crate) fn invoke_lifecycle_callback(
+    element: &Object,
+    name: &str,
+    evaluator: Option<&ScriptEvaluator>,
+) {
     if let Some(Value::Function(callback)) = element.get(name) {
-        let _ = callback.call_with_this(Value::Object(element.clone()), &[]);
+        let _ = evaluator.map_or_else(
+            || callback.call_with_this(Value::Object(element.clone()), &[]),
+            |evaluator| {
+                evaluator.call_with_this_reentrant(&callback, Value::Object(element.clone()), &[])
+            },
+        );
     }
 }
 
@@ -598,6 +598,7 @@ pub(crate) fn invoke_attribute_changed_callback(
     name: &str,
     old_value: Option<String>,
     new_value: Option<String>,
+    evaluator: Option<&ScriptEvaluator>,
 ) {
     let Some(prototype) = element.prototype() else {
         return;
@@ -621,13 +622,20 @@ pub(crate) fn invoke_attribute_changed_callback(
     let Some(Value::Function(callback)) = element.get("attributeChangedCallback") else {
         return;
     };
-    let _ = callback.call_with_this(
-        Value::Object(element.clone()),
-        &[
-            Value::String(name.to_owned()),
-            old_value.map_or(Value::Null, Value::String),
-            new_value.map_or(Value::Null, Value::String),
-        ],
+    let arguments = [
+        Value::String(name.to_owned()),
+        old_value.map_or(Value::Null, Value::String),
+        new_value.map_or(Value::Null, Value::String),
+    ];
+    let _ = evaluator.map_or_else(
+        || callback.call_with_this(Value::Object(element.clone()), &arguments),
+        |evaluator| {
+            evaluator.call_with_this_reentrant(
+                &callback,
+                Value::Object(element.clone()),
+                &arguments,
+            )
+        },
     );
 }
 

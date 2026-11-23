@@ -3,10 +3,11 @@
 //!
 //! Supported today: `white-space: normal` collapsing, soft wrap
 //! opportunities at spaces and around atomic inlines, forced breaks from
-//! `<br>`, inline boxes split across lines, `line-height: normal`,
-//! `vertical-align: baseline`, and left-to-right text aligned by every
+//! `<br>`, inline boxes split across lines, `line-height`,
+//! `vertical-align: baseline`, preserved unbreakable runs for text the user
+//! agent draws in form controls, and left-to-right text aligned by every
 //! `text-align` keyword (`justify` widens the spaces between words). Other
-//! `white-space`, `line-height`, and `vertical-align` values, as well as
+//! non-`normal` `white-space` and `vertical-align` values, as well as
 //! bidirectional text, `text-align-last`, and hyphenation, are not
 //! implemented.
 //!
@@ -17,10 +18,11 @@
 use std::ops::Range;
 
 use html::NodeID;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::Rect;
 use crate::block::{BlockResult, ContainingBlock};
-use crate::box_tree::{BlockBox, InlineItem, is_document_white_space};
+use crate::box_tree::{BlockBox, InlineItem, WhiteSpace, is_document_white_space};
 use crate::layout::Context;
 use crate::positioned::{FloatScope, PendingAbsolute, relative_offset};
 use crate::style::{ComputedStyle, Position, TextAlign};
@@ -38,9 +40,16 @@ enum Piece {
         text: String,
         width: f32,
     },
-    /// A collapsible space that survived white-space collapsing. A soft wrap
-    /// opportunity follows it.
-    Space { source: usize, width: f32 },
+    /// White space followed by a soft wrap opportunity. With `text: None`
+    /// it is a collapsible space that survived white-space collapsing,
+    /// removed at the start and end of a line. With `Some` it is a
+    /// preserved run (`pre-wrap`) drawn as written, kept at the start of a
+    /// line and hanging (not drawn) at its end.
+    Space {
+        source: usize,
+        width: f32,
+        text: Option<String>,
+    },
     /// The start of inline box `boxes[index]`.
     Start(usize),
     /// The end of inline box `boxes[index]`.
@@ -315,6 +324,7 @@ impl Context<'_> {
                     element,
                     text,
                     style,
+                    white_space,
                 } => {
                     let source = prepared.sources.len();
                     prepared.sources.push(TextSource {
@@ -322,6 +332,54 @@ impl Context<'_> {
                         element: *element,
                         style,
                     });
+                    if *white_space == WhiteSpace::PreWrap {
+                        for (is_space, run) in preserved_runs(text) {
+                            // Tab stops are not supported: a tab is one space.
+                            let run = if is_space {
+                                run.replace('\t', " ")
+                            } else {
+                                run.to_owned()
+                            };
+                            let run = run.as_str();
+                            let width =
+                                self.fonts.font_text_width(style.font, run, style.font_size);
+                            prepared.pieces.push(if is_space {
+                                Piece::Space {
+                                    source,
+                                    width,
+                                    text: Some(run.to_owned()),
+                                }
+                            } else {
+                                Piece::Word {
+                                    source,
+                                    text: run.to_owned(),
+                                    width,
+                                }
+                            });
+                        }
+                        after_space = false;
+                        continue;
+                    }
+                    if *white_space == WhiteSpace::Pre || style.nowrap {
+                        // One unbreakable run with its spaces kept.
+                        if !text.is_empty() {
+                            let text = if style.nowrap {
+                                text.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
+                            } else {
+                                text.clone()
+                            };
+                            let width =
+                                self.fonts
+                                    .font_text_width(style.font, &text, style.font_size);
+                            prepared.pieces.push(Piece::Word {
+                                source,
+                                text,
+                                width,
+                            });
+                            after_space = false;
+                        }
+                        continue;
+                    }
                     let mut rest = text.as_str();
                     while let Some(first) = rest.chars().next() {
                         let is_space = is_document_white_space(first);
@@ -339,14 +397,53 @@ impl Context<'_> {
                                         " ",
                                         style.font_size,
                                     ),
+                                    text: None,
                                 });
                                 after_space = true;
                             }
                         } else {
+                            let break_all = style.word_break == "break-all"
+                                || (style.word_break == "break-word"
+                                    && cb_width.is_some_and(|width| {
+                                        self.fonts.font_text_width(style.font, run, style.font_size)
+                                            > width
+                                    }));
+                            let mut start = 0;
+                            for (offset, grapheme) in run.grapheme_indices(true) {
+                                let character = grapheme.chars().next().expect("nonempty grapheme");
+                                // Basic CJK opportunities. Full Unicode line breaking and
+                                // dictionary-based Southeast Asian breaking are not implemented.
+                                let cjk = matches!(character as u32, 0x2e80..=0x9fff | 0xac00..=0xd7af | 0xf900..=0xfaff);
+                                if offset > start
+                                    && (break_all || (style.word_break != "keep-all" && cjk))
+                                {
+                                    let part = &run[start..offset];
+                                    prepared.pieces.push(Piece::Word {
+                                        source,
+                                        text: part.to_owned(),
+                                        width: self.fonts.font_text_width(
+                                            style.font,
+                                            part,
+                                            style.font_size,
+                                        ),
+                                    });
+                                    prepared.pieces.push(Piece::Space {
+                                        source,
+                                        width: 0.0,
+                                        text: None,
+                                    });
+                                    start = offset;
+                                }
+                            }
+                            let part = &run[start..];
                             prepared.pieces.push(Piece::Word {
                                 source,
-                                text: run.to_owned(),
-                                width: self.fonts.font_text_width(style.font, run, style.font_size),
+                                text: part.to_owned(),
+                                width: self.fonts.font_text_width(
+                                    style.font,
+                                    part,
+                                    style.font_size,
+                                ),
                             });
                             after_space = false;
                         }
@@ -478,9 +575,11 @@ impl Context<'_> {
             .map_or(range.start, |index| index + 1);
         // Collapsible spaces at the start and end of a line are removed
         // (CSS Text 3 §4.1.2).
-        let kept = |index: usize| {
-            !matches!(prepared.pieces[index], Piece::Space { .. })
-                || (first_content..last_content).contains(&index)
+        // Preserved spaces are kept at the start but hang at the end.
+        let kept = |index: usize| match prepared.pieces[index] {
+            Piece::Space { text: None, .. } => (first_content..last_content).contains(&index),
+            Piece::Space { text: Some(_), .. } => index < last_content,
+            _ => true,
         };
 
         // The width of the line's content before alignment, and how many
@@ -497,7 +596,9 @@ impl Context<'_> {
                     (width + info.padding_end + info.margin_end, spaces)
                 }
                 Piece::Word { width: word, .. } => (width + word, spaces),
-                Piece::Space { width: space, .. } => (width + space, spaces + 1),
+                Piece::Space { width: space, .. } => {
+                    (width + space, spaces + u32::from(*space > 0.0))
+                }
                 Piece::Atomic(atomic_index) => {
                     (width + prepared.atomics[*atomic_index].width, spaces)
                 }
@@ -569,8 +670,13 @@ impl Context<'_> {
                     self.push_text(&mut fragments, &prepared.sources[*source], text, x, *width);
                     x += width;
                 }
-                Piece::Space { source, width } => {
-                    self.push_text(&mut fragments, &prepared.sources[*source], " ", x, *width);
+                Piece::Space {
+                    source,
+                    width,
+                    text,
+                } => {
+                    let text = text.as_deref().unwrap_or(" ");
+                    self.push_text(&mut fragments, &prepared.sources[*source], text, x, *width);
                     // The gap after a widened space keeps the next word out
                     // of this text run.
                     x += width + space_extra;
@@ -626,7 +732,8 @@ impl Context<'_> {
             let metrics = self
                 .fonts
                 .font_vertical_metrics(style.font, style.font_size);
-            let line_height = metrics.ascent + metrics.descent + metrics.line_gap;
+            let normal = metrics.ascent + metrics.descent + metrics.line_gap;
+            let line_height = style.line_height.used(style.font_size, normal);
             let half_leading = (line_height - metrics.ascent - metrics.descent) / 2.0;
             (
                 metrics.ascent + half_leading,
@@ -642,13 +749,13 @@ impl Context<'_> {
             include(leaded(prepared.boxes[*box_index].style));
         }
         for fragment in &fragments {
-            if let LineFragment::Text(text) = fragment {
-                let metrics = self.fonts.font_vertical_metrics(text.font, text.font_size);
-                let half_leading = metrics.line_gap / 2.0;
-                include((
-                    metrics.ascent + half_leading,
-                    metrics.descent + half_leading,
-                ));
+            if let LineFragment::Text(text) = fragment
+                && let Some(source) = prepared
+                    .sources
+                    .iter()
+                    .find(|source| source.node == text.node)
+            {
+                include(leaded(source.style));
             }
         }
         let atomic_ascents = atomics_on_line
@@ -710,6 +817,11 @@ impl Context<'_> {
         };
         for (box_index, start, end) in box_ranges {
             let style = prepared.boxes[box_index].style;
+            if style.vertical_align_offset != 0.0 {
+                for fragment in &mut fragments[start..end] {
+                    translate_fragment(fragment, 0.0, style.vertical_align_offset);
+                }
+            }
             if style.position != Position::Relative {
                 continue;
             }
@@ -739,10 +851,18 @@ impl Context<'_> {
     }
 
     fn placeholder(&self, info: &InlineBoxInfo<'_>) -> InlineBoxFragment {
+        let mut style = crate::block::box_style(info.style);
+        // Transforms, stacking, and clipping do not apply to non-replaced
+        // inline boxes, and their opacity is folded into their colors.
+        style.transform = None;
+        style.z_index = None;
+        style.opacity = 1.0;
+        style.clip_x = false;
+        style.clip_y = false;
         InlineBoxFragment {
             node: info.node,
             rect: Rect::default(),
-            style: crate::block::box_style(info.style),
+            style,
         }
     }
 
@@ -765,6 +885,10 @@ impl Context<'_> {
             return;
         }
         fragments.push(LineFragment::Text(TextFragment {
+            cursor: source.style.cursor.clone(),
+            user_select: source.style.user_select.clone(),
+            text_rendering: source.style.text_rendering.clone(),
+            hidden: source.style.hidden,
             node: source.node,
             element: source.element,
             rect: Rect {
@@ -778,6 +902,10 @@ impl Context<'_> {
             font_size: source.style.font_size,
             font: source.style.font,
             color: source.style.color,
+            synthetic_bold: source.style.font_synthesis.0,
+            synthetic_italic: source.style.font_synthesis.1,
+            text_decoration: source.style.text_decoration.clone(),
+            clip: None,
         }));
     }
 }
@@ -876,4 +1004,21 @@ fn last_baseline(layout_box: &LayoutBox) -> Option<f32> {
         .filter(|child| child.placement == Placement::InFlow)
         .find_map(last_baseline)
         .or_else(|| layout_box.lines.last().map(|line| line.baseline))
+}
+
+/// Splits `pre-wrap` text into alternating runs of spaces and tabs (`true`)
+/// and other characters (`false`).
+fn preserved_runs(text: &str) -> impl Iterator<Item = (bool, &str)> {
+    let is_space = |character: char| matches!(character, ' ' | '\t');
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        let first = rest.chars().next()?;
+        let space = is_space(first);
+        let end = rest
+            .find(|character| is_space(character) != space)
+            .unwrap_or(rest.len());
+        let (run, remaining) = rest.split_at(end);
+        rest = remaining;
+        Some((space, run))
+    })
 }

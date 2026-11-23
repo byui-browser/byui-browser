@@ -120,7 +120,11 @@ pub fn parse_number(input: &str) -> Option<f32> {
 /// value resolver and are not converted by this helper.
 pub fn parse_length(input: &str) -> Option<Length> {
     let input = input.trim();
-    if input.len() >= 6 && input[..5].eq_ignore_ascii_case("calc(") && input.ends_with(')') {
+    if input
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("calc("))
+        && input.ends_with(')')
+    {
         return None;
     }
     let (number, unit) = input.split_at(number_prefix_len(input));
@@ -291,6 +295,145 @@ fn compute_font_size_in_context(
         })
     };
     (size >= 0.0).then_some(size)
+}
+
+/// Resolves same-unit CSS length functions into a value the layout crate can
+/// consume directly. Mixed-unit expressions remain unresolved because their
+/// conversion requires layout context.
+pub fn resolve_length_function(input: &str) -> Option<String> {
+    let input = input.trim();
+
+    for name in ["calc", "min", "max", "clamp"] {
+        let Some(inner) = function_inner(input, name) else {
+            continue;
+        };
+
+        if name == "calc" {
+            return calculate_length(inner).map(format_length);
+        }
+
+        let arguments = split_function_arguments(inner);
+        if (name == "clamp" && arguments.len() != 3) || (name != "clamp" && arguments.len() < 2) {
+            return None;
+        }
+
+        let lengths: Vec<Length> = arguments
+            .iter()
+            .map(|argument| parse_length(argument))
+            .collect::<Option<_>>()?;
+        let unit = lengths.first()?.unit;
+        if lengths.iter().any(|length| length.unit != unit) {
+            return None;
+        }
+
+        let value = match name {
+            "min" => lengths.iter().map(|length| length.value).reduce(f32::min)?,
+            "max" => lengths.iter().map(|length| length.value).reduce(f32::max)?,
+            "clamp" => lengths[1].value.clamp(lengths[0].value, lengths[2].value),
+            _ => unreachable!(),
+        };
+
+        return Some(format_length(Length { value, unit }));
+    }
+
+    None
+}
+
+fn function_inner<'a>(input: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}(");
+    if input.len() <= prefix.len()
+        || !input.get(..prefix.len())?.eq_ignore_ascii_case(&prefix)
+        || !input.ends_with(')')
+    {
+        return None;
+    }
+    Some(&input[prefix.len()..input.len() - 1])
+}
+
+fn split_function_arguments(input: &str) -> Vec<&str> {
+    let mut arguments = Vec::new();
+    let mut depth: usize = 0;
+    let mut start = 0;
+
+    for (index, character) in input.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                arguments.push(input[start..index].trim());
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    arguments.push(input[start..].trim());
+    arguments
+}
+
+fn calculate_length(input: &str) -> Option<Length> {
+    let mut expression = input.trim();
+    let mut result: Option<Length> = None;
+    let mut operation = 1.0;
+
+    while !expression.is_empty() {
+        let split = expression
+            .char_indices()
+            .skip(1)
+            .find(|(_, character)| matches!(character, '+' | '-'))
+            .map(|(index, _)| index);
+        let (term_text, rest) = split
+            .map(|index| expression.split_at(index))
+            .unwrap_or((expression, ""));
+        let term = parse_length(term_text.trim())?;
+
+        result = Some(match result {
+            Some(current) if current.unit == term.unit => Length {
+                value: current.value + operation * term.value,
+                unit: current.unit,
+            },
+            Some(_) => return None,
+            None => Length {
+                value: operation * term.value,
+                unit: term.unit,
+            },
+        });
+
+        expression = rest.trim_start();
+        if expression.is_empty() {
+            break;
+        }
+        let operator = expression.chars().next()?;
+        operation = match operator {
+            '+' => 1.0,
+            '-' => -1.0,
+            _ => return None,
+        };
+        expression = expression[operator.len_utf8()..].trim_start();
+    }
+
+    result
+}
+
+fn format_length(length: Length) -> String {
+    let unit = match length.unit {
+        LengthUnit::Px => "px",
+        LengthUnit::Em => "em",
+        LengthUnit::Rem => "rem",
+        LengthUnit::Ex => "ex",
+        LengthUnit::Ch => "ch",
+        LengthUnit::In => "in",
+        LengthUnit::Cm => "cm",
+        LengthUnit::Mm => "mm",
+        LengthUnit::Q => "Q",
+        LengthUnit::Pt => "pt",
+        LengthUnit::Pc => "pc",
+        LengthUnit::Vw => "vw",
+        LengthUnit::Vh => "vh",
+        LengthUnit::Vmin => "vmin",
+        LengthUnit::Vmax => "vmax",
+    };
+    format!("{}{}", format_number(length.value), unit)
 }
 
 /// Formats a CSS-pixel length as CSS text, for example `21.44px`.

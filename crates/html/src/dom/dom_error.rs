@@ -8,7 +8,7 @@ pub enum DomError {
     /// The supplied token is empty.
     Syntax,
     /// The supplied token contains ASCII whitespace.
-    InvalidToken,
+    InvalidClass,
     /// The operation is not supported for the requested node or attribute.
     Type,
     /// The supplied node ID does not identify an element.
@@ -20,7 +20,7 @@ impl fmt::Display for DomError {
         match self {
             Self::InvalidCharacter => formatter.write_str("InvalidCharacterError"),
             Self::Syntax => formatter.write_str("SyntaxError"),
-            Self::InvalidToken => formatter.write_str("InvalidCharacterError"),
+            Self::InvalidClass => formatter.write_str("InvalidCharacterError"),
             Self::Type => formatter.write_str("TypeError"),
             Self::NotFound => formatter.write_str("NotFoundError"),
         }

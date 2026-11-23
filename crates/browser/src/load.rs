@@ -2,9 +2,11 @@
 //! and scripts it references.
 
 use std::{
+    collections::HashSet,
     fmt,
     future::Future,
     io,
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -163,8 +165,7 @@ async fn fetch_bytes(
 /// downloaded into [`PageResources::fonts`]. A page served over a non-`byui:` scheme may
 /// not pull `byui:` or `file:` subresources.
 ///
-/// Limitation: CSS `@import` inside stylesheets is not followed, CSS
-/// background images are not fetched, `srcset`/`<picture>` sources are
+/// Limitation: CSS background images are not fetched, `srcset`/`<picture>` sources are
 /// ignored, and fonts are fetched without the CORS check browsers apply to
 /// cross-origin fonts.
 pub async fn load_page(controller: &RequestController, address: &str) -> Result<Page, LoadError> {
@@ -222,8 +223,8 @@ async fn load_page_with<F, Fut, G, GFut>(
     timeline: &Mutex<Vec<TimelineEvent>>,
 ) -> Result<Page, LoadError>
 where
-    F: Fn(Url) -> Fut,
-    Fut: Future<Output = Result<Fetched, LoadError>>,
+    F: Fn(Url) -> Fut + Sync,
+    Fut: Future<Output = Result<Fetched, LoadError>> + Send,
     G: Fn(Url) -> GFut,
     GFut: Future<Output = Result<Fetched<Vec<u8>>, LoadError>>,
 {
@@ -256,7 +257,7 @@ where
     let mut image_sources: Vec<String> = Vec::new();
     let nodes = (0..)
         .map(html::NodeID::new)
-        .map_while(|id| document.node(id).map(|node| (id, node)));
+        .map_while(|id| document.get_node(id).map(|node| (id, node)));
     for (id, node) in nodes {
         let html::NodeKind::Element(element) = node.get_kind() else {
             continue;
@@ -309,6 +310,7 @@ where
         fetch_images(&fetch_bytes, &main.url, image_sources, timeline),
     )
     .await;
+    let stylesheets = expand_imports(&fetch, stylesheets, timeline).await;
     let fonts = fetch_fonts(&fetch_bytes, &stylesheets, timeline).await;
     log::debug!(
         "subresources loaded: {} stylesheets, {} scripts, {} images, {} fonts",
@@ -334,6 +336,111 @@ where
             fonts: fonts.into(),
         },
     })
+}
+
+/// Fetches imported stylesheets and places them before the stylesheet that
+/// imports them, as required by the cascade. Import URLs resolve against the
+/// containing stylesheet's final response URL.
+type LoaderFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+fn expand_imports<'a, F, Fut>(
+    fetch: &'a F,
+    sheets: Vec<(Url, String)>,
+    timeline: &'a Mutex<Vec<TimelineEvent>>,
+) -> LoaderFuture<'a, Vec<(Url, String)>>
+where
+    F: Fn(Url) -> Fut + Sync + 'a,
+    Fut: Future<Output = Result<Fetched, LoadError>> + Send + 'a,
+{
+    Box::pin(async move {
+        let mut output = Vec::new();
+        let mut active = HashSet::new();
+        for sheet in sheets {
+            expand_one(fetch, sheet, timeline, &mut active, 0, &mut output).await;
+        }
+        output
+    })
+}
+
+fn expand_one<'a, F, Fut>(
+    fetch: &'a F,
+    sheet: (Url, String),
+    timeline: &'a Mutex<Vec<TimelineEvent>>,
+    active: &'a mut HashSet<String>,
+    depth: usize,
+    output: &'a mut Vec<(Url, String)>,
+) -> LoaderFuture<'a, ()>
+where
+    F: Fn(Url) -> Fut + Sync + 'a,
+    Fut: Future<Output = Result<Fetched, LoadError>> + Send + 'a,
+{
+    Box::pin(async move {
+        let (base, source) = sheet;
+        let sheet_key = base.as_str().to_owned();
+        if !active.insert(sheet_key.clone()) {
+            log::warn!("skipping cyclic CSS @import {base}");
+            return;
+        }
+        if depth < 32 {
+            let imports = css::parse_stylesheet(&source)
+                .at_rules
+                .into_iter()
+                .filter(|rule| rule.name == "import")
+                .filter_map(|rule| import_reference(&rule.prelude))
+                .collect::<Vec<_>>();
+            for reference in imports {
+                let url = match subresource_url(&base, &reference) {
+                    Ok(url) => url,
+                    Err(reason) => {
+                        log::warn!("skipping CSS @import {reference:?}: {reason}");
+                        continue;
+                    }
+                };
+                let started = Instant::now();
+                let result = fetch(url.clone()).await;
+                push_event(
+                    timeline,
+                    TimelineEvent::since(EventCategory::Network, download_label(&url), started),
+                );
+                match result {
+                    Ok(fetched) => {
+                        expand_one(
+                            fetch,
+                            (fetched.url, fetched.body),
+                            timeline,
+                            active,
+                            depth + 1,
+                            output,
+                        )
+                        .await;
+                    }
+                    Err(error) => log::warn!("skipping CSS @import {url}: {error}"),
+                }
+            }
+        }
+        output.push((base, source));
+        active.remove(&sheet_key);
+    })
+}
+
+/// Reads the URL token at the start of an `@import` prelude. Media conditions
+/// remain attached to the rule in the parser but are currently not evaluated.
+fn import_reference(prelude: &str) -> Option<String> {
+    let prelude = prelude.trim();
+    if let Some(rest) = prelude
+        .get(..4)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("url("))
+        .and_then(|_| prelude.get(4..))
+    {
+        let end = rest.find(')')?;
+        return Some(rest[..end].trim().trim_matches(['\'', '"']).to_owned());
+    }
+    let quote = prelude.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let end = prelude[1..].find(quote)? + 1;
+    Some(prelude[1..end].to_owned())
 }
 
 /// Downloads each image `src` (resolved against `base`) concurrently,
@@ -577,14 +684,29 @@ pub fn security_context_for_url_with_policy(
     if let Ok(url) = Url::parse(url)
         && matches!(url.scheme(), "http" | "https" | "byui")
         && let Some(host) = url.host_str()
+        && !host.is_empty()
     {
         let origin = Origin::new(url.scheme(), host, url.port());
-        let storage_permission = match policy.decision(&origin, PermissionKind::Storage) {
-            Some(PermissionState::Denied) => StoragePermission::Denied,
-            Some(PermissionState::Granted) | None => StoragePermission::Allowed,
-        };
-        log::debug!("security context derived: origin {origin:?}, storage {storage_permission:?}");
-        return RendererSecurityContext::new(origin, storage_permission);
+        let permissions = [
+            PermissionKind::Storage,
+            PermissionKind::Cookies,
+            PermissionKind::Geolocation,
+        ]
+        .into_iter()
+        .map(|permission| {
+            let default = if permission == PermissionKind::Storage {
+                PermissionState::Granted
+            } else {
+                PermissionState::Denied
+            };
+            (
+                permission,
+                policy.decision(&origin, permission).unwrap_or(default),
+            )
+        })
+        .collect::<Vec<_>>();
+        log::debug!("security context derived: origin {origin:?}, permissions from policy");
+        return RendererSecurityContext::with_permissions(origin, permissions);
     }
     log::debug!("security context derived: opaque origin, storage denied");
     RendererSecurityContext::new(Origin::new("opaque", "", None), StoragePermission::Denied)
@@ -774,6 +896,42 @@ mod tests {
             ],
             "inline <style> is not a download; failed downloads still appear"
         );
+    }
+
+    #[test]
+    fn imports_load_relative_to_each_stylesheet_and_precede_the_importer() {
+        let (result, requested) = load(
+            &[
+                (
+                    "https://example.test/pages/index.html",
+                    r#"<link rel="stylesheet" href="css/site.css">"#,
+                ),
+                (
+                    "https://example.test/pages/css/site.css",
+                    "@import \"base.css\"; .site { color: blue }",
+                ),
+                (
+                    "https://example.test/pages/css/base.css",
+                    "@import url('../nested.css'); .base { color: green }",
+                ),
+                (
+                    "https://example.test/pages/nested.css",
+                    ".nested { color: red }",
+                ),
+            ],
+            "https://example.test/pages/index.html",
+        );
+        let page = result.expect("page loads");
+        assert_eq!(
+            page.stylesheets,
+            [
+                ".nested { color: red }",
+                "@import url('../nested.css'); .base { color: green }",
+                "@import \"base.css\"; .site { color: blue }",
+            ]
+        );
+        assert!(requested.contains(&"https://example.test/pages/css/base.css".to_owned()));
+        assert!(requested.contains(&"https://example.test/pages/nested.css".to_owned()));
     }
 
     #[test]
@@ -1030,10 +1188,16 @@ mod tests {
 
     #[test]
     fn unsupported_origins_are_isolated_without_storage() {
-        for url in ["", "not a url", "file:///etc/passwd", "data:text/html,hi"] {
+        for url in [
+            "",
+            "not a url",
+            "file:///etc/passwd",
+            "data:text/html,hi",
+            "https:///",
+        ] {
             let context = security_context_for_url(url);
             assert!(!context.can_read_storage() && !context.can_write_storage());
-            assert_eq!(context.origin().scheme(), "opaque");
+            assert!(context.origin().is_opaque());
         }
     }
 
@@ -1062,6 +1226,19 @@ mod tests {
 
         assert!(!context.can_read_storage());
         assert!(!context.can_write_storage());
+    }
+
+    #[test]
+    fn policy_grants_reach_the_renderer_context_without_changing_defaults() {
+        let origin = Origin::new("https", "example.com", None);
+        let mut policy = PermissionPolicy::new();
+        policy.grant(origin, PermissionKind::Cookies);
+
+        let context = security_context_for_url_with_policy("https://example.com/page", &policy);
+
+        assert!(context.can_read_storage());
+        assert!(context.has_permission(PermissionKind::Cookies));
+        assert!(!context.has_permission(PermissionKind::Geolocation));
     }
 
     #[test]

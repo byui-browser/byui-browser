@@ -32,15 +32,26 @@ pub(crate) struct Context<'a> {
 ///
 /// `display:flex` and `display:inline-flex` use a single-line flex subset with
 /// `flex-direction:row|column`, `flex-basis`, `flex-grow`, `flex-shrink`, and
-/// `gap`. Wrapping, alignment, and anonymous flex items for mixed text are not
-/// implemented.
-/// Grid and table modes are preserved distinctly in computed display values,
-/// but still use ordinary flow layout. Other supported properties are
-/// margins, padding, `width`, `height`, `font-size`, `font-family`,
-/// `font-weight`, `font-style`, `color`, and `background-color`;
-/// unsupported properties (including the `font` shorthand) use their initial
-/// values. The font properties choose a face through
-/// [`FontMetrics::select_font`], which measures each text run.
+/// `gap`. Main-axis free-space distribution and `align-items` start, center,
+/// and end placement are supported for definite cross sizes. Wrapping, full
+/// baseline/stretch alignment, and anonymous flex items for mixed text are
+/// not implemented.
+/// Grid modes are preserved distinctly in computed display values, but still
+/// use ordinary flow layout. Tables lay out direct children in one row; full
+/// row groups, column sizing, and collapsed borders are not implemented.
+/// Non-replaced boxes support `width: min-content`, `max-content`, and
+/// `fit-content`; intrinsic sizing keywords on `height` and replaced boxes
+/// are not implemented. Other supported properties are margins, padding,
+/// `min-width`, `width`, `height`, `font-size`, `font-family`, `font-weight`,
+/// `font-style`, `color`, `background-color`, and the color component of the
+/// `background` shorthand, and the `font` shorthand. `text-decoration`
+/// paints simple text lines, `outline` paints a square outline without
+/// changing layout, and `vertical-align` applies an approximate baseline
+/// shift to inline boxes; unsupported properties use their initial values.
+/// The font properties choose a face through [`FontMetrics::select_font`],
+/// which measures each text run; when the face is lighter or more upright
+/// than wanted, [`FontMetrics::font_synthesis`] marks the run for
+/// synthetic bold or italic.
 /// - Floats (`float: left|right`, CSS 2.2 §9.5): shrink-to-fit boxes placed
 ///   as high as possible and stacked beside or below earlier floats; line
 ///   boxes in the same block formatting context shorten beside them, and
@@ -51,11 +62,20 @@ pub(crate) struct Context<'a> {
 ///   a box after layout; `absolute` places it against the padding box of the
 ///   nearest positioned ancestor block box (or the viewport), falling back to
 ///   its static position for `auto` insets; `fixed` places it against the
-///   viewport. `sticky` stays at its in-flow position. `z-index` is not
-///   supported; see [`LayoutTree::paint_order`] for stacking.
+///   viewport. `sticky` stays at its in-flow position. `z-index` orders
+///   positioned boxes and flex items in stacking contexts; see
+///   [`LayoutTree::paint_order`].
+/// - Visual effects that never change layout: `opacity` (group opacity for
+///   boxes; folded into the colors of inline boxes), `transform` with
+///   `transform-origin` (2D; see [`Transform`](crate::Transform)), and
+///   `overflow` clipping at the padding box. `scroll` and `auto` clip like
+///   `hidden`; boxes do not scroll.
 ///
-/// Borders are not implemented. Min/max sizes apply to replaced elements;
-/// flex items also honor their main-axis minimum size.
+/// Border widths, colors, and styles paint on boxes. Min/max sizes apply to
+/// replaced elements; ordinary blocks and flex items also honor `min-width`.
+/// Other `min-*`/`max-*` constraints are incomplete.
+/// Background images and full background layers and standards-complete
+/// `vertical-align` are not implemented.
 /// Content may overflow the viewport; the root box's rect stays viewport-sized.
 ///
 /// This lays out without images: every `<img>` is treated as broken. Use
@@ -152,7 +172,7 @@ fn propagate_canvas_background(
     let background = |node: NodeID| styles.get(node).and_then(|style| style.background_color);
     let is_element = |node: NodeID, name: &str| {
         matches!(
-            document.node(node).map(|node| node.get_kind()),
+            document.get_node(node).map(|node| node.get_kind()),
             Some(NodeKind::Element(element)) if element.get_name() == name
         )
     };
@@ -160,7 +180,7 @@ fn propagate_canvas_background(
         Some(root)
     } else if is_element(root, "html") {
         document
-            .node(root)
+            .get_node(root)
             .into_iter()
             .flat_map(|node| node.get_children().iter().copied())
             .find(|child| is_element(*child, "body"))

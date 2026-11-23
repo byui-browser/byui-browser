@@ -1,68 +1,4 @@
-//! `Node.contains()` on script element wrappers.
-//!
-//! `contains(other)` is true when `other` is this element or a descendant of
-//! it. `null` and a missing argument are false. A value that is not a node
-//! throws `TypeError`.
-
-use std::sync::{Arc, Mutex};
-
-use html::NodeID;
-use js::{Object, Value};
-
-use crate::document::Document;
-use crate::element::Element;
-
-use super::{node_argument, thrown_exception};
-
-/// Installs `Node.contains(other)` on the wrapper `object` for `element`.
-pub(super) fn install(object: &Object, element: &Element, document: &Arc<Mutex<Document>>) {
-    let node = element.node;
-    let document = Arc::clone(document);
-    object.set_method(
-        "contains",
-        Arc::new(move |arguments| {
-            let other = match arguments.first() {
-                None | Some(Value::Null) | Some(Value::Undefined) => {
-                    return Ok(Value::Boolean(false));
-                }
-                Some(value) => match node_argument(value) {
-                    Some((id, _)) => id,
-                    None => {
-                        return Err(thrown_exception(
-                            "TypeError",
-                            "Element.contains() expects a Node or null",
-                        ));
-                    }
-                },
-            };
-            let contains = {
-                let locked = document.lock().unwrap();
-                node_contains(&locked, node, other)
-            };
-            log::debug!("Element.contains() is {contains}");
-            Ok(Value::Boolean(contains))
-        }),
-    );
-}
-
-/// Reports whether `other` is an inclusive descendant of `this`.
-fn node_contains(document: &Document, this: NodeID, other: NodeID) -> bool {
-    if this == other {
-        return true;
-    }
-    let Some(source) = document.html_document() else {
-        return false;
-    };
-    let mut current = other;
-    while let Some(parent) = source.node(current).and_then(|node| node.get_parent()) {
-        if parent == this {
-            return true;
-        }
-        current = parent;
-    }
-    false
-}
-
+//! Regression coverage for shared Node behavior on Element wrappers.
 #[cfg(test)]
 mod tests {
     use html::parse_raw_html;
@@ -101,7 +37,7 @@ mod tests {
                  var grand = document.getElementById('g'); \
                  parent.contains(parent) && parent.contains(child) && parent.contains(grand) \
                  && parent.contains(parent.firstChild) && child.contains(grand) \
-                 && !child.contains(parent) && !parent.contains(null) && !parent.contains()"
+                 && !child.contains(parent) && !parent.contains(null) && !parent.contains(undefined)"
             ),
             Value::Boolean(true)
         );

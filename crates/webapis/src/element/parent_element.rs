@@ -1,39 +1,4 @@
-//! `Node.parentElement` on script element wrappers.
-//!
-//! The getter is live. It returns the shared wrapper of the parent when that
-//! parent is an element, and `null` when the node is disconnected or its
-//! parent is the document. Assignment is ignored.
-
-use std::sync::{Arc, Mutex};
-
-use js::{Object, Value};
-
-use crate::document::Document;
-use crate::element::Element;
-
-use super::node_view::{is_element, parent_id};
-use super::wrap_element;
-
-/// Installs `Node.parentElement` on the wrapper `object` for `element`.
-pub(super) fn install(object: &Object, element: &Element, document: &Arc<Mutex<Document>>) {
-    let node = element.node;
-    let document = Arc::clone(document);
-    object.define_accessor(
-        "parentElement",
-        Arc::new(move || {
-            let parent = {
-                let locked = document.lock().unwrap();
-                parent_id(&locked, node).filter(|parent| is_element(&locked, *parent))
-            };
-            match parent {
-                Some(parent) => wrap_element(&document, parent),
-                None => Ok(Value::Null),
-            }
-        }),
-        None,
-    );
-}
-
+//! Regression coverage for shared Node behavior on Element wrappers.
 #[cfg(test)]
 mod tests {
     use html::parse_raw_html;
@@ -83,6 +48,62 @@ mod tests {
             eval(
                 &mut realm,
                 "child.parentElement === document.getElementById('p')"
+            ),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn parent_element_does_not_return_non_element_parents() {
+        let mut realm = realm_with("<!doctype html><main id='p'>text<!--comment--></main>");
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var p = document.getElementById('p'); \
+                 var text = p.firstChild; var comment = text.nextSibling; \
+                 var doctype = document.firstChild; \
+                 text.parentElement === p && comment.parentElement === p && \
+                 doctype.parentElement === null && document.parentElement === null"
+            ),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn parent_element_is_live_and_returns_the_existing_wrapper() {
+        let mut realm =
+            realm_with("<main id='a'><span id='child'></span></main><section id='b'></section>");
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var a = document.getElementById('a'); var b = document.getElementById('b'); \
+                 var child = document.getElementById('child'); \
+                 var initial = child.parentElement === a; \
+                 b.appendChild(child); \
+                 var moved = child.parentElement === b && child.parentElement === b; \
+                 b.removeChild(child); \
+                 initial && moved && child.parentElement === null"
+            ),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn parent_element_is_immediate_and_null_under_a_document() {
+        let mut realm = realm_with(
+            "<main id='outer'><section id='middle'><span id='leaf'></span></section></main>",
+        );
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var outer = document.getElementById('outer'); \
+                 var middle = document.getElementById('middle'); \
+                 var leaf = document.getElementById('leaf'); \
+                 var detachedDocument = new Document(); \
+                 var detachedRoot = detachedDocument.createElement('article'); \
+                 detachedDocument.appendChild(detachedRoot); \
+                 leaf.parentElement === middle && middle.parentElement === outer && \
+                 outer.parentElement === null && detachedRoot.parentElement === null"
             ),
             Value::Boolean(true)
         );

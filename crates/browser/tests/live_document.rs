@@ -40,7 +40,7 @@ fn open(page: &Page) -> (PageSession, Arc<Mutex<Vec<String>>>) {
 
 fn attribute(document: &html::HTMLDocument, id: &str, name: &str) -> Option<String> {
     let node = document.get_element_by_id(id)?;
-    match document.node(node)?.get_kind() {
+    match document.get_node(node)?.get_kind() {
         html::NodeKind::Element(element) => element
             .get_attributes()
             .iter()
@@ -140,7 +140,7 @@ fn welcome_page_tiles_navigate_to_their_links() {
         let tile = document.get_element_by_id(id).expect("tile");
         // Clicks usually land on the tile's text, so dispatch at a child.
         let child = document
-            .node(tile)
+            .get_node(tile)
             .and_then(|node| node.get_children().first().copied())
             .unwrap_or(tile);
         session.dispatch_click_at(child).expect("tile click");

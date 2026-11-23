@@ -4,18 +4,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use css::{ComputedStyles, parse_stylesheet, style_document};
-use html::{DOMTokenList, HTMLDocument, NodeID, NodeKind};
-use js::{JsError, JsResult, Object, Realm, Value};
+use html::{ClassList, HTMLDocument, NodeID, NodeKind};
+use js::{JsError, JsResult, Object, Realm, ScriptEvaluator, Value};
 
 use crate::custom_elements::CustomElementRegistry;
 use crate::dom_exception::DomException;
 use crate::element::{
     Element, element_object, invoke_attribute_changed_callback, invoke_lifecycle_callback,
+    wrap_element,
 };
 use crate::event::{
-    EventTarget, EventTargetRef, abort_controller_constructor, add_event_listener,
-    dispatch_event_with_target, event_constructor, hashchange_event_constructor,
-    remove_event_listener,
+    EventTarget, EventTargetRef, abort_controller_constructor, dispatch_event_at,
+    event_constructor, hashchange_event_constructor,
 };
 use crate::selection::{document_get_selection, new_selection};
 use crate::selector::{SelectorError, SimpleSelector, parse_selector_list};
@@ -61,7 +61,7 @@ fn install_get_elements_by_tag_name(object: &Object, document: &Arc<Mutex<Docume
                 let locked = document.lock().unwrap();
                 locked
                     .html_document()
-                    .map(|source| matching_descendants(source, source.root, &name))
+                    .map(|source| matching_descendants(source, *source.get_root(), &name))
                     .unwrap_or_default()
             };
             let mut entries = Vec::with_capacity(matches.len());
@@ -73,8 +73,22 @@ fn install_get_elements_by_tag_name(object: &Object, document: &Arc<Mutex<Docume
     );
 }
 
-/// Registers the DOM methods and `Event` constructor supported by this crate
+/// Registers the DOM methods, the shared Node interface, and the Event constructor supported by this crate
 /// on the global JavaScript environment.
+///
+/// Document, Element, Text, Comment, and DocumentType wrappers share Node
+/// methods and stable identities. Node traversal, live childNodes, text editing,
+/// normalization, cloning, comparison, namespace lookup, and tree mutation use
+/// the existing HTML arena. Cross-document adoption throws NotSupportedError.
+/// Fragment/shadow/attribute/processing-instruction nodes, MutationObserver
+/// notifications, and live Range adjustments are not yet implemented. Node
+/// getters are own host accessors until the engine supports receiver-aware
+/// prototype accessors. CharacterData wrappers currently expose data and Node
+/// members; their other specialized interface methods are not implemented.
+/// Namespace lookup uses the arena's namespace enum and raw xmlns attributes;
+/// namespace prefixes on element names and namespaced Attr objects are not modeled.
+/// childNodes supplies live indexed access and item(); the NodeList iterable
+/// protocol and forEach() are not implemented yet.
 ///
 /// `document.getElementsByTagName(name)` matches descendants in tree order,
 /// including the document element, and returns shared element wrappers.
@@ -124,11 +138,17 @@ fn register_document_inner(
     register_shared_document(realm, Arc::new(Mutex::new(document)), location)
 }
 
-fn register_shared_document(
+pub(crate) fn register_shared_document(
     realm: &mut Realm,
     shared_document: Arc<Mutex<Document>>,
     location: Option<Object>,
 ) -> JsResult<()> {
+    let evaluator = realm.script_evaluator();
+    {
+        let document = shared_document.lock().unwrap();
+        document.event_target.lock().unwrap().evaluator = Some(evaluator.clone());
+    }
+    shared_document.lock().unwrap().event_evaluator = Some(evaluator);
     log::debug!(
         "registering document bindings ({} elements)",
         shared_document.lock().unwrap().elements.len()
@@ -161,7 +181,8 @@ fn register_shared_document(
     let custom_elements_registry = match custom_elements_registry {
         Some(registry) => registry,
         None => {
-            let registry = CustomElementRegistry::new().object();
+            let registry =
+                CustomElementRegistry::new_with_evaluator(Some(realm.script_evaluator())).object();
             realm.register_global_value("customElements", Value::Object(registry.clone()))?;
             registry
         }
@@ -224,16 +245,44 @@ fn register_shared_document(
         .lock()
         .unwrap()
         .html_document()
-        .map(|document| document.root)
+        .map(|document| *document.get_root())
     {
         // The document node is the parent of the root element. Tagging the
         // script object lets tree APIs such as `parentNode` and
         // `compareDocumentPosition` treat it as that node.
         document_object.set("__nodeId", Value::Number(root.get() as f64));
     }
+    let body_document = shared_document.clone();
+    document_object.define_accessor(
+        "body",
+        Arc::new(move || {
+            let body = {
+                let document = body_document.lock().unwrap();
+                document.html_document().and_then(|html| {
+                    html.get_nodes()
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, node)| match node.get_kind() {
+                            NodeKind::Element(element) if element.get_name() == "body" => {
+                                Some(NodeID::new(index))
+                            }
+                            _ => None,
+                        })
+                })
+            };
+            match body {
+                Some(node) => wrap_element(&body_document, node),
+                None => Ok(Value::Null),
+            }
+        }),
+        None,
+    );
     shared_document.lock().unwrap().script_bindings = Some(ScriptBindings {
         document: document_object.clone(),
         registry: custom_elements_registry.clone(),
+        node_prototype: Object::new(),
+        element_prototype: Object::new(),
+        document_prototype: Object::new(),
     });
     let get_element_document = shared_document.clone();
     let get_element_registry = custom_elements_registry.clone();
@@ -316,55 +365,7 @@ fn register_shared_document(
             Ok(Value::Object(object))
         }),
     );
-    let append_document = shared_document.clone();
-    document_object.set_method(
-        "appendChild",
-        Arc::new(move |arguments| {
-            let ([Value::Object(child)] | [Value::Array(child)]) = arguments else {
-                return Err(JsError::new("document.appendChild() expects an element"));
-            };
-            let Some(Value::Number(child_id)) = child.get("__nodeId") else {
-                return Err(JsError::new("document.appendChild() expects an element"));
-            };
-            let child_id = NodeID::new(child_id as usize);
-            let was_connected = append_document.lock().unwrap().is_connected(child_id);
-            if was_connected {
-                invoke_lifecycle_callback(child, "disconnectedCallback");
-            }
-            append_document
-                .lock()
-                .unwrap()
-                .append_child(child_id)
-                .map_err(|error| JsError::new(error.to_string()))?;
-            invoke_lifecycle_callback(child, "connectedCallback");
-            Ok(Value::Object(child.clone()))
-        }),
-    );
-    let event_listener_document = shared_document.clone();
-    document_object.set_method(
-        "addEventListener",
-        Arc::new(move |arguments| {
-            let document = event_listener_document.lock().unwrap();
-            add_event_listener(&document, arguments)
-        }),
-    );
-    let remove_event_document = shared_document.clone();
-    document_object.set_method(
-        "removeEventListener",
-        Arc::new(move |arguments| {
-            let document = remove_event_document.lock().unwrap();
-            remove_event_listener(&document, arguments)
-        }),
-    );
-    let dispatch_event_document = shared_document.clone();
-    let dispatch_target = document_object.clone();
-    document_object.set_method(
-        "dispatchEvent",
-        Arc::new(move |arguments| {
-            let document = dispatch_event_document.lock().unwrap();
-            dispatch_event_with_target(&document, &dispatch_target, arguments)
-        }),
-    );
+    crate::node::register(realm, &shared_document)?;
     realm.register_global_function("Event", Arc::new(event_constructor))?;
     realm.register_global_function("HashChangeEvent", Arc::new(hashchange_event_constructor))?;
     realm.register_global_function("AbortController", Arc::new(abort_controller_constructor))?;
@@ -373,6 +374,126 @@ fn register_shared_document(
         Some(Value::Object(window)) => window,
         _ => Object::new(),
     };
+    for name in ["Node", "Document", "Element", "EventTarget"] {
+        if let Some(constructor) = realm.registered_global_value(name) {
+            window_object.set(name, constructor);
+        }
+    }
+    // A trusted keydown targets the focused element first, then bubbles to
+    // the document and Window. Window registration happens before Document
+    // registration, so install the document-aware dispatcher here.
+    let keydown_document = Arc::clone(&shared_document);
+    let keydown_window = window_object.clone();
+    window_object.set_method(
+        "__dispatchKeydown",
+        Arc::new(move |arguments| {
+            let Some(Value::Function(create)) = keydown_window.get("__createKeydownEvent") else {
+                return Err(JsError::runtime(
+                    "window keydown event constructor is not installed",
+                ));
+            };
+            let event = create.call(arguments)?;
+            let focused = {
+                let document = keydown_document.lock().unwrap();
+                document
+                    .focused_element()
+                    .filter(|node| document.is_connected(*node))
+            };
+            let Some(node) = focused else {
+                let Some(Value::Function(dispatch)) =
+                    keydown_window.get("__dispatchKeydownAtWindow")
+                else {
+                    return Err(JsError::runtime(
+                        "window keydown dispatcher is not installed",
+                    ));
+                };
+                return dispatch.call(&[event]);
+            };
+            let Value::Object(target) = wrap_element(&keydown_document, node)? else {
+                return Err(JsError::runtime("focused keydown target is not an element"));
+            };
+            let snapshot = keydown_document.lock().unwrap().clone();
+            let result =
+                dispatch_event_at(&snapshot, Some(node), &target, std::slice::from_ref(&event))?;
+            let Value::Object(event_object) = &event else {
+                return Err(JsError::runtime("keydown event is not an object"));
+            };
+            if matches!(
+                event_object.get("__stopPropagation"),
+                Some(Value::Boolean(true))
+            ) {
+                return Ok(result);
+            }
+            let Some(Value::Function(dispatch)) = keydown_window.get("__dispatchKeydownAtWindow")
+            else {
+                return Err(JsError::runtime(
+                    "window keydown dispatcher is not installed",
+                ));
+            };
+            let window_result = dispatch.call(&[event])?;
+            match (result, window_result) {
+                (Value::Boolean(false), _) | (_, Value::Boolean(false)) => {
+                    Ok(Value::Boolean(false))
+                }
+                _ => Ok(Value::Boolean(true)),
+            }
+        }),
+    );
+    // A trusted keyup follows the same focused-element -> document -> Window
+    // path as keydown. The event dispatch is routed through the Node/Event
+    // implementation so node listeners observe the event before window.
+    let keyup_document = Arc::clone(&shared_document);
+    let keyup_window = window_object.clone();
+    window_object.set_method(
+        "__dispatchKeyup",
+        Arc::new(move |arguments| {
+            let Some(Value::Function(create)) = keyup_window.get("__createKeyupEvent") else {
+                return Err(JsError::runtime(
+                    "window keyup event constructor is not installed",
+                ));
+            };
+            let event = create.call(arguments)?;
+            let focused = {
+                let document = keyup_document.lock().unwrap();
+                document
+                    .focused_element()
+                    .filter(|node| document.is_connected(*node))
+            };
+            let Some(node) = focused else {
+                let Some(Value::Function(dispatch)) = keyup_window.get("__dispatchKeyupAtWindow")
+                else {
+                    return Err(JsError::runtime("window keyup dispatcher is not installed"));
+                };
+                return dispatch.call(&[event]);
+            };
+            let Value::Object(target) = wrap_element(&keyup_document, node)? else {
+                return Err(JsError::runtime("focused keyup target is not an element"));
+            };
+            let snapshot = keyup_document.lock().unwrap().clone();
+            let result =
+                dispatch_event_at(&snapshot, Some(node), &target, std::slice::from_ref(&event))?;
+            let Value::Object(event_object) = &event else {
+                return Err(JsError::runtime("keyup event is not an object"));
+            };
+            if matches!(
+                event_object.get("__stopPropagation"),
+                Some(Value::Boolean(true))
+            ) {
+                return Ok(result);
+            }
+            let Some(Value::Function(dispatch)) = keyup_window.get("__dispatchKeyupAtWindow")
+            else {
+                return Err(JsError::runtime("window keyup dispatcher is not installed"));
+            };
+            let window_result = dispatch.call(&[event])?;
+            match (result, window_result) {
+                (Value::Boolean(false), _) | (_, Value::Boolean(false)) => {
+                    Ok(Value::Boolean(false))
+                }
+                _ => Ok(Value::Boolean(true)),
+            }
+        }),
+    );
     let computed_style_document = shared_document.clone();
     window_object.set_method(
         "getComputedStyle",
@@ -554,7 +675,10 @@ pub struct Document {
     focused: Option<NodeID>,
     /// The JavaScript `document` object and `customElements` registry this
     /// document is registered with, once a realm exposes it to scripts.
-    script_bindings: Option<ScriptBindings>,
+    pub(crate) script_bindings: Option<ScriptBindings>,
+    /// Realm evaluator that host callbacks use so they see the same global
+    /// environment as the page script that registered the document.
+    pub(crate) event_evaluator: Option<ScriptEvaluator>,
 }
 
 /// JavaScript objects that element bindings need to reach from a document:
@@ -564,6 +688,9 @@ pub struct Document {
 pub(crate) struct ScriptBindings {
     pub(crate) document: Object,
     pub(crate) registry: Object,
+    pub(crate) node_prototype: Object,
+    pub(crate) element_prototype: Object,
+    pub(crate) document_prototype: Object,
 }
 
 impl PartialEq for Document {
@@ -596,6 +723,7 @@ impl Document {
             script_elements: HashMap::new(),
             focused: None,
             script_bindings: None,
+            event_evaluator: None,
         }
     }
 
@@ -604,7 +732,7 @@ impl Document {
             return ComputedStyles::default();
         };
         let sheets = source
-            .nodes
+            .get_nodes()
             .iter()
             .enumerate()
             .filter_map(|(index, node)| {
@@ -630,6 +758,7 @@ impl Document {
             script_elements: HashMap::new(),
             focused: None,
             script_bindings: None,
+            event_evaluator: None,
         }
     }
 
@@ -652,7 +781,7 @@ impl Document {
     pub fn text_content(&self) -> Option<String> {
         self.source_document
             .as_ref()
-            .and_then(|document| document.text_content(document.root))
+            .and_then(|document| document.text_content(*document.get_root()))
     }
 
     /// Implements `document.createElement(localName)` for an HTML document.
@@ -671,7 +800,7 @@ impl Document {
         })?;
         log::debug!("document.createElement({local_name:?})");
 
-        let element = match document.node(node).map(|node| node.get_kind()) {
+        let element = match document.get_node(node).map(|node| node.get_kind()) {
             Some(NodeKind::Element(element)) => element,
             _ => {
                 log::error!("createElement({local_name:?}) produced a non-element node");
@@ -715,7 +844,7 @@ impl Document {
         if wanted.is_empty() {
             return Vec::new();
         }
-        self.inclusive_descendant_elements(source.root)
+        self.inclusive_descendant_elements(*source.get_root())
             .into_iter()
             .filter(|element| {
                 let Some(class) = element
@@ -732,7 +861,7 @@ impl Document {
     }
 
     pub(crate) fn element_snapshot(&self, node: NodeID) -> Option<Element> {
-        let node_data = self.source_document.as_ref()?.node(node)?;
+        let node_data = self.source_document.as_ref()?.get_node(node)?;
         let NodeKind::Element(element) = node_data.get_kind() else {
             return None;
         };
@@ -792,7 +921,7 @@ impl Document {
             let Some(source) = &document.source_document else {
                 return;
             };
-            let Some(node_data) = source.node(node) else {
+            let Some(node_data) = source.get_node(node) else {
                 return;
             };
             if let NodeKind::Element(element) = node_data.get_kind() {
@@ -824,8 +953,11 @@ impl Document {
             return false;
         };
         let mut current = node;
-        while let Some(parent) = document.node(current).and_then(|node| node.get_parent()) {
-            if parent == document.root {
+        while let Some(parent) = document
+            .get_node(current)
+            .and_then(|node| node.get_parent())
+        {
+            if parent == *document.get_root() {
                 return true;
             }
             current = parent;
@@ -892,7 +1024,7 @@ impl Document {
     /// Implements the DOM `Element.classList` getter for an element in this
     /// document. The returned live token list mutates the element's `class`
     /// attribute through the DOM Standard operations.
-    pub fn class_list(&mut self, element: NodeID) -> JsResult<DOMTokenList<'_>> {
+    pub fn class_list(&mut self, element: NodeID) -> JsResult<ClassList<'_>> {
         self.source_document
             .get_or_insert_with(HTMLDocument::new)
             .class_list(element)
@@ -938,11 +1070,11 @@ impl Document {
             selectors: &[SimpleSelector],
             matches: &mut Vec<NodeID>,
         ) {
-            let Some(parent_node) = document.node(parent) else {
+            let Some(parent_node) = document.get_node(parent) else {
                 return;
             };
             for child in parent_node.get_children() {
-                let Some(node) = document.node(*child) else {
+                let Some(node) = document.get_node(*child) else {
                     continue;
                 };
                 if let NodeKind::Element(element) = node.get_kind() {
@@ -954,7 +1086,7 @@ impl Document {
             }
         }
 
-        collect(document, document.root, &selectors, &mut matches);
+        collect(document, *document.get_root(), &selectors, &mut matches);
         log::debug!(
             "querySelectorAll({selector:?}) matched {} nodes",
             matches.len()
@@ -975,10 +1107,10 @@ impl Document {
             self.source_document = Some(HTMLDocument::new());
         }
         let source = self.source_document.as_ref().unwrap();
-        let root = source.root;
+        let root = *source.get_root();
         let child_id = child;
         log::debug!("document.appendChild bridged to the DOM");
-        let child_node = source.node(child_id).ok_or_else(|| {
+        let child_node = source.get_node(child_id).ok_or_else(|| {
             log::debug!("appendChild failed: child node not found");
             DomException::NotFoundError
         })?;
@@ -989,7 +1121,7 @@ impl Document {
         }
 
         match child_node.get_kind() {
-            NodeKind::Comment(_) | NodeKind::Element(_) | NodeKind::Doctype { .. } => {}
+            NodeKind::Comment(_) | NodeKind::Element(_) | NodeKind::Doctype(_) => {}
             NodeKind::Text(_) | NodeKind::Document | NodeKind::None => {
                 log::debug!("appendChild failed: node kind cannot be a document child");
                 return Err(DomException::HierarchyRequestError);
@@ -997,7 +1129,7 @@ impl Document {
         }
 
         let root_node = source
-            .node(root)
+            .get_node(root)
             .ok_or(DomException::HierarchyRequestError)?;
         if !matches!(root_node.get_kind(), NodeKind::Document) {
             return Err(DomException::HierarchyRequestError);
@@ -1009,13 +1141,13 @@ impl Document {
             .copied()
             .filter(|sibling| *sibling != child_id)
         {
-            let Some(sibling) = source.node(sibling) else {
+            let Some(sibling) = source.get_node(sibling) else {
                 return Err(DomException::HierarchyRequestError);
             };
             match (child_node.get_kind(), sibling.get_kind()) {
                 (NodeKind::Element(_), NodeKind::Element(_))
-                | (NodeKind::Doctype { .. }, NodeKind::Doctype { .. })
-                | (NodeKind::Doctype { .. }, NodeKind::Element(_)) => {
+                | (NodeKind::Doctype(_), NodeKind::Doctype(_))
+                | (NodeKind::Doctype(_), NodeKind::Element(_)) => {
                     log::debug!("appendChild failed: document would have duplicate children");
                     return Err(DomException::HierarchyRequestError);
                 }
@@ -1024,7 +1156,7 @@ impl Document {
         }
 
         if let Some(parent) = child_node.get_parent() {
-            let Some(parent_node) = source.node(parent) else {
+            let Some(parent_node) = source.get_node(parent) else {
                 return Err(DomException::NotFoundError);
             };
             if !parent_node.get_children().contains(&child_id) {
@@ -1033,67 +1165,13 @@ impl Document {
         }
 
         let document = self.source_document.as_mut().unwrap();
-        if let Some(parent) = document.nodes[child_id.get()].get_parent() {
-            let siblings = document.nodes[parent.get()].get_children().to_vec();
-            let Some(position) = siblings.iter().position(|sibling| *sibling == child_id) else {
-                return Err(DomException::NotFoundError);
-            };
-            let mut updated_siblings = siblings;
-            updated_siblings.remove(position);
-            document.nodes[parent.get()].set_children(updated_siblings);
-        }
-        document.nodes[child_id.get()].set_parent(Some(root));
-        let mut root_children = document.nodes[root.get()].get_children().clone();
-        root_children.push(child_id);
-        document.nodes[root.get()].set_children(root_children);
+        document.append_child(root, child_id);
         self.elements = collect_elements(document);
         log::debug!(
             "appendChild done; document has {} elements",
             self.elements.len()
         );
 
-        Ok(child)
-    }
-
-    /// Appends one element below another element in the document tree.
-    pub(crate) fn append_child_to(&mut self, parent: NodeID, child: NodeID) -> JsResult<NodeID> {
-        let document = self
-            .source_document
-            .as_mut()
-            .ok_or_else(|| JsError::new("The document has no DOM tree"))?;
-        if parent == child {
-            return Err(JsError::new("HierarchyRequestError"));
-        }
-        if !matches!(
-            document.node(parent).map(|node| node.get_kind()),
-            Some(NodeKind::Element(_))
-        ) || !matches!(
-            document.node(child).map(|node| node.get_kind()),
-            Some(NodeKind::Element(_))
-        ) {
-            return Err(JsError::new("HierarchyRequestError"));
-        }
-        let mut ancestor = Some(parent);
-        while let Some(node) = ancestor {
-            if node == child {
-                return Err(JsError::new("HierarchyRequestError"));
-            }
-            ancestor = document.node(node).and_then(|node| node.get_parent());
-        }
-        if let Some(old_parent) = document.node(child).and_then(|node| node.get_parent()) {
-            let mut siblings = document
-                .node(old_parent)
-                .ok_or_else(|| JsError::new("NotFoundError"))?
-                .get_children()
-                .clone();
-            siblings.retain(|sibling| *sibling != child);
-            document.nodes[old_parent.get()].set_children(siblings);
-        }
-        document.nodes[child.get()].set_parent(Some(parent));
-        let mut children = document.nodes[parent.get()].get_children().clone();
-        children.push(child);
-        document.nodes[parent.get()].set_children(children);
-        self.elements = collect_elements(document);
         Ok(child)
     }
 }
@@ -1116,6 +1194,23 @@ fn upgrade_element(
     }
     object.set("__customElementUpgraded", Value::Boolean(true));
     if let Some(Value::Object(prototype)) = constructor.get_own_property("prototype") {
+        if let Some(bindings) = document.script_bindings() {
+            let mut tail = prototype.clone();
+            let mut has_node_base = false;
+            loop {
+                if tail == bindings.element_prototype || tail == bindings.node_prototype {
+                    has_node_base = true;
+                    break;
+                }
+                match tail.prototype() {
+                    Some(parent) => tail = parent,
+                    None => break,
+                }
+            }
+            if !has_node_base {
+                tail.set_prototype(Some(bindings.element_prototype));
+            }
+        }
         object.set_prototype(Some(prototype));
     }
     if constructor.is_bytecode_function() {
@@ -1144,27 +1239,37 @@ pub(crate) fn script_element_object(
     registry: &Object,
     element: Element,
 ) -> JsResult<Object> {
-    let (object, attributes, connected) = {
-        let mut document_state = document.lock().unwrap();
-        let object = if let Some(object) = document_state.script_elements.get(&element.node) {
-            object.clone()
-        } else {
+    let existing = document.lock().unwrap().cached_script_element(element.node);
+    let object = match existing {
+        Some(object) => object,
+        None => {
             let object = element_object(element.clone(), document.clone());
-            document_state
-                .script_elements
-                .insert(element.node, object.clone());
-            object
-        };
+            document
+                .lock()
+                .unwrap()
+                .remember_script_node(element.node, object)
+        }
+    };
+    let (attributes, connected) = {
+        let mut document_state = document.lock().unwrap();
         let attributes = upgrade_element(&mut document_state, registry, &element, &object)?;
         let connected = attributes.is_some() && document_state.is_connected(element.node);
-        (object, attributes, connected)
+        (attributes, connected)
     };
     if let Some(attributes) = attributes {
         for (name, value) in attributes {
-            invoke_attribute_changed_callback(&object, &name, None, Some(value));
+            let evaluator = document.lock().unwrap().event_evaluator.clone();
+            invoke_attribute_changed_callback(
+                &object,
+                &name,
+                None,
+                Some(value),
+                evaluator.as_ref(),
+            );
         }
         if connected {
-            invoke_lifecycle_callback(&object, "connectedCallback");
+            let evaluator = document.lock().unwrap().event_evaluator.clone();
+            invoke_lifecycle_callback(&object, "connectedCallback", evaluator.as_ref());
         }
     }
     Ok(object)
@@ -1172,12 +1277,12 @@ pub(crate) fn script_element_object(
 
 pub(crate) fn collect_elements(document: &HTMLDocument) -> Vec<Element> {
     fn collect(document: &HTMLDocument, parent: NodeID, elements: &mut Vec<Element>) {
-        let Some(node) = document.node(parent) else {
+        let Some(node) = document.get_node(parent) else {
             return;
         };
 
         for child in node.get_children() {
-            if let Some(node) = document.node(*child) {
+            if let Some(node) = document.get_node(*child) {
                 if let NodeKind::Element(element) = node.get_kind() {
                     let id_attr = element
                         .get_attributes()
@@ -1198,7 +1303,7 @@ pub(crate) fn collect_elements(document: &HTMLDocument) -> Vec<Element> {
     }
 
     let mut elements = Vec::new();
-    collect(document, document.root, &mut elements);
+    collect(document, *document.get_root(), &mut elements);
     elements
 }
 
@@ -1398,8 +1503,8 @@ mod tests {
             NodeID::new(1)
         );
         let source = document.source_document.as_ref().unwrap();
-        assert_eq!(source.node(NodeID::new(2)).unwrap().get_parent(), None);
-        assert_eq!(source.node(NodeID::new(3)).unwrap().get_parent(), None);
+        assert_eq!(source.get_node(NodeID::new(2)).unwrap().get_parent(), None);
+        assert_eq!(source.get_node(NodeID::new(3)).unwrap().get_parent(), None);
     }
 
     #[test]
@@ -1477,7 +1582,7 @@ mod tests {
         assert_eq!(document.append_child(child), Ok(child));
         let source = document.source_document.as_ref().unwrap();
         assert_eq!(
-            source.node(source.root).unwrap().get_children(),
+            source.get_node(*source.get_root()).unwrap().get_children(),
             &vec![html_child]
         );
         assert_eq!(document.get_element_by_id("appended").unwrap().node, child);
@@ -1492,21 +1597,24 @@ mod tests {
             Vec::new(),
         )));
         let comment = html_document.push_node(NodeKind::Comment("move me".into()));
-        html_document.append_child(html_document.root, element);
+        html_document.append_child(*html_document.get_root(), element);
         html_document.append_child(element, comment);
         let mut document = Document::from_html_document(&html_document);
         let comment_id = comment;
 
         assert_eq!(document.append_child(comment_id), Ok(comment_id));
         let source = document.source_document.as_ref().unwrap();
-        assert_eq!(source.node(element).unwrap().get_children(), &Vec::new());
         assert_eq!(
-            source.node(source.root).unwrap().get_children(),
+            source.get_node(element).unwrap().get_children(),
+            &Vec::new()
+        );
+        assert_eq!(
+            source.get_node(*source.get_root()).unwrap().get_children(),
             &vec![element, comment]
         );
         assert_eq!(
-            source.node(comment).unwrap().get_parent(),
-            Some(source.root)
+            source.get_node(comment).unwrap().get_parent(),
+            Some(*source.get_root())
         );
     }
 
@@ -1523,7 +1631,7 @@ mod tests {
             Namespace::Html,
             Vec::new(),
         )));
-        html_document.append_child(html_document.root, existing_element);
+        html_document.append_child(*html_document.get_root(), existing_element);
         let mut document = Document::from_html_document(&html_document);
         let before = document.source_document.clone();
 

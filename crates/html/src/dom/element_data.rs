@@ -57,6 +57,26 @@ impl ElementData {
         }
     }
 
+    /// Gets mutable attribute with name.
+    pub fn get_mut_attribute(&mut self, name: String) -> Option<&mut Attribute> {
+        if let Some(index) = self
+            .attributes
+            .iter()
+            .position(|attribute_ref| attribute_ref.get_name() == &name)
+        {
+            Option::Some(&mut self.attributes[index])
+        } else {
+            Option::None
+        }
+    }
+
+    /// Checks if element has attribute with name.
+    pub fn has_attribute(&self, name: String) -> bool {
+        self.attributes
+            .iter()
+            .any(|attribute_ref| attribute_ref.get_name() == &name)
+    }
+
     /// Updates or adds element attribute.
     pub fn set_attribute(&mut self, attribute: Attribute) {
         if let Some(index) = self
