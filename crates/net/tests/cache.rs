@@ -840,8 +840,8 @@ fn reload_bypasses_cache_and_caches_the_refresh_when_consumed() {
 }
 
 #[test]
-fn caller_cache_directives_are_preserved_for_reload_and_no_cache() {
-    let server = TestServer::start(2, |request| {
+fn cache_mode_directives_preserve_caller_headers() {
+    let server = TestServer::start(3, |request| {
         if request.starts_with("GET /reload ") {
             assert!(request.contains("cache-control: max-age=120"));
             assert!(request.contains("pragma: client-cache-rule"));
@@ -850,6 +850,11 @@ fn caller_cache_directives_are_preserved_for_reload_and_no_cache() {
         } else if request.starts_with("GET /no-cache ") {
             assert!(request.contains("cache-control: max-age=120"));
             assert!(!request.contains("cache-control: max-age=0"));
+        } else if request.starts_with("GET /no-store ") {
+            assert!(request.contains("cache-control: max-age=120"));
+            assert!(request.contains("pragma: client-cache-rule"));
+            assert!(!request.contains("cache-control: no-cache"));
+            assert!(!request.contains("pragma: no-cache"));
         } else {
             panic!("unexpected request: {request}");
         }
@@ -891,6 +896,27 @@ fn caller_cache_directives_are_preserved_for_reload_and_no_cache() {
             .unwrap();
         assert_eq!(
             collect_body(controller.fetch(no_cache).await.unwrap())
+                .await
+                .unwrap(),
+            b"ok"
+        );
+
+        let mut no_store = Request::get(format!("{}/no-store", server.url()));
+        no_store.set_cache_mode(CacheMode::NoStore);
+        no_store
+            .set_header(
+                HeaderName::from_static("cache-control"),
+                HeaderValue::from_static("max-age=120"),
+            )
+            .unwrap();
+        no_store
+            .set_header(
+                HeaderName::from_static("pragma"),
+                HeaderValue::from_static("client-cache-rule"),
+            )
+            .unwrap();
+        assert_eq!(
+            collect_body(controller.fetch(no_store).await.unwrap())
                 .await
                 .unwrap(),
             b"ok"

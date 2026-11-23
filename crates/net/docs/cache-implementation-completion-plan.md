@@ -80,8 +80,9 @@ leaves the existing representation intact. A late `304` cannot freshen a
 representation that a concurrent revalidation has already replaced; that
 caller uses the newer cached representation.
 
-`CacheMode::NoCache` now uses this path, but its request-header interaction is
-not yet fully Fetch-compatible.
+`CacheMode::NoCache` sends `Cache-Control: max-age=0` when the caller did not
+already provide `Cache-Control`, matching Fetch's request-header preparation
+rule.
 
 ### 4. Finish cache invalidation
 
@@ -108,16 +109,18 @@ Complete the behavior selected by each cache mode:
 - `OnlyIfCached`: enforce the same-origin restriction and return a Fetch
   network error without network access on a miss.
 
-The current implementation has all six modes represented, but several details
-remain incorrect:
+The current implementation has all six modes represented. `Reload` and
+`NoStore` add `Pragma: no-cache` and `Cache-Control: no-cache` only when the
+caller did not already provide each respective field; `NoCache` likewise
+preserves a caller-provided `Cache-Control` field. Default requests with
+caller-supplied validators use `no-store` behavior. These are Fetch's
+request-header preparation rules, rather than known deviations.
 
-- `Reload` and `NoStore` add `Pragma: no-cache` and `Cache-Control: no-cache`
-  only when the caller did not already provide each field. `NoCache` likewise
-  preserves a caller-provided `Cache-Control` field, and default requests with
-  caller-supplied validators use `no-store` behavior.
-- Cached redirects are not stored or followed for `OnlyIfCached`.
-- The Rust error boundary should be aligned with the JavaScript-facing
-  `TypeError` required when `only-if-cached` is used outside same-origin mode.
+Cached redirects are stored and followed for `OnlyIfCached` when redirect mode
+is `Follow`. `OnlyIfCached` outside same-origin mode currently returns the
+Rust `NetworkError` before network I/O. When a JavaScript `fetch` binding is
+introduced, it must reject that invalid option combination with the
+JavaScript-facing `TypeError` required during Request construction.
 
 ### 6. Revisit body-capture semantics
 
