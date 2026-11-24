@@ -89,7 +89,8 @@ async fn report(controller: &RequestController, url: &str) -> Result<String, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use net::{CachePartitionService, RequestError};
+    use crate::fetch_capabilities::BrowserFetchCapabilities;
+    use net::{CacheMode, FetchEnvironment, RequestError, RequestMode, Url};
     use std::{
         io::Read,
         net::TcpListener,
@@ -98,19 +99,13 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    struct TestCachePartition;
-
-    impl CachePartitionService for TestCachePartition {
-        fn cache_partition(&self, _request: &Request) -> Result<String, RequestError> {
-            Ok("refresh-cache-test".into())
-        }
-    }
-
     fn cache_enabled_client() -> RefreshClient {
         RefreshClient {
             runtime: Runtime::new().unwrap(),
             controller: RequestController::builder(Config::default())
-                .with_cache_partition_service(Arc::new(TestCachePartition))
+                .with_browser_capabilities(Arc::new(BrowserFetchCapabilities::new(
+                    "refresh-cache-test",
+                )))
                 .build()
                 .unwrap(),
         }
@@ -235,9 +230,27 @@ mod tests {
         let (url, server) = server(vec![response("200 OK", "old"), response("200 OK", "new")]);
         let client = cache_enabled_client();
         client.runtime.block_on(async {
-            let first = client.controller.fetch(Request::get(&url)).await.unwrap();
+            let environment = FetchEnvironment::from_url(Url::parse(&url).unwrap()).unwrap();
+            let mut initial = Request::get(&url);
+            initial.set_mode(RequestMode::SameOrigin).unwrap();
+            initial.set_environment(environment.clone());
+            let first = client.controller.fetch(initial).await.unwrap();
             assert_eq!(first.body.text().await.unwrap(), "old");
-            let cached = client.controller.fetch(Request::get(&url)).await.unwrap();
+            let cached = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let mut probe = Request::get(&url);
+                    probe.set_mode(RequestMode::SameOrigin).unwrap();
+                    probe.set_environment(environment.clone());
+                    probe.set_cache_mode(CacheMode::OnlyIfCached);
+                    match client.controller.fetch(probe).await {
+                        Ok(cached) => break cached,
+                        Err(RequestError::NetworkError) => tokio::task::yield_now().await,
+                        Err(error) => panic!("cache probe failed unexpectedly: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("background cache capture should finish");
             assert!(cached.from_cache);
             assert_eq!(cached.body.text().await.unwrap(), "old");
             let message = report(&client.controller, &url).await.unwrap();
