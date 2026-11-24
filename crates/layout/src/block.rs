@@ -223,7 +223,7 @@ impl Context<'_> {
                 block.node
             );
             width
-        });
+            });
         let available = (cb_width - margin_left - margin_right - padding).max(0.0);
         if let Some(max_width) = self.width_limit(block, style.max_width, basis, available) {
             width = width.min(max_width);
