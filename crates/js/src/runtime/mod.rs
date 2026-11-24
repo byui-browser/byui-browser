@@ -1,7 +1,7 @@
 //! Tree-walk interpreter for parsed programs.
 //!
 //! Supports expressions, `var`/`let`/`const` declarations, blocks, `if`,
-//! `while`, function declarations with closures, calls, `return`, object
+//! `while`, function declarations and expressions with closures, calls, `return`, object
 //! literals, and member access (`object.name`, `object[key]`, and assignment
 //! to either).
 //!
@@ -23,8 +23,9 @@
 //!   Reading a property of `null`, `undefined`, a boolean, or a bare function
 //!   is a runtime error. Missing properties read as `undefined`. Method calls
 //!   whose callee is a member expression receive the object as `this`.
-//! - Classes, `new`, and `super` parse but are not evaluated here; they run
-//!   only through the bytecode compiler and [`crate::vm::Vm`].
+//! - Classes and `super` run only through the bytecode compiler and
+//!   [`crate::vm::Vm`]. Ordinary function construction with `new` works here,
+//!   but script functions have no `prototype` property.
 //! - There is no garbage collector yet. A function stored in the scope it
 //!   closes over forms an `Arc` cycle, so its scope is never freed.
 //! - Evaluation runs on a dedicated engine thread with a large stack. Deep
@@ -370,6 +371,8 @@ enum FunctionKind {
         params: Vec<String>,
         body: Vec<Statement>,
         closure: ScopeRef,
+        /// Ordinary expressions bind `this` even in legacy interpreter mode.
+        ordinary_this: bool,
     },
     Host {
         name: String,
@@ -996,6 +999,7 @@ impl GlobalState {
                         params: params.clone(),
                         body: body.clone(),
                         closure: Arc::clone(&self.lexical),
+                        ordinary_this: false,
                     })));
                     initialize(&self.object, name, function);
                 }
@@ -1348,6 +1352,25 @@ impl Interpreter {
             }
             Expr::SuperCall { .. } | Expr::SuperMember { .. } => Err(unsupported_here("`super`")),
             Expr::Identifier(name) => read(scope, name),
+            Expr::FunctionExpression { name, params, body } => {
+                let closure = if name.is_some() {
+                    child_scope(scope)
+                } else {
+                    Arc::clone(scope)
+                };
+                let function = Value::Function(Function(Arc::new(FunctionKind::Script {
+                    name: name.clone().unwrap_or_default(),
+                    params: params.clone(),
+                    body: body.clone(),
+                    closure: Arc::clone(&closure),
+                    ordinary_this: true,
+                })));
+                if let Some(name) = name {
+                    declare_lexical(&closure, name, false, None)?;
+                    initialize(&closure, name, function.clone());
+                }
+                Ok(function)
+            }
             Expr::ArrowFunction { params, body } => {
                 let body = match body {
                     ArrowBody::Expression(expression) => {
@@ -1360,6 +1383,7 @@ impl Interpreter {
                     params: params.clone(),
                     body,
                     closure: Arc::clone(scope),
+                    ordinary_this: false,
                 }))))
             }
             Expr::Assign { name, value } => {
@@ -1832,6 +1856,7 @@ impl Interpreter {
                 params,
                 body,
                 closure,
+                ordinary_this,
                 ..
             } => self.guarded(|interpreter| {
                 if interpreter.call_depth >= interpreter.call_depth_limit {
@@ -1853,6 +1878,8 @@ impl Interpreter {
                 );
                 let scope = child_scope(closure);
                 let previous_this = std::mem::replace(&mut interpreter.this_value, receiver);
+                let previous_this_enabled = interpreter.this_enabled;
+                interpreter.this_enabled |= ordinary_this;
                 for (index, param) in params.iter().enumerate() {
                     declare_var(&scope, param)?;
                     initialize(
@@ -1865,6 +1892,7 @@ impl Interpreter {
                 // `catch` can resume execution in the caller.
                 let result = interpreter.run_body(&scope, body);
                 interpreter.this_value = previous_this;
+                interpreter.this_enabled = previous_this_enabled;
                 interpreter.call_depth -= 1;
                 Ok(match result? {
                     Completion::Return(value) => value,
@@ -1988,6 +2016,7 @@ fn hoist_lexical_declarations(
                     params: params.clone(),
                     body: body.clone(),
                     closure: Arc::clone(scope),
+                    ordinary_this: false,
                 })));
                 if function_body {
                     declare_var(scope, name)?;

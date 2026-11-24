@@ -108,6 +108,45 @@ pub fn expand(declaration: &Declaration) -> Vec<Declaration> {
     if declaration.property == "overflow" {
         return expand_overflow(&declaration.value);
     }
+    if matches!(declaration.property.as_str(), "overflow-x" | "overflow-y")
+        && !valid_overflow_value(&declaration.value)
+    {
+        log::debug!(
+            "dropping invalid {} value `{}`",
+            declaration.property,
+            declaration.value
+        );
+        return Vec::new();
+    }
+    if declaration.property.starts_with("border-")
+        && declaration.property.ends_with("-width")
+        && ["top", "right", "bottom", "left"]
+            .iter()
+            .any(|side| declaration.property == format!("border-{side}-width"))
+        && !valid_border_width(&declaration.value)
+    {
+        log::debug!(
+            "dropping invalid {} value `{}`",
+            declaration.property,
+            declaration.value
+        );
+        return Vec::new();
+    }
+    if declaration.property == "-webkit-overflow-scrolling"
+        && !CSS_WIDE_KEYWORDS
+            .iter()
+            .any(|keyword| declaration.value.eq_ignore_ascii_case(keyword))
+        && !matches!(
+            declaration.value.to_ascii_lowercase().as_str(),
+            "auto" | "touch"
+        )
+    {
+        log::debug!(
+            "dropping invalid -webkit-overflow-scrolling value `{}`",
+            declaration.value
+        );
+        return Vec::new();
+    }
     if matches!(
         declaration.property.as_str(),
         "margin-block" | "margin-inline" | "padding-block" | "padding-inline"
@@ -373,14 +412,23 @@ fn expand_font(value: &str) -> Option<Vec<Declaration>> {
 /// value sets both.
 fn expand_overflow(value: &str) -> Vec<Declaration> {
     let parts = split_components(value);
+    let is_wide = |value: &str| {
+        CSS_WIDE_KEYWORDS
+            .iter()
+            .any(|keyword| value.eq_ignore_ascii_case(keyword))
+    };
     let (x, y) = match parts.as_slice() {
         [both] => (*both, *both),
-        [x, y] => (*x, *y),
+        [x, y] if !is_wide(x) && !is_wide(y) => (*x, *y),
         _ => {
             log::debug!("dropping invalid overflow shorthand value `{value}`");
             return Vec::new();
         }
     };
+    if !valid_overflow_value(x) || !valid_overflow_value(y) {
+        log::debug!("dropping invalid overflow shorthand value `{value}`");
+        return Vec::new();
+    }
     vec![
         Declaration {
             property: "overflow-x".to_owned(),
@@ -391,6 +439,27 @@ fn expand_overflow(value: &str) -> Vec<Declaration> {
             value: y.to_owned(),
         },
     ]
+}
+
+fn valid_overflow_value(value: &str) -> bool {
+    CSS_WIDE_KEYWORDS
+        .iter()
+        .any(|keyword| value.eq_ignore_ascii_case(keyword))
+        || matches!(
+            value.to_ascii_lowercase().as_str(),
+            "visible" | "hidden" | "clip" | "scroll" | "auto" | "overlay"
+        )
+}
+
+fn valid_border_width(value: &str) -> bool {
+    CSS_WIDE_KEYWORDS
+        .iter()
+        .any(|keyword| value.eq_ignore_ascii_case(keyword))
+        || matches!(
+            value.to_ascii_lowercase().as_str(),
+            "thin" | "medium" | "thick"
+        )
+        || crate::values::parse_length(value).is_some_and(|length| length.value >= 0.0)
 }
 
 /// Expands the numeric and keyword forms of the `flex` shorthand.

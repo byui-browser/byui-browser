@@ -97,6 +97,46 @@ fn window_onload_runs_after_page_scripts_finish() {
 }
 
 #[test]
+fn inline_scripts_continue_after_errors_and_keep_diagnostics_in_order() {
+    let session = BrowserRuntime::in_memory().open_page_session(
+        "<script>var state = 'before'; throw 'first'; state = 'unreachable';</script>\
+         <script>var invalid = ;</script>\
+         <script>state += '|after'; window.onload = function () { state += '|load'; }; throw 'second';</script>",
+        Arc::new(TestConsole::default()),
+        Arc::new(TestAlert::default()),
+        browser::request_controller(None),
+        security_context(),
+    ).expect("script errors must not discard the session");
+
+    assert_eq!(
+        session.evaluate_script("state"),
+        Ok(js::Value::String("before|after|load".into()))
+    );
+    let errors = session.initial_script_errors();
+    assert_eq!(errors.len(), 3);
+    assert_eq!(errors[0].message, "Uncaught first");
+    assert_eq!(errors[1].category, js::JsErrorCategory::Syntax);
+    assert_eq!(errors[2].message, "Uncaught second");
+}
+
+#[test]
+fn evaluating_scripts_reports_the_first_error_after_attempting_later_scripts() {
+    let console = Arc::new(TestConsole::default());
+    let error = BrowserRuntime::in_memory()
+        .evaluate_page_scripts(
+            "<script>throw 'first';</script><script>console.log('later'); throw 'second';</script>",
+            console.clone(),
+            Arc::new(TestAlert::default()),
+            browser::request_controller(None),
+            security_context(),
+        )
+        .expect_err("the evaluation helper still reports errors to its caller");
+
+    assert_eq!(error.message, "Uncaught first");
+    assert_eq!(console.messages.lock().unwrap().as_slice(), ["later"]);
+}
+
+#[test]
 fn policy_context_controls_runtime_local_storage() {
     let controller = Arc::new(
         net::RequestController::builder(net::Config::default())

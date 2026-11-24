@@ -66,6 +66,9 @@ pub struct BoxStyle {
     pub clip_x: bool,
     /// Whether descendants are clipped vertically at the padding box.
     pub clip_y: bool,
+    /// Whether the legacy `-webkit-overflow-scrolling: touch` value creates
+    /// a stacking context. Touch momentum scrolling is not modeled.
+    pub webkit_overflow_scrolling_touch: bool,
 }
 
 impl Default for BoxStyle {
@@ -91,6 +94,7 @@ impl Default for BoxStyle {
             z_index: None,
             clip_x: false,
             clip_y: false,
+            webkit_overflow_scrolling_touch: false,
         }
     }
 }
@@ -216,6 +220,7 @@ impl LayoutBox {
         self.kind == BoxKind::Viewport
             || self.is_layer()
             || self.style.z_index.is_some()
+            || self.style.webkit_overflow_scrolling_touch
             || matches!(self.placement, Placement::Fixed | Placement::Sticky)
     }
 

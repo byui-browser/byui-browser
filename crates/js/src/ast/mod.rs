@@ -22,6 +22,20 @@ pub enum Expr {
     Undefined,
     /// Owned name to resolve in the execution environment.
     Identifier(String),
+    /// Ordinary function expression, evaluated to a fresh closure each time.
+    ///
+    /// An optional name is immutable and visible only inside the function,
+    /// allowing recursion without declaring a name in the enclosing scope.
+    /// Parameters currently accept unique identifiers only; defaults, rest,
+    /// destructuring, async functions, and generators are unsupported.
+    FunctionExpression {
+        /// Owned optional name for recursion and diagnostics.
+        name: Option<String>,
+        /// Owned parameter names in argument order.
+        params: Vec<String>,
+        /// Owned statements executed when the function is called.
+        body: Vec<Statement>,
+    },
     /// Arrow function with positional parameters and an expression or block body.
     ///
     /// The bytecode VM supports expression and block bodies, lexical captures,

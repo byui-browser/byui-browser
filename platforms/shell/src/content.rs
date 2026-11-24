@@ -935,7 +935,7 @@ enum PageCommand {
 /// registered its listener has finished.
 pub(crate) struct PageEvents {
     commands: mpsc::Sender<PageCommand>,
-    /// The error that stopped the most recently loaded page's scripts, if
+    /// The first startup script error in the most recently loaded page, if
     /// any. Written by the session thread, read by the Compatibility audit.
     script_error: Arc<Mutex<Option<String>>>,
 }
@@ -962,8 +962,8 @@ impl PageEvents {
 
     /// Returns a function that waits, up to `timeout`, until the session has
     /// handled every command sent before this call (such as a page load and
-    /// its scripts), then returns the error that stopped the current page's
-    /// scripts, or `None` when they finished (or have not run yet).
+    /// its scripts), then returns the first startup error for the current page,
+    /// or `None` if none has been observed.
     ///
     /// Call the function off the UI thread: a script waiting on `alert`
     /// holds up the session until the UI thread shows the dialog.
@@ -1247,10 +1247,14 @@ fn run_page_events(commands: mpsc::Receiver<PageCommand>, script_error: &Mutex<O
                 record(&performance, event);
                 match result {
                     Ok(loaded) => {
+                        let error = loaded
+                            .initial_script_errors()
+                            .first()
+                            .map(ToString::to_string);
                         shown = Some(html::parse_raw_html(page.html.clone()));
                         report_dom_change(&loaded, &mut shown, watcher.as_ref());
                         session = Some(loaded);
-                        set_script_error(script_error, None);
+                        set_script_error(script_error, error);
                     }
                     Err(error) => {
                         log::debug!("page script failed: {error}");
@@ -2678,6 +2682,45 @@ mod tests {
                 .map(|attribute| attribute.get_value().clone()),
             _ => None,
         }
+    }
+
+    #[test]
+    fn script_failure_keeps_the_session_and_relays_later_dom_changes_for_layout() {
+        let (changed_tx, changed_rx) = mpsc::channel();
+        let events = PageEvents::new();
+        let page = Page {
+            url: "https://example.test/".into(),
+            html: "<div id=\"box\" class=\"off\">Sign In</div>".into(),
+            stylesheets: vec![".off { display: none; } .on { display: block; width: 80px; height: 30px; }".into()],
+            scripts: vec![
+                "throw 'earlier script';".into(),
+                "(function () { var box = document.getElementById('box'); \
+                 box.setAttribute('class', 'on'); \
+                 box.addEventListener('click', function () { box.setAttribute('class', 'off'); }); })();".into(),
+            ],
+            resources: Default::default(),
+        };
+        events.watch_dom(Arc::new(move |dom| {
+            let _ = changed_tx.send(dom);
+        }));
+        events.load(&page, test_alert_sink(), test_runtime(), 1.0);
+        let dom = changed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("later script should reveal the form");
+        assert_eq!(box_class(&dom).as_deref(), Some("on"));
+        let layout = layout_with_live(&page, &dom, 200, 100);
+        let rect = rect_for_class(&layout, "on").expect("revealed form should be laid out");
+        assert_eq!((rect.width, rect.height), (80.0, 30.0));
+        assert_eq!(
+            events.settled_script_error(Duration::from_secs(5))(),
+            Some("Uncaught earlier script".into())
+        );
+
+        events.click(dom.get_element_by_id("box"));
+        let clicked = changed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("surviving session should handle clicks");
+        assert_eq!(box_class(&clicked).as_deref(), Some("off"));
     }
 
     #[test]

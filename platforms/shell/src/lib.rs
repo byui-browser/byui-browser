@@ -47,3 +47,6 @@ mod theme_preference;
 pub use app::{Platform, run};
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub use tab_strip::ROW_CENTER as TAB_ROW_CENTER;
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+mod address_history;

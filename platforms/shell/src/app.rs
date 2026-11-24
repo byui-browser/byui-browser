@@ -74,8 +74,37 @@ enum CaretMove {
     Right,
     /// Before the first character.
     Start,
+    WordLeft,
+    WordRight,
     /// After the last character.
     End,
+}
+
+/// Finds a URL word edge, treating punctuation as separators and preserving UTF-8.
+fn word_boundary(text: &str, caret: usize, forward: bool) -> usize {
+    if forward {
+        let mut end = caret;
+        let mut word = false;
+        for (offset, ch) in text[caret..].char_indices() {
+            if word && !ch.is_alphanumeric() {
+                break;
+            }
+            word |= ch.is_alphanumeric();
+            end = caret + offset + ch.len_utf8();
+        }
+        end
+    } else {
+        let mut start = caret;
+        let mut word = false;
+        for (offset, ch) in text[..caret].char_indices().rev() {
+            if word && !ch.is_alphanumeric() {
+                break;
+            }
+            word |= ch.is_alphanumeric();
+            start = offset;
+        }
+        start
+    }
 }
 
 /// A press in the address field that has not been released yet.
@@ -161,6 +190,7 @@ struct App {
     context_menu: Option<ContextMenu>,
     appearance: Appearance,
     appearance_path: Option<PathBuf>,
+    address_history: crate::address_history::AddressHistory,
     system_dark: Option<bool>,
     site_info_open: bool,
     menu_pressed: Option<MenuAction>,
@@ -262,7 +292,10 @@ impl App {
             .expect("application data directory should be available");
         let runtime =
             browser::BrowserRuntime::open(&root).expect("browser storage should initialize");
-        Self::with_runtime(platform, runtime, Some(root.join("appearance")))
+        let mut app = Self::with_runtime(platform, runtime, Some(root.join("appearance")));
+        app.address_history =
+            crate::address_history::AddressHistory::open(root.join("address-history"));
+        app
     }
 
     fn with_runtime(
@@ -319,6 +352,7 @@ impl App {
             context_menu: None,
             appearance,
             appearance_path,
+            address_history: crate::address_history::AddressHistory::default(),
             system_dark: None,
             site_info_open: false,
             menu_pressed: None,
@@ -1031,6 +1065,9 @@ impl App {
         behavior: NavigationBehavior,
     ) {
         log::debug!("page displayed: {url}");
+        if behavior != NavigationBehavior::Reload {
+            self.address_history.record(url);
+        }
         self.tab.document_id += 1;
         self.alerts.set_document(self.tab.id, self.tab.document_id);
         self.tab.page_events.unload();
@@ -1174,6 +1211,9 @@ impl App {
     }
 
     fn cancel_address_edit(&mut self) {
+        self.tab.suggestions.clear();
+        self.tab.suggestion_selected = None;
+        self.frame_key = None;
         self.tab.address = self.tab.address_before_edit.clone();
         self.tab.chrome.address_caret = self.tab.address.len();
         self.tab.chrome.address_anchor = None;
@@ -1182,6 +1222,19 @@ impl App {
     }
 
     fn submit_address(&mut self) {
+        if let Some(index) = self.tab.suggestion_selected.take()
+            && let Some((_, target, tab)) = self.tab.suggestions.get(index).cloned()
+        {
+            self.tab.suggestions.clear();
+            if let Some(id) = tab {
+                self.cancel_address_edit();
+                self.switch_tab(id);
+                return;
+            }
+            self.tab.address = target;
+        }
+        self.tab.suggestions.clear();
+        self.frame_key = None;
         let address = self.tab.address.trim().to_owned();
         self.tab.address = address.clone();
         self.tab.chrome.address_caret = self.tab.address.len();
@@ -1460,6 +1513,19 @@ impl App {
                     }
                     return;
                 }
+                "x" if self.tab.chrome.address_focused => {
+                    if let Some((start, end)) = self.tab.chrome.address_selection(&self.tab.address)
+                    {
+                        let text = self.tab.address[start..end].to_owned();
+                        match arboard::Clipboard::new()
+                            .and_then(|mut clipboard| clipboard.set_text(text))
+                        {
+                            Ok(()) => self.delete_address_text(false),
+                            Err(error) => log::warn!("failed to cut address: {error}"),
+                        }
+                    }
+                    return;
+                }
                 "v" if self.tab.chrome.address_focused => {
                     match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
                         Ok(text) => self.insert_address_text(&text),
@@ -1474,10 +1540,73 @@ impl App {
             return;
         }
         match key {
+            Key::Named(NamedKey::Space) if !shortcut => self.insert_address_text(" "),
+            Key::Named(NamedKey::Escape) if !self.tab.suggestions.is_empty() => {
+                self.tab.suggestions.clear();
+                self.tab.suggestion_selected = None;
+                self.frame_key = None;
+                self.redraw();
+            }
             Key::Named(NamedKey::Enter) => self.submit_address(),
             Key::Named(NamedKey::Escape) => self.cancel_address_edit(),
-            Key::Named(NamedKey::Backspace) => self.delete_address_text(false),
-            Key::Named(NamedKey::Delete) => self.delete_address_text(true),
+            Key::Named(NamedKey::Backspace | NamedKey::Delete) => {
+                let forward = key == Key::Named(NamedKey::Delete);
+                if self
+                    .tab
+                    .chrome
+                    .address_selection(&self.tab.address)
+                    .is_none()
+                {
+                    let movement = if cfg!(target_os = "macos") && modifiers.super_key() {
+                        Some(if forward {
+                            CaretMove::End
+                        } else {
+                            CaretMove::Start
+                        })
+                    } else if modifiers.control_key()
+                        || (cfg!(target_os = "macos") && modifiers.alt_key())
+                    {
+                        Some(if forward {
+                            CaretMove::WordRight
+                        } else {
+                            CaretMove::WordLeft
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(movement) = movement {
+                        let anchor = self.address_caret();
+                        self.move_address_caret(movement);
+                        self.tab.chrome.address_anchor = Some(anchor);
+                    }
+                }
+                self.delete_address_text(forward);
+            }
+            Key::Named(NamedKey::ArrowDown | NamedKey::ArrowUp)
+                if !self.tab.suggestions.is_empty() =>
+            {
+                let count = self.tab.suggestions.len();
+                let next = if key == Key::Named(NamedKey::ArrowDown) {
+                    self.tab.suggestion_selected.map_or(0, |i| (i + 1) % count)
+                } else {
+                    self.tab
+                        .suggestion_selected
+                        .map_or(count - 1, |i| (i + count - 1) % count)
+                };
+                self.tab.suggestion_selected = Some(next);
+                self.frame_key = None;
+                self.redraw();
+            }
+            Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowRight)
+                if modifiers.control_key()
+                    || (cfg!(target_os = "macos") && modifiers.alt_key()) =>
+            {
+                self.move_address_caret(if key == Key::Named(NamedKey::ArrowLeft) {
+                    CaretMove::WordLeft
+                } else {
+                    CaretMove::WordRight
+                });
+            }
             // Command+Left/Right jump to the ends on macOS, like Home/End.
             Key::Named(NamedKey::ArrowLeft)
                 if cfg!(target_os = "macos") && modifiers.super_key() =>
@@ -1543,6 +1672,7 @@ impl App {
         let caret = self.address_caret();
         self.tab.address.insert_str(caret, &text);
         self.tab.chrome.address_caret = caret + text.len();
+        self.refresh_address_suggestions();
         self.redraw();
     }
 
@@ -1562,6 +1692,7 @@ impl App {
                 self.tab.chrome.address_caret = start;
             }
         }
+        self.refresh_address_suggestions();
         self.redraw();
     }
 
@@ -1571,8 +1702,18 @@ impl App {
     fn move_address_caret(&mut self, movement: CaretMove) {
         let caret = self.address_caret();
         let selection = self.tab.chrome.address_selection(&self.tab.address);
-        self.tab.chrome.address_anchor = None;
+        let extending = self.modifiers.shift_key();
+        if extending {
+            self.tab.chrome.address_anchor.get_or_insert(caret);
+        } else {
+            self.tab.chrome.address_anchor = None;
+        }
+        let selection = if extending { None } else { selection };
         self.tab.chrome.address_caret = match (movement, selection) {
+            (CaretMove::WordLeft, Some((start, _))) => start,
+            (CaretMove::WordRight, Some((_, end))) => end,
+            (CaretMove::WordLeft, None) => word_boundary(&self.tab.address, caret, false),
+            (CaretMove::WordRight, None) => word_boundary(&self.tab.address, caret, true),
             (CaretMove::Start, _) => 0,
             (CaretMove::End, _) => self.tab.address.len(),
             (CaretMove::Left, Some((start, _))) => start,
@@ -1588,6 +1729,65 @@ impl App {
         };
         log::trace!("address caret moved to {}", self.tab.chrome.address_caret);
         self.redraw();
+    }
+
+    /// Offers saved visits, session history, and open tabs without remote requests.
+    fn refresh_address_suggestions(&mut self) {
+        let query = self.tab.address.trim().to_lowercase();
+        let mut rows = Vec::new();
+        if !query.is_empty() {
+            for entry in self.tab_entries() {
+                if entry.0 == self.tab.id {
+                    continue;
+                }
+                if let Some(tab) = self.tab_state(entry.0) {
+                    let url = tab.browser_state.current_url().unwrap_or(&tab.address);
+                    if url.to_lowercase().contains(&query)
+                        || tab.title.to_lowercase().contains(&query)
+                    {
+                        rows.push((
+                            format!("{} — Switch to tab", tab.title),
+                            url.to_owned(),
+                            Some(tab.id),
+                        ));
+                    }
+                }
+            }
+            for url in self.address_history.urls().iter().rev() {
+                if url.to_lowercase().contains(&query)
+                    && !rows.iter().any(|(_, target, _)| target == url)
+                {
+                    rows.push((url.clone(), url.clone(), None));
+                }
+            }
+            for tab in std::iter::once(&self.tab).chain(self.inactive.values()) {
+                for url in tab.browser_state.visited_urls().iter().rev() {
+                    if url.to_lowercase().contains(&query)
+                        && !rows.iter().any(|(_, target, _)| target == url)
+                    {
+                        rows.push((url.clone(), url.clone(), None));
+                    }
+                }
+            }
+            rows.truncate(6);
+            let search = format!(
+                "https://www.google.com/search?q={}",
+                self.tab
+                    .address
+                    .trim()
+                    .bytes()
+                    .map(|b| format!("%{b:02X}"))
+                    .collect::<String>()
+            );
+            rows.push((
+                format!("Search Google for {}", self.tab.address.trim()),
+                search,
+                None,
+            ));
+        }
+        self.tab.suggestions = rows;
+        self.tab.suggestion_selected = None;
+        self.frame_key = None;
     }
 
     /// Returns the address byte offset under the pointer, for placing the
@@ -2230,6 +2430,21 @@ impl App {
     }
 
     fn left_mouse_input(&mut self, state: ElementState) {
+        if self.tab.chrome.address_focused
+            && let Some(window) = &self.window
+            && let Some(index) = toolbar::suggestion_at(
+                window.inner_size().width as f32 / window.scale_factor() as f32,
+                self.cursor,
+                self.tab.suggestions.len(),
+            )
+        {
+            if state == ElementState::Pressed {
+                self.tab.suggestion_selected = Some(index);
+                self.submit_address();
+            }
+            return;
+        }
+
         let previous_tab = self.tab.elements.as_ref().map(ElementsPanel::tab);
         if let Some(panel) = &mut self.tab.elements
             && panel.dock_mouse(self.cursor, state == ElementState::Pressed)
@@ -2656,6 +2871,11 @@ impl App {
         }
         // Hover, press, and focus only change the toolbar strip; repainting
         // just that strip keeps pointer feedback and window drags smooth.
+        full |= !self.tab.suggestions.is_empty();
+        if !self.tab.chrome.address_focused {
+            self.tab.suggestions.clear();
+            self.tab.suggestion_selected = None;
+        }
         let composed = if full {
             toolbar::compose(
                 size.width,
@@ -2738,6 +2958,14 @@ impl App {
                 site_info_url.as_deref().unwrap_or_default(),
             );
         }
+        toolbar::draw_suggestions(
+            &mut composed,
+            scale as f32,
+            &self.tab.chrome,
+            &self.tab.suggestions,
+            self.tab.suggestion_selected,
+            self.font.as_ref(),
+        );
         if full {
             self.frame
                 .resize(size.width as usize * size.height as usize, 0);
@@ -4749,6 +4977,106 @@ mod tests {
     }
 
     #[test]
+    fn address_word_arrows_collapse_selection_then_move_between_url_components() {
+        let mut app = app();
+        app.begin_address_edit();
+        app.insert_address_text("https://example.com/path");
+        let word_modifier = if cfg!(target_os = "macos") {
+            ModifiersState::ALT
+        } else {
+            ModifiersState::CONTROL
+        };
+        app.select_all_address();
+        app.modifiers = word_modifier;
+        app.key_down(Key::Named(NamedKey::ArrowLeft));
+        assert_eq!(app.tab.chrome.address_caret, 0);
+        assert_eq!(app.tab.chrome.address_selection(&app.tab.address), None);
+
+        app.key_down(Key::Named(NamedKey::ArrowRight));
+        assert_eq!(&app.tab.address[..app.address_caret()], "https");
+        app.key_down(Key::Named(NamedKey::ArrowRight));
+        assert_eq!(&app.tab.address[..app.address_caret()], "https://example");
+        app.key_down(Key::Named(NamedKey::ArrowLeft));
+        assert_eq!(app.address_caret(), 8);
+
+        app.modifiers |= ModifiersState::SHIFT;
+        app.key_down(Key::Named(NamedKey::ArrowRight));
+        assert_eq!(
+            app.tab.chrome.address_selection(&app.tab.address),
+            Some((8, 15))
+        );
+        app.modifiers = word_modifier;
+        app.key_down(Key::Named(NamedKey::ArrowRight));
+        assert_eq!(app.address_caret(), 15);
+        assert_eq!(app.tab.chrome.address_selection(&app.tab.address), None);
+    }
+
+    #[test]
+    fn address_word_shortcuts_and_shift_selection() {
+        let mut app = app();
+        app.begin_address_edit();
+        app.insert_address_text("https://example.com/été");
+        app.modifiers = if cfg!(target_os = "macos") {
+            ModifiersState::ALT
+        } else {
+            ModifiersState::CONTROL
+        };
+        app.key_down(Key::Named(NamedKey::Backspace));
+        assert_eq!(app.tab.address, "https://example.com/");
+        app.modifiers = ModifiersState::SHIFT;
+        app.key_down(Key::Named(NamedKey::Home));
+        assert_eq!(
+            app.tab.chrome.address_selection(&app.tab.address),
+            Some((0, app.tab.address.len()))
+        );
+        app.insert_address_text("replacement");
+        assert_eq!(app.tab.address, "replacement");
+    }
+
+    #[test]
+    fn address_suggestions_select_history_and_dismiss_without_losing_input() {
+        let mut app = app();
+        app.tab.browser_state.record_visit("byui://welcome");
+        app.tab.browser_state.record_visit("byui://welcome");
+        app.begin_address_edit();
+        app.insert_address_text("welcome");
+        assert_eq!(app.tab.suggestions.len(), 2);
+        app.key_down(Key::Named(NamedKey::ArrowDown));
+        assert_eq!(app.tab.suggestion_selected, Some(0));
+        app.key_down(Key::Named(NamedKey::Escape));
+        assert!(app.tab.suggestions.is_empty());
+        assert_eq!(app.tab.address, "welcome");
+        app.refresh_address_suggestions();
+        app.key_down(Key::Named(NamedKey::ArrowDown));
+        app.key_down(Key::Named(NamedKey::Enter));
+        assert_eq!(app.tab.address, "byui://welcome");
+        assert!(!app.tab.chrome.address_focused);
+    }
+
+    #[test]
+    fn address_completion_switches_to_existing_tab() {
+        let mut app = app();
+        app.ensure_welcome_loaded();
+        let original = app.tab.id;
+        app.new_tab();
+        app.insert_address_text("welcome");
+        assert_eq!(app.tab.suggestions[0].2, Some(original));
+        app.key_down(Key::Named(NamedKey::ArrowDown));
+        app.key_down(Key::Named(NamedKey::Enter));
+        assert_eq!(app.tab.id, original);
+        assert!(app.tab.suggestions.is_empty());
+    }
+
+    #[test]
+    fn url_word_boundaries_preserve_unicode_and_skip_symbols() {
+        let text = "https://été.test/path";
+        assert_eq!(&text[word_boundary(text, text.len(), false)..], "path");
+        assert_eq!(&text[..word_boundary(text, 5, true)], "https://été");
+        assert_eq!(word_boundary(text, 0, false), 0);
+        assert_eq!(word_boundary(text, text.len(), true), text.len());
+    }
+
+    #[test]
     fn arrow_keys_collapse_the_selection_and_move_the_caret() {
         let mut app = app();
         app.ensure_welcome_loaded();
@@ -5011,6 +5339,35 @@ mod tab_tests {
             scripts: vec![],
             resources: Default::default(),
         }
+    }
+
+    #[test]
+    fn saved_visit_autocompletes_after_tab_closure_and_browser_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "byui-completion-restart-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut first = app();
+        first.address_history = crate::address_history::AddressHistory::open(path.clone());
+        let url = "https://byui.instructure.com/";
+        first.page_loaded(url, fixture_page(url, "Canvas"));
+        let visited_tab = first.tab.id;
+        first.new_tab();
+        first.close_tab(visited_tab);
+        first.insert_address_text("byui.instr");
+        assert_eq!(first.tab.suggestions[0].1, url);
+        drop(first);
+
+        let mut reopened = app();
+        reopened.address_history = crate::address_history::AddressHistory::open(path.clone());
+        reopened.begin_address_edit();
+        reopened.insert_address_text("BYUI.INSTRUCTURE.COM");
+        assert_eq!(reopened.tab.suggestions[0].1, url);
+        assert_eq!(reopened.tab.suggestions[0].2, None);
+        reopened.key_down(Key::Named(NamedKey::ArrowDown));
+        assert_eq!(reopened.tab.suggestion_selected, Some(0));
+        std::fs::remove_file(path).unwrap();
     }
 
     fn navigation(

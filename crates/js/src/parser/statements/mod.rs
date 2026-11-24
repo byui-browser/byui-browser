@@ -8,6 +8,7 @@ mod function;
 mod return_statement;
 
 pub(in crate::parser) use block::parse_arrow_block;
+pub(in crate::parser) use function::parse_expression as parse_function_expression;
 
 use super::{ParseResult, Parser};
 use crate::ast::Statement;

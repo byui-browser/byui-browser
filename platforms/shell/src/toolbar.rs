@@ -1548,3 +1548,128 @@ mod tests {
         }
     }
 }
+
+/// Hit-tests completion rows in logical window coordinates.
+pub(crate) fn suggestion_at(width: f32, cursor: Option<(f64, f64)>, count: usize) -> Option<usize> {
+    let field = control_rect(Control::Address, width)?;
+    let (x, y) = cursor?;
+    let y = y as f32 - field.bottom() - 4.0;
+    if x < field.left() as f64 || x >= field.right() as f64 || y < 0.0 {
+        return None;
+    }
+    let index = (y / 38.0) as usize;
+    (index < count).then_some(index)
+}
+
+/// Paints local completions over the page after all other chrome layers.
+pub(crate) fn draw_suggestions(
+    pixmap: &mut Pixmap,
+    scale: f32,
+    state: &ChromeState,
+    suggestions: &[(String, String, Option<chrome::TabId>)],
+    selected: Option<usize>,
+    font: Option<&FontVec>,
+) {
+    if !state.address_focused || suggestions.is_empty() {
+        return;
+    }
+    let Some(field) = control_rect(Control::Address, pixmap.width() as f32 / scale) else {
+        return;
+    };
+    let transform = Transform::from_scale(scale, scale);
+    let top = field.bottom() + 4.0;
+    let background = if state.dark {
+        Color::from_rgba8(43, 44, 48, 255)
+    } else {
+        Color::from_rgba8(250, 250, 252, 255)
+    };
+    if let Some(path) = rounded_rect(
+        field.left(),
+        top,
+        field.width(),
+        suggestions.len() as f32 * 38.0,
+        8.0,
+    ) {
+        fill(pixmap, &path, background, transform);
+    }
+    for (index, (label, _, _)) in suggestions.iter().enumerate() {
+        let y = top + index as f32 * 38.0;
+        if selected == Some(index)
+            && let Some(path) =
+                rounded_rect(field.left() + 3.0, y + 2.0, field.width() - 6.0, 34.0, 5.0)
+        {
+            fill(
+                pixmap,
+                &path,
+                if state.dark {
+                    Color::from_rgba8(67, 72, 88, 255)
+                } else {
+                    Color::from_rgba8(219, 229, 250, 255)
+                },
+                transform,
+            );
+        }
+        if let Some(font) = font {
+            draw_text(
+                pixmap,
+                font,
+                13.0 * scale,
+                (field.left() + 14.0) * scale,
+                (y + 24.0) * scale,
+                (field.right() - 12.0) * scale,
+                if state.dark {
+                    Color::from_rgba8(235, 236, 240, 255)
+                } else {
+                    Color::from_rgba8(32, 34, 40, 255)
+                },
+                label,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn completions_paint_and_hit_test_the_same_rows_at_each_scale() {
+        for scale in [1.0, 2.0] {
+            for dark in [false, true] {
+                let state = ChromeState {
+                    address_focused: true,
+                    dark,
+                    ..ChromeState::default()
+                };
+                let rows = vec![("Example".into(), "https://example.com".into(), None)];
+                let mut image = compose(
+                    (1000.0 * scale) as u32,
+                    (600.0 * scale) as u32,
+                    scale as f64,
+                    &state,
+                    "exam",
+                    None,
+                    None,
+                )
+                .unwrap();
+                let before = image.clone();
+                draw_suggestions(&mut image, scale, &state, &rows, Some(0), None);
+                let field = control_rect(Control::Address, 1000.0).unwrap();
+                let x = field.left() + 20.0;
+                let y = field.bottom() + 20.0;
+                assert_eq!(
+                    suggestion_at(1000.0, Some((x as f64, y as f64)), 1),
+                    Some(0)
+                );
+                assert_ne!(
+                    image.pixel((x * scale) as u32, (y * scale) as u32),
+                    before.pixel((x * scale) as u32, (y * scale) as u32)
+                );
+                assert_eq!(
+                    suggestion_at(1000.0, Some((x as f64, (y + 38.0) as f64)), 1),
+                    None
+                );
+            }
+        }
+    }
+}

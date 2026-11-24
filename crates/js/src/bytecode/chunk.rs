@@ -34,7 +34,7 @@ pub struct Chunk {
 /// How a compiled function behaves when called or constructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallableKind {
-    /// A `function` declaration: callable, and constructible with `new`.
+    /// A `function` declaration or expression: callable and constructible with `new`.
     Function,
     /// An arrow function: callable but not constructible with `new`.
     Arrow,
