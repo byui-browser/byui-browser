@@ -4,9 +4,9 @@ mod common;
 
 use common::{TestServer, runtime};
 use net::{
-    Body, CachePartitionService, Config, CookieService, FetchEnvironment, Request,
-    RequestController, RequestError, RequestPolicyService, ResponseInfo, ResponsePolicyService,
-    SchemeProviders, ServiceWorkerDecision, ServiceWorkerService,
+    Body, CacheMode, CachePartitionService, Config, CookieService, FetchEnvironment, Request,
+    RequestController, RequestError, RequestMode, RequestPolicyService, ResponseInfo,
+    ResponsePolicyService, SchemeProviders, ServiceWorkerDecision, ServiceWorkerService,
 };
 use std::sync::{
     Arc,
@@ -363,7 +363,7 @@ fn browser_context_fails_closed_when_a_required_capability_is_missing() {
     ];
 
     for (controller, missing) in controllers {
-        let mut request = Request::get("http://127.0.0.1:9/");
+        let mut request = Request::get("http://127.0.0.1:0/");
         request.set_environment(
             FetchEnvironment::from_url(reqwest::Url::parse("https://client.test/").unwrap())
                 .unwrap(),
@@ -431,17 +431,32 @@ fn cached_browser_response_is_rechecked_before_exposure() {
         .build()
         .unwrap();
     let mut request = Request::get(server.url());
+    request.set_mode(RequestMode::SameOrigin).unwrap();
     request.set_environment(
         FetchEnvironment::from_url(reqwest::Url::parse(&server.url()).unwrap()).unwrap(),
     );
-    runtime().block_on(async {
-        let response = controller
-            .fetch(request.try_clone().unwrap())
-            .await
-            .unwrap();
+    request.set_cache_mode(CacheMode::OnlyIfCached);
+    let runtime = runtime();
+    let error = runtime.block_on(async {
+        let mut initial_request = request.try_clone().unwrap();
+        initial_request.set_cache_mode(CacheMode::Default);
+        let response = controller.fetch(initial_request).await.unwrap();
         response.body.bytes().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match controller.fetch(request.try_clone().unwrap()).await {
+                    Err(error @ RequestError::UnsupportedFeature("cached response policy")) => {
+                        break error;
+                    }
+                    Err(RequestError::NetworkError) => tokio::task::yield_now().await,
+                    Ok(_) => panic!("only-if-cached response must not bypass the cache policy"),
+                    Err(error) => panic!("cache probe failed unexpectedly: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("cached response policy should be rechecked within five seconds")
     });
-    let error = runtime().block_on(controller.fetch(request)).unwrap_err();
     server.join();
     assert!(matches!(
         error,
@@ -543,16 +558,16 @@ fn rejected_http_response_does_not_store_cookies_or_enter_cache() {
 
 #[test]
 fn unsupported_request_features_fail_before_browser_service_or_network_side_effects() {
-    let mut integrity = Request::get("http://127.0.0.1:9/");
+    let mut integrity = Request::get("http://127.0.0.1:0/");
     integrity.set_integrity(Some("sha256-example".into()));
 
-    let mut priority = Request::get("http://127.0.0.1:9/");
+    let mut priority = Request::get("http://127.0.0.1:0/");
     priority.set_priority(net::RequestPriority::High);
 
-    let mut keepalive = Request::get("http://127.0.0.1:9/");
+    let mut keepalive = Request::get("http://127.0.0.1:0/");
     keepalive.set_keepalive(true);
 
-    let mut navigation = Request::get("http://127.0.0.1:9/");
+    let mut navigation = Request::get("http://127.0.0.1:0/");
     navigation.set_mode(net::RequestMode::Navigate).unwrap();
 
     for (request, feature) in [
@@ -587,7 +602,7 @@ fn service_worker_interception_fails_before_cache_cookie_or_transport_work() {
         .unwrap();
 
     let error = runtime()
-        .block_on(controller.fetch(Request::get("http://127.0.0.1:9/")))
+        .block_on(controller.fetch(Request::get("http://127.0.0.1:0/")))
         .unwrap_err();
 
     assert!(matches!(
@@ -639,7 +654,7 @@ fn connection_refusal_is_a_typed_transport_error() {
         .unwrap();
 
     assert!(matches!(
-        runtime().block_on(controller.fetch(Request::get("http://127.0.0.1:9/"))),
+        runtime().block_on(controller.fetch(Request::get("http://127.0.0.1:0/"))),
         Err(RequestError::Transport(_))
     ));
 }
