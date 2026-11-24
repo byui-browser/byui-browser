@@ -26,13 +26,8 @@ fn primary(parser: &mut Parser<'_>) -> ParseResult<(Expr, usize)> {
         Some(Token::LeftBrace) => return super::object::parse(parser),
         Some(Token::LeftBracket) => return parse_array(parser),
         Some(Token::Template { .. }) => return parse_template(parser),
-        // A `/` where an operand must start would begin a regular expression
-        // literal, which the engine has no value type for.
-        Some(Token::Divide | Token::SlashAssign) => {
-            return Err(parser.error(
-                "Regular expression literals are not supported",
-                "regular expression literal",
-            ));
+        Some(Token::Divide | Token::SlashAssign | Token::RegExp { .. }) => {
+            return parser.parse_regexp();
         }
         Some(Token::LeftParen) => {
             parser.advance();
@@ -84,11 +79,12 @@ fn argument(parser: &mut Parser<'_>) -> ParseResult<(Expr, usize)> {
 /// An error inside a substitution is reported at the template's own token
 /// index, because the substitution's tokens are not part of the outer stream.
 fn parse_template<'tokens>(parser: &mut Parser<'tokens>) -> ParseResult<(Expr, usize)> {
-    let tokens: &'tokens [Token] = parser.tokens;
+    let tokens = parser.tokens.clone();
     let position = parser.position;
     let Some(Token::Template {
         quasis,
         expressions,
+        sources,
     }) = tokens.get(position)
     else {
         return Err(parser.error("Expected a template literal", "template literal"));
@@ -96,8 +92,12 @@ fn parse_template<'tokens>(parser: &mut Parser<'tokens>) -> ParseResult<(Expr, u
     parser.advance();
     let mut parsed = Vec::with_capacity(expressions.len());
     let mut depth = 0;
-    for substitution in expressions {
+    for (index, substitution) in expressions.iter().enumerate() {
         let mut inner = Parser::new(substitution, &[]);
+        if let Some(source) = sources.get(index) {
+            inner.source = Some(source);
+            inner.retokenize(0);
+        }
         inner.depth = parser.depth;
         inner.function_depth = parser.function_depth;
         inner.method_depth = parser.method_depth;
@@ -120,6 +120,7 @@ fn parse_template<'tokens>(parser: &mut Parser<'tokens>) -> ParseResult<(Expr, u
             }
             Err(mut error) => {
                 error.token_index = position;
+                error.offset = parser.offsets.get(position).copied();
                 return Err(error);
             }
         }

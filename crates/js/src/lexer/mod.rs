@@ -6,12 +6,21 @@ use std::str::CharIndices;
 type Chars<'source> = Peekable<CharIndices<'source>>;
 
 /// A token produced by the JavaScript lexer.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     /// Numeric literal parsed as a 64-bit float.
     Number(f64),
     /// String literal after supported escapes have been decoded.
     String(String),
+    /// Owned pattern and flags of a contextually scanned regular expression.
+    /// Source-level parsing distinguishes this from division; callers of the
+    /// token-level parser may supply this token explicitly.
+    RegExp {
+        /// Pattern text without the slash delimiters; escapes are preserved.
+        pattern: String,
+        /// Flags as written, validated by the parser.
+        flags: String,
+    },
     /// Identifier that is not a reserved keyword, with any `\u` escapes
     /// decoded, so `caf\u{E9}` and `café` are both `Identifier("café")`.
     Identifier(String),
@@ -219,6 +228,9 @@ pub enum Token {
         quasis: Vec<String>,
         /// Tokens of each `${...}` substitution, without the delimiters.
         expressions: Vec<Vec<Token>>,
+        /// Original source for each substitution, used for contextual regex
+        /// parsing. Empty for token streams assembled without source text.
+        sources: Vec<String>,
     },
     /// Unrecognized source character. Kept in the stream so callers can
     /// report unsupported syntax without the lexer silently dropping it.
@@ -228,7 +240,7 @@ pub enum Token {
 }
 
 /// A token and its UTF-8 byte range in the original source.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpannedToken {
     /// The lexical token owned by this entry.
     pub token: Token,
@@ -252,6 +264,10 @@ pub struct SpannedToken {
 /// escapes below, may span lines, and each `${...}` substitution is
 /// tokenized recursively (up to 32 levels deep) and kept inside the token. A
 /// template that is not closed produces [`Token::Invalid`].
+///
+/// Numbers support decimal and `0x`/`0X` hexadecimal literals, producing
+/// IEEE 754 doubles. Binary/octal prefixes, numeric separators, and bigint
+/// suffixes are not supported.
 ///
 /// Strings may use single or double quotes. Supported escapes are `\n`, `\r`,
 /// `\t`, `\b`, `\f`, `\v`, `\0` (when not followed by a digit), `\xHH`,
@@ -356,7 +372,20 @@ fn scan_tokens(
             }
         }
 
-        let token = if ch.is_ascii_digit()
+        let token = if in_substitution && ch == '/' && template_operand_expected(&tokens) {
+            match regexp_literal(input, start) {
+                Ok((pattern, flags, end)) => {
+                    while chars.peek().is_some_and(|(offset, _)| *offset < end) {
+                        chars.next();
+                    }
+                    Token::RegExp { pattern, flags }
+                }
+                Err(message) => {
+                    chars.next();
+                    Token::Invalid(message.into())
+                }
+            }
+        } else if ch.is_ascii_digit()
             || (ch == '.'
                 && chars
                     .clone()
@@ -515,6 +544,7 @@ fn scan_template(input: &str, chars: &mut Chars<'_>, nesting: usize) -> Token {
     }
     let mut quasis = Vec::new();
     let mut expressions = Vec::new();
+    let mut sources = Vec::new();
     let mut current = String::new();
     let mut error: Option<&'static str> = None;
 
@@ -530,15 +560,19 @@ fn scan_template(input: &str, chars: &mut Chars<'_>, nesting: usize) -> Token {
                     None => Token::Template {
                         quasis,
                         expressions,
+                        sources,
                     },
                 };
             }
             '$' if take_if(chars, '{') => {
                 quasis.push(std::mem::take(&mut current));
+                let source_start = chars.peek().map_or(input.len(), |(index, _)| *index);
                 let (inner, closed) = scan_tokens(input, chars, nesting + 1, true);
                 if !closed {
                     return Token::Invalid("unterminated template literal".into());
                 }
+                let source_end = chars.peek().map_or(input.len(), |(index, _)| *index) - 1;
+                sources.push(input[source_start..source_end].into());
                 expressions.push(inner.into_iter().map(|entry| entry.token).collect());
             }
             '\r' => {
@@ -590,6 +624,37 @@ fn skip_block_comment(chars: &mut Chars<'_>) -> bool {
 
 fn scan_number(input: &str, chars: &mut Chars<'_>) -> Token {
     let start = chars.peek().expect("number begins with a character").0;
+    let mut prefix = chars.clone();
+    prefix.next();
+    if input[start..].starts_with('0') && matches!(prefix.peek(), Some((_, 'x' | 'X'))) {
+        chars.next();
+        chars.next();
+        let digits_start = start + 2;
+        let mut digits = 0;
+        while let Some((_, ch)) = chars.peek().copied() {
+            if !ch.is_ascii_hexdigit() {
+                break;
+            }
+            digits += 1;
+            chars.next();
+        }
+        if digits == 0
+            || chars
+                .peek()
+                .is_some_and(|(_, ch)| is_identifier_continue(*ch) || *ch == '\\')
+        {
+            while chars
+                .peek()
+                .is_some_and(|(_, ch)| is_identifier_continue(*ch) || *ch == '\\')
+            {
+                chars.next();
+            }
+            return Token::Invalid("malformed hexadecimal number".into());
+        }
+        return Token::Number(hexadecimal_value(
+            &input[digits_start..digits_start + digits],
+        ));
+    }
     let mut end = start;
     let mut seen_decimal = false;
     let mut seen_exponent = false;
@@ -631,6 +696,40 @@ fn scan_number(input: &str, chars: &mut Chars<'_>) -> Token {
             Token::Number,
         )
     }
+}
+
+// Keep the leading 53 bits plus guard/sticky bits, then round once to
+// nearest, ties to even. Accumulating directly in f64 can double-round long
+// literals. Values longer than 1024 significant bits necessarily overflow.
+fn hexadecimal_value(digits: &str) -> f64 {
+    let mut significand = 0_u64;
+    let mut bits = 0_i32;
+    let mut guard = false;
+    let mut sticky = false;
+    for digit in digits.bytes() {
+        let digit = (digit as char).to_digit(16).expect("validated hex digit");
+        for shift in (0..4).rev() {
+            let bit = (digit >> shift) & 1;
+            if bits == 0 && bit == 0 {
+                continue;
+            }
+            bits += 1;
+            if bits <= 53 {
+                significand = (significand << 1) | u64::from(bit);
+            } else if bits == 54 {
+                guard = bit != 0;
+            } else {
+                sticky |= bit != 0;
+            }
+            if bits > 1024 {
+                return f64::INFINITY;
+            }
+        }
+    }
+    if guard && (sticky || significand & 1 != 0) {
+        significand += 1;
+    }
+    significand as f64 * 2_f64.powi((bits - 53).max(0))
 }
 
 const UNSUPPORTED_ESCAPE: &str = "string contains an unsupported escape";
@@ -870,4 +969,152 @@ fn is_identifier_start(ch: char) -> bool {
 /// `XID_Continue`, which differs only in a few compatibility characters.
 fn is_identifier_continue(ch: char) -> bool {
     ch == '$' || ch == '\u{200C}' || ch == '\u{200D}' || unicode_ident::is_xid_continue(ch)
+}
+
+/// Scans a regular expression only when the parser expects an operand.
+pub(crate) fn regexp_literal(
+    source: &str,
+    start: usize,
+) -> Result<(String, String, usize), &'static str> {
+    let chars = source[start + 1..].char_indices();
+    let mut in_class = false;
+    let mut escaped = false;
+    for (relative, ch) in chars {
+        if is_line_terminator(ch) {
+            return Err("Line terminator in regular expression literal");
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '[' => in_class = true,
+            ']' => in_class = false,
+            '/' if !in_class => {
+                let end_pattern = start + 1 + relative;
+                let end_slash = end_pattern + 1;
+                let mut end = end_slash;
+                for (offset, flag) in source[end_slash..].char_indices() {
+                    if !is_identifier_continue(flag) {
+                        break;
+                    }
+                    end = end_slash + offset + flag.len_utf8();
+                }
+                return Ok((
+                    source[start + 1..end_pattern].into(),
+                    source[end_slash..end].into(),
+                    end,
+                ));
+            }
+            _ => {}
+        }
+    }
+    Err("Unterminated regular expression literal")
+}
+
+// Substitutions are expressions. This lexical goal handles their operand
+// positions while keeping braces and comment markers inside patterns opaque.
+fn template_operand_expected(tokens: &[SpannedToken]) -> bool {
+    let previous = tokens.last().map(|entry| &entry.token);
+    if previous == Some(&Token::RightParen) {
+        return matching_open(
+            tokens,
+            tokens.len() - 1,
+            &Token::LeftParen,
+            &Token::RightParen,
+        )
+        .and_then(|open| open.checked_sub(1))
+        .is_some_and(|index| control_parenthesis(&tokens[index].token));
+    }
+    if previous == Some(&Token::RightBrace) {
+        let Some(open) = matching_open(
+            tokens,
+            tokens.len() - 1,
+            &Token::LeftBrace,
+            &Token::RightBrace,
+        ) else {
+            return false;
+        };
+        return match open.checked_sub(1).map(|index| &tokens[index].token) {
+            Some(
+                Token::Else
+                | Token::Try
+                | Token::Finally
+                | Token::Do
+                | Token::LeftBrace
+                | Token::Semicolon,
+            ) => true,
+            Some(Token::RightParen) => {
+                let Some(paren) =
+                    matching_open(tokens, open - 1, &Token::LeftParen, &Token::RightParen)
+                else {
+                    return false;
+                };
+                if paren > 0 && control_parenthesis(&tokens[paren - 1].token) {
+                    return true;
+                }
+                // A function declaration closes a statement; a function
+                // expression closes an operand. Skip its optional name.
+                let function =
+                    if paren > 0 && matches!(tokens[paren - 1].token, Token::Identifier(_)) {
+                        paren.checked_sub(2)
+                    } else {
+                        paren.checked_sub(1)
+                    };
+                function.is_some_and(|index| {
+                    tokens[index].token == Token::Function
+                        && index > 0
+                        && matches!(tokens[index - 1].token, Token::LeftBrace | Token::Semicolon)
+                })
+            }
+            _ => false,
+        };
+    }
+    !matches!(
+        previous,
+        Some(
+            Token::Identifier(_)
+                | Token::Number(_)
+                | Token::String(_)
+                | Token::RegExp { .. }
+                | Token::Template { .. }
+                | Token::True
+                | Token::False
+                | Token::Null
+                | Token::Undefined
+                | Token::This
+                | Token::RightBracket
+                | Token::Increment
+                | Token::Decrement
+        )
+    )
+}
+
+fn control_parenthesis(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::If | Token::While | Token::For | Token::Switch | Token::Catch
+    )
+}
+
+fn matching_open(
+    tokens: &[SpannedToken],
+    end: usize,
+    open: &Token,
+    close: &Token,
+) -> Option<usize> {
+    let mut depth = 0;
+    for index in (0..=end).rev() {
+        if &tokens[index].token == close {
+            depth += 1;
+        }
+        if &tokens[index].token == open {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
 }

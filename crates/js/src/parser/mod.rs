@@ -3,6 +3,7 @@
 use crate::ast::{Expr, Program};
 use crate::lexer::Token;
 use crate::stack::with_engine_stack;
+use std::borrow::Cow;
 use std::fmt;
 
 mod expressions;
@@ -51,10 +52,14 @@ type ParseResult<T> = Result<T, ParseError>;
 
 /// Parses a complete token stream into an owned program AST.
 ///
+/// Regular expressions must be supplied as [`Token::RegExp`]. Use
+/// [`crate::parse`] for source text so the parser can distinguish `/` as a
+/// regular-expression delimiter from division.
+///
 /// Simple statements accept an explicit `;`, or an automatic semicolon at a
 /// line terminator, before `}`, or at end of input. A line terminator directly
-/// after `return` produces an empty return. Empty statements, comma
-/// declarations, and trailing commas in calls are unsupported; object
+/// after `return` produces an empty return. Trailing commas in calls are
+/// unsupported; object
 /// literals allow a trailing comma. A `{` at the start of a statement opens a
 /// block, as in JavaScript, so wrap an object literal statement in
 /// parentheses: `({ a: 1 })`.
@@ -116,7 +121,9 @@ const MAX_EXPRESSION_DEPTH: usize = 512;
 const NESTING_ERROR: &str = "Maximum parser nesting exceeded";
 
 struct Parser<'tokens> {
-    tokens: &'tokens [Token],
+    tokens: Cow<'tokens, [Token]>,
+    source: Option<&'tokens str>,
+    offsets: Vec<usize>,
     position: usize,
     depth: usize,
     function_depth: usize,
@@ -130,13 +137,15 @@ struct Parser<'tokens> {
     labels: Vec<(String, bool, usize)>,
     /// Nonzero while parsing a class method body, where `super` is valid.
     method_depth: usize,
-    line_terminators_before: &'tokens [bool],
+    line_terminators_before: Cow<'tokens, [bool]>,
 }
 
 impl<'tokens> Parser<'tokens> {
     fn new(tokens: &'tokens [Token], line_terminators_before: &'tokens [bool]) -> Self {
         Self {
-            tokens,
+            tokens: Cow::Borrowed(tokens),
+            source: None,
+            offsets: Vec::new(),
             position: 0,
             depth: 0,
             function_depth: 0,
@@ -144,7 +153,7 @@ impl<'tokens> Parser<'tokens> {
             breakables: Vec::new(),
             labels: Vec::new(),
             method_depth: 0,
-            line_terminators_before,
+            line_terminators_before: Cow::Borrowed(line_terminators_before),
         }
     }
 
@@ -168,7 +177,7 @@ impl<'tokens> Parser<'tokens> {
             message: message.into(),
             context,
             found: self.peek().map(|token| format!("{token:?}")),
-            offset: None,
+            offset: self.offsets.get(self.position).copied(),
             line: None,
             column: None,
         }
@@ -310,5 +319,76 @@ impl<'tokens> Parser<'tokens> {
         self.labels.iter().rev().any(|(label, loop_target, depth)| {
             label == name && *depth == self.function_depth && (!require_loop || *loop_target)
         })
+    }
+}
+
+/// Parses source with the parser selecting the regular-expression lexical goal.
+pub(crate) fn parse_source(source: &str) -> ParseResult<Program> {
+    with_engine_stack(|| {
+        let mut parser = Parser::new(&[], &[]);
+        parser.source = Some(source);
+        parser.retokenize(0);
+        let mut body = Vec::new();
+        while parser.peek().is_some() {
+            body.push(parser.parse_statement()?);
+        }
+        Ok(Program { body })
+    })
+}
+
+impl Parser<'_> {
+    // Re-scan after a regex delimiter: the context-free lexer may have treated
+    // quotes, comment markers, or braces inside the pattern as JS syntax.
+    fn retokenize(&mut self, start: usize) {
+        let source = self.source.expect("source parser");
+        let entries = crate::lexer::tokenize_spanned(&source[start..]);
+        self.tokens.to_mut().truncate(self.position);
+        self.offsets.truncate(self.position);
+        self.line_terminators_before
+            .to_mut()
+            .truncate(self.position);
+        let mut previous_end = start;
+        for entry in entries {
+            let offset = start + entry.start;
+            self.offsets.push(offset);
+            self.line_terminators_before.to_mut().push(
+                source[previous_end..offset]
+                    .chars()
+                    .any(|ch| matches!(ch, '\n' | '\r' | '\u{2028}' | '\u{2029}')),
+            );
+            previous_end = start + entry.end;
+            self.tokens.to_mut().push(entry.token);
+        }
+    }
+
+    fn parse_regexp(&mut self) -> ParseResult<(Expr, usize)> {
+        let (pattern, flags, end) = match self.peek() {
+            Some(Token::RegExp { pattern, flags }) => (pattern.clone(), flags.clone(), None),
+            _ => {
+                let source = self.source.ok_or_else(|| {
+                    self.error(
+                        "Regular expression literals require source-level parsing",
+                        "regular expression literal",
+                    )
+                })?;
+                let start = self.offsets[self.position];
+                let (pattern, flags, end) = crate::lexer::regexp_literal(source, start)
+                    .map_err(|message| self.error(message, "regular expression literal"))?;
+                (pattern, flags, Some(end))
+            }
+        };
+        crate::runtime::regexp::validate(&pattern, &flags)
+            .map_err(|message| self.error(message, "regular expression literal"))?;
+        if let Some(end) = end {
+            self.tokens.to_mut()[self.position] = Token::RegExp {
+                pattern: pattern.clone(),
+                flags: flags.clone(),
+            };
+            self.position += 1;
+            self.retokenize(end);
+        } else {
+            self.advance();
+        }
+        Ok((Expr::RegExp { pattern, flags }, 1))
     }
 }

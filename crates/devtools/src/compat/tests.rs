@@ -47,7 +47,7 @@ fn reports_unsupported_javascript_syntax_with_locations() {
         .expect("for loops are not implemented by the engine");
     assert_eq!(for_loop.location.as_deref(), Some("inline script #1:2"));
     assert_eq!(for_loop.evidence, Evidence::Probed);
-    assert!(has(
+    assert!(!has(
         &report,
         Area::JavaScriptSyntax,
         "Regular expression literals"
@@ -58,12 +58,8 @@ fn reports_unsupported_javascript_syntax_with_locations() {
         Area::JavaScriptSyntax,
         "Arrow functions (=>)"
     ));
-    // The engine's own parser names the script it cannot run.
-    assert!(has(
-        &report,
-        Area::ScriptExecution,
-        "inline script #1 cannot be parsed"
-    ));
+    // Regex literals are accepted by the parser; the remaining for-loop gap
+    // is reported by the syntax probe above.
 }
 
 #[test]

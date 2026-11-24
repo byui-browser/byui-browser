@@ -141,6 +141,17 @@ pub(crate) fn get_number_property(key: &str) -> JsResult<Value> {
 }
 
 fn install_string_methods(prototype: &Object) {
+    for name in ["match", "search"] {
+        set_method(
+            prototype,
+            name,
+            Arc::new(move |args| {
+                let text = this_string()?;
+                Ok(super::regexp::string_method(name, &text, args)?.expect("match/search handled"))
+            }),
+        );
+    }
+
     set_method(
         prototype,
         "charAt",
@@ -345,6 +356,9 @@ fn install_string_methods(prototype: &Object) {
         "split",
         Arc::new(|args| {
             let text = this_string()?;
+            if let Some(value) = super::regexp::string_method("split", &text, args)? {
+                return Ok(value);
+            }
             let separator = args.first().map(|value| value.to_string());
             let limit = args
                 .get(1)
@@ -376,6 +390,9 @@ fn install_string_methods(prototype: &Object) {
         "replace",
         Arc::new(|args| {
             let text = this_string()?;
+            if let Some(value) = super::regexp::string_method("replace", &text, args)? {
+                return Ok(value);
+            }
             let search = to_string_arg(args.first());
             let replacement = to_string_arg(args.get(1));
             Ok(Value::String(text.replacen(&search, &replacement, 1)))

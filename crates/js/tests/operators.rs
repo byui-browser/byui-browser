@@ -364,7 +364,7 @@ fn unsupported_operator_syntax_is_a_syntax_error() {
         "1 ?? 2 || 3",
         "1 && 2 ?? 3",
         "let x = 1; delete x",
-        "/a/",
+        "/a/gg",
     ] {
         let error = run(source).expect_err(source);
         assert_eq!(error.category, JsErrorCategory::Syntax, "{source}");

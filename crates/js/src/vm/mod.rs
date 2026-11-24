@@ -340,6 +340,14 @@ impl Vm {
             // Set when the instruction pushed or popped a frame.
             let mut switched = false;
             match instruction {
+                Instruction::NewRegExp { pattern, flags } => {
+                    let pattern = property_name(&chunk, pattern)?;
+                    let flags = property_name(&chunk, flags)?;
+                    self.push(Value::Object(crate::runtime::regexp::create(
+                        &pattern, &flags,
+                    )?));
+                }
+
                 Instruction::Constant(index) => self.push(
                     chunk
                         .constants

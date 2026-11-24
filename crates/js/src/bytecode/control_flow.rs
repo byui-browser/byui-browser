@@ -429,10 +429,8 @@ impl Compiler {
     ) -> Result<bool, super::CompileError> {
         let outer_scope = self.scopes.len();
         let loop_scope = self.enter_block()?;
-        if let Some(Statement::VariableDeclaration { kind, name, .. }) = init
-            && *kind != VarKind::Var
-        {
-            self.add_binding(loop_scope, name, *kind)?;
+        if let Some(init) = init {
+            self.collect_block_bindings(loop_scope, init.declaration_entries())?;
         }
         let enter = self.chunk.emit(Instruction::EnterScope(0));
         self.emit_scope_declarations(loop_scope)?;

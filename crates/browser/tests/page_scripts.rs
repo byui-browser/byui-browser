@@ -581,3 +581,72 @@ fn linked_script_finds_page_elements_and_handles_their_clicks() {
         .expect("button click should dispatch");
     assert_eq!(alert.messages.lock().unwrap().as_slice(), ["Clicked"]);
 }
+
+#[test]
+fn page_script_initializes_dom_with_declaration_lists_and_hex_numbers() {
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+    let session = BrowserRuntime::in_memory()
+        .open_page_session(
+            "<main id='status'></main><script>\
+                var mask = 0xffff, value = 0X2a;\
+                let element = document.getElementById('status'), text = 'Ready';\
+                element.textContent = text + ': ' + (value & mask);\
+             </script>",
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            security_context(),
+        )
+        .expect("page session");
+    assert!(session.initial_script_errors().is_empty());
+    assert_eq!(
+        session
+            .evaluate_script("document.getElementById('status').textContent")
+            .unwrap(),
+        js::Value::String("Ready: 42".into()),
+    );
+}
+
+#[test]
+fn page_scripts_use_regular_expressions_to_build_and_update_the_dom() {
+    let controller = Arc::new(
+        net::RequestController::builder(net::Config::default())
+            .build()
+            .expect("network client"),
+    );
+    let session = BrowserRuntime::in_memory()
+        .open_page_session(
+            r#"<main id="status"></main>
+               <script>
+                 var email = /^\S+@\S+\.\S+$/i;
+                 var label = ' SIGN IN '.replace(/^\s+|\s+$/g, '');
+                 if (email.test('student@example.com')) {
+                   document.getElementById('status').textContent = label;
+                 }
+               </script>
+               <script>
+                 var parts = 'one,two'.split(/\s*,\s*/);
+                 document.getElementById('status').textContent += ': ' + parts[1];
+               </script>"#,
+            Arc::new(TestConsole::default()),
+            Arc::new(TestAlert::default()),
+            controller,
+            security_context(),
+        )
+        .expect("page session");
+    assert!(
+        session.initial_script_errors().is_empty(),
+        "{:?}",
+        session.initial_script_errors()
+    );
+    assert_eq!(
+        session
+            .evaluate_script("document.getElementById('status').textContent")
+            .unwrap(),
+        js::Value::String("SIGN IN: two".into()),
+    );
+}

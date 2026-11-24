@@ -1254,6 +1254,7 @@ fn lexer_splits_templates_into_text_and_substitutions() {
         vec![Token::Template {
             quasis: vec!["a".into(), "c".into()],
             expressions: vec![vec![ident("b")]],
+            sources: vec!["b".into()],
         }]
     );
     assert_eq!(
@@ -1269,6 +1270,7 @@ fn lexer_splits_templates_into_text_and_substitutions() {
                 Token::Dot,
                 ident("a"),
             ]],
+            sources: vec![" {a: 1}.a ".into()],
         }]
     );
     assert_eq!(
@@ -1279,7 +1281,9 @@ fn lexer_splits_templates_into_text_and_substitutions() {
                 expressions: vec![vec![Token::Template {
                     quasis: vec!["b".into()],
                     expressions: vec![],
+                    sources: vec![],
                 }]],
+                sources: vec!["`b`".into()],
             },
             Token::Plus,
             Token::Number(1.0),
@@ -1470,10 +1474,10 @@ fn parser_builds_update_template_and_spread_nodes() {
 fn parser_rejects_unsupported_forms_with_specific_messages() {
     for (source, message) in [
         (
-            "let r = /a/;",
-            "Regular expression literals are not supported",
+            "let r = /a/gg;",
+            "Invalid or unsupported regular expression flag",
         ),
-        ("/=/", "Regular expression literals are not supported"),
+        ("/unterminated", "Unterminated regular expression literal"),
         (
             "let t = 1; t`x`",
             "Tagged template literals are not supported",

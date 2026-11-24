@@ -35,7 +35,7 @@ invalid parameters, and execution limits in both engines.
 ### Rejected while parsing (`JsErrorCategory::Syntax`)
 
 - Array literals.
-- Update and compound assignment on anything but a variable or member, `delete name`, `-a ** b`, `??` mixed with `||`/`&&`, regular-expression literals, and tagged templates. The rest of the expression forms (`++`, `+=`, `typeof`, `?:`, `?.`, `??`, templates, spread, ...) are supported; see [expression-forms.md](expression-forms.md).
+- Update and compound assignment on anything but a variable or member, `delete name`, `-a ** b`, `??` mixed with `||`/`&&`, malformed regular-expression literals, and tagged templates. The rest of the expression forms (`++`, `+=`, `typeof`, `?:`, `?.`, `??`, templates, spread, ...) are supported; see [expression-forms.md](expression-forms.md).
 - Unterminated template literals.
 - `for` loops.
 - Declaring several variables in one statement (`let a = 1, b = 2;`).

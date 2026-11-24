@@ -1,5 +1,5 @@
 //! Native error constructors (`Error`, `RangeError`, `ReferenceError`,
-//! `URIError`) and the URI decoding global `decodeURIComponent`.
+//! `URIError`, `SyntaxError`, `TypeError`) and the URI decoding global `decodeURIComponent`.
 //!
 //! Every native error prototype inherits from the shared `Error.prototype`,
 //! so `new RangeError() instanceof Error` holds. Instances own a string
@@ -17,7 +17,14 @@ use super::{Function, Object, host_this};
 use crate::{JsError, Value};
 
 /// The native error kinds this module provides, in installation order.
-const KINDS: &[&str] = &["Error", "RangeError", "ReferenceError", "URIError"];
+const KINDS: &[&str] = &[
+    "Error",
+    "RangeError",
+    "ReferenceError",
+    "URIError",
+    "SyntaxError",
+    "TypeError",
+];
 
 /// Installs the native error constructors and `decodeURIComponent`.
 pub(super) fn install(state: &super::GlobalState) {
@@ -63,10 +70,14 @@ fn kind_prototype(kind: &str) -> Object {
     static RANGE: OnceLock<Object> = OnceLock::new();
     static REFERENCE: OnceLock<Object> = OnceLock::new();
     static URI: OnceLock<Object> = OnceLock::new();
+    static SYNTAX: OnceLock<Object> = OnceLock::new();
+    static TYPE: OnceLock<Object> = OnceLock::new();
     let slot = match kind {
         "RangeError" => &RANGE,
         "ReferenceError" => &REFERENCE,
         "URIError" => &URI,
+        "SyntaxError" => &SYNTAX,
+        "TypeError" => &TYPE,
         _ => return error_prototype(),
     };
     slot.get_or_init(|| {
@@ -86,10 +97,14 @@ fn error_constructor(kind: &str) -> Function {
     static RANGE: OnceLock<Function> = OnceLock::new();
     static REFERENCE: OnceLock<Function> = OnceLock::new();
     static URI: OnceLock<Function> = OnceLock::new();
+    static SYNTAX: OnceLock<Function> = OnceLock::new();
+    static TYPE: OnceLock<Function> = OnceLock::new();
     let slot = match kind {
         "RangeError" => &RANGE,
         "ReferenceError" => &REFERENCE,
         "URIError" => &URI,
+        "SyntaxError" => &SYNTAX,
+        "TypeError" => &TYPE,
         _ => &ERROR,
     };
     slot.get_or_init(|| build_error_constructor(kind)).clone()
