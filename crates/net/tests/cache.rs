@@ -1259,17 +1259,38 @@ fn clear_cache_forces_a_new_network_request() {
         observed_hits.fetch_add(1, Ordering::SeqCst);
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_vec()
     });
-    let controller = cache_controller();
+    let controller = RequestController::builder(Config::default())
+        .with_browser_capabilities(Arc::new(SameOriginCacheServices))
+        .build()
+        .unwrap();
 
     runtime().block_on(async {
-        let request = Request::get(server.url());
+        let mut request = Request::get(server.url());
+        request.set_mode(RequestMode::SameOrigin).unwrap();
+        request.set_environment(
+            FetchEnvironment::from_url(reqwest::Url::parse(request.url()).unwrap()).unwrap(),
+        );
         let first = controller
             .fetch(request.try_clone().unwrap())
             .await
             .unwrap();
         assert!(!first.from_cache);
         collect_body(first).await.unwrap();
-        assert!(wait_for_cached(&controller, &request).await.from_cache);
+        let cached = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut probe = request.try_clone().unwrap();
+                probe.set_cache_mode(CacheMode::OnlyIfCached);
+                match controller.fetch(probe).await {
+                    Ok(response) if response.from_cache => break response,
+                    Err(RequestError::NetworkError) => tokio::task::yield_now().await,
+                    Ok(_) => panic!("only-if-cached response must come from the cache"),
+                    Err(error) => panic!("cache probe failed unexpectedly: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("initial body capture should finish within five seconds");
+        drop(cached);
         controller.clear_cache();
         assert!(!controller.fetch(request).await.unwrap().from_cache);
     });

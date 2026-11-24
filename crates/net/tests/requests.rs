@@ -4,9 +4,9 @@ mod common;
 
 use common::{TestServer, runtime};
 use net::{
-    Body, CachePartitionService, Config, CookieService, FetchEnvironment, Request,
-    RequestController, RequestError, RequestPolicyService, ResponseInfo, ResponsePolicyService,
-    SchemeProviders, ServiceWorkerDecision, ServiceWorkerService,
+    Body, CacheMode, CachePartitionService, Config, CookieService, FetchEnvironment, Request,
+    RequestController, RequestError, RequestMode, RequestPolicyService, ResponseInfo,
+    ResponsePolicyService, SchemeProviders, ServiceWorkerDecision, ServiceWorkerService,
 };
 use std::sync::{
     Arc,
@@ -431,17 +431,31 @@ fn cached_browser_response_is_rechecked_before_exposure() {
         .build()
         .unwrap();
     let mut request = Request::get(server.url());
+    request.set_mode(RequestMode::SameOrigin).unwrap();
     request.set_environment(
         FetchEnvironment::from_url(reqwest::Url::parse(&server.url()).unwrap()).unwrap(),
     );
+    request.set_cache_mode(CacheMode::OnlyIfCached);
     let runtime = runtime();
     let error = runtime.block_on(async {
-        let response = controller
-            .fetch(request.try_clone().unwrap())
-            .await
-            .unwrap();
+        let mut initial_request = request.try_clone().unwrap();
+        initial_request.set_cache_mode(CacheMode::Default);
+        let response = controller.fetch(initial_request).await.unwrap();
         response.body.bytes().await.unwrap();
-        controller.fetch(request).await.unwrap_err()
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match controller.fetch(request.try_clone().unwrap()).await {
+                    Err(error @ RequestError::UnsupportedFeature("cached response policy")) => {
+                        break error;
+                    }
+                    Err(RequestError::NetworkError) => tokio::task::yield_now().await,
+                    Ok(_) => panic!("only-if-cached response must not bypass the cache policy"),
+                    Err(error) => panic!("cache probe failed unexpectedly: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("cached response policy should be rechecked within five seconds")
     });
     server.join();
     assert!(matches!(
