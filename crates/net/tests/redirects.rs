@@ -468,7 +468,7 @@ fn redirect_response_is_finalized_before_target_policy_rejection() {
 #[test]
 fn redirect_rejects_embedded_credentials_before_following() {
     let server = TestServer::start(1, |_| {
-        b"HTTP/1.1 302 Found\r\nLocation: http://user:secret@127.0.0.1:9/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        b"HTTP/1.1 302 Found\r\nLocation: http://user:secret@127.0.0.1:0/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
     });
     let controller = RequestController::builder(Config::default())
         .build()
@@ -739,7 +739,7 @@ fn error_redirect_does_not_run_response_policy_or_store_cookies() {
 #[test]
 fn cors_rejects_an_unapproved_redirect_response_before_following() {
     let server = TestServer::start(1, |_| {
-        b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:0/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
     });
     let controller = RequestController::builder(Config::default())
         .with_browser_capabilities(Arc::new(RedirectServices::default()))
@@ -930,7 +930,7 @@ fn post_to_get_redirect_invalidates_the_target_cache_entry() {
 #[test]
 fn same_origin_mode_blocks_a_cross_origin_redirect_before_transport() {
     let server = TestServer::start(1, |_| {
-        b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:0/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
     });
     let controller = RequestController::builder(Config::default())
         .with_browser_capabilities(Arc::new(RedirectServices::default()))

@@ -6,8 +6,9 @@ use std::{
     io::Write,
     net::TcpListener,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
     thread,
     time::Duration,
@@ -15,14 +16,50 @@ use std::{
 
 use common::{TestServer, read_request, runtime};
 use futures_util::StreamExt;
-use net::{AbortController, CacheMode, Config, Request, RequestController, RequestError};
+use net::{
+    AbortController, CacheMode, Config, NetworkEvent, NetworkObserver, NetworkPhase, Request,
+    RequestController, RequestError,
+};
 
-const SCHEDULER_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
+const ASYNC_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct QueueObserver {
+    phases: Mutex<Vec<(u64, NetworkPhase)>>,
+    notified: tokio::sync::Notify,
+}
+
+impl QueueObserver {
+    fn saw(&self, request_id: u64, phase: NetworkPhase) -> bool {
+        self.phases.lock().unwrap().contains(&(request_id, phase))
+    }
+
+    async fn wait_for(&self, request_id: u64, phase: NetworkPhase) {
+        loop {
+            let notified = self.notified.notified();
+            if self.saw(request_id, phase) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl NetworkObserver for QueueObserver {
+    fn observe(&self, event: NetworkEvent) {
+        self.phases
+            .lock()
+            .unwrap()
+            .push((event.request_id, event.phase));
+        self.notified.notify_waiters();
+    }
+}
 
 #[test]
 fn fetch_yields_body_chunks_before_response_completion() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
+    let (release_tx, release_rx) = mpsc::channel();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         read_request(&mut stream);
@@ -30,7 +67,9 @@ fn fetch_yields_body_chunks_before_response_completion() {
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello")
             .unwrap();
         stream.flush().unwrap();
-        thread::sleep(Duration::from_millis(100));
+        release_rx
+            .recv_timeout(ASYNC_TEST_TIMEOUT)
+            .expect("test should release the remaining response bytes");
         let _ = stream.write_all(b" world");
     });
 
@@ -41,6 +80,7 @@ fn fetch_yields_body_chunks_before_response_completion() {
         let mut response = controller.fetch(Request::get(url)).await.unwrap();
         let length = response.body.length();
         let chunk = response.body.next().await.unwrap().unwrap().to_vec();
+        release_tx.send(()).unwrap();
         (length, chunk)
     });
 
@@ -81,7 +121,7 @@ fn incomplete_stream_forwards_error_and_is_not_cached() {
             }
         }
         let retry = tokio::time::timeout(
-            SCHEDULER_RELEASE_TIMEOUT,
+            ASYNC_TEST_TIMEOUT,
             controller.fetch(Request::get(server.url())),
         )
         .await
@@ -125,7 +165,7 @@ fn failed_cloned_response_releases_permit_and_is_not_cached() {
         assert!(matches!(cloned, Err(RequestError::Transport(_))));
 
         let retry = tokio::time::timeout(
-            SCHEDULER_RELEASE_TIMEOUT,
+            ASYNC_TEST_TIMEOUT,
             controller.fetch(Request::get(server.url())),
         )
         .await
@@ -163,11 +203,10 @@ fn dropping_a_stream_releases_its_scheduler_permit() {
         drop(response);
         let mut retry_request = Request::get(server.url());
         retry_request.set_cache_mode(CacheMode::Reload);
-        let retry =
-            tokio::time::timeout(SCHEDULER_RELEASE_TIMEOUT, controller.fetch(retry_request))
-                .await
-                .expect("dropped stream should release its scheduler permit")
-                .unwrap();
+        let retry = tokio::time::timeout(ASYNC_TEST_TIMEOUT, controller.fetch(retry_request))
+            .await
+            .expect("dropped stream should release its scheduler permit")
+            .unwrap();
         assert!(!retry.from_cache);
         assert_eq!(retry.body.bytes().await.unwrap(), b"body");
     });
@@ -203,7 +242,7 @@ fn aborting_after_headers_releases_the_permit_and_does_not_cache() {
         ));
 
         let retry = tokio::time::timeout(
-            SCHEDULER_RELEASE_TIMEOUT,
+            ASYNC_TEST_TIMEOUT,
             controller.fetch(Request::get(server.url())),
         )
         .await
@@ -244,7 +283,7 @@ fn aborting_cloned_response_releases_permit_and_prevents_cache_capture() {
         assert!(matches!(cloned, Err(RequestError::Aborted)));
 
         let retry = tokio::time::timeout(
-            SCHEDULER_RELEASE_TIMEOUT,
+            ASYNC_TEST_TIMEOUT,
             controller.fetch(Request::get(server.url())),
         )
         .await
@@ -263,10 +302,12 @@ fn cloned_response_holds_one_permit_until_both_branches_are_dropped() {
     let server = TestServer::start(2, |_| {
         b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody".to_vec()
     });
+    let observer = Arc::new(QueueObserver::default());
     let controller = RequestController::builder(Config {
         max_in_flight: 1,
         ..Config::default()
     })
+    .with_network_observer(observer.clone())
     .build()
     .unwrap();
 
@@ -280,18 +321,22 @@ fn cloned_response_holds_one_permit_until_both_branches_are_dropped() {
         let clone = first.try_clone().unwrap();
         drop(first);
 
-        let second = controller.fetch(request);
-        tokio::pin!(second);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut second)
-                .await
-                .is_err()
-        );
+        let mut second_request = Request::get(server.url());
+        second_request.set_cache_mode(CacheMode::NoStore);
+        let second_id = second_request.id();
+        let second_controller = controller.clone();
+        let second = tokio::spawn(async move { second_controller.fetch(second_request).await });
+        observer
+            .wait_for(second_id, NetworkPhase::QueueStarted)
+            .await;
+        tokio::task::yield_now().await;
+        assert!(!observer.saw(second_id, NetworkPhase::QueueAdmitted));
 
         drop(clone);
-        let response = tokio::time::timeout(Duration::from_secs(1), second)
+        let response = tokio::time::timeout(ASYNC_TEST_TIMEOUT, second)
             .await
             .expect("dropping both branches should release the permit")
+            .unwrap()
             .unwrap();
         assert_eq!(response.body.bytes().await.unwrap(), b"body");
     });

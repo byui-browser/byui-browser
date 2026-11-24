@@ -363,7 +363,7 @@ fn browser_context_fails_closed_when_a_required_capability_is_missing() {
     ];
 
     for (controller, missing) in controllers {
-        let mut request = Request::get("http://127.0.0.1:9/");
+        let mut request = Request::get("http://127.0.0.1:0/");
         request.set_environment(
             FetchEnvironment::from_url(reqwest::Url::parse("https://client.test/").unwrap())
                 .unwrap(),
@@ -558,16 +558,16 @@ fn rejected_http_response_does_not_store_cookies_or_enter_cache() {
 
 #[test]
 fn unsupported_request_features_fail_before_browser_service_or_network_side_effects() {
-    let mut integrity = Request::get("http://127.0.0.1:9/");
+    let mut integrity = Request::get("http://127.0.0.1:0/");
     integrity.set_integrity(Some("sha256-example".into()));
 
-    let mut priority = Request::get("http://127.0.0.1:9/");
+    let mut priority = Request::get("http://127.0.0.1:0/");
     priority.set_priority(net::RequestPriority::High);
 
-    let mut keepalive = Request::get("http://127.0.0.1:9/");
+    let mut keepalive = Request::get("http://127.0.0.1:0/");
     keepalive.set_keepalive(true);
 
-    let mut navigation = Request::get("http://127.0.0.1:9/");
+    let mut navigation = Request::get("http://127.0.0.1:0/");
     navigation.set_mode(net::RequestMode::Navigate).unwrap();
 
     for (request, feature) in [
@@ -602,7 +602,7 @@ fn service_worker_interception_fails_before_cache_cookie_or_transport_work() {
         .unwrap();
 
     let error = runtime()
-        .block_on(controller.fetch(Request::get("http://127.0.0.1:9/")))
+        .block_on(controller.fetch(Request::get("http://127.0.0.1:0/")))
         .unwrap_err();
 
     assert!(matches!(
@@ -654,7 +654,7 @@ fn connection_refusal_is_a_typed_transport_error() {
         .unwrap();
 
     assert!(matches!(
-        runtime().block_on(controller.fetch(Request::get("http://127.0.0.1:9/"))),
+        runtime().block_on(controller.fetch(Request::get("http://127.0.0.1:0/"))),
         Err(RequestError::Transport(_))
     ));
 }

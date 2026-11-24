@@ -381,10 +381,10 @@ fn completed_background_capture_is_cached() {
                     Ok(response) if response.from_cache => break response,
                     Ok(response) => {
                         let _ = response.body.bytes().await;
-                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        tokio::task::yield_now().await;
                     }
                     Err(RequestError::NetworkError | RequestError::Transport(_)) => {
-                        tokio::time::sleep(Duration::from_millis(1)).await
+                        tokio::task::yield_now().await
                     }
                     Err(error) => panic!("cache probe failed unexpectedly: {error}"),
                 }

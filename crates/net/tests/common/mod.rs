@@ -13,6 +13,8 @@ use std::{
 
 use net::{RequestError, Response};
 
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().expect("Tokio runtime should initialize")
 }
@@ -23,14 +25,16 @@ pub async fn collect_body(response: Response) -> Result<Vec<u8>, RequestError> {
 
 pub struct TestServer {
     url: String,
-    thread: thread::JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
 }
 
 impl TestServer {
-    /// Starts a minimal HTTP/1.1 server that remains available until `join`.
-    /// `connections` is retained for compatibility with existing test call sites.
-    pub fn start<F>(_connections: usize, response: F) -> Self
+    /// Starts a minimal concurrent HTTP/1.1 server that remains available until `join`.
+    ///
+    /// `expected_connections` is a sizing hint. Each accepted connection runs
+    /// on its own worker so tests can exercise transport concurrency.
+    pub fn start<F>(expected_connections: usize, response: F) -> Self
     where
         F: Fn(&str) -> Vec<u8> + Send + Sync + 'static,
     {
@@ -43,16 +47,26 @@ impl TestServer {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let thread = thread::spawn(move || {
+            let mut workers = Vec::with_capacity(expected_connections);
             while !worker_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         stream
                             .set_nonblocking(false)
                             .expect("server should set accepted socket to blocking");
-                        let request = read_request(&mut stream);
                         stream
-                            .write_all(response(&request).as_slice())
-                            .expect("server should write response");
+                            .set_read_timeout(Some(SOCKET_TIMEOUT))
+                            .expect("server should set read timeout");
+                        stream
+                            .set_write_timeout(Some(SOCKET_TIMEOUT))
+                            .expect("server should set write timeout");
+                        let response = Arc::clone(&response);
+                        workers.push(thread::spawn(move || {
+                            let request = read_request(&mut stream);
+                            stream
+                                .write_all(response(&request).as_slice())
+                                .expect("server should write response");
+                        }));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(1));
@@ -60,21 +74,46 @@ impl TestServer {
                     Err(error) => panic!("server should accept request: {error}"),
                 }
             }
+            for worker in workers {
+                worker.join().expect("server connection worker should exit");
+            }
         });
-        Self { url, thread, stop }
+        Self {
+            url,
+            thread: Some(thread),
+            stop,
+        }
     }
 
     pub fn url(&self) -> String {
         self.url.clone()
     }
 
-    pub fn join(self) {
+    pub fn join(mut self) {
+        self.stop_and_join(true);
+    }
+
+    fn stop_and_join(&mut self, propagate_panic: bool) {
         self.stop.store(true, Ordering::SeqCst);
-        self.thread.join().expect("server should exit");
+        if let Some(thread) = self.thread.take() {
+            let result = thread.join();
+            if propagate_panic {
+                result.expect("server should exit");
+            }
+        }
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.stop_and_join(false);
     }
 }
 
 pub fn read_request(stream: &mut TcpStream) -> String {
+    stream
+        .set_read_timeout(Some(SOCKET_TIMEOUT))
+        .expect("server should set request read timeout");
     // Read through the request body so assertions inspect the complete request
     // even when the operating system splits it across multiple TCP reads.
     let mut bytes = Vec::new();
@@ -105,26 +144,4 @@ pub fn read_request(stream: &mut TcpStream) -> String {
         }
     }
     String::from_utf8_lossy(&bytes).into_owned()
-}
-
-#[test]
-#[ignore = "For demonstration only."]
-pub fn fetch_image() {
-    // Fetches an image using the net crate and saves it to a file.
-    let url = "https://picsum.photos/200/300";
-    let runtime = runtime();
-    let body = runtime.block_on(async {
-        let controller = net::RequestController::builder(net::Config::default())
-            .build()
-            .expect("request controller should initialize");
-        controller
-            .fetch(net::Request::get(url))
-            .await
-            .expect("request should succeed")
-            .body
-            .bytes()
-            .await
-            .expect("response body should be readable")
-    });
-    std::fs::write("picture.png", body).expect("file should be written");
 }

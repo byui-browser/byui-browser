@@ -45,10 +45,10 @@ async fn wait_for_cached(controller: &RequestController, request: &Request) -> n
                 Ok(response) if response.from_cache => break response,
                 Ok(response) => {
                     let _ = response.body.bytes().await;
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    tokio::task::yield_now().await;
                 }
                 Err(RequestError::NetworkError | RequestError::Transport(_)) => {
-                    tokio::time::sleep(Duration::from_millis(1)).await
+                    tokio::task::yield_now().await
                 }
                 Err(error) => panic!("cache probe failed unexpectedly: {error}"),
             }
@@ -329,6 +329,7 @@ fn fully_consumed_stream_is_cached() {
         })
         .await
         .expect("fully consumed body should be cached within five seconds");
+        assert!(cached.from_cache);
         assert_eq!(cached.body.length(), Some(6));
         assert_eq!(cached.body.bytes().await.unwrap(), b"cached");
     });
@@ -1361,7 +1362,7 @@ fn reload_bypasses_cached_response_and_caches_the_refresh() {
                     Err(RequestError::NetworkError | RequestError::Transport(_)) => {}
                     Err(error) => panic!("cache probe failed unexpectedly: {error}"),
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
