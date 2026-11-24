@@ -39,8 +39,9 @@ pub(crate) struct Context<'a> {
 /// Grid modes are preserved distinctly in computed display values, but still
 /// use ordinary flow layout. Tables lay out direct children in one row; full
 /// row groups, column sizing, and collapsed borders are not implemented.
-/// Non-replaced boxes support `width: min-content`, `max-content`, and
-/// `fit-content`; intrinsic sizing keywords on `height` and replaced boxes
+/// Non-replaced boxes support `min-width`, `max-width`, `min-height`,
+/// `max-height`, and `width: min-content`, `max-content`, and `fit-content`;
+/// intrinsic sizing keywords on `height` and replaced boxes
 /// are not implemented. Other supported properties are margins, padding,
 /// `min-width`, `width`, `height`, `font-size`, `font-family`, `font-weight`,
 /// `font-style`, `color`, `background-color`, and the color component of the
@@ -72,8 +73,9 @@ pub(crate) struct Context<'a> {
 ///   `hidden`; boxes do not scroll.
 ///
 /// Border widths, colors, and styles paint on boxes. Min/max sizes apply to
-/// replaced elements; ordinary blocks and flex items also honor `min-width`.
-/// Other `min-*`/`max-*` constraints are incomplete.
+/// replaced elements, ordinary blocks, and flex items on their main axis;
+/// cross-axis flex item minimums and other `min-*`/`max-*` constraints are
+/// incomplete.
 /// Background images and full background layers and standards-complete
 /// `vertical-align` are not implemented.
 /// Content may overflow the viewport; the root box's rect stays viewport-sized.

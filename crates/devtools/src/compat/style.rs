@@ -1208,6 +1208,24 @@ fn property_has_effect(property: &str, values: &[String]) -> bool {
     // These properties need constraints, overflowing text, or keyframes to
     // demonstrate support. Generic values alone produce false negatives.
     let targeted = match property {
+        // The shorthand currently applies its color component; image, repeat,
+        // position, and sizing components are reported as separate gaps.
+        "background" => Some(differs("#t{background:#ff0000}", "")),
+        "opacity" => Some(fixture("#t{opacity:0.5}", |page| {
+            page.list.items.iter().any(|item| {
+                matches!(item, paint::DisplayItem::BeginLayer { opacity, .. } if *opacity == 0.5)
+            })
+        })),
+        "-webkit-box-shadow" => Some(same(
+            "#t{-webkit-box-shadow:2px 2px 3px red}",
+            "#t{box-shadow:2px 2px 3px red}",
+        )),
+        "vertical-align" => Some(differs("#s{vertical-align:super}", "")),
+        "font-family" => Some(fixture("#c{font-family:monospace}", |page| {
+            page.list.items.iter().any(|item| {
+                matches!(item, paint::DisplayItem::Text { text, font, .. } if text.contains("child one") && *font == layout::FontId(1))
+            })
+        })),
         "word-break" => Some(differs(
             "#c{width:16px;word-break:break-all}",
             "#c{width:16px;word-break:normal}",

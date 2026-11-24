@@ -419,7 +419,8 @@ fn visual_paint_properties_are_not_flagged_as_missing() {
     let report = audit(
         "",
         &[
-            ".a {opacity:0.5;border-color:red;font:bold 12px serif;overflow:hidden;z-index:2;\
+            ".a {background:red;opacity:0.5;border-color:red;font:bold 12px serif;overflow:hidden;z-index:2;\
+             -webkit-box-shadow:2px 2px 3px red;vertical-align:super;font-family:monospace;\
              font-weight:bold;-ms-transform:rotate(45deg);-webkit-transform:rotate(45deg);\
              font-style:italic;transform:rotate(45deg)}",
         ],
@@ -427,8 +428,12 @@ fn visual_paint_properties_are_not_flagged_as_missing() {
         None,
     );
     for property in [
+        "background",
         "opacity",
         "border-color",
+        "-webkit-box-shadow",
+        "vertical-align",
+        "font-family",
         "font",
         "overflow",
         "z-index",

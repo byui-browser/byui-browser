@@ -122,6 +122,19 @@ fn body_margin_offsets_blocks_that_fill_the_containing_block_width() {
 }
 
 #[test]
+fn max_width_and_max_height_constrain_ordinary_blocks() {
+    let (document, tree) = lay_out(
+        "<body><div id='target'>content</div></body>",
+        "body { margin: 0 } #target { width: 220px; height: 80px; \
+         max-width: 100px; max-height: 30px }",
+        300.0,
+    );
+    let target = box_for(&tree, &document, "target");
+    assert_close(target.rect.width, 100.0);
+    assert_close(target.rect.height, 30.0);
+}
+
+#[test]
 fn flex_row_distributes_grow_space_and_places_the_gap() {
     let (document, tree) = lay_out(
         "<body><div id='container'><div id='first'></div><div id='second'></div></div></body>",
