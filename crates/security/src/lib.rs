@@ -533,6 +533,17 @@ impl CookieJar {
         );
         matching_cookies
     }
+
+    /// Formats the cookies visible to `origin` as an HTTP `Cookie` header.
+    pub fn header_for(&self, origin: &Origin) -> Option<String> {
+        let header = self
+            .cookies_for(origin)
+            .into_iter()
+            .map(|cookie| format!("{}={}", cookie.name, cookie.value))
+            .collect::<Vec<_>>()
+            .join("; ");
+        (!header.is_empty()).then_some(header)
+    }
 }
 
 /// Security policy failure.

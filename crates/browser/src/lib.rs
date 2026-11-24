@@ -235,6 +235,20 @@ pub fn request_controller_with_observer(
     file_access: Option<FileAccessConfiguration>,
     observer: Option<Arc<dyn net::NetworkObserver>>,
 ) -> Arc<RequestController> {
+    request_controller_with_observer_and_policy(
+        file_access,
+        observer,
+        Arc::new(RwLock::new(PermissionPolicy::new())),
+    )
+}
+
+/// Builds a browser request controller using the supplied shared permission
+/// policy for browser-owned capabilities such as cookies.
+pub fn request_controller_with_observer_and_policy(
+    file_access: Option<FileAccessConfiguration>,
+    observer: Option<Arc<dyn net::NetworkObserver>>,
+    permission_policy: Arc<RwLock<PermissionPolicy>>,
+) -> Arc<RequestController> {
     let mut providers = SchemeProviders::new().with_page(byui_provider::provider());
     log::debug!(
         "building request controller (file provider: {})",
@@ -253,7 +267,12 @@ pub fn request_controller_with_observer(
             file_access.content_policy,
         ));
     }
-    let capabilities = Arc::new(fetch_capabilities::BrowserFetchCapabilities::default());
+    let capabilities = Arc::new(
+        fetch_capabilities::BrowserFetchCapabilities::with_permission_policy(
+            "browser-default",
+            permission_policy,
+        ),
+    );
     let builder = RequestController::builder(net::Config::default())
         .with_browser_capabilities(capabilities)
         .with_scheme_providers(providers);
@@ -517,6 +536,15 @@ impl BrowserRuntime {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .revoke(origin, permission);
+    }
+
+    /// Returns the shared policy used to create renderer contexts.
+    ///
+    /// Pass this handle to [`request_controller_with_observer_and_policy`] so
+    /// browser-owned request capabilities observe the same grants and denials.
+    #[must_use]
+    pub fn permission_policy(&self) -> Arc<RwLock<PermissionPolicy>> {
+        Arc::clone(&self.permission_policy)
     }
 
     /// Creates a renderer security context using this runtime's shared
