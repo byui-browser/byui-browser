@@ -434,14 +434,15 @@ fn cached_browser_response_is_rechecked_before_exposure() {
     request.set_environment(
         FetchEnvironment::from_url(reqwest::Url::parse(&server.url()).unwrap()).unwrap(),
     );
-    runtime().block_on(async {
+    let runtime = runtime();
+    let error = runtime.block_on(async {
         let response = controller
             .fetch(request.try_clone().unwrap())
             .await
             .unwrap();
         response.body.bytes().await.unwrap();
+        controller.fetch(request).await.unwrap_err()
     });
-    let error = runtime().block_on(controller.fetch(request)).unwrap_err();
     server.join();
     assert!(matches!(
         error,
