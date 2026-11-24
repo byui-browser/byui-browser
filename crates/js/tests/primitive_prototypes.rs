@@ -86,8 +86,7 @@ fn methods_are_shared_on_the_prototype() {
 
 #[test]
 fn user_properties_on_the_prototype_are_visible_to_primitives() {
-    // Function expressions are not in the supported subset yet, so install a
-    // data property to prove prototype lookup for script-defined names.
+    // A data property proves prototype lookup for script-defined names.
     assert_eq!(
         value("String.prototype.tag = 'marked'; 'hi'.tag"),
         string("marked")

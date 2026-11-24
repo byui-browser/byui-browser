@@ -22,6 +22,10 @@ pub(crate) struct TabState {
     pub title: String,
     pub chrome: ChromeState,
     pub browser_state: BrowserState,
+    /// Local session completions: label, target URL, optional open tab.
+    pub suggestions: Vec<(String, String, Option<TabId>)>,
+    /// Highlighted row; none keeps Enter submitting the typed text.
+    pub suggestion_selected: Option<usize>,
     pub address: String,
     pub address_before_edit: String,
     pub loaded_page: Option<browser::Page>,
@@ -79,6 +83,8 @@ impl TabState {
             title: "Welcome".into(),
             chrome: ChromeState::default(),
             browser_state: BrowserState::new(),
+            suggestions: Vec::new(),
+            suggestion_selected: None,
             address: "byui://welcome".into(),
             address_before_edit: "byui://welcome".into(),
             loaded_page: None,

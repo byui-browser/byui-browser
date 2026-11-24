@@ -18,6 +18,9 @@ fn primary(parser: &mut Parser<'_>) -> ParseResult<(Expr, usize)> {
         Some(Token::Null) => Expr::Null,
         Some(Token::Undefined) => Expr::Undefined,
         Some(Token::This) => Expr::This,
+        Some(Token::Function) => {
+            return super::super::statements::parse_function_expression(parser);
+        }
         Some(Token::New) => return parse_new(parser),
         Some(Token::Super) => return parse_super(parser),
         Some(Token::LeftBrace) => return super::object::parse(parser),

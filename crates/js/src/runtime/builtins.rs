@@ -20,6 +20,15 @@ pub(super) fn install(state: &super::GlobalState) {
     state.install_host("Symbol", Value::Function(symbol_constructor()));
     state.install_host("ArrayBuffer", Value::Function(array_buffer_constructor()));
     state.install_host("Uint8Array", Value::Function(uint8_array_constructor()));
+    for name in [
+        "Int8Array",
+        "Uint16Array",
+        "Uint32Array",
+        "Uint8ClampedArray",
+    ] {
+        state.install_host(name, Value::Function(typed_array_constructor(name)));
+    }
+    state.install_host("TextEncoder", Value::Function(text_encoder_constructor()));
 
     state.install_host("Reflect", Value::Object(reflect_namespace()));
     state.install_global_this();
@@ -170,9 +179,138 @@ pub(crate) fn value(name: &str) -> Option<Value> {
         "Symbol" => Some(Value::Function(symbol_constructor())),
         "ArrayBuffer" => Some(Value::Function(array_buffer_constructor())),
         "Uint8Array" => Some(Value::Function(uint8_array_constructor())),
+        "Int8Array" => Some(Value::Function(typed_array_constructor("Int8Array"))),
+        "Uint16Array" => Some(Value::Function(typed_array_constructor("Uint16Array"))),
+        "Uint32Array" => Some(Value::Function(typed_array_constructor("Uint32Array"))),
+        "Uint8ClampedArray" => Some(Value::Function(typed_array_constructor(
+            "Uint8ClampedArray",
+        ))),
+        "TextEncoder" => Some(Value::Function(text_encoder_constructor())),
         "Reflect" => Some(Value::Object(reflect_namespace())),
         _ => super::global_functions::value(name).or_else(|| super::errors::value(name)),
     }
+}
+
+fn typed_array_constructor(name: &'static str) -> Function {
+    Function::from_host_constructor(
+        name,
+        Arc::new(move |_| Err(JsError::new(format!("Constructor {name} requires 'new'")))),
+        Arc::new(move |args| {
+            let count = match args.first() {
+                Some(Value::Array(array)) => array
+                    .get("length")
+                    .and_then(|v| match v {
+                        Value::Number(n) => Some(n as usize),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+                Some(Value::Number(n)) => checked_length(*n)?,
+                _ => 0,
+            };
+            let bytes_per_element = match name {
+                "Uint16Array" => 2,
+                "Uint32Array" => 4,
+                _ => 1,
+            };
+            let data = Arc::new(Mutex::new(vec![0.0; count]));
+            if let Some(Value::Array(array)) = args.first() {
+                let mut target = data.lock().unwrap();
+                for (i, slot) in target.iter_mut().enumerate() {
+                    *slot = array
+                        .get(&i.to_string())
+                        .map(|v| numeric_value(&v))
+                        .unwrap_or(0.0);
+                    *slot = convert_typed(name, *slot);
+                }
+            }
+            let object = Object::new();
+            object.set_read_only("length", Value::Number(count as f64));
+            object.set_read_only(
+                "byteLength",
+                Value::Number((count * bytes_per_element) as f64),
+            );
+            let read = data.clone();
+            let write = data.clone();
+            object.set_property_hooks(
+                Arc::new(move |key| {
+                    key.parse::<usize>()
+                        .ok()
+                        .and_then(|i| read.lock().ok()?.get(i).copied())
+                        .map(|n| Ok(Some(Value::Number(n))))
+                        .unwrap_or(Ok(None))
+                }),
+                Arc::new(move |key, value| {
+                    let Ok(i) = key.parse::<usize>() else {
+                        return Ok(false);
+                    };
+                    let mut values = write.lock().unwrap();
+                    let Some(slot) = values.get_mut(i) else {
+                        return Err(JsError::new("typed-array index out of bounds"));
+                    };
+                    *slot = convert_typed(name, numeric_value(&value));
+                    Ok(true)
+                }),
+                Arc::new(move || Ok((0..count).map(|i| i.to_string()).collect())),
+            );
+            Ok(Value::Object(object))
+        }),
+    )
+}
+
+fn numeric_value(value: &Value) -> f64 {
+    match value {
+        Value::Number(n) => *n,
+        Value::Boolean(b) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        Value::Null => 0.0,
+        _ => 0.0,
+    }
+}
+
+fn convert_typed(name: &str, number: f64) -> f64 {
+    if !number.is_finite() {
+        return 0.0;
+    }
+    match name {
+        "Int8Array" => (number as i64 as i8) as f64,
+        "Uint16Array" => number.rem_euclid(65536.0).trunc(),
+        "Uint32Array" => number.rem_euclid(4294967296.0).trunc(),
+        "Uint8ClampedArray" => number.round_ties_even().clamp(0.0, 255.0),
+        _ => number.rem_euclid(256.0).trunc(),
+    }
+}
+
+fn text_encoder_constructor() -> Function {
+    Function::from_host_constructor(
+        "TextEncoder",
+        Arc::new(|_| Err(JsError::new("Constructor TextEncoder requires 'new'"))),
+        Arc::new(|_| {
+            let object = Object::new();
+            object.set_read_only("encoding", Value::String("utf-8".into()));
+            object.set_method(
+                "encode",
+                Arc::new(|args| {
+                    let text = match args.first() {
+                        Some(Value::String(s)) => s.clone(),
+                        None | Some(Value::Undefined) => String::new(),
+                        Some(v) => format!("{v:?}"),
+                    };
+                    let source = Object::new();
+                    source.set_property("length", Value::Number(text.len() as f64))?;
+                    for (index, byte) in text.as_bytes().iter().enumerate() {
+                        source.set_property(index.to_string(), Value::Number(f64::from(*byte)))?;
+                    }
+                    uint8_array_constructor().construct(&[Value::Array(source)])
+                }),
+            );
+            Ok(Value::Object(object))
+        }),
+    )
 }
 
 fn array_buffer_constructor() -> Function {

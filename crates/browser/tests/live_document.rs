@@ -62,6 +62,93 @@ fn inline_page(html: &str, script: &str) -> Page {
 }
 
 #[test]
+fn sign_in_form_initializes_and_handles_input_after_an_earlier_script_fails() {
+    let mut page = inline_page(
+        "<main><form id=\"signin\" class=\"hidden\"><button id=\"next\">Next</button></form></main>",
+        "",
+    );
+    page.scripts = vec![
+        "var reports = 0; window.onerror = function () { reports += 1; };".into(),
+        "var broken = ;".into(),
+        "(function () { \
+            var form = document.getElementById('signin'); \
+            form.setAttribute('class', 'visible'); \
+            form.setAttribute('data-ready', 'yes'); \
+            document.getElementById('next').addEventListener('click', function () { \
+                form.setAttribute('data-submitted', 'yes'); \
+            }); \
+         })();"
+            .into(),
+    ];
+
+    let (session, _) = open(&page);
+    assert_eq!(
+        session.initial_script_errors().len(),
+        1,
+        "{:?}",
+        session.initial_script_errors()
+    );
+    assert_eq!(
+        session.initial_script_errors()[0].category,
+        js::JsErrorCategory::Syntax
+    );
+    assert_eq!(
+        session.evaluate_script("reports"),
+        Ok(js::Value::Number(1.0))
+    );
+    let live = session.live_document();
+    assert_eq!(
+        attribute(&live, "signin", "class").as_deref(),
+        Some("visible")
+    );
+    assert_eq!(
+        attribute(&live, "signin", "data-ready").as_deref(),
+        Some("yes")
+    );
+
+    session
+        .dispatch_click_at(live.get_element_by_id("next").unwrap())
+        .unwrap();
+    assert_eq!(
+        attribute(&session.live_document(), "signin", "data-submitted").as_deref(),
+        Some("yes")
+    );
+}
+
+#[test]
+fn runtime_error_preserves_prior_dom_changes_listeners_and_microtasks() {
+    let mut page = inline_page("<button id=\"button\">Next</button>", "");
+    page.scripts = vec![
+        "var order = ''; \
+         document.getElementById('button').setAttribute('data-before', 'yes'); \
+         document.getElementById('button').addEventListener('click', function () { order += 'click'; }); \
+         queueMicrotask(function () { order += 'microtask'; }); \
+         throw 'boom'; order += 'unreachable';".into(),
+        "order += '|next'; window.onload = function () { order += '|load'; };".into(),
+    ];
+
+    let (session, _) = open(&page);
+    assert_eq!(session.initial_script_errors().len(), 1);
+    assert_eq!(session.initial_script_errors()[0].message, "Uncaught boom");
+    let live = session.live_document();
+    assert_eq!(
+        attribute(&live, "button", "data-before").as_deref(),
+        Some("yes")
+    );
+    assert_eq!(
+        session.evaluate_script("order"),
+        Ok(js::Value::String("microtask|next|load".into()))
+    );
+    session
+        .dispatch_click_at(live.get_element_by_id("button").unwrap())
+        .unwrap();
+    assert_eq!(
+        session.evaluate_script("order"),
+        Ok(js::Value::String("microtask|next|loadclick".into()))
+    );
+}
+
+#[test]
 fn script_attribute_changes_reach_the_live_document() {
     let (session, _) = open(&inline_page(
         "<div id=\"box\" class=\"off\"></div>",

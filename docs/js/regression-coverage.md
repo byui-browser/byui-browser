@@ -28,12 +28,14 @@ these features is implemented, update or remove the matching case in
 `unsupported_syntax_is_rejected_at_parse_time` or
 `unsupported_keywords_and_globals_fail_at_run_time`.
 
+Function expressions (anonymous and named) and arrow functions are supported.
+`function_expressions.rs` covers closures, recursion, calls, construction,
+invalid parameters, and execution limits in both engines.
+
 ### Rejected while parsing (`JsErrorCategory::Syntax`)
 
 - Array literals.
 - Update and compound assignment on anything but a variable or member, `delete name`, `-a ** b`, `??` mixed with `||`/`&&`, regular-expression literals, and tagged templates. The rest of the expression forms (`++`, `+=`, `typeof`, `?:`, `?.`, `??`, templates, spread, ...) are supported; see [expression-forms.md](expression-forms.md).
-- Function expressions and arrow functions. Only function declarations are
-  supported.
 - Unterminated template literals.
 - `for` loops.
 - Declaring several variables in one statement (`let a = 1, b = 2;`).

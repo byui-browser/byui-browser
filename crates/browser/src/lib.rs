@@ -544,6 +544,8 @@ impl BrowserRuntime {
     /// registered by those scripts are dropped with the temporary realm. Use
     /// [`BrowserRuntime::open_page_session`] when a later click must reach
     /// `document.addEventListener`.
+    /// All scripts are attempted even after an error. Returns the first script
+    /// or checkpoint error after evaluation finishes, if any.
     pub fn evaluate_page_scripts(
         &self,
         html_source: &str,
@@ -566,7 +568,12 @@ impl BrowserRuntime {
             1.0,
             None,
         )
-        .map(|booted| booted.results)
+        .and_then(
+            |booted| match booted.session.initial_script_errors.into_iter().next() {
+                Some(error) => Err(error),
+                None => Ok(booted.results),
+            },
+        )
     }
 
     /// Parses a page, evaluates its scripts, and keeps the document alive.
@@ -575,6 +582,8 @@ impl BrowserRuntime {
     /// so [`PageSession::dispatch_click`] runs listeners the scripts
     /// registered. The caller supplies the trusted renderer context created
     /// by browser navigation.
+    /// Script errors do not prevent the session from opening or later scripts
+    /// from running; inspect [`PageSession::initial_script_errors`] for them.
     pub fn open_page_session(
         &self,
         html_source: &str,
@@ -607,6 +616,8 @@ impl BrowserRuntime {
     /// inline or fetched source of every `<script>` element. Element IDs in the
     /// session match a layout of `page.html`, so a layout hit test can be
     /// passed to [`PageSession::dispatch_click_at`].
+    /// Script errors are retained in [`PageSession::initial_script_errors`];
+    /// they do not abort loading or discard DOM changes and event listeners.
     pub fn open_page(
         &self,
         page: &Page,
@@ -801,6 +812,7 @@ impl BrowserRuntime {
         };
         log::debug!("evaluating {} page scripts", sources.len());
         let mut results = Vec::with_capacity(sources.len());
+        let mut initial_script_errors = Vec::new();
         for (index, source) in sources.iter().enumerate() {
             log::trace!("evaluating script {index}: {} bytes", source.len());
             let result = realm.evaluate_script(source);
@@ -811,9 +823,15 @@ impl BrowserRuntime {
                 (Err(error), _) => {
                     let _ = report_window_error(&window, &error, initial_url);
                     log::warn!("page script failed: {error}");
-                    return Err(error);
+                    initial_script_errors.push(error);
+                    results.push(Value::Undefined);
                 }
-                (Ok(_), Err(error)) => return Err(error),
+                (Ok(_), Err(error)) => {
+                    let _ = report_window_error(&window, &error, initial_url);
+                    log::warn!("page script checkpoint failed: {error}");
+                    initial_script_errors.push(error);
+                    results.push(Value::Undefined);
+                }
             }
         }
         log::debug!("evaluated {} page scripts", results.len());
@@ -824,6 +842,7 @@ impl BrowserRuntime {
                 window,
                 document,
                 source_url: initial_url.to_owned(),
+                initial_script_errors,
             },
             results,
         })
@@ -843,9 +862,22 @@ pub struct PageSession {
     /// The live document scripts mutate, shared with the realm's bindings.
     document: Arc<Mutex<Document>>,
     source_url: String,
+    initial_script_errors: Vec<js::JsError>,
 }
 
 impl PageSession {
+    /// Errors observed while running the initial scripts and their checkpoints,
+    /// in execution order.
+    ///
+    /// Failed scripts stop at their error; later scripts still run. DOM changes,
+    /// globals, and listeners registered before an error remain in the session.
+    /// A script and its checkpoint failing together currently retain only the
+    /// script error. Later calls to [`Self::evaluate_script`] return errors
+    /// directly and do not append to this startup-only list.
+    pub fn initial_script_errors(&self) -> &[js::JsError] {
+        &self.initial_script_errors
+    }
+
     /// Evaluates one page script as a task and performs its microtask
     /// checkpoint before returning.
     ///

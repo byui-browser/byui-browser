@@ -506,6 +506,10 @@ pub(crate) struct ComputedStyle {
     pub clip_x: bool,
     /// Whether the used `overflow-y` clips descendants at the padding box.
     pub clip_y: bool,
+    /// Whether `-webkit-overflow-scrolling: touch` requests its legacy
+    /// stacking context behavior. Momentum scrolling itself requires touch
+    /// input and a scroll container, neither of which layout models yet.
+    pub webkit_overflow_scrolling_touch: bool,
     /// The computed `opacity`, from 0 (invisible) to 1 (opaque). Inline
     /// boxes fold it into their colors instead; see [`StyleMap`].
     ///
@@ -757,6 +761,7 @@ impl ComputedStyle {
             clip_overflow: false,
             clip_x: false,
             clip_y: false,
+            webkit_overflow_scrolling_touch: false,
             opacity: 1.0,
             z_index: None,
             flex_item: false,
@@ -882,6 +887,8 @@ impl ComputedStyle {
         style.ellipsis = get("text-overflow").is_some_and(|v| v.eq_ignore_ascii_case("ellipsis"));
         (style.clip_x, style.clip_y) = used_overflow(get("overflow-x"), get("overflow-y"));
         style.clip_overflow = style.clip_x;
+        style.webkit_overflow_scrolling_touch = get("-webkit-overflow-scrolling")
+            .is_some_and(|value| value.eq_ignore_ascii_case("touch"));
         if let Some(value) = get("opacity") {
             match parse_opacity(value) {
                 Some(opacity) => style.opacity = opacity,

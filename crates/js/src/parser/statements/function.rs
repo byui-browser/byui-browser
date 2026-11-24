@@ -1,22 +1,35 @@
 use super::super::{ParseResult, Parser};
-use crate::ast::Statement;
+use crate::ast::{Expr, Statement};
 use crate::lexer::Token;
 
 pub(super) fn parse(parser: &mut Parser<'_>) -> ParseResult<Statement> {
     parser.expect(&Token::Function, "function declaration")?;
     let name = parser.identifier("function declaration")?;
     let params = parse_params(parser)?;
+    let body = parse_body(parser)?;
+    Ok(Statement::FunctionDeclaration { name, params, body })
+}
+
+pub(in crate::parser) fn parse_expression(parser: &mut Parser<'_>) -> ParseResult<(Expr, usize)> {
+    parser.expect(&Token::Function, "function expression")?;
+    let name = if matches!(parser.peek(), Some(Token::Identifier(_))) {
+        Some(parser.identifier("function expression")?)
+    } else {
+        None
+    };
+    let params = parse_params(parser)?;
+    let body = parse_body(parser)?;
+    Ok((Expr::FunctionExpression { name, params, body }, 1))
+}
+
+fn parse_body(parser: &mut Parser<'_>) -> ParseResult<Vec<Statement>> {
     parser.function_depth += 1;
     // A plain function nested in a method has no home object for `super`.
     let method_depth = std::mem::take(&mut parser.method_depth);
     let body = super::block::parse(parser);
     parser.method_depth = method_depth;
     parser.function_depth -= 1;
-    Ok(Statement::FunctionDeclaration {
-        name,
-        params,
-        body: body?,
-    })
+    body
 }
 
 /// Parses a parenthesized parameter list, rejecting duplicate names.

@@ -1171,5 +1171,6 @@ pub(crate) fn box_style(style: &ComputedStyle) -> BoxStyle {
             .filter(|_| style.is_positioned() || style.flex_item),
         clip_x: style.clip_x,
         clip_y: style.clip_y,
+        webkit_overflow_scrolling_touch: style.webkit_overflow_scrolling_touch,
     }
 }

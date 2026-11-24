@@ -175,6 +175,10 @@ impl Compiler {
 
     /// Creates the compiler for a function body nested in this compiler's code.
     fn child(&self, kind: CallableKind) -> Self {
+        self.child_with_captures(kind, kind == CallableKind::Arrow)
+    }
+
+    fn child_with_captures(&self, kind: CallableKind, capture_locals: bool) -> Self {
         let mut enclosing = self.enclosing.clone();
         for (scope_index, scope) in self.scopes.iter().enumerate() {
             if !self.is_global_scope(scope_index) {
@@ -184,7 +188,7 @@ impl Compiler {
         let mut captures = HashMap::new();
         let mut capture_sources = Vec::new();
         for (scope_index, scope) in self.scopes.iter().enumerate().rev() {
-            if kind != CallableKind::Arrow {
+            if !capture_locals {
                 break;
             }
             if self.is_global_scope(scope_index) {
@@ -211,7 +215,7 @@ impl Compiler {
                 );
             }
         }
-        if kind == CallableKind::Arrow {
+        if capture_locals {
             for (name, binding) in &self.captures {
                 if captures.contains_key(name) {
                     continue;
@@ -264,6 +268,17 @@ impl Compiler {
         params: &[String],
         body: &[Statement],
     ) -> Result<FunctionTemplate, CompileError> {
+        self.compile_function_with_captures(name, kind, params, body, kind == CallableKind::Arrow)
+    }
+
+    fn compile_function_with_captures(
+        &self,
+        name: &str,
+        kind: CallableKind,
+        params: &[String],
+        body: &[Statement],
+        capture_locals: bool,
+    ) -> Result<FunctionTemplate, CompileError> {
         let too_many = || CompileError {
             message: "function has too many parameters".into(),
             unsupported: false,
@@ -271,7 +286,7 @@ impl Compiler {
         };
         let param_count = u16::try_from(params.len()).map_err(|_| too_many())?;
         log::trace!("compiling function `{name}` ({} params)", params.len());
-        let mut compiler = self.child(kind);
+        let mut compiler = self.child_with_captures(kind, capture_locals);
         for param in params {
             compiler.add_binding(0, param, VarKind::Var)?;
         }
@@ -601,6 +616,7 @@ impl Compiler {
             .rev()
             .find_map(|scope| scope.bindings.get(name).copied());
         if own.is_none()
+            && !self.captures.contains_key(name)
             && self.function != Some(CallableKind::Arrow)
             && self.enclosing.contains(name)
         {
@@ -806,6 +822,32 @@ impl Compiler {
 
     fn compile_expression(&mut self, expression: &Expr) -> Result<(), CompileError> {
         match expression {
+            Expr::FunctionExpression { name, params, body } => {
+                // The private recursive name lives outside the call's parameter
+                // scope, so a parameter or local may shadow it.
+                if let Some(name) = name {
+                    let scope = self.enter_block()?;
+                    self.add_binding(scope, name, VarKind::Const)?;
+                    self.chunk.emit(Instruction::EnterScope(1));
+                    self.emit_scope_declarations(scope)?;
+                }
+                let template = self.compile_function_with_captures(
+                    name.as_deref().unwrap_or("<anonymous>"),
+                    CallableKind::Function,
+                    params,
+                    body,
+                    true,
+                )?;
+                let index = self.add_function(template)?;
+                self.chunk.emit(Instruction::MakeFunction(index));
+                if let Some(name) = name {
+                    self.chunk.emit(Instruction::Dup);
+                    self.emit_initialize(name)?;
+                    self.chunk.emit(Instruction::ExitScope);
+                    self.scopes.pop();
+                }
+                Ok(())
+            }
             Expr::ArrowFunction { params, body } => {
                 let template = match body {
                     ArrowBody::Block(statements) => {

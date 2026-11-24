@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::conversions::{number_to_string, to_number};
+use super::conversions::{number_to_string, to_int32, to_number};
 use super::{Function, Object};
 use crate::{JsError, Value};
 
@@ -80,6 +80,8 @@ fn math_namespace() -> Object {
         ("LN2", std::f64::consts::LN_2),
         ("LN10", std::f64::consts::LN_10),
         ("SQRT2", std::f64::consts::SQRT_2),
+        ("LOG2E", std::f64::consts::LOG2_E),
+        ("LOG10E", std::f64::consts::LOG10_E),
     ] {
         math.set_read_only(name, Value::Number(value));
     }
@@ -95,6 +97,16 @@ fn math_namespace() -> Object {
         ("tan", f64::tan),
         ("log", f64::ln),
         ("exp", f64::exp),
+        ("acos", f64::acos),
+        ("acosh", f64::acosh),
+        ("asinh", f64::asinh),
+        ("atanh", f64::atanh),
+        ("cbrt", f64::cbrt),
+        ("cosh", f64::cosh),
+        ("sinh", f64::sinh),
+        ("expm1", f64::exp_m1),
+        ("log1p", f64::ln_1p),
+        ("log10", f64::log10),
     ] {
         math.set_method(
             name,
@@ -105,6 +117,68 @@ fn math_namespace() -> Object {
             }),
         );
     }
+    math.set_method(
+        "atan2",
+        Arc::new(|args| {
+            Ok(Value::Number(
+                to_number(args.first().unwrap_or(&Value::Undefined))
+                    .atan2(to_number(args.get(1).unwrap_or(&Value::Undefined))),
+            ))
+        }),
+    );
+    // Keep the requested misspelling available alongside the standard name.
+    math.set_method(
+        "atam2",
+        Arc::new(|args| {
+            Ok(Value::Number(
+                to_number(args.first().unwrap_or(&Value::Undefined))
+                    .atan2(to_number(args.get(1).unwrap_or(&Value::Undefined))),
+            ))
+        }),
+    );
+    math.set_method(
+        "hypot",
+        Arc::new(|args| {
+            let mut result: f64 = 0.0;
+            for arg in args {
+                let value = to_number(arg);
+                if value.is_infinite() {
+                    return Ok(Value::Number(f64::INFINITY));
+                }
+                if value.is_nan() {
+                    return Ok(Value::Number(f64::NAN));
+                }
+                result = result.hypot(value);
+            }
+            Ok(Value::Number(result))
+        }),
+    );
+    math.set_method(
+        "fround",
+        Arc::new(|args| {
+            Ok(Value::Number(
+                (args.first().map(to_number).unwrap_or(f64::NAN) as f32) as f64,
+            ))
+        }),
+    );
+    math.set_method(
+        "imul",
+        Arc::new(|args| {
+            let left = to_int32(args.first().unwrap_or(&Value::Undefined));
+            let right = to_int32(args.get(1).unwrap_or(&Value::Undefined));
+            Ok(Value::Number(f64::from(left.wrapping_mul(right))))
+        }),
+    );
+    math.set_method(
+        "random",
+        Arc::new(|_| {
+            let mut bytes = [0_u8; 8];
+            getrandom::fill(&mut bytes)
+                .map_err(|error| JsError::runtime(format!("Math.random failed: {error}")))?;
+            let bits = u64::from_ne_bytes(bytes) >> 11;
+            Ok(Value::Number(bits as f64 / ((1_u64 << 53) as f64)))
+        }),
+    );
     math.set_method(
         "sign",
         Arc::new(|args| {

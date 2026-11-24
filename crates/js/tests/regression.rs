@@ -620,8 +620,6 @@ fn unsupported_syntax_is_rejected_at_parse_time() {
         "let r = /a/g;",
         "/=/",
         "let tag = 1; tag`text`",
-        // Function expressions.
-        "let f = function () {};",
         // Unterminated template literals.
         "`text",
         "`${1`",

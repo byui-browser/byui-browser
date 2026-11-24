@@ -56,9 +56,11 @@
 //! - An uncaught `throw` fails with [`JsErrorCategory::Thrown`](crate::JsErrorCategory)
 //!   and the thrown value in [`JsError::thrown`](crate::JsError::thrown).
 //!
-//! Functions and methods see their own parameters and locals plus the
-//! top-level bindings. They cannot capture variables of an enclosing block or
-//! function: the compiler rejects such a reference instead of miscompiling it.
+//! Function expressions and arrows capture live enclosing block and function
+//! bindings. Named function expressions keep their immutable recursive name in
+//! a private enclosing scope. Legacy function declarations and class methods
+//! see their own parameters, locals, and top-level bindings; the compiler still
+//! rejects their references to enclosing locals.
 
 mod chunk;
 mod compiler;

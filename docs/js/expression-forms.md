@@ -11,6 +11,7 @@ engines and requires the same value, error, and side effects.
 
 | Form | Notes |
 |---|---|
+| `function (x) { return x; }`, `function recur(x) { ... }` | Function expressions create fresh closures, capture live enclosing bindings, accept callbacks and immediate invocation, and support `new`. A named expression has a private immutable recursive binding that parameters and locals may shadow. Parameters currently require unique identifiers; defaults, rest, destructuring, async, and generators are unsupported. See `crates/js/tests/function_expressions.rs`. |
 | `test ? a : b` | Right associative. Only the chosen branch runs. |
 | `a, b, c` | Evaluates every operand and yields the last. Commas in call arguments, array literals, object literals, and declarations still separate items. |
 | `++x`, `x++`, `--x`, `x--` | Target is a variable or member. The old value is converted with `ToNumber`; a postfix update yields that number. `++` must be on the same line as its operand. |
@@ -47,7 +48,7 @@ with a line and column) and never reaches the evaluator:
   (`1++`, `(a + b) += 1`).
 - Rest parameters and rest in literals (`function f(...a)`), and spread
   anywhere but an array literal, call/`new` arguments, or an object literal.
-- Function expressions, `async`/`await`, generators, destructuring, getters
+- `async`/`await`, generators, destructuring, getters
   and setters, `label:` statements, and other syntax not listed here remain
   unsupported as before.
 
@@ -56,8 +57,9 @@ with a line and column) and never reaches the evaluator:
 These parse and run, but differ from full JavaScript. Each is documented next
 to its implementation:
 
-- **Method calls in the tree-walk interpreter do not receive `this`**; the VM
-  does. Differential tests avoid `this`.
+- **Legacy function declarations in the tree-walk interpreter** still require
+  an explicit receiver entry point to enable `this`. Function expressions bind
+  their call receiver in both engines; plain calls receive `undefined`.
 - **`in` and array holes**: an elision such as `[1, , 3]` stores `undefined`,
   so `1 in [1, , 3]` is `true`. A hole made by `delete a[1]` is truly absent.
 - **`instanceof` on the interpreter**: script functions have no `prototype`,

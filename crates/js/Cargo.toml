@@ -11,6 +11,7 @@ rust-version.workspace = true
 log = { workspace = true }
 common = { workspace = true }
 unicode-ident = "1"
+getrandom = "0.3"
 
 [lints]
 workspace = true
