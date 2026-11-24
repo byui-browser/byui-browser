@@ -75,6 +75,45 @@ fn child_nodes_is_a_stable_live_list_and_preserves_wrapper_identity() {
 }
 
 #[test]
+fn child_nodes_supports_node_list_iteration_and_custom_properties() {
+    let mut realm = realm("<main id='p'>one<b id='b'></b></main>");
+    assert_script(
+        &mut realm,
+        "
+        var p = document.getElementById('p'); var list = p.childNodes;
+        var seen = []; var same = true;
+        function collect(node, index, collection) {
+            seen.push(node.nodeName + ':' + index);
+            same = same && collection === list;
+        }
+        list.forEach(collect);
+        list.note = 'custom'; list.length = 99; list[0] = document.getElementById('b');
+        seen.length === 2 && seen[0] === '#text:0' && seen[1] === 'B:1' &&
+            same && list.note === 'custom' && list.length === 2 &&
+            list[0].nodeName === '#text'
+    ",
+    );
+}
+
+#[test]
+fn child_nodes_implements_the_node_list_iterators() {
+    let mut realm = realm("<main id='p'>one<b id='b'></b></main>");
+    assert_script(
+        &mut realm,
+        "
+        var list = document.getElementById('p').childNodes;
+        var interface = list instanceof NodeList;
+        var names = ''; for (var node of list) { names = names + node.nodeName; }
+        var keys = list.keys(); var entries = list.entries();
+        var first = keys.next(); var second = entries.next();
+        interface && names === '#textB' && first.value === 0 && !first.done &&
+            second.value[0] === 0 && second.value[1] === list[0] &&
+            list[Symbol.iterator]().next().value === list[0]
+    ",
+    );
+}
+
+#[test]
 fn node_value_and_text_content_follow_node_kind_rules() {
     let mut realm = realm("<main id='p'>one<!--omit--><b>two</b></main>");
     assert_script(

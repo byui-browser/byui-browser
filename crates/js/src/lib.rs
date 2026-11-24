@@ -31,11 +31,10 @@ pub use vm::Vm;
 /// [`Value::Object`] and [`Value::Array`] are reference handles: cloning the value shares the same
 /// function or property table, and `==`/`===` compare them by identity.
 ///
-/// Symbols are currently represented by identity-bearing object handles rather
-/// than a distinct primitive variant. This includes the shared, read-only
-/// `Symbol.dispose` handle; symbol property keys and automatic resource
-/// disposal are not implemented. Bigints and other built-in object kinds
-/// remain unsupported.
+/// Symbols are represented by identity-bearing object handles rather than a
+/// distinct primitive variant. Well-known iterator keys are supported by the
+/// runtime; automatic resource disposal and other symbol-keyed built-ins are
+/// not modeled. Bigints and other built-in object kinds remain unsupported.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// The `undefined` value.

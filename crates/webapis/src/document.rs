@@ -87,8 +87,9 @@ fn install_get_elements_by_tag_name(object: &Object, document: &Arc<Mutex<Docume
 /// members; their other specialized interface methods are not implemented.
 /// Namespace lookup uses the arena's namespace enum and raw xmlns attributes;
 /// namespace prefixes on element names and namespaced Attr objects are not modeled.
-/// childNodes supplies live indexed access and item(); the NodeList iterable
-/// protocol and forEach() are not implemented yet.
+/// childNodes supplies live indexed access, item(), forEach(), and the
+/// NodeList iterator methods (`keys()`, `values()`, `entries()`, and
+/// `Symbol.iterator`).
 ///
 /// `document.getElementsByTagName(name)` matches descendants in tree order,
 /// including the document element, and returns shared element wrappers.
@@ -281,6 +282,7 @@ pub(crate) fn register_shared_document(
         document: document_object.clone(),
         registry: custom_elements_registry.clone(),
         node_prototype: Object::new(),
+        node_list_prototype: Object::new(),
         element_prototype: Object::new(),
         document_prototype: Object::new(),
     });
@@ -689,6 +691,7 @@ pub(crate) struct ScriptBindings {
     pub(crate) document: Object,
     pub(crate) registry: Object,
     pub(crate) node_prototype: Object,
+    pub(crate) node_list_prototype: Object,
     pub(crate) element_prototype: Object,
     pub(crate) document_prototype: Object,
 }

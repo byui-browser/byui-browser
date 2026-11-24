@@ -125,16 +125,17 @@ fn contains(source: &HTMLDocument, ancestor: NodeID, mut node: NodeID) -> bool {
 /// Registers or reuses the realm's Node interface and its wrapper prototypes.
 /// Node is abstract: calling or constructing it throws TypeError.
 pub(crate) fn register(realm: &mut Realm, document: &SharedDocument) -> JsResult<()> {
-    let existing =
-        ["Node", "Element", "Document"].map(|name| match realm.registered_global_value(name) {
+    let existing = ["Node", "NodeList", "Element", "Document"].map(|name| {
+        match realm.registered_global_value(name) {
             Some(Value::Function(constructor)) => match constructor.get_own_property("prototype") {
                 Some(Value::Object(prototype)) => Some(prototype),
                 _ => None,
             },
             _ => None,
-        });
-    if let [Some(node), Some(element), Some(doc)] = existing {
-        return finish_registration(document, node, element, doc);
+        }
+    });
+    if let [Some(node), Some(node_list), Some(element), Some(doc)] = existing {
+        return finish_registration(document, node, node_list, element, doc);
     }
     let evaluator = realm.script_evaluator();
     let event_target = Object::new();
@@ -221,10 +222,12 @@ pub(crate) fn register(realm: &mut Realm, document: &SharedDocument) -> JsResult
         prototype.set_method(name, Arc::new(move |arguments| call(name, arguments)));
     }
     let element = Object::with_prototype(Some(prototype.clone()));
+    let node_list = Object::new();
     let doc_prototype = Object::with_prototype(Some(prototype.clone()));
     for (name, object) in [
         ("EventTarget", event_target),
         ("Node", prototype.clone()),
+        ("NodeList", node_list.clone()),
         ("Element", element.clone()),
         ("Document", doc_prototype.clone()),
     ] {
@@ -272,12 +275,13 @@ pub(crate) fn register(realm: &mut Realm, document: &SharedDocument) -> JsResult
             window.set(name, value);
         }
     }
-    finish_registration(document, prototype, element, doc_prototype)
+    finish_registration(document, prototype, node_list, element, doc_prototype)
 }
 
 fn finish_registration(
     document: &SharedDocument,
     prototype: Object,
+    node_list: Object,
     element: Object,
     doc_prototype: Object,
 ) -> JsResult<()> {
@@ -286,6 +290,7 @@ fn finish_registration(
         let mut locked = document.lock().unwrap();
         let bindings = locked.script_bindings.as_mut().unwrap();
         bindings.node_prototype = prototype;
+        bindings.node_list_prototype = node_list;
         bindings.element_prototype = element;
         bindings.document_prototype = doc_prototype;
         bindings.document.clone()
@@ -576,6 +581,9 @@ fn base_uri(document: &SharedDocument) -> String {
 
 fn child_list(document: &SharedDocument, id: NodeID) -> Object {
     let list = Object::new();
+    if let Some(bindings) = document.lock().unwrap().script_bindings() {
+        list.set_prototype(Some(bindings.node_list_prototype));
+    }
     let get_document = document.clone();
     list.set_property_hooks(
         Arc::new(move |key| {
@@ -593,7 +601,14 @@ fn child_list(document: &SharedDocument, id: NodeID) -> Object {
             }
             Ok(None)
         }),
-        Arc::new(|_, _| Ok(true)),
+        Arc::new(|property, _| {
+            // NodeList's indexed properties are readonly. Other properties
+            // are ordinary object properties and may be added by script.
+            Ok(property == "length"
+                || property
+                    .parse::<usize>()
+                    .is_ok_and(|index| index.to_string() == property))
+        }),
         Arc::new({
             let document = document.clone();
             move || {
@@ -627,7 +642,92 @@ fn child_list(document: &SharedDocument, id: NodeID) -> Object {
             }
         }),
     );
+    let for_each_document = document.clone();
+    let for_each_list = list.clone();
+    list.set_method(
+        "forEach",
+        Arc::new(move |arguments| {
+            let Some(Value::Function(callback)) = arguments.first() else {
+                return Err(exception(
+                    "TypeError",
+                    "NodeList.forEach requires a callback",
+                ));
+            };
+            // NodeList.forEach() is live, but the iteration list is fixed at
+            // the start of the call, matching the DOM Standard's collection
+            // iteration behavior while still resolving wrappers lazily.
+            let ids = children(&for_each_document.lock().unwrap(), id);
+            let evaluator = for_each_document.lock().unwrap().event_evaluator.clone();
+            for (index, child) in ids.into_iter().enumerate() {
+                let values = [
+                    wrap(&for_each_document, child)?,
+                    Value::Number(index as f64),
+                    Value::Object(for_each_list.clone()),
+                ];
+                if let Some(evaluator) = &evaluator {
+                    evaluator.call_with_this_reentrant(callback, Value::Undefined, &values)?;
+                } else {
+                    callback.call(&values)?;
+                }
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+    for (name, kind) in [("keys", 0_u8), ("values", 1), ("entries", 2)] {
+        let iterator_document = document.clone();
+        list.set_method(
+            name,
+            Arc::new(move |_| {
+                Ok(Value::Object(node_list_iterator(
+                    &iterator_document,
+                    id,
+                    kind,
+                )))
+            }),
+        );
+    }
+    let iterator_document = document.clone();
+    list.set_method(
+        "@@iterator",
+        Arc::new(move |_| Ok(Value::Object(node_list_iterator(&iterator_document, id, 1)))),
+    );
     list
+}
+
+fn node_list_iterator(document: &SharedDocument, id: NodeID, kind: u8) -> Object {
+    let iterator = Object::new();
+    let index = Arc::new(Mutex::new(0_usize));
+    let next_document = document.clone();
+    let next_index = index.clone();
+    iterator.set_method(
+        "next",
+        Arc::new(move |_| {
+            let mut index = next_index.lock().unwrap();
+            let ids = children(&next_document.lock().unwrap(), id);
+            let result = Object::new();
+            if let Some(child) = ids.get(*index).copied() {
+                let value = match kind {
+                    0 => Value::Number(*index as f64),
+                    1 => wrap(&next_document, child)?,
+                    _ => {
+                        let entry = Object::new();
+                        entry.set("0", Value::Number(*index as f64));
+                        entry.set("1", wrap(&next_document, child)?);
+                        entry.set_read_only("length", Value::Number(2.0));
+                        Value::Array(entry)
+                    }
+                };
+                *index += 1;
+                result.set("value", value);
+                result.set("done", Value::Boolean(false));
+            } else {
+                result.set("value", Value::Undefined);
+                result.set("done", Value::Boolean(true));
+            }
+            Ok(Value::Object(result))
+        }),
+    );
+    iterator
 }
 
 fn set_text(document: &SharedDocument, id: NodeID, property: &str, value: Value) -> JsResult<()> {
@@ -1233,6 +1333,7 @@ fn new_document(
     let mut locked = document.lock().unwrap();
     let bindings = locked.script_bindings.as_mut().unwrap();
     bindings.node_prototype = original.node_prototype;
+    bindings.node_list_prototype = original.node_list_prototype;
     bindings.element_prototype = original.element_prototype;
     bindings.document_prototype = original.document_prototype;
     bindings
