@@ -14,6 +14,16 @@ pub enum Expr {
     Number(f64),
     /// Owned decoded string literal.
     String(String),
+    /// Regular expression literal, creating a fresh object on each evaluation.
+    /// Matching uses Unicode scalar values rather than UTF-16 surrogate
+    /// halves; full ECMAScript Unicode/legacy syntax is not implemented.
+    /// See `docs/js/regular-expressions.md` for supported syntax and limits.
+    RegExp {
+        /// Owned pattern text with escapes preserved.
+        pattern: String,
+        /// Owned flags, validated during parsing.
+        flags: String,
+    },
     /// Boolean literal.
     Boolean(bool),
     /// The null literal.
@@ -313,6 +323,11 @@ pub enum Statement {
         /// Optional initializer; constants require one when parsed.
         init: Option<Expr>,
     },
+    /// Comma-separated variable declarations in source order, sharing the
+    /// surrounding scope. Parser-produced entries are single
+    /// `VariableDeclaration`s with the same keyword; this introduces no block.
+    /// Destructuring declarations are not yet supported.
+    VariableDeclarationList(Vec<Statement>),
     /// Conditional statement with an optional alternative.
     If {
         /// Owned expression tested for truthiness.
@@ -558,4 +573,14 @@ pub enum LogicalOperator {
     /// `??`: evaluate the right operand only if the left is `null` or
     /// `undefined`.
     Nullish,
+}
+
+impl Statement {
+    /// Views a declaration list as its entries without introducing a scope.
+    pub(crate) fn declaration_entries(&self) -> &[Statement] {
+        match self {
+            Self::VariableDeclarationList(entries) => entries,
+            _ => std::slice::from_ref(self),
+        }
+    }
 }

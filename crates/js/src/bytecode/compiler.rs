@@ -393,7 +393,7 @@ impl Compiler {
     /// Creates the top-level function declarations before the body runs, so
     /// they can be called above their declaration, as in JavaScript.
     fn hoist_functions(&mut self, statements: &[Statement]) -> Result<(), CompileError> {
-        for statement in statements {
+        for statement in statements.iter().flat_map(Statement::declaration_entries) {
             if let Statement::FunctionDeclaration { name, params, body } = statement {
                 let template = self.compile_function(name, CallableKind::Function, params, body)?;
                 let index = self.add_function(template)?;
@@ -453,8 +453,8 @@ impl Compiler {
             } => {
                 self.add_binding(0, name, VarKind::Var)?;
             }
-            Statement::Block(statements) => {
-                for statement in statements {
+            Statement::Block(statements) | Statement::VariableDeclarationList(statements) => {
+                for statement in statements.iter().flat_map(Statement::declaration_entries) {
                     self.collect_vars(statement)?;
                 }
             }
@@ -581,7 +581,7 @@ impl Compiler {
         scope: usize,
         statements: &[Statement],
     ) -> Result<(), CompileError> {
-        for statement in statements {
+        for statement in statements.iter().flat_map(Statement::declaration_entries) {
             match statement {
                 Statement::VariableDeclaration { kind, name, .. } if *kind != VarKind::Var => {
                     self.add_binding(scope, name, *kind)?;
@@ -644,7 +644,7 @@ impl Compiler {
     ) -> Result<bool, CompileError> {
         let mut has_value = false;
         let base = self.live;
-        for statement in statements {
+        for statement in statements.iter().flat_map(Statement::declaration_entries) {
             self.live = base + usize::from(has_value);
             let produced = self.compile_statement(statement, true)?;
             if produced {
@@ -688,6 +688,12 @@ impl Compiler {
                     self.chunk.emit(Instruction::Pop);
                 }
                 Ok(is_completion)
+            }
+            Statement::VariableDeclarationList(statements) => {
+                for statement in statements {
+                    self.compile_statement(statement, false)?;
+                }
+                Ok(false)
             }
             Statement::Block(statements) => self.compile_block(statements, is_completion),
             Statement::VariableDeclaration { kind, name, init } => {
@@ -863,6 +869,26 @@ impl Compiler {
             }
             Expr::Number(value) => self.constant(Value::Number(*value)),
             Expr::String(value) => self.constant(Value::String(value.clone())),
+            Expr::RegExp { pattern, flags } => {
+                let pattern = self
+                    .chunk
+                    .add_constant(Value::String(pattern.clone()))
+                    .map_err(|message| CompileError {
+                        message: message.into(),
+                        unsupported: false,
+                        location: None,
+                    })?;
+                let flags = self
+                    .chunk
+                    .add_constant(Value::String(flags.clone()))
+                    .map_err(|message| CompileError {
+                        message: message.into(),
+                        unsupported: false,
+                        location: None,
+                    })?;
+                self.chunk.emit(Instruction::NewRegExp { pattern, flags });
+                Ok(())
+            }
             Expr::Boolean(value) => self.constant(Value::Boolean(*value)),
             Expr::Null => self.constant(Value::Null),
             Expr::Undefined => self.constant(Value::Undefined),

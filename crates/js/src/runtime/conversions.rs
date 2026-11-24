@@ -12,7 +12,7 @@ pub(super) fn to_primitive(value: &Value) -> Value {
                 let Some(Value::Function(method)) = object.get(name) else {
                     continue;
                 };
-                if let Ok(result) = method.call(&[])
+                if let Ok(result) = method.call_with_this(value.clone(), &[])
                     && !matches!(
                         result,
                         Value::Object(_) | Value::Function(_) | Value::Array(_)

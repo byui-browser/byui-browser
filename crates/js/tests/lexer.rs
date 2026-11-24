@@ -220,3 +220,22 @@ fn lexes_mixed_ascii_unicode_and_escaped_identifiers() {
         ]
     );
 }
+
+#[test]
+fn lexes_hexadecimal_numbers_and_rejects_invalid_suffixes() {
+    assert_eq!(
+        tokenize("0xff+0X2A;"),
+        vec![
+            Token::Number(255.0),
+            Token::Plus,
+            Token::Number(42.0),
+            Token::Semicolon
+        ]
+    );
+    for source in ["0x", "0Xg", "0x1g", "0x1_0", "0x1n", "0x1é"] {
+        assert!(
+            matches!(tokenize(source).as_slice(), [Token::Invalid(_)]),
+            "{source}"
+        );
+    }
+}

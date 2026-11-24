@@ -648,37 +648,20 @@ pub use ast::{Program, Statement};
 /// character column. Locations at end of input point just past the source.
 pub fn parse(source: &str) -> Result<Program, parser::ParseError> {
     log::trace!("parsing {} bytes of source", source.len());
-    let entries = lexer::tokenize_spanned(source);
-    let starts: Vec<_> = entries.iter().map(|entry| entry.start).collect();
-    let line_terminators_before: Vec<_> = entries
-        .iter()
-        .scan(0, |previous_end, entry| {
-            let has_line_terminator = source[*previous_end..entry.start]
-                .chars()
-                .any(|ch| matches!(ch, '\n' | '\r' | '\u{2028}' | '\u{2029}'));
-            *previous_end = entry.end;
-            Some(has_line_terminator)
-        })
-        .collect();
-    let tokens: Vec<_> = entries.into_iter().map(|entry| entry.token).collect();
-    let program = parser::parse_program_with_line_terminators(&tokens, &line_terminators_before)
-        .map_err(|mut error| {
-            let offset = starts
-                .get(error.token_index)
-                .copied()
-                .unwrap_or(source.len());
-            let prefix = &source[..offset];
-            error.offset = Some(offset);
-            error.line = Some(prefix.chars().filter(|ch| *ch == '\n').count() + 1);
-            error.column = Some(prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1);
-            log::debug!(
-                "syntax error at line {}, column {} (offset {offset}): {}",
-                error.line.unwrap_or(0),
-                error.column.unwrap_or(0),
-                error.message
-            );
-            error
-        })?;
+    let program = parser::parse_source(source).map_err(|mut error| {
+        let offset = error.offset.unwrap_or(source.len());
+        let prefix = &source[..offset];
+        error.offset = Some(offset);
+        error.line = Some(prefix.chars().filter(|ch| *ch == '\n').count() + 1);
+        error.column = Some(prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1);
+        log::debug!(
+            "syntax error at line {}, column {} (offset {offset}): {}",
+            error.line.unwrap_or(0),
+            error.column.unwrap_or(0),
+            error.message
+        );
+        error
+    })?;
     log::debug!("parsed {} top-level statements", program.body.len());
     Ok(program)
 }
@@ -743,15 +726,19 @@ fn evaluate_realm_program(
     // shared interpreter until that compiler metadata is represented in the
     // chunk.
     if source.contains("typeof")
-        || program.body.iter().any(|statement| {
-            matches!(
-                statement,
-                Statement::VariableDeclaration {
-                    kind: ast::VarKind::Let | ast::VarKind::Const,
-                    ..
-                }
-            )
-        })
+        || program
+            .body
+            .iter()
+            .flat_map(Statement::declaration_entries)
+            .any(|statement| {
+                matches!(
+                    statement,
+                    Statement::VariableDeclaration {
+                        kind: ast::VarKind::Let | ast::VarKind::Const,
+                        ..
+                    }
+                )
+            })
     {
         return if this_enabled {
             globals.evaluate_with_this(program, limits, this_value)

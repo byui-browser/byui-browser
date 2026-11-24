@@ -616,21 +616,21 @@ fn unsupported_syntax_is_rejected_at_parse_time() {
         // Optional chains cannot be assigned to or constructed.
         "let a = {}; a?.b = 1;",
         "let a = {}; new a?.b();",
-        // Regular-expression literals and tagged templates.
-        "let r = /a/g;",
-        "/=/",
+        // Malformed regular expressions and tagged templates.
+        "let r = /a/gg;",
+        "/(/",
         "let tag = 1; tag`text`",
         // Unterminated template literals.
         "`text",
         "`${1`",
-        // Multiple declarators.
-        "let a = 1, b = 2;",
+        // Destructuring declarators.
+        "let [a, b] = [1, 2];",
         // `return` outside a function.
         "return 1;",
         // `undefined` is a keyword here, so it cannot be a binding name.
         "let undefined = 1;",
-        // Hexadecimal numeric literals in source.
-        "0x10",
+        // Hexadecimal literals require digits.
+        "0x",
     ] {
         syntax_error(source);
     }

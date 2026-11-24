@@ -297,7 +297,7 @@ fn malformed_sources_return_errors_without_panicking() {
         "let = ;",
         "const x;",
         "let x =",
-        "let a, b;",
+        "let a,, b;",
         "{",
         "}",
         "if",
@@ -447,4 +447,30 @@ fn parses_mixed_ascii_unicode_and_escaped_identifiers() {
     );
     assert!(parse(r"let \u0069f = 1;").is_err());
     assert!(parse(r"let a\u0020b = 1;").is_err());
+}
+
+#[test]
+fn parses_declaration_lists_without_adding_a_block_scope() {
+    for (keyword, kind) in [
+        ("var", VarKind::Var),
+        ("let", VarKind::Let),
+        ("const", VarKind::Const),
+    ] {
+        let program = parse(&format!("{keyword} a = 1, b = 2;")).unwrap();
+        assert_eq!(
+            program.body,
+            vec![S::VariableDeclarationList(vec![
+                S::VariableDeclaration {
+                    kind,
+                    name: "a".into(),
+                    init: Some(Expr::Number(1.0))
+                },
+                S::VariableDeclaration {
+                    kind,
+                    name: "b".into(),
+                    init: Some(Expr::Number(2.0))
+                },
+            ])]
+        );
+    }
 }

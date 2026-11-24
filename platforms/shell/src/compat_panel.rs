@@ -904,12 +904,7 @@ mod tests {
     fn real_page_realm_reports_missing_apis_and_syntax() {
         let report = report();
         let features: Vec<&str> = report.findings.iter().map(|f| f.feature.as_str()).collect();
-        for expected in [
-            "Regular expression literals",
-            "IntersectionObserver",
-            "text-shadow",
-            "List markers",
-        ] {
+        for expected in ["IntersectionObserver", "text-shadow", "List markers"] {
             assert!(
                 features.contains(&expected),
                 "{expected} missing from {features:?}"
@@ -937,9 +932,10 @@ mod tests {
             .filter(|line| line.kind == LineKind::Section)
             .map(|line| line.text.as_str())
             .collect();
-        // The script uses a regular-expression literal, so the engine cannot parse it at all.
-        assert_eq!(sections.first(), Some(&"Script execution"));
-        assert!(sections.contains(&"JavaScript syntax"));
+        // Regular-expression literals now parse, so the unsupported API is
+        // reported in the JavaScript section rather than as a syntax failure.
+        assert_eq!(sections.first(), Some(&"JavaScript & Web APIs"));
+        assert!(!sections.contains(&"JavaScript syntax"));
         assert!(sections.contains(&"CSS properties"));
         assert_eq!(sections.last(), Some(&"Not verified (no static probe)"));
         // Narrow bodies wrap details over several rows.

@@ -95,15 +95,9 @@ fn parse_for(parser: &mut Parser<'_>) -> ParseResult<Statement> {
                 }
             });
         }
-        if kind == crate::ast::VarKind::Const && init.is_none() {
-            return Err(parser.error("Constant requires an initializer", "for initializer"));
-        }
+        let declaration = super::declaration::finish_list(parser, kind, name, init)?;
         parser.expect(&Token::Semicolon, "for initializer")?;
-        Some(Box::new(Statement::VariableDeclaration {
-            kind,
-            name,
-            init,
-        }))
+        Some(Box::new(declaration))
     } else {
         let expression = parser.parse_sequence()?;
         parser.expect(&Token::Semicolon, "for initializer")?;

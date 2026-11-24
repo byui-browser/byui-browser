@@ -9,6 +9,9 @@ engines and requires the same value, error, and side effects.
 
 ## Supported forms
 
+Regular-expression literals and the `RegExp` API are supported in both engines;
+see [regular-expressions.md](regular-expressions.md) for behavior and limits.
+
 | Form | Notes |
 |---|---|
 | `function (x) { return x; }`, `function recur(x) { ... }` | Function expressions create fresh closures, capture live enclosing bindings, accept callbacks and immediate invocation, and support `new`. A named expression has a private immutable recursive binding that parameters and locals may shadow. Parameters currently require unique identifiers; defaults, rest, destructuring, async, and generators are unsupported. See `crates/js/tests/function_expressions.rs`. |
@@ -36,8 +39,6 @@ both engines.
 Each of these is rejected deterministically while parsing (a `Syntax` error
 with a line and column) and never reaches the evaluator:
 
-- Regular-expression literals (`/ab+c/g`): the engine has no regular-expression
-  value, so `/` and `/=` where an operand must start are errors.
 - Tagged templates (`tag\`x\``).
 - `delete name` (bare identifier) and `delete` of an optional chain.
 - `-a ** b` and the other unary operators directly before `**`.

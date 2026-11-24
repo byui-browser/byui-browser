@@ -63,6 +63,7 @@ pub struct Object(Arc<ObjectData>);
 
 #[derive(Default)]
 struct ObjectData {
+    regexp: Mutex<Option<Arc<super::regexp::RegExpData>>>,
     properties: Mutex<Vec<(String, Value)>>,
     accessors: Mutex<Vec<(String, HostGetter, Option<HostSetter>)>>,
     read_only_properties: Mutex<HashSet<String>>,
@@ -91,6 +92,18 @@ impl WeakObject {
 }
 
 impl Object {
+    pub(crate) fn regexp_data(&self) -> Option<Arc<super::regexp::RegExpData>> {
+        self.0
+            .regexp
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_regexp_data(&self, data: Arc<super::regexp::RegExpData>) {
+        *self.0.regexp.lock().unwrap_or_else(PoisonError::into_inner) = Some(data);
+    }
+
     /// Creates an empty object with a new identity and no prototype.
     pub fn new() -> Self {
         Self::default()
@@ -592,6 +605,10 @@ impl fmt::Debug for Object {
 /// The JavaScript string form of a plain object.
 impl fmt::Display for Object {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("[object Object]")
+        if let Some(data) = self.regexp_data() {
+            formatter.write_str(&data.display())
+        } else {
+            formatter.write_str("[object Object]")
+        }
     }
 }

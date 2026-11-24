@@ -16,6 +16,14 @@ pub enum IterationKind {
 pub enum Instruction {
     /// Pushes a constant from the chunk's constant pool.
     Constant(u16),
+    /// Creates a fresh regular expression from pattern and flag string
+    /// constants, addressed by their constant-pool indices.
+    NewRegExp {
+        /// Constant-pool index of the pattern string.
+        pattern: u16,
+        /// Constant-pool index of the flags string.
+        flags: u16,
+    },
     /// Discards the value at the top of the stack.
     Pop,
     /// Swaps the two values at the top of the stack.

@@ -12,6 +12,7 @@ pub(super) fn install(state: &super::GlobalState) {
     super::core::install(state);
     super::primitives::install(state);
     super::errors::install(state);
+    state.install_host("RegExp", Value::Function(super::regexp::constructor()));
 
     state.install_host("Map", Value::Function(map_constructor()));
     state.install_host("Set", Value::Function(set_constructor()));
@@ -166,6 +167,7 @@ pub(crate) fn value(name: &str) -> Option<Value> {
         return Some(value);
     }
     match name {
+        "RegExp" => Some(Value::Function(super::regexp::constructor())),
         "String" => Some(Value::Function(
             super::primitives::string_constructor_value(),
         )),

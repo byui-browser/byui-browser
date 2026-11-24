@@ -45,6 +45,7 @@ mod global_functions;
 mod object;
 mod operators;
 mod primitives;
+pub(crate) mod regexp;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -948,7 +949,7 @@ impl GlobalState {
         hoist_var_declarations(&probe, statements)?;
         let mut var_names: Vec<String> = probe.lock_scope().bindings.keys().cloned().collect();
         let mut lexical_names: Vec<&str> = Vec::new();
-        for statement in statements {
+        for statement in statements.iter().flat_map(Statement::declaration_entries) {
             match statement {
                 Statement::FunctionDeclaration { name, .. } => var_names.push(name.clone()),
                 Statement::VariableDeclaration {
@@ -986,7 +987,7 @@ impl GlobalState {
         for name in &var_names {
             declare_var(&self.object, name)?;
         }
-        for statement in statements {
+        for statement in statements.iter().flat_map(Statement::declaration_entries) {
             match statement {
                 Statement::VariableDeclaration {
                     kind: kind @ (VarKind::Let | VarKind::Const),
@@ -1105,7 +1106,7 @@ impl Interpreter {
         statements: &[Statement],
     ) -> JsResult<Completion> {
         let mut value = None;
-        for statement in statements {
+        for statement in statements.iter().flat_map(Statement::declaration_entries) {
             match self.execute_statement(scope, statement)? {
                 Completion::Normal(Some(result)) => value = Some(result),
                 Completion::Normal(None) => {}
@@ -1146,6 +1147,9 @@ impl Interpreter {
                     }
                 }
                 Ok(Completion::Normal(None))
+            }
+            Statement::VariableDeclarationList(statements) => {
+                self.execute_statements(scope, statements)
             }
             Statement::Block(statements) => {
                 let block_scope = child_scope(scope);
@@ -1228,7 +1232,10 @@ impl Interpreter {
         update: &Option<Expr>,
         body: &Statement,
     ) -> JsResult<Completion> {
-        let loop_scope = match init.as_deref() {
+        let loop_scope = match init
+            .as_deref()
+            .and_then(|init| init.declaration_entries().first())
+        {
             Some(Statement::VariableDeclaration {
                 kind: VarKind::Let | VarKind::Const,
                 ..
@@ -1393,6 +1400,7 @@ impl Interpreter {
             }
             Expr::Number(number) => Ok(Value::Number(*number)),
             Expr::String(text) => Ok(Value::String(text.clone())),
+            Expr::RegExp { pattern, flags } => regexp::create(pattern, flags).map(Value::Object),
             Expr::Boolean(value) => Ok(Value::Boolean(*value)),
             Expr::Null => Ok(Value::Null),
             Expr::Undefined => Ok(Value::Undefined),
@@ -1948,7 +1956,7 @@ pub(crate) fn non_object(value: &Value, action: &str, key: &str, context: &str) 
 /// Declares every `var` in a function or script body, including those nested
 /// in blocks and control flow, but not those inside nested functions.
 fn hoist_var_declarations(scope: &ScopeRef, statements: &[Statement]) -> JsResult<()> {
-    for statement in statements {
+    for statement in statements.iter().flat_map(Statement::declaration_entries) {
         match statement {
             Statement::VariableDeclaration {
                 kind: VarKind::Var,
@@ -2003,7 +2011,7 @@ fn hoist_lexical_declarations(
     statements: &[Statement],
     function_body: bool,
 ) -> JsResult<()> {
-    for statement in statements {
+    for statement in statements.iter().flat_map(Statement::declaration_entries) {
         match statement {
             Statement::VariableDeclaration {
                 kind: kind @ (VarKind::Let | VarKind::Const),
