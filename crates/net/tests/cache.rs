@@ -298,14 +298,37 @@ fn fully_consumed_stream_is_cached() {
         observed_hits.fetch_add(1, Ordering::SeqCst);
         b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
     });
-    let controller = cache_controller();
+    let controller = RequestController::builder(Config::default())
+        .with_browser_capabilities(Arc::new(SameOriginCacheServices))
+        .build()
+        .unwrap();
 
     runtime().block_on(async {
-        let response = controller.fetch(Request::get(server.url())).await.unwrap();
+        let mut request = Request::get(server.url());
+        request.set_mode(RequestMode::SameOrigin).unwrap();
+        request.set_environment(
+            FetchEnvironment::from_url(reqwest::Url::parse(request.url()).unwrap()).unwrap(),
+        );
+        let response = controller
+            .fetch(request.try_clone().unwrap())
+            .await
+            .unwrap();
         assert_eq!(response.body.length(), Some(6));
         assert_eq!(collect_body(response).await.unwrap(), b"cached");
-        let cached = wait_for_cached(&controller, &Request::get(server.url())).await;
-        assert!(cached.from_cache);
+        let mut cached_request = request;
+        cached_request.set_cache_mode(CacheMode::OnlyIfCached);
+        let cached = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match controller.fetch(cached_request.try_clone().unwrap()).await {
+                    Ok(response) if response.from_cache => break response,
+                    Err(RequestError::NetworkError) => tokio::task::yield_now().await,
+                    Ok(_) => panic!("only-if-cached response must come from the cache"),
+                    Err(error) => panic!("cache probe failed unexpectedly: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("fully consumed body should be cached within five seconds");
         assert_eq!(cached.body.length(), Some(6));
         assert_eq!(cached.body.bytes().await.unwrap(), b"cached");
     });
