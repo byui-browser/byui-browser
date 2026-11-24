@@ -76,6 +76,7 @@ struct Frame {
 enum IteratorState {
     Values { values: Vec<Value>, index: usize },
     Keys { keys: Vec<String>, index: usize },
+    Object { iterator: Object },
 }
 
 /// What the caller does with the value a finished frame produces.
@@ -477,6 +478,20 @@ impl Vm {
                                     .collect(),
                                 index: 0,
                             },
+                            Value::Object(object) => {
+                                let Some(Value::Function(iterator)) = object.get("@@iterator")
+                                else {
+                                    return Err(JsError::runtime("object is not iterable"));
+                                };
+                                let iterator =
+                                    iterator.call_with_this(Value::Object(object), &[])?;
+                                let Value::Object(iterator) = iterator else {
+                                    return Err(JsError::runtime(
+                                        "iterator method did not return an object",
+                                    ));
+                                };
+                                IteratorState::Object { iterator }
+                            }
                             other => {
                                 return Err(JsError::runtime(format!("`{other}` is not iterable")));
                             }
@@ -517,6 +532,24 @@ impl Vm {
                             let value = Value::String(keys[*index].clone());
                             *index += 1;
                             Some(value)
+                        }
+                        Some(IteratorState::Object { iterator }) => {
+                            let Some(Value::Function(next)) = iterator.get("next") else {
+                                return Err(JsError::runtime("iterator has no next method"));
+                            };
+                            let result =
+                                next.call_with_this(Value::Object(iterator.clone()), &[])?;
+                            let Value::Object(result) = result else {
+                                return Err(JsError::runtime(
+                                    "iterator next() did not return an object",
+                                ));
+                            };
+                            if matches!(result.get("done"), Some(Value::Boolean(true))) {
+                                self.frame.iterators.pop();
+                                None
+                            } else {
+                                Some(result.get("value").unwrap_or(Value::Undefined))
+                            }
                         }
                         Some(_) => {
                             self.frame.iterators.pop();

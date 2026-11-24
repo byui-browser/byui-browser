@@ -213,6 +213,11 @@ pub(super) fn loose_equals(left: &Value, right: &Value) -> bool {
 pub(crate) fn to_property_key(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
+        Value::Object(object)
+            if object.get("description") == Some(Value::String("Symbol.iterator".into())) =>
+        {
+            "@@iterator".into()
+        }
         other => to_primitive(other).to_string(),
     }
 }
