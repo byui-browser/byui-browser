@@ -73,6 +73,15 @@ pub trait ResponsePolicyService: Send + Sync {
     ///
     /// Body lifecycle and timing events are outside this first contract slice.
     fn response_headers(&self, _request: &Request, _info: &ResponseInfo) {}
+
+    /// Observes headers from an approved validating `304 Not Modified` response.
+    ///
+    /// The engine invokes this after the retained representation has passed
+    /// normal response authorization and before it is exposed. The supplied
+    /// headers are owned by the callback and include internal fields such as
+    /// `Set-Cookie`; implementations can apply browser-owned validation
+    /// effects without making those fields part of future cache hits.
+    fn validation_response_headers(&self, _request: &Request, _headers: Headers) {}
 }
 
 /// Browser-owned HTTP cookie selection and storage.
@@ -104,6 +113,7 @@ pub trait CachePartitionService: Send + Sync {
     /// Returns an owned process-local cache partition key for this request.
     ///
     /// The key is not durable storage identity and is not shared outside this
-    /// controller.
+    /// controller. Return an empty key when no HTTP cache partition is
+    /// available; the engine will use `no-store` behavior for that request.
     fn cache_partition(&self, request: &Request) -> Result<String, RequestError>;
 }

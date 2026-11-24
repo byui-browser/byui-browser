@@ -19,18 +19,13 @@ and provider interfaces rather than importing JavaScript types into `net`.
 ## Architecture and maintainability follow-up
 
 Treat the following as internal refactors: preserve Fetch behavior and add
-focused regression coverage before changing each area. The body ownership
-slice explicitly replaces implicit `Body` and `Request` cloning with fallible
-operations, so Rust callers must migrate those calls.
+focused regression coverage before changing each area.
 
-| Priority | Issue                                                                                                                                                                                                                                                                                           | Potential solution                                                                                                                                                                                                                                                                                                            |
-| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Complete | Browser capabilities are split into request policy, response policy, cookies, service workers, and cache partitioning. The browser may compose one value into every role, while the controller stores and invokes each boundary independently. | Keep the separate non-failing `NetworkObserver` for lifecycle diagnostics and replace conservative browser implementations one capability at a time. |
-| Medium   | Request and response rules are distributed across setters, preparation, scheme handlers, the HTTP redirect loop, and response finalization. The same request service hook is invoked once during preparation and again for HTTP hops, while service-worker checks are only performed initially. | Introduce explicit request-preparation and per-hop validation states. Keep defense-in-depth checks, but centralize shared predicates and document which checks repeat after redirects so policy cannot drift between schemes.                                                                                                 |
-| Medium   | The process-local cache has an unbounded entry map and only partial `Cache-Control` support. It now preserves multiple `Vary` variants, but does not model authorization/credential state, validators, or revalidation.                                                                         | Define the cache contract as an intentionally bounded adapter, add eviction and complete cache-key inputs, and either implement standards-aware freshness/revalidation or delegate those decisions to the browser cache owner.                                                                                                |
-| Low      | `CachedResponse` mirrors `StoredResponse` and copies every field in both directions. Cache insertion and cache hits also clone complete response bodies, which can create avoidable memory bandwidth and peak allocations for large entries.                                                    | Store a `StoredResponse` with expiration metadata inside `CachedResponse`, and use shared or move-based body ownership where the cache contract permits without exposing mutable state.                                                                                                                                       |
-| Low      | Production lock `expect` calls and stale references to implementation-contract documentation hide unfinished work and can obscure the supported boundary.                                                                                                                                       | Replace the allowance with narrow tracked exceptions; map poisoned locks to typed errors or explicitly document the intended failure policy. Keep the implementation plan, contract, and gap audit synchronized and verify all referenced documents exist.                                                                    |
-| Medium   | Trace/debug paths can log raw response URLs and transport error strings. Transport diagnostics may contain full URLs, credentials, or other sensitive URL components, bypassing the crate's redaction helpers.                                                                                  | Route every URL and transport error through the existing redaction helpers, add regression coverage for logging-safe formatting, and keep public diagnostic strings explicitly non-sensitive where possible.                                                                                                                  |
+| Priority | Issue                                                                                                                                                                                                                                                                      | Potential solution                                                                                                                                                                                                              |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Medium   | The process-local response cache covers bounded storage, structured identity, freshness, validators, revalidation, `304` merging, stale extensions, cache modes, and unsafe-method invalidation. Remaining gaps are complete HTTP/shared-cache policy and durable browser-owned storage. | Complete the remaining HTTP policy audit or delegate a standards-aware cache to the browser/storage owner. |
+| Low      | Production cache and body-state locks still use `expect` on poisoning, so a poisoned lock becomes a panic rather than an explicit engine failure policy.                                                                                                                   | Map poisoned locks to typed errors where callers can recover, or document and test the deliberate process-failure policy for each remaining lock.                                                                               |
+| Medium   | Lifecycle diagnostics stop at response headers. Body consumption, completion timing, cancellation timing, and transport/body failure details are not yet exposed through the browser-owned diagnostics boundary.                                                           | Extend the diagnostics contract with non-sensitive body and timing events, route transport failures through the redaction helpers, and add focused coverage for successful, failed, dropped, and cancelled streams.             |
 
 Provider-backed `blob:`, `file:`, and `byui:` requests now use one declarative
 dispatch path for method policy, provider selection, cancellation, and response
@@ -44,9 +39,11 @@ sequenced as follows:
 1. Wire browser identity, language, and Fetch Metadata policy into the
    completed per-hop generated-header and CORS-preflight boundary.
 2. Replace the browser's conservative capability defaults with origin-aware
-   cookies, service-worker decisions, and security-policy checks.
-3. Expand the process-local cache into a standards-aware, partitioned cache
-   with freshness, validators, revalidation, and 304 handling.
+   cookies, service-worker decisions, security-policy checks, and durable
+   cache partition state.
+3. Decide whether `net` or the browser/storage owner should provide a
+   standards-aware, durable HTTP cache, then complete the remaining shared-cache
+   policy.
 4. Add transport limits and complete diagnostics for body timing and
    cancellation, then expand conformance coverage.
 
@@ -106,23 +103,44 @@ them with browser-owned implementations for:
 Each hook must specify its fail-closed, unsupported, or default behavior when
 no provider is installed.
 
-### 4. Replace the process-local cache subset
+### 4. Complete browser-owned cache integration
 
-Define whether the browser supplies a standards-aware cache or `net` expands
-its adapter. The current adapter already handles the supported `Vary` subset:
-it stores multiple request-header variants, rejects `Vary: *`, and replaces
-variants when the response's `Vary` field set changes. The resulting
-implementation must still cover:
+`net` now owns a process-local, transport-independent HTTP-cache subset and
+response capture. Browser and storage layers continue to own durable
+persistence and provide partition identity through replaceable capabilities.
 
-- credentials, authorization, response tainting, and complete partition keys;
-- `Date`, `Expires`, `Age`, `Cache-Control`, freshness, and revalidation;
-- validators, conditional requests, 304 merging, and unsafe-method
-  invalidation; and
-- all Fetch cache modes, including same-origin `OnlyIfCached` behavior.
+The implemented cache:
 
-Cache hits must create an independent public body view and must pass through
-the same response filtering and provider authorization decisions as network
-responses.
+- uses partition, method, normalized URL, credential mode and eligibility,
+  request mode, redirect taint, and authorization presence in its structured
+  identity;
+- retains authorization presence without retaining authorization values and
+  conservatively excludes authorized responses from storage;
+- bounds primary entries and aggregate body bytes, evicts least-recently-used
+  entries, and prunes stale entries;
+- stores multiple `Vary` request-header variants, rejects `Vary: *`, and
+  replaces variants when a response's `Vary` field set changes;
+- parses `Date`, `Expires`, `Age`, `Last-Modified`, and supported freshness
+  directives through a test-controlled clock;
+- retains validators, sends conditional requests, merges successful `304`
+  responses, and handles unsuccessful validation responses;
+- supports stale-while-revalidate and stale-if-error in their documented
+  windows;
+- implements unsafe-method and same-origin location invalidation;
+- implements `Default`, `NoStore`, `Reload`, `NoCache`, `ForceCache`, and
+  `OnlyIfCached`;
+- serves independent public body views from immutable buffered response bytes;
+  and
+- commits body capture only after clean, bounded end-of-stream completion.
+
+Cache hits pass through the same response filtering and provider authorization
+decisions as network responses.
+
+Remaining cache work is to decide whether `net` or the browser/storage owner
+will provide a durable standards-aware backend, then complete shared-cache
+admission and freshness policy, complete HTTP admission and invalidation rules,
+durable partition and persistence state, and browser cookie/authorization
+integration.
 
 ### 5. Harden redirects and transport
 

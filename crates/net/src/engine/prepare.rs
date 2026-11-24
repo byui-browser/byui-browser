@@ -86,10 +86,22 @@ impl RequestController {
             }
         }
 
-        if validated_url.scheme.is_http()
-            && let Some(cache_partitions) = &self.inner.cache_partitions
-        {
-            request.set_cache_partition(cache_partitions.cache_partition(request)?);
+        if validated_url.scheme.is_http() {
+            let partition = self
+                .inner
+                .cache_partitions
+                .as_ref()
+                .map(|service| service.cache_partition(request))
+                .transpose()?
+                .filter(|partition| !partition.is_empty());
+            if let Some(partition) = partition {
+                request.set_cache_partition(partition);
+            } else if request.cache_mode() != crate::CacheMode::OnlyIfCached {
+                // Fetch treats a missing HTTP cache partition as `no-store`.
+                // Preserve `only-if-cached` so it still fails without network
+                // access rather than being rewritten into a normal request.
+                request.set_cache_mode(crate::CacheMode::NoStore);
+            }
         }
         log::trace!(
             "request prepared: {} scheme={:?} cacheable={}",

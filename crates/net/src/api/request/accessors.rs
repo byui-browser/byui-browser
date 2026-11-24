@@ -46,9 +46,17 @@ impl Request {
     pub fn body(&self) -> Option<&Body> {
         self.body.as_ref()
     }
-    /// Returns the configured cache mode.
+    /// Returns the cache mode after applying Fetch's caller-validator rule.
+    ///
+    /// A default-mode request that already carries a conditional validator must
+    /// bypass cache lookup and storage. This preserves the caller's conditional
+    /// request semantics instead of combining them with a cached validator.
     pub(crate) fn cache_mode(&self) -> CacheMode {
-        self.cache_mode
+        if self.cache_mode == CacheMode::Default && self.has_caller_validator() {
+            CacheMode::NoStore
+        } else {
+            self.cache_mode
+        }
     }
     /// Returns the configured redirect mode.
     pub(crate) fn redirect_mode(&self) -> RedirectMode {
@@ -120,5 +128,18 @@ impl Request {
     /// outlive the initial resolution future.
     pub fn signal(&self) -> &AbortSignal {
         &self.signal
+    }
+
+    /// Reports whether the caller supplied a conditional request validator.
+    fn has_caller_validator(&self) -> bool {
+        [
+            "if-modified-since",
+            "if-none-match",
+            "if-unmodified-since",
+            "if-match",
+            "if-range",
+        ]
+        .into_iter()
+        .any(|name| self.headers.has(name))
     }
 }

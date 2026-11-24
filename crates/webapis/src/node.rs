@@ -454,12 +454,7 @@ fn property(document: &SharedDocument, id: NodeID, name: &str) -> JsResult<Value
         // comment, and doctype nodes.
         let relation = match name {
             "parentNode" => parent,
-            "parentElement" => parent.filter(|parent| {
-                matches!(
-                    source.get_nodes()[parent.get()].get_kind(),
-                    NodeKind::Element(_)
-                )
-            }),
+            "parentElement" => parent_element(source, parent),
             "firstChild" => node.get_children().first().copied(),
             "lastChild" => node.get_children().last().copied(),
             "previousSibling" => position
@@ -528,6 +523,19 @@ fn property(document: &SharedDocument, id: NodeID, name: &str) -> JsResult<Value
             Some(id) => return wrap(document, id),
             None => Value::Null,
         },
+    })
+}
+
+/// Returns the immediate parent when it is an Element.
+///
+/// This is the DOM `Node.parentElement` getter: it does not walk ancestors,
+/// and a non-Element parent such as a Document produces `null`.
+fn parent_element(source: &HTMLDocument, parent: Option<NodeID>) -> Option<NodeID> {
+    parent.filter(|parent| {
+        matches!(
+            source.get_nodes()[parent.get()].get_kind(),
+            NodeKind::Element(_)
+        )
     })
 }
 

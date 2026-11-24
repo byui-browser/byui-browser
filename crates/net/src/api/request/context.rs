@@ -42,7 +42,7 @@ pub struct FetchContext {
 }
 
 /// Controls how a request may cross origins.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum RequestMode {
     /// Used for document navigation requests.
     Navigate,
@@ -55,7 +55,7 @@ pub enum RequestMode {
     NoCors,
 }
 /// Controls whether credentials may be sent with a request.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum CredentialsMode {
     /// Never send credentials.
     Omit,
@@ -78,22 +78,35 @@ pub enum RedirectMode {
 }
 /// Controls which process-local cache behavior a request selects.
 ///
-/// This is a documented HTTP cache subset. `NoCache` is rejected until
-/// revalidation exists; full Fetch cache matching belongs to a later step.
+/// This is a documented HTTP cache subset. It implements the Fetch cache-mode
+/// selection rules while leaving durable browser cache storage to the embedding
+/// layer.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CacheMode {
     #[default]
     /// Use the normal HTTP cache algorithm.
     Default,
     /// Skip the cache and do not store the response.
+    ///
+    /// Network attempts add `Pragma: no-cache` and `Cache-Control: no-cache`
+    /// when the caller did not already provide those fields.
     NoStore,
-    /// Skip an existing cached response, but permit the new response to be cached.
+    /// Skip an existing cached response, send reload directives when absent,
+    /// and permit the new response to be cached.
+    ///
+    /// Network attempts add `Pragma: no-cache` and `Cache-Control: no-cache`
+    /// only when the caller did not already provide the respective field.
     Reload,
     /// Revalidate a cached response before using it.
+    ///
+    /// Network attempts add `Cache-Control: max-age=0` only when the caller
+    /// did not already provide a `Cache-Control` field.
     NoCache,
     /// Use a cached response when available, even if stale.
     ForceCache,
     /// Return a cached response or fail without making a network request.
+    ///
+    /// This mode requires [`RequestMode::SameOrigin`].
     OnlyIfCached,
 }
 /// The destination type associated with a fetch.

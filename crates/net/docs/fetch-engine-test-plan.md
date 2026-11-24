@@ -1,6 +1,6 @@
 # Net crate test plan
 
-Status as of 2026-11-10: the current body, request, header, response, cache, redirect,
+Status as of 2026-11-23: the current body, request, header, response, cache, redirect,
 streaming, scheduler, and scheme-handler regression suites pass. The first
 body API/lifecycle test slice is now covered, including constructor metadata,
 URL-encoded and ArrayBuffer consumption, equality/debug state, one-shot
@@ -46,8 +46,8 @@ is implemented:
 - Origin and response validation: provider-origin mismatch/invalid-origin
   outcomes, and the response-type decisions for navigation and credentialed
   requests.
-- HTTP execution: cache-mode branches, missing client-origin/cache
-  revalidation/priority failures, URL joining and invalid joined URLs,
+- HTTP execution: missing client-origin/cache revalidation/priority failures,
+  URL joining and invalid joined URLs,
   remaining pre-send/in-flight abort timing, remaining redirect failure paths,
   and redirect URL-list accuracy.
 - Transport and scheduling: abort immediately before transport,
@@ -175,13 +175,20 @@ diagnostics.
 
 ### 5. Credentials, cookies, and cache
 
-The cache unit suite now covers `Vary` header normalization, matching request
-header values, multiple variants, `Vary: *` rejection, and replacement when
-the response's `Vary` field set changes. When browser providers exist, test
-partitioned cookie matching, persistence,
-expiry, SameSite/secure behavior, credentials modes, `Set-Cookie` handling,
-and CORS credential checks. Expand cache tests for freshness, validators, 304
-merging, unsafe-method invalidation, partitioning, and all Fetch cache modes.
+The cache unit suite now covers `Vary` header normalization and matching,
+multiple variants, `Vary: *` rejection, variant replacement, freshness and
+heuristic lifetime calculation, validators, conditional requests, successful
+and unsuccessful `304` merging, unsafe-method and location invalidation,
+partitioning, stale-if-error/stale-while-revalidate, body capture, and all six
+Fetch cache modes. Cache integration coverage also exercises redirect and
+response-policy paths.
+
+When browser providers exist, add browser-owned partitioned cookie matching,
+persistence, expiry, SameSite/secure behavior, credentials modes,
+`Set-Cookie` handling, and CORS credential checks. Remaining cache conformance
+work is durable storage, complete shared-cache admission/freshness policy,
+range-aware partial-response handling, and a final audit of complete HTTP
+admission and invalidation rules.
 
 ### 6. Policy, transport, and scheduling
 

@@ -78,25 +78,34 @@ impl RequestController {
         Ok(response.expose())
     }
 
-    /// Gives approved HTTP response cookies to browser-owned storage policy.
+    /// Gives approved HTTP response side effects to browser-owned services.
     fn process_response_cookies(
         &self,
         request: &Request,
         url: &reqwest::Url,
         response: &mut InternalResponse,
     ) -> Result<(), RequestError> {
-        if response.cookie_headers_processed || !request.credentials_allowed(url) {
-            return Ok(());
+        if request.credentials_allowed(url)
+            && let Some(cookies) = &self.inner.cookies
+        {
+            if !response.cookie_headers_processed {
+                let values: Vec<http::HeaderValue> = response
+                    .headers
+                    .get_all(http::header::SET_COOKIE)
+                    .iter()
+                    .cloned()
+                    .collect();
+                cookies.store_set_cookie(request, &values)?;
+                response.cookie_headers_processed = true;
+            }
+            if let Some(values) = response.validation_cookie_headers.take() {
+                cookies.store_set_cookie(request, &values)?;
+            }
         }
-        if let Some(cookies) = &self.inner.cookies {
-            let values: Vec<http::HeaderValue> = response
-                .headers
-                .get_all(http::header::SET_COOKIE)
-                .iter()
-                .cloned()
-                .collect();
-            cookies.store_set_cookie(request, &values)?;
-            response.cookie_headers_processed = true;
+        if let Some(headers) = response.validation_headers.take()
+            && let Some(policy) = &self.inner.response_policy
+        {
+            policy.validation_response_headers(request, Headers::internal_response(&headers));
         }
         Ok(())
     }

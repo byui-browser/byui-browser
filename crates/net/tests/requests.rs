@@ -546,9 +546,6 @@ fn unsupported_request_features_fail_before_browser_service_or_network_side_effe
     let mut integrity = Request::get("http://127.0.0.1:9/");
     integrity.set_integrity(Some("sha256-example".into()));
 
-    let mut revalidation = Request::get("http://127.0.0.1:9/");
-    revalidation.set_cache_mode(net::CacheMode::NoCache);
-
     let mut priority = Request::get("http://127.0.0.1:9/");
     priority.set_priority(net::RequestPriority::High);
 
@@ -560,7 +557,6 @@ fn unsupported_request_features_fail_before_browser_service_or_network_side_effe
 
     for (request, feature) in [
         (integrity, "subresource integrity"),
-        (revalidation, "HTTP cache revalidation"),
         (priority, "priority scheduling"),
         (keepalive, "keepalive lifetime"),
         (navigation, "navigation fetch"),

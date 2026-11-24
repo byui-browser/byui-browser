@@ -892,10 +892,10 @@ fn redirect_policy_cannot_restore_referrer_detail_removed_on_an_earlier_hop() {
 }
 
 #[test]
-fn post_to_get_redirect_reuses_the_target_cache_entry() {
+fn post_to_get_redirect_invalidates_the_target_cache_entry() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&requests);
-    let server = TestServer::start(2, move |request| {
+    let server = TestServer::start(3, move |request| {
         observed.lock().unwrap().push(request.to_owned());
         if request.starts_with("GET /next HTTP") {
             b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 6\r\nConnection: close\r\n\r\ncached".to_vec()
@@ -917,14 +917,14 @@ fn post_to_get_redirect_reuses_the_target_cache_entry() {
         )
         .unwrap();
     assert!(redirected.redirected);
-    assert!(redirected.from_cache);
+    assert!(!redirected.from_cache);
     assert_eq!(
         runtime().block_on(collect_body(redirected)).unwrap(),
         b"cached"
     );
 
     server.join();
-    assert_eq!(requests.lock().unwrap().len(), 2);
+    assert_eq!(requests.lock().unwrap().len(), 3);
 }
 
 #[test]

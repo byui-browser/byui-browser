@@ -3,8 +3,12 @@
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
+    time::Duration,
 };
 
 use net::{RequestError, Response};
@@ -20,28 +24,44 @@ pub async fn collect_body(response: Response) -> Result<Vec<u8>, RequestError> {
 pub struct TestServer {
     url: String,
     thread: thread::JoinHandle<()>,
+    stop: Arc<AtomicBool>,
 }
 
 impl TestServer {
-    /// Starts a minimal HTTP/1.1 server that accepts exactly `connections`
-    /// requests, making each test's expected network activity explicit.
-    pub fn start<F>(connections: usize, response: F) -> Self
+    /// Starts a minimal HTTP/1.1 server that remains available until `join`.
+    /// `connections` is retained for compatibility with existing test call sites.
+    pub fn start<F>(_connections: usize, response: F) -> Self
     where
         F: Fn(&str) -> Vec<u8> + Send + Sync + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").expect("server should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("server should set nonblocking mode");
         let url = format!("http://{}", listener.local_addr().unwrap());
         let response = Arc::new(response);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
         let thread = thread::spawn(move || {
-            for _ in 0..connections {
-                let (mut stream, _) = listener.accept().expect("server should accept request");
-                let request = read_request(&mut stream);
-                stream
-                    .write_all(response(&request).as_slice())
-                    .expect("server should write response");
+            while !worker_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("server should set accepted socket to blocking");
+                        let request = read_request(&mut stream);
+                        stream
+                            .write_all(response(&request).as_slice())
+                            .expect("server should write response");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("server should accept request: {error}"),
+                }
             }
         });
-        Self { url, thread }
+        Self { url, thread, stop }
     }
 
     pub fn url(&self) -> String {
@@ -49,6 +69,7 @@ impl TestServer {
     }
 
     pub fn join(self) {
+        self.stop.store(true, Ordering::SeqCst);
         self.thread.join().expect("server should exit");
     }
 }

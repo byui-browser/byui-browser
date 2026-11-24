@@ -3,7 +3,7 @@ use url::Url;
 use crate::api::error::RequestError;
 
 /// Relationship between the request's origin and the origins in its redirect chain.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub(crate) enum RedirectTaint {
     /// Every relevant transition remains same-origin.
     #[default]
