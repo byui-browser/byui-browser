@@ -483,12 +483,14 @@ fn set_constructor() -> Function {
 }
 
 // Well-known symbols share identity across constructors and realms.
-// Limitation: like Symbol(), dispose is an object handle; symbol primitives,
-// symbol-keyed properties, and automatic resource disposal are not modeled.
+// Limitation: like Symbol(), symbols are object handles rather than a distinct
+// primitive variant. The well-known iterator key is supported by property
+// access; automatic resource disposal is not modeled.
 fn symbol_constructor() -> Function {
     static DISPOSE: OnceLock<Object> = OnceLock::new();
     static TO_PRIMITIVE: OnceLock<Object> = OnceLock::new();
     static ASYNC_DISPOSE: OnceLock<Object> = OnceLock::new();
+    static ITERATOR: OnceLock<Object> = OnceLock::new();
     let function = Function::from_host(
         "Symbol",
         Arc::new(|args| {
@@ -514,11 +516,17 @@ fn symbol_constructor() -> Function {
         symbol.set_read_only("description", Value::String("Symbol.asyncDispose".into()));
         symbol
     });
+    let iterator = ITERATOR.get_or_init(|| {
+        let symbol = Object::new();
+        symbol.set_read_only("description", Value::String("Symbol.iterator".into()));
+        symbol
+    });
     match &*function.0 {
         super::FunctionKind::Host { properties, .. } => {
             properties.set_read_only("dispose", Value::Object(dispose.clone()));
             properties.set_read_only("toPrimitive", Value::Object(to_primitive.clone()));
             properties.set_read_only("asyncDispose", Value::Object(async_dispose.clone()));
+            properties.set_read_only("iterator", Value::Object(iterator.clone()));
             let prototype = Object::new();
             properties.set_read_only("prototype", Value::Object(prototype));
         }
