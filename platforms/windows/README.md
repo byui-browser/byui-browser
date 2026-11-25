@@ -1,6 +1,6 @@
 # Windows shell
 
-A minimal native Windows window written in Rust using `winit`. The window,
+A native Windows window written in Rust using `winit`. The window,
 toolbar, and rendering code are shared with the macOS and Linux shells through
 [`platforms/shell`](../shell); this crate only supplies Windows font paths and
 keeps the native Windows titlebar and frame.
@@ -22,21 +22,42 @@ or `Escape` to cancel. HTTP and HTTPS addresses are loaded asynchronously
 through the browser loader, with a loading indicator and a built-in error page
 for failed requests. `Ctrl+R` reloads the current address without adding a
 history visit. The toolbar Back and Forward buttons traverse successful
-session history without adding visits; tabs and the menu are still staged.
+session history without adding visits. Tabs, appearance settings, page source,
+site information, Find in Page, and the shared DevTools dock are available
+through the same shell implementation used by macOS and Linux.
 
 Windows supplies the native titlebar, resize borders, and system window
-buttons. The normal window uses Windows' rounded frame, while a maximized
-window uses the system's square maximized frame.
+buttons. The shell explicitly requests rounded corners for a restored window
+and square corners while maximized; Windows versions that do not support the
+corner preference safely fall back to their system behavior.
 
 ## Windows verification checklist
 
-- Resize the normal window and confirm the system frame remains rounded.
-- Maximize and restore it; maximized corners should be square and restored
+- [x] Launch the Windows shell and render the built-in welcome page.
+- [x] Restore the normal window and confirm the system frame remains rounded.
+- [x] Maximize and restore it; maximized corners are square and restored
   corners should be rounded.
-- Visit two addresses, then verify Back and Forward enable and traverse them.
-- Use `Ctrl+R` and confirm Reload does not add another history visit.
-- Press `Ctrl+Shift+H`; switch Elements, Network, and Console, scroll each
-  view, press Delete to clear the active log, and press Escape to close.
-- Open DevTools again after navigation and confirm the live document and new
+- [x] Close the final window cleanly without a tab-strip teardown panic.
+- [x] Visit two addresses, then verify Back and Forward enable and traverse them.
+- [x] Use `Ctrl+R` and confirm Reload does not add another history visit.
+- [x] Open and close tabs, switch tabs, and verify each tab keeps its own URL and
+  history.
+- [ ] Toggle System, Light, and Dark appearance and restart to confirm the choice
+  persists.
+- [x] Use `Ctrl+F` to search the live page, cycle matches with Enter and
+  Shift+Enter, then dismiss Find with Escape.
+- [ ] Open Page Source, Site Information, and Inspect from the page menu; confirm
+  each overlay closes cleanly and restores the underlying page.
+- [x] Press `Ctrl+Shift+H`; switch Elements, Network, Performance, and Console,
+  press Delete to clear the active log, and close DevTools.
+- [ ] Open DevTools again after navigation and confirm the live document and new
   request/console entries are shown.
-- Repeat the checks at Windows display scaling above 100%.
+- [ ] Repeat the checks at Windows display scaling above 100%.
+
+Automated verification for the current Windows sprint branch:
+
+- [x] `cargo fmt --all -- --check`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo check -p byui-browser-windows`
+- [x] `cargo test -p browser-shell --lib` (194 tests)
+- [x] `git diff --check`

@@ -905,14 +905,23 @@ impl App {
         };
         window.set_title(&format!("BYUI Browser DevTools — {}", self.tab.title));
         let size = window.inner_size();
+        let (Some(width), Some(height)) =
+            (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+        else {
+            return;
+        };
         let scale = window.scale_factor();
-        let Some(mut pixmap) = Pixmap::new(size.width.max(1), size.height.max(1)) else {
+        let Some(mut pixmap) = Pixmap::new(width.get(), height.get()) else {
             return;
         };
         self.draw_devtools(&mut pixmap, scale);
         let Some(surface) = &mut self.devtools_surface else {
             return;
         };
+        if let Err(error) = surface.resize(width, height) {
+            log::warn!("failed to resize DevTools window surface: {error}");
+            return;
+        }
         let Ok(mut buffer) = surface.buffer_mut() else {
             return;
         };

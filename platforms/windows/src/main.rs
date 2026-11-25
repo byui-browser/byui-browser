@@ -10,15 +10,37 @@
 fn main() {
     browser_shell::run(browser_shell::Platform {
         // Keep the native Windows titlebar and frame. Windows supplies the
-        // rounded normal window and square maximized treatment.
+        // native titlebar and resize borders; the callback below makes the
+        // Windows 11 corner policy explicit for restored and maximized states.
         configure_window: |attributes| attributes,
-        window_created: |_| {},
-        window_changed: |_| false,
+        window_created: windows_window_created,
+        window_changed: sync_windows_chrome,
         ui_font_files: windows::ui_font_files,
         page_font_files: windows::page_font_files,
         window_controls_inset: 0.0,
     })
     .expect("Windows browser shell event loop failed");
+}
+
+#[cfg(target_os = "windows")]
+fn windows_window_created(window: &winit::window::Window) {
+    sync_windows_chrome(window);
+}
+
+#[cfg(target_os = "windows")]
+fn sync_windows_chrome(window: &winit::window::Window) -> bool {
+    use winit::platform::windows::{CornerPreference, WindowExtWindows};
+
+    // Windows 11 normally chooses these values automatically, but explicitly
+    // applying them keeps the browser shell's restored/maximized behavior
+    // stable when the system theme, snap layout, or native frame changes.
+    let preference = if window.is_maximized() {
+        CornerPreference::DoNotRound
+    } else {
+        CornerPreference::Round
+    };
+    window.set_corner_preference(preference);
+    false
 }
 
 #[cfg(target_os = "windows")]

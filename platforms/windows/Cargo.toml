@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 browser-shell = { path = "../shell" }
+winit = "0.30.13"
 
 [[bin]]
 name = "byui-browser-windows"
