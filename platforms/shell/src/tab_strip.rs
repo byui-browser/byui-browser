@@ -59,7 +59,11 @@ impl Strip {
             let x = left + index as f32 * tab_width;
             regions.push((
                 Action::Select(*id),
-                Rect::from_xywh(x, y + 2.0, tab_width - 2.0, 28.0).unwrap(),
+                // During teardown a native window can briefly report a
+                // smaller width than the minimum browser layout. Keep the
+                // tab hit region valid instead of panicking on a negative
+                // rectangle width.
+                Rect::from_xywh(x, y + 2.0, (tab_width - 2.0).max(1.0), 28.0).unwrap(),
             ));
             regions.push((
                 Action::Close(*id),
@@ -549,6 +553,17 @@ mod tests {
                 Some(Action::New)
             );
         }
+    }
+
+    #[test]
+    fn extremely_narrow_windows_keep_tab_regions_valid() {
+        let strip = Strip::new(1.0, &[TabId(0)], 0, 0.0);
+        assert!(
+            strip
+                .regions
+                .iter()
+                .all(|(_, rect)| rect.width() > 0.0 && rect.height() > 0.0)
+        );
     }
 
     #[test]
