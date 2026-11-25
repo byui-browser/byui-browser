@@ -40,11 +40,11 @@ corner preference safely fall back to their system behavior.
 - [x] Close the final window cleanly without a tab-strip teardown panic.
 - [x] Visit two addresses, then verify Back and Forward enable and traverse them.
 - [x] Use `Ctrl+R` and confirm Reload does not add another history visit.
-- [ ] Open and close tabs, switch tabs, and verify each tab keeps its own URL and
+- [x] Open and close tabs, switch tabs, and verify each tab keeps its own URL and
   history.
 - [ ] Toggle System, Light, and Dark appearance and restart to confirm the choice
   persists.
-- [ ] Use `Ctrl+F` to search the live page, cycle matches with Enter and
+- [x] Use `Ctrl+F` to search the live page, cycle matches with Enter and
   Shift+Enter, then dismiss Find with Escape.
 - [ ] Open Page Source, Site Information, and Inspect from the page menu; confirm
   each overlay closes cleanly and restores the underlying page.
