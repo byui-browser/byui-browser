@@ -75,6 +75,28 @@ fn child_nodes_is_a_stable_live_list_and_preserves_wrapper_identity() {
 }
 
 #[test]
+fn next_sibling_is_live_for_all_supported_node_kinds() {
+    let mut realm = realm("<!doctype html><main id='p'>text<!--comment--><b id='b'></b></main>");
+    assert_script(
+        &mut realm,
+        "
+        var p = document.getElementById('p');
+        var text = p.firstChild; var comment = text.nextSibling;
+        var b = document.getElementById('b');
+        var initial = document.firstChild.nextSibling === p &&
+            text.nextSibling === comment && comment.nextSibling === b &&
+            b.nextSibling === null && document.lastChild.nextSibling === null;
+        p.removeChild(comment);
+        var afterRemoval = text.nextSibling === b && comment.nextSibling === null;
+        p.appendChild(comment);
+        var afterAppend = b.nextSibling === comment && comment.nextSibling === null;
+        var detached = document.createTextNode('detached');
+        detached.nextSibling === null && initial && afterRemoval && afterAppend
+    ",
+    );
+}
+
+#[test]
 fn child_nodes_supports_node_list_iteration_and_custom_properties() {
     let mut realm = realm("<main id='p'>one<b id='b'></b></main>");
     assert_script(
