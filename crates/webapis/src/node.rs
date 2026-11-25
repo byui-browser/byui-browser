@@ -457,10 +457,8 @@ fn property(document: &SharedDocument, id: NodeID, name: &str) -> JsResult<Value
             "parentElement" => parent_element(source, parent),
             "firstChild" => first_child(source, id),
             "lastChild" => last_child(source, id),
-            "previousSibling" => position
-                .and_then(|i| i.checked_sub(1))
-                .and_then(|i| siblings?.get(i).copied()),
-            "nextSibling" => next_sibling(siblings, position),
+            "previousSibling" => previous_sibling(siblings.map(Vec::as_slice), position),
+            "nextSibling" => next_sibling(siblings.map(Vec::as_slice), position),
             _ => None,
         };
         (
@@ -552,13 +550,25 @@ fn first_child(source: &HTMLDocument, id: NodeID) -> Option<NodeID> {
         .and_then(|node| node.get_children().first().copied())
 }
 
+/// Returns the first preceding sibling in the node's current parent.
+///
+/// This is the DOM `Node.previousSibling` getter: siblings share the same
+/// non-null parent, and the relationship is resolved from the arena for every
+/// read so the JavaScript property stays live after DOM mutations. Nodes with
+/// no parent and the first child therefore return `None`.
+fn previous_sibling(siblings: Option<&[NodeID]>, position: Option<usize>) -> Option<NodeID> {
+    position
+        .and_then(|position| position.checked_sub(1))
+        .and_then(|previous| siblings?.get(previous).copied())
+}
+
 /// Returns the first following sibling in the node's current parent.
 ///
 /// This is the DOM `Node.nextSibling` getter: siblings share the same
 /// non-null parent, and the relationship is resolved from the arena for every
 /// read so the JavaScript property stays live after DOM mutations. Nodes with
 /// no parent and the last child therefore return `None`.
-fn next_sibling(siblings: Option<&Vec<NodeID>>, position: Option<usize>) -> Option<NodeID> {
+fn next_sibling(siblings: Option<&[NodeID]>, position: Option<usize>) -> Option<NodeID> {
     position.and_then(|position| {
         position
             .checked_add(1)

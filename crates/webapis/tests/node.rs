@@ -97,6 +97,31 @@ fn next_sibling_is_live_for_all_supported_node_kinds() {
 }
 
 #[test]
+fn previous_sibling_is_live_for_all_supported_node_kinds() {
+    let mut realm = realm("<!doctype html><main id='p'>text<!--comment--><b id='b'></b></main>");
+    assert_script(
+        &mut realm,
+        "
+        var p = document.getElementById('p');
+        var text = p.firstChild; var comment = text.nextSibling;
+        var b = document.getElementById('b');
+        var initial = document.firstChild.previousSibling === null &&
+            p.previousSibling === document.firstChild &&
+            text.previousSibling === null && comment.previousSibling === text &&
+            b.previousSibling === comment;
+        b.previousSibling = text;
+        var readonly = b.previousSibling === comment;
+        p.removeChild(comment);
+        var afterRemoval = b.previousSibling === text && comment.previousSibling === null;
+        p.appendChild(comment);
+        var afterAppend = comment.previousSibling === b && text.previousSibling === null;
+        var detached = document.createTextNode('detached');
+        detached.previousSibling === null && initial && readonly && afterRemoval && afterAppend
+    ",
+    );
+}
+
+#[test]
 fn child_nodes_supports_node_list_iteration_and_custom_properties() {
     let mut realm = realm("<main id='p'>one<b id='b'></b></main>");
     assert_script(
