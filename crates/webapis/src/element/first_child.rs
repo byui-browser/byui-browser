@@ -76,4 +76,28 @@ mod tests {
             Value::Null
         );
     }
+
+    #[test]
+    fn first_child_is_live_and_read_only() {
+        let mut realm = realm_with("<div id='p'></div><div id='q'></div>");
+        assert_eq!(
+            eval(
+                &mut realm,
+                "var p = document.getElementById('p'); \
+                 var q = document.getElementById('q'); \
+                 var a = document.createElement('a'); \
+                 var b = document.createElement('b'); \
+                 p.firstChild = a; p.append(a); p.append(b); \
+                 var initial = p.firstChild === a; \
+                 p.insertBefore(b, a); \
+                 var reordered = p.firstChild === b; \
+                 p.removeChild(b); \
+                 var removed = p.firstChild === a; \
+                 q.append(a); \
+                 var moved = p.firstChild === null && q.firstChild === a; \
+                 initial && reordered && removed && moved"
+            ),
+            Value::Boolean(true)
+        );
+    }
 }
