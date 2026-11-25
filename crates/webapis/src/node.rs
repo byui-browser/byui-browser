@@ -455,7 +455,7 @@ fn property(document: &SharedDocument, id: NodeID, name: &str) -> JsResult<Value
         let relation = match name {
             "parentNode" => parent,
             "parentElement" => parent_element(source, parent),
-            "firstChild" => node.get_children().first().copied(),
+            "firstChild" => first_child(source, id),
             "lastChild" => node.get_children().last().copied(),
             "previousSibling" => position
                 .and_then(|i| i.checked_sub(1))
@@ -537,6 +537,19 @@ fn parent_element(source: &HTMLDocument, parent: Option<NodeID>) -> Option<NodeI
             NodeKind::Element(_)
         )
     })
+}
+
+/// Returns the first child in a node's current children collection.
+///
+/// This is the DOM `Node.firstChild` getter: it returns the first child node,
+/// regardless of whether that node is an Element, Text, Comment, or another
+/// supported node kind, and returns `None` when the collection is empty. The
+/// arena is queried for every getter call so the JavaScript property remains
+/// live after DOM mutations.
+fn first_child(source: &HTMLDocument, id: NodeID) -> Option<NodeID> {
+    source
+        .get_node(id)
+        .and_then(|node| node.get_children().first().copied())
 }
 
 fn descendant_text(source: &HTMLDocument, id: NodeID) -> String {
