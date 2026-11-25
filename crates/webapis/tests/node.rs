@@ -118,6 +118,35 @@ fn child_nodes_supports_node_list_iteration_and_custom_properties() {
 }
 
 #[test]
+fn last_child_returns_the_final_node_and_updates_live() {
+    let mut realm =
+        realm("<main id='p'>first<!--middle--><b id='last'></b></main><aside id='empty'></aside>");
+    assert_script(
+        &mut realm,
+        "
+        var p = document.getElementById('p');
+        var empty = document.getElementById('empty');
+        var last = document.getElementById('last');
+        var initial = p.lastChild === last && p.lastChild.nodeType === Node.ELEMENT_NODE;
+        p.lastChild = p.firstChild;
+        var unchanged = p.lastChild === last;
+        p.removeChild(last);
+        var comment = p.lastChild;
+        p.removeChild(comment);
+        var text = p.lastChild;
+        p.removeChild(text);
+        var detached = document.createElement('detached');
+        var detachedChild = document.createTextNode('child');
+        detached.appendChild(detachedChild);
+        initial && unchanged && comment.nodeType === Node.COMMENT_NODE &&
+            text.nodeType === Node.TEXT_NODE && p.lastChild === null && empty.lastChild === null &&
+            text.lastChild === null && comment.lastChild === null &&
+            detached.lastChild === detachedChild && detachedChild.lastChild === null
+    ",
+    );
+}
+
+#[test]
 fn child_nodes_implements_the_node_list_iterators() {
     let mut realm = realm("<main id='p'>one<b id='b'></b></main>");
     assert_script(

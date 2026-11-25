@@ -348,6 +348,7 @@ name = "byui-browser-windows"
 version = "0.1.0"
 dependencies = [
  "browser-shell",
+ "winit",
 ]
 
 [[package]]
