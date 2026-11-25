@@ -22,11 +22,14 @@ or `Escape` to cancel. HTTP and HTTPS addresses are loaded asynchronously
 through the browser loader, with a loading indicator and a built-in error page
 for failed requests. `Ctrl+R` reloads the current address without adding a
 history visit. The toolbar Back and Forward buttons traverse successful
-session history without adding visits; tabs and the menu are still staged.
+session history without adding visits. Tabs, appearance settings, page source,
+site information, Find in Page, and the shared DevTools dock are available
+through the same shell implementation used by macOS and Linux.
 
 Windows supplies the native titlebar, resize borders, and system window
-buttons. The normal window uses Windows' rounded frame, while a maximized
-window uses the system's square maximized frame.
+buttons. The shell explicitly requests rounded corners for a restored window
+and square corners while maximized; Windows versions that do not support the
+corner preference safely fall back to their system behavior.
 
 ## Windows verification checklist
 
@@ -35,6 +38,14 @@ window uses the system's square maximized frame.
   corners should be rounded.
 - Visit two addresses, then verify Back and Forward enable and traverse them.
 - Use `Ctrl+R` and confirm Reload does not add another history visit.
+- Open and close tabs, switch tabs, and verify each tab keeps its own URL and
+  history.
+- Toggle System, Light, and Dark appearance and restart to confirm the choice
+  persists.
+- Use `Ctrl+F` to search the live page, cycle matches with Enter and
+  Shift+Enter, then dismiss Find with Escape.
+- Open Page Source, Site Information, and Inspect from the page menu; confirm
+  each overlay closes cleanly and restores the underlying page.
 - Press `Ctrl+Shift+H`; switch Elements, Network, and Console, scroll each
   view, press Delete to clear the active log, and press Escape to close.
 - Open DevTools again after navigation and confirm the live document and new
