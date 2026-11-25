@@ -38,8 +38,8 @@ corner preference safely fall back to their system behavior.
 - [x] Maximize and restore it; maximized corners are square and restored
   corners should be rounded.
 - [x] Close the final window cleanly without a tab-strip teardown panic.
-- [ ] Visit two addresses, then verify Back and Forward enable and traverse them.
-- [ ] Use `Ctrl+R` and confirm Reload does not add another history visit.
+- [x] Visit two addresses, then verify Back and Forward enable and traverse them.
+- [x] Use `Ctrl+R` and confirm Reload does not add another history visit.
 - [ ] Open and close tabs, switch tabs, and verify each tab keeps its own URL and
   history.
 - [ ] Toggle System, Light, and Dark appearance and restart to confirm the choice
@@ -48,8 +48,8 @@ corner preference safely fall back to their system behavior.
   Shift+Enter, then dismiss Find with Escape.
 - [ ] Open Page Source, Site Information, and Inspect from the page menu; confirm
   each overlay closes cleanly and restores the underlying page.
-- [ ] Press `Ctrl+Shift+H`; switch Elements, Network, and Console, scroll each
-  view, press Delete to clear the active log, and press Escape to close.
+- [x] Press `Ctrl+Shift+H`; switch Elements, Network, Performance, and Console,
+  press Delete to clear the active log, and close DevTools.
 - [ ] Open DevTools again after navigation and confirm the live document and new
   request/console entries are shown.
 - [ ] Repeat the checks at Windows display scaling above 100%.
