@@ -359,9 +359,7 @@ fn no_cache_revalidates_with_all_validators_and_reuses_the_merged_representation
             .await
             .unwrap();
         assert_eq!(collect_body(first).await.unwrap(), b"cached");
-        for _ in 0..4_096 {
-            tokio::task::yield_now().await;
-        }
+        let _ = wait_for_cached(&controller, &request).await;
         let mut no_cache = request;
         no_cache.set_cache_mode(CacheMode::NoCache);
         let revalidated = controller.fetch(no_cache).await.unwrap();
