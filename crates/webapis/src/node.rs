@@ -456,7 +456,7 @@ fn property(document: &SharedDocument, id: NodeID, name: &str) -> JsResult<Value
             "parentNode" => parent,
             "parentElement" => parent_element(source, parent),
             "firstChild" => first_child(source, id),
-            "lastChild" => node.get_children().last().copied(),
+            "lastChild" => last_child(source, id),
             "previousSibling" => position
                 .and_then(|i| i.checked_sub(1))
                 .and_then(|i| siblings?.get(i).copied()),
@@ -550,6 +550,19 @@ fn first_child(source: &HTMLDocument, id: NodeID) -> Option<NodeID> {
     source
         .get_node(id)
         .and_then(|node| node.get_children().first().copied())
+}
+
+/// Returns the last child in a node's current children collection.
+///
+/// This is the DOM `Node.lastChild` getter: it returns the final child node,
+/// regardless of whether that node is an Element, Text, Comment, DocumentType,
+/// or another supported node kind, and returns `None` when the collection is
+/// empty. The arena is queried for every getter call so the JavaScript
+/// property remains live after DOM mutations.
+fn last_child(source: &HTMLDocument, id: NodeID) -> Option<NodeID> {
+    source
+        .get_node(id)
+        .and_then(|node| node.get_children().last().copied())
 }
 
 fn descendant_text(source: &HTMLDocument, id: NodeID) -> String {
