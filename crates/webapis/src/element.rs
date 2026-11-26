@@ -21,6 +21,8 @@ mod contains;
 mod dataset;
 #[cfg(test)]
 mod first_child;
+#[cfg(test)]
+mod first_element_child;
 mod focus;
 mod get_elements_by_class_name;
 pub(crate) mod get_elements_by_tag_name;
