@@ -28,6 +28,8 @@ mod get_elements_by_class_name;
 pub(crate) mod get_elements_by_tag_name;
 mod has_attribute;
 #[cfg(test)]
+mod last_element_child;
+#[cfg(test)]
 mod node_type;
 #[cfg(test)]
 mod parent_element;
