@@ -390,6 +390,12 @@ pub(crate) fn install(object: &Object, id: NodeID, document: &SharedDocument) {
     if matches!(&kind, Some(NodeKind::Element(_) | NodeKind::Document)) {
         let getter_document = document.clone();
         object.define_accessor(
+            "firstElementChild",
+            Arc::new(move || property(&getter_document, id, "firstElementChild")),
+            None,
+        );
+        let getter_document = document.clone();
+        object.define_accessor(
             "lastElementChild",
             Arc::new(move || property(&getter_document, id, "lastElementChild")),
             None,
@@ -464,6 +470,7 @@ fn property(document: &SharedDocument, id: NodeID, name: &str) -> JsResult<Value
             "parentNode" => parent,
             "parentElement" => parent_element(source, parent),
             "firstChild" => first_child(source, id),
+            "firstElementChild" => first_element_child(source, id),
             "lastChild" => last_child(source, id),
             "lastElementChild" => last_element_child(source, id),
             "previousSibling" => position
@@ -559,6 +566,25 @@ fn first_child(source: &HTMLDocument, id: NodeID) -> Option<NodeID> {
     source
         .get_node(id)
         .and_then(|node| node.get_children().first().copied())
+}
+
+/// Returns the first Element child in a node's current children collection.
+///
+/// This is the DOM `ParentNode.firstElementChild` getter: non-Element children
+/// are skipped, and `None` is returned when the node has no Element children.
+/// The arena is queried for every getter call so the JavaScript property
+/// remains live after DOM mutations.
+fn first_element_child(source: &HTMLDocument, id: NodeID) -> Option<NodeID> {
+    source
+        .get_node(id)?
+        .get_children()
+        .iter()
+        .copied()
+        .find(|child| {
+            source
+                .get_node(*child)
+                .is_some_and(|node| matches!(node.get_kind(), NodeKind::Element(_)))
+        })
 }
 
 /// Returns the last child in a node's current children collection.
