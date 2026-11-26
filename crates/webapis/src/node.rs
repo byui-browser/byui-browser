@@ -476,7 +476,7 @@ fn property(document: &SharedDocument, id: NodeID, name: &str) -> JsResult<Value
             "previousSibling" => position
                 .and_then(|i| i.checked_sub(1))
                 .and_then(|i| siblings?.get(i).copied()),
-            "nextSibling" => position.and_then(|i| siblings?.get(i + 1).copied()),
+            "nextSibling" => next_sibling(siblings, position),
             _ => None,
         };
         (
@@ -566,6 +566,20 @@ fn first_child(source: &HTMLDocument, id: NodeID) -> Option<NodeID> {
     source
         .get_node(id)
         .and_then(|node| node.get_children().first().copied())
+}
+
+/// Returns the first following sibling in the node's current parent.
+///
+/// This is the DOM `Node.nextSibling` getter: siblings share the same
+/// non-null parent, and the relationship is resolved from the arena for every
+/// read so the JavaScript property stays live after DOM mutations. Nodes with
+/// no parent and the last child therefore return `None`.
+fn next_sibling(siblings: Option<&Vec<NodeID>>, position: Option<usize>) -> Option<NodeID> {
+    position.and_then(|position| {
+        position
+            .checked_add(1)
+            .and_then(|next| siblings?.get(next).copied())
+    })
 }
 
 /// Returns the first Element child in a node's current children collection.
