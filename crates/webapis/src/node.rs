@@ -394,6 +394,12 @@ pub(crate) fn install(object: &Object, id: NodeID, document: &SharedDocument) {
             Arc::new(move || property(&getter_document, id, "firstElementChild")),
             None,
         );
+        let getter_document = document.clone();
+        object.define_accessor(
+            "lastElementChild",
+            Arc::new(move || property(&getter_document, id, "lastElementChild")),
+            None,
+        );
     }
     let list = child_list(document, id);
     object.set_read_only("childNodes", Value::Object(list));
@@ -466,6 +472,7 @@ fn property(document: &SharedDocument, id: NodeID, name: &str) -> JsResult<Value
             "firstChild" => first_child(source, id),
             "firstElementChild" => first_element_child(source, id),
             "lastChild" => last_child(source, id),
+            "lastElementChild" => last_element_child(source, id),
             "previousSibling" => previous_sibling(siblings.map(Vec::as_slice), position),
             "nextSibling" => next_sibling(siblings.map(Vec::as_slice), position),
             _ => None,
@@ -615,6 +622,26 @@ fn last_child(source: &HTMLDocument, id: NodeID) -> Option<NodeID> {
     source
         .get_node(id)
         .and_then(|node| node.get_children().last().copied())
+}
+
+/// Returns the last Element child in a node's current children collection.
+///
+/// This is the DOM `ParentNode.lastElementChild` getter: non-Element children
+/// are skipped, and `None` is returned when the node has no Element children.
+/// The arena is queried for every getter call so the JavaScript property
+/// remains live after DOM mutations.
+fn last_element_child(source: &HTMLDocument, id: NodeID) -> Option<NodeID> {
+    source
+        .get_node(id)?
+        .get_children()
+        .iter()
+        .rev()
+        .copied()
+        .find(|child| {
+            source
+                .get_node(*child)
+                .is_some_and(|node| matches!(node.get_kind(), NodeKind::Element(_)))
+        })
 }
 
 fn descendant_text(source: &HTMLDocument, id: NodeID) -> String {
