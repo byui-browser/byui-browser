@@ -387,6 +387,14 @@ pub(crate) fn install(object: &Object, id: NodeID, document: &SharedDocument) {
             setter,
         );
     }
+    if matches!(&kind, Some(NodeKind::Element(_) | NodeKind::Document)) {
+        let getter_document = document.clone();
+        object.define_accessor(
+            "firstElementChild",
+            Arc::new(move || property(&getter_document, id, "firstElementChild")),
+            None,
+        );
+    }
     let list = child_list(document, id);
     object.set_read_only("childNodes", Value::Object(list));
     if matches!(kind, Some(NodeKind::Text(_) | NodeKind::Comment(_))) {
@@ -456,6 +464,7 @@ fn property(document: &SharedDocument, id: NodeID, name: &str) -> JsResult<Value
             "parentNode" => parent,
             "parentElement" => parent_element(source, parent),
             "firstChild" => first_child(source, id),
+            "firstElementChild" => first_element_child(source, id),
             "lastChild" => last_child(source, id),
             "previousSibling" => previous_sibling(siblings.map(Vec::as_slice), position),
             "nextSibling" => next_sibling(siblings.map(Vec::as_slice), position),
@@ -574,6 +583,25 @@ fn next_sibling(siblings: Option<&[NodeID]>, position: Option<usize>) -> Option<
             .checked_add(1)
             .and_then(|next| siblings?.get(next).copied())
     })
+}
+
+/// Returns the first Element child in a node's current children collection.
+///
+/// This is the DOM `ParentNode.firstElementChild` getter: non-Element children
+/// are skipped, and `None` is returned when the node has no Element children.
+/// The arena is queried for every getter call so the JavaScript property
+/// remains live after DOM mutations.
+fn first_element_child(source: &HTMLDocument, id: NodeID) -> Option<NodeID> {
+    source
+        .get_node(id)?
+        .get_children()
+        .iter()
+        .copied()
+        .find(|child| {
+            source
+                .get_node(*child)
+                .is_some_and(|node| matches!(node.get_kind(), NodeKind::Element(_)))
+        })
 }
 
 /// Returns the last child in a node's current children collection.
